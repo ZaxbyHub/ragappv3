@@ -20,6 +20,8 @@ from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -77,12 +79,13 @@ class FakeBackgroundProcessor:
     def __init__(self):
         self.enqueued = []
 
-    async def enqueue(self, file_path, source=None, email_subject=None, email_sender=None):
+    async def enqueue(self, file_path, source=None, email_subject=None, email_sender=None, vault_id=None):
         self.enqueued.append({
             'file_path': file_path,
             'source': source,
             'email_subject': email_subject,
             'email_sender': email_sender,
+            'vault_id': vault_id,
         })
 
 
@@ -544,7 +547,7 @@ class TestIMAPConnection(unittest.IsolatedAsyncioTestCase):
             nonlocal attempt_count
             attempt_count += 1
             if attempt_count < 3:
-                raise Exception("Connection failed")
+                raise OSError("Connection failed")
             return fake_imap
 
         with patch('app.services.email_service.aioimaplib.IMAP4_SSL', side_effect=mock_imap_connection):
@@ -575,12 +578,12 @@ class TestIMAPConnection(unittest.IsolatedAsyncioTestCase):
         def mock_imap_connection(*args, **kwargs):
             nonlocal attempt_count
             attempt_count += 1
-            raise Exception("Connection failed")
+            raise OSError("Connection failed")
 
         with patch('app.services.email_service.aioimaplib.IMAP4_SSL', side_effect=mock_imap_connection):
             with self.assertRaises(Exception) as ctx:
                 await self.service._connect_with_backoff()
-            self.assertIn("failed after", str(ctx.exception))
+            self.assertIn("IMAP connection failed after", str(ctx.exception))
             self.assertEqual(attempt_count, 4)  # 5s -> 15s -> 45s -> 60s (max)
 
     @patch('app.services.email_service.asyncio.wait_for', side_effect=asyncio.TimeoutError())
@@ -589,12 +592,12 @@ class TestIMAPConnection(unittest.IsolatedAsyncioTestCase):
         FakeIMAPClient()
 
         def mock_imap_connection(*args, **kwargs):
-            raise Exception("Persistent connection failure")
+            raise OSError("Persistent connection failure")
 
         with patch('app.services.email_service.aioimaplib.IMAP4_SSL', side_effect=mock_imap_connection):
             with self.assertRaises(Exception) as ctx:
                 await self.service._connect_with_backoff()
-            self.assertIn("failed after", str(ctx.exception))
+            self.assertIn("IMAP connection failed after", str(ctx.exception))
 
     @patch('app.services.email_service.asyncio.wait_for', side_effect=asyncio.TimeoutError())
     async def test_connect_with_backoff_stop_event_interrupts(self, mock_wait_for):
@@ -625,6 +628,11 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
             self.pool,
             self.background_processor
         )
+        # Create test vaults needed for attachment tests
+        conn = self.pool.get_connection()
+        conn.execute("INSERT INTO vaults (name) VALUES (?)", ("Vault1",))
+        conn.commit()
+        self.pool.release_connection(conn)
 
     def tearDown(self):
         self.pool.close_all()
@@ -787,7 +795,7 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
 
         # Create test email with disallowed attachment
         msg = EmailMessage()
-        msg['Subject'] = 'Test Document'
+        msg['Subject'] = 'Test Document [Vault1]'
         msg['From'] = 'sender@example.com'
         msg.set_content('Email body')
         msg.add_attachment(
@@ -812,7 +820,7 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
         # Create test email with oversized attachment
         large_content = b'x' * (11 * 1024 * 1024)  # 11MB
         msg = EmailMessage()
-        msg['Subject'] = 'Test Document'
+        msg['Subject'] = 'Test Document [Vault1]'
         msg['From'] = 'sender@example.com'
         msg.set_content('Email body')
         msg.add_attachment(
@@ -887,6 +895,162 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
 
         resolved_id = await self.service._resolve_vault_id("MYVAULT")
         self.assertEqual(resolved_id, vault_id)
+
+
+class TestSaveAttachmentSentinel(unittest.TestCase):
+    """Test _save_attachment sentinel pattern prevents double-close.
+
+    Verifies:
+    1. On successful save, fd is closed exactly once
+    2. On error (OSError during write), fd is closed exactly once
+    3. Sentinel pattern prevents double-close on multiple exceptions
+    4. Temp file is unlinked on error
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.settings = self._create_test_settings()
+        self.pool = self._create_test_pool()
+        self.background_processor = FakeBackgroundProcessor()
+        self.service = EmailIngestionService(
+            self.settings,
+            self.pool,
+            self.background_processor
+        )
+
+    def tearDown(self):
+        self.pool.close_all()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _create_test_settings(self):
+        settings = Settings()
+        settings.data_dir = Path(self.temp_dir)
+        settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+        return settings
+
+    def _create_test_pool(self):
+        db_path = os.path.join(self.temp_dir, 'test.db')
+        from app.models.database import init_db
+        init_db(db_path)
+        return SQLiteConnectionPool(db_path, max_size=2)
+
+    def _create_attachment_part(self, payload):
+        """Helper to create an email attachment part."""
+        msg = EmailMessage()
+        msg.add_attachment(
+            payload,
+            filename='test.txt',
+            main_type='text',
+            sub_type='plain'
+        )
+        return msg.iter_attachments().__next__()
+
+    @pytest.mark.asyncio
+    async def test_save_attachment_success_closes_fd_once(self):
+        """On successful save, fd is closed exactly once (no leak, no double-close)."""
+        from unittest.mock import AsyncMock, patch
+
+        part = self._create_attachment_part(b'test content')
+        vault_id = 1
+
+        close_calls = []
+        original_close = os.close
+
+        def track_close(fd):
+            close_calls.append(fd)
+            original_close(fd)
+
+        with patch('os.close', side_effect=track_close):
+            result = await self.service._save_attachment(part, vault_id)
+
+        # Verify success path returned correct result
+        self.assertIsInstance(result, str)
+        self.assertTrue(result.endswith('.txt'))
+
+        # Verify fd was closed exactly once
+        self.assertEqual(len(close_calls), 1, f"Expected 1 close call, got {len(close_calls)}")
+
+    @pytest.mark.asyncio
+    async def test_save_attachment_error_closes_fd_once(self):
+        """On OSError during write, fd is closed exactly once via sentinel."""
+        from unittest.mock import patch
+
+        part = self._create_attachment_part(b'test content')
+        vault_id = 1
+
+        close_calls = []
+        original_close = os.close
+
+        def track_close(fd):
+            close_calls.append(fd)
+            original_close(fd)
+
+        # Simulate OSError during write
+        with patch('os.close', side_effect=track_close):
+            with patch('os.write', side_effect=OSError("Simulated write failure")):
+                with self.assertRaises(Exception) as ctx:
+                    await self.service._save_attachment(part, vault_id)
+
+                self.assertIn("Failed to save attachment", str(ctx.exception))
+
+        # Verify fd was closed exactly once (sentinel prevents double-close)
+        self.assertEqual(len(close_calls), 1, f"Expected 1 close call, got {len(close_calls)}")
+
+    @pytest.mark.asyncio
+    async def test_save_attachment_error_unlinks_temp_file(self):
+        """On error, temp file is unlinked."""
+        from unittest.mock import patch
+
+        part = self._create_attachment_part(b'test content')
+        vault_id = 1
+
+        unlink_calls = []
+        original_unlink = os.unlink
+
+        def track_unlink(path):
+            unlink_calls.append(path)
+            original_unlink(path)
+
+        with patch('os.unlink', side_effect=track_unlink):
+            with patch('os.write', side_effect=OSError("Simulated write failure")):
+                try:
+                    await self.service._save_attachment(part, vault_id)
+                except Exception:
+                    pass
+
+        # Verify unlink was called to clean up temp file
+        self.assertEqual(len(unlink_calls), 1, f"Expected 1 unlink call, got {len(unlink_calls)}")
+
+    @pytest.mark.asyncio
+    async def test_save_attachment_sentinel_prevents_double_close(self):
+        """Sentinel pattern (fd=None) prevents double-close even when finally runs after except."""
+        from unittest.mock import patch
+
+        part = self._create_attachment_part(b'test content')
+        vault_id = 1
+
+        close_calls = []
+        _original_close = os.close  # noqa: F841 - reference kept for restore
+
+        def track_close(fd):
+            close_calls.append(fd)
+
+        # Patch close to track calls but not actually close (so finally sees fd!=None)
+        # We want to verify the sentinel actually prevents the second call
+        with patch('os.close', side_effect=track_close):
+            # Simulate error after partial write - this triggers except then finally
+            with patch('os.write', side_effect=OSError("Simulated failure")):
+                try:
+                    await self.service._save_attachment(part, vault_id)
+                except Exception:
+                    pass
+
+        # Sentinel pattern: except sets fd=None, so finally's if fd is not None check
+        # should prevent second close. Without sentinel, we'd see 2 close calls.
+        self.assertEqual(len(close_calls), 1,
+            f"Sentinel failed: expected 1 close (from except), got {len(close_calls)}. "
+            "Double-close occurred if count > 1.")
 
 
 if __name__ == '__main__':

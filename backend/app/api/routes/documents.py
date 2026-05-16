@@ -371,7 +371,12 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
 
 
 def _build_files_fts_query(raw_search: str) -> str:
-    tokens = re.findall(r"[A-Za-z0-9_]+", raw_search.lower())
+    # Strip hyphens: FTS5 treats hyphens as column-filter prefix (col:term).
+    # Including hyphens in tokens causes OperationalError on hyphenated searches.
+    # FTS5's default tokenizer already splits on hyphens during indexing,
+    # so individual tokens (my, doc, pdf) still match hyphenated filenames.
+    normalized = raw_search.lower().replace("-", " ")
+    tokens = re.findall(r"[A-Za-z0-9_]+", normalized)
     return " ".join(f"{token}*" for token in tokens[:8])
 
 

@@ -118,10 +118,7 @@ class FileWatcher:
                 vaults = conn.execute("SELECT id, name FROM vaults").fetchall()
                 for row in vaults:
                     vault_id = row[0]
-                    vault_name = row[1]
-                    # Sanitize vault name for filesystem
-                    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in vault_name)
-                    vault_upload_dir = settings.vaults_dir / safe_name / "uploads"
+                    vault_upload_dir = settings.vault_uploads_dir(vault_id)
                     dir_vault_map[vault_upload_dir] = vault_id
             finally:
                 pool.release_connection(conn)

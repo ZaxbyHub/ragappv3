@@ -165,7 +165,7 @@ async def _fetch_all_vaults(
     """Fetch all vaults with counts, ordered by creation date."""
     cursor = await asyncio.to_thread(
         conn.execute,
-        _VAULT_WITH_COUNTS_SQL + " GROUP BY v.id ORDER BY v.created_at ASC",
+        _VAULT_WITH_COUNTS_SQL + " GROUP BY v.id ORDER BY v.created_at ASC LIMIT 1000",
     )
     rows = await asyncio.to_thread(cursor.fetchall)
     permissions = (
@@ -285,23 +285,37 @@ async def create_vault(
                     detail="You are not a member of that organization",
                 )
 
-    # Insert vault row — IntegrityError here means duplicate name
+    # Begin explicit transaction for atomic vault + membership creation
     try:
+        await asyncio.to_thread(conn.execute, "BEGIN")
         cursor = await asyncio.to_thread(
             conn.execute,
             "INSERT INTO vaults (name, description, org_id, visibility, owner_id) VALUES (?, ?, ?, ?, ?)",
             (request.name, request.description, target_org_id, request.visibility, user["id"]),
         )
+        vault_id = cursor.lastrowid
     except sqlite3.IntegrityError:
+        try:
+            await asyncio.to_thread(conn.rollback)
+        except Exception:
+            pass
         raise HTTPException(
             status_code=409, detail=f"Vault with name '{request.name}' already exists"
         )
-
-    vault_id = cursor.lastrowid
-    if vault_id is None:
+    except Exception:
+        try:
+            await asyncio.to_thread(conn.rollback)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail="Failed to create vault")
 
-    # Insert creator as admin member — commit both inserts atomically
+    if vault_id is None:
+        try:
+            await asyncio.to_thread(conn.rollback)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Failed to create vault")
+
     try:
         await asyncio.to_thread(
             conn.execute,
@@ -309,14 +323,16 @@ async def create_vault(
             (vault_id, user["id"], "admin"),
         )
         await asyncio.to_thread(conn.commit)
-    except sqlite3.IntegrityError as e:
-        await asyncio.to_thread(conn.rollback)
+    except Exception as e:
+        try:
+            await asyncio.to_thread(conn.rollback)
+        except Exception:
+            pass
         logger.error(
-            "Unexpected IntegrityError inserting vault_members for vault %d: %s",
-            vault_id,
+            "Error creating vault or assigning membership: %s",
             e,
         )
-        raise HTTPException(status_code=500, detail="Failed to assign vault membership")
+        raise HTTPException(status_code=500, detail="Failed to create vault or assign membership")
 
     vault = await _fetch_vault_with_counts(conn, vault_id, user)
     return vault

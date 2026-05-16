@@ -219,7 +219,7 @@ class EmailIngestionService:
             logger.debug(f"Selected mailbox: {self.settings.imap_mailbox}")
 
             # Search for UNSEEN emails
-            result, data = await imap_client.search('UTF-8', 'UNSEEN')
+            result, data = await imap_client.search(None, 'UNSEEN')
             if result != 'OK':
                 logger.warning(f"IMAP search failed: {result}")
                 return
@@ -418,13 +418,16 @@ class EmailIngestionService:
             file_path = await self._save_attachment(part, vault_id)
 
             # Enqueue for processing
-            await self.background_processor.enqueue(
-                file_path=file_path,
-                source='email',
-                email_subject=subject,
-                email_sender=sender,
-                vault_id=vault_id,
-            )
+            if self.background_processor is not None:
+                await self.background_processor.enqueue(
+                    file_path=file_path,
+                    source='email',
+                    email_subject=subject,
+                    email_sender=sender,
+                    vault_id=vault_id,
+                )
+            else:
+                logger.warning("background_processor is None — skipping enqueue for file: %s", file_path)
             processed_attachments += 1
             logger.info(f"Enqueued attachment for processing: {file_path}")
 
@@ -598,18 +601,23 @@ class EmailIngestionService:
         except (OSError, RuntimeError, ValueError) as e:
             # Clean up temp file on error
             try:
-                os.close(fd)
-                os.unlink(temp_path)
-            except (OSError, FileNotFoundError):
-                # File may not exist or already closed
-                pass
+                try:
+                    os.close(fd)
+                except (OSError, FileNotFoundError):
+                    pass
+                try:
+                    os.unlink(temp_path)
+                except (OSError, FileNotFoundError):
+                    pass
+            finally:
+                fd = None  # sentinel — ALWAYS set, even if cleanup raises
             raise Exception(f"Failed to save attachment: {e}")
         finally:
-            try:
-                os.close(fd)
-            except (OSError, FileNotFoundError):
-                # File may already be closed
-                pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except (OSError, FileNotFoundError):
+                    pass
 
     async def _resolve_vault_id(self, vault_name: Optional[str]) -> int:
         """

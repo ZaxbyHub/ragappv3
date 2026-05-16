@@ -10,7 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 from queue import Empty, Queue
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -585,6 +585,19 @@ class TestVaultScopedRoutes(unittest.TestCase):
         init_db(db_path)
         self._connection_pool = SimpleConnectionPool(db_path)
 
+        # Patch evaluate_policy in route modules that use standalone evaluate_policy
+        # (bypasses global pool and uses override DB instead)
+        self._evaluate_policy_patches = []
+        for module_name in [
+            "app.api.routes.chat",
+            "app.api.routes.memories",
+            "app.api.routes.wiki",
+        ]:
+            patcher = patch(f"{module_name}.evaluate_policy")
+            mock_ep = patcher.start()
+            mock_ep.return_value = True
+            self._evaluate_policy_patches.append(patcher)
+
         def override_get_db():
             conn = self._connection_pool.get_connection()
             try:
@@ -619,6 +632,8 @@ class TestVaultScopedRoutes(unittest.TestCase):
         app.dependency_overrides.pop(get_memory_store, None)
         app.dependency_overrides.pop(get_rag_engine, None)
         app.dependency_overrides.pop(get_embedding_service, None)
+        for patcher in getattr(self, '_evaluate_policy_patches', []):
+            patcher.stop()
         if hasattr(self, '_connection_pool'):
             self._connection_pool.close_all()
         import shutil

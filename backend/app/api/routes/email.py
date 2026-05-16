@@ -109,7 +109,7 @@ async def _get_unseen_count(
             return -1
 
         # Search for UNSEEN emails
-        result, data = await imap_client.search('UTF-8', 'UNSEEN')
+        result, data = await imap_client.search(None, 'UNSEEN')
         if result != 'OK':
             return -1
 

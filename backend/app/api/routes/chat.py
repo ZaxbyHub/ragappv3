@@ -545,25 +545,49 @@ async def list_sessions(
     Returns sessions sorted by updated_at DESC with message count for each session.
     """
     # Build single JOIN query with optional vault_id filter to avoid N+1
+    user_id = user["id"]
+    is_admin = user.get("role") in ("superadmin", "admin")
     if vault_id is not None:
-        query = """
-            SELECT s.id, s.vault_id, s.title, s.created_at, s.updated_at, COUNT(m.id) as message_count, s.forked_from_session_id, s.fork_message_index
-            FROM chat_sessions s
-            LEFT JOIN chat_messages m ON m.session_id = s.id
-            WHERE s.vault_id = ?
-            GROUP BY s.id
-            ORDER BY s.updated_at DESC
-        """
-        params = (vault_id,)
+        if is_admin:
+            query = """
+                SELECT s.id, s.vault_id, s.title, s.created_at, s.updated_at, COUNT(m.id) as message_count, s.forked_from_session_id, s.fork_message_index
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON m.session_id = s.id
+                WHERE s.vault_id = ?
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC
+            """
+            params = (vault_id,)
+        else:
+            query = """
+                SELECT s.id, s.vault_id, s.title, s.created_at, s.updated_at, COUNT(m.id) as message_count, s.forked_from_session_id, s.fork_message_index
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON m.session_id = s.id
+                WHERE s.vault_id = ? AND (s.user_id = ? OR s.user_id IS NULL)
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC
+            """
+            params = (vault_id, user_id)
     else:
-        query = """
-            SELECT s.id, s.vault_id, s.title, s.created_at, s.updated_at, COUNT(m.id) as message_count, s.forked_from_session_id, s.fork_message_index
-            FROM chat_sessions s
-            LEFT JOIN chat_messages m ON m.session_id = s.id
-            GROUP BY s.id
-            ORDER BY s.updated_at DESC
-        """
-        params = ()
+        if is_admin:
+            query = """
+                SELECT s.id, s.vault_id, s.title, s.created_at, s.updated_at, COUNT(m.id) as message_count, s.forked_from_session_id, s.fork_message_index
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON m.session_id = s.id
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC
+            """
+            params = ()
+        else:
+            query = """
+                SELECT s.id, s.vault_id, s.title, s.created_at, s.updated_at, COUNT(m.id) as message_count, s.forked_from_session_id, s.fork_message_index
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON m.session_id = s.id
+                WHERE (s.user_id = ? OR s.user_id IS NULL)
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC
+            """
+            params = (user_id,)
 
     result = await asyncio.to_thread(conn.execute, query, params)
     rows = await asyncio.to_thread(result.fetchall)
@@ -1088,10 +1112,16 @@ async def _auto_name_session(
             # Only update if the title hasn't been changed manually
             existing_title = current_title[0] if current_title else None
             if existing_title is not None and existing_title != "":
-                # Improved guard: check prefix match AND length (auto-titles are typically short)
-                if len(existing_title) < 60 and existing_title.startswith(
-                    first_message[:10]
-                ):
+                # Only overwrite if title appears auto-generated
+                # Auto-generated titles are short and start with first message prefix
+                # Protect known defaults and likely manual titles
+                is_default_title = existing_title == "New conversation"
+                is_likely_auto = (
+                    not is_default_title
+                    and len(existing_title) < 60
+                    and existing_title.startswith(first_message[:10])
+                )
+                if is_likely_auto:
                     # Atomic UPDATE with WHERE clause - only updates if title hasn't changed
                     update_query = """
                         UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP
