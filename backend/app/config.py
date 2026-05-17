@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     # ── Ingestion performance configuration ──────────────────────────────────
     ingestion_worker_count: int = 2
     """Number of concurrent document ingestion workers (1-16)."""
-    optimize_mode: str = "periodic"
+    optimize_mode: str = "after_every_write"
     """LanceDB table compaction mode: 'after_every_write' (current), 'periodic' (every N chunks), 'manual' (never during ingestion)."""
     optimize_interval_chunks: int = 5000
     """Number of chunks between optimize() calls when optimize_mode is 'periodic'."""

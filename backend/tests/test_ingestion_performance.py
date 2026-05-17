@@ -83,7 +83,8 @@ class TestFailFast:
             assert isinstance(result, tuple)
             assert len(result) == 2
             embeddings, failed_indices = result
-            assert len(embeddings) == 0
+            assert len(embeddings) == 2  # full-length list with None placeholders
+            assert embeddings == [None, None]  # both positions are None (batch failed)
             assert 0 in failed_indices
 
     @pytest.mark.asyncio

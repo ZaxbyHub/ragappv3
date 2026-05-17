@@ -1294,13 +1294,14 @@ class DocumentProcessor:
                             failed_batch_indices,
                         )
 
+                        original_chunk_count = len(chunks)
                         chunks = kept_chunks
                         embeddings = kept_embeddings
 
                         if failure_pct > 50:
                             raise DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
-                                "Aborting document ingest." % (len(failed_chunk_indices), len(chunks), failure_pct),
+                                "Aborting document ingest." % (len(failed_chunk_indices), original_chunk_count, failure_pct),
                             )
                     else:
                         embeddings = batch_embeddings
@@ -1767,13 +1768,14 @@ class DocumentProcessor:
                             failed_batch_indices,
                         )
 
+                        original_chunk_count = len(chunks)
                         chunks = kept_chunks
                         embeddings = kept_embeddings
 
                         if failure_pct > 50:
                             raise DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
-                                "Aborting document ingest." % (len(failed_chunk_indices), len(chunks), failure_pct),
+                                "Aborting document ingest." % (len(failed_chunk_indices), original_chunk_count, failure_pct),
                             )
                     else:
                         embeddings = batch_embeddings

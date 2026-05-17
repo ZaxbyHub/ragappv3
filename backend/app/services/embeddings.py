@@ -433,7 +433,7 @@ class EmbeddingService:
 
     async def embed_batch(
         self, texts: List[str], batch_size: int | None = None, fail_fast: bool = True
-    ) -> List[List[float]] | tuple[List[List[float]], List[int]]:
+    ) -> List[List[float]] | tuple[List[Optional[List[float]]], List[int]]:
         """
         Generate embeddings for a batch of texts using true API batching.
 
@@ -454,7 +454,7 @@ class EmbeddingService:
 
         Returns:
             When fail_fast=True: List of embedding vectors.
-            When fail_fast=False: Tuple of (embeddings, failed_batch_indices).
+            When fail_fast=False: Tuple of (embeddings, failed_batch_indices) where failed batch positions contain None.
 
         Raises:
             EmbeddingError: If any batch fails and fail_fast=True.
@@ -512,13 +512,19 @@ class EmbeddingService:
             return all_embeddings
         else:
             failed_indices: List[int] = []
+            all_embeddings_with_nones: List[Optional[List[float]]] = []
             for batch_idx, result in enumerate(batch_results):
                 if isinstance(result, Exception):
                     failed_indices.append(batch_idx)
+                    # Add None placeholders for each text in this failed batch
+                    start = batch_idx * batch_size
+                    end = min(start + batch_size, len(texts_to_embed))
+                    for _ in range(start, end):
+                        all_embeddings_with_nones.append(None)
                     logger.warning(f"Batch {batch_idx} failed (skipping): {result}")
                 else:
-                    all_embeddings.extend(result)
-            return all_embeddings, failed_indices
+                    all_embeddings_with_nones.extend(result)
+            return all_embeddings_with_nones, failed_indices
 
     async def _embed_batch_api(self, texts: List[str]) -> List[List[float]]:
         """

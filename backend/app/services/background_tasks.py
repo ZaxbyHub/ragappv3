@@ -206,7 +206,7 @@ class BackgroundProcessor:
 
         # Create write semaphore for SQLite contention when running multiple workers
         if settings.ingestion_worker_count > 1:
-            self._write_semaphore = asyncio.Semaphore(settings.ingestion_worker_count)
+            self._write_semaphore = asyncio.Semaphore(1)
             self.processor._write_semaphore = self._write_semaphore
         else:
             self._write_semaphore = None
@@ -225,6 +225,8 @@ class BackgroundProcessor:
         """
         if self.processor is None or self.processor.pool is None:
             return
+
+        # SELECT 1: Pending rows
         try:
             with self.processor.pool.connection() as conn:
                 cursor = conn.execute(
@@ -235,8 +237,14 @@ class BackgroundProcessor:
                     """,
                 )
                 stranded = cursor.fetchall()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Stranded-row recovery sweep failed at SELECT: %s", e)
+            stranded = []
 
-                # NEW: recover processing rows stuck for >30 minutes
+        # SELECT 2: Processing rows
+        processing_stranded = []
+        try:
+            with self.processor.pool.connection() as conn:
                 processing_cursor = conn.execute(
                     """
                     SELECT id, file_path, vault_id, source
@@ -249,9 +257,9 @@ class BackgroundProcessor:
                 )
                 processing_stranded = processing_cursor.fetchall()
         except Exception as e:  # pragma: no cover - defensive
-            logger.warning("Stranded-row recovery sweep failed at SELECT: %s", e)
-            return
+            logger.warning("Processing-row recovery sweep failed at SELECT: %s", e)
 
+        # Skip if no stranded rows to recover
         if not stranded and not processing_stranded:
             return
 
@@ -299,6 +307,9 @@ class BackgroundProcessor:
                 row_id = row["id"] if hasattr(row, "keys") else row[0]
                 file_path = row["file_path"] if hasattr(row, "keys") else row[1]
                 vault_id = row["vault_id"] if hasattr(row, "keys") else row[2]
+                source = (
+                    (row["source"] if hasattr(row, "keys") else row[3]) or "upload"
+                )
 
                 from pathlib import Path as _Path
                 if not _Path(file_path).exists():
@@ -327,7 +338,7 @@ class BackgroundProcessor:
                 # Re-enqueue for processing
                 await self.enqueue(
                     file_path=file_path,
-                    source="upload",
+                    source=source,
                     vault_id=int(vault_id),
                     file_id=int(row_id),
                 )
