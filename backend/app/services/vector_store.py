@@ -790,8 +790,6 @@ class VectorStore:
                 # consistent with the multi-query and memory paths. The
                 # ``k`` parameter (``settings.multi_scale_rrf_k``) now
                 # actually shapes cross-scale ranking.
-                from app.utils.fusion import rrf_fuse  # local import — avoid cycles
-
                 fused = rrf_fuse(
                     per_scale_lists,
                     k=settings.multi_scale_rrf_k,

@@ -7,6 +7,7 @@ Verifies Task 2.2:
 3. Both are included in retrieval_debug in the done message
 """
 
+import logging
 import os
 import sys
 from typing import Dict, List, cast
@@ -58,10 +59,10 @@ class FakeLLMClient:
     def __init__(self, response: str = "test response"):
         self._response = response
 
-    async def chat_completion(self, messages):
+    async def chat_completion(self, messages, max_tokens=None):
         return self._response
 
-    async def chat_completion_stream(self, messages):
+    async def chat_completion_stream(self, messages, max_tokens=None):
         yield {"type": "content", "content": self._response}
 
 
@@ -69,6 +70,50 @@ def _make_search_results(results: List[Dict]) -> MagicMock:
     """Create an async mock for vector_store.search() returning a list of dicts."""
     mock = AsyncMock(return_value=results)
     return mock
+
+
+_EMPTY_TOKEN_PACK_STATS = {
+    "token_pack_included": 0,
+    "token_pack_skipped": 0,
+    "token_pack_truncated": 0,
+}
+
+
+class _FakeLanceSearchQuery:
+    def __init__(self, rows):
+        self._rows = rows
+        self.limit_value = None
+
+    def where(self, filter_expr):
+        return self
+
+    def limit(self, limit):
+        self.limit_value = limit
+        return self
+
+    async def to_list(self):
+        if self.limit_value is None:
+            return list(self._rows)
+        return list(self._rows[: self.limit_value])
+
+
+class _FakeLanceTable:
+    def __init__(self, dense_rows, fts_rows):
+        self.dense_query = _FakeLanceSearchQuery(dense_rows)
+        self.fts_query = _FakeLanceSearchQuery(fts_rows)
+
+    async def search(self, query, query_type):
+        if query_type == "vector":
+            return self.dense_query
+        if query_type == "fts":
+            return self.fts_query
+        raise AssertionError(f"unexpected query_type: {query_type}")
+
+    async def list_indices(self):
+        return []
+
+    async def count_rows(self):
+        return 1
 
 
 # ── helpers for creating RAGEngine with mocked deps ────────────────────────────
@@ -86,6 +131,8 @@ def _make_engine(
     engine.embedding_service = cast(object, FakeEmbeddingService([0.1] * 384))
     engine.memory_store = cast(object, FakeMemoryStore())
     engine.llm_client = cast(object, FakeLLMClient())
+    engine._thinking_client_override = None
+    engine._instant_client_override = None
     engine.reranking_enabled = reranking_enabled
     engine.reranking_service = None
     engine.reranker_top_n = None
@@ -130,6 +177,12 @@ def _make_engine(
 
     engine._query_transformer = None
     engine._retrieval_evaluator = None
+    engine._retrieval_evaluators = {}
+    engine._wiki_retrieval = None
+    engine._get_indexed_file_ids = lambda vault_id: None
+    async def _no_supersession_warning(chunks):
+        return None
+    engine._check_supersession = _no_supersession_warning
 
     return engine
 
@@ -152,7 +205,7 @@ async def test_hybrid_status_disabled_when_hybrid_search_disabled():
         user_input="test query",
         vault_id=None,
     )
-    vector_results, relevance_hint, eval_result, rerank_success, score_type, hybrid_status, fts_exceptions, rerank_status, variants_dropped, exact_match_promoted = result_tuple
+    hybrid_status = result_tuple[5]
 
     assert hybrid_status == "disabled", f"Expected 'disabled', got '{hybrid_status}'"
 
@@ -171,9 +224,82 @@ async def test_hybrid_status_both_when_fts_ok():
         user_input="test query",
         vault_id=None,
     )
-    _, _, _, _, _, hybrid_status, fts_exceptions, _, _, _ = result_tuple
+    hybrid_status = result_tuple[5]
 
     assert hybrid_status == "both", f"Expected 'both', got '{hybrid_status}'"
+
+
+@pytest.mark.asyncio
+async def test_rag_query_single_scale_hybrid_does_not_fallback_on_rrf(
+    monkeypatch,
+    caplog,
+):
+    """RAGEngine uses real single-scale hybrid search without rrf_fuse fallback."""
+    from app.services.vector_store import VectorStore
+
+    dense_rows = [
+        {
+            "id": "dense-1",
+            "text": "dense source",
+            "file_id": "dense-file",
+            "metadata": {},
+            "_distance": 0.1,
+        }
+    ]
+    fts_rows = [
+        {
+            "id": "fts-1",
+            "text": "fts source",
+            "file_id": "fts-file",
+            "metadata": {},
+            "_distance": 0.2,
+        }
+    ]
+
+    store = VectorStore()
+    store.db = MagicMock()
+    store.table = _FakeLanceTable(dense_rows, fts_rows)
+    monkeypatch.setattr(store, "_maybe_create_vector_index", AsyncMock())
+    monkeypatch.setattr(
+        "app.services.vector_store.settings.multi_scale_indexing_enabled",
+        False,
+    )
+    monkeypatch.setattr(
+        "app.services.vector_store.settings.hybrid_rrf_k",
+        60,
+    )
+    monkeypatch.setattr(
+        "app.services.vector_store.settings.rrf_legacy_mode",
+        False,
+    )
+    monkeypatch.setattr(
+        "app.services.rag_engine.settings.context_max_tokens",
+        0,
+    )
+    monkeypatch.setattr(
+        "app.services.rag_engine.settings.retrieval_evaluation_enabled",
+        False,
+    )
+
+    engine = _make_engine([], hybrid_search_enabled=True)
+    engine.vector_store = store
+    caplog.set_level(logging.WARNING)
+
+    result_tuple = await engine._execute_retrieval(
+        query_embeddings=[("original", [0.1] * 384)],
+        user_input="hybrid query",
+        vault_id=None,
+    )
+    vector_results = result_tuple[0]
+    hybrid_status = result_tuple[5]
+
+    assert [row["id"] for row in vector_results] == ["dense-1", "fts-1"]
+    assert hybrid_status == "both"
+    assert not any(
+        "cannot access local variable 'rrf_fuse'" in rec.getMessage()
+        or "Vector search fallback triggered" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -191,7 +317,7 @@ async def test_hybrid_status_dense_only_when_no_fts_status_key():
         user_input="test query",
         vault_id=None,
     )
-    _, _, _, _, _, hybrid_status, fts_exceptions, _, _, _ = result_tuple
+    hybrid_status = result_tuple[5]
 
     assert hybrid_status == "dense_only", f"Expected 'dense_only', got '{hybrid_status}'"
 
@@ -210,7 +336,7 @@ async def test_hybrid_status_dense_only_when_fts_failed():
         user_input="test query",
         vault_id=None,
     )
-    _, _, _, _, _, hybrid_status, fts_exceptions, _, _, _ = result_tuple
+    hybrid_status = result_tuple[5]
 
     assert hybrid_status == "dense_only", f"Expected 'dense_only', got '{hybrid_status}'"
 
@@ -229,7 +355,7 @@ async def test_hybrid_status_both_with_mixed_fts_status():
         user_input="test query",
         vault_id=None,
     )
-    _, _, _, _, _, hybrid_status, fts_exceptions, _, _, _ = result_tuple
+    hybrid_status = result_tuple[5]
 
     assert hybrid_status == "both", f"Expected 'both', got '{hybrid_status}'"
 
@@ -318,7 +444,7 @@ async def test_hybrid_status_included_in_done_message():
         # the except-handler score_type bug in rag_engine.py line 599
         # Note: rerank_success=True (4th elem) → rerank_status="ok" (8th elem)
         async def mock_retrieval(*args, **kwargs):
-            return [{"id": "1", "text": "doc", "file_id": "f1", "_distance": 0.1, "_fts_status": "ok", "metadata": {}}], None, "CONFIDENT", True, "rerank", "both", 0, "ok", False, False
+            return [{"id": "1", "text": "doc", "file_id": "f1", "_distance": 0.1, "_fts_status": "ok", "metadata": {}}], None, "CONFIDENT", True, "rerank", "both", 0, "ok", [], False, dict(_EMPTY_TOKEN_PACK_STATS)
         with patch.object(engine, '_execute_retrieval', mock_retrieval):
             async for msg in engine.query("test query", []):
                 if msg.get("type") == "done":
@@ -347,7 +473,7 @@ async def test_hybrid_status_dense_only_in_done_message():
         patch("app.services.rag_engine.settings.retrieval_recency_weight", 0.0), \
         patch("app.services.rag_engine.settings.context_max_tokens", 0):
         async def mock_retrieval(*args, **kwargs):
-            return [{"id": "1", "text": "doc", "file_id": "f1", "_distance": 0.1, "metadata": {}}], None, "CONFIDENT", True, "rerank", "dense_only", 0, "ok", False, False
+            return [{"id": "1", "text": "doc", "file_id": "f1", "_distance": 0.1, "metadata": {}}], None, "CONFIDENT", True, "rerank", "dense_only", 0, "ok", [], False, dict(_EMPTY_TOKEN_PACK_STATS)
         with patch.object(engine, '_execute_retrieval', mock_retrieval):
             async for msg in engine.query("test query", []):
                 if msg.get("type") == "done":
@@ -478,14 +604,14 @@ async def test_hybrid_status_dense_only_empty_results():
     # Patch _execute_retrieval to return a controlled tuple, bypassing the
     # score_type UnboundLocalError bug in rag_engine.py's except handler.
     async def mock_retrieval(*args, **kwargs):
-        return [], None, "CONFIDENT", False, "distance", "dense_only", 0, "ok", False, False
+        return [], None, "CONFIDENT", False, "distance", "dense_only", 0, "ok", [], False, dict(_EMPTY_TOKEN_PACK_STATS)
     with patch.object(engine, '_execute_retrieval', mock_retrieval):
         result_tuple = await engine._execute_retrieval(
             query_embeddings=[[0.1] * 384],
             user_input="test query",
             vault_id=None,
         )
-    _, _, _, _, _, hybrid_status, fts_exceptions, _, _, _ = result_tuple
+    hybrid_status = result_tuple[5]
 
     assert hybrid_status == "dense_only", f"Expected 'dense_only', got '{hybrid_status}'"
 

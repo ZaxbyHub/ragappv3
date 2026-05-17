@@ -23,6 +23,45 @@ import pytest
 from app.services.vector_store import VectorStore
 
 
+class _FakeSearchQuery:
+    def __init__(self, rows):
+        self._rows = rows
+        self.filters = []
+        self.limit_value = None
+
+    def where(self, filter_expr):
+        self.filters.append(filter_expr)
+        return self
+
+    def limit(self, limit):
+        self.limit_value = limit
+        return self
+
+    async def to_list(self):
+        if self.limit_value is None:
+            return list(self._rows)
+        return list(self._rows[: self.limit_value])
+
+
+class _FakeLanceTable:
+    def __init__(self, dense_rows, fts_rows):
+        self.dense_query = _FakeSearchQuery(dense_rows)
+        self.fts_query = _FakeSearchQuery(fts_rows)
+
+    async def search(self, query, query_type):
+        if query_type == "vector":
+            return self.dense_query
+        if query_type == "fts":
+            return self.fts_query
+        raise AssertionError(f"unexpected query_type: {query_type}")
+
+    async def list_indices(self):
+        return []
+
+    async def count_rows(self):
+        return 1
+
+
 class TestVectorStoreNoneGuards(unittest.TestCase):
     """Test cases for None guard behavior in VectorStore."""
 
@@ -161,6 +200,62 @@ class TestSearchNoneGuard(TestVectorStoreNoneGuards):
             )
 
         self.assertEqual(result, [])
+
+
+@pytest.mark.asyncio
+async def test_single_scale_hybrid_search_no_rrf_unboundlocal(monkeypatch, tmp_path):
+    """
+    Regression: the multi-scale branch used to import rrf_fuse locally, so
+    Python treated rrf_fuse as a search() local and the single-scale hybrid
+    branch raised UnboundLocalError before fusion could return results.
+    """
+    dense_rows = [
+        {
+            "id": "dense-1",
+            "text": "dense result",
+            "file_id": "file-dense",
+            "metadata": {},
+            "_distance": 0.1,
+        }
+    ]
+    fts_rows = [
+        {
+            "id": "fts-1",
+            "text": "fts result",
+            "file_id": "file-fts",
+            "metadata": {},
+            "_distance": 0.2,
+        }
+    ]
+
+    store = VectorStore(db_path=tmp_path / "test_lancedb")
+    store.db = MagicMock()
+    store.table = _FakeLanceTable(dense_rows, fts_rows)
+    monkeypatch.setattr(store, "_maybe_create_vector_index", AsyncMock())
+    monkeypatch.setattr(
+        "app.services.vector_store.settings.multi_scale_indexing_enabled",
+        False,
+    )
+    monkeypatch.setattr(
+        "app.services.vector_store.settings.hybrid_rrf_k",
+        60,
+    )
+    monkeypatch.setattr(
+        "app.services.vector_store.settings.rrf_legacy_mode",
+        False,
+    )
+
+    results = await store.search(
+        embedding=[0.1] * 384,
+        limit=5,
+        query_text="hybrid query",
+        hybrid=True,
+        hybrid_alpha=0.5,
+    )
+
+    assert [row["id"] for row in results] == ["dense-1", "fts-1"]
+    assert all(row["_fts_status"] == "ok" for row in results)
+    assert all("_rrf_score" in row for row in results)
 
 
 class TestDeleteByFileNoneGuard(TestVectorStoreNoneGuards):
