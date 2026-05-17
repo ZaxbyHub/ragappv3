@@ -326,7 +326,7 @@ async def lifespan(app: FastAPI):
     try:
         embedding_model_id = settings.embedding_model
         embedding_dim = settings.embedding_dim
-        validation_result = app.state.vector_store.validate_schema(
+        validation_result = await app.state.vector_store.validate_schema(
             embedding_model_id, embedding_dim
         )
         logger.info(f"Vector store schema validation completed: {validation_result}")
@@ -347,7 +347,7 @@ async def lifespan(app: FastAPI):
     # safe (prompt_builder handles missing parent_window_text gracefully).
     if settings.parent_retrieval_enabled:
         try:
-            sample_present = app.state.vector_store.has_parent_window_text_sample()
+            sample_present = await app.state.vector_store.has_parent_window_text_sample()
             if sample_present:
                 logger.info(
                     "Parent-window retrieval: ENABLED and at least one indexed chunk "

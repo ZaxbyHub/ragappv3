@@ -78,12 +78,24 @@ class Settings(BaseSettings):
     """Prefix to prepend to queries during embedding."""
     retrieval_window: int = 1
     """Window size for retrieval context expansion."""
-    embedding_batch_size: int = 32
+    embedding_batch_size: int = 64
     """Number of texts to send per embedding API request. Capped at 128 for TEI compatibility."""
     embedding_batch_max_retries: int = 3
     """Maximum number of retries for adaptive batching when token overflow occurs."""
     embedding_batch_min_sub_size: int = 1
     """Minimum sub-batch size for adaptive batching fallback."""
+
+    # ── Ingestion performance configuration ──────────────────────────────────
+    ingestion_worker_count: int = 2
+    """Number of concurrent document ingestion workers (1-16)."""
+    optimize_mode: str = "periodic"
+    """LanceDB table compaction mode: 'after_every_write' (current), 'periodic' (every N chunks), 'manual' (never during ingestion)."""
+    optimize_interval_chunks: int = 5000
+    """Number of chunks between optimize() calls when optimize_mode is 'periodic'."""
+    embedding_concurrent_batches: int = 4
+    """Maximum number of embedding batches to process concurrently (1-16). Set to 1 for sequential behavior."""
+    optimize_on_shutdown: bool = True
+    """When True, BackgroundProcessor.stop() calls VectorStore.flush_optimize() during graceful shutdown."""
 
     # ── Embedding model validation configuration ───────────────────────────────────
     strict_embedding_model_check: bool = True
@@ -544,6 +556,32 @@ class Settings(BaseSettings):
     def validate_embedding_batch_min_sub_size(cls, v: int) -> int:
         """Validate embedding batch minimum sub-size is >= 1."""
         return cls._validate_int_range(v, 1, None, "embedding_batch_min_sub_size")
+
+    @field_validator("ingestion_worker_count", mode="after")
+    @classmethod
+    def validate_ingestion_worker_count(cls, v: int) -> int:
+        """Validate ingestion worker count is in range 1..16."""
+        return cls._validate_int_range(v, 1, 16, "ingestion_worker_count")
+
+    @field_validator("optimize_mode", mode="after")
+    @classmethod
+    def validate_optimize_mode(cls, v: str) -> str:
+        """Validate optimize_mode is one of the allowed values."""
+        return cls._validate_enum(
+            v, {"after_every_write", "periodic", "manual"}, "optimize_mode"
+        )
+
+    @field_validator("optimize_interval_chunks", mode="after")
+    @classmethod
+    def validate_optimize_interval_chunks(cls, v: int) -> int:
+        """Validate optimize_interval_chunks is >= 1."""
+        return cls._validate_int_range(v, 1, None, "optimize_interval_chunks")
+
+    @field_validator("embedding_concurrent_batches", mode="after")
+    @classmethod
+    def validate_embedding_concurrent_batches(cls, v: int) -> int:
+        """Validate embedding concurrent batches is in range 1..16."""
+        return cls._validate_int_range(v, 1, 16, "embedding_concurrent_batches")
 
     @field_validator("embedding_batch_size", mode="after")
     @classmethod

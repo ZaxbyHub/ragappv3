@@ -46,6 +46,7 @@ class TestEmbeddingBatching:
         self.mock_settings.embedding_batch_size = 512
         self.mock_settings.embedding_batch_max_retries = 3
         self.mock_settings.embedding_batch_min_sub_size = 1
+        self.mock_settings.embedding_concurrent_batches = 4
 
         # Mock the settings for chunk_size_chars
         self.mock_settings.chunk_size_chars = 1200
@@ -328,6 +329,7 @@ class TestIsTokenOverflowError:
         self.mock_settings.embedding_batch_size = 512
         self.mock_settings.embedding_batch_max_retries = 3
         self.mock_settings.embedding_batch_min_sub_size = 1
+        self.mock_settings.embedding_concurrent_batches = 4
         self.mock_settings.chunk_size_chars = 1200
         self.mock_settings.chunk_overlap_chars = 120
 

@@ -5,7 +5,7 @@ services:
     image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest
     container_name: harrier-embed
     restart: unless-stopped
-    command: --model-id microsoft/harrier-oss-v1-0.6b --port 8080 --max-batch-tokens 16384
+    command: --model-id microsoft/harrier-oss-v1-0.6b --port 8080 --max-batch-tokens 16384 --max-client-batch-size 128
     ports:
       - "8080:8080"
     volumes:
@@ -113,6 +113,14 @@ services:
       - INDEX_REBUILD_DELTA=${INDEX_REBUILD_DELTA:-0.2}
       - REUPLOAD_SAFE_ORDER=${REUPLOAD_SAFE_ORDER:-true}
       - EMBEDDING_BATCH_SIZE=${EMBEDDING_BATCH_SIZE:-32}
+      - INGESTION_WORKER_COUNT=${INGESTION_WORKER_COUNT:-2}
+      - OPTIMIZE_MODE=${OPTIMIZE_MODE:-periodic}
+      - OPTIMIZE_INTERVAL_CHUNKS=${OPTIMIZE_INTERVAL_CHUNKS:-5000}
+      - EMBEDDING_CONCURRENT_BATCHES=${EMBEDDING_CONCURRENT_BATCHES:-4}
+      - OPTIMIZE_ON_SHUTDOWN=${OPTIMIZE_ON_SHUTDOWN:-true}
+      - CONTEXTUAL_CHUNKING_ENABLED=${CONTEXTUAL_CHUNKING_ENABLED:-false}
+      - CHUNK_ENRICHMENT_ENABLED=${CHUNK_ENRICHMENT_ENABLED:-false}
+      - MULTI_SCALE_INDEXING_ENABLED=${MULTI_SCALE_INDEXING_ENABLED:-false}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

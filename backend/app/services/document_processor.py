@@ -489,6 +489,7 @@ class DocumentProcessor:
         pool: Optional["SQLiteConnectionPool"] = None,
         llm_client: Optional[LLMClient] = None,
         contextual_chunker: Optional[ContextualChunker] = None,
+        write_semaphore: Optional[asyncio.Semaphore] = None,
     ):
         """
         Initialize the document processor.
@@ -501,6 +502,7 @@ class DocumentProcessor:
             pool: SQLiteConnectionPool instance for database connections
             llm_client: LLMClient instance for contextual chunking (optional)
             contextual_chunker: Pre-configured ContextualChunker instance (optional)
+            write_semaphore: Optional asyncio.Semaphore for SQLite write contention (default None)
         """
         self.parser = DocumentParser()
         # Construction-time chunk params are retained only as a fallback for
@@ -523,6 +525,7 @@ class DocumentProcessor:
         self.embedding_service = embedding_service
         self._llm_client = llm_client
         self._contextual_chunker = contextual_chunker
+        self._write_semaphore = write_semaphore
         self._chunk_enrichment_service: Optional[ChunkEnrichmentService] = None
 
     def _get_chunker(self) -> SemanticChunker:
@@ -1060,6 +1063,8 @@ class DocumentProcessor:
         file_hash = compute_file_hash(file_path)
 
         # Phase 1: Quick DB operations - get connection, do quick ops, release
+        if self._write_semaphore:
+            await self._write_semaphore.acquire()
         conn = self.pool.get_connection()
         try:
             # Check for duplicates
@@ -1086,6 +1091,8 @@ class DocumentProcessor:
         finally:
             # Release connection before long-running operations
             self.pool.release_connection(conn)
+            if self._write_semaphore:
+                self._write_semaphore.release()
 
         # Mark processing started + initial phase. Best-effort; ignored on failure.
         set_phase(
@@ -1257,7 +1264,47 @@ class DocumentProcessor:
                         percent=0.0,
                     )
                     # Generate dense embeddings (Harrier dense-only)
-                    embeddings = await self.embedding_service.embed_batch(texts)
+                    embeddings_result = await self.embedding_service.embed_batch(
+                        texts, fail_fast=False
+                    )
+                    batch_embeddings, failed_batch_indices = embeddings_result
+
+                    # Handle partial embedding failures
+                    if failed_batch_indices:
+                        batch_size_val = settings.embedding_batch_size
+                        failed_chunk_indices = set()
+                        for batch_idx in failed_batch_indices:
+                            start = batch_idx * batch_size_val
+                            end = min(start + batch_size_val, len(chunks))
+                            for idx in range(start, end):
+                                failed_chunk_indices.add(idx)
+
+                        kept_chunks = []
+                        kept_embeddings = []
+                        for i, (chunk, emb) in enumerate(zip(chunks, batch_embeddings)):
+                            if i not in failed_chunk_indices:
+                                kept_chunks.append(chunk)
+                                kept_embeddings.append(emb)
+
+                        failure_pct = len(failed_chunk_indices) / len(chunks) * 100
+                        logger.warning(
+                            "Embedding partial failure: %d/%d chunks failed (%.0f%%). "
+                            "Failed batch indices: %s",
+                            len(failed_chunk_indices), len(chunks), failure_pct,
+                            failed_batch_indices,
+                        )
+
+                        chunks = kept_chunks
+                        embeddings = kept_embeddings
+
+                        if failure_pct > 50:
+                            raise DocumentProcessingError(
+                                "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
+                                "Aborting document ingest." % (len(failed_chunk_indices), len(chunks), failure_pct),
+                            )
+                    else:
+                        embeddings = batch_embeddings
+
                     sparse_embeddings = [None] * len(chunks)
                     set_phase(
                         self.pool,
@@ -1399,12 +1446,16 @@ class DocumentProcessor:
         except Exception as e:
             # Phase 3: Update status to error on failure
             # Get connection again to update error status
+            if self._write_semaphore:
+                await self._write_semaphore.acquire()
             conn = self.pool.get_connection()
             try:
                 self._update_status(file_id, "error", conn, error_message=str(e))
                 conn.commit()
             finally:
                 self.pool.release_connection(conn)
+                if self._write_semaphore:
+                    self._write_semaphore.release()
             # Surface error in the phase fields so the frontend can render it
             # without waiting for a status-route round-trip.
             set_phase(
@@ -1417,12 +1468,16 @@ class DocumentProcessor:
             raise
 
         # Phase 3: Final DB operations - update status to indexed
+        if self._write_semaphore:
+            await self._write_semaphore.acquire()
         conn = self.pool.get_connection()
         try:
             self._update_status(file_id, "indexed", conn, chunk_count=len(chunks))
             conn.commit()
         finally:
             self.pool.release_connection(conn)
+            if self._write_semaphore:
+                self._write_semaphore.release()
 
         # Save full parsed text and enqueue wiki compile job (fire-and-forget; non-blocking).
         # parsed_text is stored on the files row so manual recompile can use it without
@@ -1431,6 +1486,8 @@ class DocumentProcessor:
             from app.services.wiki_store import WikiStore as _WikiStore
 
             _full_text = document_text or ""
+            if self._write_semaphore:
+                await self._write_semaphore.acquire()
             conn = self.pool.get_connection()
             try:
                 if _full_text:
@@ -1455,6 +1512,8 @@ class DocumentProcessor:
                 set_wiki_pending(self.pool, file_id, False)
             finally:
                 self.pool.release_connection(conn)
+                if self._write_semaphore:
+                    self._write_semaphore.release()
         except Exception as _wiki_exc:
             logger.warning("Failed to enqueue wiki ingest job for file_id=%d: %s", file_id, _wiki_exc)
             # If wiki enqueue failed, don't leave wiki_pending=1 hanging.
@@ -1487,6 +1546,8 @@ class DocumentProcessor:
         path = Path(file_path)
         if not path.exists():
             # Surface as error on the existing row so the frontend can render it.
+            if self._write_semaphore:
+                await self._write_semaphore.acquire()
             conn = self.pool.get_connection()
             try:
                 self._update_status(
@@ -1498,6 +1559,8 @@ class DocumentProcessor:
                 conn.commit()
             finally:
                 self.pool.release_connection(conn)
+                if self._write_semaphore:
+                    self._write_semaphore.release()
             set_phase(
                 self.pool,
                 file_id,
@@ -1506,6 +1569,8 @@ class DocumentProcessor:
             )
             raise FileNotFoundError(f"File not found: {file_path}")
         if not path.is_file():
+            if self._write_semaphore:
+                await self._write_semaphore.acquire()
             conn = self.pool.get_connection()
             try:
                 self._update_status(
@@ -1517,6 +1582,8 @@ class DocumentProcessor:
                 conn.commit()
             finally:
                 self.pool.release_connection(conn)
+                if self._write_semaphore:
+                    self._write_semaphore.release()
             set_phase(
                 self.pool,
                 file_id,
@@ -1527,12 +1594,16 @@ class DocumentProcessor:
 
         # Transition status: pending -> processing. Duplicate check intentionally
         # skipped — the route already ran it before inserting the row.
+        if self._write_semaphore:
+            await self._write_semaphore.acquire()
         conn = self.pool.get_connection()
         try:
             self._update_status(file_id, "processing", conn)
             conn.commit()
         finally:
             self.pool.release_connection(conn)
+            if self._write_semaphore:
+                self._write_semaphore.release()
 
         set_phase(
             self.pool,
@@ -1666,7 +1737,47 @@ class DocumentProcessor:
                         unit="chunks",
                         percent=0.0,
                     )
-                    embeddings = await self.embedding_service.embed_batch(texts)
+                    embeddings_result = await self.embedding_service.embed_batch(
+                        texts, fail_fast=False
+                    )
+                    batch_embeddings, failed_batch_indices = embeddings_result
+
+                    # Handle partial embedding failures
+                    if failed_batch_indices:
+                        batch_size_val = settings.embedding_batch_size
+                        failed_chunk_indices = set()
+                        for batch_idx in failed_batch_indices:
+                            start = batch_idx * batch_size_val
+                            end = min(start + batch_size_val, len(chunks))
+                            for idx in range(start, end):
+                                failed_chunk_indices.add(idx)
+
+                        kept_chunks = []
+                        kept_embeddings = []
+                        for i, (chunk, emb) in enumerate(zip(chunks, batch_embeddings)):
+                            if i not in failed_chunk_indices:
+                                kept_chunks.append(chunk)
+                                kept_embeddings.append(emb)
+
+                        failure_pct = len(failed_chunk_indices) / len(chunks) * 100
+                        logger.warning(
+                            "Embedding partial failure: %d/%d chunks failed (%.0f%%). "
+                            "Failed batch indices: %s",
+                            len(failed_chunk_indices), len(chunks), failure_pct,
+                            failed_batch_indices,
+                        )
+
+                        chunks = kept_chunks
+                        embeddings = kept_embeddings
+
+                        if failure_pct > 50:
+                            raise DocumentProcessingError(
+                                "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
+                                "Aborting document ingest." % (len(failed_chunk_indices), len(chunks), failure_pct),
+                            )
+                    else:
+                        embeddings = batch_embeddings
+
                     sparse_embeddings = [None] * len(chunks)
                     set_phase(
                         self.pool,
@@ -1783,12 +1894,16 @@ class DocumentProcessor:
                         await self.vector_store.delete_by_file(str(file_id))
                         await self.vector_store.add_chunks(records)
         except Exception as e:
+            if self._write_semaphore:
+                await self._write_semaphore.acquire()
             conn = self.pool.get_connection()
             try:
                 self._update_status(file_id, "error", conn, error_message=str(e))
                 conn.commit()
             finally:
                 self.pool.release_connection(conn)
+                if self._write_semaphore:
+                    self._write_semaphore.release()
             set_phase(
                 self.pool,
                 file_id,
@@ -1799,18 +1914,24 @@ class DocumentProcessor:
             raise
 
         # Mark indexed
+        if self._write_semaphore:
+            await self._write_semaphore.acquire()
         conn = self.pool.get_connection()
         try:
             self._update_status(file_id, "indexed", conn, chunk_count=len(chunks))
             conn.commit()
         finally:
             self.pool.release_connection(conn)
+            if self._write_semaphore:
+                self._write_semaphore.release()
 
         # Save parsed text + enqueue wiki ingest job (best-effort, non-blocking).
         try:
             from app.services.wiki_store import WikiStore as _WikiStore
 
             _full_text = document_text or ""
+            if self._write_semaphore:
+                await self._write_semaphore.acquire()
             conn = self.pool.get_connection()
             try:
                 if _full_text:
@@ -1831,6 +1952,8 @@ class DocumentProcessor:
                 set_wiki_pending(self.pool, file_id, False)
             finally:
                 self.pool.release_connection(conn)
+                if self._write_semaphore:
+                    self._write_semaphore.release()
         except Exception as _wiki_exc:
             logger.warning(
                 "Failed to enqueue wiki ingest job for file_id=%d: %s",

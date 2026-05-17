@@ -8,7 +8,7 @@ documents with retry logic and graceful shutdown.
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 from ..models.database import SQLiteConnectionPool
 from .document_processor import DocumentProcessingError, DocumentProcessor
@@ -17,7 +17,14 @@ from .llm_client import LLMClient
 from .maintenance import MaintenanceService
 from .vector_store import VectorStore
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
+
+# Timeout for processing rows during startup recovery sweep.
+# If a row has been in status='processing' for longer than this,
+# it will be reset to 'pending' for re-processing.
+STRANDED_PROCESSING_TIMEOUT_MINUTES = 30
 
 # Singleton instance
 _processor_instance: Optional["BackgroundProcessor"] = None
@@ -122,7 +129,7 @@ class BackgroundProcessor:
         queue: asyncio.Queue holding TaskItem objects
         shutdown_event: asyncio.Event for graceful shutdown
         processor: DocumentProcessor instance for file processing
-        _worker_task: Reference to the worker coroutine
+        _worker_tasks: List of worker task references
         _running: Boolean indicating if processor is active
     """
 
@@ -164,9 +171,10 @@ class BackgroundProcessor:
             pool=pool,
             llm_client=llm_client,
         )
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_tasks: List[asyncio.Task] = []
         self._running = False
         self.maintenance_service = maintenance_service
+        self._write_semaphore: Optional[asyncio.Semaphore] = None
 
     async def start(self) -> None:
         """
@@ -189,8 +197,19 @@ class BackgroundProcessor:
         self._running = True
         self.shutdown_event.clear()
         await self._recover_stranded_pending_rows()
-        self._worker_task = asyncio.create_task(self._worker_loop())
-        logger.info("Background processor started")
+        # Spawn N workers based on configuration
+        self._worker_tasks = []
+        for i in range(settings.ingestion_worker_count):
+            task = asyncio.create_task(self._worker_loop(), name=f"worker-{i}")
+            self._worker_tasks.append(task)
+        logger.info(f"Background processor started with {settings.ingestion_worker_count} worker(s)")
+
+        # Create write semaphore for SQLite contention when running multiple workers
+        if settings.ingestion_worker_count > 1:
+            self._write_semaphore = asyncio.Semaphore(settings.ingestion_worker_count)
+            self.processor._write_semaphore = self._write_semaphore
+        else:
+            self._write_semaphore = None
 
     async def _recover_stranded_pending_rows(self) -> None:
         """Re-enqueue any `files` rows left at status='pending' from a prior process.
@@ -216,11 +235,24 @@ class BackgroundProcessor:
                     """,
                 )
                 stranded = cursor.fetchall()
+
+                # NEW: recover processing rows stuck for >30 minutes
+                processing_cursor = conn.execute(
+                    """
+                    SELECT id, file_path, vault_id, source
+                    FROM files
+                    WHERE status = 'processing'
+                      AND (phase_started_at IS NOT NULL
+                           AND phase_started_at < datetime('now', ?))
+                    """,
+                    (f"-{STRANDED_PROCESSING_TIMEOUT_MINUTES} minutes",),
+                )
+                processing_stranded = processing_cursor.fetchall()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("Stranded-row recovery sweep failed at SELECT: %s", e)
             return
 
-        if not stranded:
+        if not stranded and not processing_stranded:
             return
 
         logger.info(
@@ -261,6 +293,54 @@ class BackgroundProcessor:
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("Failed to re-enqueue stranded row id=%s: %s", row, e)
 
+        # Recover stuck processing rows
+        for row in processing_stranded:
+            try:
+                row_id = row["id"] if hasattr(row, "keys") else row[0]
+                file_path = row["file_path"] if hasattr(row, "keys") else row[1]
+                vault_id = row["vault_id"] if hasattr(row, "keys") else row[2]
+
+                from pathlib import Path as _Path
+                if not _Path(file_path).exists():
+                    with self.processor.pool.connection() as conn:
+                        conn.execute(
+                            "UPDATE files SET status='error', "
+                            "error_message='File missing after process restart', "
+                            "phase='error' WHERE id = ?",
+                            (row_id,),
+                        )
+                        conn.commit()
+                    continue
+
+                with self.processor.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE files SET status='pending', phase='queued', "
+                        "error_message=NULL WHERE id = ?",
+                        (row_id,),
+                    )
+                    conn.commit()
+
+                logger.info(
+                    "Recovered stuck processing row id=%s: status=pending, phase=queued",
+                    row_id,
+                )
+                # Re-enqueue for processing
+                await self.enqueue(
+                    file_path=file_path,
+                    source="upload",
+                    vault_id=int(vault_id),
+                    file_id=int(row_id),
+                )
+            except Exception as e:
+                logger.warning("Failed to recover processing row %s: %s", row, e)
+
+        if processing_stranded:
+            logger.info(
+                "Recovered %d stuck processing row(s) older than %d minutes",
+                len(processing_stranded),
+                STRANDED_PROCESSING_TIMEOUT_MINUTES,
+            )
+
     async def stop(self, timeout: float = 60.0) -> None:
         """
         Stop the background processor gracefully.
@@ -278,16 +358,26 @@ class BackgroundProcessor:
         logger.info("Stopping background processor...")
         self.shutdown_event.set()
 
-        if self._worker_task:
+        # Phase 1: Wait for in-flight tasks to complete (with timeout)
+        try:
+            await asyncio.wait_for(self.queue.join(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Queue did not drain within timeout, force-cancelling workers...")
+
+        # Phase 2: Cancel remaining workers
+        if self._worker_tasks:
+            for task in self._worker_tasks:
+                task.cancel()
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+
+        # Phase 3: Flush optimize on VectorStore if available
+        if hasattr(self.processor, 'vector_store') and self.processor.vector_store is not None:
             try:
-                await asyncio.wait_for(self._worker_task, timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning("Worker task did not stop gracefully within timeout, cancelling...")
-                self._worker_task.cancel()
-                try:
-                    await self._worker_task
-                except asyncio.CancelledError:
-                    pass
+                from app.config import settings as _settings
+                if _settings.optimize_on_shutdown:
+                    await self.processor.vector_store.flush_optimize()
+            except Exception as e:
+                logger.warning("Failed to flush vector store on shutdown: %s", e)
 
         self._running = False
         logger.info("Background processor stopped")
@@ -427,6 +517,13 @@ class BackgroundProcessor:
         Requeues the task with incremented attempt count if retries remain,
         otherwise logs the permanent failure.
         """
+        # Don't requeue if shutdown is in progress
+        if self.shutdown_event.is_set():
+            logger.warning(
+                f"Task failed for {task.file_path} during shutdown, not requeuing"
+            )
+            return
+
         if task.attempt < self.max_retries:
             # Calculate exponential backoff delay
             delay = self.retry_delay * (2 ** (task.attempt - 1))

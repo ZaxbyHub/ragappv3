@@ -45,7 +45,7 @@ function baseSettings(): SettingsResponse {
     auto_scan_enabled: false,
     auto_scan_interval_minutes: 60,
     enable_model_validation: false,
-    embedding_batch_size: 32,
+    embedding_batch_size: 64,
     reranking_enabled: false,
     reranker_url: "",
     reranker_model: "",

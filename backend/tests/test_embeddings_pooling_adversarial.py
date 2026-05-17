@@ -48,6 +48,7 @@ def mock_settings():
         mock_settings.embedding_batch_size = 512
         mock_settings.embedding_batch_max_retries = 3
         mock_settings.embedding_batch_min_sub_size = 1
+        mock_settings.embedding_concurrent_batches = 4
         mock_settings.chunk_size_chars = 1200
         mock_settings.chunk_overlap_chars = 120
         yield mock_settings

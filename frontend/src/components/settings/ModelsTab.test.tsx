@@ -15,7 +15,7 @@ function formData(): SettingsFormData {
     vector_metric: "cosine",
     embedding_doc_prefix: "",
     embedding_query_prefix: "",
-    embedding_batch_size: 32,
+    embedding_batch_size: 64,
     reranking_enabled: false,
     reranker_url: "",
     reranker_model: "BAAI/bge-reranker-v2-m3",

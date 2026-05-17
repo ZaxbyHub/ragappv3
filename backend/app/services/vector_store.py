@@ -79,6 +79,8 @@ class VectorStore:
         self._fts_exceptions: int = 0
         # Track the row count at last IVF_PQ build to detect post-delete churn (Issue #13)
         self._last_index_build_row_count: int = 0
+        # Track chunk count between optimize calls when mode is 'periodic'
+        self._optimize_counter: int = 0
         # Shared semaphore limiting concurrent LanceDB search operations across all callers.
         # Lazily initialised on first use to avoid event-loop binding issues.
         self._search_semaphore: Optional[asyncio.Semaphore] = None
@@ -231,7 +233,7 @@ class VectorStore:
             self._fts_exceptions = 0
             return count
 
-    def has_parent_window_text_sample(self) -> bool:
+    async def has_parent_window_text_sample(self) -> bool:
         """Return True if at least one indexed chunk's metadata contains a
         non-empty ``parent_window_text``.
 
@@ -248,7 +250,7 @@ class VectorStore:
             # JSON substring to avoid pulling rows that lack parent windows.
             try:
                 cursor = (
-                    self.table.search()
+                    await self.table.search()
                     .where(
                         "metadata LIKE '%\"parent_window_text\"%'",
                         prefilter=True,
@@ -256,10 +258,13 @@ class VectorStore:
                     .limit(1)
                 )
                 # ``to_list()`` returns a list (possibly empty).
-                rows = cursor.to_list() if hasattr(cursor, "to_list") else list(cursor)
+                if hasattr(cursor, "to_list"):
+                    rows = await cursor.to_list()
+                else:
+                    rows = list(cursor)
             except Exception:
                 # Older LanceDB API shapes — fall back to a row scan.
-                rows = list(self.table.head(50))
+                rows = list(await self.table.head(50))
                 for row in rows:
                     md = row.get("metadata") if isinstance(row, dict) else None
                     if md and "parent_window_text" in str(md):
@@ -509,14 +514,44 @@ class VectorStore:
 
         await self.table.add(processed_records)
 
-        # Compact the table after every ingest batch (Issue #13: ANN index lifecycle)
-        try:
-            await self.table.optimize()
-        except Exception as e:
-            logger.warning("table.optimize() after add_chunks failed (non-fatal): %s", e)
+        # Compact the table per configured optimize_mode
+        optimize_mode = settings.optimize_mode
+        if optimize_mode == "after_every_write":
+            try:
+                await self.table.optimize()
+            except Exception as e:
+                logger.warning("table.optimize() after add_chunks failed (non-fatal): %s", e)
+        elif optimize_mode == "periodic":
+            self._optimize_counter += len(processed_records)
+            if self._optimize_counter >= settings.optimize_interval_chunks:
+                try:
+                    await self.table.optimize()
+                    self._optimize_counter = 0
+                except Exception as e:
+                    logger.warning(
+                        "Periodic table.optimize() failed (non-fatal, counter reset): %s", e
+                    )
+                    self._optimize_counter = 0
+        # optimize_mode == "manual": never optimize during ingestion
 
         # Check if we should create the vector index after adding chunks
         await self._maybe_create_vector_index()
+
+    async def flush_optimize(self) -> None:
+        """
+        Force an immediate table.optimize() for final compaction.
+
+        Called by BackgroundProcessor.stop() when optimize_on_shutdown is True.
+        Ensures all pending chunk writes are compacted before shutdown.
+        """
+        if self.table is None:
+            return
+        try:
+            await self.table.optimize()
+            self._optimize_counter = 0
+            logger.info("flush_optimize: table compaction completed")
+        except Exception as e:
+            logger.warning("flush_optimize failed (non-fatal): %s", e)
 
     async def _search_single_scale(
         self,

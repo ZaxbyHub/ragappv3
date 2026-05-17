@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import logging
 from collections import OrderedDict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -432,14 +432,14 @@ class EmbeddingService:
         return True
 
     async def embed_batch(
-        self, texts: List[str], batch_size: int | None = None
-    ) -> List[List[float]]:
+        self, texts: List[str], batch_size: int | None = None, fail_fast: bool = True
+    ) -> List[List[float]] | tuple[List[List[float]], List[int]]:
         """
         Generate embeddings for a batch of texts using true API batching.
 
         Sends multiple texts per API request for efficient GPU utilization.
-        Processes in batches of up to 512 (configurable) with up to 4
-        concurrent batch requests.
+        Processes batches concurrently using asyncio.gather, limited by
+        embedding_concurrent_batches setting.
 
         Applies the document prefix (if configured) to each input text before embedding.
         The document prefix is used for document embeddings and must remain constant for
@@ -448,15 +448,19 @@ class EmbeddingService:
         Args:
             texts: List of texts to embed.
             batch_size: Number of texts per API request (default: 512).
+            fail_fast: If True (default), raise on any batch failure.
+                       If False, return (embeddings, failed_batch_indices) with None
+                       placeholders for failed batches.
 
         Returns:
-            List of embedding vectors, one for each input text, in order.
+            When fail_fast=True: List of embedding vectors.
+            When fail_fast=False: Tuple of (embeddings, failed_batch_indices).
 
         Raises:
-            EmbeddingError: If any API request fails.
+            EmbeddingError: If any batch fails and fail_fast=True.
         """
         if not texts:
-            return []
+            return [] if fail_fast else ([], [])
 
         # Input validation guards
         prefix_len = len(self.embedding_doc_prefix) if self.embedding_doc_prefix else 0
@@ -485,14 +489,36 @@ class EmbeddingService:
             else:
                 texts_to_embed.append(text)
 
-        # Process in batches using true API batching
+        # Process batches concurrently using asyncio.gather + semaphore
         all_embeddings: List[List[float]] = []
+        sem = asyncio.Semaphore(settings.embedding_concurrent_batches)
+
+        async def _process_batch(batch_texts: List[str]) -> List[List[float]]:
+            async with sem:
+                return await self._embed_batch_api(batch_texts)
+
+        batch_tasks = []
         for i in range(0, len(texts_to_embed), batch_size):
             batch = texts_to_embed[i : i + batch_size]
-            embeddings = await self._embed_batch_api(batch)
-            all_embeddings.extend(embeddings)
+            batch_tasks.append(_process_batch(batch))
 
-        return all_embeddings
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        if fail_fast:
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    raise EmbeddingError(f"Embedding batch failed: {result}")
+                all_embeddings.extend(result)
+            return all_embeddings
+        else:
+            failed_indices: List[int] = []
+            for batch_idx, result in enumerate(batch_results):
+                if isinstance(result, Exception):
+                    failed_indices.append(batch_idx)
+                    logger.warning(f"Batch {batch_idx} failed (skipping): {result}")
+                else:
+                    all_embeddings.extend(result)
+            return all_embeddings, failed_indices
 
     async def _embed_batch_api(self, texts: List[str]) -> List[List[float]]:
         """
@@ -916,15 +942,27 @@ class EmbeddingService:
         backoff_delay = min(0.5 * (2**retry_count), 1.0)
         await asyncio.sleep(backoff_delay)
 
-        # Recurse on left then right to preserve order
-        left_embeddings = await self._embed_batch_with_retry(
+        # Process left and right sub-batches concurrently, then concatenate in order
+        left_task = self._embed_batch_with_retry(
             client, left_texts, max_retries, min_sub_size, retry_count=retry_count + 1
         )
-        right_embeddings = await self._embed_batch_with_retry(
+        right_task = self._embed_batch_with_retry(
             client, right_texts, max_retries, min_sub_size, retry_count=retry_count + 1
         )
 
-        return left_embeddings + right_embeddings
+        try:
+            left_result, right_result = await asyncio.gather(left_task, right_task)
+            return left_result + right_result  # left+right concatenation preserves order
+        except Exception:
+            # Fallback: sequential if gather fails
+            logger.warning("Parallel overflow retry failed, falling back to sequential")
+            left_embeddings = await self._embed_batch_with_retry(
+                client, left_texts, max_retries, min_sub_size, retry_count=retry_count + 1
+            )
+            right_embeddings = await self._embed_batch_with_retry(
+                client, right_texts, max_retries, min_sub_size, retry_count=retry_count + 1
+            )
+            return left_embeddings + right_embeddings
 
     def _is_token_overflow_error(self, error_msg: str) -> bool:
         """
