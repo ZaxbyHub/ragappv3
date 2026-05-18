@@ -436,6 +436,11 @@ services:
 CHUNK_SIZE_CHARS=1000      # Smaller chunks = more embeddings, better granularity
 CHUNK_OVERLAP_CHARS=100    # Faster processing (less accurate)
 CHUNK_OVERLAP_CHARS=400    # Slower processing (more accurate)
+MULTI_SCALE_INDEXING_ENABLED=true
+MULTI_SCALE_CHUNK_SIZES=768,1536  # Fewer default scales for faster indexing
+
+# Existing deployments can keep MULTI_SCALE_CHUNK_SIZES=512,1024,2048
+# if they want the previous three-scale indexing footprint.
 
 # Embedding batch processing (critical for performance)
 # Default: 32 (safe for most TEI deployments)

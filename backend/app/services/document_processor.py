@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -83,6 +83,10 @@ class ProcessedDocument:
 
     file_id: int
     chunks: List[ProcessedChunk]
+    document_text: str = ""
+    file_hash: str = ""
+    file_path: str = ""
+    vault_id: int = 0
 
 
 class DuplicateFileError(Exception):
@@ -558,6 +562,14 @@ class DocumentProcessor:
         self._write_semaphore = write_semaphore
         self._chunk_enrichment_service: Optional[ChunkEnrichmentService] = None
 
+    def set_llm_client(self, llm_client: Optional[LLMClient]) -> None:
+        """Rebind optional ingestion LLM work to a different live client."""
+        if self._llm_client is llm_client:
+            return
+        self._llm_client = llm_client
+        self._contextual_chunker = None
+        self._chunk_enrichment_service = None
+
     def _get_chunker(self) -> SemanticChunker:
         """Return a chunker configured with the live settings values.
 
@@ -668,6 +680,372 @@ class DocumentProcessor:
                 return f"{file_id}_{chunk_index_value}"
             return f"{file_id}_{chunk_scale}_{chunk.chunk_index}"
         return f"{file_id}_{chunk.chunk_index}"
+
+    @staticmethod
+    def _enrichment_has_content(enrichment: Any) -> bool:
+        return bool(
+            enrichment
+            and (
+                getattr(enrichment, "summary", "")
+                or getattr(enrichment, "questions", None)
+                or getattr(enrichment, "entities", None)
+                or getattr(enrichment, "aliases", None)
+            )
+        )
+
+    @staticmethod
+    def _search_text_with_enrichment(chunk: ProcessedChunk, enrichment: Any = None) -> str:
+        """Build bounded searchable text while preserving raw evidence separately."""
+        parts = [chunk.text]
+        if not DocumentProcessor._enrichment_has_content(enrichment):
+            return chunk.text
+
+        summary = getattr(enrichment, "summary", "")
+        questions = list(getattr(enrichment, "questions", []) or [])[:5]
+        entities = list(getattr(enrichment, "entities", []) or [])[:10]
+        aliases = list(getattr(enrichment, "aliases", []) or [])[:10]
+
+        if summary:
+            parts.append(f"Summary: {summary[:1000]}")
+        if questions:
+            parts.append("Questions: " + " ".join(str(q)[:240] for q in questions))
+        if entities or aliases:
+            names = [str(item)[:120] for item in entities + aliases]
+            parts.append("Entities: " + " ".join(names))
+        return "\n".join(parts)
+
+    def _candidate_chunks_for_enrichment(
+        self, file_id: int, chunks: List[ProcessedChunk]
+    ) -> List[tuple[ProcessedChunk, str]]:
+        """Choose canonical chunks for post-index enrichment.
+
+        Prefer default-scale chunks when present. For multi-scale-only indexes,
+        enrich at most one representative per parent window so duplicate scales
+        do not multiply LLM calls.
+        """
+        if not chunks:
+            return []
+
+        selected_chunks = self._select_chunks_for_enrichment(chunks)
+        return [
+            (chunk, self._build_chunk_uid(file_id, chunk))
+            for chunk in selected_chunks
+        ]
+
+    def _select_chunks_for_enrichment(
+        self, chunks: List[ProcessedChunk]
+    ) -> List[ProcessedChunk]:
+        """Choose chunks to enrich without requiring a file-specific chunk UID."""
+        if not chunks:
+            return []
+
+        default_chunks = [
+            chunk for chunk in chunks if chunk.metadata.get("chunk_scale", "default") == "default"
+        ]
+        source_chunks = default_chunks or chunks
+        selected: List[ProcessedChunk] = []
+        seen: set[tuple[Any, ...]] = set()
+
+        for chunk in source_chunks:
+            if chunk.parent_window_start is not None and chunk.parent_window_end is not None:
+                key = ("parent", chunk.parent_window_start, chunk.parent_window_end)
+            elif default_chunks:
+                key = ("default", chunk.chunk_index)
+            else:
+                key = (
+                    "chunk",
+                    chunk.metadata.get("chunk_scale", "default"),
+                    chunk.metadata.get("chunk_index", chunk.chunk_index),
+                    chunk.chunk_index,
+                )
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(chunk)
+        return selected
+
+    def set_enrichment_status(
+        self, file_id: int, status: str, error_message: Optional[str] = None
+    ) -> Optional[str]:
+        """Update enrichment state without changing files.status."""
+        if self.pool is None:
+            return None
+        updated_at = datetime.now(UTC).isoformat()
+        try:
+            with self.pool.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE files
+                    SET enrichment_status = ?,
+                        enrichment_error = ?,
+                        enrichment_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, error_message, updated_at, file_id),
+                )
+                conn.commit()
+            return updated_at
+        except sqlite3.Error as e:
+            logger.warning("Failed to update enrichment status for file_id=%s: %s", file_id, e)
+            return None
+
+    def _set_enrichment_status(
+        self, file_id: int, status: str, error_message: Optional[str] = None
+    ) -> Optional[str]:
+        """Backward-compatible wrapper for tests and older call sites."""
+        return self.set_enrichment_status(file_id, status, error_message)
+
+    def _mark_enrichment_stale_if_current_job(
+        self, file_id: int, processing_started_at: Optional[str]
+    ) -> None:
+        """Finish the same enrichment attempt if it becomes stale mid-flight."""
+        if self.pool is None or processing_started_at is None:
+            return
+        try:
+            with self.pool.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE files
+                    SET enrichment_status = 'error',
+                        enrichment_error = ?,
+                        enrichment_updated_at = ?
+                    WHERE id = ?
+                      AND enrichment_status = 'processing'
+                      AND enrichment_updated_at = ?
+                    """,
+                    (
+                        "Enrichment job became stale before completion; base index remains available",
+                        datetime.now(UTC).isoformat(),
+                        file_id,
+                        processing_started_at,
+                    ),
+                )
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.warning("Failed to mark stale enrichment for file_id=%s: %s", file_id, e)
+
+    def _is_enrichment_job_current(self, file_id: int, file_hash: str) -> bool:
+        """Return True only if this queued enrichment still matches the live file row."""
+        if self.pool is None:
+            return False
+        try:
+            with self.pool.connection() as conn:
+                row = conn.execute(
+                    "SELECT file_hash, status FROM files WHERE id = ?",
+                    (file_id,),
+                ).fetchone()
+        except sqlite3.Error as e:
+            logger.warning("Failed to validate enrichment job for file_id=%s: %s", file_id, e)
+            return False
+
+        if row is None:
+            logger.info("Skipping stale enrichment for deleted file_id=%s", file_id)
+            return False
+        current_hash = row["file_hash"] if isinstance(row, sqlite3.Row) else row[0]
+        current_status = row["status"] if isinstance(row, sqlite3.Row) else row[1]
+        if current_hash != file_hash or current_status != "indexed":
+            logger.info(
+                "Skipping stale enrichment for file_id=%s: current status/hash no longer match queued job",
+                file_id,
+            )
+            return False
+        return True
+
+    def _build_vector_record(
+        self,
+        *,
+        file_id: int,
+        vault_id: int,
+        file_hash: str,
+        chunk: ProcessedChunk,
+        embedding: List[float],
+        sparse_emb: Any,
+        document_text: str,
+        enrichment: Any = None,
+    ) -> Dict[str, Any]:
+        chunk_scale = chunk.metadata.get("chunk_scale", "default")
+        chunk_uid = self._build_chunk_uid(file_id, chunk)
+        chunk_metadata = chunk.metadata.copy()
+        chunk_metadata["chunk_uid"] = chunk_uid
+        chunk_metadata["file_id"] = str(file_id)
+        chunk_metadata["chunk_count"] = chunk.metadata.get("total_chunks") or 1
+        chunk_metadata["chunk_scale"] = chunk_scale
+        chunk_metadata["raw_text"] = chunk.raw_text or chunk.text
+
+        if self._enrichment_has_content(enrichment):
+            chunk_metadata["enrichment"] = enrichment.to_dict()
+
+        if chunk.parent_window_start is not None:
+            chunk_metadata["parent_window_start"] = chunk.parent_window_start
+        if chunk.parent_window_end is not None:
+            chunk_metadata["parent_window_end"] = chunk.parent_window_end
+        if chunk.chunk_position is not None:
+            chunk_metadata["chunk_position"] = chunk.chunk_position
+        if (
+            chunk.parent_window_start is not None
+            and chunk.parent_window_end is not None
+            and document_text
+        ):
+            chunk_metadata["parent_window_text"] = document_text[
+                chunk.parent_window_start : chunk.parent_window_end
+            ]
+
+        if settings.reupload_safe_order:
+            record_id = f"{file_id}_{file_hash[:8]}_{chunk_scale}_{chunk.chunk_index}"
+        else:
+            record_id = chunk_uid
+
+        record = {
+            "id": record_id,
+            "text": self._search_text_with_enrichment(chunk, enrichment),
+            "file_id": str(file_id),
+            "chunk_index": chunk.chunk_index,
+            "vault_id": str(vault_id),
+            "chunk_scale": chunk_scale,
+            "parent_doc_id": str(file_id),
+            "parent_window_start": chunk.parent_window_start,
+            "parent_window_end": chunk.parent_window_end,
+            "chunk_position": chunk.chunk_position,
+            "metadata": json.dumps(chunk_metadata),
+            "embedding": embedding,
+        }
+        if sparse_emb is not None:
+            try:
+                record["sparse_embedding"] = json.dumps(sparse_emb)
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Failed to serialize sparse embedding: {e}")
+                record["sparse_embedding"] = None
+        return record
+
+    async def _swap_in_enriched_vector_records(
+        self, records: List[Dict[str, Any]], old_ids: List[str]
+    ) -> None:
+        if self.vector_store is None:
+            return
+        add_then_delete = getattr(self.vector_store, "add_chunks_then_delete_ids", None)
+        if add_then_delete is not None:
+            await add_then_delete(records, old_ids)
+            return
+        # Test doubles may not implement the add-first primitive. Keep the
+        # fallback add-first as well so failures do not remove the base index.
+        await self.vector_store.add_chunks(records)
+        for old_id in old_ids:
+            delete_by_id = getattr(self.vector_store, "delete_by_id", None)
+            if delete_by_id is not None:
+                await delete_by_id(old_id)
+
+    def should_enqueue_enrichment(self, chunks: List[ProcessedChunk]) -> bool:
+        """Return True when post-index enrichment is configured and possible."""
+        return bool(
+            settings.chunk_enrichment_enabled
+            and self._llm_client is not None
+            and self.embedding_service is not None
+            and self.vector_store is not None
+            and self._select_chunks_for_enrichment(chunks)
+        )
+
+    async def run_enrichment_job(
+        self,
+        *,
+        file_id: int,
+        file_path: str,
+        vault_id: int,
+        file_hash: str,
+        chunks: List[ProcessedChunk],
+        document_text: str,
+    ) -> None:
+        """Run optional chunk enrichment after the base file is already indexed."""
+        if not self._is_enrichment_job_current(file_id, file_hash):
+            return
+
+        enrichment_service = self._get_chunk_enrichment_service()
+        if enrichment_service is None:
+            self.set_enrichment_status(file_id, "complete")
+            return
+
+        candidates = self._candidate_chunks_for_enrichment(file_id, chunks)
+        if not candidates:
+            self.set_enrichment_status(file_id, "complete")
+            return
+
+        source_filename = Path(file_path).name
+        processing_started_at = self.set_enrichment_status(file_id, "processing")
+        try:
+            chunk_dicts = [
+                {
+                    "chunk_uid": chunk_uid,
+                    "text": chunk.text,
+                    "metadata": chunk.metadata,
+                }
+                for chunk, chunk_uid in candidates
+            ]
+            enrichments = await enrichment_service.enrich_chunks(
+                chunk_dicts, document_title=source_filename
+            )
+            enrichment_by_uid = {
+                enrichment.chunk_id: enrichment
+                for enrichment in enrichments
+                if self._enrichment_has_content(enrichment)
+            }
+            if not enrichment_by_uid:
+                self.set_enrichment_status(file_id, "complete")
+                return
+
+            enrichment_texts = [
+                self._search_text_with_enrichment(
+                    chunk,
+                    enrichment_by_uid.get(self._build_chunk_uid(file_id, chunk)),
+                )
+                for chunk in chunks
+            ]
+            self._validate_chunk_sizes(enrichment_texts, source_filename)
+            embeddings_result = await self.embedding_service.embed_batch(
+                enrichment_texts, fail_fast=False
+            )
+            embeddings, failed_batch_indices = embeddings_result
+            if failed_batch_indices:
+                raise DocumentProcessingError(
+                    f"Embedding failed for enriched chunks: batches {failed_batch_indices}"
+                )
+            if len(embeddings) != len(chunks):
+                raise DocumentProcessingError(
+                    f"Enriched embedding count mismatch: expected {len(chunks)}, got {len(embeddings)}"
+                )
+
+            records = [
+                self._build_vector_record(
+                    file_id=file_id,
+                    vault_id=vault_id,
+                    file_hash=file_hash,
+                    chunk=chunk,
+                    embedding=embedding,
+                    sparse_emb=None,
+                    document_text=document_text,
+                    enrichment=enrichment_by_uid.get(
+                        self._build_chunk_uid(file_id, chunk)
+                    ),
+                )
+                for chunk, embedding in zip(chunks, embeddings)
+            ]
+            old_ids = [str(record["id"]) for record in records]
+            for record in records:
+                record["id"] = f"{record['id']}__enriched"
+            if not self._is_enrichment_job_current(file_id, file_hash):
+                self._mark_enrichment_stale_if_current_job(file_id, processing_started_at)
+                return
+            await self._swap_in_enriched_vector_records(records, old_ids)
+            await self._verify_vector_rows_visible(file_id)
+            self.set_enrichment_status(file_id, "complete")
+        except asyncio.CancelledError:
+            self.set_enrichment_status(
+                file_id,
+                "error",
+                "Enrichment job cancelled before completion",
+            )
+            raise
+        except Exception as e:
+            logger.warning("Post-index enrichment failed for file_id=%s: %s", file_id, e)
+            self.set_enrichment_status(file_id, "error", str(e)[:500])
 
     @with_retry(
         max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True
@@ -790,6 +1168,8 @@ class DocumentProcessor:
                        SET file_hash = ?, file_size = ?, file_type = ?, vault_id = ?,
                            source = ?, email_subject = ?, email_sender = ?,
                            status = 'pending', error_message = NULL,
+                           enrichment_status = NULL, enrichment_error = NULL,
+                           enrichment_updated_at = NULL,
                            modified_at = ?, processed_at = NULL
                        WHERE id = ?""",
                     (
@@ -1266,38 +1646,6 @@ class DocumentProcessor:
                 percent=100.0,
             )
 
-            # Chunk enrichment: generate auxiliary metadata (summary, questions, entities)
-            enrichment_service = self._get_chunk_enrichment_service()
-            if enrichment_service is not None:
-                stage_started_at = time.monotonic()
-                try:
-                    chunk_dicts = [
-                        {
-                            "chunk_uid": self._build_chunk_uid(file_id, c),
-                            "text": c.text,
-                            "metadata": c.metadata,
-                        }
-                        for c in chunks
-                    ]
-                    enrichments = await enrichment_service.enrich_chunks(
-                        chunk_dicts, document_title=source_filename
-                    )
-                    for chunk, enrichment in zip(chunks, enrichments):
-                        chunk.metadata["enrichment"] = enrichment.to_dict()
-                    logger.info(
-                        "Chunk enrichment completed for %s: %d chunks enriched",
-                        source_filename,
-                        len(enrichments),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Chunk enrichment failed for %s: %s",
-                        source_filename,
-                        str(e),
-                    )
-                finally:
-                    _add_elapsed_ms(stage_timings, "enrichment_ms", stage_started_at)
-
             # Generate embeddings and store in vector store
             if self.embedding_service is not None and self.vector_store is not None:
                 # Skip embedding/indexing if no chunks (status indexed with 0 chunks is acceptable)
@@ -1408,75 +1756,17 @@ class DocumentProcessor:
                     for chunk, embedding, sparse_emb in zip(
                         chunks, embeddings, sparse_embeddings
                     ):
-                        # Determine chunk_scale from metadata (set during chunking)
-                        chunk_scale = chunk.metadata.get("chunk_scale", "default")
-
-                        # Create chunk_uid for windowing support
-                        chunk_uid = self._build_chunk_uid(file_id, chunk)
-
-                        # Add chunk_uid to metadata for adjacent chunk lookups
-                        chunk_metadata = chunk.metadata.copy()
-                        chunk_metadata["chunk_uid"] = chunk_uid
-                        chunk_metadata["file_id"] = str(file_id)
-                        chunk_metadata["chunk_count"] = chunk.metadata.get(
-                            "total_chunks", len(chunks)
+                        records.append(
+                            self._build_vector_record(
+                                file_id=file_id,
+                                vault_id=vault_id,
+                                file_hash=file_hash,
+                                chunk=chunk,
+                                embedding=embedding,
+                                sparse_emb=sparse_emb,
+                                document_text=document_text,
+                            )
                         )
-                        # Ensure chunk_scale is included in metadata
-                        chunk_metadata["chunk_scale"] = chunk_scale
-                        # Preserve raw text when contextual chunking modified the text
-                        if hasattr(chunk, "raw_text") and chunk.raw_text:
-                            chunk_metadata["raw_text"] = chunk.raw_text
-
-                        # Store parent window offsets + text in metadata (Issue #12)
-                        if chunk.parent_window_start is not None:
-                            chunk_metadata["parent_window_start"] = chunk.parent_window_start
-                        if chunk.parent_window_end is not None:
-                            chunk_metadata["parent_window_end"] = chunk.parent_window_end
-                        if chunk.chunk_position is not None:
-                            chunk_metadata["chunk_position"] = chunk.chunk_position
-                        # Store parent window text for fast retrieval-time expansion
-                        # (avoids re-parsing the document at query time)
-                        if (
-                            chunk.parent_window_start is not None
-                            and chunk.parent_window_end is not None
-                            and document_text
-                        ):
-                            chunk_metadata["parent_window_text"] = document_text[
-                                chunk.parent_window_start : chunk.parent_window_end
-                            ]
-
-                        # For safe re-upload, prefix chunk IDs with the new file hash
-                        # so old-generation chunks have distinguishable IDs (Issue #13)
-                        if settings.reupload_safe_order:
-                            record_id = f"{file_id}_{file_hash[:8]}_{chunk_scale}_{chunk.chunk_index}"
-                        else:
-                            record_id = chunk_uid
-
-                        record = {
-                            "id": record_id,
-                            "text": chunk.text,
-                            "file_id": str(file_id),
-                            "chunk_index": chunk.chunk_index,
-                            "vault_id": str(vault_id),
-                            "chunk_scale": chunk_scale,
-                            # Parent-document retrieval fields (Issue #12)
-                            "parent_doc_id": str(file_id),
-                            "parent_window_start": chunk.parent_window_start,
-                            "parent_window_end": chunk.parent_window_end,
-                            "chunk_position": chunk.chunk_position,
-                            "metadata": json.dumps(chunk_metadata),
-                            "embedding": embedding,
-                        }
-                        # Add sparse embedding if available (tri-vector mode)
-                        if sparse_emb is not None:
-                            try:
-                                record["sparse_embedding"] = json.dumps(sparse_emb)
-                            except (TypeError, ValueError) as e:
-                                logger.warning(
-                                    f"Failed to serialize sparse embedding: {e}"
-                                )
-                                record["sparse_embedding"] = None
-                        records.append(record)
 
                     # Phase: writing vector index
                     set_phase(
@@ -1622,7 +1912,14 @@ class DocumentProcessor:
             stage_timings["sqlite_finalize_ms"],
         )
 
-        return ProcessedDocument(file_id=file_id, chunks=chunks)
+        return ProcessedDocument(
+            file_id=file_id,
+            chunks=chunks,
+            document_text=document_text,
+            file_hash=file_hash,
+            file_path=file_path,
+            vault_id=vault_id,
+        )
 
     async def process_existing_file(
         self,
@@ -1802,32 +2099,6 @@ class DocumentProcessor:
                 percent=100.0,
             )
 
-            enrichment_service = self._get_chunk_enrichment_service()
-            if enrichment_service is not None:
-                stage_started_at = time.monotonic()
-                try:
-                    chunk_dicts = [
-                        {
-                            "chunk_uid": self._build_chunk_uid(file_id, c),
-                            "text": c.text,
-                            "metadata": c.metadata,
-                        }
-                        for c in chunks
-                    ]
-                    enrichments = await enrichment_service.enrich_chunks(
-                        chunk_dicts, document_title=source_filename
-                    )
-                    for chunk, enrichment in zip(chunks, enrichments):
-                        chunk.metadata["enrichment"] = enrichment.to_dict()
-                except Exception as e:
-                    logger.warning(
-                        "Chunk enrichment failed for %s: %s",
-                        source_filename,
-                        str(e),
-                    )
-                finally:
-                    _add_elapsed_ms(stage_timings, "enrichment_ms", stage_started_at)
-
             if self.embedding_service is not None and self.vector_store is not None:
                 if chunks:
                     chunks = [c for c in chunks if c.text and c.text.strip()]
@@ -1925,61 +2196,17 @@ class DocumentProcessor:
                     for chunk, embedding, sparse_emb in zip(
                         chunks, embeddings, sparse_embeddings
                     ):
-                        chunk_scale = chunk.metadata.get("chunk_scale", "default")
-                        chunk_uid = self._build_chunk_uid(file_id, chunk)
-                        chunk_metadata = chunk.metadata.copy()
-                        chunk_metadata["chunk_uid"] = chunk_uid
-                        chunk_metadata["file_id"] = str(file_id)
-                        chunk_metadata["chunk_count"] = chunk.metadata.get(
-                            "total_chunks", len(chunks)
+                        records.append(
+                            self._build_vector_record(
+                                file_id=file_id,
+                                vault_id=vault_id,
+                                file_hash=file_hash,
+                                chunk=chunk,
+                                embedding=embedding,
+                                sparse_emb=sparse_emb,
+                                document_text=document_text,
+                            )
                         )
-                        chunk_metadata["chunk_scale"] = chunk_scale
-                        if hasattr(chunk, "raw_text") and chunk.raw_text:
-                            chunk_metadata["raw_text"] = chunk.raw_text
-
-                        if chunk.parent_window_start is not None:
-                            chunk_metadata["parent_window_start"] = chunk.parent_window_start
-                        if chunk.parent_window_end is not None:
-                            chunk_metadata["parent_window_end"] = chunk.parent_window_end
-                        if chunk.chunk_position is not None:
-                            chunk_metadata["chunk_position"] = chunk.chunk_position
-                        if (
-                            chunk.parent_window_start is not None
-                            and chunk.parent_window_end is not None
-                            and document_text
-                        ):
-                            chunk_metadata["parent_window_text"] = document_text[
-                                chunk.parent_window_start : chunk.parent_window_end
-                            ]
-
-                        if settings.reupload_safe_order:
-                            record_id = f"{file_id}_{file_hash[:8]}_{chunk_scale}_{chunk.chunk_index}"
-                        else:
-                            record_id = chunk_uid
-
-                        record = {
-                            "id": record_id,
-                            "text": chunk.text,
-                            "file_id": str(file_id),
-                            "chunk_index": chunk.chunk_index,
-                            "vault_id": str(vault_id),
-                            "chunk_scale": chunk_scale,
-                            "parent_doc_id": str(file_id),
-                            "parent_window_start": chunk.parent_window_start,
-                            "parent_window_end": chunk.parent_window_end,
-                            "chunk_position": chunk.chunk_position,
-                            "metadata": json.dumps(chunk_metadata),
-                            "embedding": embedding,
-                        }
-                        if sparse_emb is not None:
-                            try:
-                                record["sparse_embedding"] = json.dumps(sparse_emb)
-                            except (TypeError, ValueError) as e:
-                                logger.warning(
-                                    f"Failed to serialize sparse embedding: {e}"
-                                )
-                                record["sparse_embedding"] = None
-                        records.append(record)
 
                     set_phase(
                         self.pool,
@@ -2109,4 +2336,11 @@ class DocumentProcessor:
             stage_timings["sqlite_finalize_ms"],
         )
 
-        return ProcessedDocument(file_id=file_id, chunks=chunks)
+        return ProcessedDocument(
+            file_id=file_id,
+            chunks=chunks,
+            document_text=document_text,
+            file_hash=file_hash,
+            file_path=file_path,
+            vault_id=vault_id,
+        )

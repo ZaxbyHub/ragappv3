@@ -8,6 +8,7 @@ documents with retry logic and graceful shutdown.
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import List, Optional
 
 from app.config import settings
@@ -115,6 +116,18 @@ class TaskItem:
     file_id: Optional[int] = None
 
 
+@dataclass
+class EnrichmentTaskItem:
+    """Post-index enrichment task for an already indexed file."""
+
+    file_id: int
+    file_path: str
+    vault_id: int
+    file_hash: str
+    chunks: list
+    document_text: str
+
+
 class BackgroundProcessor:
     """
     Background task processor using asyncio.Queue for document ingestion.
@@ -162,6 +175,7 @@ class BackgroundProcessor:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.queue: asyncio.Queue[TaskItem] = asyncio.Queue()
+        self.enrichment_queue: asyncio.Queue[EnrichmentTaskItem] = asyncio.Queue()
         self.shutdown_event = asyncio.Event()
         self.processor = DocumentProcessor(
             chunk_size_chars=chunk_size_chars,
@@ -172,9 +186,14 @@ class BackgroundProcessor:
             llm_client=llm_client,
         )
         self._worker_tasks: List[asyncio.Task] = []
+        self._enrichment_worker_task: Optional[asyncio.Task] = None
         self._running = False
         self.maintenance_service = maintenance_service
         self._write_semaphore: Optional[asyncio.Semaphore] = None
+
+    def set_llm_client(self, llm_client: Optional[LLMClient]) -> None:
+        """Rebind the owned DocumentProcessor to a different ingestion LLM client."""
+        self.processor.set_llm_client(llm_client)
 
     async def start(self) -> None:
         """
@@ -197,6 +216,7 @@ class BackgroundProcessor:
         self._running = True
         self.shutdown_event.clear()
         await self._recover_stranded_pending_rows()
+        await self._recover_stranded_enrichment_rows()
 
         worker_count = settings.ingestion_worker_count
         # Create write semaphore before workers can consume queued/recovered items.
@@ -212,6 +232,9 @@ class BackgroundProcessor:
         for i in range(worker_count):
             task = asyncio.create_task(self._worker_loop(), name=f"worker-{i}")
             self._worker_tasks.append(task)
+        self._enrichment_worker_task = asyncio.create_task(
+            self._enrichment_worker_loop(), name="enrichment-worker"
+        )
         logger.info(f"Background processor started with {worker_count} worker(s)")
 
     async def _recover_stranded_pending_rows(self) -> None:
@@ -355,6 +378,32 @@ class BackgroundProcessor:
                 STRANDED_PROCESSING_TIMEOUT_MINUTES,
             )
 
+    async def _recover_stranded_enrichment_rows(self) -> None:
+        """Mark interrupted post-index enrichment as failed without touching indexed files."""
+        if self.processor is None or self.processor.pool is None:
+            return
+        try:
+            with self.processor.pool.connection() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE files
+                    SET enrichment_status = 'error',
+                        enrichment_error = 'Enrichment interrupted or queued before completion; base index remains available',
+                        enrichment_updated_at = ?
+                    WHERE status = 'indexed'
+                      AND enrichment_status IN ('pending', 'processing')
+                    """,
+                    (datetime.now(UTC).isoformat(),),
+                )
+                recovered = cursor.rowcount
+                conn.commit()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Stranded enrichment recovery sweep failed: %s", e)
+            return
+
+        if recovered:
+            logger.info("Recovered %d stranded enrichment row(s)", recovered)
+
     async def stop(self, timeout: float = 60.0) -> None:
         """
         Stop the background processor gracefully.
@@ -370,19 +419,32 @@ class BackgroundProcessor:
             return
 
         logger.info("Stopping background processor...")
-        self.shutdown_event.set()
 
-        # Phase 1: Wait for in-flight tasks to complete (with timeout)
+        # Phase 1: let ingestion workers finish first. They may enqueue
+        # post-index enrichment, so do not signal the enrichment worker to exit
+        # until the ingestion queue has drained.
+        queue_drained = True
         try:
             await asyncio.wait_for(self.queue.join(), timeout=timeout)
         except asyncio.TimeoutError:
+            queue_drained = False
             logger.warning("Queue did not drain within timeout, force-cancelling workers...")
+
+        if queue_drained:
+            try:
+                await asyncio.wait_for(self.enrichment_queue.join(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Enrichment queue did not drain within timeout")
+        self.shutdown_event.set()
 
         # Phase 2: Cancel remaining workers
         if self._worker_tasks:
             for task in self._worker_tasks:
                 task.cancel()
             await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+        if self._enrichment_worker_task:
+            self._enrichment_worker_task.cancel()
+            await asyncio.gather(self._enrichment_worker_task, return_exceptions=True)
 
         # Phase 3: Flush optimize on VectorStore if available
         if hasattr(self.processor, 'vector_store') and self.processor.vector_store is not None:
@@ -439,6 +501,11 @@ class BackgroundProcessor:
         await self.queue.put(task)
         logger.debug(f"Enqueued file: {file_path} (file_id={file_id})")
 
+    async def enqueue_enrichment(self, item: EnrichmentTaskItem) -> None:
+        """Add a post-index enrichment job to the enrichment queue."""
+        await self.enrichment_queue.put(item)
+        logger.debug("Enqueued enrichment for file_id=%s", item.file_id)
+
     async def _worker_loop(self) -> None:
         """
         Main worker loop that processes items from the queue.
@@ -465,6 +532,27 @@ class BackgroundProcessor:
                 continue
 
             await self._process_task_wrapper(task)
+
+    async def _enrichment_worker_loop(self) -> None:
+        """Process optional enrichment after base indexing completes."""
+        while True:
+            if self.shutdown_event.is_set() and self.enrichment_queue.empty():
+                break
+            try:
+                item = await asyncio.wait_for(self.enrichment_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                await self.processor.run_enrichment_job(
+                    file_id=item.file_id,
+                    file_path=item.file_path,
+                    vault_id=item.vault_id,
+                    file_hash=item.file_hash,
+                    chunks=item.chunks,
+                    document_text=item.document_text,
+                )
+            finally:
+                self.enrichment_queue.task_done()
 
     async def _process_task_wrapper(self, task: TaskItem) -> None:
         """
@@ -496,19 +584,31 @@ class BackgroundProcessor:
             if task.file_id is not None:
                 # Async upload path: the row already exists with status='pending'
                 # / phase='queued' and the duplicate check has already passed.
-                await self.processor.process_existing_file(
+                result = await self.processor.process_existing_file(
                     file_id=task.file_id,
                     file_path=task.file_path,
                     vault_id=task.vault_id,
                 )
             else:
                 # Legacy path (scan/email): processor handles dup check + insert.
-                await self.processor.process_file(
+                result = await self.processor.process_file(
                     task.file_path,
                     source=task.source,
                     email_subject=task.email_subject,
                     email_sender=task.email_sender,
                     vault_id=task.vault_id,
+                )
+            if self.processor.should_enqueue_enrichment(result.chunks):
+                self.processor.set_enrichment_status(result.file_id, "pending")
+                await self.enqueue_enrichment(
+                    EnrichmentTaskItem(
+                        file_id=result.file_id,
+                        file_path=result.file_path,
+                        vault_id=result.vault_id,
+                        file_hash=result.file_hash,
+                        chunks=result.chunks,
+                        document_text=result.document_text,
+                    )
                 )
             logger.info(f"Successfully processed: {task.file_path}")
 

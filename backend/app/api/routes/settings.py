@@ -53,6 +53,7 @@ class SettingsUpdate(BaseModel):
     instant_chat_url: Optional[str] = None
     instant_chat_model: Optional[str] = None
     default_chat_mode: Optional[str] = None
+    ingestion_llm_mode: Optional[str] = None
 
     # Per-mode retrieval overrides
     instant_initial_retrieval_top_k: Optional[int] = None
@@ -129,6 +130,15 @@ class SettingsUpdate(BaseModel):
     def validate_default_chat_mode(cls, v):
         if v is not None and v not in ("instant", "thinking"):
             raise ValueError("default_chat_mode must be 'instant' or 'thinking'")
+        return v
+
+    @field_validator("ingestion_llm_mode")
+    @classmethod
+    def validate_ingestion_llm_mode(cls, v):
+        if v is not None and v not in ("instant", "thinking", "disabled"):
+            raise ValueError(
+                "ingestion_llm_mode must be 'instant', 'thinking', or 'disabled'"
+            )
         return v
 
     @field_validator(
@@ -364,6 +374,7 @@ ALLOWED_FIELDS = [
     "instant_chat_url",
     "instant_chat_model",
     "default_chat_mode",
+    "ingestion_llm_mode",
     "instant_initial_retrieval_top_k",
     "instant_reranker_top_n",
     "instant_memory_context_top_k",
@@ -465,6 +476,7 @@ class SettingsResponse(BaseModel):
     instant_chat_url: str = "http://host.docker.internal:1234"
     instant_chat_model: str = "nvidia/nemotron-3-nano-4b"
     default_chat_mode: str = "thinking"
+    ingestion_llm_mode: str = "instant"
     instant_initial_retrieval_top_k: int = 10
     instant_reranker_top_n: int = 4
     instant_memory_context_top_k: int = 2
@@ -570,6 +582,7 @@ def _build_settings_dict() -> dict:
         "instant_chat_url": settings.instant_chat_url,
         "instant_chat_model": settings.instant_chat_model,
         "default_chat_mode": settings.default_chat_mode,
+        "ingestion_llm_mode": settings.ingestion_llm_mode,
         "instant_initial_retrieval_top_k": settings.instant_initial_retrieval_top_k,
         "instant_reranker_top_n": settings.instant_reranker_top_n,
         "instant_memory_context_top_k": settings.instant_memory_context_top_k,
@@ -698,6 +711,16 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
             base_url=settings.instant_chat_url,
             model=settings.instant_chat_model,
         )
+    if update.ingestion_llm_mode is not None:
+        background_processor = getattr(app.state, "background_processor", None)
+        if background_processor is not None:
+            if settings.ingestion_llm_mode == "instant":
+                ingestion_client = instant_client
+            elif settings.ingestion_llm_mode == "thinking":
+                ingestion_client = thinking_client
+            else:
+                ingestion_client = None
+            background_processor.set_llm_client(ingestion_client)
 
 
 def _apply_settings_update(update: SettingsUpdate) -> SettingsResponse:

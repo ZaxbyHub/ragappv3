@@ -318,6 +318,7 @@ export interface SettingsResponse {
   instant_chat_url?: string;
   instant_chat_model?: string;
   default_chat_mode?: 'instant' | 'thinking';
+  ingestion_llm_mode?: 'instant' | 'thinking' | 'disabled';
   instant_initial_retrieval_top_k?: number;
   instant_reranker_top_n?: number;
   instant_memory_context_top_k?: number;
@@ -423,6 +424,7 @@ export interface UpdateSettingsRequest {
   instant_chat_url?: string;
   instant_chat_model?: string;
   default_chat_mode?: 'instant' | 'thinking';
+  ingestion_llm_mode?: 'instant' | 'thinking' | 'disabled';
   instant_initial_retrieval_top_k?: number;
   instant_reranker_top_n?: number;
   instant_memory_context_top_k?: number;
@@ -503,6 +505,8 @@ export interface Document {
   unit_label?: string | null;
   phase_started_at?: string | null;
   processing_started_at?: string | null;
+  enrichment_status?: "pending" | "processing" | "complete" | "error" | string | null;
+  enrichment_error?: string | null;
   metadata?: Record<string, unknown>;
 }
 
@@ -549,6 +553,8 @@ export interface DocumentStatusResponse {
   wiki_status?: string | null;
   wiki_phase?: string | null;
   wiki_job_id?: number | null;
+  enrichment_status?: "pending" | "processing" | "complete" | "error" | string | null;
+  enrichment_error?: string | null;
 }
 
 export interface DocumentStatsResponse {

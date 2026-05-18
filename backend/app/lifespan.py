@@ -36,6 +36,15 @@ from app.services.wiki_retrieval import WikiRetrievalService
 logger = logging.getLogger(__name__)
 
 
+def select_ingestion_llm_client(app: FastAPI, mode: str):
+    """Select the LLM client used by optional ingestion LLM work."""
+    if mode == "instant":
+        return app.state.instant_llm_client
+    if mode == "thinking":
+        return app.state.thinking_llm_client
+    return None
+
+
 async def _llm_keepalive_task(llm_client: LLMClient, interval: int = 30):
     """
     Background task to keep LLM model loaded in LM Studio.
@@ -394,6 +403,10 @@ async def lifespan(app: FastAPI):
             "model_validation", settings.enable_model_validation
         )
     )
+    ingestion_llm_client = select_ingestion_llm_client(
+        app, settings.ingestion_llm_mode
+    )
+
     # Initialize background processor as singleton (runs continuously)
     try:
         app.state.background_processor = get_background_processor(
@@ -405,7 +418,7 @@ async def lifespan(app: FastAPI):
             embedding_service=app.state.embedding_service,
             maintenance_service=app.state.maintenance_service,
             pool=app.state.db_pool,
-            llm_client=app.state.llm_client,
+            llm_client=ingestion_llm_client,
         )
         await _safe_await(
             app.state.background_processor.start(),

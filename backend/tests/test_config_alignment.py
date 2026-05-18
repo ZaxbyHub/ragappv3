@@ -26,10 +26,10 @@ class TestNewConfigFields:
         settings = Settings()
         assert settings.context_distillation_dedup_threshold == 0.92
 
-    def test_context_distillation_synthesis_enabled_default_false(self):
-        """Test context_distillation_synthesis_enabled defaults to False."""
+    def test_context_distillation_synthesis_enabled_default_true(self):
+        """Test context_distillation_synthesis_enabled defaults to True."""
         settings = Settings()
-        assert settings.context_distillation_synthesis_enabled is False
+        assert settings.context_distillation_synthesis_enabled is True
 
     def test_context_max_tokens_default(self):
         """Test context_max_tokens defaults to 6000."""
@@ -71,15 +71,15 @@ class TestNewConfigFields:
         settings = Settings()
         assert settings.flag_embedding_url == ""
 
-    def test_multi_scale_indexing_enabled_default_false(self):
-        """Test multi_scale_indexing_enabled defaults to False."""
+    def test_multi_scale_indexing_enabled_default_true(self):
+        """Test multi_scale_indexing_enabled defaults to True."""
         settings = Settings()
-        assert settings.multi_scale_indexing_enabled is False
+        assert settings.multi_scale_indexing_enabled is True
 
     def test_multi_scale_chunk_sizes_default(self):
-        """Test multi_scale_chunk_sizes defaults to '512,1024,2048'."""
+        """Test multi_scale_chunk_sizes defaults to production-fast scales."""
         settings = Settings()
-        assert settings.multi_scale_chunk_sizes == "512,1024,2048"
+        assert settings.multi_scale_chunk_sizes == "768,1536"
 
     def test_multi_scale_overlap_ratio_default(self):
         """Test multi_scale_overlap_ratio defaults to 0.1."""
@@ -100,20 +100,20 @@ class TestFeatureFlagsDefaultToFalse:
         settings = Settings()
         assert settings.context_distillation_enabled is True
 
-    def test_context_distillation_synthesis_enabled_is_false(self):
-        """Context distillation synthesis feature flag should default to False."""
+    def test_context_distillation_synthesis_enabled_is_true(self):
+        """Context distillation synthesis feature flag should default to True."""
         settings = Settings()
-        assert settings.context_distillation_synthesis_enabled is False
+        assert settings.context_distillation_synthesis_enabled is True
 
     def test_tri_vector_search_enabled_is_false(self):
         """Tri-vector search feature flag should default to False."""
         settings = Settings()
         assert settings.tri_vector_search_enabled is False
 
-    def test_multi_scale_indexing_enabled_is_false(self):
-        """Multi-scale indexing feature flag should default to False."""
+    def test_multi_scale_indexing_enabled_is_true(self):
+        """Multi-scale indexing feature flag should default to True."""
         settings = Settings()
-        assert settings.multi_scale_indexing_enabled is False
+        assert settings.multi_scale_indexing_enabled is True
 
 
 class TestAdminSecretTokenDefault:
@@ -298,9 +298,9 @@ class TestRefactoredValidators:
 
     def test_embedding_batch_size_valid(self):
         """embedding_batch_size should accept valid values >= 1."""
-        with patch.dict("os.environ", {"EMBEDDING_BATCH_SIZE": "256"}):
+        with patch.dict("os.environ", {"EMBEDDING_BATCH_SIZE": "128"}):
             settings = Settings()
-            assert settings.embedding_batch_size == 256
+            assert settings.embedding_batch_size == 128
 
     def test_embedding_batch_size_out_of_range(self):
         """embedding_batch_size should reject values < 1."""

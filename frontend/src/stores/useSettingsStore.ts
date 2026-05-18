@@ -52,6 +52,7 @@ export interface SettingsFormData {
   instant_chat_url: string;
   instant_chat_model: string;
   default_chat_mode: 'instant' | 'thinking';
+  ingestion_llm_mode: 'instant' | 'thinking' | 'disabled';
   instant_initial_retrieval_top_k: number;
   instant_reranker_top_n: number;
   instant_memory_context_top_k: number;
@@ -110,6 +111,7 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   instant_chat_url: "models",
   instant_chat_model: "models",
   default_chat_mode: "models",
+  ingestion_llm_mode: "models",
   instant_initial_retrieval_top_k: "models",
   instant_reranker_top_n: "models",
   instant_memory_context_top_k: "models",
@@ -216,6 +218,7 @@ const defaultFormData: SettingsFormData = {
   instant_chat_url: "",
   instant_chat_model: "",
   default_chat_mode: "thinking",
+  ingestion_llm_mode: "instant",
   instant_initial_retrieval_top_k: 10,
   instant_reranker_top_n: 4,
   instant_memory_context_top_k: 2,
@@ -287,6 +290,11 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     instant_chat_model: decodeStr(settings.instant_chat_model ?? "", ""),
     default_chat_mode:
       settings.default_chat_mode === "instant" ? "instant" : "thinking",
+    ingestion_llm_mode:
+      settings.ingestion_llm_mode === "thinking" ||
+      settings.ingestion_llm_mode === "disabled"
+        ? settings.ingestion_llm_mode
+        : "instant",
     instant_initial_retrieval_top_k:
       settings.instant_initial_retrieval_top_k ?? 10,
     instant_reranker_top_n: settings.instant_reranker_top_n ?? 4,
@@ -476,6 +484,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     if (!["instant", "thinking"].includes(formData.default_chat_mode)) {
       newErrors.default_chat_mode =
         "Default chat mode must be instant or thinking";
+    }
+    if (
+      !["instant", "thinking", "disabled"].includes(formData.ingestion_llm_mode)
+    ) {
+      newErrors.ingestion_llm_mode =
+        "Ingestion LLM mode must be instant, thinking, or disabled";
     }
     if (
       formData.instant_initial_retrieval_top_k <= 0 ||

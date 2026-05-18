@@ -98,6 +98,8 @@ class Settings(BaseSettings):
     """Global cap for concurrent embedding batch API calls across all simultaneous documents (1-16)."""
     optimize_on_shutdown: bool = True
     """When True, BackgroundProcessor.stop() calls VectorStore.flush_optimize() during graceful shutdown."""
+    ingestion_llm_mode: str = "instant"
+    """LLM client used for optional ingestion-time LLM work: 'instant', 'thinking', or 'disabled'."""
 
     # ── Embedding model validation configuration ───────────────────────────────────
     strict_embedding_model_check: bool = True
@@ -164,7 +166,7 @@ class Settings(BaseSettings):
     """When True, forces k=60 uniform weights and disables exact-match promotion. Fast rollback to pre-change behavior."""
 
     # ── Contextual chunking configuration ─────────────────────────────────────
-    contextual_chunking_enabled: bool = True
+    contextual_chunking_enabled: bool = False
     """Enable LLM-based contextual chunking (prepends document context to each chunk)."""
     contextual_chunking_concurrency: int = 5
     """Maximum concurrent LLM calls for contextual chunking."""
@@ -172,7 +174,7 @@ class Settings(BaseSettings):
     # ── Multi-scale chunk indexing configuration ──────────────────────────────
     multi_scale_indexing_enabled: bool = True
     """Enable multi-scale chunk indexing (index chunks at multiple sizes for varied recall)."""
-    multi_scale_chunk_sizes: str = "512,1024,2048"
+    multi_scale_chunk_sizes: str = "768,1536"
     """Comma-separated list of chunk sizes (in characters) for multi-scale indexing."""
     multi_scale_overlap_ratio: float = 0.1
     """Overlap ratio between adjacent chunks at each scale (0.0-1.0)."""
@@ -295,7 +297,7 @@ class Settings(BaseSettings):
     """Deprecated: FlagEmbedding server removed. Field retained for config compatibility."""
 
     # ── Chunk enrichment / curator configuration ───────────────────────────
-    chunk_enrichment_enabled: bool = True
+    chunk_enrichment_enabled: bool = False
     """Enable curator-style chunk enrichment (generates auxiliary metadata for retrieval)."""
     chunk_enrichment_concurrency: int = 5
     """Maximum concurrent LLM calls for chunk enrichment."""
@@ -571,6 +573,14 @@ class Settings(BaseSettings):
         """Validate optimize_mode is one of the allowed values."""
         return cls._validate_enum(
             v, {"after_every_write", "periodic", "manual"}, "optimize_mode"
+        )
+
+    @field_validator("ingestion_llm_mode", mode="after")
+    @classmethod
+    def validate_ingestion_llm_mode(cls, v: str) -> str:
+        """Validate ingestion LLM routing mode."""
+        return cls._validate_enum(
+            v, {"instant", "thinking", "disabled"}, "ingestion_llm_mode"
         )
 
     @field_validator("optimize_interval_chunks", mode="after")

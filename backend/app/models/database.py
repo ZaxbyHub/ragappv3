@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS files (
     phase_started_at TIMESTAMP,
     processing_started_at TIMESTAMP,
     wiki_pending INTEGER NOT NULL DEFAULT 0,
+    enrichment_status TEXT,
+    enrichment_error TEXT,
+    enrichment_updated_at TIMESTAMP,
     FOREIGN KEY (vault_id) REFERENCES vaults(id)
 );
 
@@ -568,6 +571,9 @@ def init_db(sqlite_path: str) -> None:
                 ("supersedes_file_id", "INTEGER"),
                 ("ingestion_version", "INTEGER DEFAULT 1"),
                 ("wiki_pending", "INTEGER NOT NULL DEFAULT 0"),
+                ("enrichment_status", "TEXT"),
+                ("enrichment_error", "TEXT"),
+                ("enrichment_updated_at", "TIMESTAMP"),
             ):
                 if name not in existing_file_cols:
                     conn.execute(f"ALTER TABLE files ADD COLUMN {name} {ddl}")
@@ -653,6 +659,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_jobs_retry_count(sqlite_path)
     migrate_add_files_parsed_text(sqlite_path)
     migrate_add_files_processing_progress(sqlite_path)
+    migrate_add_files_enrichment_status(sqlite_path)
     migrate_add_files_search_fts(sqlite_path)
     migrate_add_curator_claim_support(sqlite_path)
 
@@ -1636,6 +1643,25 @@ def migrate_add_files_processing_progress(sqlite_path: str) -> None:
             "CREATE INDEX IF NOT EXISTS idx_files_hash_vault_status "
             "ON files(file_hash, vault_id, status)"
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_files_enrichment_status(sqlite_path: str) -> None:
+    """Migration: add independent post-index enrichment status columns."""
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
+        }
+        for name, ddl in (
+            ("enrichment_status", "TEXT"),
+            ("enrichment_error", "TEXT"),
+            ("enrichment_updated_at", "TIMESTAMP"),
+        ):
+            if name not in existing_cols:
+                conn.execute(f"ALTER TABLE files ADD COLUMN {name} {ddl}")
         conn.commit()
     finally:
         conn.close()

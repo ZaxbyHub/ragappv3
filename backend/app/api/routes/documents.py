@@ -227,6 +227,8 @@ class DocumentResponse(BaseModel):
     unit_label: Optional[str] = None
     phase_started_at: Optional[str] = None
     processing_started_at: Optional[str] = None
+    enrichment_status: Optional[str] = None
+    enrichment_error: Optional[str] = None
     metadata: Optional[dict] = None  # Frontend expects metadata
 
     model_config = ConfigDict(from_attributes=True)
@@ -331,6 +333,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     processing_started_at = (
         row["processing_started_at"] if "processing_started_at" in keys else None
     )
+    enrichment_status = row["enrichment_status"] if "enrichment_status" in keys else None
+    enrichment_error = row["enrichment_error"] if "enrichment_error" in keys else None
     return DocumentResponse(
         id=row["id"],
         file_name=file_name,
@@ -352,6 +356,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
         unit_label=unit_label,
         phase_started_at=phase_started_at,
         processing_started_at=processing_started_at,
+        enrichment_status=enrichment_status,
+        enrichment_error=enrichment_error,
         metadata={
             "status": status,
             "chunk_count": chunk_count,
@@ -366,6 +372,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
             "unit_label": unit_label,
             "phase_started_at": phase_started_at,
             "processing_started_at": processing_started_at,
+            "enrichment_status": enrichment_status,
+            "enrichment_error": enrichment_error,
         },
     )
 
@@ -452,7 +460,8 @@ async def list_documents(
             SELECT id, file_name, file_path, status, chunk_count, file_size,
                    created_at, processed_at, error_message, phase, phase_message,
                    progress_percent, processed_units, total_units, unit_label,
-                   phase_started_at, processing_started_at
+                   phase_started_at, processing_started_at, enrichment_status,
+                   enrichment_error
             FROM files
             WHERE vault_id = ?{_extra_clause()}
             ORDER BY created_at DESC
@@ -481,7 +490,8 @@ async def list_documents(
                 SELECT id, file_name, file_path, status, chunk_count, file_size,
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
-                       phase_started_at, processing_started_at
+                       phase_started_at, processing_started_at, enrichment_status,
+                       enrichment_error
                 FROM files
                 WHERE vault_id IN ({placeholders}){_extra_clause()}
                 ORDER BY created_at DESC
@@ -504,7 +514,8 @@ async def list_documents(
                 SELECT id, file_name, file_path, status, chunk_count, file_size,
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
-                       phase_started_at, processing_started_at
+                       phase_started_at, processing_started_at, enrichment_status,
+                       enrichment_error
                 FROM files{base_where}
                 ORDER BY created_at DESC
                 LIMIT ? OFFSET ?
@@ -549,6 +560,8 @@ class DocumentStatusResponse(BaseModel):
     wiki_status: Optional[str] = None
     wiki_phase: Optional[str] = None
     wiki_job_id: Optional[int] = None
+    enrichment_status: Optional[str] = None
+    enrichment_error: Optional[str] = None
 
 
 @router.get("/{file_id}/status", response_model=DocumentStatusResponse)
@@ -570,7 +583,8 @@ async def get_document_status(
         SELECT id, vault_id, file_name, status, chunk_count, error_message,
                processed_at, phase, phase_message, progress_percent,
                processed_units, total_units, unit_label, phase_started_at,
-               processing_started_at, wiki_pending
+               processing_started_at, wiki_pending, enrichment_status,
+               enrichment_error
         FROM files WHERE id = ?
         """,
         (file_id,),
@@ -648,6 +662,8 @@ async def get_document_status(
         wiki_status=wiki_status,
         wiki_phase=wiki_phase,
         wiki_job_id=wiki_job_id,
+        enrichment_status=_safe_get(row, "enrichment_status"),
+        enrichment_error=_safe_get(row, "enrichment_error"),
     )
 
 

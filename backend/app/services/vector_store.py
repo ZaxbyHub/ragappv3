@@ -475,6 +475,50 @@ class VectorStore:
         async with self._write_lock:
             return await self._add_chunks_unlocked(records)
 
+    async def add_chunks_then_delete_ids(
+        self, records: List[Dict[str, Any]], old_ids: List[str]
+    ) -> int:
+        """Add replacement chunks before deleting exact old row IDs.
+
+        Used by optional post-index enrichment so a failed enriched write cannot
+        remove the already-searchable base index. If cleanup fails after the add,
+        callers may temporarily see duplicate rows, but not zero rows.
+        """
+        async with self._write_lock:
+            await self._add_chunks_unlocked(records)
+            return await self._delete_ids_unlocked(old_ids)
+
+    async def _delete_ids_unlocked(self, ids: List[str]) -> int:
+        """Delete exact chunk row IDs. Caller must hold _write_lock."""
+        if not ids:
+            return 0
+        if self.db is None:
+            await self.connect()
+        if self.table is None:
+            if self.db is None:
+                return 0
+            try:
+                table_names = await self.db.table_names()
+                if "chunks" not in table_names:
+                    return 0
+                self.table = await self.db.open_table("chunks")
+            except (OSError, RuntimeError, ValueError):
+                return 0
+        if self.table is None:
+            return 0
+
+        clauses = [f"id = '{_lance_escape(chunk_id)}'" for chunk_id in ids]
+        where = "(" + " OR ".join(clauses) + ")"
+        try:
+            count_before = await self.table.count_rows(where)
+        except (OSError, RuntimeError, ValueError):
+            count_before = 0
+        await self.table.delete(where)
+        if count_before > 0:
+            self._index_mutation_generation += 1
+            await self._maybe_rebuild_or_drop_vector_index(count_before)
+        return count_before
+
     async def _add_chunks_unlocked(self, records: List[Dict[str, Any]]) -> Dict[str, float]:
         """
         Add chunk records to the vector store.

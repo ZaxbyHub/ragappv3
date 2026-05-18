@@ -145,7 +145,7 @@ class ChunkEnrichmentService:
         ]
 
         response = await self._llm_client.chat_completion(
-            messages, max_tokens=16384, temperature=0.2
+            messages, max_tokens=512, temperature=0.2
         )
 
         enrichment = ChunkEnrichment(

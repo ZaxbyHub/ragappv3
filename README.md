@@ -220,6 +220,9 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `JWT_ALGORITHM` | HS256 | JWT signing algorithm |
 | `ADMIN_SECRET_TOKEN` | "" | Admin bootstrap/API token. **Required** when `USERS_ENABLED=true` (JWT mode) and when `USERS_ENABLED=false` (single-admin bearer-token mode) |
 | `PARENT_RETRIEVAL_ENABLED` | `true` | Enable small-to-big context expansion (parent window retrieval) |
+| `MULTI_SCALE_INDEXING_ENABLED` | `true` | Index two chunk sizes for broader recall without the previous three-scale write cost |
+| `MULTI_SCALE_CHUNK_SIZES` | `768,1536` | Multi-scale chunk sizes. Existing deployments may keep `512,1024,2048` to preserve the prior indexing footprint |
+| `INGESTION_LLM_MODE` | `instant` | Optional ingestion LLM client: `instant`, `thinking`, or `disabled` |
 | `PARENT_WINDOW_CHARS` | `6000` | Total parent window size in characters (±3000 around matched chunk) |
 | `NEW_DEDUP_POLICY` | `true` | Use group-aware dedup (caps per-doc chunks and distinct docs in results) |
 | `PER_DOC_CHUNK_CAP` | `5` | Max chunks per document in retrieval results |
