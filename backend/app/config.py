@@ -94,6 +94,8 @@ class Settings(BaseSettings):
     """Number of chunks between optimize() calls when optimize_mode is 'periodic'."""
     embedding_concurrent_batches: int = 4
     """Maximum number of embedding batches to process concurrently (1-16). Set to 1 for sequential behavior."""
+    embedding_global_concurrent_batches: int = 4
+    """Global cap for concurrent embedding batch API calls across all simultaneous documents (1-16)."""
     optimize_on_shutdown: bool = True
     """When True, BackgroundProcessor.stop() calls VectorStore.flush_optimize() during graceful shutdown."""
 
@@ -582,6 +584,12 @@ class Settings(BaseSettings):
     def validate_embedding_concurrent_batches(cls, v: int) -> int:
         """Validate embedding concurrent batches is in range 1..16."""
         return cls._validate_int_range(v, 1, 16, "embedding_concurrent_batches")
+
+    @field_validator("embedding_global_concurrent_batches", mode="after")
+    @classmethod
+    def validate_embedding_global_concurrent_batches(cls, v: int) -> int:
+        """Validate global embedding concurrent batches is in range 1..16."""
+        return cls._validate_int_range(v, 1, 16, "embedding_global_concurrent_batches")
 
     @field_validator("embedding_batch_size", mode="after")
     @classmethod

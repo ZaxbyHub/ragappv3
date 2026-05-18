@@ -113,6 +113,9 @@ class EmbeddingService:
         "Instruct: Retrieve relevant technical documentation passages.\n"
         "Query: "
     )
+    _global_batch_semaphore: asyncio.Semaphore | None = None
+    _global_batch_semaphore_limit: int | None = None
+    _global_batch_semaphore_loop: asyncio.AbstractEventLoop | None = None
 
     def __init__(self):
         """Initialize the embedding service with HTTP client and provider detection.
@@ -144,6 +147,22 @@ class EmbeddingService:
         # LRU cache. Cache keys include the live model/url/prefix fingerprints,
         # so a settings change naturally invalidates cached entries.
         self._embed_cache = LRUCache(maxsize=1000)
+
+    def _get_global_batch_semaphore(self) -> asyncio.Semaphore:
+        """Return the process-wide embedding batch semaphore for the current loop."""
+        limit = getattr(settings, "embedding_global_concurrent_batches", None)
+        if not isinstance(limit, int):
+            limit = settings.embedding_concurrent_batches
+        loop = asyncio.get_running_loop()
+        if (
+            self.__class__._global_batch_semaphore is None
+            or self.__class__._global_batch_semaphore_limit != limit
+            or self.__class__._global_batch_semaphore_loop is not loop
+        ):
+            self.__class__._global_batch_semaphore = asyncio.Semaphore(limit)
+            self.__class__._global_batch_semaphore_limit = limit
+            self.__class__._global_batch_semaphore_loop = loop
+        return self.__class__._global_batch_semaphore
 
     @property
     def embedding_model(self) -> str:
@@ -489,13 +508,14 @@ class EmbeddingService:
             else:
                 texts_to_embed.append(text)
 
-        # Process batches concurrently using asyncio.gather + semaphore
+        # Process batches concurrently using both per-call and process-wide caps.
         all_embeddings: List[List[float]] = []
         sem = asyncio.Semaphore(settings.embedding_concurrent_batches)
 
         async def _process_batch(batch_texts: List[str]) -> List[List[float]]:
             async with sem:
-                return await self._embed_batch_api(batch_texts)
+                async with self._get_global_batch_semaphore():
+                    return await self._embed_batch_api(batch_texts)
 
         batch_tasks = []
         for i in range(0, len(texts_to_embed), batch_size):

@@ -197,19 +197,22 @@ class BackgroundProcessor:
         self._running = True
         self.shutdown_event.clear()
         await self._recover_stranded_pending_rows()
-        # Spawn N workers based on configuration
-        self._worker_tasks = []
-        for i in range(settings.ingestion_worker_count):
-            task = asyncio.create_task(self._worker_loop(), name=f"worker-{i}")
-            self._worker_tasks.append(task)
-        logger.info(f"Background processor started with {settings.ingestion_worker_count} worker(s)")
 
-        # Create write semaphore for SQLite contention when running multiple workers
-        if settings.ingestion_worker_count > 1:
+        worker_count = settings.ingestion_worker_count
+        # Create write semaphore before workers can consume queued/recovered items.
+        if worker_count > 1:
             self._write_semaphore = asyncio.Semaphore(1)
             self.processor._write_semaphore = self._write_semaphore
         else:
             self._write_semaphore = None
+            self.processor._write_semaphore = None
+
+        # Spawn N workers based on configuration
+        self._worker_tasks = []
+        for i in range(worker_count):
+            task = asyncio.create_task(self._worker_loop(), name=f"worker-{i}")
+            self._worker_tasks.append(task)
+        logger.info(f"Background processor started with {worker_count} worker(s)")
 
     async def _recover_stranded_pending_rows(self) -> None:
         """Re-enqueue any `files` rows left at status='pending' from a prior process.
