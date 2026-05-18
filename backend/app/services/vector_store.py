@@ -83,6 +83,8 @@ class VectorStore:
         self._last_index_build_generation: int = 0
         # Track chunk count between optimize calls when mode is 'periodic'
         self._optimize_counter: int = 0
+        # Serialize LanceDB table mutations, including deferred index creation that
+        # may run before search, when callers share one VectorStore instance.
         self._write_lock = asyncio.Lock()
         # Shared semaphore limiting concurrent LanceDB search operations across all callers.
         # Lazily initialised on first use to avoid event-loop binding issues.
@@ -109,6 +111,10 @@ class VectorStore:
         return self
 
     async def init_table(self, embedding_dim: int) -> "VectorStore":
+        async with self._write_lock:
+            return await self._init_table_unlocked(embedding_dim)
+
+    async def _init_table_unlocked(self, embedding_dim: int) -> "VectorStore":
         """
         Initialize or open the 'chunks' table.
 
@@ -464,12 +470,12 @@ class VectorStore:
                 current_rows,
             )
 
-    async def add_chunks(self, records: List[Dict[str, Any]]) -> None:
+    async def add_chunks(self, records: List[Dict[str, Any]]) -> Dict[str, float]:
         """Serialize chunk writes and related LanceDB maintenance."""
         async with self._write_lock:
             return await self._add_chunks_unlocked(records)
 
-    async def _add_chunks_unlocked(self, records: List[Dict[str, Any]]) -> None:
+    async def _add_chunks_unlocked(self, records: List[Dict[str, Any]]) -> Dict[str, float]:
         """
         Add chunk records to the vector store.
 
@@ -485,8 +491,9 @@ class VectorStore:
             raise RuntimeError("Table not initialized. Call init_table() first.")
 
         # Handle empty records
+        timings = {"vector_write_ms": 0.0, "optimize_ms": 0.0}
         if not records:
-            return
+            return timings
 
         # Get expected embedding dimension from table schema
         expected_dim = await self._get_expected_embedding_dim()
@@ -552,21 +559,27 @@ class VectorStore:
                     )
             processed_records.append(processed_record)
 
+        t0 = time.monotonic()
         await self.table.add(processed_records)
         self._index_mutation_generation += 1
+        timings["vector_write_ms"] += (time.monotonic() - t0) * 1000
 
         # Compact the table per configured optimize_mode
         optimize_mode = settings.optimize_mode
         if optimize_mode == "after_every_write":
             try:
+                t0 = time.monotonic()
                 await self.table.optimize()
+                timings["optimize_ms"] += (time.monotonic() - t0) * 1000
             except Exception as e:
                 logger.warning("table.optimize() after add_chunks failed (non-fatal): %s", e)
         elif optimize_mode == "periodic":
             self._optimize_counter += len(processed_records)
             if self._optimize_counter >= settings.optimize_interval_chunks:
                 try:
+                    t0 = time.monotonic()
                     await self.table.optimize()
+                    timings["optimize_ms"] += (time.monotonic() - t0) * 1000
                     self._optimize_counter = 0
                 except Exception as e:
                     logger.warning(
@@ -577,6 +590,7 @@ class VectorStore:
 
         # Check if we should create the vector index after adding chunks
         await self._maybe_create_vector_index()
+        return timings
 
     async def flush_optimize(self) -> None:
         """Serialize an explicit LanceDB optimize call."""

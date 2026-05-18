@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +40,35 @@ from .schema_parser import SchemaParser
 from .vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
+
+_STAGE_TIMING_FIELDS = (
+    "parse_ms",
+    "chunk_ms",
+    "contextual_ms",
+    "parent_window_ms",
+    "enrichment_ms",
+    "embedding_ms",
+    "vector_write_ms",
+    "optimize_ms",
+    "sqlite_finalize_ms",
+)
+
+
+def _new_stage_timings() -> dict[str, float]:
+    return {field: 0.0 for field in _STAGE_TIMING_FIELDS}
+
+
+def _add_elapsed_ms(timings: dict[str, float], field: str, started_at: float) -> None:
+    timings[field] += (time.monotonic() - started_at) * 1000
+
+
+def _merge_vector_timings(
+    timings: dict[str, float], vector_timings: Optional[dict[str, float]]
+) -> None:
+    if not vector_timings:
+        return
+    timings["vector_write_ms"] += vector_timings.get("vector_write_ms", 0.0)
+    timings["optimize_ms"] += vector_timings.get("optimize_ms", 0.0)
 
 
 @dataclass
@@ -968,7 +998,10 @@ class DocumentProcessor:
         return processed_chunks
 
     async def _process_document_file(
-        self, file_path: str, file_id: Optional[int] = None
+        self,
+        file_path: str,
+        file_id: Optional[int] = None,
+        stage_timings: Optional[dict[str, float]] = None,
     ) -> Tuple[List[ProcessedChunk], str]:
         """
         Process a document file using DocumentParser and SemanticChunker.
@@ -980,6 +1013,7 @@ class DocumentProcessor:
         Returns:
             Tuple of (List of ProcessedChunk objects, document text as string)
         """
+        parse_started_at = time.monotonic()
         try:
             elements = await asyncio.wait_for(
                 asyncio.to_thread(self.parser.parse, file_path),
@@ -989,10 +1023,14 @@ class DocumentProcessor:
             raise DocumentProcessingError(
                 f"Document parsing timed out after {settings.document_parse_timeout}s: {file_path}"
             )
+        finally:
+            if stage_timings is not None:
+                _add_elapsed_ms(stage_timings, "parse_ms", parse_started_at)
         # Join all element texts for use as context in contextual chunking
         document_text = "\n".join([str(e) for e in elements])
 
         # Check if multi-scale indexing is enabled
+        chunk_started_at = time.monotonic()
         if settings.multi_scale_indexing_enabled:
             # Parse chunk sizes from settings
             scale_strs = settings.multi_scale_chunk_sizes.split(",")
@@ -1028,12 +1066,16 @@ class DocumentProcessor:
                 scale_list,
             )
 
+            if stage_timings is not None:
+                _add_elapsed_ms(stage_timings, "chunk_ms", chunk_started_at)
             return all_chunks, document_text
         else:
             # Existing single-scale behavior — use the live-settings chunker so
             # chunk_size_chars / chunk_overlap_chars changes apply per-document.
             active_chunker = self._get_chunker()
             chunks = await asyncio.to_thread(active_chunker.chunk_elements, elements)
+            if stage_timings is not None:
+                _add_elapsed_ms(stage_timings, "chunk_ms", chunk_started_at)
             return chunks, document_text
 
     async def process_file(
@@ -1072,6 +1114,7 @@ class DocumentProcessor:
 
         # Compute file hash
         file_hash = compute_file_hash(file_path)
+        stage_timings = _new_stage_timings()
 
         # Phase 1: Quick DB operations - get connection, do quick ops, release
         if self._write_semaphore:
@@ -1118,7 +1161,9 @@ class DocumentProcessor:
         try:
             # Process the file based on type
             if self._is_schema_file(file_path):
+                stage_started_at = time.monotonic()
                 chunks = await self._process_schema_file(file_path)
+                _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
                 document_text = ""
             elif self._is_spreadsheet_file(file_path):
                 set_phase(
@@ -1127,11 +1172,13 @@ class DocumentProcessor:
                     phase=PHASE_PARSING,
                     message="Parsing spreadsheet (large spreadsheets can take several minutes)",
                 )
+                stage_started_at = time.monotonic()
                 chunks = await self._process_spreadsheet_file(file_path)
+                _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
                 document_text = " ".join(c.text for c in chunks)
             else:
                 chunks, document_text = await self._process_document_file(
-                    file_path, file_id
+                    file_path, file_id, stage_timings
                 )
 
             set_phase(
@@ -1154,6 +1201,7 @@ class DocumentProcessor:
                         len(chunks),
                         source_filename,
                     )
+                    stage_started_at = time.monotonic()
                     try:
                         await chunker.contextualize_chunks(
                             document_text=document_text,
@@ -1171,6 +1219,8 @@ class DocumentProcessor:
                             source_filename,
                             str(e),
                         )
+                    finally:
+                        _add_elapsed_ms(stage_timings, "contextual_ms", stage_started_at)
                 # else: _get_contextual_chunker already logged a warning if needed
 
             # Compute parent window offsets for small-to-big retrieval (Issue #12)
@@ -1183,6 +1233,7 @@ class DocumentProcessor:
                     Path(file_path).name,
                 )
             if document_text and chunks:
+                stage_started_at = time.monotonic()
                 try:
                     compute_parent_windows(
                         chunks,
@@ -1195,6 +1246,8 @@ class DocumentProcessor:
                         Path(file_path).name,
                         e,
                     )
+                finally:
+                    _add_elapsed_ms(stage_timings, "parent_window_ms", stage_started_at)
 
             if not chunks:
                 raise DocumentProcessingError(
@@ -1216,6 +1269,7 @@ class DocumentProcessor:
             # Chunk enrichment: generate auxiliary metadata (summary, questions, entities)
             enrichment_service = self._get_chunk_enrichment_service()
             if enrichment_service is not None:
+                stage_started_at = time.monotonic()
                 try:
                     chunk_dicts = [
                         {
@@ -1241,6 +1295,8 @@ class DocumentProcessor:
                         source_filename,
                         str(e),
                     )
+                finally:
+                    _add_elapsed_ms(stage_timings, "enrichment_ms", stage_started_at)
 
             # Generate embeddings and store in vector store
             if self.embedding_service is not None and self.vector_store is not None:
@@ -1275,9 +1331,11 @@ class DocumentProcessor:
                         percent=0.0,
                     )
                     # Generate dense embeddings (Harrier dense-only)
+                    stage_started_at = time.monotonic()
                     embeddings_result = await self.embedding_service.embed_batch(
                         texts, fail_fast=False
                     )
+                    _add_elapsed_ms(stage_timings, "embedding_ms", stage_started_at)
                     batch_embeddings, failed_batch_indices = embeddings_result
 
                     # Handle partial embedding failures
@@ -1434,17 +1492,22 @@ class DocumentProcessor:
 
                     # Initialize vector table with embedding dimension and add chunks
                     embedding_dim = len(embeddings[0])
+                    stage_started_at = time.monotonic()
                     await self.vector_store.init_table(embedding_dim)
+                    _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
 
                     if settings.reupload_safe_order:
                         # Safe re-upload: insert new generation first, then delete old (Issue #13)
                         # Step 1+2: Insert new-generation chunks (hash-prefixed IDs)
-                        await self.vector_store.add_chunks(records)
+                        vector_timings = await self.vector_store.add_chunks(records)
+                        _merge_vector_timings(stage_timings, vector_timings)
                         # Step 3: Delete old-generation chunks for this file
                         # (chunks whose IDs don't start with the new hash prefix)
+                        stage_started_at = time.monotonic()
                         deleted = await self.vector_store.delete_old_generation_by_file(
                             str(file_id), file_hash[:8]
                         )
+                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
                         if deleted > 0:
                             logger.info(
                                 "Safe re-upload: deleted %d old-generation chunks for file_id=%s",
@@ -1453,8 +1516,11 @@ class DocumentProcessor:
                             )
                     else:
                         # Legacy: delete-then-insert (not crash-safe, kept for compat)
+                        stage_started_at = time.monotonic()
                         await self.vector_store.delete_by_file(str(file_id))
-                        await self.vector_store.add_chunks(records)
+                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                        vector_timings = await self.vector_store.add_chunks(records)
+                        _merge_vector_timings(stage_timings, vector_timings)
 
                     await self._verify_vector_rows_visible(file_id)
         except Exception as e:
@@ -1482,6 +1548,7 @@ class DocumentProcessor:
             raise
 
         # Phase 3: Final DB operations - update status to indexed
+        stage_started_at = time.monotonic()
         if self._write_semaphore:
             await self._write_semaphore.acquire()
         conn = self.pool.get_connection()
@@ -1536,6 +1603,24 @@ class DocumentProcessor:
         # Clear transient progress fields and pin phase=indexed so polls show
         # a clean "ready" snapshot rather than stale embedding counters.
         clear_progress(self.pool, file_id)
+        _add_elapsed_ms(stage_timings, "sqlite_finalize_ms", stage_started_at)
+
+        logger.info(
+            "Ingestion stage timings file_id=%s file_name=%s parse_ms=%.1f chunk_ms=%.1f "
+            "contextual_ms=%.1f parent_window_ms=%.1f enrichment_ms=%.1f "
+            "embedding_ms=%.1f vector_write_ms=%.1f optimize_ms=%.1f sqlite_finalize_ms=%.1f",
+            file_id,
+            Path(file_path).name,
+            stage_timings["parse_ms"],
+            stage_timings["chunk_ms"],
+            stage_timings["contextual_ms"],
+            stage_timings["parent_window_ms"],
+            stage_timings["enrichment_ms"],
+            stage_timings["embedding_ms"],
+            stage_timings["vector_write_ms"],
+            stage_timings["optimize_ms"],
+            stage_timings["sqlite_finalize_ms"],
+        )
 
         return ProcessedDocument(file_id=file_id, chunks=chunks)
 
@@ -1631,10 +1716,13 @@ class DocumentProcessor:
         # identical to the synchronous path. We re-derive file_hash here for
         # the safe-reupload chunk-id prefix logic; this is cheap I/O.
         file_hash = compute_file_hash(file_path)
+        stage_timings = _new_stage_timings()
 
         try:
             if self._is_schema_file(file_path):
+                stage_started_at = time.monotonic()
                 chunks = await self._process_schema_file(file_path)
+                _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
                 document_text = ""
             elif self._is_spreadsheet_file(file_path):
                 set_phase(
@@ -1643,11 +1731,13 @@ class DocumentProcessor:
                     phase=PHASE_PARSING,
                     message="Parsing spreadsheet (large spreadsheets can take several minutes)",
                 )
+                stage_started_at = time.monotonic()
                 chunks = await self._process_spreadsheet_file(file_path)
+                _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
                 document_text = " ".join(c.text for c in chunks)
             else:
                 chunks, document_text = await self._process_document_file(
-                    file_path, file_id
+                    file_path, file_id, stage_timings
                 )
 
             set_phase(
@@ -1662,6 +1752,7 @@ class DocumentProcessor:
             if settings.contextual_chunking_enabled and chunks and document_text:
                 chunker = self._get_contextual_chunker()
                 if chunker is not None:
+                    stage_started_at = time.monotonic()
                     try:
                         await chunker.contextualize_chunks(
                             document_text=document_text,
@@ -1674,8 +1765,11 @@ class DocumentProcessor:
                             source_filename,
                             str(e),
                         )
+                    finally:
+                        _add_elapsed_ms(stage_timings, "contextual_ms", stage_started_at)
 
             if document_text and chunks:
+                stage_started_at = time.monotonic()
                 try:
                     compute_parent_windows(
                         chunks,
@@ -1688,6 +1782,8 @@ class DocumentProcessor:
                         Path(file_path).name,
                         e,
                     )
+                finally:
+                    _add_elapsed_ms(stage_timings, "parent_window_ms", stage_started_at)
 
             if not chunks:
                 raise DocumentProcessingError(
@@ -1708,6 +1804,7 @@ class DocumentProcessor:
 
             enrichment_service = self._get_chunk_enrichment_service()
             if enrichment_service is not None:
+                stage_started_at = time.monotonic()
                 try:
                     chunk_dicts = [
                         {
@@ -1728,6 +1825,8 @@ class DocumentProcessor:
                         source_filename,
                         str(e),
                     )
+                finally:
+                    _add_elapsed_ms(stage_timings, "enrichment_ms", stage_started_at)
 
             if self.embedding_service is not None and self.vector_store is not None:
                 if chunks:
@@ -1751,9 +1850,11 @@ class DocumentProcessor:
                         unit="chunks",
                         percent=0.0,
                     )
+                    stage_started_at = time.monotonic()
                     embeddings_result = await self.embedding_service.embed_batch(
                         texts, fail_fast=False
                     )
+                    _add_elapsed_ms(stage_timings, "embedding_ms", stage_started_at)
                     batch_embeddings, failed_batch_indices = embeddings_result
 
                     # Handle partial embedding failures
@@ -1892,13 +1993,18 @@ class DocumentProcessor:
                     )
 
                     embedding_dim = len(embeddings[0])
+                    stage_started_at = time.monotonic()
                     await self.vector_store.init_table(embedding_dim)
+                    _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
 
                     if settings.reupload_safe_order:
-                        await self.vector_store.add_chunks(records)
+                        vector_timings = await self.vector_store.add_chunks(records)
+                        _merge_vector_timings(stage_timings, vector_timings)
+                        stage_started_at = time.monotonic()
                         deleted = await self.vector_store.delete_old_generation_by_file(
                             str(file_id), file_hash[:8]
                         )
+                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
                         if deleted > 0:
                             logger.info(
                                 "Safe re-upload: deleted %d old-generation chunks for file_id=%s",
@@ -1906,8 +2012,11 @@ class DocumentProcessor:
                                 file_id,
                             )
                     else:
+                        stage_started_at = time.monotonic()
                         await self.vector_store.delete_by_file(str(file_id))
-                        await self.vector_store.add_chunks(records)
+                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                        vector_timings = await self.vector_store.add_chunks(records)
+                        _merge_vector_timings(stage_timings, vector_timings)
 
                     await self._verify_vector_rows_visible(file_id)
         except Exception as e:
@@ -1931,6 +2040,7 @@ class DocumentProcessor:
             raise
 
         # Mark indexed
+        stage_started_at = time.monotonic()
         if self._write_semaphore:
             await self._write_semaphore.acquire()
         conn = self.pool.get_connection()
@@ -1980,5 +2090,23 @@ class DocumentProcessor:
             set_wiki_pending(self.pool, file_id, False)
 
         clear_progress(self.pool, file_id)
+        _add_elapsed_ms(stage_timings, "sqlite_finalize_ms", stage_started_at)
+
+        logger.info(
+            "Ingestion stage timings file_id=%s file_name=%s parse_ms=%.1f chunk_ms=%.1f "
+            "contextual_ms=%.1f parent_window_ms=%.1f enrichment_ms=%.1f "
+            "embedding_ms=%.1f vector_write_ms=%.1f optimize_ms=%.1f sqlite_finalize_ms=%.1f",
+            file_id,
+            Path(file_path).name,
+            stage_timings["parse_ms"],
+            stage_timings["chunk_ms"],
+            stage_timings["contextual_ms"],
+            stage_timings["parent_window_ms"],
+            stage_timings["enrichment_ms"],
+            stage_timings["embedding_ms"],
+            stage_timings["vector_write_ms"],
+            stage_timings["optimize_ms"],
+            stage_timings["sqlite_finalize_ms"],
+        )
 
         return ProcessedDocument(file_id=file_id, chunks=chunks)
