@@ -98,7 +98,7 @@ Launch all 6 lanes in parallel in a **single message with multiple Agent tool ca
 | **Lane 1: Correctness** | Logic errors, null/undefined handling, race conditions, edge cases, off-by-one errors, incorrect operators | `null` checks, error path coverage, async/await correctness, loop termination, type coercion |
 | **Lane 2: Security** | Injection, auth bypass, secret exposure, privilege escalation, SSRF, path traversal, unsafe deserialization | Input sanitization, authnz enforcement points, credential handling, permission boundaries |
 | **Lane 3: Dependencies** | Import changes, version bumps, breaking API changes, new transitive deps, license issues | `package.json`/`requirements.txt`/Cargo.toml changes, lockfile drift, breaking API replacements |
-| **Lane 4: Docs vs Intent** | PR claims vs actual code changes, undocumented behavior, misleading variable names, absent changelog entries | Claims made in PR text vs what diff actually does, side effects not mentioned |
+| **Lane 4: Docs vs Intent** | PR claims vs actual code changes, undocumented behavior, misleading variable names, absent changelog entries | Claims made in PR text vs what diff actually does, side effects not mentioned. **⚠️ Highest false-positive rate (~60% in field testing). This lane frequently claims symbols are FABRICATED/MISSING when they exist in the diff — always verify Lane 4 findings against `git diff <base>..<pr>` before including in the final report.** |
 | **Lane 5: Tests** | Coverage gaps, flaky patterns, weak assertions, test isolation violations, missing edge case tests | Assertion quality, mock isolation, happy-path-only coverage, missing error-path tests |
 | **Lane 6: Performance/Architecture** | Complexity changes, memory leaks, algorithmic regressions, coupling between modules, architectural debt | Cyclomatic complexity deltas, GC pressure, connection pool usage, shared mutable state |
 
@@ -137,7 +137,9 @@ Re-read each candidate's file:line evidence directly. Validate every candidate t
 | **STRUCTURALLY_PROVEN** | file:line evidence directly demonstrates the bug (e.g., missing null check, incorrect operator) |
 | **PLAUSIBLE_BUT_UNVERIFIED** | Code pattern suggests risk, but reachability or mitigating context unconfirmed |
 
-**DISPROVED findings must be called out explicitly** — agents regularly overclaim.
+**DISPROVED findings must be called out explicitly** — agents regularly overclaim. When any explorer claims a symbol, function, or code pattern is MISSING or FABRICATED, verify by running `git diff <base>..<pr> -- <file>` directly rather than trusting the agent's grep output. Agent grep failures (wrong branch, tool error, path mismatch) are the #1 source of fabricated findings.
+
+**PR description scope may not match actual diff** — after rebase or multi-commit PRs, the PR description may undercount files. Before scoping explorer lanes, run `git diff --stat <base>..<pr>` to get the true file count and scope. Extra files (tests, config, diagnostic scripts) are common and may contain review-relevant changes not mentioned in the PR body.
 
 ---
 
@@ -246,6 +248,8 @@ If **any** answer is yes and unaccounted for in the finding, the finding is down
 5. **DISPROVED findings must be called out explicitly.** Do not silently drop overclaiming agent findings.
 6. **Explorer lanes optimize for recall.** Do not treat explorer output as final verdicts.
 7. **Obligation precedence is deterministic.** Do not skip higher-precedence sources to fill gaps with LLM synthesis.
+8. **MISSING/FABRICATED claims require diff verification.** See Phase 3 for operational context.
+9. **Verify PR scope before scoping lanes.** See Phase 3 for operational context.
 
 ---
 
