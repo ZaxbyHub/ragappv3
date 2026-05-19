@@ -4,14 +4,24 @@ description: >
   Apply when writing tests, modifying test files, fixing test failures, debugging CI failures,
   adding test coverage, creating adversarial tests, or reviewing any file under tests/.
   Also apply when implementing features or fixes that require corresponding test changes.
-  Enforces bun:test framework rules, mock isolation, cross-platform compatibility (Linux,
-  macOS, Windows), and CI pipeline awareness. Load this skill before touching any test file.
+  Enforces framework-specific rules (bun:test for TypeScript, unittest/pytest for Python),
+  mock isolation, cross-platform compatibility, and CI pipeline awareness.
+  Load this skill before touching any test file.
 effort: medium
 ---
 
-# Writing Tests for opencode-swarm
+# Writing Tests
 
-## Framework: bun:test Only
+This skill covers two test ecosystems found in this workspace:
+
+- **TypeScript (bun:test)** — used by opencode-swarm and similar projects
+- **Python (unittest/pytest)** — used by ragappv3 backend and similar projects
+
+Load the relevant section based on the test file's framework. Check for `import unittest` / `import pytest` (Python) vs `import from 'bun:test'` (TypeScript).
+
+---
+
+# Part 1: TypeScript — bun:test
 
 All test files MUST import from `bun:test`:
 
@@ -249,7 +259,7 @@ describe.skipIf(process.platform === 'win32')('group name', () => { ... });
   expect(stripTimestamp(output1)).toBe(stripTimestamp(output2));
   ```
 
-## Running Tests
+## Running TypeScript Tests
 
 > **⚠️ Do NOT use the OpenCode `test_runner` tool to validate the full repo.** It is for targeted agent validation with explicit `files: [...]` or small targeted scopes. `scope: 'all'` requires `allow_full_suite: true` and is intended for opt-in CI mirrors only. Broad scopes can stall or kill OpenCode before the `MAX_SAFE_TEST_FILES = 50` (`src/tools/test-runner.ts:26`) guard fires. For repo validation, use the shell commands below — per-file isolation loops match CI behavior. `allow_full_suite` should be used only when intentional and justified in the PR description. See [`AGENTS.md`](../../../AGENTS.md) invariant 6 for the full contract.
 
@@ -302,3 +312,276 @@ When CI reports a `unit (ubuntu-latest|macos-latest|windows-latest)` failure:
 8. Verify symlink creation is guarded or uses a `canCreateSymlinks` capability check
 9. Verify no `new Date().toISOString()` in equality assertions — strip volatile timestamps
 10. Verify tests that spawn `npx`/`vitest`/`jest` in temp dirs are skipped on non-Linux
+
+---
+
+# Part 2: Python — unittest / pytest
+
+## Framework
+
+This project uses `unittest.TestCase` classes with `pytest` as the runner. All backend test files live under `backend/tests/`.
+
+```python
+import unittest
+
+class TestMyFeature(unittest.TestCase):
+    def test_something(self):
+        self.assertEqual(result, expected)
+```
+
+Run with:
+```bash
+# From project root
+python -m pytest backend/tests/test_module.py -v --tb=short
+
+# Specific test class
+python -m pytest backend/tests/test_module.py::TestMyClass -v
+
+# Specific test
+python -m pytest backend/tests/test_module.py::TestMyClass::test_something -v
+```
+
+### Async Test Methods
+
+Test methods that call async functions must be declared `async` and decorated with `@pytest.mark.asyncio`:
+
+```python
+import pytest
+from unittest.mock import AsyncMock
+
+@pytest.mark.asyncio
+async def test_async_operation(self):
+    result = await some_async_function()
+    self.assertEqual(result, expected)
+```
+
+Without the decorator, pytest will not await the coroutine and the test will fail with "coroutine was never awaited".
+
+Use `AsyncMock` for mocking async functions:
+```python
+mock_service = AsyncMock()
+mock_service.fetch_data.return_value = {"id": 1}
+result = await mock_service.fetch_data()
+```
+
+This project uses `asyncio_mode = "auto"` in pytest configuration (pyproject.toml), so the decorator is not strictly required — pytest auto-detects async tests. However, explicit decoration is preferred for clarity and for compatibility with older pytest versions.
+
+### Pytest Fixtures
+
+Use `@pytest.fixture` for reusable setup/teardown logic:
+
+```python
+@pytest.fixture
+def db_connection(tmp_path):
+    """Fixture that provides a test database connection."""
+    db_path = tmp_path / "test.db"
+    conn = sqlite3.connect(db_path)
+    yield conn  # test runs here
+    conn.close()  # cleanup
+```
+
+Fixture scopes:
+- `scope="function"` (default): fresh fixture for each test
+- `scope="class"`: shared across all tests in a class
+- `scope="module"`: shared across all tests in a file
+- `scope="session"`: shared across entire test run
+
+### Monkeypatch
+
+Use the `monkeypatch` fixture to mock attributes and environment variables without module-level mocking:
+
+```python
+def test_with_monkeypatch(monkeypatch):
+    monkeypatch.setattr(some_object, "method", AsyncMock(return_value=42))
+    monkeypatch.setenv("API_KEY", "test-key")
+    result = some_object.method()
+    assert result == 42
+```
+
+Monkeypatch automatically restores original values after the test — no manual cleanup needed.
+
+### FastAPI TestClient with Dependency Overrides
+
+To test FastAPI endpoints with custom dependencies (e.g., test database):
+
+```python
+from fastapi.testclient import TestClient
+
+def override_get_db():
+    conn = sqlite3.connect("test.db")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+app.dependency_overrides[deps.get_db] = override_get_db
+client = TestClient(app)
+# ... run tests ...
+app.dependency_overrides.clear()
+```
+
+Always clear `dependency_overrides` after the test to prevent leaks.
+
+## Mock Exception Types MUST Match Production Catch Clauses
+
+**CRITICAL: This is the #1 cause of silent test failures in Python test fixes.**
+
+If production code catches specific exception types:
+```python
+try:
+    risky_operation()
+except (OSError, RuntimeError, ValueError):
+    handle_failure()
+```
+
+The test mock MUST raise one of those types, NOT bare `Exception`:
+```python
+# WRONG — Exception is NOT caught by the specific handler
+mock_obj.method.side_effect = Exception("something failed")
+# Result: exception propagates, test sees 500 instead of 200
+
+# CORRECT — OSError IS caught by the handler
+mock_obj.method.side_effect = OSError("something failed")
+# Result: handler catches it, execution continues, test sees 200
+```
+
+When fixing a failing test, **always read the production catch clause first**. Match the mock exception type exactly. The production code's `except` tuple is the authoritative list of exception types the code handles.
+
+## Test Class Organization
+
+### Naming
+
+- Base test: `Test<EndpointOrModule>` (e.g., `TestVaultEndpoints`, `TestAuthRoutes`)
+- Adversarial variant: `Test<Feature>Adversarial` (e.g., `TestFetchAccessibleVaultsAdversarial`)
+- Scoped tests: `Test<Feature><Scope>` (e.g., `TestVaultScopedRoutes`)
+
+### Database Access
+
+Tests that need direct database access use the pattern:
+```python
+conn = self._get_db_conn()
+try:
+    # insert test data
+    self._insert_vault(conn, "TestVault")
+finally:
+    self._connection_pool.release_connection(conn)
+```
+
+Always release connections in `finally` — SQLite has a connection limit and unreleased connections can cause "database is locked" errors in subsequent tests.
+
+### Unused Variables
+
+Ruff flags unused variables with F841. If a helper returns a value you don't need, call it without assignment:
+```python
+# WRONG — triggers F841
+vault_id = self._insert_vault(conn, "TestVault")
+
+# CORRECT — bare call, no unused variable
+self._insert_vault(conn, "TestVault")
+```
+
+## SQL Parameter Counting
+
+When writing SQL queries with parameterized placeholders, count every `?` in the query and bind exactly that many values:
+```python
+# Count the placeholders: 4 question marks
+query = """
+    SELECT DISTINCT v.id FROM vaults v WHERE v.id IN (
+        SELECT vm.vault_id FROM vault_members vm WHERE vm.user_id = ?  -- 1
+        UNION
+        SELECT vga.vault_id FROM vault_group_access vga
+        JOIN group_members gm ON vga.group_id = gm.group_id
+        WHERE gm.user_id = ?                                        -- 2
+        UNION
+        SELECT v.id FROM vaults v WHERE v.visibility = 'public' AND v.org_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM org_members om WHERE om.org_id = v.org_id AND om.user_id = ?  -- 3
+        )
+        UNION
+        SELECT v.id FROM vaults v WHERE v.visibility = 'org' AND v.org_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM org_members om WHERE om.org_id = v.org_id AND om.user_id = ?  -- 4
+        )
+    )
+"""
+
+# Bind EXACTLY 4 parameters — one per placeholder
+cursor.execute(query, (user_id, user_id, user_id, user_id))
+```
+
+Mismatch causes `sqlite3.ProgrammingError: Incorrect number of bindings` at runtime.
+
+## Defensive Null Checks in Test Assertions
+
+When verifying that an operation succeeded despite a partial failure (e.g., vault deletion despite vector store error), add a **state verification** assertion beyond just checking the HTTP response:
+
+```python
+def test_delete_vault_vector_store_failure_continues(self):
+    # ... setup ...
+    mock_vector_store.delete_by_vault.side_effect = OSError("vector store down")
+    resp = self.client.delete(f"/api/vaults/{vault_id}")
+
+    # 1. HTTP response check
+    self.assertEqual(resp.status_code, 200)
+    self.assertIn("deleted successfully", resp.json()["message"])
+
+    # 2. State verification — confirm the side effect actually occurred
+    resp_check = self.client.get(f"/api/vaults/{vault_id}")
+    self.assertEqual(resp_check.status_code, 404)
+```
+
+Without the 404 check, the test only verifies the response message — it doesn't verify the DB state changed.
+
+## Running Python Tests
+
+```bash
+# From project root — single test file
+python -m pytest backend/tests/test_vaults.py -v --tb=short -q
+
+# Single test class
+python -m pytest backend/tests/test_vaults.py::TestVaultEndpoints -v
+
+# Single test method
+python -m pytest backend/tests/test_vaults.py::TestVaultEndpoints::test_delete_vault -v
+
+# Quick pass — stop on first failure
+python -m pytest backend/tests/test_vaults.py -x --tb=line -q
+
+# With coverage (informational)
+python -m pytest backend/tests/test_vaults.py --cov=backend --cov-report=term-missing
+```
+
+The `-x` flag stops on first failure (useful during development). Omit it when checking the full test suite.
+
+### Async Test Execution
+
+This project uses `asyncio_mode = "auto"` in pyproject.toml (pytest-asyncio), so async tests are auto-detected. No special flags needed:
+
+```bash
+python -m pytest backend/tests/test_async_module.py -v
+```
+
+For projects without auto mode, add `-o asyncio_mode=auto` or use the `@pytest.mark.asyncio` decorator.
+
+## Ruff Linting for Test Files
+
+Ruff catches issues that block CI. Run locally before pushing:
+```bash
+ruff check backend/tests/test_vaults.py
+```
+
+Common ruff errors in test files:
+- **F841**: Unused variable — remove the assignment, call the function bare
+- **W293**: Trailing whitespace on blank lines — remove whitespace
+- **F541**: f-string without placeholders — remove the `f` prefix
+- **W291**: Trailing whitespace on comment lines — trim trailing spaces
+
+Fix automatically where possible:
+```bash
+ruff check --fix backend/tests/test_vaults.py
+```
+
+## Debugging CI Python Test Failures
+
+1. **Check if the failure is pre-existing**: Run the same test on `master` first. If it fails there too, it's not introduced by your branch.
+2. **Read the exact error message**: Python tracebacks include file, line number, and assertion values. The assertion diff (`expected X, got Y`) tells you everything.
+3. **Check mock setup**: The most common Python test bug is a mock that doesn't match the actual method signature or production behavior. Read the production code's `except` clause before writing the mock.
+4. **Check database state**: If a test creates data in a `try` block, verify the data exists before asserting behavior that depends on it. Missing `self._insert_*` calls are a common source of "expected 200, got 404" failures.
