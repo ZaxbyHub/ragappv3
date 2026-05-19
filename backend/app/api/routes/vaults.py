@@ -184,6 +184,96 @@ async def _fetch_all_vaults(
     return vaults
 
 
+async def _fetch_accessible_vaults(
+    conn: sqlite3.Connection, user: Optional[dict] = None
+) -> List[VaultResponse]:
+    """Fetch only vaults the user might have access to, using SQL prefiltering.
+
+    Builds a UNION query to get candidate vault IDs:
+    - (a) vaults where user is directly a member
+    - (b) vaults accessible via group membership
+    - (c) public/org-visible vaults user belongs to
+    - (d) all vaults for admin/superadmin users
+
+    Then applies get_effective_vault_permissions on the reduced set.
+    """
+    if user is None:
+        return []
+
+    user_id = user.get("id")
+    user_role = user.get("role", "")
+
+    if not user_id:
+        return []
+
+    # For admin/superadmin, fetch all vaults (no filtering needed)
+    if user_role in ("admin", "superadmin"):
+        return await _fetch_all_vaults(conn, user)
+
+    # Build UNION query for candidate vault IDs
+    # (a) vaults where user is directly a member
+    # (b) vaults accessible via group membership
+    # (c) public/org-visible vaults user belongs to
+    # (d) all vaults for superadmin (already handled above)
+
+    union_query = """
+        SELECT DISTINCT v.id FROM vaults v
+        WHERE v.id IN (
+            SELECT vm.vault_id FROM vault_members vm WHERE vm.user_id = ?
+            UNION
+            SELECT vga.vault_id FROM vault_group_access vga
+            JOIN group_members gm ON vga.group_id = gm.group_id
+            WHERE gm.user_id = ?
+            UNION
+            SELECT v.id FROM vaults v WHERE v.visibility = 'public' AND v.org_id IS NULL
+            UNION
+            SELECT v.id FROM vaults v WHERE v.visibility = 'public' AND v.org_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM org_members om WHERE om.org_id = v.org_id AND om.user_id = ?
+            )
+            UNION
+            SELECT v.id FROM vaults v WHERE v.visibility = 'org' AND v.org_id IS NOT NULL AND EXISTS (
+                SELECT 1 FROM org_members om WHERE om.org_id = v.org_id AND om.user_id = ?
+            )
+        )
+    """
+
+    cursor = await asyncio.to_thread(conn.execute, union_query, (user_id, user_id, user_id, user_id))
+    rows = await asyncio.to_thread(cursor.fetchall)
+
+    # Extract vault IDs from rows
+    vault_ids = [row[0] for row in rows]
+
+    if not vault_ids:
+        return []
+
+    # Get permissions for the filtered vault set
+    permissions = await asyncio.to_thread(
+        get_effective_vault_permissions,
+        conn,
+        user,
+        vault_ids,
+    )
+
+    # Fetch full vault records with counts
+    placeholders = ",".join("?" for _ in vault_ids)
+    full_query = _VAULT_WITH_COUNTS_SQL + f"""
+        WHERE v.id IN ({placeholders})
+        GROUP BY v.id
+        ORDER BY v.created_at ASC
+        LIMIT 1000
+    """
+
+    full_cursor = await asyncio.to_thread(conn.execute, full_query, tuple(vault_ids))
+    full_rows = await asyncio.to_thread(full_cursor.fetchall)
+
+    # Build vault responses
+    vaults = []
+    for row in full_rows:
+        vaults.append(_row_to_vault_response(row, permissions.get(row[0])))
+
+    return vaults
+
+
 @router.get("/vaults", response_model=VaultListResponse)
 async def list_vaults(
     user: dict = Depends(require_role("admin")),
@@ -201,10 +291,8 @@ async def list_accessible_vaults(
     conn: sqlite3.Connection = Depends(get_db),
 ):
     """Return vaults the current user has access to."""
-    vaults = await _fetch_all_vaults(conn, user)
-    return VaultListResponse(
-        vaults=[v for v in vaults if v.current_user_permission is not None]
-    )
+    vaults = await _fetch_accessible_vaults(conn, user)
+    return VaultListResponse(vaults=vaults)
 
 
 @router.get("/vaults/{vault_id}", response_model=VaultResponse)

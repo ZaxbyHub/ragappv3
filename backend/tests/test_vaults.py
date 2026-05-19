@@ -555,23 +555,341 @@ class TestVaultEndpoints(unittest.TestCase):
         """Delete vault with vector_store failure -> still returns 200."""
         vault_id = self._create_vault_via_api("Research")
         # Set vector store delete to raise exception
-        self._mock_vector_store.delete_by_vault.side_effect = Exception("vector store down")
+        self._mock_vector_store.delete_by_vault.side_effect = OSError("vector store down")
 
         resp = self.client.delete(f"/api/vaults/{vault_id}")
 
         # Should still succeed even if vector store fails
         self.assertEqual(resp.status_code, 200)
         self.assertIn("deleted successfully", resp.json()["message"])
+        # Verify vault is gone from DB despite vector store failure
+        resp = self.client.get(f"/api/vaults/{vault_id}")
+        self.assertEqual(resp.status_code, 404)
 
     def test_update_vault_same_name(self):
         """Update vault with its existing name -> returns 200 (not 409)."""
         vault_id = self._create_vault_via_api("Research", "Original description")
         resp = self.client.put(
-            f"/api/vaults/{vault_id}",
-            json={"name": "Research"}
-        )
+             f"/api/vaults/{vault_id}",
+             json={"name": "Research"}
+         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["name"], "Research")
+
+
+class TestAccessibleVaultsEndpoint(unittest.TestCase):
+    """Test suite for /vaults/accessible endpoint with permission filtering."""
+
+    def setUp(self):
+        self.client = TestClient(app)
+        self._temp_dir = tempfile.mkdtemp()
+        db_path = str(Path(self._temp_dir) / "test.db")
+        from app.models.database import init_db
+        init_db(db_path)
+        self._connection_pool = SimpleConnectionPool(db_path)
+
+        # Insert test users (required for FK constraints)
+        conn = self._connection_pool.get_connection()
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
+            (1, "admin", "abc123", "superadmin", 1),
+        )
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
+            (2, "user2", "abc123", "member", 1),
+        )
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
+            (3, "adminuser", "abc123", "admin", 1),
+        )
+        conn.commit()
+        self._connection_pool.release_connection(conn)
+
+        def override_get_db():
+            conn = self._connection_pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self._connection_pool.release_connection(conn)
+
+        app.dependency_overrides[get_db] = override_get_db
+
+    def tearDown(self):
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_active_user, None)
+        if hasattr(self, '_connection_pool'):
+            self._connection_pool.close_all()
+        import shutil
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def _get_db_conn(self):
+        """Get a raw connection for test data setup."""
+        conn = self._connection_pool.get_connection()
+        return conn
+
+    def _insert_user(self, conn, user_id, username, role="member", is_active=1):
+        """Insert a test user."""
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, "abc123", role, is_active)
+        )
+        conn.commit()
+
+    def _insert_vault(self, conn, name, description="", org_id=None, visibility="private", owner_id=1):
+        """Insert a vault and return its id."""
+        cursor = conn.execute(
+            "INSERT INTO vaults (name, description, org_id, visibility, owner_id) VALUES (?, ?, ?, ?, ?)",
+            (name, description, org_id, visibility, owner_id)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+    def _insert_vault_member(self, conn, vault_id, user_id, permission="read", granted_by=1):
+        """Insert a vault membership."""
+        conn.execute(
+            "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (vault_id, user_id, permission, granted_by)
+        )
+        conn.commit()
+
+    def _insert_org(self, conn, name):
+        """Insert an organization and return its id."""
+        cursor = conn.execute(
+            "INSERT INTO organizations (name, created_by) VALUES (?, ?)",
+            (name, 1)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+    def _insert_group(self, conn, name, org_id, description=""):
+        """Insert a group and return its id."""
+        cursor = conn.execute(
+            "INSERT INTO groups (name, org_id, description) VALUES (?, ?, ?)",
+            (name, org_id, description)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+    def _insert_group_member(self, conn, group_id, user_id):
+        """Insert a group membership."""
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+            (group_id, user_id)
+        )
+        conn.commit()
+
+    def _insert_vault_group_access(self, conn, vault_id, group_id, permission="read", granted_by=1):
+        """Insert vault group access."""
+        conn.execute(
+            "INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (vault_id, group_id, permission, granted_by)
+        )
+        conn.commit()
+
+    def _insert_org_member(self, conn, org_id, user_id, role="member"):
+        """Insert an organization membership."""
+        conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (org_id, user_id, role)
+        )
+        conn.commit()
+
+    def _mock_user(self, user_id, username, role="member", is_active=1):
+        """Set up a mock user for the current test."""
+        app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": user_id,
+            "username": username,
+            "role": role,
+            "is_active": is_active,
+            "full_name": username,
+            "must_change_password": False,
+        }
+
+    # 1. Non-admin user tests
+
+    def test_accessible_vaults_empty_for_new_user(self):
+        """Non-admin user with no vault access sees empty list."""
+        self._mock_user(2, "newuser", role="user")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 0)
+
+    def test_accessible_vaults_direct_member_sees_vault(self):
+        """User with direct vault membership sees vault in accessible list."""
+        # Create vault
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "MyVault")
+            # Add user as member
+            self._insert_vault_member(conn, vault_id, 2, "read")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # User 2 should see the vault
+        self._mock_user(2, "user2", role="user")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 1)
+        self.assertEqual(data["vaults"][0]["name"], "MyVault")
+        self.assertEqual(data["vaults"][0]["current_user_permission"], "read")
+
+    def test_accessible_vaults_not_seen_without_permission(self):
+        """User without vault access does NOT see it in accessible list."""
+        # Create vault for user 1
+        conn = self._get_db_conn()
+        try:
+            self._insert_vault(conn, "OtherVault")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # User 2 should NOT see it
+        self._mock_user(2, "user2", role="user")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 0)
+
+    def test_accessible_vaults_group_member_sees_vault(self):
+        """User with group access sees vault in accessible list."""
+        conn = self._get_db_conn()
+        try:
+            # Create vault and grant group access
+            vault_id = self._insert_vault(conn, "GroupVault")
+            org_id = self._insert_org(conn, "TestOrg")
+            group_id = self._insert_group(conn, "TestGroup", org_id)
+            self._insert_group_member(conn, group_id, 2)  # User 2 in group
+            self._insert_vault_group_access(conn, vault_id, group_id, "write")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        self._mock_user(2, "user2", role="user")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 1)
+        self.assertEqual(data["vaults"][0]["name"], "GroupVault")
+        self.assertEqual(data["vaults"][0]["current_user_permission"], "write")
+
+    def test_accessible_vaults_public_sees_public_vault(self):
+        """User can see public vaults without explicit membership."""
+        conn = self._get_db_conn()
+        try:
+            self._insert_vault(conn, "PublicVault", visibility="public")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        self._mock_user(2, "user2", role="user")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 1)
+        self.assertEqual(data["vaults"][0]["name"], "PublicVault")
+
+    def test_accessible_vaults_org_member_sees_org_vault(self):
+        """User in org can see org-level public/visible vaults."""
+        conn = self._get_db_conn()
+        try:
+            org_id = self._insert_org(conn, "MyOrg")
+            self._insert_org_member(conn, org_id, 2)  # User 2 in org
+            self._insert_vault(conn, "OrgVault", org_id=org_id, visibility="org")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        self._mock_user(2, "user2", role="user")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 1)
+        self.assertEqual(data["vaults"][0]["name"], "OrgVault")
+
+    def test_accessible_vaults_org_member_cant_see_other_org_vault(self):
+        """User cannot see vaults from other organizations."""
+        conn = self._get_db_conn()
+        try:
+            # Create two organizations
+            org1_id = self._insert_org(conn, "Org1")
+            org2_id = self._insert_org(conn, "Org2")
+            self._insert_org_member(conn, org1_id, 2)  # User 2 only in org1
+
+            # Create vault in org2 (private visibility - not visible to org1 user)
+            self._insert_vault(conn, "OtherOrgVault", org_id=org2_id, visibility="private")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        self._mock_user(2, "user2", role="user")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 0)
+
+    # 2. Admin user tests - should see ALL vaults
+
+    def test_accessible_vaults_admin_sees_all(self):
+        """Admin user sees ALL vaults via /vaults/accessible."""
+        conn = self._get_db_conn()
+        try:
+            # Create multiple vaults
+            self._insert_vault(conn, "Vault1")
+            self._insert_vault(conn, "Vault2")
+            self._insert_vault(conn, "Vault3")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # Admin user should see all vaults
+        self._mock_user(3, "adminuser", role="admin")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 3)
+        vault_names = {v["name"] for v in data["vaults"]}
+        self.assertEqual(vault_names, {"Vault1", "Vault2", "Vault3"})
+
+    def test_accessible_vaults_superadmin_sees_all(self):
+        """Superadmin user sees ALL vaults via /vaults/accessible."""
+        conn = self._get_db_conn()
+        try:
+            # Create multiple vaults
+            self._insert_vault(conn, "Vault1")
+            self._insert_vault(conn, "Vault2")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # Superadmin user should see all vaults
+        self._mock_user(2, "superadmin", role="superadmin")
+        resp = self.client.get("/api/vaults/accessible")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 2)
+
+    # FR-001 test - verify admin endpoint /vaults still works and shows ALL vaults
+    def test_admin_vaults_endpoint_shows_all(self):
+        """Admin /vaults endpoint returns ALL vaults (not filtered)."""
+        conn = self._get_db_conn()
+        try:
+            # Create vaults that user 2 would NOT have access to directly
+            self._insert_vault(conn, "Vault1")
+            self._insert_vault(conn, "Vault2")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # Admin user accessing /vaults (not /vaults/accessible)
+        self._mock_user(3, "adminuser", role="admin")
+        resp = self.client.get("/api/vaults")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("vaults", data)
+        self.assertEqual(len(data["vaults"]), 2)
 
 
 class TestVaultScopedRoutes(unittest.TestCase):
@@ -962,6 +1280,406 @@ class TestVaultScopedRoutes(unittest.TestCase):
         mock_vs.search.assert_called_once()
         call_kwargs = mock_vs.search.call_args[1]
         self.assertIsNone(call_kwargs.get("vault_id"))
+
+
+class TestFetchAccessibleVaultsAdversarial(unittest.TestCase):
+    """Adversarial tests for _fetch_accessible_vaults SQL prefilter security."""
+
+    def setUp(self):
+        self._temp_dir = tempfile.mkdtemp()
+        db_path = str(Path(self._temp_dir) / "test.db")
+        from app.models.database import init_db
+        init_db(db_path)
+        self._connection_pool = SimpleConnectionPool(db_path)
+
+        # Insert test users
+        conn = self._connection_pool.get_connection()
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
+            (1, "admin", "abc123", "superadmin", 1),
+        )
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
+            (2, "regularuser", "abc123", "member", 1),
+        )
+        conn.commit()
+        self._connection_pool.release_connection(conn)
+
+        # We need to import asyncio to run async functions
+        import app.api.routes.vaults as vaults_module
+        self._vaults_module = vaults_module
+
+    def tearDown(self):
+        if hasattr(self, '_connection_pool'):
+            self._connection_pool.close_all()
+        import shutil
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def _get_db_conn(self):
+        """Get a raw connection for test data setup."""
+        conn = self._connection_pool.get_connection()
+        return conn
+
+    def _insert_vault(self, conn, name, visibility="private", org_id=None):
+        """Insert a vault and return its id."""
+        cursor = conn.execute(
+            "INSERT INTO vaults (name, description, visibility, org_id, owner_id) VALUES (?, ?, ?, ?, ?)",
+            (name, f"desc_{name}", visibility, org_id, 1)
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+    def _insert_vault_member(self, conn, vault_id, user_id, permission="read"):
+        """Insert a vault membership."""
+        conn.execute(
+            "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (vault_id, user_id, permission, 1)
+        )
+        conn.commit()
+
+    def _run_async(self, coro):
+        """Run an async coroutine synchronously for testing."""
+        import asyncio
+        return asyncio.run(coro)
+
+    # ===== 1. SQL Injection via crafted user_id values =====
+
+    def test_adversarial_sql_injection_or_true(self):
+        """SQL injection attempt: ' OR '1'='1 should be safely parameterized."""
+        conn = self._get_db_conn()
+        try:
+            # Create a vault that user 2 has access to
+            vault_id = self._insert_vault(conn, "LegitimateVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            # Attempt SQL injection via user_id
+            malicious_user = {"id": "' OR '1'='1", "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, malicious_user)
+            )
+
+            # Should return empty - injection string is not a valid user_id
+            # The parameterized query treats it as a literal string, not SQL
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_sql_injection_drop_table(self):
+        """SQL injection attempt: '; DROP TABLE users;-- should be safely parameterized."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            # Attempt SQL injection with DROP TABLE
+            malicious_user = {"id": "'; DROP TABLE users;--", "role": "member"}
+
+            # Verify tables still exist after the call
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, malicious_user)
+            )
+
+            # Should return empty and NOT drop any tables
+            self.assertEqual(len(result), 0)
+
+            # Verify users table still exists
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            self.assertIsNotNone(cursor.fetchone(), "users table should still exist after injection attempt")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_sql_injection_union_bypass(self):
+        """SQL injection attempt: UNION-based bypass should be safely parameterized."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "PrivateVault")
+            # Note: user 999 does NOT have access to this vault
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            # Attempt UNION injection
+            malicious_user = {"id": "1 UNION SELECT id FROM users--", "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, malicious_user)
+            )
+
+            # Should return empty - injection is treated as literal string
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_sql_injection_comment_eof(self):
+        """SQL injection attempt: trailing comments should be safely parameterized."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            # Attempt with trailing comment
+            malicious_user = {"id": "2 --", "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, malicious_user)
+            )
+
+            # user_id "2 --" is treated as literal string, not comment
+            # Should not match user 2's actual vault
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    # ===== 2. User with no id field =====
+
+    def test_adversarial_user_missing_id_field(self):
+        """User dict with no 'id' key should return empty list."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            # User without id field
+            user_no_id = {"username": "someuser", "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, user_no_id)
+            )
+
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_user_id_is_none(self):
+        """User dict with id=None should return empty list."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            user_with_none_id = {"id": None, "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, user_with_none_id)
+            )
+
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_user_id_empty_string(self):
+        """User dict with id='' should return empty list."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            user_with_empty_id = {"id": "", "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, user_with_empty_id)
+            )
+
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    # ===== 3. User is None =====
+
+    def test_adversarial_user_is_none(self):
+        """user=None should return empty list."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, None)
+            )
+
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    # ===== 4. Special characters in user_id =====
+
+    def test_adversarial_user_id_unicode(self):
+        """Unicode characters in user_id should be safely handled."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            unicode_user = {"id": "\u0000\u2027\uFEFF", "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, unicode_user)
+            )
+
+            # Should return empty - unicode is not a valid user_id
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_user_id_newlines(self):
+        """Newlines and control characters in user_id should be safely handled."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            malicious_user = {"id": "2\nDROP TABLE users;\n", "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, malicious_user)
+            )
+
+            # Should return empty and NOT drop any tables
+            self.assertEqual(len(result), 0)
+
+            # Verify users table still exists
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            self.assertIsNotNone(cursor.fetchone(), "users table should still exist")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_user_id_sql_wildcards(self):
+        """SQL wildcards % and _ in user_id should be treated as literals."""
+        conn = self._get_db_conn()
+        try:
+            vault_id = self._insert_vault(conn, "TestVault")
+            self._insert_vault_member(conn, vault_id, 2, "read")
+
+            # User id with SQL wildcards
+            wildcard_user = {"id": "%", "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, wildcard_user)
+            )
+
+            # Should return empty - % is not a valid user_id
+            self.assertEqual(len(result), 0)
+
+            wildcard_user2 = {"id": "_", "role": "member"}
+            result2 = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, wildcard_user2)
+            )
+            self.assertEqual(len(result2), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    # ===== 5. Large number of vault memberships (DoS prevention) =====
+
+    def test_adversarial_many_vault_memberships_performance(self):
+        """User with many vault memberships should not cause DoS."""
+        conn = self._get_db_conn()
+        try:
+            # Create 100 vaults and add user 2 to all of them
+            vault_ids = []
+            for i in range(100):
+                vid = self._insert_vault(conn, f"Vault_{i}")
+                self._insert_vault_member(conn, vid, 2, "read")
+                vault_ids.append(vid)
+
+            user = {"id": 2, "role": "member"}
+
+            import time
+            start = time.time()
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, user)
+            )
+            elapsed = time.time() - start
+
+            # Should complete in reasonable time (< 5 seconds)
+            self.assertLess(elapsed, 5.0, "Should not take more than 5 seconds for 100 vaults")
+            # Should return all 100 vaults
+            self.assertEqual(len(result), 100)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_empty_vault_ids_result(self):
+        """User with access to no vaults should return empty list efficiently."""
+        conn = self._get_db_conn()
+        try:
+            # Create vault but DON'T give user 2 access
+            self._insert_vault(conn, "PrivateVault")
+
+            user = {"id": 2, "role": "member"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, user)
+            )
+
+            self.assertEqual(len(result), 0)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    # ===== 6. Phantom/non-existent vault IDs - handled by SQL FK constraints =====
+
+    def test_adversarial_phantom_vault_id_not_possible(self):
+        """Cannot insert phantom vault_id due to FK constraint - verified by SQLite."""
+        conn = self._get_db_conn()
+        try:
+            # Verify FK constraints prevent phantom vault references
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+                    (99999, 2, "read", 1)
+                )
+                conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    # ===== 7. Role bypass attempts =====
+
+    def test_adversarial_fake_admin_role(self):
+        """Function trusts role field - passing admin returns all vaults.
+
+        Note: The _fetch_accessible_vaults function trusts the role field in the
+        user dict. Actual admin verification happens at the route layer via
+        get_current_active_user dependency. This test documents that the function
+        itself does not validate admin status against the database.
+        """
+        conn = self._get_db_conn()
+        try:
+            # Create vault
+            self._insert_vault(conn, "OtherVault")
+
+            # User 2 claims to be admin - function trusts this
+            user_fake_admin = {"id": 2, "role": "admin"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, user_fake_admin)
+            )
+
+            # Since role="admin", function calls _fetch_all_vaults and returns ALL vaults
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].name, "OtherVault")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_adversarial_fake_superadmin_role(self):
+        """Function trusts role field - passing superadmin returns all vaults.
+
+        Same as above - the function trusts the role field. Actual security
+        is enforced at the route layer.
+        """
+        conn = self._get_db_conn()
+        try:
+            # Create vault that user 2 does NOT have access to
+            self._insert_vault(conn, "TrulyPrivateVault", visibility="private")
+
+            user_fake_superadmin = {"id": 2, "role": "superadmin"}
+
+            result = self._run_async(
+                self._vaults_module._fetch_accessible_vaults(conn, user_fake_superadmin)
+            )
+
+            # Since role="superadmin", function calls _fetch_all_vaults
+            # and returns ALL vaults regardless of actual permissions
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].name, "TrulyPrivateVault")
+        finally:
+            self._connection_pool.release_connection(conn)
 
 
 if __name__ == '__main__':
