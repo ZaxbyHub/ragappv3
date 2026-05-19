@@ -13,6 +13,7 @@ import httpx
 
 from app.config import settings
 from app.services.circuit_breaker import CircuitBreakerError, embeddings_cb
+from app.services.ssrf import assert_url_safe
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,8 @@ class EmbeddingService:
             raise EmbeddingError("Embedding service is not configured")
         if not base_url.startswith(("http://", "https://")):
             raise EmbeddingError("Invalid embedding URL configuration")
+
+        assert_url_safe(base_url)
 
         self.timeout = 60.0
 

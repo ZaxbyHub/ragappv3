@@ -526,26 +526,53 @@ ab -n 100 -c 10 http://localhost:9090/health
 
 ## Security
 
+### Authentication
+
+KnowledgeVault has built-in JWT-based authentication with role-based access control:
+
+**User Roles:**
+- `superadmin` — Full system access, manages other admins
+- `admin` — Full system access, can manage members and viewers
+- `member` — Can create and update documents
+- `viewer` — Read-only access
+
+**Setup:**
+- When `USERS_ENABLED=True`, set `ADMIN_SECRET_TOKEN` in `.env` to create the first admin user
+- The initial admin can then invite other users via email or create accounts manually
+- JWT tokens are stored in httpOnly refresh cookies for security
+
+**Options:**
+1. **Single-Admin Mode** (`USERS_ENABLED=false`): The `ADMIN_SECRET_TOKEN` is the sole authentication mechanism — whoever possesses the token is the admin.
+
+2. **Multi-User Mode** (`USERS_ENABLED=true`): Requires `ADMIN_SECRET_TOKEN` to be set for the initial admin account, then allows user management via the UI.
+
 ### Network Security
 
-KnowledgeVault has no built-in authentication. Secure it at the network level:
+Deploy KnowledgeVault behind a reverse proxy for additional security layers:
 
 **Option 1: Localhost Only (Safest)**
 - Keep default configuration
 - Access only from the same machine
 
-**Option 2: Reverse Proxy with Auth**
+**Option 2: Reverse Proxy with TLS**
 ```nginx
 # nginx.conf
 server {
-    listen 80;
+    listen 443 ssl http2;
     server_name knowledgevault.example.com;
     
+    # TLS configuration
+    ssl_certificate /etc/ssl/certs/knowledgevault.crt;
+    ssl_certificate_key /etc/ssl/private/knowledgevault.key;
+    
+    # Optional: additional auth layer (beyond app-level JWT)
     auth_basic "KnowledgeVault";
     auth_basic_user_file /etc/nginx/.htpasswd;
     
     location / {
         proxy_pass http://localhost:9090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 ```
@@ -553,6 +580,12 @@ server {
 **Option 3: VPN/Private Network**
 - Deploy behind corporate VPN
 - Use private subnet access controls
+
+**Reverse Proxy Purpose:**
+- TLS termination (HTTPS)
+- Optional additional authentication layer (e.g., Basic Auth for extranet access)
+- Request rate limiting
+- DDoS protection
 
 ### File Upload Security
 
@@ -583,7 +616,9 @@ knowledgevault.example.com {
 - [ ] Review access logs monthly
 - [ ] Update Docker images quarterly
 - [ ] Rotate backup encryption keys annually
-- [ ] Audit user access (if using reverse proxy auth)
+- [ ] Rotate `ADMIN_SECRET_TOKEN` and `JWT_SECRET_KEY` annually
+- [ ] Audit user roles (superadmin/admin/member/viewer) quarterly
+- [ ] Rotate JWT secret key when team members with admin access leave
 
 ---
 

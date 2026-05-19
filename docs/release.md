@@ -91,13 +91,14 @@ Before deploying KnowledgeVault to production, ensure the following:
   # Security settings
   ADMIN_SECRET_TOKEN=<secure-random-token>
   AUDIT_HMAC_KEY_VERSION=v1
+  AUDIT_HMAC_KEY=<your-hmac-key>
+  AUDIT_HMAC_KEY_V1=<your-hmac-key-v1>
   
   # Rate limiting
   ADMIN_RATE_LIMIT=10/minute
   CSRF_TOKEN_TTL=900
   
-  # Feature flags
-  ENABLE_MODEL_VALIDATION=false
+   
   ```
 
 ### Health Verification

@@ -1,3 +1,5 @@
+import sqlite3
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
@@ -177,7 +179,7 @@ def add_vault_member(
             "granted_at": row[4],
             "granted_by": row[5],
         }
-    except Exception:
+    except sqlite3.IntegrityError:
         conn.rollback()
         raise HTTPException(
             status_code=409, detail="User is already a member of this vault"
@@ -431,7 +433,7 @@ def grant_vault_group_access(
     except HTTPException:
         conn.rollback()
         raise
-    except Exception:
+    except sqlite3.IntegrityError:
         conn.rollback()
         raise HTTPException(
             status_code=409, detail="Group already has access to this vault"

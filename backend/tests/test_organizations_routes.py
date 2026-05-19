@@ -340,6 +340,23 @@ class TestCreateOrganization:
 class TestListOrganizations:
     """Tests for GET /organizations endpoint."""
 
+    def test_admin_sees_all_orgs(self, client):
+        """Admin sees all organizations (200)."""
+        org1 = _create_org("Admin Org One", 2)  # admin1 as owner
+        org2 = _create_org("Admin Org Two", 1)  # superadmin as owner
+        _add_org_member(org1, 3, "member")  # member1 is a member of org1
+
+        response = client.get("/api/organizations", headers=auth_headers(admin_token))
+        assert response.status_code == 200
+        data = response.json()
+        assert "organizations" in data
+        assert "total" in data
+        # admin should see both orgs (all orgs, not just their own)
+        assert data["total"] == 2
+        org_ids = [o["id"] for o in data["organizations"]]
+        assert org1 in org_ids
+        assert org2 in org_ids
+
     def test_member_sees_their_orgs(self, client):
         """Member sees only their organizations (200)."""
         # Create org with admin1 as owner, add member1
@@ -392,6 +409,14 @@ class TestGetOrganization:
         )
         assert response.status_code == 403
 
+    def test_nonexistent_org_returns_404(self, client):
+        """Non-existent organization returns 404."""
+        response = client.get(
+            "/api/organizations/999999", headers=auth_headers(member_token)
+        )
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
 
 class TestUpdateOrganization:
     """Tests for PATCH /organizations/{org_id} endpoint."""
@@ -430,6 +455,19 @@ class TestUpdateOrganization:
             headers=auth_headers(admin_token),
         )
         assert response.status_code == 404
+
+    def test_duplicate_name_returns_409(self, client):
+        """Updating org name to an existing org's name returns 409."""
+        _ = _create_org("Unique Org A", 2)
+        _ = _create_org("Unique Org B", 2)
+
+        response = client.patch(
+            f"/api/organizations/{org2_id}",
+            json={"name": "Unique Org A"},
+            headers=auth_headers(admin_token),
+        )
+        assert response.status_code == 409
+        assert "conflict" in response.json()["detail"].lower()
 
 
 class TestAddOrgMember:
@@ -502,6 +540,19 @@ class TestAddOrgMember:
             headers=auth_headers(admin_token),
         )
         assert response.status_code == 200
+
+    def test_duplicate_member_returns_409(self, client):
+        """Adding a user already in the org returns 409."""
+        org_id = _create_org("Dup Member Org", 2)  # admin1 as owner
+        _add_org_member(org_id, 3, "member")  # add member1
+
+        response = client.post(
+            f"/api/organizations/{org_id}/members",
+            json={"user_id": 3, "role": "member"},
+            headers=auth_headers(admin_token),
+        )
+        assert response.status_code == 409
+        assert "already a member" in response.json()["detail"].lower()
 
 
 class TestUpdateOrgMemberRole:

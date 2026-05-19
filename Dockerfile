@@ -40,6 +40,15 @@ COPY --from=frontend-builder /app/frontend/dist ./static
 # Create data directory
 RUN mkdir -p /data/knowledgevault
 
+# Create non-root runtime user
+RUN adduser --disabled-password --gecos '' appuser
+
+# Set ownership for runtime user
+RUN chown -R appuser:appuser /app /data
+
+# Switch to non-root user
+USER appuser
+
 EXPOSE 9090
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090"]

@@ -9,6 +9,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
 from app.config import settings
 from app.security import CSRFManager, issue_csrf_token
+from app.services.ssrf import URLBlocked, assert_url_safe
 
 router = APIRouter()
 
@@ -805,10 +806,20 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
     if settings.reranker_url:
         targets["reranker"] = settings.reranker_url
 
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
         results = {}
         for name, url in targets.items():
             try:
+                try:
+                    assert_url_safe(url)
+                except URLBlocked as exc:
+                    results[name] = {
+                        "url": url,
+                        "status": None,
+                        "ok": False,
+                        "error": f"SSRF blocked: {exc}",
+                    }
+                    continue
                 response = await client.get(url)
                 results[name] = {
                     "url": url,

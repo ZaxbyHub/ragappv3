@@ -9,6 +9,7 @@ Supports two backends:
      Model is loaded lazily on first use and cached.
 """
 
+import asyncio
 import logging
 import math
 import threading
@@ -18,6 +19,7 @@ import httpx
 
 from app.config import settings
 from app.services.circuit_breaker import CircuitBreakerError, reranking_cb
+from app.services.ssrf import assert_url_safe
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +177,7 @@ class RerankingService:
             "top_n": top_n,
             "truncate": True,
         }
+        await asyncio.to_thread(assert_url_safe, self.reranker_url)
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=30.0)
         try:
@@ -207,8 +210,6 @@ class RerankingService:
         Rerank using a locally loaded sentence-transformers CrossEncoder.
         Runs in a thread to avoid blocking the event loop.
         """
-        import asyncio
-
         def _score():
             model = _get_local_model(self.reranker_model)
             pairs = [(query, text) for text in texts]

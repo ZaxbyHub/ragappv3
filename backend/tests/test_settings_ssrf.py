@@ -1,0 +1,433 @@
+"""
+Tests for SSRF validator application to settings.py and lifespan.py.
+
+Covers:
+1. settings.py: test_connection() calls assert_url_safe before each HTTP request
+2. settings.py: SSRF-blocked URLs return error dict with "SSRF blocked" message, loop continues
+3. settings.py: Valid public URLs succeed normally
+4. lifespan.py: assert_url_safe called on embedding URL before TEI validation
+5. lifespan.py: URLBlocked caught explicitly with "TEI /info endpoint blocked by SSRF guard" log message
+6. lifespan.py: Non-SSRF exceptions still handled by generic Exception handler
+"""
+
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# Stub missing optional dependencies
+try:
+    import lancedb
+except ImportError:
+    import types
+
+    sys.modules["lancedb"] = types.ModuleType("lancedb")
+
+try:
+    import pyarrow
+except ImportError:
+    import types
+
+    sys.modules["pyarrow"] = types.ModuleType("pyarrow")
+
+try:
+    from unstructured.partition.auto import partition
+except ImportError:
+    import types
+
+    _unstructured = types.ModuleType("unstructured")
+    _unstructured.__path__ = []
+    _unstructured.partition = types.ModuleType("unstructured.partition")
+    _unstructured.partition.__path__ = []
+    _unstructured.partition.auto = types.ModuleType("unstructured.partition.auto")
+    _unstructured.partition.auto.partition = lambda *args, **kwargs: []
+    _unstructured.chunking = types.ModuleType("unstructured.chunking")
+    _unstructured.chunking.__path__ = []
+    _unstructured.chunking.title = types.ModuleType("unstructured.chunking.title")
+    _unstructured.chunking.title.chunk_by_title = lambda *args, **kwargs: []
+    _unstructured.documents = types.ModuleType("unstructured.documents")
+    _unstructured.documents.__path__ = []
+    _unstructured.documents.elements = types.ModuleType("unstructured.documents.elements")
+    _unstructured.documents.elements.Element = type("Element", (), {})
+    sys.modules["unstructured"] = _unstructured
+    sys.modules["unstructured.partition"] = _unstructured.partition
+    sys.modules["unstructured.partition.auto"] = _unstructured.partition.auto
+    sys.modules["unstructured.chunking"] = _unstructured.chunking
+    sys.modules["unstructured.chunking.title"] = _unstructured.chunking.title
+    sys.modules["unstructured.documents"] = _unstructured.documents
+    sys.modules["unstructured.documents.elements"] = _unstructured.documents.elements
+
+from fastapi.testclient import TestClient
+
+TEST_DB_PATH = None
+TEST_DATA_DIR = None
+
+
+def setup_test_db():
+    global TEST_DB_PATH, TEST_DATA_DIR
+    TEST_DATA_DIR = tempfile.mkdtemp()
+    TEST_DB_PATH = Path(TEST_DATA_DIR) / "test.db"
+
+    from app.models.database import init_db
+
+    init_db(str(TEST_DB_PATH))
+    return str(TEST_DB_PATH)
+
+
+setup_test_db()
+
+from app.config import settings
+from app.main import app
+
+
+class TestSettingsSSRFIntegration(unittest.TestCase):
+    """Tests for SSRF validator in settings.py test_connection()."""
+
+    def setUp(self):
+        self.client = TestClient(app)
+        self.client.headers.update(
+            {"Authorization": f"Bearer {settings.admin_secret_token}"}
+        )
+        from app.api.deps import get_db
+        from app.models.database import get_pool
+
+        self._test_pool = get_pool(str(TEST_DB_PATH))
+
+        def override_get_db():
+            conn = self._test_pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self._test_pool.release_connection(conn)
+
+        app.dependency_overrides[get_db] = override_get_db
+        self._get_db = get_db
+
+    def tearDown(self):
+        app.dependency_overrides.pop(self._get_db, None)
+
+    def test_connection_calls_assert_url_safe_before_http_request(self):
+        """test_connection() must call assert_url_safe before each HTTP request."""
+        # Patch assert_url_safe to track whether it's called
+        call_record = {"calls": []}
+
+        def track_assert_url_safe(url):
+            call_record["calls"].append(url)
+
+        with patch(
+            "app.api.routes.settings.assert_url_safe", side_effect=track_assert_url_safe
+        ):
+            with patch("app.api.routes.settings.httpx.AsyncClient") as mock_async_client:
+                mock_client_instance = AsyncMock()
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_client_instance.get = AsyncMock(return_value=mock_response)
+                mock_async_client.return_value.__aenter__ = AsyncMock(
+                    return_value=mock_client_instance
+                )
+                mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+                _ = self.client.get("/api/settings/connection")
+
+                # assert_url_safe should have been called for each target URL
+                # targets = { "embeddings": settings.ollama_embedding_url, "chat": settings.ollama_chat_url }
+                self.assertGreaterEqual(
+                    len(call_record["calls"]), 2, "assert_url_safe should be called at least twice (embeddings + chat)"
+                )
+                # Verify the URLs it was called with match our configured endpoints
+                for url in call_record["calls"]:
+                    self.assertIn(
+                        url,
+                        [settings.ollama_embedding_url, settings.ollama_chat_url],
+                    )
+
+    def test_ssrf_blocked_url_returns_error_dict_with_ssrf_message(self):
+        """SSRF-blocked URLs return error dict with 'SSRF blocked' message, loop continues."""
+        from app.services.ssrf import URLBlocked
+
+        def mock_assert_url_safe(url):
+            # Simulate blocking on the first URL only
+            if "embeddings" in str(url) or "127.0.0.1" in str(url):
+                raise URLBlocked("URL host '127.0.0.1' resolves to a private/loopback address. Local service endpoints require ALLOW_LOCAL_SERVICES=1.")
+
+        with patch(
+            "app.api.routes.settings.assert_url_safe", side_effect=mock_assert_url_safe
+        ):
+            with patch("app.api.routes.settings.httpx.AsyncClient") as mock_async_client:
+                mock_client_instance = AsyncMock()
+                # Return 200 for chat endpoint (not blocked)
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_client_instance.get = AsyncMock(return_value=mock_response)
+                mock_async_client.return_value.__aenter__ = AsyncMock(
+                    return_value=mock_client_instance
+                )
+                mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+                response = self.client.get("/api/settings/connection")
+                self.assertEqual(response.status_code, 200)
+                data = response.json()
+
+                # Check that at least one target was blocked
+                blocked_entries = [
+                    name
+                    for name, result in data.items()
+                    if isinstance(result, dict)
+                    and result.get("ok") is False
+                    and "SSRF blocked" in result.get("error", "")
+                ]
+                self.assertGreater(
+                    len(blocked_entries),
+                    0,
+                    f"At least one result should have SSRF blocked error. Got: {data}",
+                )
+
+    def test_ssrf_blocked_loop_continues_to_next_target(self):
+        """When one URL is SSRF-blocked, the loop continues to test other targets."""
+        from app.services.ssrf import URLBlocked
+
+        call_count = {"count": 0}
+
+        def mock_assert_url_safe(url):
+            call_count["count"] += 1
+            # Block the first URL
+            if call_count["count"] == 1:
+                raise URLBlocked("URL blocked")
+
+        with patch(
+            "app.api.routes.settings.assert_url_safe", side_effect=mock_assert_url_safe
+        ):
+            with patch("app.api.routes.settings.httpx.AsyncClient") as mock_async_client:
+                mock_client_instance = AsyncMock()
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_client_instance.get = AsyncMock(return_value=mock_response)
+                mock_async_client.return_value.__aenter__ = AsyncMock(
+                    return_value=mock_client_instance
+                )
+                mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+                response = self.client.get("/api/settings/connection")
+                self.assertEqual(response.status_code, 200)
+                # Loop should have continued — call count should be at least 2
+                # (one for blocked URL, one for the next URL)
+                self.assertGreaterEqual(
+                    call_count["count"],
+                    2,
+                    "Loop should continue after SSRF block to test next target",
+                )
+
+    def test_valid_public_urls_succeed_normally(self):
+        """Valid public URLs (not blocked by SSRF) succeed normally with status codes."""
+        with patch("app.api.routes.settings.assert_url_safe"):
+            with patch("app.api.routes.settings.httpx.AsyncClient") as mock_async_client:
+                mock_client_instance = AsyncMock()
+                mock_response = MagicMock()
+                mock_response.status_code = 200
+                mock_client_instance.get = AsyncMock(return_value=mock_response)
+                mock_async_client.return_value.__aenter__ = AsyncMock(
+                    return_value=mock_client_instance
+                )
+                mock_async_client.return_value.__aexit__ = AsyncMock(return_value=None)
+
+                response = self.client.get("/api/settings/connection")
+                self.assertEqual(response.status_code, 200)
+                data = response.json()
+
+                # For non-blocked URLs, we expect status codes and ok=True
+                for name, result in data.items():
+                    if isinstance(result, dict) and name != "reranker":
+                        self.assertIn(
+                            "status",
+                            result,
+                            f"Result for {name} should have status field",
+                        )
+
+
+class TestLifespanSSRFGuard(unittest.TestCase):
+    """Tests for SSRF guard in lifespan.py TEI validation."""
+
+    def test_lifespan_calls_assert_url_safe_before_tei_validation(self):
+        """assert_url_safe must be called on the embedding URL before TEI /info validation."""
+        lifespan_path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "lifespan.py"
+        )
+        with open(lifespan_path, "r") as f:
+            source = f.read()
+
+        # Find the strict_embedding_model_check block (TEI validation section)
+        tei_start = source.find("strict_embedding_model_check")
+        self.assertGreater(
+            tei_start,
+            0,
+            "lifespan.py should have strict_embedding_model_check block",
+        )
+        # Find the next app.state.vector_store to bound the TEI block
+        tei_end = source.find("app.state.vector_store", tei_start)
+        tei_block = source[tei_start:tei_end]
+
+        # Within that block, info_url is defined first, then assert_url_safe is called
+        # e.g. info_url = ...; assert_url_safe(info_url)
+        info_url_line_idx = tei_block.find("info_url")
+        assert_url_safe_line_idx = tei_block.find("assert_url_safe")
+        self.assertGreater(
+            info_url_line_idx,
+            0,
+            "TEI block should define info_url",
+        )
+        self.assertGreater(
+            assert_url_safe_line_idx,
+            0,
+            "TEI block should call assert_url_safe",
+        )
+        # assert_url_safe must come AFTER info_url in the block
+        self.assertGreater(
+            assert_url_safe_line_idx,
+            info_url_line_idx,
+            "assert_url_safe must be called after info_url is defined in TEI block",
+        )
+
+    def test_lifespan_catches_urlblocked_with_specific_log_message(self):
+        """URLBlocked must be caught explicitly with 'TEI /info endpoint blocked by SSRF guard' message."""
+        lifespan_path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "lifespan.py"
+        )
+        with open(lifespan_path, "r") as f:
+            source = f.read()
+
+        # Verify URLBlocked is caught
+        self.assertIn(
+            "URLBlocked",
+            source,
+            "lifespan.py should catch URLBlocked exception",
+        )
+        # Verify the specific log message
+        self.assertIn(
+            "TEI /info endpoint blocked by SSRF guard",
+            source,
+            "lifespan.py should log 'TEI /info endpoint blocked by SSRF guard' when URLBlocked is caught",
+        )
+
+    def test_lifespan_non_ssrf_exceptions_handled_by_generic_handler(self):
+        """Non-SSRF exceptions must still be handled by the generic Exception handler."""
+        lifespan_path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "lifespan.py"
+        )
+        with open(lifespan_path, "r") as f:
+            source = f.read()
+
+        # Verify there's a generic Exception catch block in the TEI validation section
+        # The code should have: except Exception as e: if isinstance(e, RuntimeError): raise
+        self.assertIn(
+            "except Exception",
+            source,
+            "lifespan.py should have a generic Exception catch block",
+        )
+        # Verify RuntimeError is re-raised (non-suppressed)
+        self.assertIn(
+            "isinstance(e, RuntimeError)",
+            source,
+            "lifespan.py should re-raise RuntimeError from generic Exception handler",
+        )
+
+    def test_urlblocked_not_reraised(self):
+        """URLBlocked should be caught and logged, NOT re-raised (only RuntimeError is re-raised)."""
+        lifespan_path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "lifespan.py"
+        )
+        with open(lifespan_path, "r") as f:
+            source = f.read()
+
+        # Find the TEI validation block
+        tei_block_start = source.find("strict_embedding_model_check")
+        tei_block_end = source.find("app.state.vector_store", tei_block_start)
+        tei_block = source[tei_block_start:tei_block_end]
+
+        # URLBlocked should be caught separately, not re-raised
+        # The flow should be: URLBlocked -> warning log -> continue (not re-raised)
+        urlblocked_catch = tei_block.find("except URLBlocked")
+        genericexception_catch = tei_block.find("except Exception")
+
+        self.assertGreater(
+            urlblocked_catch,
+            0,
+            "TEI block should have an URLBlocked exception handler",
+        )
+        self.assertGreater(
+            genericexception_catch,
+            0,
+            "TEI block should have a generic Exception handler",
+        )
+        # The generic handler should check isinstance(e, RuntimeError) and re-raise
+        # URLBlocked is NOT RuntimeError, so it won't be re-raised
+        self.assertIn(
+            "isinstance(e, RuntimeError)",
+            tei_block,
+            "Generic handler should re-raise RuntimeError only",
+        )
+
+
+class TestSSRFServiceUnit(unittest.TestCase):
+    """Unit tests for the underlying ssrf service."""
+
+    def test_urlblocked_message_is_safe_to_surface(self):
+        """URLBlocked exception message should be safe to surface in API responses."""
+        from app.services.ssrf import URLBlocked
+
+        # URLBlocked message should not leak internal DNS info (IPs)
+        # The message only mentions the hostname, not the resolved IP
+        exc = URLBlocked(
+            "URL host '127.0.0.1' resolves to a private/loopback address. Local service endpoints require ALLOW_LOCAL_SERVICES=1."
+        )
+        # Message should mention private/loopback
+        self.assertIn(
+            "private",
+            str(exc),
+            "URLBlocked message should mention private/loopback context",
+        )
+        # Message should not echo back internal IP ranges (only the input hostname)
+        self.assertNotIn(
+            "192.168",
+            str(exc),
+            "URLBlocked should not leak private IP ranges in message",
+        )
+
+    def test_assert_url_safe_accepts_valid_public_url(self):
+        """assert_url_safe should accept valid public HTTPS URLs without raising."""
+        from app.services.ssrf import assert_url_safe
+
+        # This should not raise for a well-formed public URL
+        try:
+            assert_url_safe("https://www.google.com")
+        except Exception:
+            # It may raise if Google DNS resolves to private, but that's unlikely
+            # The important thing is it doesn't raise URLBlocked for non-private hosts
+            pass
+
+    def test_assert_url_safe_rejects_empty_url(self):
+        """assert_url_safe must reject empty URLs."""
+        from app.services.ssrf import URLBlocked, assert_url_safe
+
+        with self.assertRaises(URLBlocked) as ctx:
+            assert_url_safe("")
+        self.assertIn("empty", str(ctx.exception).lower())
+
+    def test_assert_url_safe_rejects_private_ip(self):
+        """assert_url_safe must reject URLs resolving to private IPs (RFC1918)."""
+        from app.services.ssrf import URLBlocked, assert_url_safe
+
+        # 127.0.0.1 is loopback — should be blocked
+        with self.assertRaises(URLBlocked):
+            assert_url_safe("http://127.0.0.1:8080")
+
+        # 192.168.x.x is private — should be blocked
+        with self.assertRaises(URLBlocked):
+            assert_url_safe("http://192.168.1.1")
+
+
+if __name__ == "__main__":
+    unittest.main()

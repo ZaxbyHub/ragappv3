@@ -28,6 +28,7 @@ from app.services.model_checker import ModelChecker
 from app.services.rag_engine import RAGEngine
 from app.services.reranking import RerankingService
 from app.services.secret_manager import SecretManager
+from app.services.ssrf import URLBlocked, assert_url_safe
 from app.services.toggle_manager import ToggleManager
 from app.services.vector_store import VectorStore, VectorStoreError
 from app.services.wiki_compile_processor import WikiCompileProcessor
@@ -250,6 +251,7 @@ async def lifespan(app: FastAPI):
                 info_url = (
                     app.state.embedding_service.embeddings_url.rstrip("/") + "/info"
                 )
+                assert_url_safe(info_url)
                 response = await client.get(info_url)
                 if response.status_code == 200:
                     info_data = response.json()
@@ -275,6 +277,10 @@ async def lifespan(app: FastAPI):
                     )
         except httpx.TimeoutException:
             logger.warning("TEI /info endpoint timed out, skipping model validation")
+        except URLBlocked as e:
+            logger.warning(
+                "TEI /info endpoint blocked by SSRF guard: %s (continuing)", e
+            )
         except Exception as e:
             if isinstance(e, RuntimeError):
                 raise  # Re-raise our own error

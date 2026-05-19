@@ -16,6 +16,8 @@ import os
 import socket
 from urllib.parse import urlparse
 
+from .ssrf import _is_blocked_address
+
 
 class CuratorURLBlocked(Exception):
     """Raised when a curator URL fails the SSRF guard.
@@ -37,39 +39,11 @@ def _local_opt_in_enabled() -> bool:
     return os.environ.get(_LOCAL_OPT_IN_ENV, "").strip() in ("1", "true", "True")
 
 
-def _is_blocked_address(ip: str) -> bool:
-    """Return True for private / loopback / link-local / multicast IPs."""
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        # Unresolvable bytes — treat as blocked rather than fail-open.
-        return True
-    return (
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_multicast
-        or addr.is_reserved
-        or addr.is_unspecified
-    )
-
-
 def assert_curator_url_safe(url: str) -> None:
     """Validate a curator URL and raise ``CuratorURLBlocked`` on rejection.
 
-    Rules:
-      - URL must be http:// or https://. Other schemes (file://, gopher://,
-        data://, javascript:) are denied unconditionally.
-      - URL may not include credentials (``user:pass@``).
-      - The hostname must resolve. If any resolved address is private /
-        loopback / link-local / multicast / reserved / unspecified, the
-        URL is denied unless ``ALLOW_LOCAL_CURATOR=1`` is set.
-      - Empty URL is treated as "curator disabled" — the caller is
-        responsible for not invoking this with an empty URL when curator
-        is enabled.
-
-    The caller is expected to also pass ``follow_redirects=False`` to its
-    HTTP client so a 30x to a private host can't bypass the guard.
+    Wraps the shared ssrf.assert_url_safe() logic but uses curator-specific
+    exception type and ALLOW_LOCAL_CURATOR opt-in (independent of ALLOW_LOCAL_SERVICES).
     """
     if not url or not url.strip():
         raise CuratorURLBlocked("Curator URL is empty.")

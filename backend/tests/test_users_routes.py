@@ -795,3 +795,340 @@ class TestUpdateUser(TestUserRoutes):
         assert response.status_code == 200
         data = response.json()
         assert data["full_name"] == "Updated Name"
+
+
+class TestCreateUser(TestUserRoutes):
+    """Tests for POST /users/ endpoint."""
+
+    def test_create_user_admin_can_create_member(self):
+        """Admin can create a new member user."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "newmember",
+                "password": "SecurePass123!",
+                "full_name": "New Member",
+                "role": "member",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["username"] == "newmember"
+        assert data["full_name"] == "New Member"
+        assert data["role"] == "member"
+        assert data["is_active"] is True
+        assert "id" in data
+        assert "created_at" in data
+        assert "hashed_password" not in data
+
+    def test_create_user_superadmin_can_create_superadmin(self):
+        """Superadmin can create another superadmin."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.superadmin_id, "superadmin", "superadmin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "newsuperadmin",
+                "password": "SecurePass123!",
+                "full_name": "New Superadmin",
+                "role": "superadmin",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["username"] == "newsuperadmin"
+        assert data["role"] == "superadmin"
+
+    def test_create_user_admin_cannot_create_superadmin(self):
+        """Admin cannot create superadmin - returns 403."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "newsuperadmin",
+                "password": "SecurePass123!",
+                "role": "superadmin",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 403
+        assert "superadmin" in response.json()["detail"].lower()
+
+    def test_create_user_duplicate_username_returns_400(self):
+        """Duplicate username returns 400."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "member",  # Already exists
+                "password": "SecurePass123!",
+                "role": "member",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 400
+        assert "already exists" in response.json()["detail"].lower()
+
+    def test_create_user_invalid_role_returns_400(self):
+        """Invalid role returns 400."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "newuser",
+                "password": "SecurePass123!",
+                "role": "invalid_role",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 400
+        assert "invalid role" in response.json()["detail"].lower()
+
+    def test_create_user_weak_password_returns_400(self):
+        """Weak password (no uppercase) returns 400 from password_strength_check."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "newuser",
+                "password": "weak1234",  # Passes Pydantic length check but no uppercase
+                "role": "member",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 400
+        assert "password" in response.json()["detail"].lower()
+
+    def test_create_user_username_too_short_returns_422(self):
+        """Username too short returns 422."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "ab",  # min_length=3
+                "password": "SecurePass123!",
+                "role": "member",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 422
+
+    def test_create_user_member_rejected(self):
+        """Member role cannot create users - returns 403."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.member_id, "member", "member")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "newuser",
+                "password": "SecurePass123!",
+                "role": "member",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 403
+
+
+class TestAdminResetPassword(TestUserRoutes):
+    """Tests for PATCH /users/{user_id}/password endpoint."""
+
+    def test_admin_reset_password_member(self):
+        """Admin can reset a member's password."""
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.patch(
+            f"/users/{self.member_id}/password",
+            json={"new_password": "NewSecurePass123!"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["message"] == "Password reset successfully"
+        assert data["must_change_password"] is True
+
+    def test_admin_reset_password_not_found(self):
+        """Resetting password for non-existent user returns 404."""
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.patch(
+            "/users/999/password",
+            json={"new_password": "NewSecurePass123!"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    def test_admin_reset_password_weak_password_returns_400(self):
+        """Weak password returns 400."""
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.patch(
+            f"/users/{self.member_id}/password",
+            json={"new_password": "weak"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 400
+        assert "password" in response.json()["detail"].lower()
+
+    def test_admin_reset_password_sets_must_change_password(self):
+        """Password reset sets must_change_password=1."""
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.patch(
+            f"/users/{self.member_id}/password",
+            json={"new_password": "NewSecurePass123!"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+
+        # Verify DB was updated
+        cursor = self.conn.execute(
+            "SELECT must_change_password FROM users WHERE id = ?", (self.member_id,)
+        )
+        assert cursor.fetchone()[0] == 1
+
+
+class TestGetUserOrganizations(TestUserRoutes):
+    """Tests for GET /users/{user_id}/organizations endpoint."""
+
+    @pytest.fixture(autouse=True)
+    def setup_orgs(self):
+        """Set up organizations and org_members table."""
+        # Create organizations table and org_members table
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS organizations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS org_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                org_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (org_id) REFERENCES organizations(id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members(user_id)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_org ON org_members(org_id)")
+        self.conn.commit()
+
+        # Create test organizations
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("Test Org 1", "First test organization"),
+        )
+        self.org1_id = cursor.lastrowid
+
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("Test Org 2", "Second test organization"),
+        )
+        self.org2_id = cursor.lastrowid
+
+        # Add member to org1 as admin
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org1_id, self.member_id, "admin"),
+        )
+        # Add member to org2 as member
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org2_id, self.member_id, "member"),
+        )
+        self.conn.commit()
+
+        yield
+
+        # Clean up org tables
+        self.conn.execute("DROP TABLE IF EXISTS org_members")
+        self.conn.execute("DROP TABLE IF EXISTS organizations")
+        self.conn.commit()
+
+    def test_get_user_organizations_returns_orgs(self):
+        """Admin can get user's organization memberships."""
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.get(
+            f"/users/{self.member_id}/organizations",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "organizations" in data
+        orgs = data["organizations"]
+        assert len(orgs) == 2
+
+        # Check org1
+        org1 = next(o for o in orgs if o["id"] == self.org1_id)
+        assert org1["name"] == "Test Org 1"
+        assert org1["role"] == "admin"
+
+        # Check org2
+        org2 = next(o for o in orgs if o["id"] == self.org2_id)
+        assert org2["name"] == "Test Org 2"
+        assert org2["role"] == "member"
+
+    def test_get_user_organizations_user_not_found(self):
+        """Non-existent user returns 404."""
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.get(
+            "/users/999/organizations",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    def test_get_user_organizations_no_orgs(self):
+        """User with no org memberships returns empty list."""
+        token = get_token(self.admin_id, "admin", "admin")
+        # viewer has no org memberships
+        response = self.client.get(
+            f"/users/{self.viewer_id}/organizations",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["organizations"] == []
+
+    def test_get_user_organizations_member_rejected(self):
+        """Member cannot view other users' organizations - returns 403."""
+        token = get_token(self.member_id, "member", "member")
+        response = self.client.get(
+            f"/users/{self.admin_id}/organizations",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 403

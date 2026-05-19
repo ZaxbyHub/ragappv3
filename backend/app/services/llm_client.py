@@ -15,6 +15,7 @@ from app.services.circuit_breaker import (
     CircuitBreakerState,
     create_llm_circuit_breaker,
 )
+from app.services.ssrf import assert_url_safe
 from app.utils.assistant_sanitizer import sanitize_assistant_content
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class LLMClient:
         self.base_url = (base_url or settings.ollama_chat_url).rstrip("/")
         self.model = model or settings.chat_model
         self.timeout = timeout
+        assert_url_safe(base_url or settings.ollama_chat_url)
         self._circuit_breaker = create_llm_circuit_breaker(name=cb_name)
         self._client: Optional[httpx.AsyncClient] = None
 

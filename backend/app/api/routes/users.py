@@ -122,35 +122,26 @@ async def create_user(
 
     try:
         # Check username uniqueness (case-insensitive)
-        cursor = conn.execute(
-            "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
-            (body.username,),
-        )
-        if cursor.fetchone():
+        cursor = await asyncio.to_thread(conn.execute, "SELECT id FROM users WHERE username = ? COLLATE NOCASE", (body.username,))
+        if await asyncio.to_thread(cursor.fetchone):
             raise HTTPException(
                 status_code=400,
                 detail=f"Username '{body.username}' already exists",
             )
 
         # Insert the new user and default assignments in one transaction.
-        cursor = conn.execute(
-            """INSERT INTO users (username, hashed_password, full_name, role, is_active)
-            VALUES (?, ?, ?, ?, 1)""",
-            (body.username, hashed_password, body.full_name, body.role),
-        )
+        cursor = await asyncio.to_thread(conn.execute, """INSERT INTO users (username, hashed_password, full_name, role, is_active)
+            VALUES (?, ?, ?, ?, 1)""", (body.username, hashed_password, body.full_name, body.role))
         user_id = cursor.lastrowid
 
         # Fetch the created user before commit so response construction remains
         # part of the same rollback boundary as creation and default grants.
-        cursor = conn.execute(
-            "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?",
-            (user_id,),
-        )
-        row = cursor.fetchone()
+        cursor = await asyncio.to_thread(conn.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
+        row = await asyncio.to_thread(cursor.fetchone)
         if row is None:
             raise RuntimeError("Failed to retrieve created user")
 
-        conn.commit()
+        await asyncio.to_thread(conn.commit)
 
         return {
             "id": row[0],
@@ -161,10 +152,10 @@ async def create_user(
             "created_at": row[5],
         }
     except HTTPException:
-        conn.rollback()
+        await asyncio.to_thread(conn.rollback)
         raise
     except Exception as exc:
-        conn.rollback()
+        await asyncio.to_thread(conn.rollback)
         logger.error("Failed to create user with default assignments", exc_info=True)
         raise HTTPException(
             status_code=500,
@@ -189,26 +180,17 @@ async def list_users(
     try:
         if q:
             search_pattern = f"%{q}%"
-            count_cursor = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE username LIKE ? OR full_name LIKE ?",
-                (search_pattern, search_pattern),
-            )
-            total = count_cursor.fetchone()[0]
-            cursor = conn.execute(
-                """SELECT id, username, full_name, role, is_active, created_at
+            count_cursor = await asyncio.to_thread(conn.execute, "SELECT COUNT(*) FROM users WHERE username LIKE ? OR full_name LIKE ?", (search_pattern, search_pattern))
+            total = (await asyncio.to_thread(count_cursor.fetchone))[0]
+            cursor = await asyncio.to_thread(conn.execute, """SELECT id, username, full_name, role, is_active, created_at
                    FROM users WHERE username LIKE ? OR full_name LIKE ?
-                   ORDER BY id LIMIT ? OFFSET ?""",
-                (search_pattern, search_pattern, limit, skip),
-            )
+                   ORDER BY id LIMIT ? OFFSET ?""", (search_pattern, search_pattern, limit, skip))
         else:
-            count_cursor = conn.execute("SELECT COUNT(*) FROM users")
-            total = count_cursor.fetchone()[0]
-            cursor = conn.execute(
-                """SELECT id, username, full_name, role, is_active, created_at
-                   FROM users ORDER BY id LIMIT ? OFFSET ?""",
-                (limit, skip),
-            )
-        rows = cursor.fetchall()
+            count_cursor = await asyncio.to_thread(conn.execute, "SELECT COUNT(*) FROM users")
+            total = (await asyncio.to_thread(count_cursor.fetchone))[0]
+            cursor = await asyncio.to_thread(conn.execute, """SELECT id, username, full_name, role, is_active, created_at
+                   FROM users ORDER BY id LIMIT ? OFFSET ?""", (limit, skip))
+        rows = await asyncio.to_thread(cursor.fetchall)
 
         users = []
         for row in rows:
@@ -238,11 +220,8 @@ async def get_user(
     conn = pool.get_connection()
 
     try:
-        cursor = conn.execute(
-            "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?",
-            (user_id,),
-        )
-        row = cursor.fetchone()
+        cursor = await asyncio.to_thread(conn.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
+        row = await asyncio.to_thread(cursor.fetchone)
 
         if not row:
             raise HTTPException(status_code=404, detail="User not found")
@@ -272,11 +251,8 @@ async def update_user(
     Cannot change own role to prevent admin locking themselves out.
     """
     # Verify target user exists
-    cursor = db.execute(
-        "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?",
-        (user_id,),
-    )
-    target_row = cursor.fetchone()
+    cursor = await asyncio.to_thread(db.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
+    target_row = await asyncio.to_thread(cursor.fetchone)
 
     if not target_row:
         raise HTTPException(status_code=404, detail="User not found")
@@ -287,11 +263,8 @@ async def update_user(
 
     if body.username is not None:
         # Check username uniqueness (case-insensitive)
-        dup_cursor = db.execute(
-            "SELECT id FROM users WHERE username = ? COLLATE NOCASE AND id != ?",
-            (body.username, user_id),
-        )
-        if dup_cursor.fetchone():
+        dup_cursor = await asyncio.to_thread(db.execute, "SELECT id FROM users WHERE username = ? COLLATE NOCASE AND id != ?", (body.username, user_id))
+        if await asyncio.to_thread(dup_cursor.fetchone):
             raise HTTPException(
                 status_code=409, detail="Username already taken"
             )
@@ -330,18 +303,12 @@ async def update_user(
 
     # Execute update
     update_values.append(user_id)
-    db.execute(
-        f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?",
-        tuple(update_values),
-    )
-    db.commit()
+    await asyncio.to_thread(db.execute, f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?", tuple(update_values))
+    await asyncio.to_thread(db.commit)
 
     # Fetch updated user
-    cursor = db.execute(
-        "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?",
-        (user_id,),
-    )
-    row = cursor.fetchone()
+    cursor = await asyncio.to_thread(db.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
+    row = await asyncio.to_thread(cursor.fetchone)
 
     return {
         "id": row[0],
@@ -365,8 +332,8 @@ async def admin_reset_password(
     Forces must_change_password=1 for the target user.
     """
     # Verify target user exists
-    cursor = db.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-    if not cursor.fetchone():
+    cursor = await asyncio.to_thread(db.execute, "SELECT id FROM users WHERE id = ?", (user_id,))
+    if not await asyncio.to_thread(cursor.fetchone):
         raise HTTPException(status_code=404, detail="User not found")
 
     # Validate password strength
@@ -379,11 +346,8 @@ async def admin_reset_password(
     hashed_password = hash_password(body.new_password)
 
     # Update password and force password change on next login
-    db.execute(
-        "UPDATE users SET hashed_password = ?, must_change_password = 1 WHERE id = ?",
-        (hashed_password, user_id),
-    )
-    db.commit()
+    await asyncio.to_thread(db.execute, "UPDATE users SET hashed_password = ?, must_change_password = 1 WHERE id = ?", (hashed_password, user_id))
+    await asyncio.to_thread(db.commit)
 
     return {
         "message": "Password reset successfully",
@@ -409,8 +373,8 @@ async def update_user_role(
     conn = pool.get_connection()
 
     try:
-        cursor = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,))
-        target_row = cursor.fetchone()
+        cursor = await asyncio.to_thread(conn.execute, "SELECT role FROM users WHERE id = ?", (user_id,))
+        target_row = await asyncio.to_thread(cursor.fetchone)
 
         if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
@@ -419,20 +383,15 @@ async def update_user_role(
 
         if current_role == "superadmin" and body.role != "superadmin":
             # Atomic guard: only demote if there are other active superadmins
-            cursor.execute(
-                """UPDATE users SET role = ?
-                   WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""",
-                (body.role, user_id),
-            )
-            if cursor.rowcount == 0:
+            await asyncio.to_thread(cursor.execute, """UPDATE users SET role = ?
+                   WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""", (body.role, user_id))
+            if await asyncio.to_thread(lambda: cursor.rowcount) == 0:
                 raise HTTPException(
                     status_code=400, detail="Cannot demote the last superadmin"
                 )
         else:
-            cursor.execute(
-                "UPDATE users SET role = ? WHERE id = ?", (body.role, user_id)
-            )
-        conn.commit()
+            await asyncio.to_thread(cursor.execute, "UPDATE users SET role = ? WHERE id = ?", (body.role, user_id))
+        await asyncio.to_thread(conn.commit)
 
         return {
             "message": f"User role updated to {body.role}",
@@ -465,10 +424,8 @@ async def update_user_active(
                 status_code=400, detail="Cannot deactivate your own account"
             )
 
-        cursor = conn.execute(
-            "SELECT role, is_active FROM users WHERE id = ?", (user_id,)
-        )
-        target_row = cursor.fetchone()
+        cursor = await asyncio.to_thread(conn.execute, "SELECT role, is_active FROM users WHERE id = ?", (user_id,))
+        target_row = await asyncio.to_thread(cursor.fetchone)
 
         if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
@@ -478,21 +435,15 @@ async def update_user_active(
 
         if target_role == "superadmin" and not body.is_active and currently_active:
             # Atomic guard: only deactivate if there are other active superadmins
-            cursor.execute(
-                """UPDATE users SET is_active = ?
-                   WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""",
-                (0, user_id),
-            )
-            if cursor.rowcount == 0:
+            await asyncio.to_thread(cursor.execute, """UPDATE users SET is_active = ?
+                   WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""", (0, user_id))
+            if await asyncio.to_thread(lambda: cursor.rowcount) == 0:
                 raise HTTPException(
                     status_code=400, detail="Cannot deactivate the last superadmin"
                 )
         else:
-            cursor.execute(
-                "UPDATE users SET is_active = ? WHERE id = ?",
-                (1 if body.is_active else 0, user_id),
-            )
-        conn.commit()
+            await asyncio.to_thread(cursor.execute, "UPDATE users SET is_active = ? WHERE id = ?", (1 if body.is_active else 0, user_id))
+        await asyncio.to_thread(conn.commit)
 
         status_str = "activated" if body.is_active else "deactivated"
         return {
@@ -514,8 +465,8 @@ async def delete_user(
     conn = pool.get_connection()
 
     try:
-        cursor = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,))
-        target_row = cursor.fetchone()
+        cursor = await asyncio.to_thread(conn.execute, "SELECT role FROM users WHERE id = ?", (user_id,))
+        target_row = await asyncio.to_thread(cursor.fetchone)
 
         if not target_row:
             raise HTTPException(status_code=404, detail="User not found")
@@ -528,11 +479,8 @@ async def delete_user(
             )
 
         # Prevent orphaning organizations by deleting their sole owner
-        cursor = conn.execute(
-            "SELECT org_id FROM org_members WHERE user_id = ? AND role = 'owner'",
-            (user_id,),
-        )
-        owned_orgs = [row[0] for row in cursor.fetchall()]
+        cursor = await asyncio.to_thread(conn.execute, "SELECT org_id FROM org_members WHERE user_id = ? AND role = 'owner'", (user_id,))
+        owned_orgs = [row[0] for row in await asyncio.to_thread(cursor.fetchall)]
         if owned_orgs:
             raise HTTPException(
                 status_code=400,
@@ -541,18 +489,15 @@ async def delete_user(
 
         if target_role == "superadmin":
             # Atomic guard: only delete if there are other active superadmins
-            cursor.execute(
-                """DELETE FROM users
-                   WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""",
-                (user_id,),
-            )
-            if cursor.rowcount == 0:
+            await asyncio.to_thread(cursor.execute, """DELETE FROM users
+                   WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""", (user_id,))
+            if await asyncio.to_thread(lambda: cursor.rowcount) == 0:
                 raise HTTPException(
                     status_code=400, detail="Cannot delete the last superadmin"
                 )
         else:
-            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
-        conn.commit()
+            await asyncio.to_thread(cursor.execute, "DELETE FROM users WHERE id = ?", (user_id,))
+        await asyncio.to_thread(conn.commit)
 
         return {"message": "User deleted", "user_id": user_id}
     finally:
@@ -568,18 +513,15 @@ async def get_user_organizations(
     pool = get_pool(str(settings.sqlite_path))
     conn = pool.get_connection()
     try:
-        cursor = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cursor.fetchone():
+        cursor = await asyncio.to_thread(conn.execute, "SELECT id FROM users WHERE id = ?", (user_id,))
+        if not await asyncio.to_thread(cursor.fetchone):
             raise HTTPException(status_code=404, detail="User not found")
 
-        cursor = conn.execute(
-            """SELECT o.id, o.name, o.description, om.role, om.joined_at
+        cursor = await asyncio.to_thread(conn.execute, """SELECT o.id, o.name, o.description, om.role, om.joined_at
                FROM org_members om JOIN organizations o ON om.org_id = o.id
-               WHERE om.user_id = ? ORDER BY o.name""",
-            (user_id,),
-        )
+               WHERE om.user_id = ? ORDER BY o.name""", (user_id,))
         orgs = []
-        for row in cursor.fetchall():
+        for row in await asyncio.to_thread(cursor.fetchall):
             orgs.append({
                 "id": row[0],
                 "name": row[1],
@@ -678,23 +620,19 @@ async def get_user_groups(
 
     try:
         # Verify user exists
-        cursor = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        if not cursor.fetchone():
+        cursor = await asyncio.to_thread(conn.execute, "SELECT id FROM users WHERE id = ?", (user_id,))
+        if not await asyncio.to_thread(cursor.fetchone):
             raise HTTPException(status_code=404, detail="User not found")
 
         # For non-superadmins, verify caller shares an org with target user
         if user.get("role") != "superadmin":
             # Get target user's orgs
-            cursor.execute(
-                "SELECT org_id FROM org_members WHERE user_id = ?", (user_id,)
-            )
-            target_orgs = {row[0] for row in cursor.fetchall()}
+            await asyncio.to_thread(cursor.execute, "SELECT org_id FROM org_members WHERE user_id = ?", (user_id,))
+            target_orgs = {row[0] for row in await asyncio.to_thread(cursor.fetchall)}
             # Get caller's orgs
             caller_id = user.get("id")
-            cursor.execute(
-                "SELECT org_id FROM org_members WHERE user_id = ?", (caller_id,)
-            )
-            caller_orgs = {row[0] for row in cursor.fetchall()}
+            await asyncio.to_thread(cursor.execute, "SELECT org_id FROM org_members WHERE user_id = ?", (caller_id,))
+            caller_orgs = {row[0] for row in await asyncio.to_thread(cursor.fetchall)}
             # Check overlap
             if not target_orgs & caller_orgs:  # intersection
                 raise HTTPException(
@@ -703,14 +641,11 @@ async def get_user_groups(
                 )
 
         # Get groups the user is a member of
-        cursor = conn.execute(
-            """SELECT g.id, g.name, g.description, g.org_id
+        cursor = await asyncio.to_thread(conn.execute, """SELECT g.id, g.name, g.description, g.org_id
                FROM groups g
                JOIN group_members gm ON g.id = gm.group_id
-               WHERE gm.user_id = ?""",
-            (user_id,),
-        )
-        rows = cursor.fetchall()
+               WHERE gm.user_id = ?""", (user_id,))
+        rows = await asyncio.to_thread(cursor.fetchall)
 
         groups = []
         for row in rows:

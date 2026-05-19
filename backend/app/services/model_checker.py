@@ -1,12 +1,14 @@
 """
 Model availability checker for Ollama and OpenAI-compatible endpoints.
 """
+import asyncio
 from typing import Any, Dict
 
 import httpx
 
 from app.config import settings
 from app.services.circuit_breaker import CircuitBreakerError, model_checker_cb
+from app.services.ssrf import assert_url_safe
 
 
 class ModelCheckerError(Exception):
@@ -50,6 +52,10 @@ class ModelChecker:
             'chat_model': {'available': False, 'error': None},
             'instant_chat_model': {'available': False, 'error': None},
         }
+
+        await asyncio.to_thread(assert_url_safe, settings.ollama_embedding_url)
+        await asyncio.to_thread(assert_url_safe, settings.ollama_chat_url)
+        await asyncio.to_thread(assert_url_safe, settings.instant_chat_url)
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             # Check embedding model
