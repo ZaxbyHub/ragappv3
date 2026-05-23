@@ -4,6 +4,10 @@ WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
+ARG VITE_APP_BASENAME=/
+ARG VITE_API_URL=/api
+ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
+ENV VITE_API_URL=${VITE_API_URL}
 RUN npm run build
 
 # Stage 2: Backend with Unstructured dependencies
@@ -51,4 +55,4 @@ USER appuser
 
 EXPOSE 9090
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]

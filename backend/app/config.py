@@ -5,10 +5,12 @@ Application configuration using Pydantic Settings.
 import logging
 import warnings
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
 from pydantic import SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from app.utils.paths import normalize_root_path
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,8 @@ class Settings(BaseSettings):
 
     # Server configuration
     port: int = 9090
+    app_root_path: str = ""
+    """External app root path when deployed behind a prefix-stripping proxy, e.g. /knowledgevault."""
 
     # Base data directory - use relative path for cross-platform compatibility
     data_dir: Path = Path("./data")
@@ -455,7 +459,10 @@ class Settings(BaseSettings):
     }
 
     # CORS settings
-    backend_cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    backend_cors_origins: Annotated[list[str], NoDecode] = [
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ]
 
     # Helper validation functions (consolidated validators)
     @staticmethod
@@ -487,6 +494,30 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"{field_name} must be one of: {', '.join(sorted(allowed))}"
             )
+        return v
+
+    @field_validator("app_root_path", mode="after")
+    @classmethod
+    def validate_app_root_path(cls, v: str) -> str:
+        """Normalize and validate the browser-visible app root path."""
+        return normalize_root_path(v)
+
+    @field_validator("backend_cors_origins", mode="before")
+    @classmethod
+    def parse_backend_cors_origins(cls, v):
+        """Support JSON lists and comma-separated env values for CORS origins."""
+        if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return []
+            if value.startswith("["):
+                import json
+
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("backend_cors_origins JSON value must be a list")
+                return parsed
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
         return v
 
     # Migration validators for backward compatibility

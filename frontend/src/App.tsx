@@ -7,6 +7,7 @@ import { useEffect, lazy, Suspense } from "react";
 import { useAuthStore } from "@/stores/useAuthStore";
 import type { NavItemId } from "@/components/layout/navigationTypes";
 import { Loader2 } from "lucide-react";
+import { APP_BASENAME } from "@/lib/paths";
 
 // H-16 fix: Lazy-load all page components for code splitting
 const ChatShell = lazy(() => import("@/pages/ChatShell"));
@@ -115,7 +116,10 @@ function App() {
 
   return (
     <ErrorBoundary>
-      <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <BrowserRouter
+        basename={APP_BASENAME || undefined}
+        future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
+      >
         <Suspense fallback={<PageLoader />}>
           <Routes>
               <Route path="/setup" element={<SetupPage />} />

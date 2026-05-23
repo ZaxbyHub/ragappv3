@@ -71,6 +71,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        VITE_APP_BASENAME: ${VITE_APP_BASENAME:-/}
+        VITE_API_URL: ${VITE_API_URL:-/api}
     container_name: knowledgevault
     restart: unless-stopped
     ports:
@@ -80,6 +83,9 @@ services:
     environment:
       - DATA_DIR=/app/data
       - UVICORN_RELOAD=false
+      - APP_ROOT_PATH=${APP_ROOT_PATH:-}
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-http://localhost:3000}
       - OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
       - OLLAMA_CHAT_URL=${OLLAMA_CHAT_URL:-http://host.docker.internal:11434}
       - INSTANT_CHAT_URL=${INSTANT_CHAT_URL:-http://host.docker.internal:1234}

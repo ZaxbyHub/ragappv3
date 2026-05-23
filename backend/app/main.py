@@ -42,6 +42,7 @@ from app.lifespan import lifespan
 from app.limiter import limiter
 from app.middleware.logging import LoggingMiddleware
 from app.middleware.maintenance import MaintenanceMiddleware
+from app.utils.paths import normalize_root_path
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ app = FastAPI(
     title="KnowledgeVault API",
     version="0.1.0",
     description="Self-hosted RAG Knowledge Base API",
+    root_path=normalize_root_path(settings.app_root_path),
     lifespan=lifespan,
 )
 

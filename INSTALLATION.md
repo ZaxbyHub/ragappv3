@@ -363,6 +363,8 @@ services:
       - SQLITE_PATH=/app/data/ragapp.db
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
+      - APP_ROOT_PATH=${APP_ROOT_PATH:-}
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
       - OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
       - OLLAMA_CHAT_URL=http://ollama:11434
       - EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
@@ -379,10 +381,11 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_APP_BASENAME: ${VITE_APP_BASENAME:-/}
+        VITE_API_URL: ${VITE_API_URL:-/api}
     ports:
       - "3000:3000"
-    environment:
-      - VITE_API_URL=http://localhost:9090
     depends_on:
       - backend
     networks:
@@ -436,7 +439,7 @@ RUN mkdir -p /app/data /app/uploads
 EXPOSE 9090
 
 # Start command
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9090"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]
 ```
 
 #### Step 5: Create Frontend Dockerfile
@@ -456,6 +459,11 @@ RUN npm ci
 
 # Copy application code
 COPY . .
+
+ARG VITE_APP_BASENAME=/
+ARG VITE_API_URL=/api
+ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
+ENV VITE_API_URL=${VITE_API_URL}
 
 # Build application
 RUN npm run build
@@ -558,7 +566,12 @@ Create `frontend/.env`:
 
 ```bash
 # API URL
-VITE_API_URL=http://localhost:9090
+VITE_API_URL=/api
+VITE_APP_BASENAME=/
+
+# For a subpath deployment behind a prefix-stripping proxy:
+# VITE_API_URL=/knowledgevault/api
+# VITE_APP_BASENAME=/knowledgevault
 
 # Feature Flags
 VITE_USERS_ENABLED=true

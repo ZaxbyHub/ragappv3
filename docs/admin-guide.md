@@ -577,6 +577,37 @@ server {
 }
 ```
 
+For a subpath deployment such as `https://MEDXS.af.mil/knowledgevault/`, build and run with:
+
+```env
+APP_ROOT_PATH=/knowledgevault
+VITE_APP_BASENAME=/knowledgevault
+VITE_API_URL=/knowledgevault/api
+BACKEND_CORS_ORIGINS=https://MEDXS.af.mil
+FORWARDED_ALLOW_IPS=127.0.0.1
+```
+
+Use a prefix-stripping proxy. The browser sees `/knowledgevault/...`; the container still receives unprefixed internal routes like `/api`, `/assets`, and `/health`.
+
+```nginx
+location = /knowledgevault {
+    return 301 /knowledgevault/;
+}
+
+location /knowledgevault/ {
+    proxy_pass http://knowledgevault:9090/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Prefix /knowledgevault;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600;
+}
+```
+
 **Option 3: VPN/Private Network**
 - Deploy behind corporate VPN
 - Use private subnet access controls

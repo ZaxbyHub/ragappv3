@@ -1,7 +1,15 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import axios from "axios";
-import { setJwtAccessToken, getJwtAccessToken, refreshAccessToken, ensureCsrfToken, resetCsrfToken, attachCsrfInterceptor } from "@/lib/api";
+import {
+  API_BASE_URL,
+  setJwtAccessToken,
+  getJwtAccessToken,
+  refreshAccessToken,
+  ensureCsrfToken,
+  resetCsrfToken,
+  attachCsrfInterceptor,
+} from "@/lib/api";
 
 interface User {
   id: number;
@@ -45,8 +53,6 @@ interface AuthState {
   // Internal
   _setLoading: (loading: boolean) => void;
 }
-
-const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
 
 // Create a separate axios instance for auth calls to avoid interceptor loops
 const authClient = axios.create({

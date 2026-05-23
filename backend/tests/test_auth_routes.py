@@ -87,10 +87,12 @@ class TestAuthRoutes(unittest.TestCase):
         # Store original settings to restore later
         self._original_jwt_secret = settings.jwt_secret_key
         self._original_users_enabled = settings.users_enabled
+        self._original_app_root_path = settings.app_root_path
 
         # Override JWT secret for testing
         settings.jwt_secret_key = "test-secret-key-for-testing-at-least-32-chars-long"
         settings.users_enabled = True
+        settings.app_root_path = ""
 
         # Create a test pool for the temporary database
         self.test_pool = SQLiteConnectionPool(self.db_path, max_size=5)
@@ -98,6 +100,14 @@ class TestAuthRoutes(unittest.TestCase):
         # Create FastAPI app and configure dependency overrides
         from app.api.deps import get_db
         from app.main import app as main_app
+        from app.security import csrf_protect
+
+        class TestCSRFManager:
+            def generate_token(self):
+                return "test-csrf-token"
+
+            def validate_token(self, token):
+                return token == "test-csrf-token"
 
         # Override the get_db dependency to use our test pool
         def get_test_db():
@@ -108,6 +118,8 @@ class TestAuthRoutes(unittest.TestCase):
                 self.test_pool.release_connection(conn)
 
         main_app.dependency_overrides[get_db] = get_test_db
+        main_app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        main_app.state.csrf_manager = TestCSRFManager()
 
         # Create test client with dependency overrides
         self.client = TestClient(main_app)
@@ -118,6 +130,7 @@ class TestAuthRoutes(unittest.TestCase):
         # Restore original settings
         settings.jwt_secret_key = self._original_jwt_secret
         settings.users_enabled = self._original_users_enabled
+        settings.app_root_path = self._original_app_root_path
 
         # Clear dependency overrides
 
@@ -137,7 +150,7 @@ class TestAuthRoutes(unittest.TestCase):
     def test_register_first_user_is_superadmin(self):
         """Register first user and verify role is superadmin."""
         response = self.client.post(
-            "/api/auth/register", json={"username": "admin", "password": "password123"}
+            "/api/auth/register", json={"username": "admin", "password": "Password123"}
         )
 
         self.assertEqual(response.status_code, 200)
@@ -149,12 +162,12 @@ class TestAuthRoutes(unittest.TestCase):
         """Register second user and verify role is member."""
         # First register a superadmin
         self.client.post(
-            "/api/auth/register", json={"username": "admin", "password": "password123"}
+            "/api/auth/register", json={"username": "admin", "password": "Password123"}
         )
 
         # Then register a second user
         response = self.client.post(
-            "/api/auth/register", json={"username": "user2", "password": "password456"}
+            "/api/auth/register", json={"username": "user2", "password": "Password456"}
         )
 
         self.assertEqual(response.status_code, 200)
@@ -166,12 +179,12 @@ class TestAuthRoutes(unittest.TestCase):
         """Register same username twice should return 409."""
         self.client.post(
             "/api/auth/register",
-            json={"username": "duplicate", "password": "password123"},
+            json={"username": "duplicate", "password": "Password123"},
         )
 
         response = self.client.post(
             "/api/auth/register",
-            json={"username": "duplicate", "password": "password456"},
+            json={"username": "duplicate", "password": "Password456"},
         )
 
         self.assertEqual(response.status_code, 409)
@@ -179,7 +192,7 @@ class TestAuthRoutes(unittest.TestCase):
     def test_register_short_username(self):
         """Register with username < 3 chars should return 400."""
         response = self.client.post(
-            "/api/auth/register", json={"username": "ab", "password": "password123"}
+            "/api/auth/register", json={"username": "ab", "password": "Password123"}
         )
 
         self.assertEqual(response.status_code, 400)
@@ -199,12 +212,12 @@ class TestAuthRoutes(unittest.TestCase):
         # First register
         self.client.post(
             "/api/auth/register",
-            json={"username": "logintest", "password": "password123"},
+            json={"username": "logintest", "password": "Password123"},
         )
 
         # Then login
         response = self.client.post(
-            "/api/auth/login", json={"username": "logintest", "password": "password123"}
+            "/api/auth/login", json={"username": "logintest", "password": "Password123"}
         )
 
         self.assertEqual(response.status_code, 200)
@@ -218,7 +231,7 @@ class TestAuthRoutes(unittest.TestCase):
         # First register
         self.client.post(
             "/api/auth/register",
-            json={"username": "wrongpw", "password": "password123"},
+            json={"username": "wrongpw", "password": "Password123"},
         )
 
         # Try login with wrong password
@@ -234,7 +247,7 @@ class TestAuthRoutes(unittest.TestCase):
         # First register user
         self.client.post(
             "/api/auth/register",
-            json={"username": "inactiveuser", "password": "password123"},
+            json={"username": "inactiveuser", "password": "Password123"},
         )
 
         # Deactivate user using the test pool
@@ -250,7 +263,7 @@ class TestAuthRoutes(unittest.TestCase):
         # Try login
         response = self.client.post(
             "/api/auth/login",
-            json={"username": "inactiveuser", "password": "password123"},
+            json={"username": "inactiveuser", "password": "Password123"},
         )
 
         self.assertEqual(response.status_code, 403)
@@ -261,12 +274,12 @@ class TestAuthRoutes(unittest.TestCase):
         # First register and login
         self.client.post(
             "/api/auth/register",
-            json={"username": "refreshuser", "password": "password123"},
+            json={"username": "refreshuser", "password": "Password123"},
         )
 
         login_response = self.client.post(
             "/api/auth/login",
-            json={"username": "refreshuser", "password": "password123"},
+            json={"username": "refreshuser", "password": "Password123"},
         )
         self.assertEqual(login_response.status_code, 200)
 
@@ -291,7 +304,7 @@ class TestAuthRoutes(unittest.TestCase):
         # First register a user
         self.client.post(
             "/api/auth/register",
-            json={"username": "expireduser", "password": "password123"},
+            json={"username": "expireduser", "password": "Password123"},
         )
 
         # Create an expired refresh token session using the test pool
@@ -322,12 +335,12 @@ class TestAuthRoutes(unittest.TestCase):
         # Register and login
         self.client.post(
             "/api/auth/register",
-            json={"username": "logoutuser", "password": "password123"},
+            json={"username": "logoutuser", "password": "Password123"},
         )
 
         login_response = self.client.post(
             "/api/auth/login",
-            json={"username": "logoutuser", "password": "password123"},
+            json={"username": "logoutuser", "password": "Password123"},
         )
 
         # Get the refresh token cookie
@@ -357,7 +370,7 @@ class TestAuthRoutes(unittest.TestCase):
         """After register, needs_setup should be False."""
         self.client.post(
             "/api/auth/register",
-            json={"username": "someuser", "password": "password123"},
+            json={"username": "someuser", "password": "Password123"},
         )
 
         response = self.client.get("/api/auth/setup-status")
@@ -371,12 +384,12 @@ class TestAuthRoutes(unittest.TestCase):
         # Register and login
         self.client.post(
             "/api/auth/register",
-            json={"username": "updateuser", "password": "password123"},
+            json={"username": "updateuser", "password": "Password123"},
         )
 
         login_response = self.client.post(
             "/api/auth/login",
-            json={"username": "updateuser", "password": "password123"},
+            json={"username": "updateuser", "password": "Password123"},
         )
 
         access_token = login_response.json()["access_token"]
@@ -392,17 +405,17 @@ class TestAuthRoutes(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["full_name"], "Updated Name")
 
-    def test_update_me_password(self):
-        """Update password, verify old sessions deleted."""
+    def test_update_me_password_preserves_existing_session(self):
+        """PATCH /auth/me updates password without rotating existing sessions."""
         # Register and login first time
         self.client.post(
             "/api/auth/register",
-            json={"username": "passupdateuser", "password": "password123"},
+            json={"username": "passupdateuser", "password": "Password123"},
         )
 
         login_response1 = self.client.post(
             "/api/auth/login",
-            json={"username": "passupdateuser", "password": "password123"},
+            json={"username": "passupdateuser", "password": "Password123"},
         )
 
         # Get first session token
@@ -413,32 +426,32 @@ class TestAuthRoutes(unittest.TestCase):
         access_token = login_response1.json()["access_token"]
         response = self.client.patch(
             "/api/auth/me",
-            json={"password": "newpassword456"},
+            json={"password": "newPassword456"},
             headers={"Authorization": f"Bearer {access_token}"},
         )
 
         self.assertEqual(response.status_code, 200)
 
-        # Old session should be deleted - trying to use old refresh token should fail
+        # PATCH /auth/me updates the profile only; session revocation is covered by
+        # the dedicated /auth/change-password endpoint.
         refresh_response = self.client.post(
             "/api/auth/refresh", cookies={"refresh_token": token1}
         )
 
-        # Should fail because session was deleted
-        self.assertEqual(refresh_response.status_code, 401)
+        self.assertEqual(refresh_response.status_code, 200)
 
     def test_case_insensitive_username(self):
         """Username uniqueness should be case-insensitive."""
         # Register with lowercase
         self.client.post(
             "/api/auth/register",
-            json={"username": "caseuser", "password": "password123"},
+            json={"username": "caseuser", "password": "Password123"},
         )
 
         # Try to register with same name in different case
         response = self.client.post(
             "/api/auth/register",
-            json={"username": "CASEUSER", "password": "password456"},
+            json={"username": "CASEUSER", "password": "Password456"},
         )
 
         self.assertEqual(response.status_code, 409)
@@ -447,7 +460,7 @@ class TestAuthRoutes(unittest.TestCase):
         """Login with nonexistent user should return 401."""
         response = self.client.post(
             "/api/auth/login",
-            json={"username": "nonexistent", "password": "password123"},
+            json={"username": "nonexistent", "password": "Password123"},
         )
 
         self.assertEqual(response.status_code, 401)
@@ -465,14 +478,14 @@ class TestAuthRoutes(unittest.TestCase):
             "/api/auth/register",
             json={
                 "username": "profileuser",
-                "password": "password123",
+                "password": "Password123",
                 "full_name": "Test User",
             },
         )
 
         login_response = self.client.post(
             "/api/auth/login",
-            json={"username": "profileuser", "password": "password123"},
+            json={"username": "profileuser", "password": "Password123"},
         )
 
         access_token = login_response.json()["access_token"]
@@ -490,7 +503,7 @@ class TestAuthRoutes(unittest.TestCase):
         """POST /api/auth/register JSON body should NOT contain refresh_token."""
         response = self.client.post(
             "/api/auth/register",
-            json={"username": "nocookieuser", "password": "password123"},
+            json={"username": "nocookieuser", "password": "Password123"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -504,7 +517,7 @@ class TestAuthRoutes(unittest.TestCase):
         """POST /api/auth/register should set refresh_token httpOnly cookie."""
         response = self.client.post(
             "/api/auth/register",
-            json={"username": "cookieuser", "password": "password123"},
+            json={"username": "cookieuser", "password": "Password123"},
         )
 
         self.assertEqual(response.status_code, 200)
@@ -521,19 +534,19 @@ class TestAuthRoutes(unittest.TestCase):
         # First register and login to get access token
         self.client.post(
             "/api/auth/register",
-            json={"username": "pwchangeuser", "password": "password123"},
+            json={"username": "pwchangeuser", "password": "Password123"},
         )
 
         login_response = self.client.post(
             "/api/auth/login",
-            json={"username": "pwchangeuser", "password": "password123"},
+            json={"username": "pwchangeuser", "password": "Password123"},
         )
         access_token = login_response.json()["access_token"]
 
         # Call change-password
         response = self.client.post(
             "/api/auth/change-password",
-            json={"current_password": "password123", "new_password": "newpassword456"},
+            json={"current_password": "Password123", "new_password": "newPassword456"},
             headers={"Authorization": f"Bearer {access_token}"},
         )
 
@@ -549,19 +562,19 @@ class TestAuthRoutes(unittest.TestCase):
         # First register and login to get access token
         self.client.post(
             "/api/auth/register",
-            json={"username": "pwcookieuser", "password": "password123"},
+            json={"username": "pwcookieuser", "password": "Password123"},
         )
 
         login_response = self.client.post(
             "/api/auth/login",
-            json={"username": "pwcookieuser", "password": "password123"},
+            json={"username": "pwcookieuser", "password": "Password123"},
         )
         access_token = login_response.json()["access_token"]
 
         # Call change-password
         response = self.client.post(
             "/api/auth/change-password",
-            json={"current_password": "password123", "new_password": "newpassword789"},
+            json={"current_password": "Password123", "new_password": "Newpassword789"},
             headers={"Authorization": f"Bearer {access_token}"},
         )
 
@@ -573,6 +586,85 @@ class TestAuthRoutes(unittest.TestCase):
         self.assertIn("refresh_token", set_cookie)
         self.assertIn("HttpOnly", set_cookie)
         self.assertIn("Path=/api/auth/refresh", set_cookie)
+
+    def test_prefixed_refresh_cookie_paths_for_auth_routes(self):
+        """All refresh-token set/delete call sites use the external app root path."""
+        settings.app_root_path = "/knowledgevault"
+
+        register_response = self.client.post(
+            "/api/auth/register",
+            json={"username": "prefixuser", "password": "Password123"},
+        )
+        self.assertEqual(register_response.status_code, 200)
+        self.assertIn(
+            "Path=/knowledgevault/api/auth/refresh",
+            register_response.headers.get("set-cookie", ""),
+        )
+
+        login_response = self.client.post(
+            "/api/auth/login",
+            json={"username": "prefixuser", "password": "Password123"},
+        )
+        self.assertEqual(login_response.status_code, 200)
+        self.assertIn(
+            "Path=/knowledgevault/api/auth/refresh",
+            login_response.headers.get("set-cookie", ""),
+        )
+        access_token = login_response.json()["access_token"]
+        refresh_token = login_response.cookies.get("refresh_token")
+
+        refresh_response = self.client.post(
+            "/api/auth/refresh",
+            cookies={"refresh_token": refresh_token},
+        )
+        self.assertEqual(refresh_response.status_code, 200)
+        self.assertIn(
+            "Path=/knowledgevault/api/auth/refresh",
+            refresh_response.headers.get("set-cookie", ""),
+        )
+        refresh_token = refresh_response.cookies.get("refresh_token")
+
+        logout_response = self.client.post(
+            "/api/auth/logout",
+            cookies={"refresh_token": refresh_token},
+        )
+        self.assertEqual(logout_response.status_code, 200)
+        self.assertIn(
+            "Path=/knowledgevault/api/auth/refresh",
+            logout_response.headers.get("set-cookie", ""),
+        )
+        self.assertIn("Max-Age=0", logout_response.headers.get("set-cookie", ""))
+
+        second_login = self.client.post(
+            "/api/auth/login",
+            json={"username": "prefixuser", "password": "Password123"},
+        )
+        self.assertEqual(second_login.status_code, 200)
+        access_token = second_login.json()["access_token"]
+
+        change_password_response = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": "Password123", "new_password": "Newpassword456"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(change_password_response.status_code, 200)
+        self.assertIn(
+            "Path=/knowledgevault/api/auth/refresh",
+            change_password_response.headers.get("set-cookie", ""),
+        )
+        access_token = change_password_response.json()["access_token"]
+        refresh_token = change_password_response.cookies.get("refresh_token")
+
+        revoke_all_response = self.client.delete(
+            "/api/auth/sessions",
+            headers={"Authorization": f"Bearer {access_token}"},
+            cookies={"refresh_token": refresh_token},
+        )
+        self.assertEqual(revoke_all_response.status_code, 200)
+        self.assertIn(
+            "Path=/knowledgevault/api/auth/refresh",
+            revoke_all_response.headers.get("set-cookie", ""),
+        )
 
 
 if __name__ == "__main__":

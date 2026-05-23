@@ -12,6 +12,7 @@ import redis
 from fastapi import Header, HTTPException, Request, Response
 
 from app.config import settings
+from app.utils.paths import csrf_cookie_path
 
 logger = logging.getLogger("security")
 CSRF_COOKIE_NAME = "X-CSRF-Token"
@@ -205,6 +206,7 @@ def issue_csrf_token(response: Response, csrf_manager: CSRFManager) -> str:
         samesite="lax",
         secure=settings.csrf_cookie_secure,
         httponly=False,
+        path=csrf_cookie_path(),
     )
     return token
 

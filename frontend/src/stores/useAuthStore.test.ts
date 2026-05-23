@@ -28,6 +28,7 @@ vi.mock("axios", () => ({
 
 // Mock @/lib/api
 vi.mock("@/lib/api", () => ({
+  API_BASE_URL: "/api",
   setJwtAccessToken: vi.fn(),
   getJwtAccessToken: vi.fn(() => null),
   refreshAccessToken: vi.fn(),

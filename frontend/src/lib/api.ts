@@ -1,7 +1,8 @@
 import axios, { AxiosRequestHeaders } from "axios";
 import { setChatHistory as storageSetChatHistory, getChatHistory as storageGetChatHistory } from "./storage";
+import { appPath } from "./paths";
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
+export const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
 
 // Module-level JWT token holder - persisted via useAuthStore persist middleware
 let _jwtAccessToken: string | null = null;
@@ -113,6 +114,17 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
       return Promise.reject(error);
     }
   );
+}
+
+export function loginRedirectPath(): string {
+  return appPath("/login");
+}
+
+export function redirectToLogin(): void {
+  const loginPath = loginRedirectPath();
+  if (window.location.pathname !== loginPath) {
+    window.location.href = loginPath;
+  }
 }
 
 // Singleton refresh promise — ensures only one /auth/refresh call is in flight
@@ -247,9 +259,7 @@ apiClient.interceptors.response.use(
 
       // Clear auth state and redirect to login
       _jwtAccessToken = null;
-      if (window.location.pathname !== "/login") {
-        window.location.href = "/login";
-      }
+      redirectToLogin();
     }
 
     // Extract the most useful error message

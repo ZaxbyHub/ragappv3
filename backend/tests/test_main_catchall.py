@@ -100,8 +100,10 @@ class TestMainCatchAllRoute(unittest.TestCase):
             content = f.read()
 
         # Check for assets mount configuration
-        self.assertIn('app.mount("/assets"', content,
+        self.assertIn('app.mount(', content,
                       "Assets mount not found")
+        self.assertIn('"/assets"', content,
+                      "Assets mount path not found")
         self.assertIn('StaticFiles(directory=str(static_dir / "assets")', content,
                       "Assets directory configuration not found")
 
