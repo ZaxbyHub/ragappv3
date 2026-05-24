@@ -20,7 +20,7 @@ import unittest
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from app.api.deps import get_user_orgs, get_user_primary_org, MultipleOrgError
+from app.api.deps import MultipleOrgError, get_user_orgs, get_user_primary_org
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
 
 

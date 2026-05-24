@@ -8,12 +8,12 @@ Verifies:
 4. _log_pool_stats() fallback behavior (uses hardcoded 5 for keepalive - BUG)
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
-
 # Ensure correct import path for the test environment
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 # Add backend to path
 backend_path = Path(__file__).parent.parent.parent
@@ -48,8 +48,8 @@ class TestLLMClientPoolConfig:
     async def test_start_uses_settings_values(self):
         """Verify LLMClient.start() creates httpx.Limits with default settings values."""
         with patch("app.services.llm_client.assert_url_safe", mock_assert_url_safe):
-            from app.services.llm_client import LLMClient
             from app.config import settings
+            from app.services.llm_client import LLMClient
 
             client = LLMClient()
             await client.start()

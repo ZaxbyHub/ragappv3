@@ -457,9 +457,9 @@ class TestWhitelistLogicBypass(unittest.TestCase):
 
     def test_whitelist_returns_true_with_valid_key(self):
         """_should_whitelist should return True when X-API-Key matches health_check_api_key."""
-        from app.limiter import _should_whitelist
         from starlette.requests import Request
-        from unittest.mock import MagicMock
+
+        from app.limiter import _should_whitelist
 
         # Create mock request with matching API key
         mock_request = MagicMock(spec=Request)
@@ -474,9 +474,9 @@ class TestWhitelistLogicBypass(unittest.TestCase):
 
     def test_whitelist_returns_false_with_invalid_key(self):
         """_should_whitelist should return False when X-API-Key does not match."""
-        from app.limiter import _should_whitelist
         from starlette.requests import Request
-        from unittest.mock import MagicMock
+
+        from app.limiter import _should_whitelist
 
         # Create mock request with non-matching API key
         mock_request = MagicMock(spec=Request)
@@ -490,9 +490,9 @@ class TestWhitelistLogicBypass(unittest.TestCase):
 
     def test_whitelist_returns_false_when_no_key(self):
         """_should_whitelist should return False when X-API-Key header is not present."""
-        from app.limiter import _should_whitelist
         from starlette.requests import Request
-        from unittest.mock import MagicMock
+
+        from app.limiter import _should_whitelist
 
         # Create mock request with no API key header
         mock_request = MagicMock(spec=Request)

@@ -61,7 +61,6 @@ except ImportError:
 
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
 
-
 # =============================================================================
 # Source Inspection Helpers
 # =============================================================================

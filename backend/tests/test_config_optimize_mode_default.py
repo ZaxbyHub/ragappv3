@@ -9,9 +9,8 @@ Tests verify:
 """
 
 import pytest
-from pydantic import ValidationError
-
 from backend.app.config import Settings
+from pydantic import ValidationError
 
 
 class TestOptimizeModeDefault:

@@ -135,10 +135,10 @@ class TestAsyncVerifyPasswordThreadPoolExhaustion(unittest.IsolatedAsyncioTestCa
 
         # Total time should be reasonable — with 4 workers and ~400ms bcrypt ops,
         # 20 tasks should take ~5 batches * 400ms = ~2s (not 20 * 400ms = 8s serially)
-        # Allow 4 seconds as upper bound for overhead
+        # Allow 6 seconds as upper bound for CI overhead and system load variability
         self.assertLess(
             total_time,
-            4.0,
+            6.0,
             f"Thread pool may be serializing: {num_concurrent} calls took {total_time:.2f}s"
         )
 

@@ -23,6 +23,7 @@ from app.api.deps import (
     get_user_accessible_vault_ids,
 )
 from app.config import settings
+from app.limiter import limiter
 from app.models.chat_mode import ChatMode
 from app.models.database import get_pool
 from app.services.citation_validator import repair_against_sources_and_memories
@@ -31,7 +32,6 @@ from app.services.wiki_citation_helpers import (
     build_per_claim_sources as _build_per_claim_sources_impl,
 )
 from app.services.wiki_store import WikiStore
-from app.limiter import limiter
 from app.utils.assistant_sanitizer import sanitize_chat_messages_content
 
 # Track background tasks to prevent garbage collection

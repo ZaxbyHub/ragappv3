@@ -8,9 +8,9 @@ Tests verify:
 """
 
 import os
-import pytest
 from unittest.mock import patch
 
+import pytest
 from backend.app.config import Settings
 
 

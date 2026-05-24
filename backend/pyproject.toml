@@ -9,9 +9,10 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 # Test files: stub-package imports (lancedb/pyarrow/unstructured) are intentionally
-# imported for conftest.py compatibility; E402 and E722 common in test helpers
-"tests/*.py" = ["F401", "E402", "E722", "F821"]
-"test_*.py" = ["F401", "E402", "E722", "F821"]
+# imported for conftest.py compatibility; E402 and E722 common in test helpers;
+# F841 unused variables common in test fixtures and diagnostic assertions
+"tests/*.py" = ["F401", "E402", "E722", "F821", "F841"]
+"test_*.py" = ["F401", "E402", "E722", "F821", "F841"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
