@@ -501,7 +501,6 @@ class TestConcurrentReacquireAfterTimeoutAdversarial(unittest.IsolatedAsyncioTes
         second_acquired = False
         second_released = False
 
-        orig_acquire2 = real_lock.acquire
         orig_release2 = real_lock.release
 
         def tracking_release2():

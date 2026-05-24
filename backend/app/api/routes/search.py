@@ -20,10 +20,10 @@ from app.api.deps import (
     get_evaluate_policy,
     get_vector_store,
 )
+from app.config import settings
+from app.limiter import limiter
 from app.services.embeddings import EmbeddingError, EmbeddingService
 from app.services.vector_store import VectorStore, VectorStoreError
-from app.limiter import limiter
-from app.config import settings
 
 router = APIRouter()
 

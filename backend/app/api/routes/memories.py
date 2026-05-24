@@ -19,9 +19,9 @@ from app.api.deps import (
     get_db,
     get_memory_store,
 )
-from app.services.memory_store import MemoryRecord, MemoryStore, MemoryStoreError
-from app.limiter import limiter
 from app.config import settings
+from app.limiter import limiter
+from app.services.memory_store import MemoryRecord, MemoryStore, MemoryStoreError
 
 logger = logging.getLogger(__name__)
 

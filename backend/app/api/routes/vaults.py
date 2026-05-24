@@ -24,9 +24,9 @@ from app.api.deps import (
     require_role,
     require_vault_permission,
 )
-from app.services.vector_store import VectorStore
-from app.limiter import limiter
 from app.config import settings
+from app.limiter import limiter
+from app.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 

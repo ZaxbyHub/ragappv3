@@ -31,8 +31,8 @@ from app.services.wiki_citation_helpers import (
     build_per_claim_sources as _build_per_claim_sources_impl,
 )
 from app.services.wiki_store import WikiStore
-from app.utils.assistant_sanitizer import sanitize_chat_messages_content
 from app.limiter import limiter
+from app.utils.assistant_sanitizer import sanitize_chat_messages_content
 
 # Track background tasks to prevent garbage collection
 _background_tasks: Set[asyncio.Task] = set()
