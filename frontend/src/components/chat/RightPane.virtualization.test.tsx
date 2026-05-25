@@ -73,11 +73,13 @@ vi.mock("@/stores/useChatStore", () => {
     return JSON.stringify(ids);
   });
   const useLastCompletedAssistantWikiRefsMock = vi.fn(() => undefined);
+  const useLastCompletedAssistantKmsRefsMock = vi.fn(() => undefined);
   return {
     useChatStore: chatStoreMock,
     useChatMessages: useChatMessagesMock,
     useLastCompletedAssistantSources: useLastCompletedAssistantSourcesMock,
     useLastCompletedAssistantWikiRefs: useLastCompletedAssistantWikiRefsMock,
+    useLastCompletedAssistantKmsRefs: useLastCompletedAssistantKmsRefsMock,
     useLastUserContent: useLastUserContentMock,
     useSourcesForSourceId: useSourcesForSourceIdMock,
     useCompletedAssistantMessageIdsKey: useCompletedAssistantMessageIdsKeyMock,

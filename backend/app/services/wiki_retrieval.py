@@ -182,6 +182,20 @@ class WikiRetrievalService:
     def __init__(self, pool: Any) -> None:
         self._pool = pool
 
+    def _acquire(self) -> sqlite3.Connection:
+        # Support both the production SQLiteConnectionPool
+        # (get_connection/release_connection) and lightweight test pools
+        # (get/put).
+        if hasattr(self._pool, "get_connection"):
+            return self._pool.get_connection()
+        return self._pool.get()
+
+    def _release(self, conn: sqlite3.Connection) -> None:
+        if hasattr(self._pool, "release_connection"):
+            self._pool.release_connection(conn)
+        else:
+            self._pool.put(conn)
+
     def retrieve(self, query: str, vault_id: Optional[int]) -> List[WikiEvidence]:
         """Return ranked WikiEvidence for the query.
 
@@ -190,14 +204,14 @@ class WikiRetrievalService:
         if vault_id is None:
             return []
 
-        conn = self._pool.get()
+        conn = self._acquire()
         try:
             return self._retrieve_sync(conn, query, vault_id)
         except Exception as exc:
             logger.warning("Wiki retrieval failed: %s", exc, exc_info=True)
             return []
         finally:
-            self._pool.put(conn)
+            self._release(conn)
 
     def _retrieve_sync(
         self, conn: sqlite3.Connection, query: str, vault_id: int
@@ -429,10 +443,10 @@ class WikiRetrievalService:
             rows = conn.execute(
                 """SELECT c.*, p.title, p.slug, p.page_type, p.status AS page_status,
                           p.summary, p.last_compiled_at
-                   FROM wiki_claims_fts fts
-                   JOIN wiki_claims c ON fts.rowid = c.id
+                   FROM wiki_claims_fts
+                   JOIN wiki_claims c ON wiki_claims_fts.rowid = c.id
                    LEFT JOIN wiki_pages p ON c.page_id = p.id
-                   WHERE fts MATCH ? AND c.vault_id = ?
+                   WHERE wiki_claims_fts MATCH ? AND c.vault_id = ?
                    ORDER BY rank
                    LIMIT 10""",
                 (normalized_query, vault_id),
@@ -473,9 +487,9 @@ class WikiRetrievalService:
         try:
             rows = conn.execute(
                 """SELECT p.*
-                   FROM wiki_pages_fts fts
-                   JOIN wiki_pages p ON fts.rowid = p.id
-                   WHERE fts MATCH ? AND p.vault_id = ?
+                   FROM wiki_pages_fts
+                   JOIN wiki_pages p ON wiki_pages_fts.rowid = p.id
+                   WHERE wiki_pages_fts MATCH ? AND p.vault_id = ?
                    ORDER BY rank
                    LIMIT 5""",
                 (normalized_query, vault_id),

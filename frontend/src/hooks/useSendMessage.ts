@@ -6,6 +6,7 @@ import {
   type ChatMessage,
   type ChatSessionMessage,
   type WikiReference,
+  type KMSReference,
 } from "@/lib/api";
 import { useChatStore, type Message } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
@@ -117,6 +118,8 @@ export function useSendMessage(
 
       // Accumulate wiki refs from the SSE stream so they can be persisted with the message.
       let streamedWikiRefs: WikiReference[] = [];
+      // Accumulate KMS refs from the SSE stream so they can be persisted with the message.
+      let streamedKmsRefs: KMSReference[] = [];
 
       // Resolve effective chat mode using the same logic as the Composer
       // toggle so the highlighted mode and the sent payload never diverge.
@@ -150,6 +153,10 @@ export function useSendMessage(
           onWiki: (wikiRefs: WikiReference[]) => {
             streamedWikiRefs = wikiRefs;
             updateMessage(assistantMessageId, { wikiRefs });
+          },
+          onKMS: (kmsRefs: KMSReference[]) => {
+            streamedKmsRefs = kmsRefs;
+            updateMessage(assistantMessageId, { kmsRefs });
           },
           onMode: (mode) => {
             updateMessage(assistantMessageId, { mode });
@@ -197,6 +204,7 @@ export function useSendMessage(
                     sources: assistantMsg.sources ?? undefined,
                     memories: assistantMsg.memoriesUsed ?? undefined,
                     wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
+                    kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
                     mode: assistantMsg.mode,
                   })
                 );

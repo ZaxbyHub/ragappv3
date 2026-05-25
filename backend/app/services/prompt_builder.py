@@ -10,6 +10,7 @@ from app.services.document_retrieval import RAGSource
 from app.services.memory_store import MemoryRecord
 
 if TYPE_CHECKING:
+    from app.services.kms_retrieval import KMSEvidence
     from app.services.wiki_retrieval import WikiEvidence
 
 CITATION_INSTRUCTION = (
@@ -17,12 +18,15 @@ CITATION_INSTRUCTION = (
     "- Wiki citations: use [W1], [W2], ... for claims drawn from compiled wiki "
     "knowledge. Wiki evidence is source-backed and should be preferred when it "
     "directly and confidently answers the question.\n"
+    "- KMS citations: use [K1], [K2], ... for claims drawn from curated knowledge "
+    "base entries. KMS evidence is user-curated documentation and should be "
+    "preferred when it directly answers the question.\n"
     "- Document citations: use [S1], [S2], [S3] for factual claims from retrieved "
     "documents. If raw documents contradict wiki evidence, documents win and you "
     "should note the discrepancy.\n"
     "- Memory citations: use [M1], [M2] for claims from stored memories. Memories "
     "are NOT document sources — never cite a memory as [S#].\n"
-    "- Do NOT attach [S#] citations to answers supported only by [W#] or [M#].\n"
+    "- Do NOT attach [S#] citations to answers supported only by [W#], [K#] or [M#].\n"
     "- Cite only evidence you actually used. Do not list all retrieved candidates.\n"
     "- Do NOT cite by filename. Always use the assigned labels.\n"
     "- If wiki evidence directly answers and is fresh/high-confidence, answer from "
@@ -90,6 +94,17 @@ def format_wiki_evidence(evidence: "WikiEvidence", index: int) -> str:
     return f"{header}\n<wiki_evidence>{body}</wiki_evidence>"
 
 
+def format_kms_evidence(evidence: "KMSEvidence", index: int) -> str:
+    """Format a KMSEvidence item for injection into the prompt."""
+    label = f"[K{index}]"
+    title = evidence.title or ""
+    status = evidence.status or ""
+    source_type = evidence.source_type or ""
+    header = f"{label} {title} | status: {status} | type: {source_type}"
+    body = evidence.excerpt or evidence.summary or ""
+    return f"{header}\n<kms_evidence>{body}</kms_evidence>"
+
+
 class PromptBuilderService:
     """Service for building prompts and messages for the LLM."""
 
@@ -114,6 +129,7 @@ class PromptBuilderService:
             "when answering questions.\n\n"
             "Citation labels:\n"
             "- Compiled wiki knowledge is labeled [W1], [W2], ...\n"
+            "- Curated knowledge base entries are labeled [K1], [K2], ...\n"
             "- Documents are labeled [S1], [S2], [S3], ...\n"
             "- Memories are labeled [M1], [M2], ...\n"
             "Memories are durable user-provided context, NOT retrieved documents.\n\n"
@@ -133,6 +149,7 @@ class PromptBuilderService:
         memories: List[MemoryRecord],
         relevance_hint: Optional[str] = None,
         wiki_evidence: Optional[List["WikiEvidence"]] = None,
+        kms_evidence: Optional[List["KMSEvidence"]] = None,
     ) -> List[Dict[str, str]]:
         """Build the complete message list for LLM completion.
 
@@ -191,6 +208,17 @@ class PromptBuilderService:
             user_content_parts.append(
                 "Wiki Evidence (compiled source-backed knowledge):\n"
                 + "\n\n".join(wiki_sections)
+            )
+
+        # KMS evidence injected after wiki, before raw document evidence
+        if kms_evidence:
+            kms_sections = [
+                format_kms_evidence(ev, idx + 1)
+                for idx, ev in enumerate(kms_evidence)
+            ]
+            user_content_parts.append(
+                "Knowledge Base Evidence (user-curated documentation):\n"
+                + "\n\n".join(kms_sections)
             )
 
         if primary_sections:

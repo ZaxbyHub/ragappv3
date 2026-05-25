@@ -669,11 +669,32 @@ export interface WikiReference {
   provenance_summary: string;
 }
 
+/**
+ * A user-curated knowledge base entry cited as [K#] in an assistant response.
+ * Mirrors KMSEvidence.to_dict() from the backend.
+ */
+export interface KMSReference {
+  /** Stable label like "K1", "K2" — matches the [K#] cited in answer text. */
+  kms_label: string;
+  entry_id: number;
+  slug: string | null;
+  title: string;
+  summary: string | null;
+  excerpt: string | null;
+  tags: string[];
+  status: string | null;
+  source_type: string | null;
+  file_id: number | null;
+  score: number;
+  score_type: string | null;
+}
+
 export interface ChatStreamCallbacks {
   onMessage: (chunk: string) => void;
   onSources?: (sources: Source[]) => void;
   onMemories?: (memories: UsedMemory[]) => void;
   onWiki?: (wikiRefs: WikiReference[]) => void;
+  onKMS?: (kmsRefs: KMSReference[]) => void;
   onCitationValidation?: (validation: CitationValidationDebug) => void;
   /** Resolved chat mode reported by the backend at the start of the stream. */
   onMode?: (mode: "instant" | "thinking") => void;
@@ -709,6 +730,8 @@ export interface ChatSessionMessage {
   memories?: UsedMemory[] | null;
   /** Wiki evidence cited as [W#] in this assistant message. Null on legacy rows. */
   wiki_refs?: WikiReference[] | null;
+  /** KMS evidence cited as [K#] in this assistant message. Null on legacy rows. */
+  kms_refs?: KMSReference[] | null;
   created_at: string;
   feedback?: "up" | "down" | null;
   /** Chat mode used to generate this assistant message. Null on user rows / legacy data. */
@@ -730,6 +753,7 @@ export interface AddMessageRequest {
   sources?: Source[];
   memories?: UsedMemory[];
   wiki_refs?: WikiReference[];
+  kms_refs?: KMSReference[];
   mode?: "instant" | "thinking";
 }
 
@@ -1122,6 +1146,9 @@ export async function parseSSEStream(
           }
           if (Array.isArray(parsed.wiki_used) && parsed.wiki_used.length > 0) {
             callbacks.onWiki?.(parsed.wiki_used as WikiReference[]);
+          }
+          if (Array.isArray(parsed.kms_used) && parsed.kms_used.length > 0) {
+            callbacks.onKMS?.(parsed.kms_used as KMSReference[]);
           }
           if (parsed.citation_validation && typeof parsed.citation_validation === "object") {
             callbacks.onCitationValidation?.(parsed.citation_validation as CitationValidationDebug);

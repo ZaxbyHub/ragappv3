@@ -10,6 +10,7 @@ import {
   useChatStore,
   useLastCompletedAssistantSources,
   useLastCompletedAssistantWikiRefs,
+  useLastCompletedAssistantKmsRefs,
   useLastUserContent,
   useSourcesForSourceId,
   useCompletedAssistantMessageIdsKey,
@@ -18,6 +19,7 @@ import {
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { getChunkContext, getDocumentRawBlob, type ChunkContextResponse, type Source } from "@/lib/api";
 import { WikiCards } from "./WikiCards";
+import { KMSCards } from "./KMSCards";
 import { getRelevanceLabel, type ScoreType } from "@/lib/relevance";
 import { EmptyState } from "@/components/shared/EmptyState";
 
@@ -493,6 +495,7 @@ export function RightPane() {
   // changes.
   const lastCompletedSources = useLastCompletedAssistantSources();
   const lastCompletedWikiRefs = useLastCompletedAssistantWikiRefs();
+  const lastCompletedKmsRefs = useLastCompletedAssistantKmsRefs();
   const query = useLastUserContent();
   const completedAssistantIdsKey = useCompletedAssistantMessageIdsKey();
   const { selectedEvidenceSource, setSelectedEvidenceSource, activeRightTab, setActiveRightTab } = useChatShellStore();
@@ -597,6 +600,10 @@ export function RightPane() {
   const hasSources = sources.length > 0;
   const hasStructuredOutputs = structuredOutputs.length > 0;
   const hasWikiRefs = (lastCompletedWikiRefs?.length ?? 0) > 0;
+  const hasKmsRefs = (lastCompletedKmsRefs?.length ?? 0) > 0;
+  const tabCount = 3 + (hasWikiRefs ? 1 : 0) + (hasKmsRefs ? 1 : 0);
+  const tabsGridCols =
+    tabCount >= 5 ? "grid-cols-5" : tabCount === 4 ? "grid-cols-4" : "grid-cols-3";
 
   return (
     <div className="flex h-full flex-col">
@@ -611,7 +618,7 @@ export function RightPane() {
         onValueChange={setActiveTab}
         className="flex-1 flex flex-col min-h-0"
       >
-        <TabsList className={`grid w-full flex-shrink-0 ${hasWikiRefs ? "grid-cols-4" : "grid-cols-3"}`}>
+        <TabsList className={`grid w-full flex-shrink-0 ${tabsGridCols}`}>
           <TabsTrigger value="sources">
             Sources
             {hasSources && (
@@ -636,6 +643,14 @@ export function RightPane() {
               Wiki
               <span className="ml-1.5 text-xs text-muted-foreground">
                 ({lastCompletedWikiRefs!.length})
+              </span>
+            </TabsTrigger>
+          )}
+          {hasKmsRefs && (
+            <TabsTrigger value="kms">
+              Knowledge
+              <span className="ml-1.5 text-xs text-muted-foreground">
+                ({lastCompletedKmsRefs!.length})
               </span>
             </TabsTrigger>
           )}
@@ -740,6 +755,16 @@ export function RightPane() {
             <ScrollArea className="h-full">
               <div className="pr-4">
                 <WikiCards wikiRefs={lastCompletedWikiRefs!} />
+              </div>
+            </ScrollArea>
+          </TabsContent>
+        )}
+
+        {hasKmsRefs && (
+          <TabsContent value="kms" className="flex-1 min-h-0 mt-4">
+            <ScrollArea className="h-full">
+              <div className="pr-4">
+                <KMSCards kmsRefs={lastCompletedKmsRefs!} />
               </div>
             </ScrollArea>
           </TabsContent>

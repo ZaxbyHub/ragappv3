@@ -81,6 +81,7 @@ class ChatResponse(BaseModel):
     sources: List[Dict[str, Any]] = Field(default_factory=list)
     memories_used: List[UsedMemory] = Field(default_factory=list)
     wiki_used: List[Dict[str, Any]] = Field(default_factory=list)
+    kms_used: List[Dict[str, Any]] = Field(default_factory=list)
     # "distance" | "rerank" | "rrf" — tells the client how to interpret `score`
     # values in each source (polarity + thresholds). Default "distance" keeps
     # older clients on the safe path if the engine omits it.
@@ -114,6 +115,7 @@ class AddMessageRequest(BaseModel):
     sources: Optional[List[dict]] = None
     memories: Optional[List[dict]] = None
     wiki_refs: Optional[List[dict]] = None
+    kms_refs: Optional[List[dict]] = None
     mode: Optional[Literal["instant", "thinking"]] = None
 
 
@@ -229,6 +231,7 @@ def stream_chat_response(
         sources = []
         memories_used = []
         wiki_used: List[Dict[str, Any]] = []
+        kms_used: List[Dict[str, Any]] = []
         # Default to "distance" so the frontend always has a well-defined
         # score polarity to interpret `score` values against, even if the
         # engine never emits a done event (e.g. early error).
@@ -261,7 +264,7 @@ def stream_chat_response(
                     yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
                 elif chunk_type == "error":
                     yield f"data: {json.dumps({'type': 'error', 'message': chunk.get('message', 'Chat stream failed'), 'code': chunk.get('code', 'UNKNOWN_ERROR')})}\n\n"
-                    yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'score_type': score_type})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
                     return
                 elif chunk_type == "fallback":
                     content = chunk.get("content", "")
@@ -272,6 +275,7 @@ def stream_chat_response(
                     sources = chunk.get("sources", [])
                     memories_used = chunk.get("memories_used", [])
                     wiki_used = chunk.get("wiki_used", [])
+                    kms_used = chunk.get("kms_used", [])
                     score_type = chunk.get("score_type", score_type)
         except Exception as e:
             logger.error(
@@ -292,7 +296,8 @@ def stream_chat_response(
         full_content = "".join(collected_content)
         try:
             cv = repair_against_sources_and_memories(
-                full_content, sources, memories_used, wiki_evidence=wiki_used
+                full_content, sources, memories_used,
+                wiki_evidence=wiki_used, kms_evidence=kms_used,
             )
             citation_validation = {
                 "valid": list(cv.valid_citations),
@@ -310,6 +315,7 @@ def stream_chat_response(
             "sources": sources,
             "memories_used": memories_used,
             "wiki_used": wiki_used,
+            "kms_used": kms_used,
             "score_type": score_type,
         }
         if citation_validation is not None:
@@ -362,6 +368,7 @@ async def non_stream_chat_response(
     sources = []
     memories_used = []
     wiki_used: List[Dict[str, Any]] = []
+    kms_used: List[Dict[str, Any]] = []
     score_type = "distance"
 
     try:
@@ -379,6 +386,7 @@ async def non_stream_chat_response(
                 sources = chunk.get("sources", [])
                 memories_used = chunk.get("memories_used", [])
                 wiki_used = chunk.get("wiki_used", [])
+                kms_used = chunk.get("kms_used", [])
                 score_type = chunk.get("score_type", score_type)
     except RAGEngineError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -396,7 +404,8 @@ async def non_stream_chat_response(
     # before returning the response so persisted history is well-formed.
     try:
         cv = repair_against_sources_and_memories(
-            full_content, sources, memories_used, wiki_evidence=wiki_used
+            full_content, sources, memories_used,
+            wiki_evidence=wiki_used, kms_evidence=kms_used,
         )
         full_content = cv.repaired_content
         if cv.invalid_stripped:
@@ -432,6 +441,7 @@ async def non_stream_chat_response(
         sources=sources,
         memories_used=[UsedMemory(**m) for m in memories_used] if memories_used else [],
         wiki_used=wiki_used,
+        kms_used=kms_used,
         score_type=score_type,
     )
 
@@ -657,6 +667,7 @@ async def get_session(
     col_names = {row[1] for row in table_info_rows}
     has_memories_col = "memories" in col_names
     has_wiki_refs_col = "wiki_refs" in col_names
+    has_kms_refs_col = "kms_refs" in col_names
     has_mode_col = "mode" in col_names
 
     if has_memories_col and has_wiki_refs_col:
@@ -691,7 +702,25 @@ async def get_session(
         for mid, mval in await asyncio.to_thread(mode_result.fetchall):
             mode_by_id[mid] = mval
 
-    # Parse messages with JSON sources, memories, and wiki_refs.
+    # Side-fetch persisted KMS reference cards per message (parallel to mode).
+    # Keeps the branched SELECTs above untouched.
+    kms_by_id: Dict[int, Optional[list]] = {}
+    if has_kms_refs_col:
+        kms_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id, kms_refs FROM chat_messages WHERE session_id = ?",
+            (session_id,),
+        )
+        for kid, kval in await asyncio.to_thread(kms_result.fetchall):
+            if kval:
+                try:
+                    kms_by_id[kid] = json.loads(kval)
+                except json.JSONDecodeError:
+                    kms_by_id[kid] = []
+            else:
+                kms_by_id[kid] = None
+
+    # Parse messages with JSON sources, memories, wiki_refs, and kms_refs.
     messages = []
     for msg_row in message_rows:
         sources = None
@@ -722,6 +751,7 @@ async def get_session(
                     "sources": sources,
                     "memories": memories_val,
                     "wiki_refs": wiki_refs_val,
+                    "kms_refs": kms_by_id.get(msg_row[0]),
                     "created_at": msg_row[6],
                     "feedback": msg_row[7],
                     "mode": mode_by_id.get(msg_row[0]),
@@ -742,6 +772,7 @@ async def get_session(
                     "sources": sources,
                     "memories": memories_val,
                     "wiki_refs": None,
+                    "kms_refs": kms_by_id.get(msg_row[0]),
                     "created_at": msg_row[5],
                     "feedback": msg_row[6],
                     "mode": mode_by_id.get(msg_row[0]),
@@ -756,6 +787,7 @@ async def get_session(
                     "sources": sources,
                     "memories": None,
                     "wiki_refs": None,
+                    "kms_refs": kms_by_id.get(msg_row[0]),
                     "created_at": msg_row[4],
                     "feedback": msg_row[5],
                     "mode": mode_by_id.get(msg_row[0]),
@@ -845,6 +877,7 @@ async def fork_session(
     fork_col_names = {row[1] for row in table_info_rows}
     has_memories_col = "memories" in fork_col_names
     has_wiki_refs_col = "wiki_refs" in fork_col_names
+    has_kms_refs_col = "kms_refs" in fork_col_names
     has_mode_col = "mode" in fork_col_names
 
     # Fetch messages up to message_index, including all available columns.
@@ -889,6 +922,18 @@ async def fork_session(
         )
         source_mode_rows = await asyncio.to_thread(source_mode_result.fetchall)
         source_modes = [r[0] for r in source_mode_rows[: request.message_index + 1]]
+
+    # Side-fetch source kms_refs in row order so they can be re-applied to the
+    # copied rows without bifurcating the INSERT branches below.
+    source_kms_refs: List[Optional[str]] = []
+    if has_kms_refs_col:
+        source_kms_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT kms_refs FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            (session_id,),
+        )
+        source_kms_rows = await asyncio.to_thread(source_kms_result.fetchall)
+        source_kms_refs = [r[0] for r in source_kms_rows[: request.message_index + 1]]
 
     # Create new forked session and copy messages atomically.
     fork_title = f"Branch of {session_row[2] or 'conversation'}"
@@ -943,6 +988,22 @@ async def fork_session(
                         "UPDATE chat_messages SET mode = ? WHERE id = ?",
                         (mode_val, new_id),
                     )
+
+        # Apply kms_refs positionally to the newly-inserted rows (parallel to mode).
+        if has_kms_refs_col and source_kms_refs:
+            new_id_result_kms = await asyncio.to_thread(
+                conn.execute,
+                "SELECT id FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+                (new_session_id,),
+            )
+            new_id_rows_kms = await asyncio.to_thread(new_id_result_kms.fetchall)
+            for (new_id,), kms_val in zip(new_id_rows_kms, source_kms_refs):
+                if kms_val is not None:
+                    await asyncio.to_thread(
+                        conn.execute,
+                        "UPDATE chat_messages SET kms_refs = ? WHERE id = ?",
+                        (kms_val, new_id),
+                    )
         await asyncio.to_thread(conn.commit)
     except Exception:
         await asyncio.to_thread(conn.rollback)
@@ -982,6 +1043,22 @@ async def fork_session(
         for mid, mval in await asyncio.to_thread(fork_mode_result.fetchall):
             fork_mode_by_id[mid] = mval
 
+    fork_kms_by_id: Dict[int, Optional[list]] = {}
+    if has_kms_refs_col:
+        fork_kms_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id, kms_refs FROM chat_messages WHERE session_id = ?",
+            (new_session_id,),
+        )
+        for kid, kval in await asyncio.to_thread(fork_kms_result.fetchall):
+            if kval:
+                try:
+                    fork_kms_by_id[kid] = json.loads(kval)
+                except json.JSONDecodeError:
+                    fork_kms_by_id[kid] = []
+            else:
+                fork_kms_by_id[kid] = None
+
     messages = []
     for row in copied_rows:
         sources = None
@@ -1011,6 +1088,7 @@ async def fork_session(
                     "sources": sources,
                     "memories": mem_val,
                     "wiki_refs": wiki_val,
+                    "kms_refs": fork_kms_by_id.get(row[0]),
                     "created_at": row[6],
                     "feedback": None,
                     "mode": fork_mode_by_id.get(row[0]),
@@ -1031,6 +1109,7 @@ async def fork_session(
                     "sources": sources,
                     "memories": mem_val,
                     "wiki_refs": None,
+                    "kms_refs": fork_kms_by_id.get(row[0]),
                     "created_at": row[5],
                     "feedback": None,
                     "mode": fork_mode_by_id.get(row[0]),
@@ -1045,6 +1124,7 @@ async def fork_session(
                     "sources": sources,
                     "memories": None,
                     "wiki_refs": None,
+                    "kms_refs": fork_kms_by_id.get(row[0]),
                     "created_at": row[4],
                     "feedback": None,
                     "mode": fork_mode_by_id.get(row[0]),
@@ -1240,6 +1320,7 @@ async def add_message(
     sources_json = json.dumps(request.sources) if request.sources else None
     memories_json = json.dumps(request.memories) if request.memories else None
     wiki_refs_json = json.dumps(request.wiki_refs) if request.wiki_refs else None
+    kms_refs_json = json.dumps(request.kms_refs) if request.kms_refs else None
 
     # Sanitize assistant content before persistence — defense in depth against
     # any thinking/reasoning trace that slipped past the LLM-time stripper or
@@ -1258,6 +1339,7 @@ async def add_message(
     col_names_add = {row[1] for row in table_info_rows}
     has_memories_col = "memories" in col_names_add
     has_wiki_refs_col = "wiki_refs" in col_names_add
+    has_kms_refs_col = "kms_refs" in col_names_add
     has_mode_col = "mode" in col_names_add
 
     if has_memories_col and has_wiki_refs_col:
@@ -1309,6 +1391,14 @@ async def add_message(
             conn.execute,
             "UPDATE chat_messages SET mode = ? WHERE id = ?",
             (persisted_mode, message_id),
+        )
+
+    # Persist KMS reference cards via side-write (keeps INSERT branching unchanged).
+    if has_kms_refs_col and kms_refs_json is not None:
+        await asyncio.to_thread(
+            conn.execute,
+            "UPDATE chat_messages SET kms_refs = ? WHERE id = ?",
+            (kms_refs_json, message_id),
         )
     await asyncio.to_thread(conn.commit)
     if has_memories_col and has_wiki_refs_col:
@@ -1363,6 +1453,10 @@ async def add_message(
     else:
         created_at = row[4]
 
+    # KMS refs round-trip from the request (side-written above); echo back the
+    # parsed value so the client can render [K#] cards immediately.
+    kms_refs_out = request.kms_refs if (has_kms_refs_col and request.kms_refs) else None
+
     return {
         "id": row[0],
         "role": row[1],
@@ -1370,6 +1464,7 @@ async def add_message(
         "sources": sources,
         "memories": memories,
         "wiki_refs": wiki_refs_out,
+        "kms_refs": kms_refs_out,
         "created_at": created_at,
         "mode": persisted_mode,
     }

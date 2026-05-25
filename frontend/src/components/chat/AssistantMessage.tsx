@@ -9,6 +9,7 @@ import { MarkdownMessage, parseCitationSegments } from "./MarkdownMessage";
 import { SourceCards } from "./SourceCards";
 import { MemoryCards } from "./MemoryCards";
 import { WikiCards } from "./WikiCards";
+import { KMSCards } from "./KMSCards";
 import { AssistantMessageActions } from "./MessageActions";
 
 // Re-export for backwards compat with tests
@@ -49,10 +50,17 @@ export function AssistantMessage({
   const { openRightPane, setSelectedEvidenceSource, setActiveRightTab } = useChatShellStore();
   const prefersReducedMotion = useReducedMotion();
 
-  // Derive cited sources, memories, and wiki refs for evidence cards
-  const { citedSources, citedMemories, citedWikis } = useMemo(
-    () => parseCitationSegments(message.content, message.sources, message.memoriesUsed, message.wikiRefs),
-    [message.content, message.sources, message.memoriesUsed, message.wikiRefs]
+  // Derive cited sources, memories, wiki refs, and KMS refs for evidence cards
+  const { citedSources, citedMemories, citedWikis, citedKms } = useMemo(
+    () =>
+      parseCitationSegments(
+        message.content,
+        message.sources,
+        message.memoriesUsed,
+        message.wikiRefs,
+        message.kmsRefs
+      ),
+    [message.content, message.sources, message.memoriesUsed, message.wikiRefs, message.kmsRefs]
   );
 
   const handleSourceClick = useCallback(
@@ -84,6 +92,8 @@ export function AssistantMessage({
   const memoriesForCards = citedMemories;
   // Wiki cards: show ONLY wiki refs explicitly cited as [W#] in the answer.
   const wikiRefsForCards = citedWikis;
+  // KMS cards: show ONLY KMS refs explicitly cited as [K#] in the answer.
+  const kmsRefsForCards = citedKms;
 
   return (
     <motion.div
@@ -134,6 +144,7 @@ export function AssistantMessage({
           sources={message.sources}
           memories={message.memoriesUsed}
           wikiRefs={message.wikiRefs}
+          kmsRefs={message.kmsRefs}
           isStreaming={isStreaming}
           onCitationClick={handleSourceClick}
           citedSources={citedSources}
@@ -142,6 +153,11 @@ export function AssistantMessage({
         {/* Wiki cards — compiled knowledge cited as [W#] */}
         {!isStreaming && wikiRefsForCards.length > 0 && (
           <WikiCards wikiRefs={wikiRefsForCards} />
+        )}
+
+        {/* KMS cards — user-curated knowledge cited as [K#] */}
+        {!isStreaming && kmsRefsForCards.length > 0 && (
+          <KMSCards kmsRefs={kmsRefsForCards} />
         )}
 
         {/* Source cards — shown below the message body */}

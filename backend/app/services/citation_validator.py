@@ -18,9 +18,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Sequence, Tuple
 
-# Match [S<digits>], [M<digits>], and [W<digits>] anywhere in text.
-# Case-sensitive: S/M/W only — lowercase variants are treated as plain text.
-_CITATION_RE = re.compile(r"\[(S|M|W)(\d+)\]")
+# Match [S<digits>], [M<digits>], [W<digits>], and [K<digits>] anywhere in text.
+# Case-sensitive: S/M/W/K only — lowercase variants are treated as plain text.
+_CITATION_RE = re.compile(r"\[(S|M|W|K)(\d+)\]")
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ class CitationValidationResult:
     has_any_citation: bool
     uncited_factual_warning: bool
     invalid_wiki_citations: Tuple[str, ...] = field(default=())
+    invalid_kms_citations: Tuple[str, ...] = field(default=())
 
 
 def _label_set(prefix: str, count: int) -> set[str]:
@@ -70,8 +71,9 @@ def validate_and_repair_citations(
     source_count: int,
     memory_count: int,
     wiki_count: int = 0,
+    kms_count: int = 0,
 ) -> CitationValidationResult:
-    """Validate ``[S#]``, ``[M#]``, and ``[W#]`` citations in ``content``.
+    """Validate ``[S#]``, ``[M#]``, ``[W#]``, and ``[K#]`` citations in ``content``.
 
     Args:
         content: Complete assistant response text.
@@ -80,6 +82,9 @@ def validate_and_repair_citations(
         wiki_count: Number of wiki evidence items available (range W1..WN).
             Defaults to 0 for backward compatibility — W citations will be
             treated as invalid when wiki_count is 0.
+        kms_count: Number of KMS evidence items available (range K1..KN).
+            Defaults to 0 for backward compatibility — K citations will be
+            treated as invalid when kms_count is 0.
 
     Returns:
         CitationValidationResult with the repaired content, the set of valid
@@ -91,19 +96,22 @@ def validate_and_repair_citations(
             valid_citations=(),
             invalid_citations=(),
             invalid_stripped=False,
-            has_evidence=source_count > 0 or memory_count > 0 or wiki_count > 0,
+            has_evidence=source_count > 0 or memory_count > 0 or wiki_count > 0 or kms_count > 0,
             has_any_citation=False,
             uncited_factual_warning=False,
             invalid_wiki_citations=(),
+            invalid_kms_citations=(),
         )
 
     valid_s = _label_set("S", source_count)
     valid_m = _label_set("M", memory_count)
     valid_w = _label_set("W", wiki_count)
+    valid_k = _label_set("K", kms_count)
 
     valid: List[str] = []
     invalid: List[str] = []
     invalid_wiki: List[str] = []
+    invalid_kms: List[str] = []
 
     def _replacer(match: re.Match) -> str:
         prefix, num = match.group(1), match.group(2)
@@ -112,6 +120,7 @@ def validate_and_repair_citations(
             (prefix == "S" and label in valid_s)
             or (prefix == "M" and label in valid_m)
             or (prefix == "W" and label in valid_w)
+            or (prefix == "K" and label in valid_k)
         )
         if is_valid:
             valid.append(label)
@@ -119,6 +128,8 @@ def validate_and_repair_citations(
         invalid.append(label)
         if prefix == "W":
             invalid_wiki.append(label)
+        elif prefix == "K":
+            invalid_kms.append(label)
         # Strip the invalid citation. Leave a single space so words don't merge.
         return ""
 
@@ -130,7 +141,9 @@ def validate_and_repair_citations(
     repaired = re.sub(r"\s+([.,;:!?])", r"\1", repaired)
     repaired = repaired.strip()
 
-    has_evidence = source_count > 0 or memory_count > 0 or wiki_count > 0
+    has_evidence = (
+        source_count > 0 or memory_count > 0 or wiki_count > 0 or kms_count > 0
+    )
     has_any_citation = bool(valid)
     uncited_factual_warning = (
         has_evidence
@@ -147,6 +160,7 @@ def validate_and_repair_citations(
         has_any_citation=has_any_citation,
         uncited_factual_warning=uncited_factual_warning,
         invalid_wiki_citations=tuple(dict.fromkeys(invalid_wiki)),
+        invalid_kms_citations=tuple(dict.fromkeys(invalid_kms)),
     )
 
 
@@ -179,6 +193,17 @@ def parse_wiki_citations(content: str) -> List[str]:
     return wikis
 
 
+def parse_kms_citations(content: str) -> List[str]:
+    """Return [K#] labels found in content, deduped, in first-occurrence order."""
+    kms: List[str] = []
+    for m in _CITATION_RE.finditer(content or ""):
+        if m.group(1) == "K":
+            label = f"K{m.group(2)}"
+            if label not in kms:
+                kms.append(label)
+    return kms
+
+
 def labels_for_sources(sources: Iterable[dict]) -> List[str]:
     """Return the source_label values for an iterable of source dicts."""
     out: List[str] = []
@@ -204,12 +229,14 @@ def repair_against_sources_and_memories(
     sources: Sequence[dict],
     memories: Sequence[dict],
     wiki_evidence: Optional[Sequence[dict]] = None,
+    kms_evidence: Optional[Sequence[dict]] = None,
 ) -> CitationValidationResult:
-    """Convenience: derive counts from source/memory/wiki dicts, then validate.
+    """Convenience: derive counts from source/memory/wiki/kms dicts, then validate.
 
     Sources are expected to use 1-based ``source_label`` like ``S1``.
     Memories are expected to use 1-based ``memory_label`` like ``M1``.
     Wiki evidence items are expected to use 1-based ``wiki_label`` like ``W1``.
+    KMS evidence items are expected to use 1-based ``kms_label`` like ``K1``.
     Counts default to the maximum index assigned across the inputs so
     sparse labelings (e.g. only S2 and S4) still validate correctly.
     """
@@ -227,12 +254,14 @@ def repair_against_sources_and_memories(
         return n
 
     wiki_count = _max_index(wiki_evidence or [], "W", "wiki_label")
+    kms_count = _max_index(kms_evidence or [], "K", "kms_label")
 
     return validate_and_repair_citations(
         content,
         source_count=_max_index(sources, "S", "source_label"),
         memory_count=_max_index(memories, "M", "memory_label"),
         wiki_count=wiki_count,
+        kms_count=kms_count,
     )
 
 
@@ -241,6 +270,7 @@ __all__ = [
     "validate_and_repair_citations",
     "parse_citations",
     "parse_wiki_citations",
+    "parse_kms_citations",
     "labels_for_sources",
     "labels_for_memories",
     "repair_against_sources_and_memories",

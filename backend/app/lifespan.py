@@ -17,6 +17,7 @@ from app.services.email_service import EmailIngestionService
 from app.services.embeddings import EmbeddingService
 from app.services.file_watcher import FileWatcher
 from app.services.kms_compile_processor import KMSCompileProcessor
+from app.services.kms_retrieval import KMSRetrievalService
 from app.services.llm_client import (
     LLMClient,
     create_instant_client,
@@ -468,6 +469,10 @@ async def lifespan(app: FastAPI):
     app.state.wiki_retrieval = WikiRetrievalService(pool=app.state.db_pool)
     logger.info("WikiRetrievalService initialized")
 
+    # Initialize KMSRetrievalService using the app's DB pool
+    app.state.kms_retrieval = KMSRetrievalService(pool=app.state.db_pool)
+    logger.info("KMSRetrievalService initialized")
+
     # Start WikiCompileProcessor (background wiki job worker)
     try:
         app.state.wiki_compile_processor = WikiCompileProcessor(pool=app.state.db_pool)
@@ -504,6 +509,7 @@ async def lifespan(app: FastAPI):
         llm_client=app.state.llm_client,
         reranking_service=app.state.reranking_service,
         wiki_retrieval=app.state.wiki_retrieval,
+        kms_retrieval=app.state.kms_retrieval,
         thinking_client=app.state.thinking_llm_client,
         instant_client=app.state.instant_llm_client,
     )

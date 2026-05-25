@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Source, UsedMemory, WikiReference } from "@/lib/api";
+import type { Source, UsedMemory, WikiReference, KMSReference } from "@/lib/api";
 
 export interface Message {
   id: string;
@@ -10,6 +10,8 @@ export interface Message {
   memoriesUsed?: UsedMemory[];
   /** Wiki evidence cited as [W#] in this assistant message. */
   wikiRefs?: WikiReference[];
+  /** KMS evidence cited as [K#] in this assistant message. */
+  kmsRefs?: KMSReference[];
   /** Chat mode used to generate this assistant message. */
   mode?: "instant" | "thinking";
   stopped?: boolean;
@@ -280,6 +282,22 @@ export const useLastCompletedAssistantWikiRefs = (): WikiReference[] | undefined
       if (id === streamingId) continue;
       const msg = s.messagesById[id];
       if (msg?.role === "assistant" && msg.wikiRefs && msg.wikiRefs.length > 0) return msg.wikiRefs;
+    }
+    return undefined;
+  });
+
+/**
+ * Selector returning the KMS refs of the most recent *completed* assistant
+ * message. Mirrors useLastCompletedAssistantWikiRefs.
+ */
+export const useLastCompletedAssistantKmsRefs = (): KMSReference[] | undefined =>
+  useChatStore((s) => {
+    const streamingId = s.streamingMessageId;
+    for (let i = s.messageIds.length - 1; i >= 0; i--) {
+      const id = s.messageIds[i];
+      if (id === streamingId) continue;
+      const msg = s.messagesById[id];
+      if (msg?.role === "assistant" && msg.kmsRefs && msg.kmsRefs.length > 0) return msg.kmsRefs;
     }
     return undefined;
   });

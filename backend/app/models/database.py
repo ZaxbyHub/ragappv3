@@ -721,10 +721,12 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_refs_and_job_input(sqlite_path)
     migrate_add_wiki_jobs_retry_count(sqlite_path)
     migrate_add_kms_tables(sqlite_path)
+    migrate_add_kms_refs(sqlite_path)
     migrate_add_files_parsed_text(sqlite_path)
     migrate_add_files_processing_progress(sqlite_path)
     migrate_add_files_enrichment_status(sqlite_path)
     migrate_add_files_search_fts(sqlite_path)
+    migrate_add_files_content_fts(sqlite_path)
     migrate_add_curator_claim_support(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
@@ -1418,6 +1420,22 @@ def migrate_add_wiki_refs_and_job_input(sqlite_path: str) -> None:
         conn.close()
 
 
+def migrate_add_kms_refs(sqlite_path: str) -> None:
+    """Migration: add ``kms_refs`` to chat_messages for persisted [K#] citation
+    cards (the KMS counterpart to ``wiki_refs``). Idempotent.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_msg_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()
+        ]
+        if "kms_refs" not in existing_msg_cols:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN kms_refs TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def migrate_add_wiki_jobs_retry_count(sqlite_path: str) -> None:
     """Migration: add retry_count to wiki_compile_jobs. Idempotent."""
     conn = sqlite3.connect(sqlite_path)
@@ -1881,6 +1899,66 @@ def migrate_add_files_search_fts(sqlite_path: str) -> None:
             """
         )
         conn.execute("INSERT INTO files_search_fts(files_search_fts) VALUES('rebuild')")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def migrate_add_files_content_fts(sqlite_path: str) -> None:
+    """Migration: add ``files_content_fts`` FTS5 index over ``files.parsed_text``.
+
+    This is the document *body* search index — kept separate from
+    ``files_search_fts`` (metadata only) so content search can be tuned
+    independently of filename/metadata search. Lives in a migration rather
+    than the base schema because the indexed column (``parsed_text``) is itself
+    added by a migration, so this must run after ``migrate_add_files_parsed_text``.
+
+    The UPDATE trigger is guarded with ``WHEN new.parsed_text IS NOT old.parsed_text``
+    so frequent metadata/progress writes during ingestion do not re-index the
+    full document body on every row update.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
+        ]
+        if "parsed_text" not in existing_cols:
+            # Defensive: normally added by migrate_add_files_parsed_text first.
+            conn.execute("ALTER TABLE files ADD COLUMN parsed_text TEXT")
+
+        conn.executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS files_content_fts USING fts5(
+                parsed_text,
+                content='files',
+                content_rowid='id'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS files_content_fts_insert AFTER INSERT ON files BEGIN
+                INSERT INTO files_content_fts(rowid, parsed_text)
+                VALUES (new.id, new.parsed_text);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS files_content_fts_delete AFTER DELETE ON files BEGIN
+                INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)
+                VALUES ('delete', old.id, old.parsed_text);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS files_content_fts_update AFTER UPDATE ON files
+            WHEN new.parsed_text IS NOT old.parsed_text BEGIN
+                INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)
+                VALUES ('delete', old.id, old.parsed_text);
+                INSERT INTO files_content_fts(rowid, parsed_text)
+                VALUES (new.id, new.parsed_text);
+            END;
+            """
+        )
+        conn.execute("INSERT INTO files_content_fts(files_content_fts) VALUES('rebuild')")
         conn.commit()
     except Exception:
         conn.rollback()

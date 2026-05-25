@@ -22,11 +22,14 @@ from app.services.kms_store import KMSStore
 logger = logging.getLogger(__name__)
 
 
-def require_kms_enabled() -> None:
+async def require_kms_enabled() -> None:
     """Master switch (config.kms_enabled). When off, the entire KMS subsystem —
-    reads, writes, and job creation — is unavailable, not just auto-ingest."""
+    reads, writes, and job creation — is unavailable, not just auto-ingest.
+
+    Returns 503 (Service Unavailable) since the subsystem is intentionally
+    turned off, not an authorization failure."""
     if not settings.kms_enabled:
-        raise HTTPException(status_code=403, detail="KMS subsystem is disabled")
+        raise HTTPException(status_code=503, detail="KMS subsystem is disabled")
 
 
 # Apply the master switch to every KMS route. CSRF is added per-route on the
@@ -53,12 +56,6 @@ async def _require_vault_read(user: dict, vault_id: int) -> None:
 async def _require_vault_write(user: dict, vault_id: int) -> None:
     if not await evaluate_policy(user, "vault", vault_id, "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
-
-
-async def require_kms_enabled() -> None:
-    """Dependency that ensures the KMS subsystem is enabled."""
-    if not settings.kms_enabled:
-        raise HTTPException(status_code=503, detail="KMS subsystem is disabled")
 
 
 # ---------------------------------------------------------------------------

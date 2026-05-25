@@ -389,6 +389,10 @@ class TestKMSCSRFProtection(KMSFixTestBase):
 
     def setUp(self):
         super().setUp()
+        # The base class overrides csrf_protect to bypass CSRF for ordinary CRUD
+        # tests. Remove that override here so the real csrf_protect dependency
+        # runs and we can assert the 403 behaviour for missing/invalid tokens.
+        app.dependency_overrides.pop(csrf_protect, None)
         # Set up a mock CSRF manager on app.state so csrf_protect doesn't fail with 503
         # We want to test 403 (CSRF token missing/mismatch), not 503 (CSRF service unavailable)
         class MockCSRFManager:

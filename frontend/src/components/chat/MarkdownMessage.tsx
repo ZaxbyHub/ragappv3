@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { CopyButton } from "@/components/shared/CopyButton";
 import { SourceCitation } from "./SourceCitation";
-import type { Source, UsedMemory, WikiReference } from "@/lib/api";
+import type { Source, UsedMemory, WikiReference, KMSReference } from "@/lib/api";
 
 // =============================================================================
 // Syntax highlighter — lazily loaded so first chat render is not penalized
@@ -143,11 +143,12 @@ export const MarkdownMessageTestInternals = {
 // =============================================================================
 
 interface ParsedSegment {
-  type: "text" | "citation" | "memory_citation" | "wiki_citation";
+  type: "text" | "citation" | "memory_citation" | "wiki_citation" | "kms_citation";
   content?: string;
   sourceName?: string;
   memoryLabel?: string;
   wikiLabel?: string;
+  kmsLabel?: string;
 }
 
 /**
@@ -164,21 +165,31 @@ export function parseCitationSegments(
   content: string,
   sources: Source[] | undefined,
   memories?: UsedMemory[],
-  wikiRefs?: WikiReference[]
-): { segments: ParsedSegment[]; citedSources: Source[]; citedMemories: UsedMemory[]; citedWikis: WikiReference[] } {
+  wikiRefs?: WikiReference[],
+  kmsRefs?: KMSReference[]
+): {
+  segments: ParsedSegment[];
+  citedSources: Source[];
+  citedMemories: UsedMemory[];
+  citedWikis: WikiReference[];
+  citedKms: KMSReference[];
+} {
   // Capture groups:
   //  1. document number (e.g. "2" from "[S2]")
   //  2. memory number   (e.g. "1" from "[M1]")
   //  3. wiki number     (e.g. "3" from "[W3]")
-  //  4. legacy filename (e.g. "report.pdf" from "[Source: report.pdf]")
-  const regex = /\[S(\d+)\]|\[M(\d+)\]|\[W(\d+)\]|\[Source:\s*([^\]]+)\]/g;
+  //  4. kms number      (e.g. "4" from "[K4]")
+  //  5. legacy filename (e.g. "report.pdf" from "[Source: report.pdf]")
+  const regex = /\[S(\d+)\]|\[M(\d+)\]|\[W(\d+)\]|\[K(\d+)\]|\[Source:\s*([^\]]+)\]/g;
   const segments: ParsedSegment[] = [];
   const citedSources: Source[] = [];
   const citedMemories: UsedMemory[] = [];
   const citedWikis: WikiReference[] = [];
+  const citedKms: KMSReference[] = [];
   const seenSourceIds = new Set<string>();
   const seenMemoryIds = new Set<string>();
   const seenWikiLabels = new Set<string>();
+  const seenKmsLabels = new Set<string>();
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
@@ -227,8 +238,21 @@ export function parseCitationSegments(
         seenWikiLabels.add(label);
       }
     } else if (match[4]) {
+      // KMS citation [K#]
+      const label = `K${match[4]}`;
+      let kms = kmsRefs?.find((k) => k.kms_label === label);
+      if (!kms) {
+        const idx = parseInt(match[4], 10) - 1;
+        if (kmsRefs && idx >= 0 && idx < kmsRefs.length) kms = kmsRefs[idx];
+      }
+      segments.push({ type: "kms_citation", kmsLabel: label });
+      if (kms && !seenKmsLabels.has(label)) {
+        citedKms.push(kms);
+        seenKmsLabels.add(label);
+      }
+    } else if (match[5]) {
       // Legacy [Source: filename]
-      const sourceName = match[4].trim();
+      const sourceName = match[5].trim();
       const source = sources?.find((s) => s.filename === sourceName);
       segments.push({ type: "citation", sourceName });
       if (source && !seenSourceIds.has(source.id)) {
@@ -244,7 +268,7 @@ export function parseCitationSegments(
     segments.push({ type: "text", content: content.slice(lastIndex) });
   }
 
-  return { segments, citedSources, citedMemories, citedWikis };
+  return { segments, citedSources, citedMemories, citedWikis, citedKms };
 }
 
 // =============================================================================
@@ -255,7 +279,7 @@ export function parseCitationSegments(
 // below renders each marker as an interactive citation chip.
 // =============================================================================
 
-const CITATION_REGEX = /\[(S|M|W)(\d+)\]|\[Source:\s*([^\]]+)\]/g;
+const CITATION_REGEX = /\[(S|M|W|K)(\d+)\]|\[Source:\s*([^\]]+)\]/g;
 
 interface MdastNode {
   type: string;
@@ -351,10 +375,12 @@ interface MarkdownMessageProps {
   sources?: Source[];
   memories?: UsedMemory[];
   wikiRefs?: WikiReference[];
+  kmsRefs?: KMSReference[];
   isStreaming?: boolean;
   onCitationClick?: (source: Source) => void;
   onMemoryCitationClick?: (memory: UsedMemory) => void;
   onWikiCitationClick?: (wiki: WikiReference) => void;
+  onKmsCitationClick?: (kms: KMSReference) => void;
   citedSources?: Source[];
 }
 
@@ -376,15 +402,17 @@ export const MarkdownMessage = memo(function MarkdownMessage({
   sources,
   memories,
   wikiRefs,
+  kmsRefs,
   isStreaming,
   onCitationClick,
   onMemoryCitationClick,
   onWikiCitationClick,
+  onKmsCitationClick,
   citedSources: externalCitedSources,
 }: MarkdownMessageProps) {
   const { segments, citedSources: internalCitedSources } = useMemo(
-    () => parseCitationSegments(content, sources, memories, wikiRefs),
-    [content, sources, memories, wikiRefs]
+    () => parseCitationSegments(content, sources, memories, wikiRefs, kmsRefs),
+    [content, sources, memories, wikiRefs, kmsRefs]
   );
 
   const citedSources = externalCitedSources ?? internalCitedSources;
@@ -422,6 +450,35 @@ export const MarkdownMessage = memo(function MarkdownMessage({
           title={titleText}
           aria-label={titleText}
           data-citation-type="wiki"
+          data-citation-label={label}
+        >
+          {label}
+        </button>
+      );
+    }
+    if (type === "K") {
+      const kms =
+        kmsRefs?.find((k) => k.kms_label === label) ??
+        (() => {
+          const m = label.match(/^K(\d+)$/);
+          if (m && kmsRefs) {
+            const idx = parseInt(m[1], 10) - 1;
+            return idx >= 0 && idx < kmsRefs.length ? kmsRefs[idx] : undefined;
+          }
+          return undefined;
+        })();
+      const titleText = kms
+        ? `Knowledge ${label}: ${kms.title}${kms.excerpt ? ` — ${kms.excerpt.slice(0, 100)}` : ""}`
+        : `Knowledge ${label}`;
+      return (
+        <button
+          type="button"
+          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-md border border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-[10px] font-semibold tracking-wide hover:bg-emerald-500/20 hover:border-emerald-500/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={() => kms && onKmsCitationClick?.(kms)}
+          disabled={!kms}
+          title={titleText}
+          aria-label={titleText}
+          data-citation-type="kms"
           data-citation-label={label}
         >
           {label}

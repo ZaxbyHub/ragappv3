@@ -10,6 +10,7 @@ from app.config import settings
 from app.models.chat_mode import ChatMode
 from app.services.citation_validator import (
     parse_citations,
+    parse_kms_citations,
     parse_wiki_citations,
     repair_against_sources_and_memories,
 )
@@ -117,6 +118,7 @@ class RAGEngine:
         document_retrieval_service: Optional[DocumentRetrievalService] = None,
         prompt_builder_service: Optional[PromptBuilderService] = None,
         wiki_retrieval: Optional[Any] = None,
+        kms_retrieval: Optional[Any] = None,
         thinking_client: Optional[LLMClient] = None,
         instant_client: Optional[LLMClient] = None,
     ) -> None:
@@ -199,6 +201,9 @@ class RAGEngine:
 
         # Wiki retrieval service (optional — injected at startup)
         self._wiki_retrieval = wiki_retrieval
+
+        # KMS retrieval service (optional — injected at startup)
+        self._kms_retrieval = kms_retrieval
 
     @property
     def thinking_client(self) -> LLMClient:
@@ -535,6 +540,23 @@ class RAGEngine:
                 logger.warning("Wiki retrieval failed: %s", exc)
                 wiki_evidence = []
 
+        # KMS retrieval: query user-curated knowledge entries. Gated by the
+        # kms_enabled master switch (also re-checked inside the service).
+        kms_evidence: List[Any] = []
+        if (
+            self._kms_retrieval is not None
+            and vault_id is not None
+            and settings.kms_enabled
+        ):
+            try:
+                kms_evidence = await asyncio.to_thread(
+                    self._kms_retrieval.retrieve, retrieval_query, vault_id
+                )
+                logger.info("[query] KMS retrieval: %d candidates", len(kms_evidence))
+            except Exception as exc:
+                logger.warning("KMS retrieval failed: %s", exc)
+                kms_evidence = []
+
         # Update trace with wiki results
         query_type = _classify_query(retrieval_query)
         trace.wiki_query = retrieval_query
@@ -735,6 +757,7 @@ class RAGEngine:
         messages = self.prompt_builder.build_messages(
             user_input, chat_history, relevant_chunks, memories, relevance_hint,
             wiki_evidence=wiki_evidence if wiki_evidence else None,
+            kms_evidence=kms_evidence if kms_evidence else None,
         )
 
         # Stream or non-stream LLM response. Capture the assembled
@@ -764,6 +787,7 @@ class RAGEngine:
         full_response = "".join(assembled_response)
         cited_sources, cited_memories = parse_citations(full_response)
         cited_wikis = parse_wiki_citations(full_response)
+        cited_kms = parse_kms_citations(full_response)
         trace.cited_sources = cited_sources
         trace.cited_memories = cited_memories
         trace.wiki_cited = cited_wikis
@@ -795,6 +819,8 @@ class RAGEngine:
             cited_labels=set(cited_memories),
             wiki_candidates=wiki_evidence,
             cited_wiki_labels=set(cited_wikis),
+            kms_candidates=kms_evidence,
+            cited_kms_labels=set(cited_kms),
         )
         # Populate final-source labels on the trace for evaluation tooling.
         trace.final_sources = [
@@ -810,6 +836,7 @@ class RAGEngine:
                 done_msg.get("sources", []),
                 done_msg.get("memories_used", []),
                 wiki_evidence=done_msg.get("wiki_used", []),
+                kms_evidence=done_msg.get("kms_used", []),
             )
             trace.invalid_citations = list(validation.invalid_citations)
             trace.answer_supported = (
@@ -1301,6 +1328,8 @@ class RAGEngine:
         cited_labels: Optional[set] = None,
         wiki_candidates: Optional[List[Any]] = None,
         cited_wiki_labels: Optional[set] = None,
+        kms_candidates: Optional[List[Any]] = None,
+        cited_kms_labels: Optional[set] = None,
     ) -> Dict[str, Any]:
         """Build the final done message with sources.
 
@@ -1385,11 +1414,19 @@ class RAGEngine:
                 if ev.label_placeholder in cited_wiki_labels:
                     wiki_used.append(ev.to_dict())
 
+        # Build kms_used: only KMS evidence whose label was cited in the response
+        kms_used: List[Dict[str, Any]] = []
+        if kms_candidates and cited_kms_labels:
+            for ev in kms_candidates:
+                if ev.label_placeholder in cited_kms_labels:
+                    kms_used.append(ev.to_dict())
+
         return {
             "type": "done",
             "sources": sources,
             "memories_used": memories_used,
             "wiki_used": wiki_used,
+            "kms_used": kms_used,
             "retrieval_debug": retrieval_debug,
             "score_type": score_type,
         }
