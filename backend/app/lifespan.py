@@ -480,16 +480,20 @@ async def lifespan(app: FastAPI):
         logger.warning("WikiCompileProcessor start failed (continuing): %s", e)
         app.state.wiki_compile_processor = None
 
-    # Start KMSCompileProcessor (background KMS job worker)
-    try:
-        app.state.kms_compile_processor = KMSCompileProcessor(pool=app.state.db_pool)
-        await _safe_await(
-            app.state.kms_compile_processor.start(),
-            "KMSCompileProcessor start",
-            timeout=10,
-        )
-    except Exception as e:
-        logger.warning("KMSCompileProcessor start failed (continuing): %s", e)
+    # Start KMSCompileProcessor (background KMS job worker) only if KMS is enabled
+    if settings.kms_enabled:
+        try:
+            app.state.kms_compile_processor = KMSCompileProcessor(pool=app.state.db_pool)
+            await _safe_await(
+                app.state.kms_compile_processor.start(),
+                "KMSCompileProcessor start",
+                timeout=10,
+            )
+        except Exception as e:
+            logger.warning("KMSCompileProcessor start failed (continuing): %s", e)
+            app.state.kms_compile_processor = None
+    else:
+        logger.info("KMS subsystem disabled; skipping KMSCompileProcessor startup")
         app.state.kms_compile_processor = None
 
     # Initialize RAGEngine singleton with cached services

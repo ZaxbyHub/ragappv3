@@ -77,6 +77,9 @@ export interface SettingsFormData {
   wiki_llm_curator_run_on_ingest: boolean;
   wiki_llm_curator_run_on_query: boolean;
   wiki_llm_curator_run_on_manual: boolean;
+  // KMS / Knowledge Management config
+  kms_enabled: boolean;
+  kms_compile_on_ingest: boolean;
 }
 
 export type SettingsErrors = Partial<Record<keyof SettingsFormData, string>>;
@@ -135,6 +138,8 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   wiki_llm_curator_run_on_ingest: "wiki",
   wiki_llm_curator_run_on_query: "wiki",
   wiki_llm_curator_run_on_manual: "wiki",
+  kms_enabled: "maintenance",
+  kms_compile_on_ingest: "maintenance",
 };
 
 // Fields that invalidate existing embeddings when changed — reindex required.
@@ -242,6 +247,8 @@ const defaultFormData: SettingsFormData = {
   wiki_llm_curator_run_on_ingest: true,
   wiki_llm_curator_run_on_query: false,
   wiki_llm_curator_run_on_manual: true,
+  kms_enabled: true,
+  kms_compile_on_ingest: true,
 };
 
 // Unwrap legacy json.dumps-encoded strings ('"x"' -> 'x').
@@ -325,6 +332,8 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     wiki_llm_curator_run_on_query: settings.wiki_llm_curator_run_on_query ?? false,
     wiki_llm_curator_run_on_manual:
       settings.wiki_llm_curator_run_on_manual ?? true,
+    kms_enabled: settings.kms_enabled ?? true,
+    kms_compile_on_ingest: settings.kms_compile_on_ingest ?? true,
   };
 }
 

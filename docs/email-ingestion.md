@@ -136,6 +136,10 @@ Configure email ingestion via environment variables in your `.env` file:
     "text/css",
     "application/xml",
     "application/x-yaml",
+    "text/x-log",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 ```
 
@@ -351,16 +355,16 @@ Subject: #projectx Q4 Reports
 From: manager@company.com
 Attachments:
 - report_q4.pdf
-- financials.xlsx (will be skipped - not allowed)
+- financials.xlsx
 - summary.txt
-- presentation.pptx (will be skipped - not allowed)
+- presentation.pptx
 ```
 
 **Result:**
 - `report_q4.pdf` → Processed ✓
-- `financials.xlsx` → Skipped (MIME type not allowed) ✗
+- `financials.xlsx` → Processed ✓
 - `summary.txt` → Processed ✓
-- `presentation.pptx` → Skipped (MIME type not allowed) ✗
+- `presentation.pptx` → Processed ✓
 
 #### Email Without Vault Tag
 
@@ -407,8 +411,8 @@ Attachments: None
 | `.css` | `text/css` | ✓ Yes |
 | `.xml` | `application/xml` | ✓ Yes |
 | `.yaml`/`.yml` | `application/x-yaml` | ✓ Yes |
-| `.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | ✗ No |
-| `.pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | ✗ No |
+| `.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | ✓ Yes |
+| `.pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` | ✓ Yes |
 | `.zip` | `application/zip` | ✗ No |
 | `.jpg`/`.png` | Image types | ✗ No |
 
