@@ -1486,6 +1486,15 @@ async def batch_delete_documents(
             )
             deleted_count += 1
 
+            await _safe_record_action(
+                normalized_file_id,
+                "delete",
+                "success",
+                user,
+                getattr(request.app.state, "secret_manager", None),
+                conn,
+            )
+
         except Exception:
             logger.exception("Error deleting document %s", file_id)
             failed_ids.append(file_id)
@@ -1538,6 +1547,15 @@ async def delete_all_vault_documents(
                 conn,
             )
             deleted_count += 1
+
+            await _safe_record_action(
+                file_id,
+                "delete",
+                "success",
+                user,
+                getattr(request.app.state, "secret_manager", None),
+                conn,
+            )
 
         except Exception:
             logger.exception(

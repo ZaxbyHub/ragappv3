@@ -39,6 +39,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - SQLite calls in `auth.py`, `deps.py`, and `vaults.py` wrapped with `asyncio.to_thread()` for async safety; fixed critical bugs where async functions were incorrectly passed to `asyncio.to_thread()`
 - All database write paths now have internal rollback in named functions for improved error handling and consistency
 - VectorStore write lock now uses timeout and Semaphore for better concurrency control
+- KMS routes now return HTTP 503 when the KMS subsystem is disabled (`require_kms_enabled` dependency added to all KMS endpoints)
+- KMS mutating routes (POST, PUT, DELETE) now protected by CSRF token validation
+- KMS entry slug field now enforced with min_length=1 validation
+- Document batch delete and vault delete operations now emit HMAC-signed audit log entries via `_safe_record_action()`
+- KMSCompileProcessor background worker now only starts when `kms_enabled=true`; skipped entirely when KMS is disabled
+- Email ingestion now accepts PowerPoint (.pptx) attachments via the `application/vnd.openxmlformats-officedocument.presentationml.presentation` MIME type
 
 ### Added
 

@@ -238,6 +238,8 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `SEARCH_RATE_LIMIT` | `60` | Maximum search requests per minute per user (0 = unlimited) |
 | `VAULT_CREATE_RATE_LIMIT` | `10` | Maximum vault creation requests per minute per user (0 = unlimited) |
 | `MEMORY_MUTATION_RATE_LIMIT` | `30` | Maximum memory create/update/delete requests per minute per user (0 = unlimited) |
+| `KMS_ENABLED` | `true` | Master switch for the KMS (Knowledge Management) subsystem |
+| `KMS_COMPILE_ON_INGEST` | `true` | Create/refresh a KMS document entry when a document finishes indexing |
 
 ### Data Directory Structure
 

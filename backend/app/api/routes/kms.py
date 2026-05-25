@@ -55,6 +55,12 @@ async def _require_vault_write(user: dict, vault_id: int) -> None:
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
 
+async def require_kms_enabled() -> None:
+    """Dependency that ensures the KMS subsystem is enabled."""
+    if not settings.kms_enabled:
+        raise HTTPException(status_code=503, detail="KMS subsystem is disabled")
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -66,7 +72,7 @@ class KMSEntryCreateRequest(BaseModel):
     body: str = ""
     summary: str = Field("", max_length=2000)
     tags: list[str] = Field(default_factory=list)
-    slug: Optional[str] = None
+    slug: Optional[str] = Field(None, min_length=1, max_length=500)
     status: str = "draft"
 
 
@@ -75,7 +81,7 @@ class KMSEntryUpdateRequest(BaseModel):
     body: Optional[str] = None
     summary: Optional[str] = Field(None, max_length=2000)
     tags: Optional[list[str]] = None
-    slug: Optional[str] = None
+    slug: Optional[str] = Field(None, min_length=1, max_length=500)
     status: Optional[str] = None
 
 
@@ -105,6 +111,7 @@ async def list_kms_entries(
     per_page: int = Query(50, ge=1, le=200),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _: None = Depends(require_kms_enabled),
 ):
     await _require_vault_read(user, vault_id)
     store = KMSStore(db)
@@ -125,7 +132,8 @@ async def create_kms_entry(
     request: KMSEntryCreateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
-    _csrf: str = Depends(csrf_protect),
+    _: None = Depends(require_kms_enabled),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(user, request.vault_id)
     _validate_status(request.status)
@@ -153,6 +161,7 @@ async def get_kms_entry(
     entry_id: int,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _: None = Depends(require_kms_enabled),
 ):
     store = KMSStore(db)
     entry = store.get_entry(entry_id)
@@ -168,7 +177,8 @@ async def update_kms_entry(
     request: KMSEntryUpdateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
-    _csrf: str = Depends(csrf_protect),
+    _: None = Depends(require_kms_enabled),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     store = KMSStore(db)
     entry = store.get_entry(entry_id)
@@ -188,7 +198,8 @@ async def delete_kms_entry(
     entry_id: int,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
-    _csrf: str = Depends(csrf_protect),
+    _: None = Depends(require_kms_enabled),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     store = KMSStore(db)
     entry = store.get_entry(entry_id)
@@ -211,6 +222,7 @@ async def search_kms(
     per_page: int = Query(50, ge=1, le=200),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _: None = Depends(require_kms_enabled),
 ):
     await _require_vault_read(user, vault_id)
     store = KMSStore(db)
@@ -236,7 +248,8 @@ async def compile_document_kms(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
-    _csrf: str = Depends(csrf_protect),
+    _: None = Depends(require_kms_enabled),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Enqueue a KMS ingest job for an already-indexed document."""
     await _require_vault_write(user, vault_id)
@@ -264,7 +277,8 @@ async def recompile_vault_kms(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
-    _csrf: str = Depends(csrf_protect),
+    _: None = Depends(require_kms_enabled),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Enqueue a settings_reindex job to recompile all document entries in a vault."""
     await _require_vault_write(user, vault_id)
@@ -289,6 +303,7 @@ async def list_kms_jobs(
     status: Optional[str] = Query(None),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _: None = Depends(require_kms_enabled),
 ):
     await _require_vault_read(user, vault_id)
     store = KMSStore(db)
@@ -302,6 +317,7 @@ async def get_kms_job(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _: None = Depends(require_kms_enabled),
 ):
     await _require_vault_read(user, vault_id)
     store = KMSStore(db)
