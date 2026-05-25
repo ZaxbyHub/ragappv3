@@ -16,7 +16,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.config import settings
 from app.models.database import init_db, run_migrations
-from app.services.kms_retrieval import KMSEvidence, KMSRetrievalService, build_kms_fts_query
+from app.services.kms_retrieval import (
+    KMSEvidence,
+    KMSRetrievalService,
+    build_kms_fts_query,
+)
 
 
 class _Pool:

@@ -177,6 +177,7 @@ class TestWikiRetrievalEndToEnd(unittest.TestCase):
         import tempfile
         from pathlib import Path
         from queue import Empty, Queue
+
         from app.models.database import init_db, run_migrations
 
         self._tmp = tempfile.mkdtemp()
