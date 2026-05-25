@@ -20,6 +20,26 @@ vi.mock("@tanstack/react-virtual", () => ({
   }),
 }));
 
+// Radix Select cannot be driven in jsdom (no pointer-capture support), so we
+// mock the primitive with a context that lets SelectItem clicks invoke
+// onValueChange — exercising TagFilter's real value-mapping wiring.
+vi.mock("@/components/ui/select", async () => {
+  const React = await import("react");
+  const Ctx = React.createContext<(v: string) => void>(() => {});
+  return {
+    Select: ({ onValueChange, children }: { onValueChange: (v: string) => void; children: React.ReactNode }) =>
+      React.createElement(Ctx.Provider, { value: onValueChange }, children),
+    SelectTrigger: ({ children, "aria-label": ariaLabel }: { children: React.ReactNode; "aria-label"?: string }) =>
+      React.createElement("div", { role: "group", "aria-label": ariaLabel }, children),
+    SelectValue: ({ placeholder }: { placeholder?: string }) => React.createElement("span", null, placeholder),
+    SelectContent: ({ children }: { children: React.ReactNode }) => React.createElement("div", null, children),
+    SelectItem: ({ value, children }: { value: string; children: React.ReactNode }) => {
+      const onValueChange = React.useContext(Ctx);
+      return React.createElement("button", { onClick: () => onValueChange(value) }, children);
+    },
+  };
+});
+
 import { DocumentTable } from "@/components/documents/DocumentTable";
 import { TagFilter } from "@/components/documents/TagFilter";
 import { useBulkSelection } from "@/components/documents/useBulkSelection";
@@ -96,9 +116,16 @@ describe("DocumentTable sorting", () => {
 describe("TagFilter", () => {
   it("emits the tag id on selection and null for 'All tags'", () => {
     const onChange = vi.fn();
-    render(<TagFilter tags={[tag(7, "ops")]} value={null} onChange={onChange} />);
-    // The select renders; verify the trigger shows placeholder/all.
+    render(<TagFilter tags={[tag(7, "ops")]} value={7} onChange={onChange} />);
     expect(screen.getByLabelText("Filter by tag")).toBeInTheDocument();
+
+    // Selecting a tag emits its numeric id.
+    fireEvent.click(screen.getByRole("button", { name: "ops (0)" }));
+    expect(onChange).toHaveBeenCalledWith(7);
+
+    // Selecting "All tags" emits null.
+    fireEvent.click(screen.getByRole("button", { name: "All tags" }));
+    expect(onChange).toHaveBeenCalledWith(null);
   });
 
   it("renders nothing when there are no tags", () => {

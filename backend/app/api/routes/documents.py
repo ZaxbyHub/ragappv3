@@ -622,7 +622,7 @@ async def list_documents(
                    created_at, processed_at, error_message, phase, phase_message,
                    progress_percent, processed_units, total_units, unit_label,
                    phase_started_at, processing_started_at, enrichment_status,
-                   enrichment_error
+                   enrichment_error, vault_id
             FROM files
             WHERE vault_id = ?{_extra_clause()}
             {order_clause}
@@ -652,7 +652,7 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error
+                       enrichment_error, vault_id
                 FROM files
                 WHERE vault_id IN ({placeholders}){_extra_clause()}
                 {order_clause}
@@ -676,7 +676,7 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error
+                       enrichment_error, vault_id
                 FROM files{base_where}
                 {order_clause}
                 LIMIT ? OFFSET ?
@@ -1708,6 +1708,12 @@ async def delete_all_vault_documents(
     secret_manager = getattr(request.app.state, "secret_manager", None)
 
     def _atomic_delete() -> int:
+        # A best-effort purge above (e.g. mark_claims_stale_by_file) may have
+        # raised after issuing DML but before its own commit, leaving an open
+        # implicit transaction. Clear it so BEGIN IMMEDIATE cannot fail with
+        # "cannot start a transaction within a transaction" (F-006).
+        if conn.in_transaction:
+            conn.rollback()
         try:
             conn.execute("BEGIN IMMEDIATE")
             if secret_manager is not None:

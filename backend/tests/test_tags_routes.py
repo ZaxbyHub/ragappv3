@@ -344,6 +344,63 @@ class TestTagAssignment(TagsTestBase):
         )
         self.assertEqual(resp.json()["tags"], [])
 
+    def test_deleting_file_cascades_to_document_tags(self):
+        # Coverage gap: ON DELETE CASCADE on document_tags.file_id must clear
+        # assignment rows when the file row is removed.
+        f1 = self._seed_file(2, "a.txt")
+        t1 = self._make_tag("alpha")
+        self.client.post(
+            "/api/tags/assign",
+            json={"vault_id": 2, "file_ids": [f1], "tag_ids": [t1]},
+            headers=self._headers(),
+        )
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM document_tags WHERE file_id = ?", (f1,)
+                ).fetchone()[0],
+                1,
+            )
+            conn.execute("DELETE FROM files WHERE id = ?", (f1,))
+            conn.commit()
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM document_tags WHERE file_id = ?", (f1,)
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_getter_excludes_cross_vault_tag(self):
+        # Regression (F-005): even if a document_tags row links a file to a tag
+        # from a different vault, the getters must not surface it.
+        from app.services.tag_store import TagStore
+
+        f1 = self._seed_file(2, "a.txt")
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            # Tag belonging to vault 9, assigned to a vault-2 file directly.
+            cur = conn.execute(
+                "INSERT INTO tags (vault_id, name, created_at, updated_at) "
+                "VALUES (9, 'leak', '', '')"
+            )
+            leak_tag_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO document_tags (file_id, tag_id, created_at) VALUES (?,?,'')",
+                (f1, leak_tag_id),
+            )
+            conn.commit()
+
+            store = TagStore(conn)
+            self.assertEqual(store.get_tags_for_document(f1), [])
+            self.assertEqual(store.get_tags_for_documents([f1])[f1], [])
+        finally:
+            self._connection_pool.release_connection(conn)
+
 
 class TestDocumentSortAndFilter(TagsTestBase):
     def test_sort_by_file_name_asc_desc(self):
@@ -426,6 +483,14 @@ class TestDocumentSortAndFilter(TagsTestBase):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(resp.json()["id"], f1)
         self.assertEqual({t["name"] for t in resp.json()["tags"]}, {"z"})
+
+    def test_list_includes_vault_id(self):
+        # Regression (F-001): list responses must populate vault_id, not null.
+        f1 = self._seed_file(2, "a.txt")
+        resp = self.client.get("/api/documents?vault_id=2", headers=self._headers())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        doc = next(d for d in resp.json()["documents"] if d["id"] == f1)
+        self.assertEqual(doc["vault_id"], 2)
 
     def test_get_single_document_404(self):
         resp = self.client.get("/api/documents/99999", headers=self._headers())

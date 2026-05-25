@@ -222,11 +222,15 @@ class TagStore:
         return self.get_tags_for_document(file_id)
 
     def get_tags_for_document(self, file_id: int) -> list[Tag]:
+        # Defense-in-depth: only return tags that belong to the file's own
+        # vault. Assignment already enforces this, but the extra join guards
+        # against any future path that links a cross-vault tag (F-005).
         rows = self._db.execute(
             """SELECT t.*, 0 AS document_count
                FROM tags t
                JOIN document_tags dt ON dt.tag_id = t.id
-               WHERE dt.file_id = ?
+               JOIN files f ON f.id = dt.file_id
+               WHERE dt.file_id = ? AND t.vault_id = f.vault_id
                ORDER BY t.name COLLATE NOCASE ASC""",
             (file_id,),
         ).fetchall()
@@ -240,11 +244,13 @@ class TagStore:
         if not file_ids:
             return result
         placeholders = ",".join("?" * len(file_ids))
+        # See get_tags_for_document: scope each file's tags to its own vault.
         rows = self._db.execute(
             f"""SELECT dt.file_id AS _fid, t.*, 0 AS document_count
                 FROM tags t
                 JOIN document_tags dt ON dt.tag_id = t.id
-                WHERE dt.file_id IN ({placeholders})
+                JOIN files f ON f.id = dt.file_id
+                WHERE dt.file_id IN ({placeholders}) AND t.vault_id = f.vault_id
                 ORDER BY t.name COLLATE NOCASE ASC""",
             tuple(file_ids),
         ).fetchall()

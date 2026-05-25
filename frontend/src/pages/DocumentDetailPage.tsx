@@ -82,6 +82,16 @@ export default function DocumentDetailPage() {
     const isPdf = ext === "pdf";
     if (!isText && !isPdf) return;
 
+    // Guard against loading huge text files into a JS string (F-004). PDFs are
+    // streamed into an object URL by the browser, so only text needs the cap.
+    const MAX_TEXT_PREVIEW_BYTES = 5 * 1024 * 1024;
+    if (isText && typeof doc.size === "number" && doc.size > MAX_TEXT_PREVIEW_BYTES) {
+      setPreviewText(
+        `File too large to preview (${formatFileSize(doc.size)}). Download to view.`
+      );
+      return;
+    }
+
     let revoked: string | null = null;
     const controller = new AbortController();
     (async () => {

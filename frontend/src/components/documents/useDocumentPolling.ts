@@ -78,14 +78,29 @@ export function useDocumentPolling({
     async (docs: Document[]) => {
       if (!activeVaultId) return;
       const indexed = docs.filter((d) => d.metadata?.status === "indexed");
-      const results = await Promise.allSettled(
-        indexed.map((d) => getDocumentWikiStatus(Number(d.id), activeVaultId))
+      // Bound concurrency so a large vault (hundreds of indexed docs) cannot
+      // fire one request per document simultaneously on every refresh (F-003).
+      const CONCURRENCY = 6;
+      const results: (DocumentWikiStatus | undefined)[] = new Array(indexed.length);
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < indexed.length) {
+          const i = cursor++;
+          try {
+            results[i] = await getDocumentWikiStatus(Number(indexed[i].id), activeVaultId);
+          } catch {
+            results[i] = undefined;
+          }
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(CONCURRENCY, indexed.length) }, worker)
       );
       setWikiStatusMap((prev) => {
         const next = { ...prev };
         indexed.forEach((d, i) => {
           const r = results[i];
-          if (r.status === "fulfilled") next[String(d.id)] = r.value;
+          if (r !== undefined) next[String(d.id)] = r;
         });
         return next;
       });
