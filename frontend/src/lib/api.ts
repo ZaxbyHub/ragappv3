@@ -506,9 +506,20 @@ export interface SearchMemoriesResponse {
   total: number;
 }
 
+export interface Tag {
+  id: number;
+  vault_id: number;
+  name: string;
+  color: string;
+  created_at: string;
+  updated_at: string;
+  document_count: number;
+}
+
 export interface Document {
   id: string;
   filename: string;
+  vault_id?: number | null;
   content_type?: string;
   size?: number;
   created_at?: string;
@@ -525,6 +536,21 @@ export interface Document {
   enrichment_status?: "pending" | "processing" | "complete" | "error" | string | null;
   enrichment_error?: string | null;
   metadata?: Record<string, unknown>;
+  tags?: Tag[];
+}
+
+export type DocumentSortBy = "created_at" | "file_name" | "file_size" | "status";
+export type SortOrder = "asc" | "desc";
+
+export interface ListDocumentsOptions {
+  vaultId?: number;
+  search?: string;
+  status?: string;
+  page?: number;
+  perPage?: number;
+  sortBy?: DocumentSortBy;
+  sortOrder?: SortOrder;
+  tagId?: number;
 }
 
 export interface ListDocumentsResponse {
@@ -929,15 +955,92 @@ export async function listMemories(vaultId?: number): Promise<{ memories: Memory
   return response.data;
 }
 
-export async function listDocuments(vaultId?: number, search?: string, status?: string, page?: number, perPage?: number): Promise<ListDocumentsResponse> {
+export async function listDocuments(options: ListDocumentsOptions = {}): Promise<ListDocumentsResponse> {
+  const { vaultId, search, status, page, perPage, sortBy, sortOrder, tagId } = options;
   const params: Record<string, unknown> = {};
   if (vaultId != null) params.vault_id = vaultId;
   if (search && search.trim()) params.search = search.trim();
   if (status && status.trim()) params.status = status.trim();
   if (page != null) params.page = page;
   if (perPage != null) params.per_page = perPage;
+  if (sortBy) params.sort_by = sortBy;
+  if (sortOrder) params.sort_order = sortOrder;
+  if (tagId != null) params.tag_id = tagId;
   const response = await apiClient.get<ListDocumentsResponse>("/documents", { params });
   return response.data;
+}
+
+export async function getDocument(fileId: string | number): Promise<Document> {
+  const response = await apiClient.get<Document>(`/documents/${fileId}`);
+  return response.data;
+}
+
+// ---------------------------------------------------------------------------
+// Tags (document organization)
+// ---------------------------------------------------------------------------
+
+export async function listTags(vaultId: number): Promise<Tag[]> {
+  const response = await apiClient.get<{ tags: Tag[] }>("/tags", { params: { vault_id: vaultId } });
+  return response.data.tags;
+}
+
+export async function createTag(vaultId: number, name: string, color = ""): Promise<Tag> {
+  const response = await apiClient.post<Tag>("/tags", { vault_id: vaultId, name, color });
+  return response.data;
+}
+
+export async function updateTag(
+  tagId: number,
+  data: { name?: string; color?: string }
+): Promise<Tag> {
+  const response = await apiClient.put<Tag>(`/tags/${tagId}`, data);
+  return response.data;
+}
+
+export async function deleteTag(tagId: number): Promise<void> {
+  await apiClient.delete(`/tags/${tagId}`);
+}
+
+export async function assignTags(
+  vaultId: number,
+  fileIds: number[],
+  tagIds: number[]
+): Promise<{ assigned: number }> {
+  const response = await apiClient.post<{ assigned: number }>("/tags/assign", {
+    vault_id: vaultId,
+    file_ids: fileIds,
+    tag_ids: tagIds,
+  });
+  return response.data;
+}
+
+export async function getDocumentTags(fileId: number, vaultId: number): Promise<Tag[]> {
+  const response = await apiClient.get<{ tags: Tag[] }>(`/tags/documents/${fileId}`, {
+    params: { vault_id: vaultId },
+  });
+  return response.data.tags;
+}
+
+export async function setDocumentTags(
+  fileId: number,
+  vaultId: number,
+  tagIds: number[]
+): Promise<Tag[]> {
+  const response = await apiClient.put<{ tags: Tag[] }>(`/tags/documents/${fileId}`, {
+    vault_id: vaultId,
+    tag_ids: tagIds,
+  });
+  return response.data.tags;
+}
+
+export async function unassignTag(
+  tagId: number,
+  fileId: number,
+  vaultId: number
+): Promise<void> {
+  await apiClient.delete(`/tags/${tagId}/documents/${fileId}`, {
+    params: { vault_id: vaultId },
+  });
 }
 
 export async function uploadDocument(

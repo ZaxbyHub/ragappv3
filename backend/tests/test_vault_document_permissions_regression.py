@@ -99,6 +99,10 @@ def permission_client():
         )
         conn.execute(
             "INSERT INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
+            (1, "Default Vault", "", "private"),
+        )
+        conn.execute(
+            "INSERT INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
             (2, "Admin Vault", "", "private"),
         )
         conn.execute(
@@ -206,7 +210,8 @@ def test_vault_list_includes_effective_permission_and_public_read(permission_cli
     client, _, _, current_user = permission_client
     current_user.update({"id": 3, "username": "member", "role": "member"})
 
-    response = client.get("/api/vaults")
+    # Regular users list via /vaults/accessible; /vaults is admin-only.
+    response = client.get("/api/vaults/accessible")
 
     assert response.status_code == 200
     vaults = {vault["id"]: vault for vault in response.json()["vaults"]}

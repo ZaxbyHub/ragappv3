@@ -13,6 +13,7 @@ import mimetypes
 import os
 import re
 import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -32,6 +33,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.deps import (
+    UserRole,
     get_background_processor,
     get_current_active_user,
     get_db,
@@ -210,6 +212,28 @@ async def _record_upload_audit(
         logger.warning("Upload audit logging failed for file_id=%s: %s", file_id, exc)
 
 
+async def require_document_admin(
+    user: dict = Depends(get_current_active_user),
+    conn: sqlite3.Connection = Depends(get_db),
+    evaluate: Callable = Depends(get_evaluate_policy),
+) -> dict:
+    """Gate for cross-vault document admin operations (e.g. batch delete).
+
+    Allows application admins/superadmins, or any user who holds admin
+    permission on at least one accessible vault. Per-file vault-admin checks
+    inside the handler still apply — this is a coarse pre-filter so a caller
+    with no admin capability anywhere is rejected before the request body is
+    even parsed (returning 403 rather than leaking a 422 / empty result).
+    """
+    if UserRole.level(user.get("role", "")) >= UserRole.ADMIN:
+        return user
+    vault_ids = await get_user_accessible_vault_ids(user, conn)
+    for vault_id in vault_ids:
+        if await evaluate(user, "vault", vault_id, "admin"):
+            return user
+    raise HTTPException(status_code=403, detail="Admin access required")
+
+
 @router.post("/admin/retry/{file_id}")
 @limiter.limit(settings.admin_rate_limit)
 async def retry_document(
@@ -281,6 +305,7 @@ class DocumentResponse(BaseModel):
     file_name: str
     filename: str  # Frontend alias
     file_path: str
+    vault_id: Optional[int] = None
     status: str
     chunk_count: int
     size: Optional[int] = None  # Frontend expects size
@@ -298,6 +323,7 @@ class DocumentResponse(BaseModel):
     enrichment_status: Optional[str] = None
     enrichment_error: Optional[str] = None
     metadata: Optional[dict] = None  # Frontend expects metadata
+    tags: List[dict] = Field(default_factory=list)  # Assigned organization tags
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -384,6 +410,27 @@ def _allowed_document_roots(settings_dep: Settings, vault_id: int) -> list[Path]
     ]
 
 
+_SORT_COLUMNS = {
+    "created_at": "created_at",
+    "file_name": "file_name COLLATE NOCASE",
+    "file_size": "file_size",
+    "status": "status",
+}
+
+
+def _build_order_clause(sort_by: str, sort_order: str) -> str:
+    """Build a safe ORDER BY clause from whitelisted column + direction.
+
+    Both inputs are validated against fixed allowlists, so the returned string
+    never contains caller-controlled SQL. Unknown values fall back to the
+    default (created_at DESC). A stable secondary key on id keeps pagination
+    deterministic when the primary key has ties.
+    """
+    column = _SORT_COLUMNS.get(sort_by, _SORT_COLUMNS["created_at"])
+    direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+    return f"ORDER BY {column} {direction}, id {direction}"
+
+
 def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     """Convert a database row to a DocumentResponse."""
     keys = row.keys()
@@ -408,6 +455,7 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
         file_name=file_name,
         filename=file_name,  # Frontend alias
         file_path=row["file_path"],
+        vault_id=row["vault_id"] if "vault_id" in keys else None,
         status=status,
         chunk_count=chunk_count,
         size=row["file_size"]
@@ -467,6 +515,12 @@ async def list_documents(
         description="Filter by document name or metadata fields (case-insensitive substring)",
     ),
     status: Optional[str] = Query(None, description="Filter by processing status"),
+    tag_id: Optional[int] = Query(None, description="Filter by assigned tag ID"),
+    sort_by: str = Query(
+        "created_at",
+        description="Sort column: created_at, file_name, file_size, status",
+    ),
+    sort_order: str = Query("desc", description="Sort direction: asc or desc"),
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
@@ -476,10 +530,14 @@ async def list_documents(
 
     Returns a list of files with their id, file_name, file_path, status,
     chunk_count, created_at, and processed_at fields.
-    Optionally filter by vault_id, search (document name/metadata substring), or status.
-    Supports pagination via page/per_page.
+    Optionally filter by vault_id, search (document name/metadata substring),
+    status, or assigned tag. Supports pagination and sorting.
     """
     offset = (page - 1) * per_page
+
+    # Whitelist sort column + direction so the dynamic ORDER BY can never carry
+    # caller-controlled SQL. Anything off-whitelist falls back to the default.
+    order_clause = _build_order_clause(sort_by, sort_order)
 
     # Build search/status filter clause additions
     extra_where: list[str] = []
@@ -534,6 +592,11 @@ async def list_documents(
     if status and status.strip():
         extra_where.append("status = ?")
         extra_params.append(status.strip())
+    if tag_id is not None:
+        extra_where.append(
+            "id IN (SELECT dt.file_id FROM document_tags dt WHERE dt.tag_id = ?)"
+        )
+        extra_params.append(tag_id)
 
     def _extra_clause(prefix: str = "AND") -> str:
         if not extra_where:
@@ -559,10 +622,10 @@ async def list_documents(
                    created_at, processed_at, error_message, phase, phase_message,
                    progress_percent, processed_units, total_units, unit_label,
                    phase_started_at, processing_started_at, enrichment_status,
-                   enrichment_error
+                   enrichment_error, vault_id
             FROM files
             WHERE vault_id = ?{_extra_clause()}
-            ORDER BY created_at DESC
+            {order_clause}
             LIMIT ? OFFSET ?
             """,
             (vault_id, *extra_params, per_page, offset),
@@ -589,10 +652,10 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error
+                       enrichment_error, vault_id
                 FROM files
                 WHERE vault_id IN ({placeholders}){_extra_clause()}
-                ORDER BY created_at DESC
+                {order_clause}
                 LIMIT ? OFFSET ?
                 """,
                 (*accessible_vaults, *extra_params, per_page, offset),
@@ -613,9 +676,9 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error
+                       enrichment_error, vault_id
                 FROM files{base_where}
-                ORDER BY created_at DESC
+                {order_clause}
                 LIMIT ? OFFSET ?
                 """,
                 (*extra_params, per_page, offset),
@@ -623,6 +686,17 @@ async def list_documents(
     rows = await asyncio.to_thread(cursor.fetchall)
 
     documents = [_row_to_document_response(row) for row in rows]
+
+    # Attach organization tags in a single batch query (avoids N+1).
+    file_ids = [doc.id for doc in documents]
+    if file_ids:
+        from app.services.tag_store import TagStore
+
+        tags_by_file = await asyncio.to_thread(
+            TagStore(conn).get_tags_for_documents, file_ids
+        )
+        for doc in documents:
+            doc.tags = [asdict(t) for t in tags_by_file.get(doc.id, [])]
 
     return DocumentListResponse(documents=documents, total=total)
 
@@ -932,6 +1006,46 @@ async def get_document_stats(
         documents_by_status=documents_by_status,
         total_files=total_files,  # Backward compatibility
     )
+
+
+@router.get("/{file_id}", response_model=DocumentResponse)
+async def get_document(
+    file_id: int,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
+):
+    """Fetch a single document with its assigned tags.
+
+    Registered after the static ``/stats`` route so the int path param does not
+    shadow it.
+    """
+    cursor = await asyncio.to_thread(
+        conn.execute,
+        """
+        SELECT id, file_name, file_path, status, chunk_count, file_size, vault_id,
+               created_at, processed_at, error_message, phase, phase_message,
+               progress_percent, processed_units, total_units, unit_label,
+               phase_started_at, processing_started_at, enrichment_status,
+               enrichment_error
+        FROM files WHERE id = ?
+        """,
+        (file_id,),
+    )
+    row = await asyncio.to_thread(cursor.fetchone)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"Document with id {file_id} not found"
+        )
+    if not await evaluate(user, "vault", row["vault_id"], "read"):
+        raise HTTPException(status_code=403, detail="Access denied to vault")
+
+    document = _row_to_document_response(row)
+    from app.services.tag_store import TagStore
+
+    tags = await asyncio.to_thread(TagStore(conn).get_tags_for_document, file_id)
+    document.tags = [asdict(t) for t in tags]
+    return document
 
 
 @router.post("", response_model=UploadResponse)
@@ -1322,6 +1436,60 @@ def _unlink_document_file(stored_path: str, vault_id: int) -> None:
         logger.warning("Failed to unlink document file %s: %s", file_path, exc)
 
 
+async def _purge_file_derived_data(
+    conn: sqlite3.Connection,
+    vector_store: VectorStore,
+    file_id: int,
+    vault_id: int,
+) -> Optional[str]:
+    """Best-effort cleanup of a file's derived data, without deleting its row.
+
+    Removes vector chunks and marks dependent wiki claims stale (both external
+    to the files-table transaction and best-effort), then returns the resolved
+    on-disk path so the caller can GC it after the row is gone. Does NOT delete
+    the files row and does NOT commit.
+    """
+    stored_path: Optional[str] = None
+    try:
+        path_cursor = await asyncio.to_thread(
+            conn.execute, "SELECT file_path FROM files WHERE id = ?", (file_id,)
+        )
+        path_row = await asyncio.to_thread(path_cursor.fetchone)
+        if path_row is not None:
+            stored_path = path_row["file_path"]
+    except sqlite3.Error:
+        stored_path = None
+
+    try:
+        db = vector_store.db
+        if db is not None and "chunks" in await db.table_names():
+            vector_store.table = await db.open_table("chunks")
+            deleted_chunks = await vector_store.delete_by_file(str(file_id))
+            logger.info(
+                "Deleted %d chunks from vector store for file_id %s",
+                deleted_chunks,
+                file_id,
+            )
+        else:
+            logger.debug(
+                "Chunks table not found, skipping vector store deletion for file_id %s",
+                file_id,
+            )
+    except Exception as e:
+        logger.warning("Error deleting chunks from vector store: %s", e)
+
+    try:
+        from app.services.wiki_store import WikiStore as _WikiStore
+
+        await asyncio.to_thread(
+            lambda: _WikiStore(conn).mark_claims_stale_by_file(file_id, vault_id)
+        )
+    except Exception as e:
+        logger.warning("mark_claims_stale_by_file(%d) failed: %s", file_id, e)
+
+    return stored_path
+
+
 async def _delete_file_record(
     conn: sqlite3.Connection,
     vector_store: VectorStore,
@@ -1331,45 +1499,11 @@ async def _delete_file_record(
 ) -> None:
     """Delete one file and its derived data with consistent cleanup."""
     try:
-        # Resolve the on-disk path before deleting the row so the file can be
-        # garbage-collected from disk after the DB row is gone (DD-C003).
-        stored_path: Optional[str] = None
-        try:
-            path_cursor = await asyncio.to_thread(
-                conn.execute, "SELECT file_path FROM files WHERE id = ?", (file_id,)
-            )
-            path_row = await asyncio.to_thread(path_cursor.fetchone)
-            if path_row is not None:
-                stored_path = path_row["file_path"]
-        except sqlite3.Error:
-            stored_path = None
-
-        try:
-            db = vector_store.db
-            if db is not None and "chunks" in await db.table_names():
-                vector_store.table = await db.open_table("chunks")
-                deleted_chunks = await vector_store.delete_by_file(str(file_id))
-                logger.info(
-                    "Deleted %d chunks from vector store for file_id %s",
-                    deleted_chunks,
-                    file_id,
-                )
-            else:
-                logger.debug(
-                    "Chunks table not found, skipping vector store deletion for file_id %s",
-                    file_id,
-                )
-        except Exception as e:
-            logger.warning("Error deleting chunks from vector store: %s", e)
-
-        try:
-            from app.services.wiki_store import WikiStore as _WikiStore
-
-            await asyncio.to_thread(
-                lambda: _WikiStore(conn).mark_claims_stale_by_file(file_id, vault_id)
-            )
-        except Exception as e:
-            logger.warning("mark_claims_stale_by_file(%d) failed: %s", file_id, e)
+        # Resolve the on-disk path and purge derived data before deleting the
+        # row so the file can be garbage-collected from disk afterwards (DD-C003).
+        stored_path = await _purge_file_derived_data(
+            conn, vector_store, file_id, vault_id
+        )
 
         await asyncio.to_thread(
             conn.execute, "DELETE FROM files WHERE id = ?", (file_id,)
@@ -1458,7 +1592,7 @@ async def batch_delete_documents(
         ..., embed=True, description="List of file IDs to delete"
     ),
     conn: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(require_document_admin),
     vector_store: VectorStore = Depends(get_vector_store),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
@@ -1545,34 +1679,78 @@ async def delete_all_vault_documents(
         conn.execute, "SELECT id, file_name FROM files WHERE vault_id = ?", (vault_id,)
     )
     rows = await asyncio.to_thread(cursor.fetchall)
+    file_ids = [row["id"] for row in rows]
 
-    deleted_count = 0
+    if not file_ids:
+        return DeleteAllVaultResponse(deleted_count=0, vault_id=vault_id)
 
-    for row in rows:
-        file_id = row["id"]
-        file_name = row["file_name"]
+    # Purge derived data (vector chunks, wiki claims) per file first. These are
+    # external to the files-table transaction and best-effort by design.
+    stored_paths: list[str] = []
+    for file_id in file_ids:
         try:
-            await _delete_file_record(
-                conn,
-                vector_store,
-                file_id,
-                file_name,
-                vault_id,
+            path = await _purge_file_derived_data(
+                conn, vector_store, file_id, vault_id
             )
-            await _safe_record_action(
-                file_id,
-                "delete",
-                "success",
-                user,
-                getattr(request.app.state, "secret_manager", None),
-                conn,
-            )
-            deleted_count += 1
-
+            if path:
+                stored_paths.append(path)
         except Exception:
             logger.exception(
-                "Error deleting document %d from vault %d", file_id, vault_id
+                "Error purging derived data for document %d in vault %d",
+                file_id,
+                vault_id,
             )
+
+    # Delete every files row for the vault atomically: either all rows are
+    # removed or none are, so a mid-batch failure can no longer leave the vault
+    # partially deleted (DD-C011). Audit rows are written in the same
+    # transaction so the log matches what was actually committed.
+    secret_manager = getattr(request.app.state, "secret_manager", None)
+
+    def _atomic_delete() -> int:
+        # A best-effort purge above (e.g. mark_claims_stale_by_file) may have
+        # raised after issuing DML but before its own commit, leaving an open
+        # implicit transaction. Clear it so BEGIN IMMEDIATE cannot fail with
+        # "cannot start a transaction within a transaction" (F-006).
+        if conn.in_transaction:
+            conn.rollback()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if secret_manager is not None:
+                for file_id in file_ids:
+                    try:
+                        _record_document_action(
+                            file_id,
+                            "delete",
+                            "success",
+                            _user_id_str(user),
+                            secret_manager,
+                            conn,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — audit must not abort delete
+                        logger.warning(
+                            "Audit logging failed (delete/success) for file_id=%s: %s",
+                            file_id,
+                            exc,
+                        )
+            cur = conn.execute(
+                "DELETE FROM files WHERE vault_id = ?", (vault_id,)
+            )
+            conn.commit()
+            return cur.rowcount
+        except Exception:
+            conn.rollback()
+            raise
+
+    try:
+        deleted_count = await asyncio.to_thread(_atomic_delete)
+    except Exception as e:
+        logger.exception("Atomic delete of vault %d documents failed", vault_id)
+        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+
+    # GC on-disk files after the rows are committed.
+    for path in stored_paths:
+        await asyncio.to_thread(_unlink_document_file, path, vault_id)
 
     logger.info("Deleted %d documents from vault %d", deleted_count, vault_id)
 

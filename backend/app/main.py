@@ -29,6 +29,7 @@ from app.api.routes.memories import router as memories_router
 from app.api.routes.organizations import router as organizations_router
 from app.api.routes.search import router as search_router
 from app.api.routes.settings import router as settings_router
+from app.api.routes.tags import router as tags_router
 from app.api.routes.users import router as users_router
 from app.api.routes.vault_members import (
     group_access_router as vault_group_access_router,
@@ -123,6 +124,7 @@ app.include_router(organizations_router, prefix="/api")
 app.include_router(groups_router, prefix="/api")
 app.include_router(wiki_router, prefix="/api")
 app.include_router(kms_router, prefix="/api")
+app.include_router(tags_router, prefix="/api")
 
 # Register exception handler for validation errors (empty filename)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)

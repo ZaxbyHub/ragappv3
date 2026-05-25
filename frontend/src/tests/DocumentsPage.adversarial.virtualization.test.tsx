@@ -10,10 +10,15 @@
  * the virtualizer's handling of adversarial inputs.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { render as rtlRender, screen, waitFor, act } from "@testing-library/react";
 import "@testing-library/jest-dom";
+import { MemoryRouter } from "react-router-dom";
 
 import DocumentsPage from "@/pages/DocumentsPage";
+
+// DocumentsPage renders <Link> for document names; provide a router context.
+const render: typeof rtlRender = (ui, options) =>
+  rtlRender(ui, { wrapper: MemoryRouter, ...options });
 
 // =============================================================================
 // MOCK RESIZE OBSERVER

@@ -12,6 +12,7 @@ import { APP_BASENAME } from "@/lib/paths";
 // H-16 fix: Lazy-load all page components for code splitting
 const ChatShell = lazy(() => import("@/pages/ChatShell"));
 const DocumentsPage = lazy(() => import("@/pages/DocumentsPage"));
+const DocumentDetailPage = lazy(() => import("@/pages/DocumentDetailPage"));
 const MemoryPage = lazy(() => import("@/pages/MemoryPage"));
 const VaultsPage = lazy(() => import("@/pages/VaultsPage"));
 const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
@@ -161,6 +162,16 @@ function App() {
                   <ProtectedRoute>
                     <MainAppShell>
                       <DocumentsPage />
+                    </MainAppShell>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/documents/:documentId"
+                element={
+                  <ProtectedRoute>
+                    <MainAppShell>
+                      <DocumentDetailPage />
                     </MainAppShell>
                   </ProtectedRoute>
                 }

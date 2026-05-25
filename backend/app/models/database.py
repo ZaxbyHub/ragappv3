@@ -588,6 +588,33 @@ CREATE INDEX IF NOT EXISTS idx_kms_entries_vault_status ON kms_entries(vault_id,
 CREATE INDEX IF NOT EXISTS idx_kms_entries_vault_slug ON kms_entries(vault_id, slug);
 CREATE INDEX IF NOT EXISTS idx_kms_entries_file_id ON kms_entries(file_id);
 CREATE INDEX IF NOT EXISTS idx_kms_compile_jobs_vault_status ON kms_compile_jobs(vault_id, status);
+
+-- ============================================================
+-- Document organization tags (user-curated, vault-scoped)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vault_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(vault_id, name),
+    FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS document_tags (
+    file_id INTEGER NOT NULL,
+    tag_id INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (file_id, tag_id),
+    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+    FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_tags_vault ON tags(vault_id);
+CREATE INDEX IF NOT EXISTS idx_document_tags_tag_id ON document_tags(tag_id);
 """
 
 
@@ -722,6 +749,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_jobs_retry_count(sqlite_path)
     migrate_add_kms_tables(sqlite_path)
     migrate_add_kms_refs(sqlite_path)
+    migrate_add_tags_tables(sqlite_path)
     migrate_add_files_parsed_text(sqlite_path)
     migrate_add_files_processing_progress(sqlite_path)
     migrate_add_files_enrichment_status(sqlite_path)
@@ -1523,6 +1551,50 @@ def migrate_add_kms_tables(sqlite_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_kms_entries_vault_slug ON kms_entries(vault_id, slug);
             CREATE INDEX IF NOT EXISTS idx_kms_entries_file_id ON kms_entries(file_id);
             CREATE INDEX IF NOT EXISTS idx_kms_compile_jobs_vault_status ON kms_compile_jobs(vault_id, status);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_tags_tables(sqlite_path: str) -> None:
+    """
+    Migration: Add document organization tags tables for existing databases.
+
+    Idempotent — safe to run multiple times. Tables and indexes use IF NOT
+    EXISTS guards. document_tags rows are removed automatically via ON DELETE
+    CASCADE when a file or tag is deleted (foreign keys are enabled on every
+    pooled connection).
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                color TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(vault_id, name),
+                FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS document_tags (
+                file_id INTEGER NOT NULL,
+                tag_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tags_vault ON tags(vault_id);
+            CREATE INDEX IF NOT EXISTS idx_document_tags_tag_id ON document_tags(tag_id);
         """)
         conn.commit()
     finally:

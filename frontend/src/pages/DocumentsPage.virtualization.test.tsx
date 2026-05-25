@@ -6,10 +6,15 @@
  * works correctly for both desktop table and mobile card views.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { render as rtlRender, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
+import { MemoryRouter } from "react-router-dom";
 
 import DocumentsPage from "@/pages/DocumentsPage";
+
+// DocumentsPage renders <Link> for document names; provide a router context.
+const render: typeof rtlRender = (ui, options) =>
+  rtlRender(ui, { wrapper: MemoryRouter, ...options });
 
 // Mock @tanstack/react-virtual with dynamic behavior
 vi.mock("@tanstack/react-virtual", () => ({
