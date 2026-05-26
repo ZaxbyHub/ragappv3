@@ -94,6 +94,18 @@ class TestFolderCrud(FoldersTestBase):
         resp = self._create("Orphan", parent=999999)
         self.assertEqual(resp.status_code, 404)
 
+    def test_rename_to_existing_sibling_returns_409(self):
+        # F-002: PUT /folders/{id} must 409 when the new name collides with an
+        # existing sibling at the same level.
+        self._create("Alpha")
+        beta = self._create("Beta").json()
+        resp = self.client.put(
+            f"/api/folders/{beta['id']}",
+            json={"name": "Alpha"},
+            headers=self._write_headers(),
+        )
+        self.assertEqual(resp.status_code, 409)
+
 
 class TestFolderReparentAndCycles(FoldersTestBase):
     def test_reparent_to_root(self):
@@ -123,6 +135,19 @@ class TestFolderReparentAndCycles(FoldersTestBase):
         resp = self.client.put(
             f"/api/folders/{a['id']}",
             json={"parent_folder_id": b["id"]},
+            headers=self._write_headers(),
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_deep_descendant_cycle_rejected(self):
+        # F-003: Three-node chain A → B → C; moving A under C (grandchild)
+        # must also 409 — the BFS in _descendant_ids must traverse all depths.
+        a = self._create("A").json()
+        b = self._create("B", parent=a["id"]).json()
+        c = self._create("C", parent=b["id"]).json()
+        resp = self.client.put(
+            f"/api/folders/{a['id']}",
+            json={"parent_folder_id": c["id"]},
             headers=self._write_headers(),
         )
         self.assertEqual(resp.status_code, 409)

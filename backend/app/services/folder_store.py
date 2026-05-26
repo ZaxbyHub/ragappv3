@@ -150,18 +150,25 @@ class FolderStore:
             raise ValueError("Folder name must not be empty")
         if parent_folder_id is not None:
             self._require_folder_in_vault(vault_id, parent_folder_id)
-        if self._name_exists(vault_id, parent_folder_id, name):
-            raise FolderDuplicateError(
-                f"Folder {name!r} already exists in this location"
+        # BEGIN IMMEDIATE: name-uniqueness check + INSERT must be atomic so two
+        # concurrent creates cannot both pass the check before either commits.
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            if self._name_exists(vault_id, parent_folder_id, name):
+                raise FolderDuplicateError(
+                    f"Folder {name!r} already exists in this location"
+                )
+            now = datetime.utcnow().isoformat()
+            cur = self._db.execute(
+                """INSERT INTO folders
+                       (vault_id, parent_folder_id, name, description, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (vault_id, parent_folder_id, name, description, now, now),
             )
-        now = datetime.utcnow().isoformat()
-        cur = self._db.execute(
-            """INSERT INTO folders
-                   (vault_id, parent_folder_id, name, description, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (vault_id, parent_folder_id, name, description, now, now),
-        )
-        self._db.commit()
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         return self.get_folder(cur.lastrowid, vault_id)  # type: ignore[return-value]
 
     def get_folder(self, folder_id: int, vault_id: int) -> Optional[Folder]:
@@ -222,25 +229,39 @@ class FolderStore:
         if description is not None:
             updates["description"] = description
 
-        if "name" in updates or "parent_folder_id" in updates:
-            if self._name_exists(
-                vault_id, new_parent, new_name, exclude_id=folder_id
-            ):
-                raise FolderDuplicateError(
-                    f"Folder {new_name!r} already exists in this location"
-                )
-
         if not updates:
             return current
 
         updates["updated_at"] = datetime.utcnow().isoformat()
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [folder_id, vault_id]
-        self._db.execute(
-            f"UPDATE folders SET {set_clause} WHERE id = ? AND vault_id = ?",
-            values,
-        )
-        self._db.commit()
+
+        if "name" in updates or "parent_folder_id" in updates:
+            # BEGIN IMMEDIATE: name-uniqueness check + UPDATE must be atomic so two
+            # concurrent renames/reparents cannot both pass the check before either
+            # commits.
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                if self._name_exists(
+                    vault_id, new_parent, new_name, exclude_id=folder_id
+                ):
+                    raise FolderDuplicateError(
+                        f"Folder {new_name!r} already exists in this location"
+                    )
+                self._db.execute(
+                    f"UPDATE folders SET {set_clause} WHERE id = ? AND vault_id = ?",
+                    values,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        else:
+            self._db.execute(
+                f"UPDATE folders SET {set_clause} WHERE id = ? AND vault_id = ?",
+                values,
+            )
+            self._db.commit()
         return self.get_folder(folder_id, vault_id)
 
     def delete_folder(self, folder_id: int, vault_id: int) -> bool:

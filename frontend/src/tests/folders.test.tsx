@@ -1,7 +1,7 @@
 /**
  * Folder hierarchy tests: FolderTree sidebar (tree building, selection,
  * expand/collapse, inline create) and MoveToFolderDialog (folder picker +
- * move call).
+ * move call) and MoveFolderDialog (folder reparent).
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
@@ -12,12 +12,15 @@ vi.mock("sonner", () => ({
 }));
 
 const moveDocumentsToFolder = vi.fn();
+const updateFolder = vi.fn();
 vi.mock("@/lib/api", () => ({
   moveDocumentsToFolder: (...args: unknown[]) => moveDocumentsToFolder(...args),
+  updateFolder: (...args: unknown[]) => updateFolder(...args),
 }));
 
 import { FolderTree } from "@/components/documents/FolderTree";
 import { MoveToFolderDialog } from "@/components/documents/MoveToFolderDialog";
+import { MoveFolderDialog } from "@/components/documents/MoveFolderDialog";
 import type { Folder } from "@/lib/api";
 
 const folder = (id: number, name: string, parent: number | null = null): Folder => ({
@@ -123,5 +126,53 @@ describe("MoveToFolderDialog", () => {
     await waitFor(() =>
       expect(moveDocumentsToFolder).toHaveBeenCalledWith(1, [10, 11], null)
     );
+  });
+});
+
+describe("MoveFolderDialog", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const parentFolder = folder(1, "Parent");
+  const childFolder = folder(2, "Child", 1);
+
+  it("reparents a folder into a selected parent", async () => {
+    updateFolder.mockResolvedValue({ ...childFolder, parent_folder_id: null });
+    const onMoved = vi.fn();
+    // Moving "Child" — "Parent" should be available as an option.
+    render(
+      <MoveFolderDialog
+        open={true}
+        onOpenChange={vi.fn()}
+        folder={childFolder}
+        folders={[parentFolder, childFolder]}
+        onMoved={onMoved}
+      />
+    );
+
+    // "No parent (root)" is pre-selected because childFolder.parent_folder_id is 1,
+    // not null, so the "No parent" radio is unchecked by default. We click it.
+    fireEvent.click(screen.getByRole("radio", { name: "No parent (root)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move" }));
+
+    await waitFor(() =>
+      expect(updateFolder).toHaveBeenCalledWith(2, { parent_folder_id: null })
+    );
+    await waitFor(() => expect(onMoved).toHaveBeenCalled());
+  });
+
+  it("excludes the folder being moved from the picker options", () => {
+    render(
+      <MoveFolderDialog
+        open={true}
+        onOpenChange={vi.fn()}
+        folder={parentFolder}
+        folders={[parentFolder, childFolder]}
+        onMoved={vi.fn()}
+      />
+    );
+    // "Parent" (id=1) is being moved, so it must not appear as an option.
+    // "Child" (id=2, child of Parent) appears as a pickable destination.
+    expect(screen.queryByRole("radio", { name: "Parent" })).not.toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Child" })).toBeInTheDocument();
   });
 });

@@ -47,6 +47,7 @@ import { DocumentCardsList } from "@/components/documents/DocumentCardsList";
 import { TagFilter } from "@/components/documents/TagFilter";
 import { BulkTagDialog } from "@/components/documents/BulkTagDialog";
 import { FolderTree } from "@/components/documents/FolderTree";
+import { MoveFolderDialog } from "@/components/documents/MoveFolderDialog";
 import { MoveToFolderDialog } from "@/components/documents/MoveToFolderDialog";
 import { ConfirmDialog, type ConfirmDialogState } from "@/components/documents/ConfirmDialog";
 
@@ -78,6 +79,7 @@ export default function DocumentsPage() {
   const [folderFilterId, setFolderFilterId] = useState<number | null>(null);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [moveFolderOpen, setMoveFolderOpen] = useState(false);
+  const [movingFolder, setMovingFolder] = useState<Folder | null>(null);
 
   // Persist the resizable filename column width across reloads.
   const [filenameColWidth, setFilenameColWidth] = useState<number>(() => {
@@ -256,6 +258,10 @@ export default function DocumentsPage() {
     },
     [fetchFolders, fetchDocuments]
   );
+
+  const handleMoveFolderTrigger = useCallback((folder: Folder) => {
+    setMovingFolder(folder);
+  }, []);
 
   const handleSort = useCallback((column: DocumentSortBy) => {
     setSortBy((prevCol) => {
@@ -631,6 +637,7 @@ export default function DocumentsPage() {
             onCreate={handleCreateFolder}
             onRename={handleRenameFolder}
             onDelete={handleDeleteFolder}
+            onMove={handleMoveFolderTrigger}
           />
         )}
         <div className="flex-1 min-w-0">
@@ -701,6 +708,22 @@ export default function DocumentsPage() {
             clearSelection();
             fetchFolders();
             fetchDocuments();
+          }}
+        />
+      )}
+
+      {movingFolder && (
+        <MoveFolderDialog
+          key={movingFolder.id}
+          open={movingFolder != null}
+          onOpenChange={(open) => {
+            if (!open) setMovingFolder(null);
+          }}
+          folder={movingFolder}
+          folders={folders}
+          onMoved={() => {
+            setMovingFolder(null);
+            fetchFolders();
           }}
         />
       )}

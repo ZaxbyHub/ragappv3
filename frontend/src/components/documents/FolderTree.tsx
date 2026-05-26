@@ -3,6 +3,7 @@ import {
   ChevronRight,
   ChevronDown,
   Folder as FolderIcon,
+  FolderInput,
   FolderPlus,
   Library,
   MoreVertical,
@@ -30,6 +31,7 @@ interface FolderTreeProps {
   onCreate: (name: string, parentFolderId: number | null) => Promise<void>;
   onRename: (folderId: number, name: string) => Promise<void>;
   onDelete: (folder: Folder) => void;
+  onMove?: (folder: Folder) => void;
 }
 
 interface FolderNodeData extends Folder {
@@ -136,6 +138,7 @@ function FolderNode({
   onCreate,
   onRename,
   onDelete,
+  onMove,
 }: {
   node: FolderNodeData;
   depth: number;
@@ -151,6 +154,7 @@ function FolderNode({
   onCreate: (name: string, parentFolderId: number | null) => Promise<void>;
   onRename: (folderId: number, name: string) => Promise<void>;
   onDelete: (folder: Folder) => void;
+  onMove?: (folder: Folder) => void;
 }) {
   const hasChildren = node.children.length > 0;
   const isOpen = expanded.has(node.id);
@@ -232,6 +236,12 @@ function FolderNode({
                 <Pencil className="mr-2 h-4 w-4" />
                 Rename
               </DropdownMenuItem>
+              {onMove && (
+                <DropdownMenuItem onClick={() => onMove(node)}>
+                  <FolderInput className="mr-2 h-4 w-4" />
+                  Move to...
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem
                 className="text-destructive focus:text-destructive"
                 onClick={() => onDelete(node)}
@@ -263,6 +273,7 @@ function FolderNode({
               onCreate={onCreate}
               onRename={onRename}
               onDelete={onDelete}
+              onMove={onMove}
             />
           ))}
           {addingChildId === node.id && (
@@ -292,6 +303,7 @@ export function FolderTree({
   onCreate,
   onRename,
   onDelete,
+  onMove,
 }: FolderTreeProps) {
   const tree = useMemo(() => buildTree(folders), [folders]);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
@@ -355,6 +367,7 @@ export function FolderTree({
           onCreate={onCreate}
           onRename={onRename}
           onDelete={onDelete}
+          onMove={onMove}
         />
       ))}
 
