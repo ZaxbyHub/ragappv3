@@ -40,7 +40,7 @@ cd backend
 # Lint — this is the gate that most often fails in CI (import sorting, I001).
 ruff check .
 # CI-targeted tests (the exact subset CI runs):
-pytest --tb=short -q tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py
+pytest --tb=short -v tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py
 ```
 
 When you've changed a specific area, **also** run that area's tests (CI's
@@ -57,6 +57,8 @@ npm run typecheck   # tsc --noEmit
 npm run lint        # eslint src --max-warnings 0  (zero-warning gate)
 npm test            # vitest run
 npm run build       # tsc && vite build
+# Also verify the subpath deployment build (CI runs this separately):
+VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/api npm run build
 ```
 
 When a frontend test fails on a jsdom quirk (router context, Radix `Select`,

@@ -94,7 +94,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 **CI is the source of truth, not your local toolchain.** Before pushing or
 opening a PR, run the `preflight` skill — it reproduces the exact CI gates from
 `.github/workflows/ci.yml` (backend `ruff check .`, frontend
-typecheck/lint/test/build, and the `scripts/check_*_contract.py` contract
+typecheck/lint/test/build, and the `scripts/check_*.py` contract
 scripts). A lint or type error caught locally is free; caught in CI it costs a
 push → fail → fixup-commit round trip.
 
