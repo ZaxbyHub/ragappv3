@@ -161,7 +161,11 @@ After enabling swarm mode, immediately execute `$ARGUMENTS` using this swarm-lik
 2. Launch parallel exploration for disjoint investigation work.
 3. Create a scoped plan.
 4. Implement in coherent units.
-5. Run objective verification.
+5. Run objective verification. Before any push or PR, run the
+   `ci-compatibility-audit` skill so this repo's CI gates (backend ruff,
+   frontend typecheck/lint/test/build, quality-contract scripts) are green
+   locally first — a CI-only lint or type failure costs a full push → fail →
+   fixup-commit round trip.
 6. Use independent reviewer validation where risk justifies it.
 7. Use critic challenge only for high-impact or still-ambiguous results.
 8. Summarize what changed, what was verified, and what risks remain.

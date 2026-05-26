@@ -43,6 +43,10 @@ For each obligation, classify:
 - CONTRADICTED
 - STEALTH_CHANGE
 
+For database-backed API changes, additionally verify:
+- Response model fields are returned by the underlying SQL SELECT (check model definition against every query path that populates it)
+- Frontend API types match backend serialization (do not assume backend int = frontend number; verify the actual API contract)
+
 ### Phase 3 — Run the substance gate
 Check for:
 - placeholders, TODOs, stubs, no-ops

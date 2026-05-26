@@ -10,6 +10,10 @@ Before declaring done, verify:
 
 ## All builds (always required)
 
+- [ ] **Ran the `ci-compatibility-audit` skill** (mirrors this repo's CI gates
+      locally: backend `ruff check .`, frontend typecheck/lint/test/build,
+      quality contract scripts) and every gate is green BEFORE pushing or
+      opening the PR. This prevents the push → CI-fail → fixup-commit round trip.
 - [ ] All tests passing
 - [ ] Type checking passing
 - [ ] Linting passing

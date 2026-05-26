@@ -744,6 +744,11 @@ docker compose -f docker-compose.yml up -d
 - **[Release Process](docs/release.md)** - Deployment and release procedures
 - **[Non-Technical Setup](docs/non-technical-setup.md)** - Setup guide for non-technical users
 
+### Contributing
+
+- **[Contributing Guide](CONTRIBUTING.md)** - Setup, branch/commit/PR conventions, and how to run CI gates locally
+- **[Engineering Conventions](docs/engineering/conventions.md)** & **[Testing Policy](docs/engineering/testing.md)** - Codebase conventions for contributors and AI agents
+
 ## License
 
 No license file present. Add LICENSE file or update this section as needed.
