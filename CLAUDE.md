@@ -91,6 +91,11 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## Repository environment notes
 
+**Engineering conventions & testing policy** live in `docs/engineering/conventions.md`
+and `docs/engineering/testing.md` (also surfaced via the `engineering-conventions`
+and `writing-tests` skills, and summarized for all agent runners in the root
+`AGENTS.md`). Read them before non-trivial backend/frontend work.
+
 **CI is the source of truth, not your local toolchain.** Before pushing or
 opening a PR, run the `ci-compatibility-audit` skill — it reproduces the exact
 CI gates from `.github/workflows/ci.yml` (backend `ruff check .`, frontend

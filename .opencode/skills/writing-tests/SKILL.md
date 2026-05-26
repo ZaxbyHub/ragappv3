@@ -1,0 +1,42 @@
+---
+name: writing-tests
+description: >
+  RAGAPPv3 testing policy and conventions. Load before writing or modifying any
+  test, fixing a test/CI failure, or adding coverage. Covers backend pytest +
+  unittest (SimpleConnectionPool dependency-override harness, FK cascades, the
+  Python 3.11-vs-local event-loop trap) and frontend Vitest + React Testing
+  Library + jsdom (MemoryRouter, Radix Select, react-virtual mock patterns).
+  This repo's frontend uses Vitest, NOT bun:test.
+---
+
+# RAGAPPv3 Testing
+
+The authoritative testing policy and conventions live in
+**`docs/engineering/testing.md`**. Read it before touching tests.
+
+## Policy (summary)
+
+- New behavior ships with tests. For a bug fix, add a failing reproduction test, then make it pass.
+- Assert real behavior: backend → status **+** body **+** DB state change; frontend → callback args / DOM, not just "it rendered".
+- Cover negative paths (403/422, cross-vault isolation, cascade deletes, error branches). Security-sensitive code has `*_adversarial` companion tests.
+- No test theater — a test must exercise what its name claims.
+
+## Backend (pytest + unittest)
+
+- `unittest.TestCase` / `IsolatedAsyncioTestCase` run under pytest; `asyncio_mode = "auto"` (no marker needed). `conftest.py` sets test env and clears `app.*` modules.
+- Route tests use the **`SimpleConnectionPool` + `app.dependency_overrides`** harness — canonical example `backend/tests/test_tags_routes.py`: tempdir → `init_db` → `run_migrations`; override `get_db` / `get_vector_store` (AsyncMock) / `get_current_active_user` / `csrf_protect`; restore in teardown.
+- Seed rows in FK order; verify cascades by deleting the parent (FKs are ON).
+- **CI pins Python 3.11.** Local 3.14+ fails some tests with `RuntimeError: There is no current event loop` — a local artifact, not a regression. Avoid manual `asyncio.get_event_loop()` in new tests.
+
+## Frontend (Vitest + RTL + jsdom)
+
+> Vitest, **not** `bun:test`. Ignore any bun guidance.
+
+- Config in `frontend/vite.config.ts`; `*.test.tsx`; `src/test/setup.ts` mocks `localStorage`/`confirm`/`scrollTo`.
+- jsdom mock patterns (full snippets in `ci-compatibility-audit/references/frontend-testing-gotchas.md`): wrap `<Link>` components in `MemoryRouter`; mock `@/components/ui/select` (Radix can't open in jsdom); mock `@tanstack/react-virtual`'s `useVirtualizer` to render all rows; `vi.mock` factories can't close over outer vars (`await import("react")`).
+
+## Running
+
+CI runs only a *narrow* backend pytest subset — also run your changed area's tests locally (`pytest -q tests/<file>`). Use `ci-compatibility-audit` for the exact CI-mirror commands before pushing.
+
+See `docs/engineering/testing.md` for full detail.
