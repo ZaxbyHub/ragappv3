@@ -21,21 +21,35 @@ describe("FileIcon", () => {
   it.each([
     ["proposal.doc", "#3b82f6"],
     ["proposal.docx", "#3b82f6"],
+    ["deck.pptx", "#f97316"],
     ["notes.md", "#14b8a6"],
     ["notes.mdx", "#14b8a6"],
     ["budget.xlsx", "#22c55e"],
     ["budget.xls", "#22c55e"],
     ["export.csv", "#22c55e"],
+    ["data.json", "#eab308"],
+    ["script.py", "#8b5cf6"],
+    ["app.js", "#8b5cf6"],
+    ["main.ts", "#8b5cf6"],
+    ["page.html", "#8b5cf6"],
+    ["style.css", "#8b5cf6"],
+    ["config.xml", "#8b5cf6"],
+    ["conf.yaml", "#8b5cf6"],
+    ["conf.yml", "#8b5cf6"],
+    ["query.sql", "#8b5cf6"],
   ])("renders the expected colored branch for %s", (filename, color) => {
     expect(renderIcon(filename)).toHaveStyle({ color });
   });
 
-  it("renders the neutral text icon branch for txt files", () => {
-    const svg = renderIcon("readme.txt");
+  it.each(["readme.txt", "server.log"])(
+    "renders the neutral text icon branch for %s",
+    (filename) => {
+      const svg = renderIcon(filename);
 
-    expect(svg).toHaveClass("lucide-file-text");
-    expect(svg.getAttribute("style") ?? "").not.toContain("color:");
-  });
+      expect(svg).toHaveClass("lucide-file-text");
+      expect(svg.getAttribute("style") ?? "").not.toContain("color:");
+    }
+  );
 
   it.each([null, undefined, "", "README", "archive.unknown"])(
     "falls back to the generic file icon for %s",

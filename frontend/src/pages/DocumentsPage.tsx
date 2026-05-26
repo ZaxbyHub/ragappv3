@@ -12,6 +12,7 @@ import {
   Loader2,
   Trash,
   Tag as TagIcon,
+  FolderInput,
 } from "lucide-react";
 import {
   scanDocuments,
@@ -20,7 +21,12 @@ import {
   deleteAllDocumentsInVault,
   downloadDocument,
   listTags,
+  listFolders,
+  createFolder,
+  updateFolder,
+  deleteFolder,
   type Tag,
+  type Folder,
   type DocumentSortBy,
   type SortOrder,
 } from "@/lib/api";
@@ -40,6 +46,9 @@ import { DocumentTable } from "@/components/documents/DocumentTable";
 import { DocumentCardsList } from "@/components/documents/DocumentCardsList";
 import { TagFilter } from "@/components/documents/TagFilter";
 import { BulkTagDialog } from "@/components/documents/BulkTagDialog";
+import { FolderTree } from "@/components/documents/FolderTree";
+import { MoveFolderDialog } from "@/components/documents/MoveFolderDialog";
+import { MoveToFolderDialog } from "@/components/documents/MoveToFolderDialog";
 import { ConfirmDialog, type ConfirmDialogState } from "@/components/documents/ConfirmDialog";
 
 const FILENAME_COL_WIDTH_KEY = "ragapp_doc_table_filename_col";
@@ -65,6 +74,12 @@ export default function DocumentsPage() {
   const [tagFilterId, setTagFilterId] = useState<number | null>(null);
   const [tags, setTags] = useState<Tag[]>([]);
   const [bulkTagOpen, setBulkTagOpen] = useState(false);
+
+  // Folder hierarchy state
+  const [folderFilterId, setFolderFilterId] = useState<number | null>(null);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [moveFolderOpen, setMoveFolderOpen] = useState(false);
+  const [movingFolder, setMovingFolder] = useState<Folder | null>(null);
 
   // Persist the resizable filename column width across reloads.
   const [filenameColWidth, setFilenameColWidth] = useState<number>(() => {
@@ -135,6 +150,7 @@ export default function DocumentsPage() {
     sortBy,
     sortOrder,
     tagFilterId,
+    folderFilterId,
     uploads,
   });
 
@@ -168,6 +184,84 @@ export default function DocumentsPage() {
   useEffect(() => {
     setTagFilterId(null);
   }, [activeVaultId]);
+
+  // Load the vault's folders for the sidebar tree + move dialog.
+  const fetchFolders = useCallback(async () => {
+    if (activeVaultId == null) {
+      setFolders([]);
+      return;
+    }
+    try {
+      setFolders(await listFolders(activeVaultId));
+    } catch (err) {
+      console.error("Failed to load folders:", err);
+    }
+  }, [activeVaultId]);
+
+  useEffect(() => {
+    fetchFolders();
+  }, [fetchFolders]);
+
+  // Reset the folder filter when switching vaults (folder ids are vault-scoped).
+  useEffect(() => {
+    setFolderFilterId(null);
+  }, [activeVaultId]);
+
+  const handleCreateFolder = useCallback(
+    async (name: string, parentFolderId: number | null) => {
+      if (activeVaultId == null) return;
+      try {
+        await createFolder(activeVaultId, name, parentFolderId);
+        await fetchFolders();
+        toast.success(`Created folder "${name}"`);
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to create folder");
+        throw err;
+      }
+    },
+    [activeVaultId, fetchFolders]
+  );
+
+  const handleRenameFolder = useCallback(
+    async (folderId: number, name: string) => {
+      try {
+        await updateFolder(folderId, { name });
+        await fetchFolders();
+        toast.success("Folder renamed");
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to rename folder");
+        throw err;
+      }
+    },
+    [fetchFolders]
+  );
+
+  const handleDeleteFolder = useCallback(
+    (folder: Folder) => {
+      setConfirmDialog({
+        open: true,
+        title: "Delete Folder",
+        description: `Delete folder "${folder.name}"? Subfolders are also deleted; documents inside are moved out of the folder (not deleted).`,
+        variant: "destructive",
+        onConfirm: async () => {
+          try {
+            await deleteFolder(folder.id);
+            // If the active filter pointed at a removed folder, fall back to all.
+            setFolderFilterId((prev) => (prev === folder.id ? null : prev));
+            await Promise.all([fetchFolders(), fetchDocuments()]);
+            toast.success("Folder deleted");
+          } catch (err) {
+            toast.error(err instanceof Error ? err.message : "Failed to delete folder");
+          }
+        },
+      });
+    },
+    [fetchFolders, fetchDocuments]
+  );
+
+  const handleMoveFolderTrigger = useCallback((folder: Folder) => {
+    setMovingFolder(folder);
+  }, []);
 
   const handleSort = useCallback((column: DocumentSortBy) => {
     setSortBy((prevCol) => {
@@ -237,12 +331,13 @@ export default function DocumentsPage() {
         toast.error(`Failed to delete ${result.failed_ids.length} document${result.failed_ids.length > 1 ? "s" : ""}`);
       }
       clearSelection();
+      fetchFolders();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
     } finally {
       setIsBulkDeleting(false);
     }
-  }, [canMutateDocuments, selectedIds, setDocuments, setStats, clearSelection]);
+  }, [canMutateDocuments, selectedIds, setDocuments, setStats, clearSelection, fetchFolders]);
 
   const handleBulkDelete = useCallback(() => {
     if (selectedIds.size === 0) return;
@@ -264,13 +359,14 @@ export default function DocumentsPage() {
         toast.success(`Deleted ${result.deleted_count} document${result.deleted_count > 1 ? "s" : ""}`);
         setDocuments([]);
         setStats((prev) => (prev ? { ...prev, total_documents: 0 } : prev));
+        fetchFolders();
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
     } finally {
       setIsBulkDeletingAll(false);
     }
-  }, [activeVaultId, canMutateDocuments, setDocuments, setStats]);
+  }, [activeVaultId, canMutateDocuments, setDocuments, setStats, fetchFolders]);
 
   const handleDeleteAllInVault = useCallback(() => {
     if (!documents || documents.length === 0) return;
@@ -363,7 +459,7 @@ export default function DocumentsPage() {
           try {
             await deleteDocument(docId);
             toast.success("Document deleted successfully");
-            await Promise.all([fetchDocuments(), fetchStats()]);
+            await Promise.all([fetchDocuments(), fetchStats(), fetchFolders()]);
             setOptimisticallyDeletedIds((prev) => {
               const next = new Set(prev);
               next.delete(docId);
@@ -513,6 +609,10 @@ export default function DocumentsPage() {
                 <TagIcon className="w-4 h-4 mr-2" />
                 Tag
               </Button>
+              <Button variant="outline" size="sm" onClick={() => setMoveFolderOpen(true)}>
+                <FolderInput className="w-4 h-4 mr-2" />
+                Move
+              </Button>
               <Button variant="destructive" size="sm" onClick={handleBulkDelete} disabled={isBulkDeleting}>
                 {isBulkDeleting ? (
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
@@ -527,6 +627,20 @@ export default function DocumentsPage() {
         </div>
       </div>
 
+      <div className="flex gap-6">
+        {hasSelectedVault && (
+          <FolderTree
+            folders={folders}
+            selectedFolderId={folderFilterId}
+            onSelect={setFolderFilterId}
+            canMutate={canMutateDocuments}
+            onCreate={handleCreateFolder}
+            onRename={handleRenameFolder}
+            onDelete={handleDeleteFolder}
+            onMove={handleMoveFolderTrigger}
+          />
+        )}
+        <div className="flex-1 min-w-0">
       {loading ? (
         <DocumentsTableSkeleton />
       ) : isResolvingSearchEmptyState ? (
@@ -565,6 +679,8 @@ export default function DocumentsPage() {
           />
         </>
       )}
+        </div>
+      </div>
 
       {activeVaultId != null && (
         <BulkTagDialog
@@ -577,6 +693,37 @@ export default function DocumentsPage() {
           onAssigned={() => {
             fetchTags();
             fetchDocuments();
+          }}
+        />
+      )}
+
+      {activeVaultId != null && (
+        <MoveToFolderDialog
+          open={moveFolderOpen}
+          onOpenChange={setMoveFolderOpen}
+          vaultId={activeVaultId}
+          selectedFileIds={selectedFileIds}
+          folders={folders}
+          onMoved={() => {
+            clearSelection();
+            fetchFolders();
+            fetchDocuments();
+          }}
+        />
+      )}
+
+      {movingFolder && (
+        <MoveFolderDialog
+          key={movingFolder.id}
+          open={movingFolder != null}
+          onOpenChange={(open) => {
+            if (!open) setMovingFolder(null);
+          }}
+          folder={movingFolder}
+          folders={folders}
+          onMoved={() => {
+            setMovingFolder(null);
+            fetchFolders();
           }}
         />
       )}

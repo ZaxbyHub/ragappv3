@@ -22,6 +22,7 @@ from app.api.routes.documents import (
 )
 from app.api.routes.email import router as email_router
 from app.api.routes.eval import router as eval_router
+from app.api.routes.folders import router as folders_router
 from app.api.routes.groups import router as groups_router
 from app.api.routes.health import router as health_router
 from app.api.routes.kms import router as kms_router
@@ -125,6 +126,7 @@ app.include_router(groups_router, prefix="/api")
 app.include_router(wiki_router, prefix="/api")
 app.include_router(kms_router, prefix="/api")
 app.include_router(tags_router, prefix="/api")
+app.include_router(folders_router, prefix="/api")
 
 # Register exception handler for validation errors (empty filename)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)

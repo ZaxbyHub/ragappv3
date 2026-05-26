@@ -11,10 +11,8 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-import threading
 import unittest
 from pathlib import Path
-from queue import Empty, Queue
 from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -32,50 +30,13 @@ except ImportError:
     import types
     sys.modules["pyarrow"] = types.ModuleType("pyarrow")
 
+from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_db, get_vector_store
 from app.config import settings
 from app.main import app
 from app.services.auth_service import create_access_token
-
-
-class SimpleConnectionPool:
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self._pool = Queue(maxsize=5)
-        self._lock = threading.Lock()
-        self._closed = False
-
-    def get_connection(self):
-        if self._closed:
-            raise RuntimeError("Pool closed")
-        try:
-            return self._pool.get_nowait()
-        except Empty:
-            return self._create_connection()
-
-    def _create_connection(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
-
-    def release_connection(self, conn):
-        if not self._closed:
-            try:
-                self._pool.put_nowait(conn)
-            except Exception:
-                conn.close()
-
-    def close_all(self):
-        self._closed = True
-        while True:
-            try:
-                conn = self._pool.get_nowait()
-                conn.close()
-            except Empty:
-                break
 
 
 class DocumentsDeleteAuditTestBase(unittest.TestCase):

@@ -19,6 +19,7 @@ interface UseDocumentPollingArgs {
   sortBy: DocumentSortBy;
   sortOrder: SortOrder;
   tagFilterId: number | null;
+  folderFilterId: number | null;
   uploads: UploadFile[];
 }
 
@@ -37,6 +38,7 @@ export function useDocumentPolling({
   sortBy,
   sortOrder,
   tagFilterId,
+  folderFilterId,
   uploads,
 }: UseDocumentPollingArgs) {
   const [documents, setDocuments] = useState<Document[]>([]);
@@ -55,6 +57,7 @@ export function useDocumentPolling({
         sortBy,
         sortOrder,
         tagId: tagFilterId ?? undefined,
+        folderId: folderFilterId ?? undefined,
       });
       setDocuments(response?.documents || []);
     } catch (err) {
@@ -62,7 +65,7 @@ export function useDocumentPolling({
       toast.error(err instanceof Error ? err.message : "Failed to load documents");
       setDocuments([]);
     }
-  }, [activeVaultId, search, sortBy, sortOrder, tagFilterId]);
+  }, [activeVaultId, search, sortBy, sortOrder, tagFilterId, folderFilterId]);
 
   const fetchStats = useCallback(async () => {
     try {

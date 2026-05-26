@@ -324,6 +324,7 @@ class DocumentResponse(BaseModel):
     enrichment_error: Optional[str] = None
     metadata: Optional[dict] = None  # Frontend expects metadata
     tags: List[dict] = Field(default_factory=list)  # Assigned organization tags
+    folder_id: Optional[int] = None  # Folder the document is filed in (null = unfiled)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -450,6 +451,7 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     )
     enrichment_status = row["enrichment_status"] if "enrichment_status" in keys else None
     enrichment_error = row["enrichment_error"] if "enrichment_error" in keys else None
+    folder_id = row["folder_id"] if "folder_id" in keys else None
     return DocumentResponse(
         id=row["id"],
         file_name=file_name,
@@ -474,6 +476,7 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
         processing_started_at=processing_started_at,
         enrichment_status=enrichment_status,
         enrichment_error=enrichment_error,
+        folder_id=folder_id,
         metadata={
             "status": status,
             "chunk_count": chunk_count,
@@ -516,6 +519,9 @@ async def list_documents(
     ),
     status: Optional[str] = Query(None, description="Filter by processing status"),
     tag_id: Optional[int] = Query(None, description="Filter by assigned tag ID"),
+    folder_id: Optional[int] = Query(
+        None, description="Filter to documents directly in this folder ID"
+    ),
     sort_by: str = Query(
         "created_at",
         description="Sort column: created_at, file_name, file_size, status",
@@ -597,6 +603,9 @@ async def list_documents(
             "id IN (SELECT dt.file_id FROM document_tags dt WHERE dt.tag_id = ?)"
         )
         extra_params.append(tag_id)
+    if folder_id is not None:
+        extra_where.append("folder_id = ?")
+        extra_params.append(folder_id)
 
     def _extra_clause(prefix: str = "AND") -> str:
         if not extra_where:
@@ -622,7 +631,7 @@ async def list_documents(
                    created_at, processed_at, error_message, phase, phase_message,
                    progress_percent, processed_units, total_units, unit_label,
                    phase_started_at, processing_started_at, enrichment_status,
-                   enrichment_error, vault_id
+                   enrichment_error, vault_id, folder_id
             FROM files
             WHERE vault_id = ?{_extra_clause()}
             {order_clause}
@@ -652,7 +661,7 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error, vault_id
+                       enrichment_error, vault_id, folder_id
                 FROM files
                 WHERE vault_id IN ({placeholders}){_extra_clause()}
                 {order_clause}
@@ -676,7 +685,7 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error, vault_id
+                       enrichment_error, vault_id, folder_id
                 FROM files{base_where}
                 {order_clause}
                 LIMIT ? OFFSET ?

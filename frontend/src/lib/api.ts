@@ -537,6 +537,18 @@ export interface Document {
   enrichment_error?: string | null;
   metadata?: Record<string, unknown>;
   tags?: Tag[];
+  folder_id?: number | null;
+}
+
+export interface Folder {
+  id: number;
+  vault_id: number;
+  parent_folder_id: number | null;
+  name: string;
+  description: string;
+  created_at: string;
+  updated_at: string;
+  document_count: number;
 }
 
 export type DocumentSortBy = "created_at" | "file_name" | "file_size" | "status";
@@ -551,6 +563,7 @@ export interface ListDocumentsOptions {
   sortBy?: DocumentSortBy;
   sortOrder?: SortOrder;
   tagId?: number;
+  folderId?: number;
 }
 
 export interface ListDocumentsResponse {
@@ -956,7 +969,7 @@ export async function listMemories(vaultId?: number): Promise<{ memories: Memory
 }
 
 export async function listDocuments(options: ListDocumentsOptions = {}): Promise<ListDocumentsResponse> {
-  const { vaultId, search, status, page, perPage, sortBy, sortOrder, tagId } = options;
+  const { vaultId, search, status, page, perPage, sortBy, sortOrder, tagId, folderId } = options;
   const params: Record<string, unknown> = {};
   if (vaultId != null) params.vault_id = vaultId;
   if (search && search.trim()) params.search = search.trim();
@@ -966,6 +979,7 @@ export async function listDocuments(options: ListDocumentsOptions = {}): Promise
   if (sortBy) params.sort_by = sortBy;
   if (sortOrder) params.sort_order = sortOrder;
   if (tagId != null) params.tag_id = tagId;
+  if (folderId != null) params.folder_id = folderId;
   const response = await apiClient.get<ListDocumentsResponse>("/documents", { params });
   return response.data;
 }
@@ -1041,6 +1055,57 @@ export async function unassignTag(
   await apiClient.delete(`/tags/${tagId}/documents/${fileId}`, {
     params: { vault_id: vaultId },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Folders (document hierarchy)
+// ---------------------------------------------------------------------------
+
+export async function listFolders(vaultId: number): Promise<Folder[]> {
+  const response = await apiClient.get<{ folders: Folder[] }>("/folders", {
+    params: { vault_id: vaultId },
+  });
+  return response.data.folders;
+}
+
+export async function createFolder(
+  vaultId: number,
+  name: string,
+  parentFolderId: number | null = null,
+  description = ""
+): Promise<Folder> {
+  const response = await apiClient.post<Folder>("/folders", {
+    vault_id: vaultId,
+    name,
+    description,
+    parent_folder_id: parentFolderId,
+  });
+  return response.data;
+}
+
+export async function updateFolder(
+  folderId: number,
+  data: { name?: string; description?: string; parent_folder_id?: number | null }
+): Promise<Folder> {
+  const response = await apiClient.put<Folder>(`/folders/${folderId}`, data);
+  return response.data;
+}
+
+export async function deleteFolder(folderId: number): Promise<void> {
+  await apiClient.delete(`/folders/${folderId}`);
+}
+
+export async function moveDocumentsToFolder(
+  vaultId: number,
+  fileIds: number[],
+  folderId: number | null
+): Promise<{ moved: number }> {
+  const response = await apiClient.post<{ moved: number }>("/folders/move", {
+    vault_id: vaultId,
+    file_ids: fileIds,
+    folder_id: folderId,
+  });
+  return response.data;
 }
 
 export async function uploadDocument(

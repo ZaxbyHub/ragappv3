@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS files (
     enrichment_status TEXT,
     enrichment_error TEXT,
     enrichment_updated_at TIMESTAMP,
+    folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
     FOREIGN KEY (vault_id) REFERENCES vaults(id)
 );
 
@@ -615,6 +616,29 @@ CREATE TABLE IF NOT EXISTS document_tags (
 
 CREATE INDEX IF NOT EXISTS idx_tags_vault ON tags(vault_id);
 CREATE INDEX IF NOT EXISTS idx_document_tags_tag_id ON document_tags(tag_id);
+
+-- ============================================================
+-- Document folders (user-curated hierarchy, vault-scoped)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS folders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vault_id INTEGER NOT NULL,
+    parent_folder_id INTEGER,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_folder_id) REFERENCES folders(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_folders_vault ON folders(vault_id);
+CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_folder_id);
+-- NOTE: the idx_files_folder_id index is created by migrate_add_folders(), not
+-- here. The files table's executescript path also runs against pre-existing
+-- (legacy) databases where files.folder_id may not exist yet; indexing it here
+-- would raise "no such column: folder_id" before the migration adds the column.
 """
 
 
@@ -750,6 +774,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_kms_tables(sqlite_path)
     migrate_add_kms_refs(sqlite_path)
     migrate_add_tags_tables(sqlite_path)
+    migrate_add_folders(sqlite_path)
     migrate_add_files_parsed_text(sqlite_path)
     migrate_add_files_processing_progress(sqlite_path)
     migrate_add_files_enrichment_status(sqlite_path)
@@ -1596,6 +1621,54 @@ def migrate_add_tags_tables(sqlite_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_tags_vault ON tags(vault_id);
             CREATE INDEX IF NOT EXISTS idx_document_tags_tag_id ON document_tags(tag_id);
         """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_folders(sqlite_path: str) -> None:
+    """
+    Migration: Add document folder hierarchy for existing databases.
+
+    Idempotent — safe to run multiple times. The folders table and indexes use
+    IF NOT EXISTS guards; files.folder_id is added only when absent. Deleting a
+    folder unfiles its documents (files.folder_id ON DELETE SET NULL) and
+    cascade-deletes its subfolders (parent_folder_id ON DELETE CASCADE);
+    deleting a vault cascade-deletes all of its folders.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                parent_folder_id INTEGER,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
+                FOREIGN KEY (parent_folder_id) REFERENCES folders(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_folders_vault ON folders(vault_id);
+            CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_folder_id);
+        """)
+        existing_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
+        ]
+        if "folder_id" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN folder_id INTEGER "
+                "REFERENCES folders(id) ON DELETE SET NULL"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_folder_id ON files(folder_id)"
+        )
         conn.commit()
     finally:
         conn.close()

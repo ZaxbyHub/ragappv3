@@ -60,6 +60,7 @@ except ImportError:
     sys.modules["unstructured.documents"] = _unstructured.documents
     sys.modules["unstructured.documents.elements"] = _unstructured.documents.elements
 
+from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_llm_health_checker, get_model_checker
@@ -291,47 +292,7 @@ class TestMemoriesEndpoints(unittest.TestCase):
 
         # Override get_db to use a pool that allows cross-thread usage
         # Create a simple pool for testing
-        import threading
-        from queue import Empty, Queue
-
         from app.api.deps import get_db, get_memory_store
-
-        class SimpleConnectionPool:
-            def __init__(self, db_path):
-                self.db_path = db_path
-                self._pool = Queue(maxsize=5)
-                self._lock = threading.Lock()
-                self._closed = False
-
-            def get_connection(self):
-                if self._closed:
-                    raise RuntimeError("Pool closed")
-                try:
-                    return self._pool.get_nowait()
-                except Empty:
-                    return self._create_connection()
-
-            def _create_connection(self):
-                conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA foreign_keys = ON;")
-                return conn
-
-            def release_connection(self, conn):
-                if not self._closed:
-                    try:
-                        self._pool.put_nowait(conn)
-                    except:
-                        conn.close()
-
-            def close_all(self):
-                self._closed = True
-                while True:
-                    try:
-                        conn = self._pool.get_nowait()
-                        conn.close()
-                    except Empty:
-                        break
 
         self._connection_pool = SimpleConnectionPool(db_path)
 
@@ -481,47 +442,7 @@ class TestDocumentsEndpoints(unittest.TestCase):
 
         # Override get_db to use a pool that allows cross-thread usage
         # Create a simple pool for testing
-        import threading
-        from queue import Empty, Queue
-
         from app.api.deps import get_current_active_user, get_db, get_evaluate_policy
-
-        class SimpleConnectionPool:
-            def __init__(self, db_path):
-                self.db_path = db_path
-                self._pool = Queue(maxsize=5)
-                self._lock = threading.Lock()
-                self._closed = False
-
-            def get_connection(self):
-                if self._closed:
-                    raise RuntimeError("Pool closed")
-                try:
-                    return self._pool.get_nowait()
-                except Empty:
-                    return self._create_connection()
-
-            def _create_connection(self):
-                conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA foreign_keys = ON;")
-                return conn
-
-            def release_connection(self, conn):
-                if not self._closed:
-                    try:
-                        self._pool.put_nowait(conn)
-                    except:
-                        conn.close()
-
-            def close_all(self):
-                self._closed = True
-                while True:
-                    try:
-                        conn = self._pool.get_nowait()
-                        conn.close()
-                    except Empty:
-                        break
 
         self._connection_pool = SimpleConnectionPool(db_path)
 
