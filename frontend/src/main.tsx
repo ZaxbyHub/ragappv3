@@ -6,8 +6,11 @@ import App from './App.tsx'
 import './index.css'
 // Initialize theme from persisted preference before first paint
 import { useThemeStore } from '@/stores/useThemeStore'
+import { logSubpathConfig } from './lib/paths'
 
 const queryClient = new QueryClient()
+
+logSubpathConfig();
 
 // ThemedToaster keeps sonner's color scheme aligned with our user-overridable
 // theme toggle. We pass "system" through directly so OS-level preference

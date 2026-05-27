@@ -224,6 +224,7 @@ def stream_chat_response(
         return StreamingResponse(
             error_generator(),
             media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     async def event_generator():
@@ -340,6 +341,7 @@ def stream_chat_response(
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
     )
 
 

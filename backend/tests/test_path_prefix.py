@@ -11,6 +11,7 @@ from app.security import issue_csrf_token
 from app.utils.paths import (
     csrf_cookie_path,
     external_path,
+    is_unstripped_prefix,
     normalize_root_path,
     refresh_cookie_path,
 )
@@ -147,3 +148,92 @@ def test_backend_internal_routes_remain_unprefixed():
     assert 'app.mount(\n            "/assets"' in main_source
     assert "/knowledgevault/api" not in main_source
     assert "/knowledgevault/assets" not in main_source
+
+
+# ---------------------------------------------------------------------------
+# F-006: is_unstripped_prefix proxy guard unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsUnstrippedPrefix:
+    def test_detects_prefixed_api_path(self):
+        assert is_unstripped_prefix("meridian/api/health", "/meridian") is True
+
+    def test_detects_exact_prefix(self):
+        assert is_unstripped_prefix("meridian", "/meridian") is True
+
+    def test_ignores_api_path_without_prefix(self):
+        assert is_unstripped_prefix("api/health", "/meridian") is False
+
+    def test_ignores_frontend_route(self):
+        assert is_unstripped_prefix("chat", "/meridian") is False
+
+    def test_boundary_safe_no_partial_match(self):
+        assert is_unstripped_prefix("meridianx/foo", "/meridian") is False
+
+    def test_disabled_for_root_deploy(self):
+        assert is_unstripped_prefix("anything", "") is False
+
+    def test_multi_segment_prefix(self):
+        assert is_unstripped_prefix("apps/meridian/api", "/apps/meridian") is True
+
+    def test_multi_segment_no_match(self):
+        assert is_unstripped_prefix("apps/other/api", "/apps/meridian") is False
+
+
+# ---------------------------------------------------------------------------
+# F-005: delete_cookie must use refresh_cookie_path() helper
+# ---------------------------------------------------------------------------
+
+
+def test_delete_cookie_uses_refresh_cookie_path():
+    """delete_cookie must use the same path helper so the browser actually clears it."""
+    import re
+
+    auth_source = Path("app/api/routes/auth.py").read_text(encoding="utf-8")
+    # No hardcoded refresh cookie paths — all must use the helper
+    assert 'path="/api/auth/refresh"' not in auth_source
+    # Verify delete_cookie calls exist and use the helper
+    delete_calls = re.findall(r"delete_cookie\([^)]*\)", auth_source)
+    assert len(delete_calls) > 0, "Expected at least one delete_cookie call"
+    for call in delete_calls:
+        if "refresh" in call.lower() or "path=" in call:
+            assert "refresh_cookie_path()" in call, (
+                f"delete_cookie uses hardcoded path: {call}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# N-3: StreamingResponse must include X-Accel-Buffering for nginx proxies
+# ---------------------------------------------------------------------------
+
+
+def test_chat_streaming_responses_have_proxy_headers():
+    """All StreamingResponse in chat.py must include X-Accel-Buffering for nginx."""
+    import re
+
+    chat_source = Path("app/api/routes/chat.py").read_text(encoding="utf-8")
+    # Match StreamingResponse(...) including nested parens like error_generator()
+    streaming_blocks = re.findall(
+        r"StreamingResponse\((?:[^()]*\([^()]*\)[^()]*)*[^()]*\)",
+        chat_source,
+        re.DOTALL,
+    )
+    assert len(streaming_blocks) >= 2, (
+        f"Expected >=2 StreamingResponse calls, found {len(streaming_blocks)}"
+    )
+    for block in streaming_blocks:
+        assert "X-Accel-Buffering" in block, (
+            f"StreamingResponse missing X-Accel-Buffering header: {block[:80]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# F-006: SPA catch-all must call the proxy guard
+# ---------------------------------------------------------------------------
+
+
+def test_spa_catchall_calls_proxy_guard():
+    """SPA catch-all must check for unstripped proxy prefix."""
+    main_source = Path("app/main.py").read_text(encoding="utf-8")
+    assert "is_unstripped_prefix" in main_source

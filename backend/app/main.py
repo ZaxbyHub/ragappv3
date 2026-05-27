@@ -45,7 +45,7 @@ from app.lifespan import lifespan
 from app.limiter import limiter
 from app.middleware.logging import LoggingMiddleware
 from app.middleware.maintenance import MaintenanceMiddleware
-from app.utils.paths import normalize_root_path
+from app.utils.paths import is_unstripped_prefix, normalize_root_path
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,11 @@ app = FastAPI(
     description="Self-hosted RAG Knowledge Base API",
     root_path=normalize_root_path(settings.app_root_path),
     lifespan=lifespan,
+)
+logger.info(
+    "Subpath config: APP_ROOT_PATH=%r  root_path=%r",
+    settings.app_root_path,
+    app.root_path,
 )
 
 # Security check: warn if admin_secret_token is not set or using default value
@@ -155,11 +160,12 @@ if static_dir.exists():
         )
         logger.info(f"Static files mounted successfully from {static_dir}")
 
-        # Catch-all route for SPA client-side routing
-        # Serves index.html for any unmatched frontend routes (not API routes)
+        # ── SPA CATCH-ALL ──────────────────────────────────────
+        # Everything below this line is caught by the SPA fallback.
+        # All API routers MUST be registered ABOVE this point.
+        # ───────────────────────────────────────────────────────
         @app.get("/{full_path:path}")
         async def serve_spa(full_path: str):
-            # Return 404 for API and assets paths to avoid shadowing (case-insensitive)
             normalized_path = full_path.lower()
             if (
                 normalized_path == "api"
@@ -168,6 +174,15 @@ if static_dir.exists():
                 or normalized_path.startswith("assets/")
             ):
                 raise HTTPException(status_code=404, detail="Not found")
+            if is_unstripped_prefix(full_path, settings.app_root_path):
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        "Proxy misconfiguration: request path starts with "
+                        "APP_ROOT_PATH. Your reverse proxy must strip the "
+                        "prefix before forwarding. See deployment docs."
+                    ),
+                )
             return FileResponse(static_dir / "index.html")
 
     except Exception as e:

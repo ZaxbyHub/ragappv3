@@ -73,7 +73,7 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_APP_BASENAME: ${VITE_APP_BASENAME:-/}
-        VITE_API_URL: ${VITE_API_URL:-/api}
+        VITE_API_URL: ${VITE_API_URL:-}
     container_name: knowledgevault
     restart: unless-stopped
     ports:

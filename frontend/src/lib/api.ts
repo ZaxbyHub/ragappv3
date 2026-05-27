@@ -2,7 +2,8 @@ import axios, { AxiosRequestHeaders } from "axios";
 import { setChatHistory as storageSetChatHistory, getChatHistory as storageGetChatHistory } from "./storage";
 import { appPath } from "./paths";
 
-export const API_BASE_URL = import.meta.env.VITE_API_URL || "/api";
+export const API_BASE_URL = import.meta.env.VITE_API_URL || appPath("/api");
+console.info("[KnowledgeVault] API_BASE_URL:", API_BASE_URL);
 
 // Module-level JWT token holder - persisted via useAuthStore persist middleware
 let _jwtAccessToken: string | null = null;

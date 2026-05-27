@@ -52,6 +52,11 @@ jobs:
           VITE_APP_BASENAME: /knowledgevault
           VITE_API_URL: /knowledgevault/api
 
+      - name: Build subpath deployment (derived API URL)
+        run: npm run build
+        env:
+          VITE_APP_BASENAME: /meridian
+
   quality-contracts:
     name: Quality contracts
     runs-on: ubuntu-latest

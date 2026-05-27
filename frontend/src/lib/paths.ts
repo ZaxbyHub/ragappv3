@@ -1,35 +1,6 @@
-const UNSAFE_BASE_PATH_PATTERN = /[\s;\\?#]/;
+import { normalizeBasePath } from "./normalize-base-path";
 
-function hasControlCharacter(value: string): boolean {
-  return Array.from(value).some((char) => {
-    const code = char.charCodeAt(0);
-    return code < 32 || code === 127;
-  });
-}
-
-export function normalizeBasePath(value?: string | null): string {
-  const raw = value ?? "";
-  if (!raw) return "";
-  if (raw !== raw.trim()) {
-    throw new Error("Base path cannot contain leading or trailing whitespace");
-  }
-  if (/^https?:\/\//i.test(raw) || (raw.startsWith("//") && /[^/]/.test(raw))) {
-    throw new Error("Base path must be a path, not a URL");
-  }
-  if (UNSAFE_BASE_PATH_PATTERN.test(raw) || hasControlCharacter(raw)) {
-    throw new Error("Base path contains unsafe characters");
-  }
-  if (/\/{2,}/.test(raw.replace(/^\/+|\/+$/g, ""))) {
-    throw new Error("Base path cannot contain duplicate slashes");
-  }
-
-  const stripped = raw.replace(/^\/+|\/+$/g, "");
-  if (!stripped) return "";
-  if (stripped.split("/").some((part) => part === "." || part === "..")) {
-    throw new Error("Base path cannot contain relative path segments");
-  }
-  return `/${stripped}`;
-}
+export { normalizeBasePath };
 
 export const APP_BASENAME = normalizeBasePath(
   import.meta.env.VITE_APP_BASENAME || import.meta.env.BASE_URL || "/"
@@ -41,4 +12,24 @@ export function appPath(path: string, basename = APP_BASENAME): string {
   if (!base) return suffix;
   if (suffix === "/") return `${base}/`;
   return `${base}${suffix}`;
+}
+
+export function logSubpathConfig(): void {
+  const viteAppBasename = import.meta.env.VITE_APP_BASENAME ?? "(not set)";
+  const viteApiUrl = import.meta.env.VITE_API_URL ?? "(not set)";
+  const baseUrl = import.meta.env.BASE_URL ?? "(not set)";
+
+  console.info(
+    "[KnowledgeVault] Subpath config:\n" +
+      `  VITE_APP_BASENAME = ${JSON.stringify(viteAppBasename)}\n` +
+      `  VITE_API_URL      = ${JSON.stringify(viteApiUrl)}${!import.meta.env.VITE_API_URL ? "  (derived)" : ""}\n` +
+      `  BASE_URL          = ${JSON.stringify(baseUrl)}\n` +
+      `  APP_BASENAME      = ${JSON.stringify(APP_BASENAME)}`
+  );
+
+  if (import.meta.env.VITE_APP_BASENAME && !import.meta.env.VITE_API_URL) {
+    console.info(
+      "[KnowledgeVault] VITE_API_URL not set — derived from VITE_APP_BASENAME"
+    );
+  }
 }

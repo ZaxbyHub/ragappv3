@@ -383,7 +383,7 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_APP_BASENAME: ${VITE_APP_BASENAME:-/}
-        VITE_API_URL: ${VITE_API_URL:-/api}
+        VITE_API_URL: ${VITE_API_URL:-}
     ports:
       - "3000:3000"
     depends_on:
@@ -461,7 +461,7 @@ RUN npm ci
 COPY . .
 
 ARG VITE_APP_BASENAME=/
-ARG VITE_API_URL=/api
+ARG VITE_API_URL=
 ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
 ENV VITE_API_URL=${VITE_API_URL}
 
@@ -565,13 +565,14 @@ LOCKOUT_DURATION_MINUTES=15
 Create `frontend/.env`:
 
 ```bash
-# API URL
-VITE_API_URL=/api
+# Base path (VITE_API_URL is derived when empty — defaults to /api)
+VITE_API_URL=
 VITE_APP_BASENAME=/
 
 # For a subpath deployment behind a prefix-stripping proxy:
-# VITE_API_URL=/knowledgevault/api
 # VITE_APP_BASENAME=/knowledgevault
+# VITE_API_URL is derived from VITE_APP_BASENAME when empty (e.g. /knowledgevault/api).
+# Set VITE_API_URL explicitly only for custom API gateways.
 
 # Feature Flags
 VITE_USERS_ENABLED=true

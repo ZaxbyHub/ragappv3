@@ -107,14 +107,14 @@ def main() -> int:
         failures.append(".env.example APP_ROOT_PATH should default to empty root path")
     if env_value(env_text, "VITE_APP_BASENAME") != "/":
         failures.append(".env.example VITE_APP_BASENAME should default to /")
-    if env_value(env_text, "VITE_API_URL") != "/api":
-        failures.append(".env.example VITE_API_URL should default to /api")
+    if env_value(env_text, "VITE_API_URL") != "":
+        failures.append(".env.example VITE_API_URL should default to empty (derived from VITE_APP_BASENAME)")
     if compose_default(compose_text, "APP_ROOT_PATH") != "":
         failures.append("docker-compose.yml APP_ROOT_PATH should default to empty")
     if compose_default(compose_text, "VITE_APP_BASENAME") != "/":
         failures.append("docker-compose.yml VITE_APP_BASENAME should default to /")
-    if compose_default(compose_text, "VITE_API_URL") != "/api":
-        failures.append("docker-compose.yml VITE_API_URL should default to /api")
+    if compose_default(compose_text, "VITE_API_URL") != "":
+        failures.append("docker-compose.yml VITE_API_URL should default to empty (derived from VITE_APP_BASENAME)")
 
     prefix_example = [
         "APP_ROOT_PATH=/knowledgevault",
@@ -132,15 +132,15 @@ def main() -> int:
     ]:
         for token in [
             "ARG VITE_APP_BASENAME=/",
-            "ARG VITE_API_URL=/api",
+            "ARG VITE_API_URL=",
             "ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}",
             "ENV VITE_API_URL=${VITE_API_URL}",
         ]:
             if token not in dockerfile_text:
                 failures.append(f"{dockerfile_name} is missing {token}")
 
-    if 'import.meta.env.VITE_API_URL || "/api"' not in frontend_api:
-        failures.append("frontend API default no longer matches VITE_API_URL=/api")
+    if 'import.meta.env.VITE_API_URL || appPath("/api")' not in frontend_api:
+        failures.append("frontend API default no longer derives from appPath when VITE_API_URL is empty")
     if "VITE_APP_BASENAME" not in frontend_paths or "BASE_URL" not in frontend_paths:
         failures.append("frontend path helper no longer reads VITE_APP_BASENAME/BASE_URL")
     if "normalizeViteBase(appBasename)" not in vite_config:

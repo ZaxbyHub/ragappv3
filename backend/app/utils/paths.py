@@ -50,3 +50,12 @@ def csrf_cookie_path(root_path: str | None = None) -> str:
 
         root_path = settings.app_root_path
     return normalize_root_path(root_path) or "/"
+
+
+def is_unstripped_prefix(full_path: str, root_path: str) -> bool:
+    """Detect if a request path still carries the external prefix (proxy misconfiguration)."""
+    prefix = normalize_root_path(root_path)
+    if not prefix:
+        return False
+    bare = prefix.lstrip("/")
+    return full_path == bare or full_path.startswith(bare + "/")

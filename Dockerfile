@@ -5,9 +5,11 @@ COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
 ARG VITE_APP_BASENAME=/
-ARG VITE_API_URL=/api
+ARG VITE_API_URL=
 ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
 ENV VITE_API_URL=${VITE_API_URL}
+COPY scripts/validate_vite_env.mjs /tmp/validate_vite_env.mjs
+RUN node /tmp/validate_vite_env.mjs
 RUN npm run build
 
 # Stage 2: Backend with Unstructured dependencies

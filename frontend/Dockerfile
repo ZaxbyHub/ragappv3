@@ -12,10 +12,19 @@ RUN npm ci
 COPY . .
 
 ARG VITE_APP_BASENAME=/
-ARG VITE_API_URL=/api
+ARG VITE_API_URL=
 ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
 ENV VITE_API_URL=${VITE_API_URL}
 
+RUN node -e " \
+  var v = process.env.VITE_APP_BASENAME || ''; \
+  if (v && v !== '/') { \
+    if (v !== v.trim()) throw new Error('VITE_APP_BASENAME: leading/trailing whitespace'); \
+    if (/^https?:\\/\\//i.test(v)) throw new Error('VITE_APP_BASENAME: must be path not URL'); \
+    if (/[\\s;\\\\?#]/.test(v)) throw new Error('VITE_APP_BASENAME: unsafe characters'); \
+  } \
+  console.log('validate: VITE_APP_BASENAME=' + (v || '(root)') + ' OK'); \
+  "
 RUN npm run build
 
 # Final stage

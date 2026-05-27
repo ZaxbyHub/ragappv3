@@ -1,4 +1,6 @@
-const API_PROXY_TARGET = 'http://localhost:9090'
+// normalizeBasePath is duplicated here because vite.config.ts runs under
+// tsconfig.node.json which cannot import from src/ without composite conflicts.
+// Keep in sync with src/lib/normalize-base-path.ts.
 const UNSAFE_BASE_PATH_PATTERN = /[\s;\\?#]/
 
 function hasControlCharacter(value: string): boolean {
@@ -6,12 +8,6 @@ function hasControlCharacter(value: string): boolean {
     const code = char.charCodeAt(0)
     return code < 32 || code === 127
   })
-}
-
-export interface ApiProxyOptions {
-  target: string
-  changeOrigin: boolean
-  rewrite: (requestPath: string) => string
 }
 
 export function normalizeBasePath(value?: string | null): string {
@@ -36,6 +32,14 @@ export function normalizeBasePath(value?: string | null): string {
     throw new Error('Base path cannot contain relative path segments')
   }
   return `/${stripped}`
+}
+
+const API_PROXY_TARGET = 'http://localhost:9090'
+
+export interface ApiProxyOptions {
+  target: string
+  changeOrigin: boolean
+  rewrite: (requestPath: string) => string
 }
 
 export function normalizeViteBase(value?: string | null): string {
@@ -69,7 +73,6 @@ export function createApiProxy(basename: string): Record<string, ApiProxyOptions
   }
 
   return {
-    '/api': rootProxy,
     [createApiProxyPath(base)]: {
       target: API_PROXY_TARGET,
       changeOrigin: true,

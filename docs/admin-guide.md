@@ -577,17 +577,60 @@ server {
 }
 ```
 
-For a subpath deployment such as `https://MEDXS.af.mil/knowledgevault/`, build and run with:
+#### Subpath Deployment
+
+For a subpath deployment such as `https://example.com/knowledgevault/`, configure these variables and rebuild the Docker image:
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `APP_ROOT_PATH` | Runtime env | Cookie paths and OpenAPI docs (backend) |
+| `VITE_APP_BASENAME` | Build arg | Frontend base path and asset URLs |
+| `VITE_API_URL` | Build arg (optional) | API URL override. Derived from `VITE_APP_BASENAME` when empty |
+| `BACKEND_CORS_ORIGINS` | Runtime env | Allowed CORS origins for your domain |
+| `FORWARDED_ALLOW_IPS` | Runtime env | Trusted proxy IPs for forwarded headers |
+
+**Minimal configuration** (`.env` or environment):
 
 ```env
 APP_ROOT_PATH=/knowledgevault
 VITE_APP_BASENAME=/knowledgevault
-VITE_API_URL=/knowledgevault/api
-BACKEND_CORS_ORIGINS=https://MEDXS.af.mil
-FORWARDED_ALLOW_IPS=127.0.0.1
+BACKEND_CORS_ORIGINS=https://example.com
+FORWARDED_ALLOW_IPS=*
 ```
 
-Use a prefix-stripping proxy. The browser sees `/knowledgevault/...`; the container still receives unprefixed internal routes like `/api`, `/assets`, and `/health`.
+`VITE_API_URL` is automatically derived as `/knowledgevault/api` when left empty. To set it explicitly (e.g., for a custom API gateway), add it to your config:
+
+```env
+VITE_API_URL=/knowledgevault/api
+```
+
+**Rebuild and restart** after changing build args:
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+```
+
+> **Important:** `VITE_APP_BASENAME` and `VITE_API_URL` are baked into the JavaScript bundle at Docker build time. Changing them at runtime has no effect — you must rebuild the image.
+
+##### Changing the Prefix
+
+To change from `/knowledgevault` to `/meridian` (or any path, including multi-segment like `/apps/meridian`):
+
+1. Update `.env`:
+   ```env
+   APP_ROOT_PATH=/meridian
+   VITE_APP_BASENAME=/meridian
+   ```
+2. Update your reverse proxy config to strip `/meridian` instead of `/knowledgevault`.
+3. Rebuild: `docker compose build --no-cache`
+4. Restart: `docker compose up -d`
+
+##### Reverse Proxy Configuration
+
+The reverse proxy **must strip the prefix** before forwarding to the container. The backend receives bare paths (`/api`, `/assets`, `/health`).
+
+**NGINX:**
 
 ```nginx
 location = /knowledgevault {
@@ -607,6 +650,40 @@ location /knowledgevault/ {
     proxy_read_timeout 3600;
 }
 ```
+
+**Caddy:**
+
+```caddyfile
+handle_path /knowledgevault/* {
+    reverse_proxy knowledgevault:9090
+}
+```
+
+> `handle_path` strips the prefix automatically. No additional rewrite configuration is needed.
+
+##### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Failed to load module script: MIME type "text/html"` | Docker image built without `VITE_APP_BASENAME` | Rebuild with `--build-arg VITE_APP_BASENAME=/yourprefix` |
+| 404 with "Proxy misconfiguration" message | Reverse proxy not stripping prefix | Add trailing `/` to `proxy_pass` (nginx) or use `handle_path` (Caddy) |
+| SSE/streaming appears in bursts | nginx buffering enabled | Add `proxy_buffering off;` to nginx location block |
+| Login/auth failures after prefix change | `APP_ROOT_PATH` doesn't match `VITE_APP_BASENAME` | Ensure both use the same prefix value |
+| Blank page, no console errors | `VITE_APP_BASENAME` set but image not rebuilt | Run `docker compose build --no-cache` |
+
+##### Deployment Compatibility Matrix
+
+| Frontend Build | Backend Config | Proxy | Result |
+|---------------|---------------|-------|--------|
+| Root (default) | Root | None | Works |
+| Prefixed | Prefixed (matching) | Stripping | Works |
+| Root | Prefixed | Stripping | Assets 404 — rebuild frontend |
+| Prefixed | Root | Stripping | Cookie/auth failures |
+| Prefixed | Prefixed | Non-stripping | MIME errors, 404 diagnostic |
+
+##### Multi-Instance Deployments
+
+Multiple KnowledgeVault instances can share a domain using distinct prefixes (e.g., `/team-a` and `/team-b`). Cookies are scoped to each prefix path, preventing unintentional cross-instance interference. However, path-scoped cookies are not a strong security boundary — for actual tenant isolation, use separate domains.
 
 **Option 3: VPN/Private Network**
 - Deploy behind corporate VPN
