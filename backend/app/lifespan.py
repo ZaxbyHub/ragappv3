@@ -159,6 +159,10 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "vector_top_k",
             "kms_enabled",
             "kms_compile_on_ingest",
+            "wiki_enabled",
+            "wiki_compile_on_ingest",
+            "wiki_compile_on_query",
+            "wiki_compile_after_indexing",
         ]
         for key in NEW_DIRECT_KEYS:
             if key in persisted:

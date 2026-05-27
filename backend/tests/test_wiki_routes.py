@@ -57,6 +57,7 @@ from fastapi.testclient import TestClient
 from app.api.deps import get_current_active_user, get_db, get_vector_store
 from app.config import settings
 from app.main import app
+from app.security import csrf_protect
 
 _MOCK_SUPERADMIN = {
     "id": 0,
@@ -148,11 +149,14 @@ class WikiRouteTestBase(unittest.TestCase):
         app.dependency_overrides[get_current_active_user] = lambda: _MOCK_SUPERADMIN
         app.dependency_overrides[get_db] = _get_db_override
         app.dependency_overrides[get_vector_store] = lambda: mock_vs
+        # Override CSRF protection for ordinary CRUD tests
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
 
     def tearDown(self):
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_vector_store, None)
+        app.dependency_overrides.pop(csrf_protect, None)
         self._pool.close_all()
 
         # Restore settings and clear pool cache
@@ -467,3 +471,431 @@ class TestWikiPromoteMemoryRoute(WikiRouteTestBase):
             json={"memory_id": mem_id, "vault_id": 1},
         )
         self.assertEqual(resp.status_code, 403)
+
+
+# ---------------------------------------------------------------------------
+# Test: wiki_enabled master switch
+# ---------------------------------------------------------------------------
+
+
+class TestWikiEnabledSwitch(WikiRouteTestBase):
+    """Tests for the wiki_enabled master switch (503 when disabled)."""
+
+    def setUp(self):
+        super().setUp()
+        self._original_wiki_enabled = settings.wiki_enabled
+        settings.wiki_enabled = True  # Default to True so normal tests pass
+
+    def tearDown(self):
+        settings.wiki_enabled = self._original_wiki_enabled
+        super().tearDown()
+
+    # ---- GET endpoints ----
+
+    def test_wiki_disabled_list_pages_returns_503(self):
+        """GET /api/wiki/pages returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.get("/api/wiki/pages", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_get_page_returns_503(self):
+        """GET /api/wiki/pages/{id} returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.get("/api/wiki/pages/1")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_list_entities_returns_503(self):
+        """GET /api/wiki/entities returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.get("/api/wiki/entities", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_list_claims_returns_503(self):
+        """GET /api/wiki/claims returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.get("/api/wiki/claims", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_get_lint_returns_503(self):
+        """GET /api/wiki/lint returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.get("/api/wiki/lint", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_list_jobs_returns_503(self):
+        """GET /api/wiki/jobs returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.get("/api/wiki/jobs", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_search_returns_503(self):
+        """GET /api/wiki/search returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.get("/api/wiki/search", params={"vault_id": 1, "q": "test"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_get_job_returns_503(self):
+        """GET /api/wiki/jobs/{id} returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.get("/api/wiki/jobs/1", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    # ---- POST endpoints ----
+
+    def test_wiki_disabled_create_page_returns_503(self):
+        """POST /api/wiki/pages returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.post(
+            "/api/wiki/pages",
+            json={"vault_id": 1, "title": "Test Page", "page_type": "overview"},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_create_claim_returns_503(self):
+        """POST /api/wiki/claims returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.post(
+            "/api/wiki/claims",
+            json={"vault_id": 1, "claim_text": "Test claim", "source_type": "manual"},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_run_lint_returns_503(self):
+        """POST /api/wiki/lint/run returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.post("/api/wiki/lint/run", json={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_promote_memory_returns_503(self):
+        """POST /api/wiki/promote-memory returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.post(
+            "/api/wiki/promote-memory",
+            json={"memory_id": 1, "vault_id": 1},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_retry_job_returns_503(self):
+        """POST /api/wiki/jobs/{id}/retry returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.post("/api/wiki/jobs/1/retry", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_cancel_job_returns_503(self):
+        """POST /api/wiki/jobs/{id}/cancel returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.post("/api/wiki/jobs/1/cancel", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_compile_document_returns_503(self):
+        """POST /api/wiki/documents/{id}/compile returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.post("/api/wiki/documents/1/compile", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_recompile_returns_503(self):
+        """POST /api/wiki/recompile returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.post("/api/wiki/recompile", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    # ---- PUT endpoints ----
+
+    def test_wiki_disabled_update_page_returns_503(self):
+        """PUT /api/wiki/pages/{id} returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.put(
+            "/api/wiki/pages/1",
+            json={"title": "Updated Title"},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_update_claim_returns_503(self):
+        """PUT /api/wiki/claims/{id} returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.put(
+            "/api/wiki/claims/1",
+            json={"claim_text": "Updated claim"},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    # ---- DELETE endpoints ----
+
+    def test_wiki_disabled_delete_page_returns_503(self):
+        """DELETE /api/wiki/pages/{id} returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.delete("/api/wiki/pages/1")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    def test_wiki_disabled_delete_claim_returns_503(self):
+        """DELETE /api/wiki/claims/{id} returns 503 when wiki_enabled=False."""
+        settings.wiki_enabled = False
+        response = self.client.delete("/api/wiki/claims/1")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["detail"], "Wiki subsystem is disabled")
+
+    # ---- Enabled = True: normal operation proceeds ----
+
+    def test_wiki_enabled_list_pages_succeeds(self):
+        """GET /api/wiki/pages returns 200 when wiki_enabled=True."""
+        settings.wiki_enabled = True
+        response = self.client.get("/api/wiki/pages", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 200)
+
+
+# ---------------------------------------------------------------------------
+# Test: CSRF protection on wiki mutating routes
+# ---------------------------------------------------------------------------
+
+
+class TestWikiCSRFProtection(WikiRouteTestBase):
+    """Tests for CSRF protection on wiki write endpoints.
+
+    These tests verify that write endpoints return 403 when no valid CSRF token
+    is provided. The CSRF token must be in both the cookie and the X-CSRF-Token header.
+
+    These tests set up a proper CSRF manager so that the CSRF check is actually reached,
+    allowing us to test the 403 response for missing/invalid tokens.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # IMPORTANT: Remove the csrf_protect override from base class setUp so
+        # that the real csrf_protect runs and we can test 403 behavior
+        app.dependency_overrides.pop(csrf_protect, None)
+        # Set up a mock CSRF manager on app.state so csrf_protect doesn't fail
+        # with 503 (CSRF service unavailable). We want to test 403 (CSRF token
+        # missing/mismatch), not 503.
+        class MockCSRFManager:
+            def validate_token(self, token):
+                # Always return True so we can test the token mismatch/cookie check
+                return True
+
+        app.state.csrf_manager = MockCSRFManager()
+
+    def tearDown(self):
+        # Clean up csrf_protect override and mock CSRF manager
+        app.dependency_overrides.pop(csrf_protect, None)
+        if hasattr(app.state, "csrf_manager"):
+            delattr(app.state, "csrf_manager")
+        super().tearDown()
+
+    def _create_page_with_csrf(self):
+        """Helper to create a page with CSRF override."""
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        resp = self.client.post(
+            "/api/wiki/pages",
+            json={"vault_id": 1, "title": "Test Page", "page_type": "overview"},
+        )
+        app.dependency_overrides.pop(csrf_protect, None)
+        return resp
+
+    def _create_claim_with_csrf(self):
+        """Helper to create a claim with CSRF override."""
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        resp = self.client.post(
+            "/api/wiki/claims",
+            json={"vault_id": 1, "claim_text": "Test claim", "source_type": "manual"},
+        )
+        app.dependency_overrides.pop(csrf_protect, None)
+        return resp
+
+    # ---- POST /wiki/pages ----
+
+    def test_create_page_without_csrf_returns_403(self):
+        """POST /api/wiki/pages without CSRF token returns 403."""
+        response = self.client.post(
+            "/api/wiki/pages",
+            json={"vault_id": 1, "title": "Test Page", "page_type": "overview"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- PUT /wiki/pages/{page_id} ----
+
+    def test_update_page_without_csrf_returns_403(self):
+        """PUT /api/wiki/pages/{id} without CSRF token returns 403."""
+        # First create a page with CSRF override
+        create_resp = self._create_page_with_csrf()
+        self.assertEqual(create_resp.status_code, 201)
+        page_id = create_resp.json()["id"]
+
+        # Now update without CSRF - should get 403
+        response = self.client.put(
+            f"/api/wiki/pages/{page_id}",
+            json={"title": "Updated Title"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- DELETE /wiki/pages/{page_id} ----
+
+    def test_delete_page_without_csrf_returns_403(self):
+        """DELETE /api/wiki/pages/{id} without CSRF token returns 403."""
+        # First create a page with CSRF override
+        create_resp = self._create_page_with_csrf()
+        self.assertEqual(create_resp.status_code, 201)
+        page_id = create_resp.json()["id"]
+
+        response = self.client.delete(f"/api/wiki/pages/{page_id}")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- POST /wiki/claims ----
+
+    def test_create_claim_without_csrf_returns_403(self):
+        """POST /api/wiki/claims without CSRF token returns 403."""
+        response = self.client.post(
+            "/api/wiki/claims",
+            json={
+                "vault_id": 1,
+                "claim_text": "Test claim",
+                "source_type": "manual",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- PUT /wiki/claims/{claim_id} ----
+
+    def test_update_claim_without_csrf_returns_403(self):
+        """PUT /api/wiki/claims/{id} without CSRF token returns 403."""
+        # First create a claim with CSRF override
+        create_resp = self._create_claim_with_csrf()
+        self.assertEqual(create_resp.status_code, 201)
+        claim_id = create_resp.json()["id"]
+
+        response = self.client.put(
+            f"/api/wiki/claims/{claim_id}",
+            json={"claim_text": "Updated"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- DELETE /wiki/claims/{claim_id} ----
+
+    def test_delete_claim_without_csrf_returns_403(self):
+        """DELETE /api/wiki/claims/{id} without CSRF token returns 403."""
+        # First create a claim with CSRF override
+        create_resp = self._create_claim_with_csrf()
+        self.assertEqual(create_resp.status_code, 201)
+        claim_id = create_resp.json()["id"]
+
+        response = self.client.delete(f"/api/wiki/claims/{claim_id}")
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- POST /wiki/lint/run ----
+
+    def test_run_lint_without_csrf_returns_403(self):
+        """POST /api/wiki/lint/run without CSRF token returns 403."""
+        response = self.client.post(
+            "/api/wiki/lint/run",
+            json={"vault_id": 1},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- POST /wiki/promote-memory ----
+
+    def test_promote_memory_without_csrf_returns_403(self):
+        """POST /api/wiki/promote-memory without CSRF token returns 403."""
+        mem_id = self._insert_memory("Some memory content")
+        response = self.client.post(
+            "/api/wiki/promote-memory",
+            json={"memory_id": mem_id, "vault_id": 1},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- POST /wiki/recompile ----
+
+    def test_recompile_without_csrf_returns_403(self):
+        """POST /api/wiki/recompile without CSRF token returns 403."""
+        response = self.client.post("/api/wiki/recompile", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("csrf", response.json()["detail"].lower())
+
+    # ---- GET routes should still work without CSRF ----
+
+    def test_list_pages_without_csrf_succeeds(self):
+        """GET /api/wiki/pages does NOT require CSRF and returns 200."""
+        response = self.client.get("/api/wiki/pages", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 200)
+
+    def test_get_page_without_csrf_succeeds(self):
+        """GET /api/wiki/pages/{id} does NOT require CSRF and returns 200 or 404."""
+        # Create a page first with CSRF
+        create_resp = self._create_page_with_csrf()
+        self.assertEqual(create_resp.status_code, 201)
+        page_id = create_resp.json()["id"]
+
+        # GET should work without CSRF
+        response = self.client.get(f"/api/wiki/pages/{page_id}")
+        self.assertEqual(response.status_code, 200)
+
+    def test_list_claims_without_csrf_succeeds(self):
+        """GET /api/wiki/claims does NOT require CSRF and returns 200."""
+        response = self.client.get("/api/wiki/claims", params={"vault_id": 1})
+        self.assertEqual(response.status_code, 200)
+
+    # ---- Mutating routes work correctly with valid CSRF token ----
+
+    def test_create_page_with_csrf_succeeds(self):
+        """POST /api/wiki/pages with CSRF override succeeds."""
+        response = self._create_page_with_csrf()
+        self.assertEqual(response.status_code, 201)
+
+    def test_update_page_with_csrf_succeeds(self):
+        """PUT /api/wiki/pages/{id} with CSRF override succeeds."""
+        create_resp = self._create_page_with_csrf()
+        self.assertEqual(create_resp.status_code, 201)
+        page_id = create_resp.json()["id"]
+
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        response = self.client.put(
+            f"/api/wiki/pages/{page_id}",
+            json={"title": "Updated Title"},
+        )
+        app.dependency_overrides.pop(csrf_protect, None)
+        self.assertEqual(response.status_code, 200)
+
+    def test_delete_page_with_csrf_succeeds(self):
+        """DELETE /api/wiki/pages/{id} with CSRF override succeeds."""
+        create_resp = self._create_page_with_csrf()
+        self.assertEqual(create_resp.status_code, 201)
+        page_id = create_resp.json()["id"]
+
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        response = self.client.delete(f"/api/wiki/pages/{page_id}")
+        app.dependency_overrides.pop(csrf_protect, None)
+        self.assertEqual(response.status_code, 204)
+
+    # ---- Job management routes with CSRF ----
+    # These require seeding a wiki_job directly, which needs proper DB schema.
+    # Skipping for now as they test the same CSRF pattern as other routes.
+
+    # ---- Document compile route with CSRF ----
+    # Skipping as it requires file seeding with proper schema
+
+    # ---- Lint finding resolve route with CSRF ----
+    # Skipping as it requires lint_finding seeding with proper schema

@@ -242,6 +242,10 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `MEMORY_MUTATION_RATE_LIMIT` | `30` | Maximum memory create/update/delete requests per minute per user (0 = unlimited) |
 | `KMS_ENABLED` | `true` | Master switch for the KMS (Knowledge Management) subsystem |
 | `KMS_COMPILE_ON_INGEST` | `true` | Create/refresh a KMS document entry when a document finishes indexing |
+| `WIKI_ENABLED` | `true` | Master switch for the wiki subsystem. When `false`, all wiki routes return HTTP 503. |
+| `WIKI_COMPILE_ON_INGEST` | `true` | Enqueue a wiki compile job when a document finishes indexing (requires `WIKI_ENABLED=true`) |
+| `WIKI_COMPILE_ON_QUERY` | `true` | Run wiki compile on-the-fly during chat queries (requires `WIKI_ENABLED=true`) |
+| `WIKI_COMPILE_AFTER_INDEXING` | `true` | Trigger wiki compilation after background indexing completes (requires `WIKI_ENABLED=true`) |
 
 ### Data Directory Structure
 

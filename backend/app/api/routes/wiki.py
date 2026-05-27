@@ -16,13 +16,28 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import evaluate_policy, get_current_active_user, get_db
+from app.config import settings
+from app.security import csrf_protect
 from app.services.wiki_compiler import WikiCompiler
 from app.services.wiki_events import get_wiki_event_bus
 from app.services.wiki_linter import WikiLinter
 from app.services.wiki_store import WikiStore
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+
+
+async def require_wiki_enabled() -> None:
+    """Master switch (config.wiki_enabled). When off, the entire wiki subsystem —
+    reads, writes, and job creation — is unavailable.
+
+    Returns 503 (Service Unavailable) since the subsystem is intentionally
+    turned off, not an authorization failure.
+    """
+    if not settings.wiki_enabled:
+        raise HTTPException(status_code=503, detail="Wiki subsystem is disabled")
+
+
+router = APIRouter(dependencies=[Depends(require_wiki_enabled)])
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +159,7 @@ async def create_wiki_page(
     request: WikiPageCreateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(user, request.vault_id)
     store = WikiStore(db)
@@ -185,6 +201,7 @@ async def update_wiki_page(
     request: WikiPageUpdateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     store = WikiStore(db)
     page = store.get_page(page_id, load_relations=False)
@@ -201,6 +218,7 @@ async def delete_wiki_page(
     page_id: int,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     store = WikiStore(db)
     page = store.get_page(page_id, load_relations=False)
@@ -252,6 +270,7 @@ async def create_wiki_claim(
     request: WikiClaimCreateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(user, request.vault_id)
     store = WikiStore(db)
@@ -277,6 +296,7 @@ async def update_wiki_claim(
     request: WikiClaimUpdateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     store = WikiStore(db)
     claim = store.get_claim(claim_id)
@@ -376,6 +396,7 @@ async def delete_wiki_claim(
     claim_id: int,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     store = WikiStore(db)
     claim = store.get_claim(claim_id)
@@ -408,6 +429,7 @@ async def run_wiki_lint(
     request: LintRunRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(user, request.vault_id)
     store = WikiStore(db)
@@ -425,6 +447,7 @@ async def promote_memory_to_wiki(
     request: PromoteMemoryRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(user, request.vault_id)
     store = WikiStore(db)
@@ -558,6 +581,7 @@ async def retry_wiki_job(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(user, vault_id)
     store = WikiStore(db)
@@ -576,6 +600,7 @@ async def cancel_wiki_job(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(user, vault_id)
     store = WikiStore(db)
@@ -598,6 +623,7 @@ async def compile_document_wiki(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Manually enqueue a wiki ingest job for an already-indexed document."""
     await _require_vault_write(user, vault_id)
@@ -821,6 +847,7 @@ async def resolve_lint_finding(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     await _require_vault_write(user, vault_id)
     store = WikiStore(db)
@@ -842,6 +869,7 @@ async def recompile_vault_wiki(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Enqueue a settings_reindex job to re-derive all stale claims in a vault."""
     await _require_vault_write(user, vault_id)

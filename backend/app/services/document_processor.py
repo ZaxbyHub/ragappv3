@@ -1871,15 +1871,15 @@ class DocumentProcessor:
                 # so the status route can report wiki_status="pending" during the
                 # brief window before the wiki_compile_jobs row exists.
                 set_wiki_pending(self.pool, file_id, True)
-                _WikiStore(conn).create_job(
-                    vault_id=vault_id,
-                    trigger_type="ingest",
-                    trigger_id=f"file:{file_id}",
-                    input_json={"file_id": file_id, "vault_id": vault_id},
-                )
-                # Job row now exists; the status route will derive wiki_status
-                # from it directly. Clear the flag so the row doesn't carry a
-                # permanently-stale wiki_pending=1 marker.
+                if settings.wiki_enabled and settings.wiki_compile_on_ingest:
+                    _WikiStore(conn).create_job(
+                        vault_id=vault_id,
+                        trigger_type="ingest",
+                        trigger_id=f"file:{file_id}",
+                        input_json={"file_id": file_id, "vault_id": vault_id},
+                    )
+                # Always clear the transient marker after the decision is made,
+                # regardless of whether a job row was created.
                 set_wiki_pending(self.pool, file_id, False)
             finally:
                 self.pool.release_connection(conn)
@@ -2321,14 +2321,15 @@ class DocumentProcessor:
                     )
                     conn.commit()
                 set_wiki_pending(self.pool, file_id, True)
-                _WikiStore(conn).create_job(
-                    vault_id=vault_id,
-                    trigger_type="ingest",
-                    trigger_id=f"file:{file_id}",
-                    input_json={"file_id": file_id, "vault_id": vault_id},
-                )
-                # Clear flag now that the job row exists — status route
-                # derives wiki_status from the job row directly.
+                if settings.wiki_enabled and settings.wiki_compile_on_ingest:
+                    _WikiStore(conn).create_job(
+                        vault_id=vault_id,
+                        trigger_type="ingest",
+                        trigger_id=f"file:{file_id}",
+                        input_json={"file_id": file_id, "vault_id": vault_id},
+                    )
+                # Always clear the transient marker after the decision is made,
+                # regardless of whether a job row was created.
                 set_wiki_pending(self.pool, file_id, False)
             finally:
                 self.pool.release_connection(conn)
