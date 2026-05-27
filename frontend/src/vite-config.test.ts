@@ -26,8 +26,10 @@ describe("Vite subpath configuration helpers", () => {
     expect(createApiProxyPath("")).toBe("/api");
     expect(createApiProxyPath("/knowledgevault")).toBe("/knowledgevault/api");
     expect(Object.keys(createApiProxy(""))).toEqual(["/api"]);
+    // When a prefix is set, only the prefixed proxy is created (no bare /api).
+    // This enforces dev/prod parity: bare /api requests fail in dev the same
+    // way they fail in production behind the prefix-stripping proxy.
     expect(Object.keys(createApiProxy("/knowledgevault"))).toEqual([
-      "/api",
       "/knowledgevault/api",
     ]);
   });
