@@ -247,6 +247,7 @@ function NavRow({
           : "text-muted-foreground hover:text-foreground hover:bg-muted",
       )}
       aria-current={isActive ? "page" : undefined}
+      aria-label={item.label}
       title={isExpanded ? undefined : item.label}
     >
       {typeof Icon === "function" ? (

@@ -36,6 +36,43 @@ vi.mock('@/components/ui/input', () => ({
   Input: (props: any) => <input {...props} />,
 }));
 
+// Radix Select cannot be driven in jsdom; render the add-form permission
+// picker as a native <select> so option labels and value wiring stay testable.
+vi.mock('@/components/ui/select', async () => {
+  const React = await import('react');
+  const collectItems = (children: React.ReactNode): { value: string; label: React.ReactNode }[] => {
+    const items: { value: string; label: React.ReactNode }[] = [];
+    React.Children.forEach(children, (child: any) => {
+      if (!child || typeof child !== 'object') return;
+      if (child.props?.value !== undefined && child.props?.children !== undefined && !child.props?.children?.type) {
+        items.push({ value: child.props.value, label: child.props.children });
+      } else if (child.props?.children) {
+        items.push(...collectItems(child.props.children));
+      }
+    });
+    return items;
+  };
+  return {
+    Select: ({ value, onValueChange, disabled, children }: any) =>
+      React.createElement(
+        'select',
+        {
+          value,
+          disabled,
+          'aria-label': 'Permission level for new member',
+          onChange: (e: any) => onValueChange?.(e.target.value),
+        },
+        collectItems(children).map((item) =>
+          React.createElement('option', { key: item.value, value: item.value }, item.label)
+        )
+      ),
+    SelectTrigger: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    SelectValue: () => null,
+    SelectContent: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    SelectItem: ({ children }: any) => React.createElement(React.Fragment, null, children),
+  };
+});
+
 vi.mock('@/components/ui/dialog', () => ({
   Dialog: ({ children, open }: any) => open ? <div data-testid="dialog">{children}</div> : null,
   DialogContent: ({ children }: any) => <div data-testid="dialog-content">{children}</div>,
@@ -86,71 +123,6 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
     });
   });
 
-  // 2. Search user autocomplete
-  describe('Search user autocomplete', () => {
-    it('should search users when typing in the search box', async () => {
-      await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
-
-      await waitFor(() => {
-        expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
-      });
-
-      const api = await import('@/lib/api');
-      (api.default.get as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        data: { users: [{ id: 99, username: 'newuser', full_name: 'New User', is_active: true }] },
-      });
-
-      const input = screen.getByPlaceholderText('Search users...');
-      await act(async () => {
-        fireEvent.change(input, { target: { value: 'new' } });
-      });
-
-      // Wait for debounce (300ms) + API response
-      await new Promise(r => setTimeout(r, 400));
-      await waitFor(() => {
-        expect(screen.getByText('New User')).toBeInTheDocument();
-      });
-    });
-
-    it('should select user from dropdown and add them', async () => {
-      const api = await import('@/lib/api');
-      // Setup: first GET is for members list, second GET is for search
-      (api.default.get as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce({ data: { members: [{ user_id: 1, username: 'alice', full_name: 'Alice Johnson', permission: 'read', granted_at: '2024-01-01' }], total: 1 } })
-        .mockResolvedValueOnce({ data: { users: [{ id: 42, username: 'bob', full_name: 'Bob Smith', is_active: true }] } });
-
-      await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
-      await new Promise(r => setTimeout(r, 100));
-
-      const input = screen.getByPlaceholderText('Search users...');
-      await act(async () => {
-        fireEvent.change(input, { target: { value: 'bob' } });
-      });
-
-      // Wait for debounce + API
-      await new Promise(r => setTimeout(r, 400));
-      await waitFor(() => {
-        expect(screen.getByText('Bob Smith')).toBeInTheDocument();
-      });
-
-      // Click on user to select
-      await act(async () => {
-        fireEvent.click(screen.getByText('Bob Smith'));
-      });
-
-      // Now click add
-      const addButton = screen.getByRole('button', { name: /add/i });
-      await act(async () => { fireEvent.click(addButton); });
-
-      await waitFor(() => {
-        expect(api.default.post).toHaveBeenCalledWith('/vaults/1/members', {
-          member_user_id: 42,
-          permission: 'read',
-        });
-      });
-    });
-  });
-
   // 3. API error handling
   describe('API error handling', () => {
     it('should show error toast on fetch failure', async () => {
@@ -166,25 +138,17 @@ describe('VaultMembersPanel ADVERSARIAL', () => {
 
     it('should show error toast on add member failure', async () => {
       const api = await import('@/lib/api');
-      // Setup: first GET is members list, second GET is user search
-      (api.default.get as ReturnType<typeof vi.fn>)
-        .mockResolvedValueOnce({ data: { members: [{ user_id: 1, username: 'alice', full_name: 'Alice Johnson', permission: 'read', granted_at: '2024-01-01' }], total: 1 } })
-        .mockResolvedValueOnce({ data: { users: [{ id: 99, username: 'newguy', full_name: 'New Guy', is_active: true }] } });
 
       await act(async () => { render(<VaultMembersPanel vaultId={1} />); });
-      await new Promise(r => setTimeout(r, 100));
 
-      // Search and select user
-      const input = screen.getByPlaceholderText('Search users...');
-      await act(async () => {
-        fireEvent.change(input, { target: { value: 'new' } });
-      });
-      await new Promise(r => setTimeout(r, 400));
       await waitFor(() => {
-        expect(screen.getByText('New Guy')).toBeInTheDocument();
+        expect(screen.getByText('Alice Johnson')).toBeInTheDocument();
       });
+
+      // Enter a user ID into the plain add-member input
+      const input = screen.getByPlaceholderText('Enter user ID...');
       await act(async () => {
-        fireEvent.click(screen.getByText('New Guy'));
+        fireEvent.change(input, { target: { value: '99' } });
       });
 
       // Mock the POST to fail

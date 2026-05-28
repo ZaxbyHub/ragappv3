@@ -381,6 +381,7 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-48">
                         <DropdownMenuItem
+                          aria-label={isPinned ? "Unpin session" : "Pin session"}
                           onClick={(e) => {
                             e.stopPropagation();
                             onPinToggle();
@@ -399,6 +400,7 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
                           )}
                         </DropdownMenuItem>
                         <DropdownMenuItem
+                          aria-label="Rename session"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleStartEdit();
@@ -409,6 +411,7 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
+                          aria-label="Delete session"
                           onClick={(e) => {
                             e.stopPropagation();
                             onDelete();

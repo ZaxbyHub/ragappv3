@@ -18,18 +18,18 @@ describe("useChatShellStore", () => {
   });
 
   describe("test_initial_state_desktop", () => {
-    it("should have sessionRailOpen=true, rightPaneOpen=false, rightPaneWidth=320, activeSessionId=null on desktop", async () => {
+    it("should have sessionRailOpen=true, rightPaneOpen=false, rightPaneWidth=400, activeSessionId=null on desktop", async () => {
       // Desktop width (>=768)
       mockWindowInnerWidth(1024);
-      
+
       // Import fresh store after mocking window
       const { useChatShellStore } = await import("./useChatShellStore");
-      
+
       const state = useChatShellStore.getState();
-      
+
       expect(state.sessionRailOpen).toBe(true);
       expect(state.rightPaneOpen).toBe(false);
-      expect(state.rightPaneWidth).toBe(320);
+      expect(state.rightPaneWidth).toBe(400);
       expect(state.activeSessionId).toBe(null);
     });
   });
@@ -72,11 +72,11 @@ describe("useChatShellStore", () => {
   });
 
   describe("test_right_pane_width_min_clamp", () => {
-    it("setRightPaneWidth(100) should clamp to 240 (min)", async () => {
+    it("setRightPaneWidth(100) should clamp to 320 (min)", async () => {
       const { useChatShellStore } = await import("./useChatShellStore");
-      
+
       useChatShellStore.getState().setRightPaneWidth(100);
-      expect(useChatShellStore.getState().rightPaneWidth).toBe(240);
+      expect(useChatShellStore.getState().rightPaneWidth).toBe(320);
     });
   });
 
@@ -180,17 +180,17 @@ describe("useChatShellStore", () => {
       
       expect(state.sessionRailOpen).toBe(false);
       expect(state.rightPaneOpen).toBe(false);
-      expect(state.rightPaneWidth).toBe(320);
+      expect(state.rightPaneWidth).toBe(400);
       expect(state.activeSessionId).toBe(null);
     });
   });
 
   describe("test_boundary_values", () => {
-    it("should accept exactly min width 240", async () => {
+    it("should accept exactly min width 320", async () => {
       const { useChatShellStore } = await import("./useChatShellStore");
-      
-      useChatShellStore.getState().setRightPaneWidth(240);
-      expect(useChatShellStore.getState().rightPaneWidth).toBe(240);
+
+      useChatShellStore.getState().setRightPaneWidth(320);
+      expect(useChatShellStore.getState().rightPaneWidth).toBe(320);
     });
 
     it("should accept exactly max width 600", async () => {

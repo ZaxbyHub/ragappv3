@@ -120,14 +120,14 @@ export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps
         <h3 className="text-sm font-semibold shrink-0">Compile Jobs</h3>
         <div className="flex items-center gap-2">
           <Select
-            value={statusFilter}
-            onValueChange={(v) => setStatusFilter(v)}
+            value={statusFilter || "all"}
+            onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}
           >
             <SelectTrigger className="text-xs h-8 w-[140px]">
               <SelectValue placeholder="All statuses" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="">All statuses</SelectItem>
+              <SelectItem value="all">All statuses</SelectItem>
               <SelectItem value="pending">Pending</SelectItem>
               <SelectItem value="running">Running</SelectItem>
               <SelectItem value="completed">Completed</SelectItem>
