@@ -11,7 +11,10 @@ import { Loader2 } from "lucide-react";
 import { APP_BASENAME } from "@/lib/paths";
 
 // Toggle mock-data mode via: VITE_TEST_MODE=true npm run dev
-const TEST_MODE = import.meta.env.VITE_TEST_MODE === "true";
+// Gated on import.meta.env.DEV so it is statically false (and dead-code
+// eliminated) in any production build — the demo auth bypass and mock
+// fixtures can never ship in `vite build` output regardless of VITE_TEST_MODE.
+const TEST_MODE = import.meta.env.DEV && import.meta.env.VITE_TEST_MODE === "true";
 
 // H-16 fix: Lazy-load all page components for code splitting
 const ChatShell = lazy(() => import("@/pages/ChatShell"));

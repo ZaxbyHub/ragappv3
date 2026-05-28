@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Loader2 } from "lucide-react";
@@ -24,11 +25,12 @@ export function ProtectedRoute({ children, testMode = false }: ProtectedRoutePro
   // H-10 fix: Use only the JWT auth store — legacy AuthContext OR removed
   const { isAuthenticated, isLoading, isInitialized, needsSetup } = useAuthStore();
 
-  // When testMode is enabled, auto-login with demo credentials so protected
-  // routes are accessible without a real backend. Pages already use
-  // useTestMode() to render mock data.
-  if (testMode) {
-    if (!isAuthenticated) {
+  // testMode is a development-only convenience (see App.tsx, where it is gated
+  // by import.meta.env.DEV so it can never be enabled in a production build).
+  // Seed a demo session once — in an effect, not during render — so protected
+  // routes are reachable without a backend. Pages use useTestMode() for mock data.
+  useEffect(() => {
+    if (testMode && !isAuthenticated) {
       useAuthStore.setState({
         user: getDemoUser(),
         accessToken: "demo-token",
@@ -39,6 +41,9 @@ export function ProtectedRoute({ children, testMode = false }: ProtectedRoutePro
         authMode: "jwt",
       });
     }
+  }, [testMode, isAuthenticated]);
+
+  if (testMode) {
     return <>{children}</>;
   }
 
