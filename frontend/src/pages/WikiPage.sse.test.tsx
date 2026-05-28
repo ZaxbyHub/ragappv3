@@ -36,6 +36,11 @@ vi.mock("@/components/vault/VaultSelector", () => ({
 
 vi.mock("./WikiPageList", () => ({
   WikiPageList: () => <div data-testid="wiki-list" />,
+  PAGE_TYPES: [
+    { value: "", label: "All" },
+    { value: "overview", label: "Overview" },
+    { value: "entity", label: "Entities" },
+  ],
 }));
 
 vi.mock("./WikiPageDetail", () => ({

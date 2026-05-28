@@ -39,6 +39,11 @@ vi.mock("sonner", () => ({
 // Mock child wiki page components to isolate the parent
 vi.mock("@/pages/WikiPageList", () => ({
   WikiPageList: () => <div data-testid="wiki-page-list">Page List</div>,
+  PAGE_TYPES: [
+    { value: "", label: "All" },
+    { value: "overview", label: "Overview" },
+    { value: "entity", label: "Entities" },
+  ],
 }));
 
 vi.mock("@/pages/WikiPageDetail", () => ({
