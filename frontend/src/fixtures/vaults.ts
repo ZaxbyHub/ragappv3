@@ -54,7 +54,6 @@ export const mockVaults: Vault[] = [
     memory_count: 45,
     session_count: 32,
     org_id: 1,
-    is_default: true,
   },
   {
     id: 2,

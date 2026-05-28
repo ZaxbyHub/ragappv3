@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { toast } from "sonner";
 import apiClient from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { UserPlus, UserX, Loader2, Users, Search } from "lucide-react";
+import { UserPlus, UserX, Loader2, Users } from "lucide-react";
 
 type VaultPermission = "read" | "write" | "admin";
 
@@ -53,12 +53,6 @@ export function VaultMembersPanel({ vaultId }: VaultMembersPanelProps) {
   const [removeDialogOpen, setRemoveDialogOpen] = useState(false);
   const [memberToRemove, setMemberToRemove] = useState<VaultMember | null>(null);
   const [updatingMemberId, setUpdatingMemberId] = useState<number | null>(null);
-  const [userSearchQuery, setUserSearchQuery] = useState("");
-  const [userSearchResults, setUserSearchResults] = useState<{id: number; username: string; full_name: string}[]>([]);
-  const [showUserDropdown, setShowUserDropdown] = useState(false);
-  const [searchingUsers, setSearchingUsers] = useState(false);
-  const userSearchRef = useRef<HTMLDivElement>(null);
-  const userSearchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchMembers = useCallback(async () => {
     setLoading(true);
@@ -72,53 +66,6 @@ export function VaultMembersPanel({ vaultId }: VaultMembersPanelProps) {
   }, [vaultId]);
 
   useEffect(() => { fetchMembers(); }, [fetchMembers]);
-
-  useEffect(() => {
-    function handleClickOutside(e: MouseEvent) {
-      if (userSearchRef.current && !userSearchRef.current.contains(e.target as Node)) {
-        setShowUserDropdown(false);
-      }
-    }
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (userSearchTimeoutRef.current) clearTimeout(userSearchTimeoutRef.current);
-    };
-  }, []);
-
-  const searchUsers = useCallback(async (query: string) => {
-    if (!query.trim()) {
-      setUserSearchResults([]);
-      setShowUserDropdown(false);
-      return;
-    }
-    setSearchingUsers(true);
-    try {
-      const response = await apiClient.get<{ users: {id: number; username: string; full_name: string}[] }>("/users/", { params: { q: query, limit: 10 } });
-      const users = Array.isArray(response.data) ? response.data : response.data.users ?? [];
-      setUserSearchResults(users.filter((u: any) => u.is_active !== false));
-      setShowUserDropdown(true);
-    } catch {
-      setUserSearchResults([]);
-    } finally {
-      setSearchingUsers(false);
-    }
-  }, []);
-
-  const handleUserSearchChange = (value: string) => {
-    setUserSearchQuery(value);
-    if (userSearchTimeoutRef.current) clearTimeout(userSearchTimeoutRef.current);
-    userSearchTimeoutRef.current = setTimeout(() => searchUsers(value), 300);
-  };
-
-  const selectUser = (user: {id: number; username: string; full_name: string}) => {
-    setUserSearchQuery(`${user.full_name || user.username} (${user.username})`);
-    setNewMemberUserId(String(user.id));
-    setShowUserDropdown(false);
-  };
 
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();

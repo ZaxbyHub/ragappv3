@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { toast } from "sonner";
 import apiClient from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Users, UserX, Loader2, Building2, Search } from "lucide-react";
+import { Users, UserX, Loader2, Building2 } from "lucide-react";
 
 type VaultPermission = "read" | "write" | "admin";
 
@@ -54,13 +54,6 @@ export function VaultGroupAccessPanel({ vaultId }: VaultGroupAccessPanelProps) {
   const [removeDialogOpen, setRemoveDialogOpen] = useState(false);
   const [groupToRemove, setGroupToRemove] = useState<GroupAccess | null>(null);
   const [updatingGroupId, setUpdatingGroupId] = useState<number | null>(null);
-  const [groupSearchQuery, setGroupSearchQuery] = useState("");
-  const [groupSearchResults, setGroupSearchResults] = useState<{id: number; name: string; org_name?: string}[]>([]);
-  const [showGroupDropdown, setShowGroupDropdown] = useState(false);
-  const [searchingGroups, setSearchingGroups] = useState(false);
-
-  const groupSearchRef = useRef<HTMLDivElement>(null);
-  const groupSearchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchGroupAccess = useCallback(async () => {
     setLoading(true);
@@ -78,52 +71,6 @@ export function VaultGroupAccessPanel({ vaultId }: VaultGroupAccessPanelProps) {
   }, [vaultId]);
 
   useEffect(() => { fetchGroupAccess(); }, [fetchGroupAccess]);
-
-  useEffect(() => {
-    function handleClickOutside(e: MouseEvent) {
-      if (groupSearchRef.current && !groupSearchRef.current.contains(e.target as Node)) {
-        setShowGroupDropdown(false);
-      }
-    }
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (groupSearchTimeoutRef.current) clearTimeout(groupSearchTimeoutRef.current);
-    };
-  }, []);
-
-  const searchGroups = useCallback(async (query: string) => {
-    if (!query.trim()) {
-      setGroupSearchResults([]);
-      setShowGroupDropdown(false);
-      return;
-    }
-    setSearchingGroups(true);
-    try {
-      const response = await apiClient.get<{ groups: {id: number; name: string; org_name?: string}[] }>("/groups/", { params: { q: query, limit: 10 } });
-      setGroupSearchResults(Array.isArray(response.data) ? response.data : response.data.groups ?? []);
-      setShowGroupDropdown(true);
-    } catch {
-      setGroupSearchResults([]);
-    } finally {
-      setSearchingGroups(false);
-    }
-  }, []);
-
-  const handleGroupSearchChange = (value: string) => {
-    setGroupSearchQuery(value);
-    if (groupSearchTimeoutRef.current) clearTimeout(groupSearchTimeoutRef.current);
-    groupSearchTimeoutRef.current = setTimeout(() => searchGroups(value), 300);
-  };
-
-  const selectGroup = (group: {id: number; name: string}) => {
-    setGroupSearchQuery(group.name);
-    setNewGroupId(String(group.id));
-    setShowGroupDropdown(false);
-  };
 
   const handleAddGroup = async (e: React.FormEvent) => {
     e.preventDefault();

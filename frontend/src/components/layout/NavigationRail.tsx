@@ -6,7 +6,7 @@ import {
 import { useThemeStore } from "@/stores/useThemeStore";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { cn } from "@/lib/utils";
-import { NavLink, useLocation, useNavigate } from "react-router-dom";
+import { NavLink, useLocation } from "react-router-dom";
 import type { NavItemId, NavigationProps } from "./navigationTypes";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useState, useEffect } from "react";
@@ -48,12 +48,6 @@ const sectionLabels: Record<NavSection, string> = {
   account: "Account",
 };
 
-const statusLabels: Record<string, string> = {
-  backend: "API",
-  embeddings: "Embeddings",
-  chat: "Chat",
-};
-
 function StatusIndicator({ isUp, label, loading, isExpanded }: { isUp: boolean; label: string; loading?: boolean; isExpanded?: boolean }) {
   return (
     <div className="flex items-center min-h-4 gap-2.5">
@@ -83,7 +77,6 @@ const SIDEBAR_EXPANDED_KEY = "sidebar-expanded";
 
 export function NavigationRail({ healthStatus }: NavigationRailProps) {
   const location = useLocation();
-  const navigate = useNavigate();
   const pathname = location.pathname;
   const { theme, setTheme } = useThemeStore();
   const userRole = useAuthStore((state) => state.user?.role);
@@ -118,11 +111,6 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
   const workspaceItems = visibleItems.filter((i) => i.section === "workspace");
   const adminItems = visibleItems.filter((i) => i.section === "admin");
   const accountItems = visibleItems.filter((i) => i.section === "account");
-  const handleLogout = async () => {
-    await logout();
-    navigate("/login", { replace: true });
-  };
-
   return (
     <nav
       className={cn(
