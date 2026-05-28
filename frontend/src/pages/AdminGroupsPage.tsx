@@ -27,6 +27,7 @@ import {
   type Group,
   type VaultAccessItem,
 } from "@/lib/api";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 // ============================================================================
 // Main Page Component
@@ -179,15 +180,13 @@ function AdminGroupsPageContent(): JSX.Element {
   // ============================================================================
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-300" role="main" aria-label="Groups Management">
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12" role="main" aria-label="Groups Management">
       {/* Header */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Groups</h1>
-          <p className="text-muted-foreground mt-1">
-            Manage user groups and their vault access permissions
-          </p>
-        </div>
+        <PageTitleHeader
+          title="Groups"
+          description="Manage user groups and their vault access permissions"
+        />
         <Button onClick={handleCreateClick} aria-label="Create new group">
           <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
           Create Group

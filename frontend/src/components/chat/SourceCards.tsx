@@ -39,7 +39,7 @@ function SourceCard({ source, fallbackIndex, onClick }: SourceCardProps) {
   return (
     <div
       className={cn(
-        "rounded-lg border border-border bg-card p-3 text-sm cursor-pointer",
+        "rounded-sm border border-border bg-card p-3 text-sm cursor-pointer",
         "hover:border-primary/30 hover:bg-accent/5 transition-colors duration-150",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       )}

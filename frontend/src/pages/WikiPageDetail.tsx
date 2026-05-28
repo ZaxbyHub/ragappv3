@@ -26,7 +26,7 @@ function ClaimRow({ claim }: { claim: WikiClaim }) {
   const isCurator = claim.created_by_kind === "llm_curator";
   const isNeedsReview = claim.status === "needs_review";
   const rowBg = isNeedsReview
-    ? "bg-blue-50/60 dark:bg-blue-950/20 rounded-md px-2 -mx-2"
+    ? "bg-blue-50/60 dark:bg-blue-950/20 rounded-sm -sm px-2 -mx-2"
     : "";
   return (
     <div
@@ -86,7 +86,7 @@ function ClaimRow({ claim }: { claim: WikiClaim }) {
 
 function LintFindingRow({ finding }: { finding: WikiLintFinding }) {
   return (
-    <div className={`rounded-md px-3 py-2 text-sm ${SEVERITY_COLORS[finding.severity] ?? ""}`}>
+    <div className={`rounded-sm px-3 py-2 text-sm ${SEVERITY_COLORS[finding.severity] ?? ""}`}>
       <div className="font-medium">{finding.title}</div>
       {finding.details && <div className="text-xs mt-0.5 opacity-75">{finding.details}</div>}
     </div>
@@ -113,7 +113,7 @@ export function WikiPageDetail({ page, onBack, onEdit, onDelete }: WikiPageDetai
               <Edit className="w-4 h-4 mr-1" />
               Edit
             </Button>
-            <Button variant="outline" size="sm" onClick={onDelete} className="text-destructive hover:text-destructive">
+            <Button variant="destructive" size="sm" onClick={onDelete}>
               <Trash2 className="w-4 h-4" />
             </Button>
           </div>
@@ -121,10 +121,10 @@ export function WikiPageDetail({ page, onBack, onEdit, onDelete }: WikiPageDetai
 
         {/* Meta */}
         <div className="flex gap-2 flex-wrap">
-          <Badge variant="outline" className="capitalize">{page.page_type}</Badge>
-          <Badge variant="outline">{page.status}</Badge>
+          <Badge variant="default" className="capitalize">{page.page_type}</Badge>
+          <Badge variant="default" className="capitalize">{page.status}</Badge>
           {page.confidence > 0 && (
-            <Badge variant="outline">confidence: {(page.confidence * 100).toFixed(0)}%</Badge>
+            <Badge variant="default" className="capitalize">confidence: {(page.confidence * 100).toFixed(0)}%</Badge>
           )}
         </div>
 

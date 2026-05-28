@@ -79,7 +79,7 @@ export function EmptyTranscript({
         transition={{ duration: 0.35 }}
         className="flex max-w-md flex-col items-center text-center"
       >
-        <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10 shadow-md shadow-primary/10" aria-hidden>
+        <div className="mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10 border border-border" aria-hidden>
           <Sparkles className="h-8 w-8 text-primary" />
         </div>
 

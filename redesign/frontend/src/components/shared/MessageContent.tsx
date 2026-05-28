@@ -36,7 +36,7 @@ export function MessageContent({ content, sources, isStreaming }: MessageContent
             {sources.map((source) => (
               <div
                 key={source.id}
-                className="text-xs p-2 rounded-md bg-muted/50 border border-border"
+                className="text-xs p-2 rounded bg-muted/50 border border-border"
               >
                 <div className="flex items-center justify-between">
                   <span className="font-medium">{source.filename}</span>

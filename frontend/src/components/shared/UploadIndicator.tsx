@@ -33,7 +33,7 @@ export function UploadIndicator() {
     <div className="fixed bottom-20 right-4 z-50 md:bottom-4 md:right-4 max-w-sm w-full">
       <div
         className={cn(
-          "bg-card border rounded-lg shadow-lg overflow-hidden transition-all",
+          "bg-card border rounded-sm shadow-lg overflow-hidden transition-all",
           isExpanded ? "max-h-96" : "max-h-14"
         )}
       >

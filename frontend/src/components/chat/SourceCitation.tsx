@@ -35,7 +35,7 @@ export function SourceCitation({ source, index, onClick, variant = "strip" }: So
               onClick={onClick}
               className={cn(
                 "inline-flex items-center justify-center align-middle mx-0.5 cursor-pointer select-none",
-                "min-w-[20px] h-[20px] px-1 rounded",
+                "min-w-[20px] h-[20px] px-1 rounded-sm",
                 "text-[10px] font-semibold leading-none",
                 "bg-primary/10 text-primary hover:bg-primary/20 active:scale-95",
                 "border border-primary/20 hover:border-primary/35 transition-colors duration-150",

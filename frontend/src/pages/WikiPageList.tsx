@@ -1,13 +1,11 @@
-import { useEffect, useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Search, Plus } from "lucide-react";
+import { LoadingSpinner } from "@/components/LoadingSpinner";
+import { EmptyState } from "@/components/EmptyState";
+import { FileText } from "lucide-react";
 import type { WikiPage } from "@/lib/api";
 
-const PAGE_TYPES = [
+export const PAGE_TYPES = [
   { value: "", label: "All" },
   { value: "overview", label: "Overview" },
   { value: "entity", label: "Entities" },
@@ -31,66 +29,22 @@ interface WikiPageListProps {
   pages: WikiPage[];
   loading: boolean;
   onSelect: (pageId: number) => void;
-  onFilter: (params: { page_type?: string; search?: string }) => void;
-  onCreateClick: () => void;
 }
 
-export function WikiPageList({ pages, loading, onSelect, onFilter, onCreateClick }: WikiPageListProps) {
-  const [search, setSearch] = useState("");
-  const [activeType, setActiveType] = useState("");
-
-  useEffect(() => {
-    onFilter({ page_type: activeType || undefined, search: search || undefined });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeType]);
-
-  function handleSearch() {
-    onFilter({ page_type: activeType || undefined, search: search || undefined });
-  }
-
+export function WikiPageList({ pages, loading, onSelect }: WikiPageListProps) {
   return (
-    <div className="flex flex-col gap-4 h-full">
-      {/* Search + create */}
-      <div className="flex gap-2">
-        <Input
-          placeholder="Search wiki..."
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleSearch()}
-          className="flex-1"
-        />
-        <Button variant="outline" size="icon" onClick={handleSearch} aria-label="Search">
-          <Search className="w-4 h-4" />
-        </Button>
-        <Button onClick={onCreateClick} size="sm">
-          <Plus className="w-4 h-4 mr-1" />
-          New Page
-        </Button>
-      </div>
-
-      {/* Type filter tabs */}
-      <Tabs value={activeType} onValueChange={setActiveType}>
-        <TabsList className="flex-wrap h-auto gap-1">
-          {PAGE_TYPES.map((t) => (
-            <TabsTrigger key={t.value} value={t.value} className="text-xs">
-              {t.label}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-      </Tabs>
-
-      {/* Page list */}
-      <div className="flex flex-col gap-2 overflow-y-auto flex-1">
-        {loading && (
-          <p className="text-sm text-muted-foreground text-center py-8">Loading…</p>
-        )}
+    <div className="flex flex-col gap-2 h-full overflow-y-auto">
+        {loading && <LoadingSpinner label="Loading pages…" />}
         {!loading && pages.length === 0 && (
-          <p className="text-sm text-muted-foreground text-center py-8">No pages found.</p>
+          <EmptyState
+            icon={FileText}
+            title="No pages found"
+          />
         )}
         {pages.map((page) => (
           <Card
             key={page.id}
-            className="cursor-pointer hover:bg-secondary/50 transition-colors"
+            className="cursor-pointer hover:bg-card/60 transition-colors"
             onClick={() => onSelect(page.id)}
             role="button"
             tabIndex={0}
@@ -105,17 +59,16 @@ export function WikiPageList({ pages, loading, onSelect, onFilter, onCreateClick
                     <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{page.summary}</p>
                   )}
                 </div>
-                <div className="flex flex-col items-end gap-1 shrink-0">
+                <div className="flex flex-col items-end justify-between gap-2 shrink-0">
                   <Badge variant="outline" className="text-xs capitalize">{page.page_type}</Badge>
-                  <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${STATUS_COLORS[page.status] ?? ""}`}>
-                    {page.status}
+                  <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium capitalize ${STATUS_COLORS[page.status] ?? ""}`}>
+                    {page.status.replace('_', ' ')}
                   </span>
                 </div>
               </div>
             </CardContent>
           </Card>
         ))}
-      </div>
     </div>
   );
 }

@@ -4,6 +4,8 @@ import { cn } from "@/lib/utils";
 import { getChatSession } from "@/lib/api";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useChatMessages, useChatStore, type Message } from "@/stores/useChatStore";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockChatMessages } from "@/fixtures/chat";
 import { SessionRail } from "@/components/chat/SessionRail";
 import { TranscriptPane } from "@/components/chat/TranscriptPane";
 import { RightPane } from "@/components/chat/RightPane";
@@ -38,6 +40,7 @@ function useIsMobile(breakpoint = 768) {
 }
 
 export default function ChatShell() {
+  const testMode = useTestMode();
   const { sessionId } = useParams<{ sessionId?: string }>();
   const {
     sessionRailOpen,
@@ -151,6 +154,10 @@ export default function ChatShell() {
     loadedSessionRef.current = sessionId;
     (async () => {
       try {
+        if (testMode) {
+          useChatStore.getState().loadChat(sessionId, mockChatMessages);
+          return;
+        }
         const detail = await getChatSession(parseInt(sessionId));
         const loadedMessages: Message[] = (detail.messages ?? []).map((m) => ({
           id: m.id.toString(),
@@ -169,7 +176,7 @@ export default function ChatShell() {
         console.error("Failed to load chat session:", err);
       }
     })();
-  }, [sessionId]);
+  }, [sessionId, testMode]);
 
   const handleResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -312,7 +319,7 @@ export default function ChatShell() {
       <aside
         className={cn(
           "hidden lg:flex lg:flex-col lg:flex-shrink-0 lg:border-l lg:border-border lg:bg-background lg:transition-all lg:duration-300 lg:ease-in-out",
-          rightPaneOpen ? "lg:translate-x-0 lg:opacity-100" : "lg:w-0 lg:opacity-0 lg:overflow-hidden"
+          rightPaneOpen ? "lg:translate-x-0 lg:opacity-100 blur-none" : "lg:w-0 lg:opacity-0 lg:overflow-hidden blur-sm"
         )}
         style={{ width: rightPaneOpen ? `${rightPaneWidth}px` : undefined }}
         aria-label="Details panel"
@@ -320,7 +327,7 @@ export default function ChatShell() {
         {rightPaneOpen && (
           <div className="relative left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/40 transition-colors hidden lg:block" onMouseDown={handleResizeStart} role="separator" aria-label="Resize details panel" aria-orientation="vertical" />
         )}
-        <div className="flex h-full flex-col p-4">
+        <div className="flex h-full flex-col p-4 bg-card/80 flex-shrink-0 w-full">
           <RightPane />
         </div>
       </aside>

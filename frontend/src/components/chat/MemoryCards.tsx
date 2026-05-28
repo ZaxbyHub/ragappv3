@@ -17,7 +17,7 @@ function MemoryCard({ memory }: MemoryCardProps) {
   return (
     <div
       className={cn(
-        "rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm",
+        "rounded-sm border border-amber-500/30 bg-amber-500/5 p-3 text-sm",
         "hover:border-amber-500/50 hover:bg-amber-500/10 transition-colors duration-150",
       )}
       role="article"

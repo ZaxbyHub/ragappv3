@@ -33,6 +33,8 @@ import {
   testConnections,
 } from "@/lib/api";
 import type { ConnectionTestResult, UpdateSettingsRequest } from "@/lib/api";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockSettings } from "@/fixtures/settings";
 import {
   useSettingsStore,
   type SettingsFormData,
@@ -51,6 +53,7 @@ import { OverviewTab } from "@/components/settings/OverviewTab";
 import { WikiCuratorSettings } from "@/components/settings/WikiCuratorSettings";
 import { MaintenanceSettings } from "@/components/settings/MaintenanceSettings";
 import { SaveDiscardFooter } from "@/components/settings/SaveDiscardFooter";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { ReindexConfirmDialog } from "@/components/settings/ReindexConfirmDialog";
 import { REINDEX_REQUIRED_FIELDS } from "@/stores/useSettingsStore";
 import { useVaultStore } from "@/stores/useVaultStore";
@@ -79,6 +82,7 @@ function SettingsPageContent({
   isTestingConnections: boolean;
   onTestConnections: () => Promise<void>;
 }) {
+  const testMode = useTestMode();
   const {
     settings,
     formData,
@@ -105,6 +109,11 @@ function SettingsPageContent({
   const [reindexDialogOpen, setReindexDialogOpen] = useState(false);
 
   useEffect(() => {
+    if (testMode) {
+      setSettings(mockSettings);
+      initializeForm(mockSettings);
+      return;
+    }
     let mounted = true;
     getSettings()
       .then((data) => {
@@ -121,7 +130,7 @@ function SettingsPageContent({
     return () => {
       mounted = false;
     };
-  }, [setSettings, initializeForm, setError]);
+  }, [setSettings, initializeForm, setError, testMode]);
 
   const dirtySet = dirtyFields();
   const dirtyCount = dirtySet.size;
@@ -234,7 +243,7 @@ function SettingsPageContent({
   }
 
   const tabTrigger = (value: SettingsTab, label: string) => (
-    <TabsTrigger value={value}>
+    <TabsTrigger value={value} className="text-xs">
       <span className="flex items-center gap-1">
         {label}
         {tabDots[value] > 0 && (
@@ -250,7 +259,7 @@ function SettingsPageContent({
   return (
     <>
       {reindexRequired && (
-        <div className="flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-4">
+        <div className="flex items-start gap-3 rounded-sm border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-4">
           <AlertTriangle
             className="h-5 w-5 text-amber-600 flex-shrink-0 mt-0.5"
             aria-hidden
@@ -280,7 +289,7 @@ function SettingsPageContent({
         onValueChange={(v) => setActiveTab(v as SettingsTab)}
         className="w-full"
       >
-        <TabsList className="grid w-full max-w-3xl grid-cols-6">
+        <TabsList className="flex-wrap h-auto gap-1 mb-4">
           {tabTrigger("overview", "Overview")}
           {tabTrigger("models", "Models")}
           {tabTrigger("documents", "Documents")}
@@ -401,14 +410,12 @@ function SettingsPageWithStatus({ health }: { health: HealthStatus }) {
   void ConnectionSettings;
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-300">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
-          <p className="text-muted-foreground mt-1">
-            Configure your application preferences
-          </p>
-        </div>
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <PageTitleHeader
+          title="Settings"
+          description="Configure your application preferences"
+        />
         <div className="flex flex-col items-end gap-1">
           <ConnectionStatusBadges health={health} />
           <span className="text-xs text-muted-foreground">

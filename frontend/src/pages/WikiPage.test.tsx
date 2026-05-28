@@ -38,11 +38,7 @@ vi.mock("sonner", () => ({
 
 // Mock child wiki page components to isolate the parent
 vi.mock("@/pages/WikiPageList", () => ({
-  WikiPageList: ({ onCreateClick }: { onCreateClick: () => void }) => (
-    <div data-testid="wiki-page-list">
-      <button onClick={onCreateClick} data-testid="create-page-btn">New Page</button>
-    </div>
-  ),
+  WikiPageList: () => <div data-testid="wiki-page-list">Page List</div>,
 }));
 
 vi.mock("@/pages/WikiPageDetail", () => ({
@@ -190,9 +186,9 @@ describe("WikiPage", () => {
     // Dialog not open initially
     expect(queryByTestId("wiki-edit-dialog")).toBeNull();
 
-    // Simulate clicking the create button inside WikiPageList
+    // Simulate clicking the New Page button in the toolbar
     await act(async () => {
-      screen.getByTestId("create-page-btn").click();
+      screen.getByRole("button", { name: /new page/i }).click();
     });
 
     expect(screen.getByTestId("wiki-edit-dialog")).toBeInTheDocument();

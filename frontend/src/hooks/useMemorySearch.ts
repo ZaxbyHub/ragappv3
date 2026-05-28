@@ -2,6 +2,8 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { toast } from "sonner";
 import { useDebounce } from "./useDebounce";
 import { searchMemories, listMemories, type MemoryResult } from "@/lib/api";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockMemories } from "@/fixtures/memories";
 
 export interface UseMemorySearchReturn {
   memories: MemoryResult[];
@@ -13,7 +15,8 @@ export interface UseMemorySearchReturn {
 
 /** Manages memory search with debounced queries and abort-on-unmount cleanup. */
 export function useMemorySearch(activeVaultId: number | null): UseMemorySearchReturn {
-  const [memories, setMemories] = useState<MemoryResult[]>([]);
+  const testMode = useTestMode();
+  const [memories, setMemories] = useState<MemoryResult[]>(testMode ? mockMemories : []);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery] = useDebounce(searchQuery, 300);
   const [loading, setLoading] = useState(false);
@@ -29,6 +32,17 @@ export function useMemorySearch(activeVaultId: number | null): UseMemorySearchRe
 
     setLoading(true);
     try {
+      if (testMode) {
+        if (!abortController.signal.aborted) {
+          if (debouncedSearchQuery.trim()) {
+            const q = debouncedSearchQuery.toLowerCase();
+            setMemories(mockMemories.filter((m) => m.content.toLowerCase().includes(q)));
+          } else {
+            setMemories(mockMemories);
+          }
+        }
+        return;
+      }
       if (debouncedSearchQuery.trim()) {
         // Search mode — use POST /memories/search
         const response = await searchMemories(
@@ -57,7 +71,7 @@ export function useMemorySearch(activeVaultId: number | null): UseMemorySearchRe
         setLoading(false);
       }
     }
-  }, [debouncedSearchQuery, activeVaultId]);
+  }, [debouncedSearchQuery, activeVaultId, testMode]);
 
   useEffect(() => {
     handleSearch();

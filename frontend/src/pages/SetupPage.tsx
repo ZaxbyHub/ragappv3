@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Database, Shield, User, Loader2, Eye, EyeOff } from "lucide-react";
 
@@ -100,7 +101,7 @@ export default function SetupPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+    <div className="flex min-h-screen items-center justify-center p-4">
       <Card className="w-full max-w-md">
         <CardHeader className="space-y-1">
           <div className="flex items-center justify-center mb-2">
@@ -116,7 +117,7 @@ export default function SetupPage() {
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
-              <label htmlFor="setup-username" className="text-sm font-medium">Username</label>
+              <Label htmlFor="setup-username">Username</Label>
               <div className="relative">
                 <User className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -139,7 +140,7 @@ export default function SetupPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="setup-fullname" className="text-sm font-medium">Full name</label>
+              <Label htmlFor="setup-fullname">Full name</Label>
               <div className="relative">
                 <User className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -156,7 +157,7 @@ export default function SetupPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="setup-password" className="text-sm font-medium">Password</label>
+              <Label htmlFor="setup-password">Password</Label>
               <div className="relative">
                 <Shield className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -171,14 +172,16 @@ export default function SetupPage() {
                   aria-invalid={!!errors.password}
                   className="pl-10 pr-10"
                 />
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="absolute right-0.5 top-1/2 -translate-y-1/2"
                   onClick={() => setShowPassword((v) => !v)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   aria-label={showPassword ? "Hide password" : "Show password"}
                 >
                   {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
+                </Button>
               </div>
               {errors.password && (
                 <p id="setup-password-error" className="text-sm text-destructive">{errors.password}</p>
@@ -186,7 +189,7 @@ export default function SetupPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="setup-confirm-password" className="text-sm font-medium">Confirm Password</label>
+              <Label htmlFor="setup-confirm-password">Confirm Password</Label>
               <div className="relative">
                 <Shield className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -201,14 +204,16 @@ export default function SetupPage() {
                   aria-invalid={!!errors.confirmPassword}
                   className="pl-10 pr-10"
                 />
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="absolute right-0.5 top-1/2 -translate-y-1/2"
                   onClick={() => setShowConfirmPassword((v) => !v)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   aria-label={showConfirmPassword ? "Hide password confirmation" : "Show password confirmation"}
                 >
                   {showConfirmPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
+                </Button>
               </div>
               {errors.confirmPassword && (
                 <p id="setup-confirm-password-error" className="text-sm text-destructive">{errors.confirmPassword}</p>

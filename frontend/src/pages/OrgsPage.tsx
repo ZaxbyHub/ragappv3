@@ -4,11 +4,32 @@ import { useAuthStore } from "@/stores/useAuthStore";
 import apiClient from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { RoleGuard } from "@/components/auth/RoleGuard";
 import { Building2, Plus, Trash2, Users, Vault, ChevronDown, ChevronUp, Loader2, UserPlus, UserX, Search } from "lucide-react";
+import { EmptyState } from "@/components/EmptyState";
+import { LoadingSpinner } from "@/components/LoadingSpinner";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
+import {
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 
 type OrgRole = "owner" | "admin" | "member";
 
@@ -45,9 +66,17 @@ const ROLE_OPTIONS: { value: OrgRole; label: string }[] = [
 
 const CHANGEABLE_ROLE_OPTIONS = ROLE_OPTIONS.filter((r) => r.value !== "owner");
 
+const MOCK_ORGS: Organization[] = [
+  { id: 1, name: "Acme Corporation", description: "Primary engineering organization", member_count: 12, vault_count: 4, created_at: "2023-09-01T08:00:00Z" },
+  { id: 2, name: "Beta Labs", description: "Research and development division", member_count: 8, vault_count: 2, created_at: "2023-10-15T10:30:00Z" },
+  { id: 3, name: "Gamma Solutions", description: "Client-facing support and documentation", member_count: 24, vault_count: 6, created_at: "2023-11-20T14:00:00Z" },
+  { id: 4, name: "Delta Systems", description: "Infrastructure and DevOps team", member_count: 6, vault_count: 3, created_at: "2024-01-05T09:15:00Z" },
+];
+
 function OrgsPageContent() {
-  const [orgs, setOrgs] = useState<Organization[]>([]);
-  const [loading, setLoading] = useState(true);
+  const testMode = useTestMode();
+  const [orgs, setOrgs] = useState<Organization[]>(testMode ? MOCK_ORGS : []);
+  const [loading, setLoading] = useState(!testMode);
   const [expandedOrgId, setExpandedOrgId] = useState<number | null>(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -129,6 +158,10 @@ function OrgsPageContent() {
   const isMember = currentUser?.role === "member";
 
   const fetchOrgs = useCallback(async () => {
+    if (testMode) {
+      setOrgs(MOCK_ORGS);
+      return;
+    }
     setLoading(true);
     try {
       const response = await apiClient.get<{ organizations: Organization[]; total: number }>("/organizations/");
@@ -139,9 +172,9 @@ function OrgsPageContent() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [testMode]);
 
-  useEffect(() => { fetchOrgs(); }, [fetchOrgs]);
+  useEffect(() => { if (!testMode) fetchOrgs(); }, [fetchOrgs, testMode]);
 
   const fetchOrgMembers = useCallback(async (orgId: number) => {
     try {
@@ -282,12 +315,12 @@ function OrgsPageContent() {
   const formatDate = (dateStr: string) => new Date(dateStr).toLocaleDateString();
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-300">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Organizations</h1>
-          <p className="text-muted-foreground mt-1">Manage organizations and their members</p>
-        </div>
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <PageTitleHeader
+          title="Organizations"
+          description="Manage organizations and their members"
+        />
         {!isMember && (
           <Button onClick={() => setCreateDialogOpen(true)}>
             <Plus className="w-4 h-4 mr-2" />Create Organization
@@ -296,14 +329,13 @@ function OrgsPageContent() {
       </div>
 
       {loading ? (
-        <div className="flex justify-center py-12">
-          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" role="status" aria-live="polite" />
-          <span className="sr-only">Loading organizations</span>
-        </div>
+        <LoadingSpinner label="Loading organizations…" />
       ) : orgs.length === 0 ? (
-        <div className="text-center py-12 text-muted-foreground" role="status" aria-live="polite">
-          No organizations found. Create one to get started.
-        </div>
+        <EmptyState
+          icon={Building2}
+          title="No organizations found"
+          description="Create one to get started."
+        />
       ) : (
         <div className="space-y-4">
           {orgs.map((org) => (
@@ -311,7 +343,7 @@ function OrgsPageContent() {
               <CardHeader className="pb-4">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center">
+                    <div className="w-10 h-10 rounded-sm bg-primary/10 flex items-center justify-center">
                       <Building2 className="w-5 h-5 text-primary" />
                     </div>
                     <div>
@@ -332,7 +364,7 @@ function OrgsPageContent() {
                       {expandedOrgId === org.id ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
                     </Button>
                     {!isMember && (
-                      <Button variant="ghost" size="icon" onClick={() => { setOrgToDelete(org); setDeleteDialogOpen(true); }} aria-label={`Delete organization ${org.name}`} className="text-destructive hover:text-destructive hover:bg-destructive/10">
+                      <Button variant="destructive" size="icon" onClick={() => { setOrgToDelete(org); setDeleteDialogOpen(true); }} aria-label={`Delete organization ${org.name}`}>
                         <Trash2 className="w-4 h-4" />
                       </Button>
                     )}
@@ -343,8 +375,8 @@ function OrgsPageContent() {
                 <CardContent className="border-t pt-4">
                   {!isMember && (
                   <form onSubmit={(e) => handleAddMember(e, org.id)} className="flex gap-2 items-end mb-4">
-                    <div className="flex-1 space-y-2 relative" ref={userSearchRef}>
-                      <label htmlFor={`org-member-search-${org.id}`} className="text-sm font-medium">Search User</label>
+                    <div className="flex-1 space-y-2 relative w-2/3" ref={userSearchRef}>
+                      <Label htmlFor={`org-member-search-${org.id}`}>Search User</Label>
                       <div className="relative">
                         <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
                         <Input
@@ -355,13 +387,17 @@ function OrgsPageContent() {
                           onFocus={() => { if (userSearchResults.length > 0) setShowUserDropdown(true); }}
                           disabled={addingMember && orgForMemberAction === org.id}
                           aria-label="Search for user to add as organization member"
-                          className="pl-10"
+                          className="pl-10 w-full"
                           autoComplete="off"
                         />
-                        {searchingUsers && <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 animate-spin text-muted-foreground" />}
+                        {searchingUsers && (
+                          <div className="absolute right-3 top-1/2 -translate-y-1/2">
+                            <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+                          </div>
+                        )}
                       </div>
                       {showUserDropdown && userSearchResults.length > 0 && (
-                        <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-popover border rounded-md shadow-md max-h-48 overflow-y-auto">
+                        <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-popover border rounded-sm shadow-md max-h-48 overflow-y-auto">
                           {userSearchResults.map((u) => {
                             const alreadyMember = org.members?.some((m) => m.user_id === u.id);
                             return (
@@ -383,16 +419,29 @@ function OrgsPageContent() {
                         </div>
                       )}
                       {showUserDropdown && userSearchQuery.trim() && !searchingUsers && userSearchResults.length === 0 && (
-                        <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-popover border rounded-md shadow-md px-3 py-2 text-sm text-muted-foreground">
+                        <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-popover border rounded-sm shadow-md px-3 py-2 text-sm text-muted-foreground">
                           No users found
                         </div>
                       )}
                     </div>
-                    <div className="space-y-2">
-                      <label htmlFor={`org-member-role-${org.id}`} className="text-sm font-medium">Role</label>
-                      <select id={`org-member-role-${org.id}`} value={newMemberRole} onChange={(e) => setNewMemberRole(e.target.value as OrgRole)} disabled={addingMember && orgForMemberAction === org.id} aria-label="Role for new member" className="h-10 rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring">
-                        {ROLE_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
-                      </select>
+                    <div className="space-y-2 w-1/3">
+                      <Label htmlFor={`org-member-role-${org.id}`}>Role</Label>
+                      <Select
+                        value={newMemberRole}
+                        onValueChange={(v) => setNewMemberRole(v as OrgRole)}
+                        disabled={addingMember && orgForMemberAction === org.id}
+                      >
+                        <SelectTrigger id={`org-member-role-${org.id}`} aria-label="Role for new member">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {ROLE_OPTIONS.map((opt) => (
+                            <SelectItem key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </div>
                     <Button type="submit" disabled={(addingMember && orgForMemberAction === org.id) || !selectedUser}>
                       {addingMember && orgForMemberAction === org.id ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <UserPlus className="w-4 h-4 mr-2" />}
@@ -401,61 +450,62 @@ function OrgsPageContent() {
                   </form>
                   )}
 
-                  <div className="overflow-x-auto">
-                    <table className="w-full">
-                      <caption className="sr-only">Organization Members</caption>
-                      <thead>
-                        <tr className="border-b">
-                          <th scope="col" className="text-left py-2 font-medium">User</th>
-                          <th scope="col" className="text-left py-2 font-medium">Role</th>
-                          <th scope="col" className="text-left py-2 font-medium">Joined</th>
-                          <th scope="col" className="text-right py-2 font-medium">Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {!org.members ? (
-                          <tr><td colSpan={4} className="py-8 text-center"><Loader2 className="w-6 h-6 animate-spin mx-auto text-muted-foreground" role="status" aria-live="polite" /><span className="sr-only">Loading members</span></td></tr>
-                        ) : org.members.length === 0 ? (
-                          <tr><td colSpan={4} className="py-8 text-center text-muted-foreground" role="status" aria-live="polite">No members yet.</td></tr>
-                        ) : (
-                          org.members.map((member) => (
-                            <tr key={member.user_id} className="border-b last:border-0">
-                              <td className="py-3">
-                                <div>
-                                  <div className="font-medium">{member.full_name || member.username}</div>
-                                  <div className="text-sm text-muted-foreground">@{member.username}</div>
-                                </div>
-                              </td>
-                               <td className="py-3">
-                                 {member.role === "owner" ? (
-                                   <Badge variant="default" className="text-xs">Owner</Badge>
-                                 ) : (
-                                   !isMember && (
-                                     <select value={member.role} onChange={(e) => handleRoleChange(org.id, member.user_id, e.target.value as OrgRole)} disabled={updatingMemberId === member.user_id} aria-label={`Change role for ${member.username}`} className="h-8 rounded-md border border-input bg-background px-2 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
-                                       {CHANGEABLE_ROLE_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
-                                     </select>
-                                   )
-                                 )}
-                               </td>
-                              <td className="py-3 text-muted-foreground text-sm">{formatDate(member.joined_at)}</td>
-                               <td className="py-3 text-right flex items-center justify-end gap-1">
-                                 {member.role !== "owner" && (isSuperAdmin || org.members?.some((m) => m.user_id === currentUser?.id && m.role === "owner")) && (
-                                   <Button variant="ghost" size="sm" className="text-xs h-7 px-2" onClick={() => { setTransferOrgId(org.id); setTransferTargetId(member.user_id); setTransferDialogOpen(true); }} aria-label={`Transfer ownership to ${member.username}`} title="Transfer Ownership">
-                                     Transfer
-                                   </Button>
-                                 )}
-                                 {!isMember && (
-                                   <Button variant="ghost" size="icon" onClick={() => { setMemberToRemove(member); setOrgForMemberAction(org.id); setRemoveMemberDialogOpen(true); }} aria-label={`Remove ${member.username} from organization`} className="text-destructive hover:text-destructive hover:bg-destructive/10" disabled={member.role === "owner"} title={member.role === "owner" ? "Cannot remove owner — transfer ownership first" : "Remove member"}>
-                                     <UserX className="w-4 h-4" />
-                                   </Button>
-                                 )}
-                               </td>
-                            </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
+                  <Table>
+                    <TableCaption className="sr-only">Organization Members</TableCaption>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="text-left py-2">User</TableHead>
+                        <TableHead className="text-left py-2">Role</TableHead>
+                        <TableHead className="text-left py-2">Joined</TableHead>
+                        <TableHead className="text-right py-2">Actions</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {!org.members ? (
+                        <TableRow><TableCell colSpan={4} className="py-8 text-center"><Loader2 className="w-6 h-6 animate-spin mx-auto text-muted-foreground" role="status" aria-live="polite" /><span className="sr-only">Loading members</span></TableCell></TableRow>
+                      ) : org.members.length === 0 ? (
+                        <TableRow>
+                          <TableCell colSpan={4} className="py-8">
+                            <EmptyState
+                              title="No members yet"
+                              className="py-0"
+                            />
+                          </TableCell>
+                        </TableRow>
+                      ) : (
+                        org.members.map((member) => (
+                          <TableRow key={member.user_id}>
+                            <TableCell className="py-3">
+                              <div>
+                                <div className="font-medium">{member.full_name || member.username}</div>
+                                <div className="text-sm text-muted-foreground">@{member.username}</div>
+                              </div>
+                            </TableCell>
+                            <TableCell className="py-3">
+                              {member.role === "owner" ? (
+                                <Badge variant="default" className="text-xs">Owner</Badge>
+                              ) : (
+                                <select value={member.role} onChange={(e) => handleRoleChange(org.id, member.user_id, e.target.value as OrgRole)} disabled={updatingMemberId === member.user_id} aria-label={`Change role for ${member.username}`} className="h-8 rounded-sm border border-input bg-background px-2 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+                                  {CHANGEABLE_ROLE_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
+                                </select>
+                              )}
+                            </TableCell>
+                            <TableCell className="py-3 text-muted-foreground text-sm">{formatDate(member.joined_at)}</TableCell>
+                            <TableCell className="py-3 text-right flex items-center justify-end gap-1">
+                              {member.role !== "owner" && (isSuperAdmin || org.members?.some((m) => m.user_id === currentUser?.id && m.role === "owner")) && (
+                                <Button variant="ghost" size="sm" className="text-xs h-7 px-2" onClick={() => { setTransferOrgId(org.id); setTransferTargetId(member.user_id); setTransferDialogOpen(true); }} aria-label={`Transfer ownership to ${member.username}`} title="Transfer Ownership">
+                                  Transfer
+                                </Button>
+                              )}
+                              <Button variant="destructive" size="icon" onClick={() => { setMemberToRemove(member); setOrgForMemberAction(org.id); setRemoveMemberDialogOpen(true); }} aria-label={`Remove ${member.username} from organization`} disabled={member.role === "owner"} title={member.role === "owner" ? "Cannot remove owner — transfer ownership first" : "Remove member"}>
+                                <UserX className="w-4 h-4" />
+                              </Button>
+                            </TableCell>
+                          </TableRow>
+                        ))
+                      )}
+                    </TableBody>
+                  </Table>
                 </CardContent>
               )}
             </Card>
@@ -474,11 +524,11 @@ function OrgsPageContent() {
             </DialogHeader>
             <div className="space-y-4 py-4">
               <div className="space-y-2">
-                <label htmlFor="org-name" className="text-sm font-medium">Name</label>
+                <Label htmlFor="org-name">Name</Label>
                 <Input id="org-name" placeholder="Organization name..." value={newOrgName} onChange={(e) => setNewOrgName(e.target.value)} disabled={creatingOrg} required aria-label="Organization name" />
               </div>
               <div className="space-y-2">
-                <label htmlFor="org-description" className="text-sm font-medium">Description</label>
+                <Label htmlFor="org-description">Description</Label>
                 <Input id="org-description" placeholder="Description (optional)..." value={newOrgDescription} onChange={(e) => setNewOrgDescription(e.target.value)} disabled={creatingOrg} aria-label="Organization description" />
               </div>
             </div>

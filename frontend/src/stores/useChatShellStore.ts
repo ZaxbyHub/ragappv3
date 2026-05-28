@@ -37,13 +37,13 @@ interface ChatShellState {
   setActiveRightTab: (tab: RightPaneTab) => void;
 }
 
-const DEFAULT_RIGHT_PANE_WIDTH = 320;
-const MIN_RIGHT_PANE_WIDTH = 240;
+const DEFAULT_RIGHT_PANE_WIDTH = 400;
+const MIN_RIGHT_PANE_WIDTH = 320;
 const MAX_RIGHT_PANE_WIDTH = 600;
 
-const MIN_SESSION_RAIL_WIDTH = 200;
+const MIN_SESSION_RAIL_WIDTH = 240;
 const MAX_SESSION_RAIL_WIDTH = 400;
-const DEFAULT_SESSION_RAIL_WIDTH = 260;
+const DEFAULT_SESSION_RAIL_WIDTH = 320;
 
 const isMobile = () => {
   if (typeof window === "undefined") return false;

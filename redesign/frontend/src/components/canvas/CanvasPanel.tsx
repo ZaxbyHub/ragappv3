@@ -50,7 +50,7 @@ export function CanvasPanel() {
                   key={tab.id}
                   onClick={() => setCanvasView(tab.id)}
                   className={cn(
-                    "flex items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors",
+                    "flex items-center gap-2 px-3 py-1.5 text-sm rounded transition-colors",
                     canvas.view === tab.id
                       ? "bg-accent text-accent-foreground"
                       : "text-muted-foreground hover:text-foreground"

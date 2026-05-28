@@ -25,15 +25,6 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
-  MoreHorizontal,
-  Edit,
   Trash2,
   Users,
   FolderOpen,
@@ -42,8 +33,12 @@ import {
   Search,
   ChevronUp,
   ChevronDown,
+  Pencil,
 } from "lucide-react";
+import { EmptyState } from "@/components/EmptyState";
 import { listGroups, type Group, type GroupListResponse } from "@/lib/api";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockGroups } from "@/fixtures/groups";
 
 // ============================================================================
 // Types
@@ -78,7 +73,7 @@ function SkeletonRow(): JSX.Element {
         <Skeleton className="h-4 w-24" />
       </TableCell>
       <TableCell className="text-right">
-        <Skeleton className="h-8 w-8 ml-auto rounded-md" />
+        <Skeleton className="h-8 w-8 ml-auto rounded-sm" />
       </TableCell>
     </TableRow>
   );
@@ -94,6 +89,7 @@ export function GroupTable({
   onManageMembers,
   onManageVaults,
 }: GroupTableProps): JSX.Element {
+  const testMode = useTestMode();
   const [page, setPage] = useState(1);
   const [searchInput, setSearchInput] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -112,7 +108,17 @@ export function GroupTable({
   // Fetch groups data
   const { data, isLoading, isFetching, error } = useQuery<GroupListResponse, Error>({
     queryKey: ["groups", page, debouncedSearch],
-    queryFn: () => listGroups(page, PAGE_SIZE, debouncedSearch || undefined),
+    queryFn: () => {
+      if (testMode) {
+        let filtered = mockGroups;
+        if (debouncedSearch) {
+          const q = debouncedSearch.toLowerCase();
+          filtered = mockGroups.filter((g) => g.name.toLowerCase().includes(q) || (g.description ?? "").toLowerCase().includes(q));
+        }
+        return Promise.resolve({ groups: filtered, total: filtered.length, page: 1, per_page: PAGE_SIZE });
+      }
+      return listGroups(page, PAGE_SIZE, debouncedSearch || undefined);
+    },
     placeholderData: (previousData) => previousData,
   });
 
@@ -152,45 +158,50 @@ export function GroupTable({
     },
     {
       id: "actions",
-      header: "",
+      header: "Actions",
       cell: ({ row }) => {
         const group = row.original;
         return (
-          <div className="text-right">
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-8 w-8"
-                  aria-label={`Actions for ${group.name}`}
-                >
-                  <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={() => onEdit(group)}>
-                  <Edit className="mr-2 h-4 w-4" aria-hidden="true" />
-                  Edit
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => onManageMembers(group)}>
-                  <Users className="mr-2 h-4 w-4" aria-hidden="true" />
-                  Manage Members
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => onManageVaults(group)}>
-                  <FolderOpen className="mr-2 h-4 w-4" aria-hidden="true" />
-                  Manage Vault Access
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onClick={() => onDelete(group)}
-                  className="text-destructive focus:text-destructive"
-                >
-                  <Trash2 className="mr-2 h-4 w-4" aria-hidden="true" />
-                  Delete
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+          <div className="flex items-center justify-end gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              onClick={() => onEdit(group)}
+              aria-label={`Edit group ${group.name}`}
+              title="Edit Group"
+            >
+              <Pencil className="w-4 h-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              onClick={() => onManageMembers(group)}
+              aria-label={`Manage members for ${group.name}`}
+              title="Manage Members"
+            >
+              <Users className="w-4 h-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              onClick={() => onManageVaults(group)}
+              aria-label={`Manage vault access for ${group.name}`}
+              title="Manage Vault Access"
+            >
+              <FolderOpen className="w-4 h-4" />
+            </Button>
+            <Button
+              variant="destructive"
+              size="icon"
+              className="h-8 w-8"
+              onClick={() => onDelete(group)}
+              aria-label={`Delete group ${group.name}`}
+            >
+              <Trash2 className="w-4 h-4" />
+            </Button>
           </div>
         );
       },
@@ -240,7 +251,7 @@ export function GroupTable({
       <div
         role="alert"
         aria-live="polite"
-        className="rounded-md border border-destructive/50 bg-destructive/10 p-4 text-center text-destructive"
+        className="rounded-sm border border-destructive/50 bg-destructive/10 p-4 text-center text-destructive"
       >
         Failed to load groups: {error.message}
       </div>
@@ -263,13 +274,13 @@ export function GroupTable({
           placeholder="Search groups by name..."
           value={searchInput}
           onChange={handleSearchChange}
-          className="pl-10"
+          className="pl-10 w-1/2"
           aria-label="Search groups"
         />
       </div>
 
       {/* Groups Table */}
-      <div className="rounded-md border">
+      <div className="rounded-sm border">
         <Table>
           <TableHeader>
             {table.getHeaderGroups().map((headerGroup) => (
@@ -279,7 +290,7 @@ export function GroupTable({
                     {header.isPlaceholder ? null : (
                       <button
                         type="button"
-                        className="flex items-center gap-1 font-medium hover:text-foreground"
+                        className={`flex items-center gap-1 font-medium hover:text-foreground w-full ${header.id === "actions" ? "justify-end" : ""}`}
                         onClick={header.column.getCanSort() ? header.column.getToggleSortingHandler() : undefined}
                         disabled={!header.column.getCanSort()}
                         aria-label={
@@ -326,15 +337,12 @@ export function GroupTable({
               ))
             ) : groups.length === 0 ? (
               <TableRow>
-                <TableCell
-                  colSpan={columns.length}
-                  className="h-32 text-center text-muted-foreground"
-                  role="status"
-                  aria-live="polite"
-                >
-                  {searchInput
-                    ? "No groups match your search"
-                    : "No groups found"}
+                <TableCell colSpan={columns.length} className="p-8">
+                  <EmptyState
+                    icon={Users}
+                    title={searchInput ? "No groups match your search" : "No groups found"}
+                    className="py-0"
+                  />
                 </TableCell>
               </TableRow>
             ) : (

@@ -62,7 +62,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
               key={item.id}
               onClick={() => onItemSelect(item.id)}
               className={cn(
-                "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-lg transition-all duration-200",
+                "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-sm transition-all duration-200",
                 "hover:bg-secondary focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 isActive && "bg-primary/10"
               )}
@@ -92,7 +92,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
           <SheetTrigger asChild>
             <button
               className={cn(
-                "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-lg transition-all duration-200",
+                "flex flex-col items-center gap-1 min-w-[44px] min-h-[44px] px-3 py-2 rounded-sm transition-all duration-200",
                 "hover:bg-secondary focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                 moreOpen && "bg-primary/10"
               )}
@@ -122,7 +122,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
                 <SheetTitle id="mobile-more-title" className="text-xl font-semibold">More</SheetTitle>
                 <button
                   onClick={() => setMoreOpen(false)}
-                  className="p-2 rounded-lg hover:bg-secondary focus:outline-none focus-visible:ring-2 focus-visible:ring-ring min-w-[44px] min-h-[44px]"
+                  className="p-2 rounded-sm hover:bg-secondary focus:outline-none focus-visible:ring-2 focus-visible:ring-ring min-w-[44px] min-h-[44px]"
                   aria-label="Close"
                 >
                   <X className="w-5 h-5" />

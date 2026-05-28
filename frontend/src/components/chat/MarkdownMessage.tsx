@@ -105,7 +105,7 @@ const CodeBlock = memo(function CodeBlock({ language, code }: CodeBlockProps) {
   }, [code, language]);
 
   return (
-    <div className="relative my-3 rounded-lg overflow-hidden border border-border group/code">
+    <div className="relative my-3 rounded-sm overflow-hidden border border-border group/code">
       {language && (
         <div className="flex items-center justify-between px-4 py-1.5 bg-muted border-b border-border">
           <span className="text-[11px] text-muted-foreground font-mono">{language}</span>
@@ -444,7 +444,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
       return (
         <button
           type="button"
-          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-md border border-indigo-500/40 bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 text-[10px] font-semibold tracking-wide hover:bg-indigo-500/20 hover:border-indigo-500/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-sm border border-indigo-500/40 bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 text-[10px] font-semibold tracking-wide hover:bg-indigo-500/20 hover:border-indigo-500/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           onClick={() => wiki && onWikiCitationClick?.(wiki)}
           disabled={!wiki}
           title={titleText}
@@ -502,7 +502,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
       return (
         <button
           type="button"
-          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-md border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-[10px] font-semibold tracking-wide hover:bg-amber-500/20 hover:border-amber-500/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="inline-flex items-center align-baseline px-1.5 py-0.5 mx-0.5 rounded-sm border border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-[10px] font-semibold tracking-wide hover:bg-amber-500/20 hover:border-amber-500/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           onClick={() => memory && onMemoryCitationClick?.(memory)}
           disabled={!memory}
           title={titleText}
@@ -563,7 +563,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
               className={
                 className?.startsWith("language-")
                   ? className
-                  : "bg-muted px-1 py-0.5 rounded text-[0.85em] font-mono"
+                  : "bg-muted px-1 py-0.5 rounded-sm text-[0.85em] font-mono"
               }
             >
               {children}

@@ -14,8 +14,16 @@
 import { useEffect, useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Loader2, ShieldCheck, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import { NumberInput } from "./NumberInput";
 import { testCuratorConnection } from "@/lib/api";
@@ -117,47 +125,52 @@ export function WikiCuratorSettings({
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          <label className="flex items-center gap-2 text-sm">
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-enabled"
               checked={formData.wiki_enabled}
               onCheckedChange={(v) => onChange("wiki_enabled", Boolean(v))}
             />
-            Wiki enabled
-          </label>
-          <label className="flex items-center gap-2 text-sm">
+            <Label htmlFor="wiki-enabled" className="text-sm font-normal">Wiki enabled</Label>
+          </div>
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-compile-on-ingest"
               checked={formData.wiki_compile_on_ingest}
               onCheckedChange={(v) =>
                 onChange("wiki_compile_on_ingest", Boolean(v))
               }
             />
-            Compile on document ingest
-          </label>
-          <label className="flex items-center gap-2 text-sm">
+            <Label htmlFor="wiki-compile-on-ingest" className="text-sm font-normal">Compile on document ingest</Label>
+          </div>
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-compile-on-query"
               checked={formData.wiki_compile_on_query}
               onCheckedChange={(v) =>
                 onChange("wiki_compile_on_query", Boolean(v))
               }
             />
-            Compile on chat query
-          </label>
-          <label className="flex items-center gap-2 text-sm">
+            <Label htmlFor="wiki-compile-on-query" className="text-sm font-normal">Compile on chat query</Label>
+          </div>
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-compile-after-indexing"
               checked={formData.wiki_compile_after_indexing}
               onCheckedChange={(v) =>
                 onChange("wiki_compile_after_indexing", Boolean(v))
               }
             />
-            Compile after document indexing finishes
-          </label>
-          <label className="flex items-center gap-2 text-sm">
+            <Label htmlFor="wiki-compile-after-indexing" className="text-sm font-normal">Compile after document indexing finishes</Label>
+          </div>
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-lint-enabled"
               checked={formData.wiki_lint_enabled}
               onCheckedChange={(v) => onChange("wiki_lint_enabled", Boolean(v))}
             />
-            Wiki lint enabled
-          </label>
+            <Label htmlFor="wiki-lint-enabled" className="text-sm font-normal">Wiki lint enabled</Label>
+          </div>
         </CardContent>
       </Card>
 
@@ -174,23 +187,21 @@ export function WikiCuratorSettings({
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          <label className="flex items-center gap-2 text-sm">
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-llm-curator-enabled"
               checked={formData.wiki_llm_curator_enabled}
               onCheckedChange={(v) =>
                 onChange("wiki_llm_curator_enabled", Boolean(v))
               }
             />
-            Enable LLM curator
-          </label>
+            <Label htmlFor="wiki-llm-curator-enabled" className="text-sm font-normal">Enable LLM curator</Label>
+          </div>
 
           <div className="space-y-1">
-            <label
-              htmlFor="curator-url"
-              className="text-sm font-medium block"
-            >
+            <Label htmlFor="curator-url" className="block">
               Endpoint URL
-            </label>
+            </Label>
             <Input
               id="curator-url"
               type="url"
@@ -211,17 +222,14 @@ export function WikiCuratorSettings({
             <p className="text-xs text-muted-foreground">
               OpenAI-compatible /v1/chat/completions base URL. Local
               endpoints (loopback / RFC1918) require{" "}
-              <code className="rounded bg-muted px-1">ALLOW_LOCAL_CURATOR=1</code>.
+              <code className="rounded-sm bg-muted px-1">ALLOW_LOCAL_CURATOR=1</code>.
             </p>
           </div>
 
           <div className="space-y-1">
-            <label
-              htmlFor="curator-model"
-              className="text-sm font-medium block"
-            >
+            <Label htmlFor="curator-model" className="block">
               Model name
-            </label>
+            </Label>
             <Input
               id="curator-model"
               type="text"
@@ -243,12 +251,9 @@ export function WikiCuratorSettings({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1">
-              <label
-                htmlFor="curator-temp"
-                className="text-sm font-medium block"
-              >
+              <Label htmlFor="curator-temp" className="block">
                 Temperature (0.0–1.0)
-              </label>
+              </Label>
               <NumberInput
                 id="curator-temp"
                 value={formData.wiki_llm_curator_temperature}
@@ -260,12 +265,9 @@ export function WikiCuratorSettings({
               />
             </div>
             <div className="space-y-1">
-              <label
-                htmlFor="curator-max-input"
-                className="text-sm font-medium block"
-              >
+              <Label htmlFor="curator-max-input" className="block">
                 Max input chars (1000–24000)
-              </label>
+              </Label>
               <NumberInput
                 id="curator-max-input"
                 parseAs="int"
@@ -278,12 +280,9 @@ export function WikiCuratorSettings({
               />
             </div>
             <div className="space-y-1">
-              <label
-                htmlFor="curator-max-output"
-                className="text-sm font-medium block"
-              >
+              <Label htmlFor="curator-max-output" className="block">
                 Max output tokens
-              </label>
+              </Label>
               <NumberInput
                 id="curator-max-output"
                 parseAs="int"
@@ -296,12 +295,9 @@ export function WikiCuratorSettings({
               />
             </div>
             <div className="space-y-1">
-              <label
-                htmlFor="curator-timeout"
-                className="text-sm font-medium block"
-              >
+              <Label htmlFor="curator-timeout" className="block">
                 Timeout seconds (10–600)
-              </label>
+              </Label>
               <NumberInput
                 id="curator-timeout"
                 value={formData.wiki_llm_curator_timeout_sec}
@@ -313,12 +309,9 @@ export function WikiCuratorSettings({
               />
             </div>
             <div className="space-y-1">
-              <label
-                htmlFor="curator-concurrency"
-                className="text-sm font-medium block"
-              >
+              <Label htmlFor="curator-concurrency" className="block">
                 Concurrency (1–4)
-              </label>
+              </Label>
               <NumberInput
                 id="curator-concurrency"
                 parseAs="int"
@@ -331,31 +324,30 @@ export function WikiCuratorSettings({
               />
             </div>
             <div className="space-y-1">
-              <label
-                htmlFor="curator-mode"
-                className="text-sm font-medium block"
-              >
+              <Label htmlFor="curator-mode" className="block">
                 Mode
-              </label>
-              <select
-                id="curator-mode"
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+              </Label>
+              <Select
                 value={formData.wiki_llm_curator_mode}
-                onChange={(e) =>
-                  onChange("wiki_llm_curator_mode", e.target.value)
+                onValueChange={(v) =>
+                  onChange("wiki_llm_curator_mode", v)
                 }
                 disabled={!formData.wiki_llm_curator_enabled}
               >
-                <option value="draft">draft (always needs review)</option>
-                <option value="active_if_verified">
-                  active if verified
-                </option>
-              </select>
+                <SelectTrigger id="curator-mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="draft">draft (always needs review)</SelectItem>
+                  <SelectItem value="active_if_verified">active if verified</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           </div>
 
-          <label className="flex items-center gap-2 text-sm">
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-llm-curator-require-quote-match"
               checked={formData.wiki_llm_curator_require_quote_match}
               onCheckedChange={(v) =>
                 onChange(
@@ -365,48 +357,52 @@ export function WikiCuratorSettings({
               }
               disabled={!formData.wiki_llm_curator_enabled}
             />
-            Require source-quote match
-          </label>
-          <label className="flex items-center gap-2 text-sm">
+            <Label htmlFor="wiki-llm-curator-require-quote-match" className="text-sm font-normal">Require source-quote match</Label>
+          </div>
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-llm-curator-require-chunk-id"
               checked={formData.wiki_llm_curator_require_chunk_id}
               onCheckedChange={(v) =>
                 onChange("wiki_llm_curator_require_chunk_id", Boolean(v))
               }
               disabled={!formData.wiki_llm_curator_enabled}
             />
-            Require chunk ID
-          </label>
-          <label className="flex items-center gap-2 text-sm">
+            <Label htmlFor="wiki-llm-curator-require-chunk-id" className="text-sm font-normal">Require chunk ID</Label>
+          </div>
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-llm-curator-run-on-ingest"
               checked={formData.wiki_llm_curator_run_on_ingest}
               onCheckedChange={(v) =>
                 onChange("wiki_llm_curator_run_on_ingest", Boolean(v))
               }
               disabled={!formData.wiki_llm_curator_enabled}
             />
-            Run on ingest
-          </label>
-          <label className="flex items-center gap-2 text-sm">
+            <Label htmlFor="wiki-llm-curator-run-on-ingest" className="text-sm font-normal">Run on ingest</Label>
+          </div>
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-llm-curator-run-on-query"
               checked={formData.wiki_llm_curator_run_on_query}
               onCheckedChange={(v) =>
                 onChange("wiki_llm_curator_run_on_query", Boolean(v))
               }
               disabled={!formData.wiki_llm_curator_enabled}
             />
-            Run on query (default off)
-          </label>
-          <label className="flex items-center gap-2 text-sm">
+            <Label htmlFor="wiki-llm-curator-run-on-query" className="text-sm font-normal">Run on query (default off)</Label>
+          </div>
+          <div className="flex items-center gap-2">
             <Checkbox
+              id="wiki-llm-curator-run-on-manual"
               checked={formData.wiki_llm_curator_run_on_manual}
               onCheckedChange={(v) =>
                 onChange("wiki_llm_curator_run_on_manual", Boolean(v))
               }
               disabled={!formData.wiki_llm_curator_enabled}
             />
-            Run on manual / recompile
-          </label>
+            <Label htmlFor="wiki-llm-curator-run-on-manual" className="text-sm font-normal">Run on manual / recompile</Label>
+          </div>
 
           <div className="flex items-center gap-3 pt-2 border-t">
             <Button

@@ -3,6 +3,7 @@ import { useNavigate, Navigate, Link, useLocation } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Card,
   CardContent,
@@ -11,12 +12,19 @@ import {
   CardTitle,
   CardDescription,
 } from "@/components/ui/card";
-import { KeyRound, LogIn, Loader2, Lock, User, Eye, EyeOff } from "lucide-react";
+import { Loader2 } from "lucide-react";
+import { MeridianLogo } from "@/components/icons/MeridianLogo";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { LockPasswordIcon, Login01Icon, User02Icon, ViewOffSlashIcon, ViewIcon } from "@hugeicons/core-free-icons";
+
+const TEST_MODE = import.meta.env.VITE_TEST_MODE === "true";
+const DEMO_USERNAME = import.meta.env.VITE_DEMO_USERNAME || "demo";
+const DEMO_PASSWORD = import.meta.env.VITE_DEMO_PASSWORD || "demo123";
 
 export default function LoginPage() {
   const [credentials, setCredentials] = useState({
-    username: "",
-    password: "",
+    username: TEST_MODE ? DEMO_USERNAME : "",
+    password: TEST_MODE ? DEMO_PASSWORD : "",
   });
 
   const [error, setError] = useState("");
@@ -29,9 +37,11 @@ export default function LoginPage() {
   // RT-03 fix: restore return-to URL after login
   const returnTo = (location.state as { from?: { pathname: string } })?.from?.pathname || "/";
 
-  // Initialize auth store on mount
+  // Initialize auth store on mount (skip in test mode)
   useEffect(() => {
-    useAuthStore.getState().init();
+    if (!TEST_MODE) {
+      useAuthStore.getState().init();
+    }
   }, []);
 
   // Show loading while checking setup status
@@ -40,7 +50,7 @@ export default function LoginPage() {
       <div className="flex min-h-screen items-center justify-center bg-background p-4">
         <div className="flex flex-col items-center gap-3">
           <Loader2 className="h-8 w-8 animate-spin text-primary" aria-hidden="true" />
-          <p className="text-sm text-muted-foreground">Loading KnowledgeVault…</p>
+          <p className="text-sm text-muted-foreground">Loading Meridian…</p>
         </div>
       </div>
     );
@@ -61,6 +71,34 @@ export default function LoginPage() {
     }
 
     try {
+      if (TEST_MODE) {
+        // In test mode, validate against env credentials instead of backend
+        if (
+          credentials.username === DEMO_USERNAME &&
+          credentials.password === DEMO_PASSWORD
+        ) {
+          const role = import.meta.env.VITE_DEMO_ROLE || "superadmin";
+          useAuthStore.setState({
+            user: {
+              id: 1,
+              username: DEMO_USERNAME,
+              full_name: import.meta.env.VITE_DEMO_FULL_NAME || "Demo User",
+              role: role as "superadmin" | "admin" | "member" | "viewer",
+              is_active: true,
+            },
+            accessToken: "demo-token",
+            isAuthenticated: true,
+            isInitialized: true,
+            needsSetup: false,
+            isLoading: false,
+            authMode: "jwt",
+          });
+          navigate(returnTo, { replace: true });
+          return;
+        }
+        throw new Error("Invalid demo credentials");
+      }
+
       await login(credentials.username, credentials.password);
       navigate(returnTo, { replace: true });
     } catch (err) {
@@ -75,25 +113,28 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+    <div className="flex min-h-screen items-center justify-center p-4">
       <Card className="w-full max-w-md">
         <CardHeader className="space-y-1">
           <div className="flex items-center justify-center mb-2">
-            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-primary/10">
-              <KeyRound className="h-6 w-6 text-primary" />
+            <div className="flex flex-col items-center justify-center">
+              <MeridianLogo className="size-20" />
+              <span className="text-2xl font-bold text-primary font-electrolize tracking-tighter uppercase">
+                Meridian
+              </span>
             </div>
           </div>
           <CardTitle className="text-2xl text-center">Welcome Back</CardTitle>
           <CardDescription className="text-center">
-            Enter your credentials to access KnowledgeVault
+            Enter your credentials to access
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
-              <label htmlFor="login-username" className="text-sm font-medium">Username</label>
+              <Label htmlFor="login-username">Username</Label>
               <div className="relative">
-                <User className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   id="login-username"
                   type="text"
@@ -110,9 +151,9 @@ export default function LoginPage() {
               </div>
             </div>
             <div className="space-y-2">
-              <label htmlFor="login-password" className="text-sm font-medium">Password</label>
+              <Label htmlFor="login-password">Password</Label>
               <div className="relative">
-                <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   id="login-password"
                   type={showPassword ? "text" : "password"}
@@ -125,14 +166,16 @@ export default function LoginPage() {
                   aria-invalid={!!error}
                   className="pl-10 pr-10"
                 />
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="absolute right-0.5 top-1/2 -translate-y-1/2"
                   onClick={() => setShowPassword((v) => !v)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   aria-label={showPassword ? "Hide password" : "Show password"}
                 >
-                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
+                  {showPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" />}
+                </Button>
               </div>
             </div>
 
@@ -152,7 +195,7 @@ export default function LoginPage() {
                 </>
               ) : (
                 <>
-                  <LogIn className="mr-2 h-4 w-4" />
+                  <HugeiconsIcon strokeWidth={1.2} icon={Login01Icon} className="mr-2 h-4 w-4" />
                   Sign In
                 </>
               )}

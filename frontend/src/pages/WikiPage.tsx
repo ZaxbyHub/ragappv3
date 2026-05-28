@@ -9,7 +9,12 @@ import { WikiJobsPanel } from "./WikiJobsPanel";
 import { useWikiData } from "@/hooks/useWikiData";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { AlertCircle, Layers } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { AlertCircle, Layers, Search, Plus } from "lucide-react";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
+import { PAGE_TYPES } from "./WikiPageList";
+import { EmptyState } from "@/components/EmptyState";
 import { API_BASE_URL } from "@/lib/api";
 
 export function wikiEventsUrl(vaultId: number | string): string {
@@ -22,6 +27,8 @@ export default function WikiPage() {
   const [editingPage, setEditingPage] = useState<import("@/lib/api").WikiPage | null>(null);
   const [lintPanelOpen, setLintPanelOpen] = useState(false);
   const [jobsPanelOpen, setJobsPanelOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [activeType, setActiveType] = useState("");
   const [jobsRefreshSignal, setJobsRefreshSignal] = useState(0);
   const eventSourceRef = useRef<EventSource | null>(null);
 
@@ -48,6 +55,13 @@ export default function WikiPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeVaultId]);
+
+  useEffect(() => {
+    if (activeVaultId) {
+      fetchPages({ page_type: activeType || undefined, search: search || undefined });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeType]);
 
   // Subscribe to wiki compile job completion events for the active vault.
   // On any terminal job event, refetch pages, lint findings, and bump the
@@ -127,17 +141,15 @@ export default function WikiPage() {
   }
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between px-6 py-4 border-b border-border shrink-0">
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between shrink-0">
         <div className="flex items-center gap-3">
-          <h1 className="text-xl font-semibold">Wiki</h1>
-          <VaultSelector />
+          <PageTitleHeader title="Wiki" description="Knowledge base pages" />
         </div>
         <div className="flex items-center gap-2">
+          <VaultSelector />
           <Button
             variant="outline"
-            size="sm"
             onClick={() => { setJobsPanelOpen((v) => !v); setLintPanelOpen(false); }}
           >
             <Layers className="w-4 h-4 mr-1" />
@@ -145,32 +157,74 @@ export default function WikiPage() {
           </Button>
           <Button
             variant="outline"
-            size="sm"
             onClick={() => { setLintPanelOpen((v) => !v); setJobsPanelOpen(false); }}
           >
             <AlertCircle className="w-4 h-4 mr-1" />
             Lint {lintFindings.length > 0 && `(${lintFindings.length})`}
           </Button>
+          <Button onClick={handleCreateClick}>
+            <Plus className="size-4 mr-1" />
+            New Page
+          </Button>
         </div>
       </div>
+
+      {/* Toolbar */}
+      {activeVaultId && (
+        <div className="flex flex-col gap-4">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 w-1/2 relative">
+              <Search
+                className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+                aria-hidden="true"
+              />
+              <Input
+                placeholder="Search wiki..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && fetchPages({ page_type: activeType || undefined, search: search || undefined })}
+                className="w-full pl-10"
+              />
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => fetchPages({ page_type: activeType || undefined, search: search || undefined })}
+                aria-label="Search"
+              >
+                <Search className="size-4" />
+              </Button>
+            </div>
+          </div>
+          <Tabs value={activeType} onValueChange={setActiveType}>
+            <TabsList className="flex-wrap h-auto gap-1">
+              {PAGE_TYPES.map((t) => (
+                <TabsTrigger key={t.value} value={t.value} className="text-xs">
+                  {t.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+        </div>
+      )}
 
       {/* Main content */}
       <div className="flex flex-1 overflow-hidden">
         {/* Left panel: list */}
         <div
-          className={`border-r border-border p-4 flex flex-col overflow-hidden ${
-            selectedPage ? "hidden md:flex md:w-80 lg:w-96 shrink-0" : "flex-1"
+          className={`flex flex-col overflow-hidden ${
+            selectedPage ? "border-r border-border hidden md:flex md:w-80 lg:w-96 shrink-0 pr-4" : "flex-1"
           }`}
         >
           {!activeVaultId ? (
-            <p className="text-sm text-muted-foreground text-center py-8">Select a vault to view its wiki.</p>
+            <EmptyState
+              title="Select a vault"
+              description="Choose a vault to view its wiki pages."
+            />
           ) : (
             <WikiPageList
               pages={pages}
               loading={loading}
               onSelect={openPage}
-              onFilter={(params) => fetchPages(params)}
-              onCreateClick={handleCreateClick}
             />
           )}
           {error && (
@@ -180,7 +234,7 @@ export default function WikiPage() {
 
         {/* Right panel: detail */}
         {selectedPage && (
-          <div className="flex-1 p-4 overflow-hidden">
+          <div className="flex-1 px-4 overflow-hidden">
             <WikiPageDetail
               page={selectedPage}
               onBack={closePage}

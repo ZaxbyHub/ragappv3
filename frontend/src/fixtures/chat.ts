@@ -1,0 +1,220 @@
+import type { ChatSession, ChatSessionMessage, Source, UsedMemory, WikiReference } from "@/lib/api";
+import type { Message } from "@/stores/useChatStore";
+
+export const mockSources: Source[] = [
+  {
+    id: "src-1",
+    file_id: "doc-001",
+    filename: "Project_Requirements_2024.pdf",
+    section: "Section 2.3",
+    snippet: "The system shall support real-time collaboration for up to 500 concurrent users.",
+    score: 0.94,
+  },
+  {
+    id: "src-2",
+    file_id: "doc-003",
+    filename: "API_Specification_v2.md",
+    section: "Authentication",
+    snippet: "All endpoints require a Bearer token in the Authorization header.",
+    score: 0.91,
+  },
+  {
+    id: "src-3",
+    file_id: "doc-007",
+    filename: "Database_Schema.sql",
+    section: "users table",
+    snippet: "CREATE TABLE users (id SERIAL PRIMARY KEY, username VARCHAR(255) UNIQUE NOT NULL)",
+    score: 0.88,
+  },
+];
+
+export const mockUsedMemories: UsedMemory[] = [
+  {
+    id: "mem-1",
+    memory_label: "M1",
+    content: "User prefers concise answers with bullet points for technical questions.",
+    category: "preference",
+    score: 0.95,
+  },
+  {
+    id: "mem-2",
+    memory_label: "M2",
+    content: "The production API base URL is https://api.example.com/v2.",
+    category: "fact",
+    score: 0.92,
+  },
+];
+
+export const mockWikiReferences: WikiReference[] = [
+  {
+    wiki_label: "W1",
+    page_id: 1,
+    claim_id: 1,
+    title: "Project Overview",
+    slug: "project-overview",
+    page_type: "overview",
+    claim_text: "The platform supports semantic search over indexed documents.",
+    excerpt: "The platform provides document indexing and semantic search capabilities.",
+    confidence: 0.96,
+    status: "verified",
+    page_status: "verified",
+    claim_status: "verified",
+    score: 0.96,
+    score_type: "distance",
+    source_count: 2,
+    provenance_summary: "Derived from 2 document sources",
+  },
+  {
+    wiki_label: "W2",
+    page_id: 5,
+    claim_id: 2,
+    title: "Security Policies",
+    slug: "security-policies",
+    page_type: "procedure",
+    claim_text: "API authentication requires valid JWT tokens.",
+    excerpt: "All API requests must include a valid JWT token.",
+    confidence: 0.99,
+    status: "verified",
+    page_status: "verified",
+    claim_status: "verified",
+    score: 0.99,
+    score_type: "distance",
+    source_count: 1,
+    provenance_summary: "Derived from security policy document",
+  },
+];
+
+export const mockChatSessions: ChatSession[] = [
+  {
+    id: 1,
+    vault_id: 1,
+    title: "API Integration Questions",
+    created_at: "2024-05-01T10:00:00Z",
+    updated_at: "2024-05-01T10:45:00Z",
+    message_count: 6,
+    forked_from_session_id: null,
+    fork_message_index: null,
+  },
+  {
+    id: 2,
+    vault_id: 1,
+    title: "Database Schema Review",
+    created_at: "2024-05-02T14:30:00Z",
+    updated_at: "2024-05-02T15:10:00Z",
+    message_count: 12,
+    forked_from_session_id: null,
+    fork_message_index: null,
+  },
+  {
+    id: 3,
+    vault_id: 1,
+    title: "Security Best Practices",
+    created_at: "2024-05-03T09:15:00Z",
+    updated_at: "2024-05-03T09:40:00Z",
+    message_count: 4,
+    forked_from_session_id: 2,
+    fork_message_index: 5,
+  },
+  {
+    id: 4,
+    vault_id: 2,
+    title: "Q1 Report Analysis",
+    created_at: "2024-05-04T11:00:00Z",
+    updated_at: "2024-05-04T12:30:00Z",
+    message_count: 8,
+    forked_from_session_id: null,
+    fork_message_index: null,
+  },
+  {
+    id: 5,
+    vault_id: 1,
+    title: "New Feature Brainstorm",
+    created_at: "2024-05-05T16:00:00Z",
+    updated_at: "2024-05-05T16:45:00Z",
+    message_count: 15,
+    forked_from_session_id: null,
+    fork_message_index: null,
+  },
+  {
+    id: 6,
+    vault_id: 1,
+    title: "Deployment Troubleshooting",
+    created_at: "2024-05-06T08:30:00Z",
+    updated_at: "2024-05-06T09:00:00Z",
+    message_count: 3,
+    forked_from_session_id: null,
+    fork_message_index: null,
+  },
+  {
+    id: 7,
+    vault_id: 1,
+    title: "Unnamed chat",
+    created_at: "2024-05-07T13:00:00Z",
+    updated_at: "2024-05-07T13:05:00Z",
+    message_count: 1,
+    forked_from_session_id: null,
+    fork_message_index: null,
+  },
+];
+
+export const mockChatMessages: Message[] = [
+  {
+    id: "msg-1",
+    role: "user",
+    content: "How do I authenticate with the API?",
+    created_at: "2024-05-01T10:00:00Z",
+  },
+  {
+    id: "msg-2",
+    role: "assistant",
+    content:
+      "You can authenticate with the API by including a Bearer token in the `Authorization` header of every request.\n\n**Example:**\n```\nAuthorization: Bearer <your-jwt-token>\n```\n\nThe token can be obtained from the `/auth/login` endpoint. Tokens expire after 24 hours and can be refreshed using the `/auth/refresh` endpoint.",
+    sources: [mockSources[1]],
+    memoriesUsed: [],
+    wikiRefs: [mockWikiReferences[1]],
+    created_at: "2024-05-01T10:01:00Z",
+  },
+  {
+    id: "msg-3",
+    role: "user",
+    content: "What are the rate limits?",
+    created_at: "2024-05-01T10:05:00Z",
+  },
+  {
+    id: "msg-4",
+    role: "assistant",
+    content:
+      "The API enforces the following rate limits:\n\n- **Standard tier:** 100 requests per minute\n- **Premium tier:** 1,000 requests per minute\n- **Burst allowance:** 10 requests per second\n\nIf you exceed these limits, you'll receive a `429 Too Many Requests` response with a `Retry-After` header indicating when you can resume.",
+    sources: [],
+    memoriesUsed: [mockUsedMemories[0]],
+    wikiRefs: [],
+    created_at: "2024-05-01T10:06:00Z",
+  },
+  {
+    id: "msg-5",
+    role: "user",
+    content: "Can you summarize the project requirements document?",
+    created_at: "2024-05-01T10:10:00Z",
+  },
+  {
+    id: "msg-6",
+    role: "assistant",
+    content:
+      "Based on the **Project Requirements 2024** document, here are the key points:\n\n1. **Real-time Collaboration:** Support for 500+ concurrent users with sub-100ms latency.\n2. **Document Ingestion:** Automatic parsing of PDF, DOCX, and Markdown files.\n3. **Semantic Search:** Vector-based retrieval with hybrid search (keyword + semantic).\n4. **Security:** End-to-end encryption, RBAC, and audit logging.\n5. **Scalability:** Horizontal scaling via containerized microservices.",
+    sources: [mockSources[0]],
+    memoriesUsed: [mockUsedMemories[1]],
+    wikiRefs: [mockWikiReferences[0]],
+    created_at: "2024-05-01T10:12:00Z",
+  },
+];
+
+export const mockChatSessionMessages: ChatSessionMessage[] = mockChatMessages.map((m) => ({
+  id: parseInt(m.id.replace("msg-", ""), 10),
+  role: m.role,
+  content: m.content,
+  sources: m.sources ?? null,
+  memories: m.memoriesUsed ?? null,
+  wiki_refs: m.wikiRefs ?? null,
+  created_at: m.created_at ?? new Date().toISOString(),
+  feedback: m.id === "msg-2" ? "up" : m.id === "msg-4" ? "down" : null,
+}));

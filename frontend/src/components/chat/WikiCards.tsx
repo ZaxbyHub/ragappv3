@@ -24,7 +24,7 @@ function WikiCard({ wikiRef }: WikiCardProps) {
   return (
     <div
       className={cn(
-        "rounded-lg border border-indigo-500/30 bg-indigo-500/5 p-3 text-sm",
+        "rounded-sm border border-indigo-500/30 bg-indigo-500/5 p-3 text-sm",
         "hover:border-indigo-500/50 hover:bg-indigo-500/10 transition-colors duration-150",
       )}
       role="article"
