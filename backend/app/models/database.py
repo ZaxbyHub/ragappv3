@@ -387,6 +387,7 @@ CREATE TABLE IF NOT EXISTS wiki_claims (
     vault_id INTEGER NOT NULL,
     page_id INTEGER REFERENCES wiki_pages(id) ON DELETE SET NULL,
     claim_text TEXT NOT NULL,
+    normalized_text TEXT,
     claim_type TEXT NOT NULL DEFAULT 'fact',
     subject TEXT,
     predicate TEXT,
@@ -526,6 +527,7 @@ CREATE INDEX IF NOT EXISTS idx_wiki_pages_vault_type_status ON wiki_pages(vault_
 CREATE INDEX IF NOT EXISTS idx_wiki_pages_vault_slug ON wiki_pages(vault_id, slug);
 CREATE INDEX IF NOT EXISTS idx_wiki_entities_vault_name ON wiki_entities(vault_id, canonical_name);
 CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_page_status ON wiki_claims(vault_id, page_id, status);
+CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_normalized ON wiki_claims(vault_id, normalized_text);
 CREATE INDEX IF NOT EXISTS idx_wiki_claim_sources_claim_id ON wiki_claim_sources(claim_id);
 CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_vault_status ON wiki_compile_jobs(vault_id, status);
 CREATE INDEX IF NOT EXISTS idx_wiki_lint_findings_vault_status_severity ON wiki_lint_findings(vault_id, status, severity);
@@ -847,6 +849,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_relations_unique(sqlite_path)
     migrate_add_wiki_page_hierarchy_and_versioning(sqlite_path)
     migrate_add_wiki_supporting_tables(sqlite_path)
+    migrate_add_wiki_claims_normalized_text(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -2425,6 +2428,36 @@ def migrate_add_wiki_supporting_tables(sqlite_path: str) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_wiki_activity_log_vault ON wiki_activity_log(vault_id, created_at DESC);
         """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_wiki_claims_normalized_text(sqlite_path: str) -> None:
+    """Migration: add normalized_text column + index to wiki_claims and backfill
+    existing rows. Idempotent. Mirrors normalize_claim_text in wiki_store."""
+    import re
+
+    def _normalize(text: str) -> str:
+        normalized = re.sub(r"[^\w\s]", "", (text or "").lower().strip())
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(wiki_claims)").fetchall()]
+        if "normalized_text" not in cols:
+            conn.execute("ALTER TABLE wiki_claims ADD COLUMN normalized_text TEXT")
+            # Backfill existing rows (SQLite has no regex, so normalize in Python).
+            rows = conn.execute("SELECT id, claim_text FROM wiki_claims").fetchall()
+            for claim_id, claim_text in rows:
+                conn.execute(
+                    "UPDATE wiki_claims SET normalized_text = ? WHERE id = ?",
+                    (_normalize(claim_text), claim_id),
+                )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_normalized "
+            "ON wiki_claims(vault_id, normalized_text)"
+        )
         conn.commit()
     finally:
         conn.close()

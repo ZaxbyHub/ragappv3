@@ -201,6 +201,16 @@ def normalize_slug(text: str) -> str:
     return text
 
 
+def normalize_claim_text(text: str) -> str:
+    """Normalize claim text for fuzzy dedup: lowercase, strip punctuation,
+    collapse whitespace. Stored in the indexed ``wiki_claims.normalized_text``
+    column so near-duplicate claims can be found with a bounded indexed lookup
+    instead of a full-table scan (DD-C011)."""
+    normalized = re.sub(r"[^\w\s]", "", (text or "").lower().strip())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
 def _row_to_dict(row: sqlite3.Row) -> dict:
     return dict(row)
 
@@ -491,6 +501,7 @@ class WikiStore:
         vault_id: int,
         expected_version: Optional[int] = None,
         edited_by: Optional[int] = None,
+        commit: bool = True,
         **kwargs: Any,
     ) -> Optional[WikiPage]:
         allowed = {"title", "page_type", "markdown", "summary", "status", "confidence", "slug", "last_compiled_at", "parent_id"}
@@ -498,49 +509,57 @@ class WikiStore:
         if not updates:
             return self.get_page(page_id)
 
-        # DD-C020: optimistic locking
-        if expected_version is not None:
-            row = self._db.execute(
-                "SELECT version FROM wiki_pages WHERE id = ? AND vault_id = ?",
-                (page_id, vault_id),
-            ).fetchone()
-            if not row:
-                return None
-            current_version = dict(row)["version"]
-            if current_version != expected_version:
-                raise ValueError(
-                    f"Version conflict: expected {expected_version}, got {current_version}"
-                )
+        # DD-C020: optimistic locking. Read current version once and reuse it for
+        # both the conflict check and the bump so there is a single read point.
+        row = self._db.execute(
+            "SELECT version FROM wiki_pages WHERE id = ? AND vault_id = ?",
+            (page_id, vault_id),
+        ).fetchone()
+        if not row:
+            return None
+        current_version = dict(row)["version"]
+        if expected_version is not None and current_version != expected_version:
+            raise ValueError(
+                f"Version conflict: expected {expected_version}, got {current_version}"
+            )
 
         # DD-C003: snapshot current state before updating
-        self.save_version(page_id, vault_id, edited_by=edited_by)
+        self.save_version(page_id, vault_id, edited_by=edited_by, commit=False)
 
         if "title" in updates and "slug" not in updates:
             updates["slug"] = normalize_slug(updates["title"])
         if "slug" in updates:
             updates["slug"] = normalize_slug(updates["slug"])
         updates["updated_at"] = datetime.utcnow().isoformat()
-        updates["version"] = self._db.execute(
-            "SELECT version FROM wiki_pages WHERE id = ? AND vault_id = ?",
-            (page_id, vault_id),
-        ).fetchone()[0] + 1
+        updates["version"] = current_version + 1
         set_clause = ", ".join(f"{k} = ?" for k in updates)
-        values = list(updates.values()) + [page_id, vault_id]
-        self._db.execute(
-            f"UPDATE wiki_pages SET {set_clause} WHERE id = ? AND vault_id = ?", values
+        # F-005: pin the UPDATE to the version we read so a concurrent writer that
+        # already bumped the row cannot be silently clobbered (TOCTOU). The
+        # rowcount check turns a lost update into an explicit conflict.
+        values = list(updates.values()) + [page_id, vault_id, current_version]
+        cur = self._db.execute(
+            f"UPDATE wiki_pages SET {set_clause} WHERE id = ? AND vault_id = ? AND version = ?",
+            values,
         )
-        self._db.commit()
-        self.log_activity(vault_id, "page_updated", "page", page_id, user_id=edited_by)
+        if cur.rowcount == 0:
+            self._db.rollback()
+            raise ValueError(
+                f"Version conflict: page {page_id} was modified concurrently"
+            )
+        self.log_activity(vault_id, "page_updated", "page", page_id, user_id=edited_by, commit=False)
+        if commit:
+            self._db.commit()
         return self.get_page(page_id)
 
-    def delete_page(self, page_id: int, vault_id: int) -> bool:
+    def delete_page(self, page_id: int, vault_id: int, commit: bool = True) -> bool:
         cur = self._db.execute(
             "DELETE FROM wiki_pages WHERE id = ? AND vault_id = ?", (page_id, vault_id)
         )
-        self._db.commit()
         deleted = cur.rowcount > 0
         if deleted:
-            self.log_activity(vault_id, "page_deleted", "page", page_id)
+            self.log_activity(vault_id, "page_deleted", "page", page_id, commit=False)
+        if commit:
+            self._db.commit()
         return deleted
 
     def _fts_page_ids(self, vault_id: int, query: str) -> list[int]:
@@ -611,25 +630,36 @@ class WikiStore:
         vault_id: int,
         search: Optional[str] = None,
         page_id: Optional[int] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
     ) -> list[WikiEntity]:
+        # F-012: bound result sets so a large vault cannot return an unbounded list.
+        page_clause = ""
+        page_params: list[Any] = []
+        if limit is not None:
+            page_clause = " LIMIT ? OFFSET ?"
+            page_params = [limit, offset]
         if search:
             ids = self._fts_entity_ids(vault_id, search)
             if not ids:
                 return []
             placeholders = ",".join("?" * len(ids))
             rows = self._db.execute(
-                f"SELECT * FROM wiki_entities WHERE id IN ({placeholders}) AND vault_id = ?",
-                [*ids, vault_id],
+                f"SELECT * FROM wiki_entities WHERE id IN ({placeholders}) AND vault_id = ?"
+                f" ORDER BY canonical_name{page_clause}",
+                [*ids, vault_id, *page_params],
             ).fetchall()
         elif page_id is not None:
             rows = self._db.execute(
-                "SELECT * FROM wiki_entities WHERE vault_id = ? AND page_id = ? ORDER BY canonical_name",
-                (vault_id, page_id),
+                f"SELECT * FROM wiki_entities WHERE vault_id = ? AND page_id = ?"
+                f" ORDER BY canonical_name{page_clause}",
+                [vault_id, page_id, *page_params],
             ).fetchall()
         else:
             rows = self._db.execute(
-                "SELECT * FROM wiki_entities WHERE vault_id = ? ORDER BY canonical_name",
-                (vault_id,),
+                f"SELECT * FROM wiki_entities WHERE vault_id = ?"
+                f" ORDER BY canonical_name{page_clause}",
+                [vault_id, *page_params],
             ).fetchall()
         return [_to_wiki_entity(r) for r in rows]
 
@@ -662,11 +692,12 @@ class WikiStore:
         now = datetime.utcnow().isoformat()
         cur = self._db.execute(
             """INSERT INTO wiki_claims
-               (vault_id, page_id, claim_text, claim_type, subject, predicate, object,
+               (vault_id, page_id, claim_text, normalized_text, claim_type, subject, predicate, object,
                 source_type, status, confidence, created_by, created_by_kind,
                 created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (vault_id, page_id, claim_text, claim_type, subject, predicate, object,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (vault_id, page_id, claim_text, normalize_claim_text(claim_text), claim_type,
+             subject, predicate, object,
              source_type, status, confidence, created_by, created_by_kind, now, now),
         )
         claim_id = cur.lastrowid
@@ -691,6 +722,8 @@ class WikiStore:
         entity: Optional[str] = None,
         search: Optional[str] = None,
         status: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
     ) -> list[WikiClaim]:
         if search:
             ids = self._fts_claim_ids(vault_id, search)
@@ -712,10 +745,17 @@ class WikiStore:
             sql += " AND status = ?"
             params.append(status)
         sql += " ORDER BY created_at DESC"
+        # F-012: bound result sets so a large vault cannot return an unbounded list.
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params += [limit, offset]
         rows = self._db.execute(sql, params).fetchall()
         claims = [_to_wiki_claim(r) for r in rows]
+        # F-008: batch-load every claim's sources in a single query instead of
+        # firing one SELECT per claim (N+1).
+        sources_by_claim = self._load_sources_for([c.id for c in claims])
         for claim in claims:
-            claim.sources = self._load_sources(claim.id)
+            claim.sources = sources_by_claim.get(claim.id, [])
         return claims
 
     def find_claim_by_text(self, vault_id: int, claim_text: str) -> Optional[WikiClaim]:
@@ -735,6 +775,8 @@ class WikiStore:
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return self.get_claim(claim_id)
+        if "claim_text" in updates:
+            updates["normalized_text"] = normalize_claim_text(updates["claim_text"])
         updates["updated_at"] = datetime.utcnow().isoformat()
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [claim_id, vault_id]
@@ -802,6 +844,21 @@ class WikiStore:
             "SELECT * FROM wiki_claim_sources WHERE claim_id = ? ORDER BY id", (claim_id,)
         ).fetchall()
         return [_to_claim_source(r) for r in rows]
+
+    def _load_sources_for(self, claim_ids: list[int]) -> dict[int, list[WikiClaimSource]]:
+        """Batch-load sources for many claims in one query (avoids N+1)."""
+        if not claim_ids:
+            return {}
+        placeholders = ",".join("?" * len(claim_ids))
+        rows = self._db.execute(
+            f"SELECT * FROM wiki_claim_sources WHERE claim_id IN ({placeholders}) ORDER BY claim_id, id",
+            claim_ids,
+        ).fetchall()
+        grouped: dict[int, list[WikiClaimSource]] = {}
+        for r in rows:
+            src = _to_claim_source(r)
+            grouped.setdefault(src.claim_id, []).append(src)
+        return grouped
 
     def _fts_claim_ids(self, vault_id: int, query: str) -> list[int]:
         rows = self._db.execute(
@@ -886,17 +943,33 @@ class WikiStore:
         row = self._db.execute("SELECT * FROM wiki_compile_jobs WHERE id = ?", (cur.lastrowid,)).fetchone()
         return _to_compile_job(row)
 
-    def list_jobs(self, vault_id: int, status: Optional[str] = None) -> list[WikiCompileJob]:
+    def list_jobs(
+        self,
+        vault_id: int,
+        status: Optional[str] = None,
+        limit: Optional[int] = None,
+        trigger_type: Optional[str] = None,
+        trigger_id: Optional[str] = None,
+    ) -> list[WikiCompileJob]:
+        # F-012: optional bound so callers that only need recent jobs don't pull
+        # the vault's entire job history. trigger_type/trigger_id let status
+        # endpoints filter in SQL instead of pulling and filtering in Python.
+        sql = "SELECT * FROM wiki_compile_jobs WHERE vault_id = ?"
+        params: list[Any] = [vault_id]
         if status:
-            rows = self._db.execute(
-                "SELECT * FROM wiki_compile_jobs WHERE vault_id = ? AND status = ? ORDER BY created_at DESC",
-                (vault_id, status),
-            ).fetchall()
-        else:
-            rows = self._db.execute(
-                "SELECT * FROM wiki_compile_jobs WHERE vault_id = ? ORDER BY created_at DESC",
-                (vault_id,),
-            ).fetchall()
+            sql += " AND status = ?"
+            params.append(status)
+        if trigger_type is not None:
+            sql += " AND trigger_type = ?"
+            params.append(trigger_type)
+        if trigger_id is not None:
+            sql += " AND trigger_id = ?"
+            params.append(trigger_id)
+        sql += " ORDER BY created_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._db.execute(sql, params).fetchall()
         return [_to_compile_job(r) for r in rows]
 
     def get_job(self, job_id: int, vault_id: int) -> Optional[WikiCompileJob]:
@@ -1290,6 +1363,7 @@ class WikiStore:
         page_id: int,
         vault_id: int,
         edited_by: Optional[int] = None,
+        commit: bool = True,
     ) -> Optional[WikiPageVersion]:
         """Snapshot current page state into wiki_page_versions before an update."""
         row = self._db.execute(
@@ -1307,7 +1381,8 @@ class WikiStore:
             (page_id, vault_id, d["title"], d["markdown"], d.get("summary") or "",
              d["status"], d.get("confidence") or 0.0, edited_by, now),
         )
-        self._db.commit()
+        if commit:
+            self._db.commit()
         vrow = self._db.execute(
             "SELECT * FROM wiki_page_versions WHERE id = ?", (cur.lastrowid,)
         ).fetchone()
@@ -1362,18 +1437,39 @@ class WikiStore:
     # -----------------------------------------------------------------------
 
     def sync_page_links(self, page_id: int, vault_id: int, markdown: str) -> list[WikiPageLink]:
-        """Parse [[slug]] from markdown, resolve to page IDs, replace old links."""
-        # Extract all [[...]] wiki-link targets
-        slugs = re.findall(r"\[\[([^\]]+)\]\]", markdown)
+        """Parse [[slug]] and [[slug|display]] from markdown, resolve to page IDs,
+        replace old links."""
+        # Extract all [[...]] wiki-link targets. F-006: support the
+        # ``[[slug|display text]]`` form — the part before the pipe is the link
+        # target, the part after is the human-readable label.
+        raw_targets = re.findall(r"\[\[([^\]]+)\]\]", markdown)
+        # (normalized_slug, link_text) pairs in document order.
+        parsed: list[tuple[str, str]] = []
+        for raw in raw_targets:
+            target_part, _, display_part = raw.partition("|")
+            slug = normalize_slug(target_part.strip())
+            if not slug:
+                continue
+            link_text = (display_part.strip() or target_part.strip())
+            parsed.append((slug, link_text))
+
+        # F-009: resolve every distinct slug in a single query instead of one
+        # SELECT per link.
         resolved: list[tuple[int, str]] = []
-        for raw in slugs:
-            slug = normalize_slug(raw.strip())
-            target = self._db.execute(
-                "SELECT id FROM wiki_pages WHERE vault_id = ? AND slug = ?",
-                (vault_id, slug),
-            ).fetchone()
-            if target:
-                resolved.append((target[0], raw.strip()))
+        unique_slugs = list({slug for slug, _ in parsed})
+        if unique_slugs:
+            placeholders = ",".join("?" * len(unique_slugs))
+            rows_by_slug = {
+                r["slug"]: r["id"]
+                for r in self._db.execute(
+                    f"SELECT id, slug FROM wiki_pages WHERE vault_id = ? AND slug IN ({placeholders})",
+                    [vault_id, *unique_slugs],
+                ).fetchall()
+            }
+            for slug, link_text in parsed:
+                target_id = rows_by_slug.get(slug)
+                if target_id is not None:
+                    resolved.append((target_id, link_text))
 
         # Replace old links for this source page
         self._db.execute(
@@ -1398,11 +1494,12 @@ class WikiStore:
         ).fetchall()
         return [_to_page_link(r) for r in rows]
 
-    def list_backlinks(self, page_id: int) -> list[WikiPageLink]:
-        """List pages that link TO this page."""
+    def list_backlinks(self, page_id: int, vault_id: int) -> list[WikiPageLink]:
+        """List pages that link TO this page (scoped to the page's vault)."""
         rows = self._db.execute(
-            "SELECT * FROM wiki_page_links WHERE target_page_id = ? ORDER BY created_at DESC",
-            (page_id,),
+            "SELECT * FROM wiki_page_links WHERE target_page_id = ? AND vault_id = ? "
+            "ORDER BY created_at DESC",
+            (page_id, vault_id),
         ).fetchall()
         return [_to_page_link(r) for r in rows]
 
@@ -1418,6 +1515,7 @@ class WikiStore:
         target_id: int,
         user_id: Optional[int] = None,
         details: Optional[dict] = None,
+        commit: bool = True,
     ) -> WikiActivityEntry:
         """Insert an entry into the wiki activity log."""
         now = datetime.utcnow().isoformat()
@@ -1428,7 +1526,8 @@ class WikiStore:
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (vault_id, action, target_type, target_id, user_id, details_json, now),
         )
-        self._db.commit()
+        if commit:
+            self._db.commit()
         row = self._db.execute(
             "SELECT * FROM wiki_activity_log WHERE id = ?", (cur.lastrowid,)
         ).fetchone()
@@ -1447,39 +1546,47 @@ class WikiStore:
     # -----------------------------------------------------------------------
 
     def find_claim_by_normalized_text(self, vault_id: int, claim_text: str) -> Optional[WikiClaim]:
-        """Normalize text (lowercase, strip punctuation, collapse spaces) and compare."""
-        normalized = re.sub(r"[^\w\s]", "", claim_text.lower().strip())
-        normalized = re.sub(r"\s+", " ", normalized).strip()
-        rows = self._db.execute(
-            "SELECT * FROM wiki_claims WHERE vault_id = ?", (vault_id,)
-        ).fetchall()
-        for row in rows:
-            existing_text = dict(row).get("claim_text") or ""
-            existing_norm = re.sub(r"[^\w\s]", "", existing_text.lower().strip())
-            existing_norm = re.sub(r"\s+", " ", existing_norm).strip()
-            if existing_norm == normalized:
-                claim = _to_wiki_claim(row)
-                claim.sources = self._load_sources(claim.id)
-                return claim
-        return None
+        """Find a claim by normalized text using the indexed normalized_text column."""
+        normalized = normalize_claim_text(claim_text)
+        if not normalized:
+            return None
+        row = self._db.execute(
+            "SELECT * FROM wiki_claims WHERE vault_id = ? AND normalized_text = ? LIMIT 1",
+            (vault_id, normalized),
+        ).fetchone()
+        if row is None:
+            return None
+        claim = _to_wiki_claim(row)
+        claim.sources = self._load_sources(claim.id)
+        return claim
 
     # -----------------------------------------------------------------------
     # Bulk Operations (DD-C025)
     # -----------------------------------------------------------------------
 
     def bulk_update_pages(self, page_ids: list[int], vault_id: int, **kwargs: Any) -> list[WikiPage]:
-        """Update multiple pages at once. Returns list of updated pages."""
-        results = []
-        for pid in page_ids:
-            page = self.update_page(pid, vault_id, **kwargs)
-            if page:
-                results.append(page)
+        """Update multiple pages atomically. Either all succeed or none are committed."""
+        results: list[WikiPage] = []
+        try:
+            for pid in page_ids:
+                page = self.update_page(pid, vault_id, commit=False, **kwargs)
+                if page:
+                    results.append(page)
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         return results
 
     def bulk_delete_pages(self, page_ids: list[int], vault_id: int) -> int:
-        """Delete multiple pages at once. Returns number of pages deleted."""
+        """Delete multiple pages atomically. Either all succeed or none are committed."""
         count = 0
-        for pid in page_ids:
-            if self.delete_page(pid, vault_id):
-                count += 1
+        try:
+            for pid in page_ids:
+                if self.delete_page(pid, vault_id, commit=False):
+                    count += 1
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         return count

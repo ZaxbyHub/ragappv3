@@ -191,9 +191,9 @@ async def create_wiki_page(
             created_by=user.get("id"),
             parent_id=request.parent_id,
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Error creating wiki page")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Failed to create wiki page")
     return _page_dict(page)
 
 
@@ -207,7 +207,14 @@ async def get_wiki_page(
     page = store.get_page(page_id)
     if not page:
         raise HTTPException(status_code=404, detail="Wiki page not found")
-    await _require_vault_read(user, page.vault_id)
+    # F-003: collapse a vault-access denial to 404 so an unauthorized caller cannot
+    # distinguish "exists in another vault" (403) from "does not exist" (404).
+    try:
+        await _require_vault_read(user, page.vault_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        raise
     return _page_dict(page)
 
 
@@ -223,7 +230,13 @@ async def update_wiki_page(
     page = store.get_page(page_id, load_relations=False)
     if not page:
         raise HTTPException(status_code=404, detail="Wiki page not found")
-    await _require_vault_write(user, page.vault_id)
+    # F-003: collapse a vault-access denial to 404 (existence non-distinguishable).
+    try:
+        await _require_vault_write(user, page.vault_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        raise
     updates = request.model_dump(exclude_none=True)
     expected_version = updates.pop("expected_version", None)
     try:
@@ -254,7 +267,13 @@ async def delete_wiki_page(
     page = store.get_page(page_id, load_relations=False)
     if not page:
         raise HTTPException(status_code=404, detail="Wiki page not found")
-    await _require_vault_write(user, page.vault_id)
+    # F-003: collapse a vault-access denial to 404 (existence non-distinguishable).
+    try:
+        await _require_vault_write(user, page.vault_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        raise
     store.delete_page(page_id, page.vault_id)
 
 
@@ -303,8 +322,9 @@ async def attach_file_to_page(
         pf = store.attach_file(page_id, request.file_id, request.vault_id)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail="File already attached to this page")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Error attaching file to wiki page")
+        raise HTTPException(status_code=400, detail="Failed to attach file to page")
     return _as_dict(pf)
 
 
@@ -360,7 +380,7 @@ async def list_page_backlinks(
         raise HTTPException(status_code=404, detail="Wiki page not found")
     if page.vault_id != vault_id:
         raise HTTPException(status_code=404, detail="Wiki page not found")
-    backlinks = store.list_backlinks(page_id)
+    backlinks = store.list_backlinks(page_id, vault_id)
     return {"backlinks": [_as_dict(bl) for bl in backlinks]}
 
 
@@ -414,12 +434,14 @@ async def bulk_wiki_pages(
 async def list_wiki_entities(
     vault_id: int = Query(...),
     search: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
     await _require_vault_read(user, vault_id)
     store = WikiStore(db)
-    entities = store.list_entities(vault_id, search=search)
+    entities = store.list_entities(vault_id, search=search, limit=limit, offset=offset)
     return {"entities": [_as_dict(e) for e in entities]}
 
 
@@ -434,12 +456,17 @@ async def list_wiki_claims(
     entity: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
     await _require_vault_read(user, vault_id)
     store = WikiStore(db)
-    claims = store.list_claims(vault_id, page_id=page_id, entity=entity, search=search, status=status)
+    claims = store.list_claims(
+        vault_id, page_id=page_id, entity=entity, search=search, status=status,
+        limit=limit, offset=offset,
+    )
     return {"claims": [_as_dict(c) for c in claims]}
 
 
@@ -643,9 +670,9 @@ async def promote_memory_to_wiki(
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    except Exception as e:
+    except Exception:
         logger.exception("Error promoting memory to wiki")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to promote memory to wiki")
 
     return {
         "page": _page_dict(result["page"]),
@@ -837,12 +864,12 @@ async def get_document_wiki_status(
     db.row_factory = sqlite3.Row
     store = WikiStore(db)
 
-    # Collect ingest jobs for this file
-    jobs = store.list_jobs(vault_id)
-    file_jobs = sorted(
-        [j for j in jobs if j.trigger_type == "ingest" and j.trigger_id == f"file:{file_id}"],
-        key=lambda j: j.created_at,
-        reverse=True,
+    # Collect ingest jobs for this file (filtered + bounded in SQL — F-012)
+    file_jobs = store.list_jobs(
+        vault_id,
+        trigger_type="ingest",
+        trigger_id=f"file:{file_id}",
+        limit=50,
     )
     latest_job = file_jobs[0] if file_jobs else None
 
@@ -937,15 +964,11 @@ async def get_memory_wiki_status(
     db.row_factory = sqlite3.Row
     store = WikiStore(db)
 
-    # Collect memory jobs
-    jobs = store.list_jobs(vault_id)
-    mem_jobs = sorted(
-        [j for j in jobs
-         if j.trigger_type in ("memory", "manual")
-         and j.trigger_id == f"memory:{memory_id}"],
-        key=lambda j: j.created_at,
-        reverse=True,
-    )
+    # Collect memory jobs (trigger_id filtered + bounded in SQL — F-012).
+    # trigger_type can be either "memory" or "manual", so keep that check in Python
+    # over the already-bounded result set.
+    jobs = store.list_jobs(vault_id, trigger_id=f"memory:{memory_id}", limit=50)
+    mem_jobs = [j for j in jobs if j.trigger_type in ("memory", "manual")]
     latest_job = mem_jobs[0] if mem_jobs else None
 
     # Claims sourced from this memory
