@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Dialog,
   DialogContent,
@@ -17,6 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Bold, Italic, Heading1, Link, List, Code } from "lucide-react";
 import type { WikiPage } from "@/lib/api";
 
 const PAGE_TYPES = [
@@ -38,6 +39,91 @@ const STATUSES = [
   {value: "stale", label: "Stale"},
   {value: "archived", label: "Archived"},
 ] as const;
+
+const TEMPLATES: Record<string, string> = {
+  entity: "# {title}\n\n## Overview\n\n## Key Facts\n\n## Related Entities\n",
+  procedure: "# {title}\n\n## Purpose\n\n## Steps\n\n1. \n2. \n3. \n\n## Notes\n",
+  system: "# {title}\n\n## Architecture\n\n## Components\n\n## Interfaces\n",
+  acronym: "# {title}\n\n**Stands for:** \n\n## Context\n\n## Usage\n",
+  qa: "# {title}\n\n## Question\n\n## Answer\n\n## Sources\n",
+  manual: "# {title}\n\n",
+};
+
+function getTemplate(pageType: string, title: string): string {
+  const tmpl = TEMPLATES[pageType] ?? "# {title}\n\n";
+  return tmpl.replace("{title}", title || "Untitled");
+}
+
+/** Returns true if `content` matches any template (with any title). */
+function isTemplateContent(content: string): boolean {
+  if (!content) return true;
+  for (const tmpl of Object.values(TEMPLATES)) {
+    // Build a regex from the template: escape special chars, replace {title} with .*
+    const escaped = tmpl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = escaped.replace("\\{title\\}", ".*");
+    if (new RegExp(`^${pattern}$`, "s").test(content)) return true;
+  }
+  // Also match the fallback
+  if (/^# .*\n\n$/.test(content)) return true;
+  return false;
+}
+
+interface MarkdownToolbarProps {
+  textareaRef: React.RefObject<HTMLTextAreaElement | null>;
+  value: string;
+  onChange: (v: string) => void;
+}
+
+function MarkdownToolbar({ textareaRef, value, onChange }: MarkdownToolbarProps) {
+  const insertMarkdown = useCallback(
+    (before: string, after: string, placeholder: string) => {
+      const ta = textareaRef.current;
+      if (!ta) return;
+      const start = ta.selectionStart;
+      const end = ta.selectionEnd;
+      const selected = value.slice(start, end);
+      const insertion = selected || placeholder;
+      const newValue =
+        value.slice(0, start) + before + insertion + after + value.slice(end);
+      onChange(newValue);
+      // Restore focus and select the inserted text after React re-renders
+      requestAnimationFrame(() => {
+        ta.focus();
+        const selStart = start + before.length;
+        const selEnd = selStart + insertion.length;
+        ta.setSelectionRange(selStart, selEnd);
+      });
+    },
+    [textareaRef, value, onChange],
+  );
+
+  const buttons = [
+    { icon: Bold, label: "Bold", before: "**", after: "**", placeholder: "bold" },
+    { icon: Italic, label: "Italic", before: "_", after: "_", placeholder: "italic" },
+    { icon: Heading1, label: "Heading", before: "# ", after: "", placeholder: "heading" },
+    { icon: Link, label: "Link", before: "[", after: "](url)", placeholder: "link text" },
+    { icon: List, label: "List", before: "- ", after: "", placeholder: "list item" },
+    { icon: Code, label: "Code", before: "`", after: "`", placeholder: "code" },
+  ] as const;
+
+  return (
+    <div className="flex gap-1 border rounded-md p-1 bg-muted/50">
+      {buttons.map((btn) => (
+        <Button
+          key={btn.label}
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7"
+          title={btn.label}
+          onClick={() => insertMarkdown(btn.before, btn.after, btn.placeholder)}
+        >
+          <btn.icon className="h-4 w-4" />
+        </Button>
+      ))}
+    </div>
+  );
+}
 
 interface WikiEditDialogProps {
   open: boolean;
@@ -65,6 +151,9 @@ export function WikiEditDialog({ open, page, vaultId: _vaultId, onClose, onSave 
   const [confidence, setConfidence] = useState(0);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const isCreating = !page;
 
   useEffect(() => {
     if (page) {
@@ -79,13 +168,21 @@ export function WikiEditDialog({ open, page, vaultId: _vaultId, onClose, onSave 
       setTitle("");
       setPageType("entity");
       setSlug("");
-      setMarkdown("");
+      setMarkdown(getTemplate("entity", ""));
       setSummary("");
       setStatus("draft");
       setConfidence(0);
     }
     setError(null);
   }, [page, open]);
+
+  // Auto-fill template when page type changes during creation
+  useEffect(() => {
+    if (!isCreating) return;
+    if (isTemplateContent(markdown)) {
+      setMarkdown(getTemplate(pageType, title));
+    }
+  }, [pageType]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleSave() {
     if (!title.trim()) {
@@ -158,13 +255,19 @@ export function WikiEditDialog({ open, page, vaultId: _vaultId, onClose, onSave 
 
           <div>
             <Label htmlFor="wiki-markdown">Content (Markdown)</Label>
+            <MarkdownToolbar
+              textareaRef={textareaRef}
+              value={markdown}
+              onChange={setMarkdown}
+            />
             <Textarea
+              ref={textareaRef}
               id="wiki-markdown"
               value={markdown}
               onChange={(e) => setMarkdown(e.target.value)}
               placeholder="Page content…"
               rows={6}
-              className="font-mono text-sm"
+              className="font-mono text-sm mt-1"
             />
           </div>
 

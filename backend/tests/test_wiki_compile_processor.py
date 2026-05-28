@@ -1193,8 +1193,12 @@ class TestWikiFirstRetrievalGate(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def _make_wiki_evidence(self, claim_status, confidence, page_status="needs_review"):
+    def _make_wiki_evidence(self, claim_status, confidence, page_status="needs_review", freshness=None):
+        from datetime import datetime as _dt
+
         from app.services.wiki_retrieval import WikiEvidence
+        if freshness is None:
+            freshness = _dt.utcnow().isoformat()
         return WikiEvidence(
             label_placeholder="W1",
             page_id=1,
@@ -1209,7 +1213,7 @@ class TestWikiFirstRetrievalGate(unittest.TestCase):
             claim_status=claim_status,
             score=confidence,
             score_type="relation",
-            freshness=None,
+            freshness=freshness,
             source_count=1,
             provenance_summary="1 doc",
         )
@@ -1280,3 +1284,12 @@ class TestWikiFirstRetrievalGate(unittest.TestCase):
         )
         result = _raw_rag_required("entity_lookup", [evidence])
         self.assertTrue(result, "Stale page must require raw RAG regardless of claim status")
+
+    def test_stale_freshness_requires_raw_rag(self):
+        """Old freshness timestamp must not suppress raw RAG even with active high-confidence claim."""
+        from app.services.rag_engine import _raw_rag_required
+        evidence = self._make_wiki_evidence(
+            claim_status="active", confidence=0.9, freshness="2020-01-01T00:00:00"
+        )
+        result = _raw_rag_required("entity_lookup", [evidence])
+        self.assertTrue(result, "Stale freshness must require raw RAG")

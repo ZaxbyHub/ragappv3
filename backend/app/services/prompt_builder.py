@@ -221,6 +221,19 @@ class PromptBuilderService:
                 + "\n\n".join(kms_sections)
             )
 
+        # Dedup: skip document chunks whose text substantially overlaps wiki claims
+        if wiki_evidence:
+            wiki_texts = {
+                (ev.claim_text or "").lower().strip()
+                for ev in wiki_evidence
+                if ev.claim_text
+            }
+            def _covered_by_wiki(section_text: str) -> bool:
+                lower = section_text.lower()
+                return any(wt in lower for wt in wiki_texts if len(wt) > 40)
+            primary_sections = [s for s in primary_sections if not _covered_by_wiki(s)]
+            supporting_sections = [s for s in supporting_sections if not _covered_by_wiki(s)]
+
         if primary_sections:
             primary_text = "\n\n".join(primary_sections)
             user_content_parts.append(f"Primary Evidence:\n{primary_text}")

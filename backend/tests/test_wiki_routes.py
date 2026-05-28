@@ -899,3 +899,578 @@ class TestWikiCSRFProtection(WikiRouteTestBase):
 
     # ---- Lint finding resolve route with CSRF ----
     # Skipping as it requires lint_finding seeding with proper schema
+
+
+# ===========================================================================
+# New endpoint coverage (versions, files, backlinks, activity, bulk,
+# entities/claims paging, document/memory status, optimistic lock, F-003,
+# F-010). All subclass WikiRouteTestBase and mirror its harness exactly.
+# ===========================================================================
+
+
+class WikiNewRouteTestBase(WikiRouteTestBase):
+    """Extends the base harness with a file-insert helper and vault-2 helper.
+
+    The base ``init_db`` applies SCHEMA only; it does NOT run the production
+    migrations that add ``wiki_compile_jobs.input_json`` /
+    ``wiki_compile_jobs.retry_count`` (those live in ``run_migrations``). The
+    ``/compile``, ``/recompile``, and job-status routes call
+    ``store.create_job(..., input_json=...)``, so we patch those columns onto
+    the harness DB here (test-only fixture parity with production migrations).
+    This does NOT modify any source or the shared base class.
+    """
+
+    def setUp(self):
+        super().setUp()
+        conn = self._raw()
+        job_cols = {r[1] for r in conn.execute("PRAGMA table_info(wiki_compile_jobs)").fetchall()}
+        if "input_json" not in job_cols:
+            conn.execute("ALTER TABLE wiki_compile_jobs ADD COLUMN input_json TEXT DEFAULT '{}'")
+        if "retry_count" not in job_cols:
+            conn.execute("ALTER TABLE wiki_compile_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+        self._pool.release(conn)
+
+    def _insert_file(
+        self,
+        vault_id: int = 1,
+        file_name: str = "doc.pdf",
+        status: str = "indexed",
+    ) -> int:
+        conn = self._raw()
+        cur = conn.execute(
+            """INSERT INTO files (vault_id, file_path, file_name, file_size, status)
+               VALUES (?, ?, ?, ?, ?)""",
+            (vault_id, f"/tmp/{file_name}", file_name, 1234, status),
+        )
+        conn.commit()
+        file_id = cur.lastrowid
+        self._pool.release(conn)
+        return file_id
+
+    def _insert_vault2(self) -> None:
+        conn = self._raw()
+        conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (2, 'Other')")
+        conn.commit()
+        self._pool.release(conn)
+
+    def _create_page(self, vault_id: int = 1, title: str = "Page", page_type: str = "entity", markdown: str = "") -> dict:
+        resp = self.client.post(
+            "/api/wiki/pages",
+            json={"vault_id": vault_id, "title": title, "page_type": page_type, "markdown": markdown},
+        )
+        self.assertEqual(resp.status_code, 201, resp.text)
+        return resp.json()
+
+
+class TestWikiPageVersionsRoute(WikiNewRouteTestBase):
+
+    def test_versions_returns_history_after_update(self):
+        page = self._create_page(title="Versioned")
+        page_id = page["id"]
+        # An update snapshots the prior state into wiki_page_versions.
+        upd = self.client.put(
+            f"/api/wiki/pages/{page_id}",
+            json={"title": "Versioned v2", "status": "verified"},
+        )
+        self.assertEqual(upd.status_code, 200, upd.text)
+
+        resp = self.client.get(f"/api/wiki/pages/{page_id}/versions", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertIn("versions", data)
+        self.assertGreaterEqual(len(data["versions"]), 1)
+        v = data["versions"][0]
+        self.assertEqual(v["page_id"], page_id)
+        self.assertEqual(v["vault_id"], 1)
+        # The snapshot is the PRE-update title.
+        self.assertEqual(v["title"], "Versioned")
+
+    def test_versions_nonexistent_page_returns_404(self):
+        resp = self.client.get("/api/wiki/pages/99999/versions", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_versions_wrong_vault_returns_404(self):
+        self._insert_vault2()
+        page = self._create_page(vault_id=1, title="In Vault One")
+        page_id = page["id"]
+        # Page exists but is in vault 1; query as vault 2 -> 404 (scoping).
+        resp = self.client.get(f"/api/wiki/pages/{page_id}/versions", params={"vault_id": 2})
+        self.assertEqual(resp.status_code, 404)
+
+
+class TestWikiPageFilesRoute(WikiNewRouteTestBase):
+
+    def test_attach_list_detach_file(self):
+        page = self._create_page(title="Has Files")
+        page_id = page["id"]
+        file_id = self._insert_file(vault_id=1, file_name="attach.pdf")
+
+        # Attach -> 201
+        attach = self.client.post(
+            f"/api/wiki/pages/{page_id}/files",
+            json={"vault_id": 1, "file_id": file_id},
+        )
+        self.assertEqual(attach.status_code, 201, attach.text)
+        pf = attach.json()
+        self.assertEqual(pf["page_id"], page_id)
+        self.assertEqual(pf["file_id"], file_id)
+        self.assertEqual(pf["vault_id"], 1)
+
+        # List -> 200 with the attachment
+        listing = self.client.get(f"/api/wiki/pages/{page_id}/files", params={"vault_id": 1})
+        self.assertEqual(listing.status_code, 200, listing.text)
+        files = listing.json()["files"]
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0]["file_id"], file_id)
+
+        # Detach -> 204
+        detach = self.client.delete(
+            f"/api/wiki/pages/{page_id}/files/{file_id}", params={"vault_id": 1}
+        )
+        self.assertEqual(detach.status_code, 204, detach.text)
+
+        # List again -> empty
+        listing2 = self.client.get(f"/api/wiki/pages/{page_id}/files", params={"vault_id": 1})
+        self.assertEqual(listing2.json()["files"], [])
+
+    def test_duplicate_attach_returns_409(self):
+        # A second attach of the same (page, file) pair must return 409.
+        # WikiStore.attach_file uses a plain INSERT, so the UNIQUE(page_id,
+        # file_id) constraint raises sqlite3.IntegrityError, which the route
+        # translates into 409. The first attach still leaves exactly one row.
+        page = self._create_page(title="Dup Files")
+        page_id = page["id"]
+        file_id = self._insert_file(vault_id=1)
+        first = self.client.post(
+            f"/api/wiki/pages/{page_id}/files",
+            json={"vault_id": 1, "file_id": file_id},
+        )
+        self.assertEqual(first.status_code, 201, first.text)
+        dup = self.client.post(
+            f"/api/wiki/pages/{page_id}/files",
+            json={"vault_id": 1, "file_id": file_id},
+        )
+        self.assertEqual(dup.status_code, 409, dup.text)
+        self.assertIn("already attached", dup.json()["detail"].lower())
+        # The conflict left the original single attachment intact.
+        listing = self.client.get(f"/api/wiki/pages/{page_id}/files", params={"vault_id": 1})
+        self.assertEqual(len(listing.json()["files"]), 1)
+
+    def test_attach_wrong_vault_page_returns_403(self):
+        # Page is in vault 1; request claims vault 2 -> handler returns 403.
+        self._insert_vault2()
+        page = self._create_page(vault_id=1, title="Vault1 Page")
+        page_id = page["id"]
+        file_id = self._insert_file(vault_id=2)
+        resp = self.client.post(
+            f"/api/wiki/pages/{page_id}/files",
+            json={"vault_id": 2, "file_id": file_id},
+        )
+        self.assertEqual(resp.status_code, 403, resp.text)
+        self.assertIn("vault", resp.json()["detail"].lower())
+
+    def test_detach_nonexistent_attachment_returns_404(self):
+        page = self._create_page(title="No Attach")
+        page_id = page["id"]
+        resp = self.client.delete(
+            f"/api/wiki/pages/{page_id}/files/99999", params={"vault_id": 1}
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_list_files_wrong_vault_returns_404(self):
+        self._insert_vault2()
+        page = self._create_page(vault_id=1, title="Vault1 Files")
+        page_id = page["id"]
+        resp = self.client.get(f"/api/wiki/pages/{page_id}/files", params={"vault_id": 2})
+        self.assertEqual(resp.status_code, 404)
+
+
+class TestWikiBacklinksRoute(WikiNewRouteTestBase):
+
+    def test_backlinks_returns_linking_pages(self):
+        # DD-C030 end-to-end: creating a page whose body contains [[slug]] must
+        # auto-create the link (create_page wires sync_page_links), so the
+        # target's backlinks list it without any manual store call.
+        target = self._create_page(title="Target Page")
+        target_slug = target["slug"]
+        target_id = target["id"]
+        source = self._create_page(
+            title="Source Page",
+            markdown=f"See [[{target_slug}]] for details.",
+        )
+        source_id = source["id"]
+
+        resp = self.client.get(f"/api/wiki/pages/{target_id}/backlinks", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertIn("backlinks", data)
+        self.assertEqual(len(data["backlinks"]), 1)
+        bl = data["backlinks"][0]
+        self.assertEqual(bl["source_page_id"], source_id)
+        self.assertEqual(bl["target_page_id"], target_id)
+
+    def test_update_page_markdown_resyncs_backlinks(self):
+        # DD-C030 end-to-end: editing a page's body via PUT re-resolves its
+        # [[slug]] links (update_page wires sync_page_links). A link added on
+        # edit appears; one removed on a later edit disappears.
+        target = self._create_page(title="Edit Target")
+        target_slug = target["slug"]
+        target_id = target["id"]
+        source = self._create_page(title="Edit Source", markdown="no links yet")
+        source_id = source["id"]
+
+        # Initially no backlinks.
+        before = self.client.get(
+            f"/api/wiki/pages/{target_id}/backlinks", params={"vault_id": 1}
+        )
+        self.assertEqual(before.json()["backlinks"], [])
+
+        # Edit the source to reference the target.
+        put = self.client.put(
+            f"/api/wiki/pages/{source_id}",
+            json={"markdown": f"Now see [[{target_slug}]]."},
+        )
+        self.assertEqual(put.status_code, 200, put.text)
+        after = self.client.get(
+            f"/api/wiki/pages/{target_id}/backlinks", params={"vault_id": 1}
+        )
+        self.assertEqual(len(after.json()["backlinks"]), 1)
+        self.assertEqual(after.json()["backlinks"][0]["source_page_id"], source_id)
+
+        # Edit again to remove the link -> backlink is dropped.
+        put2 = self.client.put(
+            f"/api/wiki/pages/{source_id}",
+            json={"markdown": "link removed"},
+        )
+        self.assertEqual(put2.status_code, 200, put2.text)
+        final = self.client.get(
+            f"/api/wiki/pages/{target_id}/backlinks", params={"vault_id": 1}
+        )
+        self.assertEqual(final.json()["backlinks"], [])
+
+    def test_backlinks_wrong_vault_returns_404(self):
+        # F-002 vault scoping: a page in vault 1 is invisible when queried as vault 2.
+        self._insert_vault2()
+        page = self._create_page(vault_id=1, title="Scoped Page")
+        page_id = page["id"]
+        resp = self.client.get(f"/api/wiki/pages/{page_id}/backlinks", params={"vault_id": 2})
+        self.assertEqual(resp.status_code, 404)
+
+    def test_backlinks_nonexistent_page_returns_404(self):
+        resp = self.client.get("/api/wiki/pages/99999/backlinks", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 404)
+
+
+class TestWikiActivityRoute(WikiNewRouteTestBase):
+
+    def test_activity_returns_entries_for_vault(self):
+        page = self._create_page(title="Activity Page")
+        page_id = page["id"]
+        # An update logs a page_updated activity entry.
+        self.client.put(f"/api/wiki/pages/{page_id}", json={"status": "verified"})
+
+        resp = self.client.get("/api/wiki/activity", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertIn("activity", data)
+        self.assertGreaterEqual(len(data["activity"]), 1)
+        actions = {e["action"] for e in data["activity"]}
+        self.assertIn("page_updated", actions)
+        for e in data["activity"]:
+            self.assertEqual(e["vault_id"], 1)
+
+    def test_activity_respects_limit(self):
+        # Generate several activity entries via repeated updates.
+        page = self._create_page(title="Limit Page")
+        page_id = page["id"]
+        for i in range(5):
+            self.client.put(f"/api/wiki/pages/{page_id}", json={"status": "verified", "summary": f"s{i}"})
+
+        resp = self.client.get("/api/wiki/activity", params={"vault_id": 1, "limit": 2})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertLessEqual(len(resp.json()["activity"]), 2)
+
+
+class TestWikiBulkRoute(WikiNewRouteTestBase):
+
+    def test_bulk_delete_removes_pages(self):
+        ids = [self._create_page(title=f"Bulk Del {i}")["id"] for i in range(3)]
+        resp = self.client.post(
+            "/api/wiki/pages/bulk",
+            json={"vault_id": 1, "page_ids": ids, "action": "delete"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["action"], "delete")
+        self.assertEqual(data["deleted"], 3)
+        for pid in ids:
+            self.assertEqual(self.client.get(f"/api/wiki/pages/{pid}").status_code, 404)
+
+    def test_bulk_update_sets_status_on_all(self):
+        ids = [self._create_page(title=f"Bulk Upd {i}")["id"] for i in range(3)]
+        resp = self.client.post(
+            "/api/wiki/pages/bulk",
+            json={
+                "vault_id": 1,
+                "page_ids": ids,
+                "action": "update",
+                "updates": {"status": "verified"},
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["action"], "update")
+        self.assertEqual(data["updated"], 3)
+        for pid in ids:
+            page = self.client.get(f"/api/wiki/pages/{pid}").json()
+            self.assertEqual(page["status"], "verified")
+
+    def test_bulk_update_without_updates_returns_400(self):
+        ids = [self._create_page(title="Bulk NoUpdates")["id"]]
+        resp = self.client.post(
+            "/api/wiki/pages/bulk",
+            json={"vault_id": 1, "page_ids": ids, "action": "update"},
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("updates", resp.json()["detail"].lower())
+
+    def test_bulk_unknown_action_returns_400(self):
+        ids = [self._create_page(title="Bulk Unknown")["id"]]
+        resp = self.client.post(
+            "/api/wiki/pages/bulk",
+            json={"vault_id": 1, "page_ids": ids, "action": "frobnicate"},
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("unknown bulk action", resp.json()["detail"].lower())
+
+
+class TestWikiEntitiesClaimsPaging(WikiNewRouteTestBase):
+
+    def _insert_entity(self, canonical_name: str, vault_id: int = 1) -> int:
+        conn = self._raw()
+        now = "2026-01-01T00:00:00"
+        cur = conn.execute(
+            """INSERT INTO wiki_entities
+               (vault_id, canonical_name, entity_type, aliases_json, description, created_at, updated_at)
+               VALUES (?, ?, 'unknown', '[]', '', ?, ?)""",
+            (vault_id, canonical_name, now, now),
+        )
+        conn.commit()
+        eid = cur.lastrowid
+        self._pool.release(conn)
+        return eid
+
+    def test_entities_limit_caps_results(self):
+        for i in range(5):
+            self._insert_entity(f"Entity{i:02d}")
+        resp = self.client.get(
+            "/api/wiki/entities", params={"vault_id": 1, "limit": 2, "offset": 0}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(len(resp.json()["entities"]), 2)
+
+    def test_entities_offset_windows_results(self):
+        for i in range(5):
+            self._insert_entity(f"Ent{i:02d}")
+        full = self.client.get("/api/wiki/entities", params={"vault_id": 1, "limit": 1000}).json()["entities"]
+        self.assertEqual(len(full), 5)
+        windowed = self.client.get(
+            "/api/wiki/entities", params={"vault_id": 1, "limit": 2, "offset": 2}
+        ).json()["entities"]
+        self.assertEqual(len(windowed), 2)
+        # ordered by canonical_name, so offset window matches the full ordering
+        self.assertEqual(
+            [e["canonical_name"] for e in windowed],
+            [e["canonical_name"] for e in full[2:4]],
+        )
+
+    def test_claims_limit_caps_results(self):
+        for i in range(5):
+            self.client.post(
+                "/api/wiki/claims",
+                json={"vault_id": 1, "claim_text": f"Claim number {i}", "source_type": "manual"},
+            )
+        resp = self.client.get(
+            "/api/wiki/claims", params={"vault_id": 1, "limit": 3, "offset": 0}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(len(resp.json()["claims"]), 3)
+
+    def test_claims_status_filter(self):
+        self.client.post(
+            "/api/wiki/claims",
+            json={"vault_id": 1, "claim_text": "Active claim", "source_type": "manual", "status": "active"},
+        )
+        self.client.post(
+            "/api/wiki/claims",
+            json={"vault_id": 1, "claim_text": "Superseded claim", "source_type": "manual", "status": "superseded"},
+        )
+        resp = self.client.get(
+            "/api/wiki/claims", params={"vault_id": 1, "status": "active"}
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        claims = resp.json()["claims"]
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0]["status"], "active")
+
+
+class TestWikiDocumentStatusRoute(WikiNewRouteTestBase):
+
+    def test_document_status_no_jobs(self):
+        file_id = self._insert_file(vault_id=1)
+        resp = self.client.get(f"/api/wiki/documents/{file_id}/status", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["file_id"], file_id)
+        self.assertEqual(data["wiki_status"], "not_compiled")
+        self.assertEqual(data["claims_count"], 0)
+        self.assertIsNone(data["latest_job"])
+        self.assertEqual(data["job_count"], 0)
+
+    def test_document_status_selects_latest_job(self):
+        file_id = self._insert_file(vault_id=1)
+        # Enqueue a compile job (POST /compile creates a wiki ingest job).
+        compile_resp = self.client.post(
+            f"/api/wiki/documents/{file_id}/compile", params={"vault_id": 1}
+        )
+        self.assertEqual(compile_resp.status_code, 202, compile_resp.text)
+
+        resp = self.client.get(f"/api/wiki/documents/{file_id}/status", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["job_count"], 1)
+        self.assertIsNotNone(data["latest_job"])
+        self.assertEqual(data["latest_job"]["trigger_id"], f"file:{file_id}")
+        # A pending job is not yet compiled.
+        self.assertEqual(data["wiki_status"], "not_compiled")
+
+
+class TestWikiMemoryStatusRoute(WikiNewRouteTestBase):
+
+    def test_memory_status_not_promoted(self):
+        mem_id = self._insert_memory("Some memory content")
+        resp = self.client.get(f"/api/wiki/memories/{mem_id}/status", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["memory_id"], mem_id)
+        self.assertEqual(data["wiki_status"], "not_promoted")
+        self.assertEqual(data["claims_count"], 0)
+        self.assertEqual(data["job_count"], 0)
+        self.assertIsNone(data["latest_job"])
+
+    def test_memory_status_selects_memory_job(self):
+        mem_id = self._insert_memory("Memory with a job")
+        # Seed a memory-trigger job directly through the store.
+        conn = self._raw()
+        from app.services.wiki_store import WikiStore
+        store = WikiStore(conn)
+        job = store.create_job(
+            vault_id=1,
+            trigger_type="memory",
+            trigger_id=f"memory:{mem_id}",
+            input_json={"memory_id": mem_id},
+        )
+        self._pool.release(conn)
+
+        resp = self.client.get(f"/api/wiki/memories/{mem_id}/status", params={"vault_id": 1})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["job_count"], 1)
+        self.assertIsNotNone(data["latest_job"])
+        self.assertEqual(data["latest_job"]["id"], job.id)
+        self.assertEqual(data["latest_job"]["trigger_id"], f"memory:{mem_id}")
+
+
+class TestWikiOptimisticLock(WikiNewRouteTestBase):
+
+    def test_stale_expected_version_returns_409(self):
+        page = self._create_page(title="Lock Me")
+        page_id = page["id"]
+        # A freshly-created page starts at version 1. First update (no expected
+        # version) bumps it to 2.
+        first = self.client.put(
+            f"/api/wiki/pages/{page_id}",
+            json={"title": "Lock Me v1"},
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        current_version = first.json()["version"]
+        self.assertEqual(current_version, 2)
+
+        # Second update with a now-stale expected_version (1) -> 409 conflict.
+        stale = self.client.put(
+            f"/api/wiki/pages/{page_id}",
+            json={"title": "Lock Me stale", "expected_version": 1},
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertIn("version conflict", stale.json()["detail"].lower())
+
+        # A matching expected_version still succeeds.
+        ok = self.client.put(
+            f"/api/wiki/pages/{page_id}",
+            json={"title": "Lock Me ok", "expected_version": current_version},
+        )
+        self.assertEqual(ok.status_code, 200, ok.text)
+
+
+class TestWikiF003ExistenceOracle(WikiNewRouteTestBase):
+    """F-003: a vault the caller cannot read must return 404, not 403, so an
+    unauthorized caller cannot distinguish 'exists elsewhere' from 'absent'."""
+
+    def setUp(self):
+        super().setUp()
+        # Seed vault 2 (private by default) and a page inside it.
+        self._insert_vault2()
+        page = self._create_page(vault_id=2, title="Secret Vault2 Page")
+        self._secret_page_id = page["id"]
+
+    def _use_viewer(self):
+        viewer = {
+            "id": 4242,
+            "username": "viewer",
+            "full_name": "Viewer",
+            "role": "viewer",
+            "is_active": True,
+            "must_change_password": False,
+        }
+        app.dependency_overrides[get_current_active_user] = lambda: viewer
+
+    def test_unreadable_vault_page_returns_404_not_403(self):
+        # A viewer with no membership has no read access to private vault 2;
+        # the route collapses the 403 to 404 (F-003).
+        self._use_viewer()
+        resp = self.client.get(f"/api/wiki/pages/{self._secret_page_id}")
+        self.assertEqual(resp.status_code, 404, resp.text)
+        self.assertEqual(resp.json()["detail"], "Wiki page not found")
+        # Restore superadmin override so tearDown's pop is consistent.
+        app.dependency_overrides[get_current_active_user] = lambda: _MOCK_SUPERADMIN
+
+    def test_nonexistent_page_also_returns_404(self):
+        # The negative existence path returns the same status/detail, so the
+        # two cases are indistinguishable to the caller.
+        self._use_viewer()
+        resp = self.client.get("/api/wiki/pages/99999")
+        self.assertEqual(resp.status_code, 404, resp.text)
+        self.assertEqual(resp.json()["detail"], "Wiki page not found")
+        app.dependency_overrides[get_current_active_user] = lambda: _MOCK_SUPERADMIN
+
+
+class TestWikiF010GenericError(WikiNewRouteTestBase):
+    """F-010: internal create_page failures surface a generic message, never a
+    raw exception string."""
+
+    def test_create_page_internal_error_is_generic(self):
+        # Force store.create_page to raise. The handler logs the exception and
+        # returns a 400 with a fixed, non-leaking detail.
+        from unittest.mock import patch
+        with patch(
+            "app.api.routes.wiki.WikiStore.create_page",
+            side_effect=RuntimeError("super-secret internal stack detail"),
+        ):
+            resp = self.client.post(
+                "/api/wiki/pages",
+                json={"vault_id": 1, "title": "Boom", "page_type": "entity"},
+            )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertEqual(resp.json()["detail"], "Failed to create wiki page")
+        self.assertNotIn("super-secret", resp.json()["detail"])

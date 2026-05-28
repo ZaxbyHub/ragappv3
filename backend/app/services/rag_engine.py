@@ -85,6 +85,20 @@ def _classify_query(query: str) -> str:
     return "general"
 
 
+_WIKI_FRESHNESS_MAX_AGE_DAYS = 7
+
+
+def _is_fresh(freshness_str: Optional[str], max_age_days: int = _WIKI_FRESHNESS_MAX_AGE_DAYS) -> bool:
+    """Return True if the freshness timestamp is within max_age_days of now."""
+    if not freshness_str:
+        return False
+    try:
+        compiled_at = datetime.fromisoformat(freshness_str)
+        return (datetime.utcnow() - compiled_at).days <= max_age_days
+    except (ValueError, TypeError):
+        return False
+
+
 def _raw_rag_required(query_type: str, wiki_evidence: List[Any]) -> bool:
     """Return True if raw document RAG is needed given query type and wiki results."""
     if not wiki_evidence:
@@ -92,13 +106,14 @@ def _raw_rag_required(query_type: str, wiki_evidence: List[Any]) -> bool:
     if query_type == "document_specific":
         return True
     if query_type == "entity_lookup":
-        # Skip raw RAG only when a high-confidence, non-stale claim directly answers
+        # Skip raw RAG only when a high-confidence, non-stale, fresh claim directly answers
         high_conf = [
             ev for ev in wiki_evidence
             if ev.claim_id is not None
             and (ev.claim_status or "") in ("active", "verified")
             and (ev.page_status or "") not in ("stale", "archived", "draft")
             and ev.confidence >= 0.75
+            and _is_fresh(ev.freshness)
         ]
         return len(high_conf) == 0
     # For all other query types, keep raw RAG as supplement
@@ -528,34 +543,40 @@ class RAGEngine:
 
         effective_alpha = self.hybrid_alpha
 
-        # Wiki retrieval: query the Knowledge Compiler before raw document RAG.
-        wiki_evidence: List[Any] = []
-        if self._wiki_retrieval is not None and vault_id is not None:
+        # Wiki + KMS retrieval: run in parallel when both are enabled.
+        async def _wiki_retrieve() -> List[Any]:
+            if self._wiki_retrieval is None or vault_id is None:
+                return []
             try:
-                wiki_evidence = await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     self._wiki_retrieval.retrieve, retrieval_query, vault_id
                 )
-                logger.info("[query] Wiki retrieval: %d candidates", len(wiki_evidence))
+                logger.info("[query] Wiki retrieval: %d candidates", len(result))
+                return result
             except Exception as exc:
                 logger.warning("Wiki retrieval failed: %s", exc)
-                wiki_evidence = []
+                return []
 
-        # KMS retrieval: query user-curated knowledge entries. Gated by the
-        # kms_enabled master switch (also re-checked inside the service).
-        kms_evidence: List[Any] = []
-        if (
-            self._kms_retrieval is not None
-            and vault_id is not None
-            and settings.kms_enabled
-        ):
+        async def _kms_retrieve() -> List[Any]:
+            if (
+                self._kms_retrieval is None
+                or vault_id is None
+                or not settings.kms_enabled
+            ):
+                return []
             try:
-                kms_evidence = await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     self._kms_retrieval.retrieve, retrieval_query, vault_id
                 )
-                logger.info("[query] KMS retrieval: %d candidates", len(kms_evidence))
+                logger.info("[query] KMS retrieval: %d candidates", len(result))
+                return result
             except Exception as exc:
                 logger.warning("KMS retrieval failed: %s", exc)
-                kms_evidence = []
+                return []
+
+        wiki_evidence, kms_evidence = await asyncio.gather(
+            _wiki_retrieve(), _kms_retrieve()
+        )
 
         # Update trace with wiki results
         query_type = _classify_query(retrieval_query)

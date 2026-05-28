@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
-import { WikiPageList } from "./WikiPageList";
+import { WikiPageList, PAGE_TYPES } from "./WikiPageList";
 import { WikiPageDetail } from "./WikiPageDetail";
 import { WikiEditDialog } from "./WikiEditDialog";
 import { WikiLintPanel } from "./WikiLintPanel";
@@ -11,11 +11,10 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { AlertCircle, Layers, Search, Plus } from "lucide-react";
+import { AlertCircle, Layers, Search, Plus, Activity } from "lucide-react";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
-import { PAGE_TYPES } from "./WikiPageList";
 import { EmptyState } from "@/components/EmptyState";
-import { API_BASE_URL } from "@/lib/api";
+import { API_BASE_URL, getWikiActivityFeed } from "@/lib/api";
 
 export function wikiEventsUrl(vaultId: number | string): string {
   return `${API_BASE_URL}/wiki/events?vault_id=${encodeURIComponent(String(vaultId))}`;
@@ -27,6 +26,11 @@ export default function WikiPage() {
   const [editingPage, setEditingPage] = useState<import("@/lib/api").WikiPage | null>(null);
   const [lintPanelOpen, setLintPanelOpen] = useState(false);
   const [jobsPanelOpen, setJobsPanelOpen] = useState(false);
+  const [activityPanelOpen, setActivityPanelOpen] = useState(false);
+  const [activityEntries, setActivityEntries] = useState<
+    Array<{ id: number; action: string; page_title?: string; user?: string; created_at: string }>
+  >([]);
+  const [activityLoading, setActivityLoading] = useState(false);
   const [search, setSearch] = useState("");
   const [activeType, setActiveType] = useState("");
   const [jobsRefreshSignal, setJobsRefreshSignal] = useState(0);
@@ -101,6 +105,16 @@ export default function WikiPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeVaultId]);
 
+  // Fetch activity feed when panel opens
+  useEffect(() => {
+    if (!activityPanelOpen || !activeVaultId) return;
+    setActivityLoading(true);
+    getWikiActivityFeed(activeVaultId, 50)
+      .then((data) => setActivityEntries(Array.isArray(data) ? data : data.entries ?? []))
+      .catch(() => setActivityEntries([]))
+      .finally(() => setActivityLoading(false));
+  }, [activityPanelOpen, activeVaultId]);
+
   function handleCreateClick() {
     setEditingPage(null);
     setEditDialogOpen(true);
@@ -150,14 +164,21 @@ export default function WikiPage() {
           <VaultSelector />
           <Button
             variant="outline"
-            onClick={() => { setJobsPanelOpen((v) => !v); setLintPanelOpen(false); }}
+            onClick={() => { setActivityPanelOpen((v) => !v); setJobsPanelOpen(false); setLintPanelOpen(false); }}
+          >
+            <Activity className="w-4 h-4 mr-1" />
+            Activity
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => { setJobsPanelOpen((v) => !v); setLintPanelOpen(false); setActivityPanelOpen(false); }}
           >
             <Layers className="w-4 h-4 mr-1" />
             Jobs
           </Button>
           <Button
             variant="outline"
-            onClick={() => { setLintPanelOpen((v) => !v); setJobsPanelOpen(false); }}
+            onClick={() => { setLintPanelOpen((v) => !v); setJobsPanelOpen(false); setActivityPanelOpen(false); }}
           >
             <AlertCircle className="w-4 h-4 mr-1" />
             Lint {lintFindings.length > 0 && `(${lintFindings.length})`}
@@ -225,6 +246,8 @@ export default function WikiPage() {
               pages={pages}
               loading={loading}
               onSelect={openPage}
+              vaultId={activeVaultId}
+              onRefresh={() => fetchPages({ page_type: activeType || undefined, search: search || undefined })}
             />
           )}
           {error && (
@@ -251,6 +274,7 @@ export default function WikiPage() {
               findings={lintFindings}
               loading={loading}
               onRunLint={handleRunLint}
+              vaultId={activeVaultId}
             />
           </div>
         )}
@@ -259,6 +283,35 @@ export default function WikiPage() {
         {jobsPanelOpen && activeVaultId && (
           <div className="w-80 border-l border-border p-4 overflow-y-auto shrink-0">
             <WikiJobsPanel vaultId={activeVaultId} refreshSignal={jobsRefreshSignal} />
+          </div>
+        )}
+
+        {/* Activity panel: right side overlay */}
+        {activityPanelOpen && activeVaultId && (
+          <div className="w-80 border-l border-border p-4 overflow-y-auto shrink-0">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold">Activity Feed</h3>
+            </div>
+            {activityLoading && <p className="text-xs text-muted-foreground">Loading...</p>}
+            {!activityLoading && activityEntries.length === 0 && (
+              <p className="text-xs text-muted-foreground">No recent activity.</p>
+            )}
+            {!activityLoading && activityEntries.length > 0 && (
+              <div className="flex flex-col gap-2">
+                {activityEntries.map((entry) => (
+                  <div key={entry.id} className="rounded-md border border-border px-3 py-2 text-xs">
+                    <div className="font-medium capitalize">{entry.action.replace(/_/g, " ")}</div>
+                    {entry.page_title && (
+                      <div className="text-muted-foreground truncate">{entry.page_title}</div>
+                    )}
+                    <div className="flex items-center gap-2 mt-1 text-muted-foreground">
+                      {entry.user && <span>{entry.user}</span>}
+                      <span>{new Date(entry.created_at).toLocaleString()}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>

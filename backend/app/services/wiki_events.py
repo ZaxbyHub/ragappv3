@@ -56,6 +56,40 @@ class WikiEventBus:
                 except Exception:
                     logger.debug("wiki event bus: dropped event for vault %d", vault_id)
 
+    def publish_page_change(
+        self,
+        vault_id: int,
+        page_id: int,
+        action: str,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Publish a wiki page change event (created/updated/deleted)."""
+        event: dict = {
+            "type": "page_change",
+            "page_id": page_id,
+            "action": action,
+        }
+        if user_id is not None:
+            event["user_id"] = user_id
+        self.publish(vault_id, event)
+
+    def publish_claim_change(
+        self,
+        vault_id: int,
+        claim_id: int,
+        action: str,
+        user_id: Optional[int] = None,
+    ) -> None:
+        """Publish a wiki claim change event (created/updated/deleted)."""
+        event: dict = {
+            "type": "claim_change",
+            "claim_id": claim_id,
+            "action": action,
+        }
+        if user_id is not None:
+            event["user_id"] = user_id
+        self.publish(vault_id, event)
+
 
 _bus: Optional[WikiEventBus] = None
 

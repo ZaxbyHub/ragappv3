@@ -2072,6 +2072,46 @@ export async function getMemoryWikiStatus(memoryId: number, vaultId: number): Pr
   return response.data;
 }
 
+// Version history
+export async function getWikiPageVersions(pageId: number, vaultId: number) {
+  const response = await apiClient.get(`/wiki/pages/${pageId}/versions`, { params: { vault_id: vaultId } });
+  return response.data;
+}
+
+// File attachments
+export async function getWikiPageFiles(pageId: number, vaultId: number) {
+  const response = await apiClient.get(`/wiki/pages/${pageId}/files`, { params: { vault_id: vaultId } });
+  return response.data;
+}
+
+export async function attachWikiPageFile(pageId: number, vaultId: number, fileId: number) {
+  const response = await apiClient.post(`/wiki/pages/${pageId}/files`, { vault_id: vaultId, file_id: fileId });
+  return response.data;
+}
+
+export async function detachWikiPageFile(pageId: number, fileId: number, vaultId: number) {
+  const response = await apiClient.delete(`/wiki/pages/${pageId}/files/${fileId}`, { params: { vault_id: vaultId } });
+  return response.data;
+}
+
+// Backlinks
+export async function getWikiPageBacklinks(pageId: number, vaultId: number) {
+  const response = await apiClient.get(`/wiki/pages/${pageId}/backlinks`, { params: { vault_id: vaultId } });
+  return response.data;
+}
+
+// Activity feed
+export async function getWikiActivityFeed(vaultId: number, limit: number = 50) {
+  const response = await apiClient.get("/wiki/activity", { params: { vault_id: vaultId, limit } });
+  return response.data;
+}
+
+// Bulk operations
+export async function bulkWikiPageAction(vaultId: number, pageIds: number[], action: "delete" | "update", updates?: Record<string, unknown>) {
+  const response = await apiClient.post("/wiki/pages/bulk", { vault_id: vaultId, page_ids: pageIds, action, updates });
+  return response.data;
+}
+
 export async function resolveWikiLintFinding(
   findingId: number,
   vaultId: number,

@@ -84,6 +84,7 @@ class WikiPageCreateRequest(BaseModel):
     summary: str = ""
     status: str = "draft"
     confidence: float = 0.0
+    parent_id: Optional[int] = None
 
 
 class WikiPageUpdateRequest(BaseModel):
@@ -94,6 +95,8 @@ class WikiPageUpdateRequest(BaseModel):
     summary: Optional[str] = None
     status: Optional[str] = None
     confidence: Optional[float] = None
+    parent_id: Optional[int] = None
+    expected_version: Optional[int] = None
 
 
 class WikiClaimCreateRequest(BaseModel):
@@ -131,6 +134,18 @@ class PromoteMemoryRequest(BaseModel):
 
 class LintRunRequest(BaseModel):
     vault_id: int
+
+
+class WikiFileAttachRequest(BaseModel):
+    vault_id: int
+    file_id: int
+
+
+class WikiBulkRequest(BaseModel):
+    vault_id: int
+    page_ids: list[int] = Field(..., min_length=1)
+    action: str = Field(..., description="Action: delete or update")
+    updates: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +189,11 @@ async def create_wiki_page(
             status=request.status,
             confidence=request.confidence,
             created_by=user.get("id"),
+            parent_id=request.parent_id,
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Error creating wiki page")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Failed to create wiki page")
     return _page_dict(page)
 
 
@@ -191,7 +207,14 @@ async def get_wiki_page(
     page = store.get_page(page_id)
     if not page:
         raise HTTPException(status_code=404, detail="Wiki page not found")
-    await _require_vault_read(user, page.vault_id)
+    # F-003: collapse a vault-access denial to 404 so an unauthorized caller cannot
+    # distinguish "exists in another vault" (403) from "does not exist" (404).
+    try:
+        await _require_vault_read(user, page.vault_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        raise
     return _page_dict(page)
 
 
@@ -207,10 +230,30 @@ async def update_wiki_page(
     page = store.get_page(page_id, load_relations=False)
     if not page:
         raise HTTPException(status_code=404, detail="Wiki page not found")
-    await _require_vault_write(user, page.vault_id)
+    # F-003: collapse a vault-access denial to 404 (existence non-distinguishable).
+    try:
+        await _require_vault_write(user, page.vault_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        raise
     updates = request.model_dump(exclude_none=True)
-    updated = store.update_page(page_id, page.vault_id, **updates)
-    return _page_dict(updated)
+    expected_version = updates.pop("expected_version", None)
+    try:
+        updated = store.update_page(
+            page_id,
+            page.vault_id,
+            expected_version=expected_version,
+            edited_by=user.get("id"),
+            **updates,
+        )
+    except ValueError as e:
+        if "Version conflict" in str(e):
+            raise HTTPException(status_code=409, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
+    result = _page_dict(updated)
+    result["version"] = updated.version if updated else None
+    return result
 
 
 @router.delete("/wiki/pages/{page_id}", status_code=204)
@@ -224,8 +267,163 @@ async def delete_wiki_page(
     page = store.get_page(page_id, load_relations=False)
     if not page:
         raise HTTPException(status_code=404, detail="Wiki page not found")
-    await _require_vault_write(user, page.vault_id)
+    # F-003: collapse a vault-access denial to 404 (existence non-distinguishable).
+    try:
+        await _require_vault_write(user, page.vault_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        raise
     store.delete_page(page_id, page.vault_id)
+
+
+# ---------------------------------------------------------------------------
+# Page version history (DD-C003)
+# ---------------------------------------------------------------------------
+
+@router.get("/wiki/pages/{page_id}/versions")
+async def list_page_versions(
+    page_id: int,
+    vault_id: int = Query(...),
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+):
+    await _require_vault_read(user, vault_id)
+    store = WikiStore(db)
+    page = store.get_page(page_id, load_relations=False)
+    if not page:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    if page.vault_id != vault_id:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    versions = store.list_versions(page_id)
+    return {"versions": [_as_dict(v) for v in versions]}
+
+
+# ---------------------------------------------------------------------------
+# Page file attachments (DD-C019)
+# ---------------------------------------------------------------------------
+
+@router.post("/wiki/pages/{page_id}/files", status_code=201)
+async def attach_file_to_page(
+    page_id: int,
+    request: WikiFileAttachRequest,
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    await _require_vault_write(user, request.vault_id)
+    store = WikiStore(db)
+    page = store.get_page(page_id, load_relations=False)
+    if not page:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    if page.vault_id != request.vault_id:
+        raise HTTPException(status_code=403, detail="Page does not belong to this vault")
+    try:
+        pf = store.attach_file(page_id, request.file_id, request.vault_id)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="File already attached to this page")
+    except Exception:
+        logger.exception("Error attaching file to wiki page")
+        raise HTTPException(status_code=400, detail="Failed to attach file to page")
+    return _as_dict(pf)
+
+
+@router.delete("/wiki/pages/{page_id}/files/{file_id}", status_code=204)
+async def detach_file_from_page(
+    page_id: int,
+    file_id: int,
+    vault_id: int = Query(...),
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    await _require_vault_write(user, vault_id)
+    store = WikiStore(db)
+    removed = store.detach_file(page_id, file_id, vault_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="File attachment not found")
+
+
+@router.get("/wiki/pages/{page_id}/files")
+async def list_page_files(
+    page_id: int,
+    vault_id: int = Query(...),
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+):
+    await _require_vault_read(user, vault_id)
+    store = WikiStore(db)
+    page = store.get_page(page_id, load_relations=False)
+    if not page:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    if page.vault_id != vault_id:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    files = store.list_page_files(page_id)
+    return {"files": [_as_dict(f) for f in files]}
+
+
+# ---------------------------------------------------------------------------
+# Backlinks (DD-C030)
+# ---------------------------------------------------------------------------
+
+@router.get("/wiki/pages/{page_id}/backlinks")
+async def list_page_backlinks(
+    page_id: int,
+    vault_id: int = Query(...),
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+):
+    await _require_vault_read(user, vault_id)
+    store = WikiStore(db)
+    page = store.get_page(page_id, load_relations=False)
+    if not page:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    if page.vault_id != vault_id:
+        raise HTTPException(status_code=404, detail="Wiki page not found")
+    backlinks = store.list_backlinks(page_id, vault_id)
+    return {"backlinks": [_as_dict(bl) for bl in backlinks]}
+
+
+# ---------------------------------------------------------------------------
+# Activity feed (DD-C026)
+# ---------------------------------------------------------------------------
+
+@router.get("/wiki/activity")
+async def list_wiki_activity(
+    vault_id: int = Query(...),
+    limit: int = Query(50, ge=1, le=200),
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+):
+    await _require_vault_read(user, vault_id)
+    store = WikiStore(db)
+    entries = store.list_activity(vault_id, limit=limit)
+    return {"activity": [_as_dict(e) for e in entries]}
+
+
+# ---------------------------------------------------------------------------
+# Bulk operations (DD-C025)
+# ---------------------------------------------------------------------------
+
+@router.post("/wiki/pages/bulk")
+async def bulk_wiki_pages(
+    request: WikiBulkRequest,
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    await _require_vault_write(user, request.vault_id)
+    store = WikiStore(db)
+    if request.action == "delete":
+        count = store.bulk_delete_pages(request.page_ids, request.vault_id)
+        return {"action": "delete", "deleted": count}
+    elif request.action == "update":
+        if not request.updates:
+            raise HTTPException(status_code=400, detail="updates field required for update action")
+        pages = store.bulk_update_pages(request.page_ids, request.vault_id, **request.updates)
+        return {"action": "update", "updated": len(pages), "pages": [_as_dict(p) for p in pages]}
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown bulk action: {request.action}")
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +434,14 @@ async def delete_wiki_page(
 async def list_wiki_entities(
     vault_id: int = Query(...),
     search: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
     await _require_vault_read(user, vault_id)
     store = WikiStore(db)
-    entities = store.list_entities(vault_id, search=search)
+    entities = store.list_entities(vault_id, search=search, limit=limit, offset=offset)
     return {"entities": [_as_dict(e) for e in entities]}
 
 
@@ -256,12 +456,17 @@ async def list_wiki_claims(
     entity: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
     await _require_vault_read(user, vault_id)
     store = WikiStore(db)
-    claims = store.list_claims(vault_id, page_id=page_id, entity=entity, search=search, status=status)
+    claims = store.list_claims(
+        vault_id, page_id=page_id, entity=entity, search=search, status=status,
+        limit=limit, offset=offset,
+    )
     return {"claims": [_as_dict(c) for c in claims]}
 
 
@@ -465,9 +670,9 @@ async def promote_memory_to_wiki(
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
-    except Exception as e:
+    except Exception:
         logger.exception("Error promoting memory to wiki")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Failed to promote memory to wiki")
 
     return {
         "page": _page_dict(result["page"]),
@@ -542,12 +747,15 @@ async def wiki_events_stream(
 async def search_wiki(
     vault_id: int = Query(...),
     q: str = Query(..., min_length=1),
+    page_type: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    sort_by: Optional[str] = Query(None, description="Sort pages by: title, updated_at, confidence"),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
     await _require_vault_read(user, vault_id)
     store = WikiStore(db)
-    results = store.search(vault_id, q)
+    results = store.search(vault_id, q, page_type=page_type, status=status, sort_by=sort_by)
     return {
         "query": q,
         "pages": [_as_dict(p) for p in results["pages"]],
@@ -656,12 +864,12 @@ async def get_document_wiki_status(
     db.row_factory = sqlite3.Row
     store = WikiStore(db)
 
-    # Collect ingest jobs for this file
-    jobs = store.list_jobs(vault_id)
-    file_jobs = sorted(
-        [j for j in jobs if j.trigger_type == "ingest" and j.trigger_id == f"file:{file_id}"],
-        key=lambda j: j.created_at,
-        reverse=True,
+    # Collect ingest jobs for this file (filtered + bounded in SQL — F-012)
+    file_jobs = store.list_jobs(
+        vault_id,
+        trigger_type="ingest",
+        trigger_id=f"file:{file_id}",
+        limit=50,
     )
     latest_job = file_jobs[0] if file_jobs else None
 
@@ -756,15 +964,11 @@ async def get_memory_wiki_status(
     db.row_factory = sqlite3.Row
     store = WikiStore(db)
 
-    # Collect memory jobs
-    jobs = store.list_jobs(vault_id)
-    mem_jobs = sorted(
-        [j for j in jobs
-         if j.trigger_type in ("memory", "manual")
-         and j.trigger_id == f"memory:{memory_id}"],
-        key=lambda j: j.created_at,
-        reverse=True,
-    )
+    # Collect memory jobs (trigger_id filtered + bounded in SQL — F-012).
+    # trigger_type can be either "memory" or "manual", so keep that check in Python
+    # over the already-bounded result set.
+    jobs = store.list_jobs(vault_id, trigger_id=f"memory:{memory_id}", limit=50)
+    mem_jobs = [j for j in jobs if j.trigger_type in ("memory", "manual")]
     latest_job = mem_jobs[0] if mem_jobs else None
 
     # Claims sourced from this memory

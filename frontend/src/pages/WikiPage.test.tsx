@@ -56,8 +56,8 @@ vi.mock("@/pages/WikiEditDialog", () => ({
 }));
 
 vi.mock("@/pages/WikiLintPanel", () => ({
-  WikiLintPanel: ({ onRunLint }: { onRunLint: () => void }) => (
-    <div data-testid="wiki-lint-panel">
+  WikiLintPanel: ({ onRunLint, vaultId }: { onRunLint: () => void; vaultId: number | null }) => (
+    <div data-testid="wiki-lint-panel" data-vault-id={vaultId}>
       <button onClick={onRunLint} data-testid="run-lint-btn">Run Lint</button>
     </div>
   ),

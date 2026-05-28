@@ -88,7 +88,7 @@ class CuratorResult:
     input_chars: int = 0
 
     def to_summary(self) -> dict[str, Any]:
-        return {
+        summary: dict[str, Any] = {
             "accepted": len(self.accepted),
             "rejected": len(self.rejected),
             "lint": len(self.lint_findings),
@@ -96,6 +96,12 @@ class CuratorResult:
             "calls": self.calls,
             "input_chars": self.input_chars,
         }
+        if self.rejected:
+            summary["rejections"] = [
+                {"claim_text": r.claim_text, "reason": r.reason}
+                for r in self.rejected
+            ]
+        return summary
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +347,11 @@ class WikiCurator:
                 merged_contradictions.extend(
                     c for c in raw_contradictions if isinstance(c, dict)
                 )
+
+        # Sort merged claims deterministically so that when concurrency > 1
+        # and two chunks propose the same claim, the dedup winner is always
+        # the same regardless of parallel execution order.
+        merged_claims.sort(key=lambda c: (str(c.get("claim_text") or ""), str(c.get("chunk_id") or "")))
 
         for raw in merged_claims:
             try:

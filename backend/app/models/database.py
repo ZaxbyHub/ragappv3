@@ -350,6 +350,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
 CREATE TABLE IF NOT EXISTS wiki_pages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     vault_id INTEGER NOT NULL,
+    parent_id INTEGER REFERENCES wiki_pages(id) ON DELETE SET NULL,
     slug TEXT NOT NULL,
     title TEXT NOT NULL,
     page_type TEXT NOT NULL CHECK (page_type IN (
@@ -360,6 +361,7 @@ CREATE TABLE IF NOT EXISTS wiki_pages (
     status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN (
         'draft','verified','stale','needs_review','archived')),
     confidence REAL DEFAULT 0.0,
+    version INTEGER NOT NULL DEFAULT 1,
     created_by INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -385,6 +387,7 @@ CREATE TABLE IF NOT EXISTS wiki_claims (
     vault_id INTEGER NOT NULL,
     page_id INTEGER REFERENCES wiki_pages(id) ON DELETE SET NULL,
     claim_text TEXT NOT NULL,
+    normalized_text TEXT,
     claim_type TEXT NOT NULL DEFAULT 'fact',
     subject TEXT,
     predicate TEXT,
@@ -407,7 +410,7 @@ CREATE TABLE IF NOT EXISTS wiki_claim_sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     claim_id INTEGER NOT NULL REFERENCES wiki_claims(id) ON DELETE CASCADE,
     source_kind TEXT NOT NULL CHECK (source_kind IN (
-        'document','memory','chat_message','manual')),
+        'document','memory','chat_message','manual','wiki')),
     file_id INTEGER,
     chunk_id TEXT,
     memory_id INTEGER,
@@ -430,7 +433,8 @@ CREATE TABLE IF NOT EXISTS wiki_relations (
     object_text TEXT,
     claim_id INTEGER REFERENCES wiki_claims(id) ON DELETE CASCADE,
     confidence REAL DEFAULT 0.0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(subject_entity_id, predicate, object_entity_id)
 );
 
 CREATE TABLE IF NOT EXISTS wiki_compile_jobs (
@@ -523,9 +527,69 @@ CREATE INDEX IF NOT EXISTS idx_wiki_pages_vault_type_status ON wiki_pages(vault_
 CREATE INDEX IF NOT EXISTS idx_wiki_pages_vault_slug ON wiki_pages(vault_id, slug);
 CREATE INDEX IF NOT EXISTS idx_wiki_entities_vault_name ON wiki_entities(vault_id, canonical_name);
 CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_page_status ON wiki_claims(vault_id, page_id, status);
+CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_normalized ON wiki_claims(vault_id, normalized_text);
 CREATE INDEX IF NOT EXISTS idx_wiki_claim_sources_claim_id ON wiki_claim_sources(claim_id);
 CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_vault_status ON wiki_compile_jobs(vault_id, status);
 CREATE INDEX IF NOT EXISTS idx_wiki_lint_findings_vault_status_severity ON wiki_lint_findings(vault_id, status, severity);
+
+-- Wiki page version history (DD-C003)
+CREATE TABLE IF NOT EXISTS wiki_page_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+    vault_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    markdown TEXT NOT NULL DEFAULT '',
+    summary TEXT DEFAULT '',
+    status TEXT NOT NULL,
+    confidence REAL DEFAULT 0.0,
+    edited_by INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_wiki_page_versions_page ON wiki_page_versions(page_id);
+
+-- Wiki page file attachments (DD-C019)
+CREATE TABLE IF NOT EXISTS wiki_page_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    vault_id INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(page_id, file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_wiki_page_files_page ON wiki_page_files(page_id);
+CREATE INDEX IF NOT EXISTS idx_wiki_page_files_file ON wiki_page_files(file_id);
+
+-- Wiki inter-page links and backlinks (DD-C030)
+CREATE TABLE IF NOT EXISTS wiki_page_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+    target_page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+    vault_id INTEGER NOT NULL,
+    link_text TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_page_id, target_page_id)
+);
+CREATE INDEX IF NOT EXISTS idx_wiki_page_links_source ON wiki_page_links(source_page_id);
+CREATE INDEX IF NOT EXISTS idx_wiki_page_links_target ON wiki_page_links(target_page_id);
+
+-- Wiki activity log (DD-C026)
+CREATE TABLE IF NOT EXISTS wiki_activity_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vault_id INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN (
+        'page_created','page_updated','page_deleted',
+        'claim_created','claim_updated','claim_deleted',
+        'entity_created','entity_updated',
+        'job_completed','job_failed',
+        'lint_resolved','lint_dismissed')),
+    target_type TEXT NOT NULL CHECK (target_type IN (
+        'page','claim','entity','job','lint_finding')),
+    target_id INTEGER NOT NULL,
+    user_id INTEGER,
+    details_json TEXT DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_wiki_activity_log_vault ON wiki_activity_log(vault_id, created_at DESC);
 
 -- ============================================================
 -- KMS / Knowledge Management tables (user-curated documentation)
@@ -781,6 +845,11 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_files_search_fts(sqlite_path)
     migrate_add_files_content_fts(sqlite_path)
     migrate_add_curator_claim_support(sqlite_path)
+    migrate_widen_wiki_claim_sources_source_kind(sqlite_path)
+    migrate_add_wiki_relations_unique(sqlite_path)
+    migrate_add_wiki_page_hierarchy_and_versioning(sqlite_path)
+    migrate_add_wiki_supporting_tables(sqlite_path)
+    migrate_add_wiki_claims_normalized_text(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -2136,6 +2205,260 @@ migrate_add_files_content_fts('/path/to/app.db')"
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
+    """Migration: add 'wiki' to the wiki_claim_sources.source_kind CHECK constraint.
+
+    SQLite cannot ALTER a CHECK constraint, so we use the rename-recreate-copy
+    pattern. wiki_claim_sources has NO child tables referencing it, NO FTS
+    virtual table, and NO triggers — simpler than the wiki_claims rebuild.
+
+    We still set ``legacy_alter_table=ON`` and ``foreign_keys=OFF`` during the
+    swap for safety, and validate FK integrity afterwards.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    conn.isolation_level = None
+    try:
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_claim_sources'"
+        ).fetchone()
+        if not tbl:
+            return
+
+        old_present = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_claim_sources_old'"
+        ).fetchone()
+        if old_present and not tbl:
+            conn.execute("PRAGMA legacy_alter_table = ON")
+            conn.execute("ALTER TABLE wiki_claim_sources_old RENAME TO wiki_claim_sources")
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+        elif old_present:
+            conn.execute("DROP TABLE IF EXISTS wiki_claim_sources_old")
+
+        create_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='wiki_claim_sources'"
+        ).fetchone()
+        if create_sql and "'wiki'" in create_sql[0]:
+            return
+
+        before_count = conn.execute("SELECT COUNT(*) FROM wiki_claim_sources").fetchone()[0]
+
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("PRAGMA legacy_alter_table = ON")
+        try:
+            conn.execute("ALTER TABLE wiki_claim_sources RENAME TO wiki_claim_sources_old")
+
+            conn.execute(
+                """
+                CREATE TABLE wiki_claim_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    claim_id INTEGER NOT NULL REFERENCES wiki_claims(id) ON DELETE CASCADE,
+                    source_kind TEXT NOT NULL CHECK (source_kind IN (
+                        'document','memory','chat_message','manual','wiki')),
+                    file_id INTEGER,
+                    chunk_id TEXT,
+                    memory_id INTEGER,
+                    chat_message_id INTEGER,
+                    source_label TEXT,
+                    quote TEXT,
+                    char_start INTEGER,
+                    char_end INTEGER,
+                    page_number INTEGER,
+                    confidence REAL DEFAULT 0.0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                INSERT INTO wiki_claim_sources (
+                    id, claim_id, source_kind, file_id, chunk_id, memory_id,
+                    chat_message_id, source_label, quote, char_start, char_end,
+                    page_number, confidence, created_at
+                )
+                SELECT id, claim_id, source_kind, file_id, chunk_id, memory_id,
+                       chat_message_id, source_label, quote, char_start, char_end,
+                       page_number, confidence, created_at
+                FROM wiki_claim_sources_old
+                """
+            )
+
+            after_count = conn.execute("SELECT COUNT(*) FROM wiki_claim_sources").fetchone()[0]
+            if after_count != before_count:
+                raise RuntimeError(
+                    f"migrate_widen_wiki_claim_sources_source_kind: row-count "
+                    f"parity failed ({before_count} -> {after_count}). "
+                    f"wiki_claim_sources_old has been preserved."
+                )
+
+            conn.execute("DROP TABLE wiki_claim_sources_old")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_wiki_claim_sources_claim_id "
+                "ON wiki_claim_sources(claim_id)"
+            )
+        finally:
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            conn.execute("PRAGMA foreign_keys = ON")
+
+        violations = conn.execute("PRAGMA foreign_key_check(wiki_claim_sources)").fetchall()
+        if violations:
+            raise RuntimeError(
+                f"migrate_widen_wiki_claim_sources_source_kind: "
+                f"foreign_key_check reported {len(violations)} violation(s): "
+                f"{violations[:5]}"
+            )
+    finally:
+        conn.close()
+
+
+def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
+    """Migration: add UNIQUE constraint on wiki_relations(subject_entity_id, predicate, object_entity_id).
+
+    Deduplicates existing rows first (keeps highest id per triple), then
+    creates a unique index. Idempotent.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_relations'"
+        ).fetchone()
+        if not tbl:
+            return
+
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_relations_unique_triple'"
+        ).fetchone()
+        if idx:
+            return
+
+        conn.execute(
+            """DELETE FROM wiki_relations WHERE id NOT IN (
+                SELECT MAX(id) FROM wiki_relations
+                GROUP BY subject_entity_id, predicate, object_entity_id
+            )"""
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_wiki_relations_unique_triple "
+            "ON wiki_relations(subject_entity_id, predicate, object_entity_id)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_wiki_page_hierarchy_and_versioning(sqlite_path: str) -> None:
+    """Migration: add parent_id and version columns to wiki_pages. Idempotent."""
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(wiki_pages)").fetchall()]
+        if "parent_id" not in cols:
+            conn.execute("ALTER TABLE wiki_pages ADD COLUMN parent_id INTEGER REFERENCES wiki_pages(id) ON DELETE SET NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_wiki_pages_parent ON wiki_pages(parent_id)")
+        if "version" not in cols:
+            conn.execute("ALTER TABLE wiki_pages ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_wiki_supporting_tables(sqlite_path: str) -> None:
+    """Migration: add wiki_page_versions, wiki_page_files, wiki_page_links,
+    wiki_activity_log tables. Idempotent via IF NOT EXISTS."""
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS wiki_page_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+                vault_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                markdown TEXT NOT NULL DEFAULT '',
+                summary TEXT DEFAULT '',
+                status TEXT NOT NULL,
+                confidence REAL DEFAULT 0.0,
+                edited_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_wiki_page_versions_page ON wiki_page_versions(page_id);
+
+            CREATE TABLE IF NOT EXISTS wiki_page_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                vault_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(page_id, file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wiki_page_files_page ON wiki_page_files(page_id);
+            CREATE INDEX IF NOT EXISTS idx_wiki_page_files_file ON wiki_page_files(file_id);
+
+            CREATE TABLE IF NOT EXISTS wiki_page_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+                target_page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+                vault_id INTEGER NOT NULL,
+                link_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source_page_id, target_page_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wiki_page_links_source ON wiki_page_links(source_page_id);
+            CREATE INDEX IF NOT EXISTS idx_wiki_page_links_target ON wiki_page_links(target_page_id);
+
+            CREATE TABLE IF NOT EXISTS wiki_activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                action TEXT NOT NULL CHECK (action IN (
+                    'page_created','page_updated','page_deleted',
+                    'claim_created','claim_updated','claim_deleted',
+                    'entity_created','entity_updated',
+                    'job_completed','job_failed',
+                    'lint_resolved','lint_dismissed')),
+                target_type TEXT NOT NULL CHECK (target_type IN (
+                    'page','claim','entity','job','lint_finding')),
+                target_id INTEGER NOT NULL,
+                user_id INTEGER,
+                details_json TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_wiki_activity_log_vault ON wiki_activity_log(vault_id, created_at DESC);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_wiki_claims_normalized_text(sqlite_path: str) -> None:
+    """Migration: add normalized_text column + index to wiki_claims and backfill
+    existing rows. Idempotent. Mirrors normalize_claim_text in wiki_store."""
+    import re
+
+    def _normalize(text: str) -> str:
+        normalized = re.sub(r"[^\w\s]", "", (text or "").lower().strip())
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(wiki_claims)").fetchall()]
+        if "normalized_text" not in cols:
+            conn.execute("ALTER TABLE wiki_claims ADD COLUMN normalized_text TEXT")
+            # Backfill existing rows (SQLite has no regex, so normalize in Python).
+            rows = conn.execute("SELECT id, claim_text FROM wiki_claims").fetchall()
+            for claim_id, claim_text in rows:
+                conn.execute(
+                    "UPDATE wiki_claims SET normalized_text = ? WHERE id = ?",
+                    (_normalize(claim_text), claim_id),
+                )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_normalized "
+            "ON wiki_claims(vault_id, normalized_text)"
+        )
+        conn.commit()
     finally:
         conn.close()
 

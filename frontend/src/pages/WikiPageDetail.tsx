@@ -1,9 +1,11 @@
+import { useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { ArrowLeft, Edit, Trash2 } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronRight, Edit, FileText, Link2, Trash2, History } from "lucide-react";
 import type { WikiPage, WikiClaim, WikiLintFinding } from "@/lib/api";
+import { getWikiPageVersions, getWikiPageFiles, getWikiPageBacklinks } from "@/lib/api";
 
 interface WikiPageDetailProps {
   page: WikiPage;
@@ -90,6 +92,166 @@ function LintFindingRow({ finding }: { finding: WikiLintFinding }) {
       <div className="font-medium">{finding.title}</div>
       {finding.details && <div className="text-xs mt-0.5 opacity-75">{finding.details}</div>}
     </div>
+  );
+}
+
+interface VersionEntry {
+  version: number;
+  edited_by: string | null;
+  edited_at: string;
+  diff_summary: string | null;
+}
+
+interface FileAttachment {
+  file_id: number;
+  filename: string;
+  attached_at: string;
+}
+
+interface BacklinkEntry {
+  page_id: number;
+  title: string;
+  slug: string;
+}
+
+function VersionHistorySection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
+  const [open, setOpen] = useState(false);
+  const [versions, setVersions] = useState<VersionEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    getWikiPageVersions(pageId, vaultId)
+      .then((data) => setVersions(Array.isArray(data) ? data : data.versions ?? []))
+      .catch(() => setVersions([]))
+      .finally(() => setLoading(false));
+  }, [open, pageId, vaultId]);
+
+  return (
+    <Card>
+      <CardHeader
+        className="pb-2 pt-3 px-4 cursor-pointer select-none"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <CardTitle className="text-sm flex items-center gap-1">
+          {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          <History className="w-4 h-4" />
+          Version History
+        </CardTitle>
+      </CardHeader>
+      {open && (
+        <CardContent className="px-4 pb-3">
+          {loading && <p className="text-xs text-muted-foreground">Loading...</p>}
+          {!loading && versions.length === 0 && (
+            <p className="text-xs text-muted-foreground">No version history available.</p>
+          )}
+          {!loading &&
+            versions.map((v) => (
+              <div key={v.version} className="border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
+                <div className="flex items-center gap-2 text-xs">
+                  <Badge variant="outline" className="text-[10px]">v{v.version}</Badge>
+                  <span className="text-muted-foreground">{new Date(v.edited_at).toLocaleString()}</span>
+                  {v.edited_by && <span className="text-muted-foreground">by {v.edited_by}</span>}
+                </div>
+                {v.diff_summary && <p className="text-xs text-muted-foreground mt-0.5">{v.diff_summary}</p>}
+              </div>
+            ))}
+        </CardContent>
+      )}
+    </Card>
+  );
+}
+
+function AttachmentsSection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
+  const [open, setOpen] = useState(false);
+  const [files, setFiles] = useState<FileAttachment[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    getWikiPageFiles(pageId, vaultId)
+      .then((data) => setFiles(Array.isArray(data) ? data : data.files ?? []))
+      .catch(() => setFiles([]))
+      .finally(() => setLoading(false));
+  }, [open, pageId, vaultId]);
+
+  return (
+    <Card>
+      <CardHeader
+        className="pb-2 pt-3 px-4 cursor-pointer select-none"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <CardTitle className="text-sm flex items-center gap-1">
+          {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          <FileText className="w-4 h-4" />
+          Attachments
+        </CardTitle>
+      </CardHeader>
+      {open && (
+        <CardContent className="px-4 pb-3">
+          {loading && <p className="text-xs text-muted-foreground">Loading...</p>}
+          {!loading && files.length === 0 && (
+            <p className="text-xs text-muted-foreground">No attachments.</p>
+          )}
+          {!loading &&
+            files.map((f) => (
+              <div key={f.file_id} className="flex items-center gap-2 text-xs border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
+                <FileText className="w-3 h-3 text-muted-foreground" />
+                <span className="truncate">{f.filename}</span>
+                <span className="text-muted-foreground ml-auto">{new Date(f.attached_at).toLocaleDateString()}</span>
+              </div>
+            ))}
+        </CardContent>
+      )}
+    </Card>
+  );
+}
+
+function BacklinksSection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
+  const [open, setOpen] = useState(false);
+  const [backlinks, setBacklinks] = useState<BacklinkEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    getWikiPageBacklinks(pageId, vaultId)
+      .then((data) => setBacklinks(Array.isArray(data) ? data : data.backlinks ?? []))
+      .catch(() => setBacklinks([]))
+      .finally(() => setLoading(false));
+  }, [open, pageId, vaultId]);
+
+  return (
+    <Card>
+      <CardHeader
+        className="pb-2 pt-3 px-4 cursor-pointer select-none"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <CardTitle className="text-sm flex items-center gap-1">
+          {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+          <Link2 className="w-4 h-4" />
+          Backlinks
+        </CardTitle>
+      </CardHeader>
+      {open && (
+        <CardContent className="px-4 pb-3">
+          {loading && <p className="text-xs text-muted-foreground">Loading...</p>}
+          {!loading && backlinks.length === 0 && (
+            <p className="text-xs text-muted-foreground">No pages link to this page.</p>
+          )}
+          {!loading &&
+            backlinks.map((bl) => (
+              <div key={bl.page_id} className="flex items-center gap-2 text-xs border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
+                <Link2 className="w-3 h-3 text-muted-foreground" />
+                <span className="truncate font-medium">{bl.title}</span>
+                <span className="text-muted-foreground ml-auto">{bl.slug}</span>
+              </div>
+            ))}
+        </CardContent>
+      )}
+    </Card>
   );
 }
 
@@ -191,6 +353,15 @@ export function WikiPageDetail({ page, onBack, onEdit, onDelete }: WikiPageDetai
             </CardContent>
           </Card>
         )}
+
+        {/* Version History */}
+        <VersionHistorySection pageId={page.id} vaultId={page.vault_id} />
+
+        {/* Attachments */}
+        <AttachmentsSection pageId={page.id} vaultId={page.vault_id} />
+
+        {/* Backlinks */}
+        <BacklinksSection pageId={page.id} vaultId={page.vault_id} />
       </div>
     </ScrollArea>
   );

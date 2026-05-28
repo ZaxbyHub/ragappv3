@@ -264,7 +264,7 @@ class WikiRetrievalService:
                     candidates[key] = ev
 
         # 4. FTS page search (fallback, lower score)
-        if normalized_query and len(candidates) < 3:
+        if normalized_query and len(candidates) < 5:
             fts_page_results = self._fts_page_search(conn, normalized_query, vault_id)
             for ev in fts_page_results:
                 if entity_candidates:

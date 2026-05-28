@@ -102,7 +102,7 @@ def build_per_claim_sources(
             return mem
         if prefix == "W" and num_str in wiki_by_num:
             ref = dict(wiki_by_num[num_str])
-            ref["source_kind"] = "manual"
+            ref["source_kind"] = "wiki"
             return ref
         return None
 

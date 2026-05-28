@@ -1,6 +1,8 @@
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Play } from "lucide-react";
+import { Play, Check, X } from "lucide-react";
+import { resolveWikiLintFinding } from "@/lib/api";
 import type { WikiLintFinding } from "@/lib/api";
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -21,9 +23,23 @@ interface WikiLintPanelProps {
   findings: WikiLintFinding[];
   loading: boolean;
   onRunLint: () => void;
+  vaultId: number | null;
 }
 
-export function WikiLintPanel({ findings, loading, onRunLint }: WikiLintPanelProps) {
+export function WikiLintPanel({ findings, loading, onRunLint, vaultId }: WikiLintPanelProps) {
+  const [resolving, setResolving] = useState<number | null>(null);
+
+  const handleResolve = async (findingId: number, status: "resolved" | "dismissed") => {
+    if (!vaultId) return;
+    setResolving(findingId);
+    try {
+      await resolveWikiLintFinding(findingId, vaultId, status);
+      onRunLint();
+    } finally {
+      setResolving(null);
+    }
+  };
+
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
@@ -50,8 +66,34 @@ export function WikiLintPanel({ findings, loading, onRunLint }: WikiLintPanelPro
             {finding.details && (
               <div className="text-xs text-muted-foreground mt-0.5">{finding.details}</div>
             )}
-            <div className="text-xs text-muted-foreground mt-1 uppercase tracking-wide">
-              {finding.severity} · {finding.finding_type.replace(/_/g, " ")}
+            <div className="flex items-center justify-between mt-1">
+              <div className="text-xs text-muted-foreground uppercase tracking-wide">
+                {finding.severity} · {finding.finding_type.replace(/_/g, " ")}
+              </div>
+              {vaultId && (
+                <div className="flex gap-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-1.5 text-xs"
+                    disabled={resolving === finding.id}
+                    onClick={() => handleResolve(finding.id, "resolved")}
+                    title="Resolve"
+                  >
+                    <Check className="w-3 h-3" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-1.5 text-xs"
+                    disabled={resolving === finding.id}
+                    onClick={() => handleResolve(finding.id, "dismissed")}
+                    title="Dismiss"
+                  >
+                    <X className="w-3 h-3" />
+                  </Button>
+                </div>
+              )}
             </div>
           </CardContent>
         </Card>

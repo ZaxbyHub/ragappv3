@@ -217,7 +217,10 @@ class WikiCompiler:
           memory   → memory_id (int)
           manual   → source_label (str)
         """
-        existing = self._store.find_claim_by_text(vault_id, claim_text)
+        # Exact match first; fall back to normalized (fuzzy) match so claims that
+        # differ only in punctuation/whitespace/case are deduped (DD-C011).
+        existing = self._store.find_claim_by_text(vault_id, claim_text) or \
+            self._store.find_claim_by_normalized_text(vault_id, claim_text)
         if existing:
             # Promote unverified → active when the caller has explicit per-claim citations.
             new_status = create_kwargs.get("status")

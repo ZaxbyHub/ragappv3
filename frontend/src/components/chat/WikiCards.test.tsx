@@ -1,7 +1,25 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render as rtlRender, screen, fireEvent } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { WikiCards, WikiCard } from "./WikiCards";
 import type { WikiReference } from "@/lib/api";
+
+// WikiCard calls useNavigate() for in-app navigation; spy on it to assert routing.
+const navigateMock = vi.hoisted(() => vi.fn());
+vi.mock("react-router-dom", async () => {
+  const actual = await vi.importActual<typeof import("react-router-dom")>(
+    "react-router-dom"
+  );
+  return { ...actual, useNavigate: () => navigateMock };
+});
+
+// Components calling router hooks need a Router context (see frontend-testing-gotchas).
+const render: typeof rtlRender = (ui, options) =>
+  rtlRender(ui, { wrapper: MemoryRouter, ...options });
+
+beforeEach(() => {
+  navigateMock.mockClear();
+});
 
 const makeWiki = (overrides: Partial<WikiReference> = {}): WikiReference => ({
   wiki_label: "W1",
@@ -105,21 +123,21 @@ describe("WikiCard", () => {
     expect(screen.getByLabelText("Open wiki page Task Force Alpha")).toBeInTheDocument();
   });
 
-  it("does not render external link button when slug is null", () => {
-    render(<WikiCard wikiRef={makeWiki({ slug: null })} />);
+  it("does not render external link button when page_id and slug are both null", () => {
+    render(<WikiCard wikiRef={makeWiki({ page_id: null, slug: null })} />);
     expect(screen.queryByRole("button", { name: /open wiki page/i })).not.toBeInTheDocument();
   });
 
-  it("opens wiki page in new tab when external link is clicked", () => {
-    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
-    render(<WikiCard wikiRef={makeWiki({ slug: "task-force-alpha" })} />);
+  it("navigates to the wiki page by id when the open link is clicked", () => {
+    render(<WikiCard wikiRef={makeWiki({ page_id: 1, slug: "task-force-alpha" })} />);
     fireEvent.click(screen.getByLabelText("Open wiki page Task Force Alpha"));
-    expect(openSpy).toHaveBeenCalledWith(
-      "/wiki?page=task-force-alpha",
-      "_blank",
-      "noopener"
-    );
-    openSpy.mockRestore();
+    expect(navigateMock).toHaveBeenCalledWith("/wiki?page=1");
+  });
+
+  it("navigates by slug when page_id is null", () => {
+    render(<WikiCard wikiRef={makeWiki({ page_id: null, slug: "task-force-alpha" })} />);
+    fireEvent.click(screen.getByLabelText("Open wiki page Task Force Alpha"));
+    expect(navigateMock).toHaveBeenCalledWith("/wiki?page=task-force-alpha");
   });
 
   it("truncates long body and shows More button", () => {

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { BookOpen, ChevronDown, ChevronUp, ExternalLink } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { WikiReference } from "@/lib/api";
@@ -9,6 +10,7 @@ interface WikiCardProps {
 
 function WikiCard({ wikiRef }: WikiCardProps) {
   const [expanded, setExpanded] = useState(false);
+  const navigate = useNavigate();
   const body = wikiRef.claim_text ?? wikiRef.excerpt ?? "";
   const isLong = body.length > 160;
   const display = expanded || !isLong ? body : body.slice(0, 160) + "…";
@@ -16,8 +18,10 @@ function WikiCard({ wikiRef }: WikiCardProps) {
   const conf = wikiRef.confidence != null ? `${Math.round(wikiRef.confidence * 100)}%` : null;
 
   const handleNavigate = () => {
-    if (wikiRef.slug) {
-      window.open(`/wiki?page=${encodeURIComponent(wikiRef.slug)}`, "_blank", "noopener");
+    if (wikiRef.page_id != null) {
+      navigate(`/wiki?page=${wikiRef.page_id}`);
+    } else if (wikiRef.slug) {
+      navigate(`/wiki?page=${encodeURIComponent(wikiRef.slug)}`);
     }
   };
 
@@ -60,7 +64,7 @@ function WikiCard({ wikiRef }: WikiCardProps) {
                 <span className="capitalize">{statusLabel}</span>
               </>
             )}
-            {wikiRef.slug && (
+            {(wikiRef.page_id != null || wikiRef.slug) && (
               <button
                 type="button"
                 onClick={handleNavigate}

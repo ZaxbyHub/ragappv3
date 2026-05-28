@@ -52,7 +52,7 @@ vi.mock("./WikiEditDialog", () => ({
 }));
 
 vi.mock("./WikiLintPanel", () => ({
-  WikiLintPanel: () => <div data-testid="wiki-lint" />,
+  WikiLintPanel: ({ vaultId: _v }: { vaultId: number | null }) => <div data-testid="wiki-lint" />,
 }));
 
 vi.mock("./WikiJobsPanel", () => ({
