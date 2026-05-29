@@ -6,15 +6,12 @@ import type { NavItemId } from "./navigationTypes";
 
 const mockLogout = vi.hoisted(() => vi.fn());
 
-// Under vitest, the named icons from "@hugeicons/core-free-icons" resolve to
-// undefined, so the real HugeiconsIcon throws "currentIcon is not iterable" and
-// crashes every render. Mock the renderer to a harmless stub so the rebranded
-// component mounts. Identity of the SVG is not assertable; tests assert on the
-// stable aria-labels instead.
-vi.mock("@hugeicons/react", () => ({
-  HugeiconsIcon: () => null,
-  IconSvgElement: undefined,
-}));
+// NOTE: We intentionally do NOT mock "@hugeicons/react". The real HugeiconsIcon
+// spreads its `icon` prop (`[...icon]`), so it throws "currentIcon is not
+// iterable" if a non-array (e.g. a lucide forwardRef component such as the KMS
+// "Library" icon) is ever routed to it. Rendering the real component here is a
+// regression guard for that production crash (every authenticated page mounts
+// this rail). See the Array.isArray discriminator in NavRow.
 
 // Mock useThemeStore before importing NavigationRail (NavigationRail imports useThemeStore)
 vi.mock("@/stores/useThemeStore", () => ({
@@ -69,6 +66,24 @@ describe("NavigationRail", () => {
       expect(screen.getByLabelText("Users")).toBeInTheDocument();
       expect(screen.getByLabelText("Organizations")).toBeInTheDocument();
       expect(screen.getByLabelText("Profile")).toBeInTheDocument();
+    });
+
+    // Regression: the KMS nav item uses a lucide icon (`Library`), which is a
+    // forwardRef object, not an array. With the real HugeiconsIcon mounted,
+    // routing it through HugeiconsIcon would throw "currentIcon is not iterable"
+    // and crash every authenticated page. The KMS row must render a real icon.
+    it("renders the lucide-iconed KMS item without crashing (regression)", () => {
+      render(
+        <MemoryRouter>
+          <NavigationRail healthStatus={mockHealthStatus} />
+        </MemoryRouter>
+      );
+
+      const kmsLink = screen.getByLabelText("KMS");
+      expect(kmsLink).toBeInTheDocument();
+      // The lucide icon renders as an inline <svg>, proving it was NOT misrouted
+      // into HugeiconsIcon (which would have thrown before rendering anything).
+      expect(kmsLink.querySelector("svg")).toBeInTheDocument();
     });
 
     it("does not render chatNew item", () => {

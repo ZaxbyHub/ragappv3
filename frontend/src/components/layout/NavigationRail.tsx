@@ -48,6 +48,16 @@ const sectionLabels: Record<NavSection, string> = {
   account: "Account",
 };
 
+// Hugeicons icons are IconSvgElement arrays; everything else (lucide icons,
+// etc.) is a React component. lucide icons are forwardRef OBJECTS, not
+// functions, so a `typeof === "function"` check would misroute them into
+// HugeiconsIcon, which spreads its icon prop (`[...icon]`) and crashes with
+// "currentIcon is not iterable". Array.isArray is the correct discriminator,
+// and as a user-defined type guard it also narrows the component branch.
+function isHugeicon(icon: NavConfigItem["icon"]): icon is IconSvgElement {
+  return Array.isArray(icon);
+}
+
 function StatusIndicator({ isUp, label, loading, isExpanded }: { isUp: boolean; label: string; loading?: boolean; isExpanded?: boolean }) {
   return (
     <div className="flex items-center min-h-4 gap-2.5">
@@ -250,10 +260,10 @@ function NavRow({
       aria-label={item.label}
       title={isExpanded ? undefined : item.label}
     >
-      {typeof Icon === "function" ? (
-        <Icon className="w-4 h-4 flex-shrink-0" />
-      ) : (
+      {isHugeicon(Icon) ? (
         <HugeiconsIcon strokeWidth={1.2} icon={Icon} size={16} className="flex-shrink-0" />
+      ) : (
+        <Icon className="w-4 h-4 flex-shrink-0" />
       )}
       {isExpanded && <span className="truncate whitespace-nowrap">{item.label}</span>}
     </NavLink>
