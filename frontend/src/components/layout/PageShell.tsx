@@ -39,7 +39,7 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
       {/* Skip navigation link (CR-3) */}
       <a
         href="#main-content"
-        className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:bg-primary focus:text-primary-foreground focus:rounded-lg focus:text-sm focus:font-medium focus:shadow-lg"
+        className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:bg-primary focus:text-primary-foreground focus:rounded-sm focus:text-sm focus:font-medium focus:shadow-lg"
       >
         Skip to main content
       </a>
@@ -49,7 +49,7 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
 
       {/* Main Content Area */}
       <main id="main-content" className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
-        <div className={isChat ? "flex-1 min-h-0 overflow-hidden" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 max-w-7xl mx-auto w-full"}>
+        <div className={isChat ? "flex-1 min-h-0 overflow-hidden" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 mx-auto w-full"}>
           <AnimatePresence mode="wait">
             <motion.div
               key={location.pathname}

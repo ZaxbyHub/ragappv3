@@ -71,6 +71,30 @@ vi.mock("@/stores/useChatShellStore", () => ({
   useChatShellStore: vi.fn(),
 }));
 
+// Radix DropdownMenu cannot be opened in jsdom (no pointer-capture support), so
+// the pin/rename/delete menu items would never mount under fireEvent.click. Mock
+// the primitive so the trigger and its content render inline (always visible) —
+// the same approach the repo uses for ui/tabs and ui/select. The aria-labels on
+// each item ("Pin session"/"Rename session"/"Delete session") remain queryable.
+vi.mock("@/components/ui/dropdown-menu", async () => {
+  const React = await import("react");
+  return {
+    DropdownMenu: ({ children }: { children: React.ReactNode }) =>
+      React.createElement("div", null, children),
+    DropdownMenuTrigger: ({ children, asChild: _asChild }: { children: React.ReactNode; asChild?: boolean }) =>
+      React.createElement("div", null, children),
+    DropdownMenuContent: ({ children }: { children: React.ReactNode }) =>
+      React.createElement("div", null, children),
+    DropdownMenuItem: ({ children, onClick, "aria-label": ariaLabel, className }: any) =>
+      React.createElement(
+        "button",
+        { type: "button", role: "menuitem", onClick, "aria-label": ariaLabel, className },
+        children,
+      ),
+    DropdownMenuSeparator: () => React.createElement("hr"),
+  };
+});
+
 const Wrapper = ({ children }: { children: React.ReactNode }) => (
   <BrowserRouter>{children}</BrowserRouter>
 );
@@ -273,7 +297,9 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
       const sessionItem = await screen.findByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionItem);
-      fireEvent.click(within(sessionItem).getByLabelText("Delete session"));
+      // Pin/rename/delete now live in a dropdown opened by the "More options" button.
+      fireEvent.click(within(sessionItem).getByLabelText("More options"));
+      fireEvent.click(await screen.findByLabelText("Delete session"));
 
       // With the toast-undo flow, clicking delete immediately removes the session (optimistic removal)
       await waitFor(() => {
@@ -314,11 +340,12 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       const sessionItem = screen.getByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionItem);
 
-      const pinButton = within(sessionItem).getByLabelText("Pin session");
-
-      // Rapidly click pin 10 times
+      // Pin now lives in the "More options" dropdown, which closes on select.
+      // Reopen the menu and click "Pin session" 10 times to exercise rapid toggling.
       for (let i = 0; i < 10; i++) {
-        fireEvent.click(pinButton);
+        fireEvent.click(within(sessionItem).getByLabelText("More options"));
+        const pinItem = await screen.findByLabelText("Pin session");
+        fireEvent.click(pinItem);
       }
 
       expect(mockTogglePinSession).toHaveBeenCalledTimes(10);
@@ -357,7 +384,9 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
       const sessionElement = screen.getByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionElement);
-      fireEvent.click(screen.getByLabelText("Rename session"));
+      // Rename now lives in the "More options" dropdown.
+      fireEvent.click(within(sessionElement).getByLabelText("More options"));
+      fireEvent.click(await screen.findByLabelText("Rename session"));
 
       // useDebounce is mocked to return immediately, so no timer is needed
       // (vi.runAllTimersAsync would fail without fake timers)
@@ -466,7 +495,9 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
       const sessionElement = screen.getByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionElement);
-      fireEvent.click(screen.getByLabelText("Rename session"));
+      // Rename now lives in the "More options" dropdown.
+      fireEvent.click(within(sessionElement).getByLabelText("More options"));
+      fireEvent.click(await screen.findByLabelText("Rename session"));
 
       // useDebounce is mocked to return immediately, so no timer advancement needed
       const input = screen.getByLabelText("Edit session title");
@@ -697,7 +728,10 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       // removes the session optimistically (no confirmation dialog).
       const session1 = screen.getByText("Session 1").closest('[role="button"]');
       fireEvent.mouseEnter(session1!);
-      fireEvent.click(within(session1!).getByLabelText("Delete session"));
+      // Delete now lives in the "More options" dropdown. Scope to session1's row
+      // since every session renders its own (inline-mocked) delete item.
+      fireEvent.click(within(session1! as HTMLElement).getByLabelText("More options"));
+      fireEvent.click(within(session1! as HTMLElement).getByLabelText("Delete session"));
 
       // Session 1 should be optimistically removed from the UI immediately
       await waitFor(() => {
@@ -816,7 +850,9 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
       const sessionElement = screen.getByRole("button", { name: /chat session/i });
       fireEvent.mouseEnter(sessionElement);
-      fireEvent.click(screen.getByLabelText("Rename session"));
+      // Rename now lives in the "More options" dropdown.
+      fireEvent.click(within(sessionElement).getByLabelText("More options"));
+      fireEvent.click(await screen.findByLabelText("Rename session"));
 
       // useDebounce is mocked to return immediately, so no timer advancement needed
       const input = screen.getByLabelText("Edit session title");

@@ -83,7 +83,7 @@ describe("WikiPageList", () => {
 
   it("shows empty state when there are no pages and not loading", () => {
     render(<WikiPageList {...defaultProps()} pages={[]} />);
-    expect(screen.getByText("No pages found.")).toBeInTheDocument();
+    expect(screen.getByText("No pages found")).toBeInTheDocument();
   });
 
   it("calls onSelect with the page id when a row is clicked", () => {
@@ -150,34 +150,12 @@ describe("WikiPageList", () => {
     expect(screen.queryByText("1 selected")).not.toBeInTheDocument();
   });
 
-  it("search submit (button) calls onFilter with the query", () => {
-    const props = defaultProps();
-    render(<WikiPageList {...props} />);
-    fireEvent.change(screen.getByPlaceholderText("Search wiki..."), {
-      target: { value: "alpha" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Search" }));
-    expect(props.onFilter).toHaveBeenCalledWith({ page_type: undefined, search: "alpha" });
-  });
-
-  it("search submit on Enter calls onFilter with the query", () => {
-    const props = defaultProps();
-    render(<WikiPageList {...props} />);
-    const input = screen.getByPlaceholderText("Search wiki...");
-    fireEvent.change(input, { target: { value: "beta" } });
-    fireEvent.keyDown(input, { key: "Enter" });
-    expect(props.onFilter).toHaveBeenCalledWith({ page_type: undefined, search: "beta" });
-  });
-
-  it("changing the activeType tab fires onFilter with the page_type", async () => {
-    const props = defaultProps();
-    render(<WikiPageList {...props} />);
-    props.onFilter.mockClear();
-    fireEvent.click(screen.getByRole("tab", { name: "Entities" }));
-    await waitFor(() => {
-      expect(props.onFilter).toHaveBeenCalledWith({ page_type: "entity", search: undefined });
-    });
-  });
+  // NOTE: search/tabs/onFilter behavior moved out of WikiPageList (now a pure
+  // list) and into WikiPage.tsx during the rebrand. The equivalent coverage —
+  // search-button, Enter-key, and page-type tab driving fetchPages/listWikiPages
+  // with the right query — was relocated to WikiPage.test.tsx ("Search and filter
+  // toolbar" describe block), since this component no longer renders those
+  // affordances or accepts onFilter.
 
   it("changing the pages prop clears the current selection", () => {
     const props = defaultProps();

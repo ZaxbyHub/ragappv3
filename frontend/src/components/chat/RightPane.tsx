@@ -65,7 +65,7 @@ function highlightQueryTerms(text: string, query: string): React.ReactNode[] {
       return (
         <mark
           key={index}
-          className="bg-amber-200/80 dark:bg-amber-500/30 rounded px-0.5"
+          className="bg-amber-200/80 dark:bg-amber-500/30 rounded-sm px-0.5"
           aria-label={`Search match: ${part}`}
         >
           {part}
@@ -212,10 +212,10 @@ function SourceListItem({
       id={`evidence-source-${source.id}`}
       onClick={onClick}
       className={cn(
-        "w-full text-left p-3 rounded-lg border transition-all",
+        "w-full text-left p-3 rounded-sm border transition-all",
         "hover:bg-accent/50 hover:border-accent",
         isSelected
-          ? "bg-primary/10 border-primary ring-2 ring-primary/30"
+          ? "bg-primary/10 border-primary/50"
           : "bg-card border-border"
       )}
     >
@@ -370,7 +370,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
 
   return (
     <div className="flex flex-col h-full min-h-0 gap-4">
-      <div className="flex items-center justify-between flex-shrink-0">
+      <div className="flex flex-col justify-start items-start gap-2 flex-shrink-0">
         <div className="flex items-center gap-2">
           <FileText className="h-4 w-4 text-primary" />
           <h3 className="font-semibold">{source.filename}</h3>
@@ -453,7 +453,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
           </Suspense>
         </div>
       ) : (
-        <ScrollArea className="flex-1 min-h-0 rounded-md border p-4">
+        <ScrollArea className="flex-1 min-h-0 rounded-sm border p-4">
           <div className="text-sm leading-relaxed whitespace-pre-wrap">
             {previewContent ? highlightedContent : "No preview content available."}
           </div>
@@ -472,7 +472,7 @@ function StructuredOutputItem({ output }: StructuredOutputItemProps) {
   const label = output.type === "code" ? "Code" : "Table";
 
   return (
-    <div className="p-3 rounded-lg border bg-card hover:bg-accent/50 transition-colors">
+    <div className="p-3 rounded-sm border bg-card hover:bg-accent/50 transition-colors">
       <div className="flex items-center gap-2 mb-2">
         <Icon className="h-4 w-4 text-primary" />
         <span className="text-xs font-medium text-muted-foreground uppercase">
@@ -606,7 +606,7 @@ export function RightPane() {
     tabCount >= 5 ? "grid-cols-5" : tabCount === 4 ? "grid-cols-4" : "grid-cols-3";
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full flex-col flex-shrink-0 min-w-0">
       <div className="mb-4 flex items-center justify-between">
         <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
           Evidence
@@ -616,32 +616,32 @@ export function RightPane() {
       <Tabs
         value={activeTab}
         onValueChange={setActiveTab}
-        className="flex-1 flex flex-col min-h-0"
+        className="flex-1 flex flex-col min-h-0 w-full"
       >
         <TabsList className={`grid w-full flex-shrink-0 ${tabsGridCols}`}>
-          <TabsTrigger value="sources">
+          <TabsTrigger value="sources" className="text-xs flex items-center gap-1.5">
             Sources
             {hasSources && (
-              <span className="ml-1.5 text-xs text-muted-foreground">
+              <span className="text-[11px] text-muted-foreground">
                 ({sources.length})
               </span>
             )}
           </TabsTrigger>
-          <TabsTrigger value="preview" disabled={!selectedSource}>
+          <TabsTrigger value="preview" disabled={!selectedSource} className="text-xs flex items-center gap-1.5">
             Preview
           </TabsTrigger>
-          <TabsTrigger value="extracted" disabled={!hasStructuredOutputs}>
+          <TabsTrigger value="extracted" disabled={!hasStructuredOutputs} className="text-xs flex items-center gap-1.5">
             Extracted
             {hasStructuredOutputs && (
-              <span className="ml-1.5 text-xs text-muted-foreground">
+              <span className="text-[11px] text-muted-foreground">
                 ({structuredOutputs.length})
               </span>
             )}
           </TabsTrigger>
           {hasWikiRefs && (
-            <TabsTrigger value="wiki">
+            <TabsTrigger value="wiki" className="text-xs flex items-center gap-1.5">
               Wiki
-              <span className="ml-1.5 text-xs text-muted-foreground">
+              <span className="text-[11px] text-muted-foreground">
                 ({lastCompletedWikiRefs!.length})
               </span>
             </TabsTrigger>
@@ -656,21 +656,23 @@ export function RightPane() {
           )}
         </TabsList>
 
-        <TabsContent value="sources" className="flex-1 min-h-0 mt-4">
+        <TabsContent value="sources" className="flex-1 min-h-0 mt-4 flex-shrink-0">
           {!hasSources ? (
-            <EmptyState
-              icon={BookOpen}
-              title="No sources yet"
-              description="Send a message to see retrieved sources."
-            />
+            <div className="flex-1 min-w-[320px]">
+              <EmptyState
+                icon={BookOpen}
+                title="No sources yet"
+                description="Send a message to see retrieved sources."
+              />
+            </div>
           ) : shouldVirtualizeSources ? (
             <div
               ref={sourcesScrollRef}
-              className="h-full overflow-y-auto"
+              className="h-full overflow-y-auto w-full min-w-[320px]"
               aria-label="Sources list"
               role="list"
             >
-              <div style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative', paddingRight: '1rem' }}>
+              <div style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}>
                 {sourcesVirtualizer.getVirtualItems().map((virtualItem) => {
                   const source = sources[virtualItem.index];
                   return (
@@ -699,8 +701,8 @@ export function RightPane() {
               </div>
             </div>
           ) : (
-            <ScrollArea className="h-full">
-              <div className="space-y-2 pr-4">
+            <ScrollArea className="h-full min-w-[320px]">
+              <div className="space-y-2">
                 {sources.map((source, index) => (
                   <SourceListItem
                     key={source.id}
@@ -733,7 +735,7 @@ export function RightPane() {
         </TabsContent>
 
         <TabsContent value="extracted" className="flex-1 min-h-0 mt-4">
-          <ScrollArea className="h-full">
+          <ScrollArea className="h-full min-w-[320px]">
             {!hasStructuredOutputs ? (
               <EmptyState
                 icon={Layers}
@@ -741,7 +743,7 @@ export function RightPane() {
                 description="Extracted content will appear here."
               />
             ) : (
-              <div className="space-y-2 pr-4">
+              <div className="space-y-2">
                 {structuredOutputs.map((output) => (
                   <StructuredOutputItem key={output.id} output={output} />
                 ))}
@@ -752,7 +754,7 @@ export function RightPane() {
 
         {hasWikiRefs && (
           <TabsContent value="wiki" className="flex-1 min-h-0 mt-4">
-            <ScrollArea className="h-full">
+            <ScrollArea className="h-full min-w-[320px]">
               <div className="pr-4">
                 <WikiCards wikiRefs={lastCompletedWikiRefs!} />
               </div>

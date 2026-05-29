@@ -15,9 +15,11 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Brain, Plus, Search, Trash2, Pencil, Loader2, BookOpen } from "lucide-react";
+import { EmptyState } from "@/components/EmptyState";
 import { toast } from "sonner";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { useMemorySearch } from "@/hooks/useMemorySearch";
 import { useMemoryCrud, getCategoryFromMetadata, getTagsFromMetadata, getSourceFromMetadata, MAX_MEMORY_CONTENT_LENGTH } from "@/hooks/useMemoryCrud";
 import { updateMemory, promoteMemoryToWiki, getMemoryWikiStatus, type MemoryResult, type MemoryWikiStatus } from "@/lib/api";
@@ -148,12 +150,12 @@ export default function MemoryPage() {
   }
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-300">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Memory</h1>
-          <p className="text-muted-foreground mt-1">View and manage AI memory and context</p>
-        </div>
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <PageTitleHeader
+          title="Memory"
+          description="View and manage AI memory and context"
+        />
         <div className="flex items-center gap-2">
           <VaultSelector />
           <Button onClick={() => setIsAddDialogOpen(true)}>
@@ -163,7 +165,7 @@ export default function MemoryPage() {
         </div>
       </div>
 
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-2">
         <div className="relative flex-1 max-w-md">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <Input
@@ -174,9 +176,8 @@ export default function MemoryPage() {
             onKeyDown={(e) => e.key === "Enter" && handleSearch()}
           />
         </div>
-        <Button onClick={handleSearch} disabled={loading}>
-          {loading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Search className="w-4 h-4 mr-2" />}
-          Search
+        <Button variant="outline" size="icon" onClick={handleSearch} disabled={loading}>
+          {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
         </Button>
         <Badge variant="secondary">{memories?.length || 0} {searchQuery ? "results" : "memories"}</Badge>
       </div>
@@ -269,14 +270,11 @@ export default function MemoryPage() {
           ))}
         </div>
       ) : !memories || memories.length === 0 ? (
-        <Card>
-          <CardContent className="py-12 text-center">
-            <Brain className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
-            <p className="text-muted-foreground">
-              {searchQuery ? "No memories match your search" : "No memories yet. Add some to get started."}
-            </p>
-          </CardContent>
-        </Card>
+        <EmptyState
+          icon={Brain}
+          title={searchQuery ? "No memories match your search" : "No memories yet"}
+          description={searchQuery ? undefined : "Add some to get started."}
+        />
       ) : (
         <div className="space-y-3">
           {memories.map((memory) => (
@@ -345,7 +343,7 @@ export default function MemoryPage() {
                       <Pencil className="w-4 h-4 text-muted-foreground" />
                     </Button>
                     <Button
-                      variant="ghost"
+                      variant="destructive"
                       size="icon"
                       className="h-8 w-8"
                       onClick={() => openDeleteDialog(memory)}
@@ -355,7 +353,7 @@ export default function MemoryPage() {
                       {isDeleting === memory.id ? (
                         <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
                       ) : (
-                        <Trash2 className="w-4 h-4 text-destructive" />
+                        <Trash2 className="w-4 h-4" />
                       )}
                     </Button>
                   </div>
@@ -418,7 +416,7 @@ export default function MemoryPage() {
             </DialogDescription>
           </DialogHeader>
           {deleteTarget && (
-            <p className="text-sm text-muted-foreground border rounded p-3 bg-muted line-clamp-3">
+            <p className="text-sm text-muted-foreground border rounded-sm p-3 bg-muted line-clamp-3">
               {deleteTarget.content}
             </p>
           )}

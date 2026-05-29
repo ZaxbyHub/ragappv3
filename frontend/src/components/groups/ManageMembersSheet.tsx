@@ -158,7 +158,7 @@ export function ManageMembersSheet({
             {isLoading ? (
               <div className="space-y-3">
                 {Array.from({ length: 5 }).map((_, i) => (
-                  <div key={i} className="flex items-center gap-3 p-3 rounded-md border">
+                  <div key={i} className="flex items-center gap-3 p-3 rounded-sm border">
                     <Skeleton className="h-4 w-4" />
                     <div className="flex-1 space-y-2">
                       <Skeleton className="h-4 w-32" />
@@ -180,7 +180,7 @@ export function ManageMembersSheet({
                 {filteredUsers.map((user) => (
                   <div
                     key={user.id}
-                    className="flex items-start space-x-3 rounded-md border p-3 hover:bg-muted/50 transition-colors"
+                    className="flex items-start space-x-3 rounded-sm border p-3 hover:bg-muted/50 transition-colors"
                   >
                     <Checkbox
                       id={`user-${user.id}`}

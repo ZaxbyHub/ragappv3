@@ -3,6 +3,7 @@ import { useNavigate, Link, Navigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Card,
   CardContent,
@@ -11,7 +12,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { UserPlus, Loader2, User, Lock, Eye, EyeOff } from "lucide-react";
+import { Loader2 } from "lucide-react";
+import { MeridianLogo } from "@/components/icons/MeridianLogo";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { LockPasswordIcon, User02Icon, UserAdd01Icon, ViewIcon, ViewOffSlashIcon } from "@hugeicons/core-free-icons";
 
 export default function RegisterPage() {
   const [formData, setFormData] = useState({
@@ -92,25 +96,28 @@ export default function RegisterPage() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+    <div className="flex min-h-screen items-center justify-center p-4">
       <Card className="w-full max-w-md">
         <CardHeader className="space-y-1">
           <div className="flex items-center justify-center mb-2">
-            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-primary/10">
-              <UserPlus className="h-6 w-6 text-primary" />
+            <div className="flex flex-col items-center justify-center">
+              <MeridianLogo className="size-20" />
+              <span className="text-2xl font-bold text-primary font-electrolize tracking-tighter uppercase">
+                Meridian
+              </span>
             </div>
           </div>
           <CardTitle className="text-2xl text-center">Create Account</CardTitle>
           <CardDescription className="text-center">
-            Sign up to start using KnowledgeVault
+            Sign up to start using Meridian
           </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="space-y-2">
-              <label htmlFor="register-username" className="text-sm font-medium">Username</label>
+              <Label htmlFor="register-username">Username</Label>
               <div className="relative">
-                <User className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   id="register-username"
                   type="text"
@@ -131,9 +138,9 @@ export default function RegisterPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="register-fullname" className="text-sm font-medium">Full name</label>
+              <Label htmlFor="register-fullname">Full name</Label>
               <div className="relative">
-                <User className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   id="register-fullname"
                   type="text"
@@ -148,7 +155,7 @@ export default function RegisterPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="register-password" className="text-sm font-medium">Password</label>
+              <Label htmlFor="register-password">Password</Label>
               {formData.password && (
                 <ul className="space-y-0.5 text-xs">
                   <li className={formData.password.length >= 8 ? "text-green-600 dark:text-green-400" : "text-muted-foreground"}>
@@ -163,7 +170,7 @@ export default function RegisterPage() {
                 </ul>
               )}
               <div className="relative">
-                <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   id="register-password"
                   type={showPassword ? "text" : "password"}
@@ -176,14 +183,16 @@ export default function RegisterPage() {
                   aria-invalid={!!errors.password}
                   className="pl-10 pr-10"
                 />
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="absolute right-0.5 top-1/2 -translate-y-1/2"
                   onClick={() => setShowPassword((v) => !v)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   aria-label={showPassword ? "Hide password" : "Show password"}
                 >
-                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
+                  {showPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" />}
+                </Button>
               </div>
               {errors.password && (
                 <p id="register-password-error" className="text-sm text-destructive">{errors.password}</p>
@@ -191,9 +200,9 @@ export default function RegisterPage() {
             </div>
 
             <div className="space-y-2">
-              <label htmlFor="register-confirm-password" className="text-sm font-medium">Confirm Password</label>
+              <Label htmlFor="register-confirm-password">Confirm Password</Label>
               <div className="relative">
-                <Lock className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
                   id="register-confirm-password"
                   type={showConfirmPassword ? "text" : "password"}
@@ -206,14 +215,16 @@ export default function RegisterPage() {
                   aria-invalid={!!errors.confirmPassword}
                   className="pl-10 pr-10"
                 />
-                <button
+                <Button
                   type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="absolute right-0.5 top-1/2 -translate-y-1/2"
                   onClick={() => setShowConfirmPassword((v) => !v)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   aria-label={showConfirmPassword ? "Hide password confirmation" : "Show password confirmation"}
                 >
-                  {showConfirmPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                </button>
+                  {showConfirmPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" />}
+                </Button>
               </div>
               {errors.confirmPassword && (
                 <p id="register-confirm-password-error" className="text-sm text-destructive">{errors.confirmPassword}</p>
@@ -241,7 +252,7 @@ export default function RegisterPage() {
                 </>
               ) : (
                 <>
-                  <UserPlus className="mr-2 h-4 w-4" />
+                  <HugeiconsIcon strokeWidth={1.2} icon={UserAdd01Icon} className="mr-2 h-4 w-4" />
                   Create Account
                 </>
               )}

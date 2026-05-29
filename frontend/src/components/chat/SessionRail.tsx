@@ -30,12 +30,6 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -51,6 +45,10 @@ import {
   type ChatSession,
   type ChatSessionDetail,
 } from "@/lib/api";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockChatSessions } from "@/fixtures/chat";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { Message01Icon } from "@hugeicons/core-free-icons";
 
 // =============================================================================
 // TYPES & INTERFACES
@@ -216,7 +214,7 @@ export function ChatSearchInput({
               <X className="h-3 w-3" aria-hidden="true" />
             </Button>
           )}
-          <kbd className="hidden sm:inline-flex h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium text-muted-foreground">
+          <kbd className="hidden sm:inline-flex h-5 select-none items-center gap-1 rounded-sm border bg-muted px-1.5 font-mono text-[10px] font-medium text-muted-foreground">
             <span className="text-xs">Ctrl</span>K
           </kbd>
         </div>
@@ -296,11 +294,11 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
       <div
         ref={ref}
         className={`
-          group relative flex items-center gap-2 rounded-md px-2 py-2 text-sm
-          cursor-pointer transition-all duration-150
+          group relative flex flex-col justify-start items-start rounded-sm px-3 py-2.5 text-sm mb-2
+          cursor-pointer transition-all duration-150 ease-in-out
           border border-transparent
-          ${isActive ? "bg-primary/10 border-l-2 border-primary" : "hover:bg-muted hover:border-border/50"}
-          focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2
+          ${isActive ? "bg-primary/10 border-ring" : "hover:bg-muted hover:border-border/50"}
+          focus-within:border focus-within:border-ring
         `}
         onClick={() => !isEditing && onClick()}
         role={isEditing ? "listitem" : "button"}
@@ -316,211 +314,133 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
           }
         }}
       >
-        <MessageSquare
-          className={`h-4 w-4 flex-shrink-0 ${
-            isActive ? "text-accent-foreground" : "text-muted-foreground"
-          }`}
-          aria-hidden="true"
-        />
+        <div className="flex flex-col items-start gap-2">
+          <div className="flex items-center justify-between gap-2">
+            <HugeiconsIcon icon={Message01Icon} strokeWidth={1.2} size={16} color={isActive ? "text-accent-foreground" : "text-muted-foreground"} aria-hidden="true" />
 
-        <div className="flex-1 min-w-0">
-          {isEditing ? (
-            <div className="flex items-center gap-1">
-              <Input
-                ref={inputRef}
-                type="text"
-                value={editTitle}
-                onChange={(e) => setEditTitle(e.target.value)}
-                onKeyDown={handleKeyDown}
-                onClick={(e) => e.stopPropagation()}
-                className="flex-1 h-6 px-1 text-sm"
-                aria-label="Edit session title"
-              />
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-5 w-5"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleSaveEdit();
-                }}
-                aria-label="Save title"
-              >
-                <Check className="h-3 w-3" aria-hidden="true" />
-              </Button>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-5 w-5"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleCancelEdit();
-                }}
-                aria-label="Cancel editing"
-              >
-                <X className="h-3 w-3" aria-hidden="true" />
-              </Button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2">
-              <span className={`truncate font-medium${isActive ? " text-foreground" : ""}`}>{truncatedTitle}</span>
-              {session.forked_from_session_id != null && (
-                <span title="Branched conversation"><GitBranch className="h-3 w-3 text-muted-foreground flex-shrink-0" aria-hidden="true" /></span>
-              )}
-              {isPinned && (
-                <Pin className="h-3 w-3 text-muted-foreground flex-shrink-0" aria-hidden="true" />
-              )}
-            </div>
-          )}
-
-          {!isEditing && (
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span>{formatRelativeTime(session.updated_at)}</span>
-              {session.message_count !== undefined && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span>{session.message_count} messages</span>
-                </>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Hover/Focus Actions */}
-        {!isEditing && (
-          <TooltipProvider delayDuration={300}>
-            <div
-              className={`
-                flex items-center gap-0.5
-                opacity-0 group-hover:opacity-100 group-focus-within:opacity-100
-                transition-opacity
-              `}
-              role="group"
-              aria-label="Session actions"
-            >
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onPinToggle();
-                    }}
-                    aria-label={isPinned ? "Unpin session" : "Pin session"}
-                  >
-                    {isPinned ? (
-                      <PinOff className="h-3.5 w-3.5" aria-hidden="true" />
-                    ) : (
-                      <Pin className="h-3.5 w-3.5" aria-hidden="true" />
-                    )}
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">
-                  <p>{isPinned ? "Unpin" : "Pin"}</p>
-                </TooltipContent>
-              </Tooltip>
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleStartEdit();
-                    }}
-                    aria-label="Rename session"
-                  >
-                    <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">
-                  <p>Rename</p>
-                </TooltipContent>
-              </Tooltip>
-
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7 text-destructive hover:text-destructive"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDelete();
-                    }}
-                    aria-label="Delete session"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">
-                  <p>Delete</p>
-                </TooltipContent>
-              </Tooltip>
-
-              {/* Context Menu */}
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7"
+            <div className="w-full">
+              {isEditing ? (
+                <div className="flex items-center gap-2">
+                  <Input
+                    ref={inputRef}
+                    type="text"
+                    value={editTitle}
+                    onChange={(e) => setEditTitle(e.target.value)}
+                    onKeyDown={handleKeyDown}
                     onClick={(e) => e.stopPropagation()}
-                    aria-label="More options"
+                    className="flex-1 h-6 px-1 text-sm"
+                    aria-label="Edit session title"
+                  />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-5 w-5"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleSaveEdit();
+                    }}
+                    aria-label="Save title"
                   >
-                    <MoreHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+                    <Check className="h-3 w-3" aria-hidden="true" />
                   </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-48">
-                  <DropdownMenuItem
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-5 w-5"
                     onClick={(e) => {
                       e.stopPropagation();
-                      onPinToggle();
+                      handleCancelEdit();
                     }}
+                    aria-label="Cancel editing"
                   >
-                    {isPinned ? (
-                      <>
-                        <PinOff className="mr-2 h-4 w-4" aria-hidden="true" />
-                        Unpin
-                      </>
-                    ) : (
-                      <>
-                        <Pin className="mr-2 h-4 w-4" aria-hidden="true" />
-                        Pin
-                      </>
-                    )}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleStartEdit();
-                    }}
-                  >
-                    <Pencil className="mr-2 h-4 w-4" aria-hidden="true" />
-                    Rename
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDelete();
-                    }}
-                    className="text-destructive focus:text-destructive"
-                  >
-                    <Trash2 className="mr-2 h-4 w-4" aria-hidden="true" />
-                    Delete
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+                    <X className="h-3 w-3" aria-hidden="true" />
+                  </Button>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between gap-2">
+                  <span className={`truncate font-medium${isActive ? " text-foreground" : ""}`}>{truncatedTitle}</span>
+                  {session.forked_from_session_id != null && (
+                    <span title="Branched conversation"><GitBranch className="h-3 w-3 text-muted-foreground flex-shrink-0" aria-hidden="true" /></span>
+                  )}
+                  {isPinned && (
+                    <Pin className="h-3 w-3 text-muted-foreground flex-shrink-0" aria-hidden="true" />
+                  )}
+                  {!isEditing && (
+                    <div className="justify-items-end">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          onClick={(e) => e.stopPropagation()}
+                          aria-label="More options"
+                        >
+                          <MoreHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-48">
+                        <DropdownMenuItem
+                          aria-label={isPinned ? "Unpin session" : "Pin session"}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onPinToggle();
+                          }}
+                        >
+                          {isPinned ? (
+                            <>
+                              <PinOff className="mr-2 h-4 w-4" aria-hidden="true" />
+                              Unpin
+                            </>
+                          ) : (
+                            <>
+                              <Pin className="mr-2 h-4 w-4" aria-hidden="true" />
+                              Pin
+                            </>
+                          )}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          aria-label="Rename session"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleStartEdit();
+                          }}
+                        >
+                          <Pencil className="mr-2 h-4 w-4" aria-hidden="true" />
+                          Rename
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          aria-label="Delete session"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDelete();
+                          }}
+                          className="text-destructive focus:text-destructive bg-destructive/10 hover:!bg-destructive/20"
+                        >
+                          <Trash2 className="mr-2 h-4 w-4" aria-hidden="true" />
+                          Delete
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
-          </TooltipProvider>
-        )}
-      </div>
+          </div>
 
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span>{formatRelativeTime(session.updated_at)}</span>
+            {session.message_count !== undefined && (
+              <>
+                <span aria-hidden="true">&mdash;</span>
+                <span>{session.message_count} messages</span>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
     </>
   );
 });
@@ -675,6 +595,7 @@ interface SessionRailProps {
 }
 
 export function SessionRail({ vaultId, className }: SessionRailProps) {
+  const testMode = useTestMode();
   const navigate = useNavigate();
   const {
     activeSessionId,
@@ -708,6 +629,11 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
     const forceRefresh = sessionListRefreshToken !== lastRefreshTokenRef.current;
     lastRefreshTokenRef.current = sessionListRefreshToken;
     const fetchSessions = async () => {
+      if (testMode) {
+        setSessions(mockChatSessions);
+        setIsLoading(false);
+        return;
+      }
       // Use cache if fresh and same vault
       if (
         !forceRefresh &&
@@ -739,7 +665,7 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
 
     fetchSessions();
     return () => { cancelled = true; };
-  }, [vaultId, sessionListRefreshToken]);
+  }, [vaultId, sessionListRefreshToken, testMode]);
 
   // Track which session IDs have been fetched to avoid duplicate fetches
   const fetchedIdsRef = useRef<Set<number>>(new Set());
@@ -1049,9 +975,9 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
   );
 
   return (
-    <div className={`flex h-full flex-col ${className || ""}`}>
+    <div className={`flex h-full flex-col ${className || ""} p-3 px-6 bg-card/80`}>
       {/* Header */}
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-6">
         <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
           Sessions
         </h2>

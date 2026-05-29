@@ -73,6 +73,63 @@ vi.mock('@/components/ui/input', () => ({
   Input: (props: React.InputHTMLAttributes<HTMLInputElement>) => <input {...props} />,
 }));
 
+// Radix Select cannot be driven in jsdom; render it as a native <select> so
+// option labels stay assertable and fireEvent.change works on the role picker.
+vi.mock('@/components/ui/select', async () => {
+  const React = await import('react');
+  const findTriggerProps = (children: React.ReactNode): Record<string, unknown> => {
+    let props: Record<string, unknown> = {};
+    React.Children.forEach(children, (child: any) => {
+      if (!child || typeof child !== 'object') return;
+      if (child.type?.__isSelectTrigger) {
+        props = child.props ?? {};
+      } else if (child.props?.children) {
+        const nested = findTriggerProps(child.props.children);
+        if (Object.keys(nested).length) props = nested;
+      }
+    });
+    return props;
+  };
+  const collectItems = (children: React.ReactNode): { value: string; label: React.ReactNode }[] => {
+    const items: { value: string; label: React.ReactNode }[] = [];
+    React.Children.forEach(children, (child: any) => {
+      if (!child || typeof child !== 'object') return;
+      if (child.type?.__isSelectItem) {
+        items.push({ value: child.props.value, label: child.props.children });
+      } else if (child.props?.children) {
+        items.push(...collectItems(child.props.children));
+      }
+    });
+    return items;
+  };
+  const SelectTrigger: any = ({ children }: any) => React.createElement(React.Fragment, null, children);
+  SelectTrigger.__isSelectTrigger = true;
+  const SelectItem: any = ({ children }: any) => React.createElement(React.Fragment, null, children);
+  SelectItem.__isSelectItem = true;
+  return {
+    Select: ({ value, onValueChange, disabled, children }: any) => {
+      const triggerProps = findTriggerProps(children);
+      return React.createElement(
+        'select',
+        {
+          value,
+          disabled,
+          'aria-label': triggerProps['aria-label'],
+          id: triggerProps.id,
+          onChange: (e: any) => onValueChange?.(e.target.value),
+        },
+        collectItems(children).map((item) =>
+          React.createElement('option', { key: item.value, value: item.value }, item.label)
+        )
+      );
+    },
+    SelectTrigger,
+    SelectValue: () => null,
+    SelectContent: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    SelectItem,
+  };
+});
+
 vi.mock('@/components/ui/badge', () => ({
   Badge: ({ children }: { children: React.ReactNode }) => <span>{children}</span>,
 }));
@@ -164,16 +221,6 @@ describe('AdminUsersPage', () => {
     await waitFor(() => {
       const searchInput = screen.getByPlaceholderText('Search by username or name...');
       expect(searchInput).toBeInTheDocument();
-    });
-  });
-
-  it('renders user count badge', async () => {
-    await act(async () => {
-      render(<AdminUsersPage />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('3 users')).toBeInTheDocument();
     });
   });
 

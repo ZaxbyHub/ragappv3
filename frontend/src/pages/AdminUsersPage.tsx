@@ -3,9 +3,10 @@ import { toast } from "sonner";
 import { AdminGuard } from "@/components/auth/RoleGuard";
 import { useAuthStore } from "@/stores/useAuthStore";
 import apiClient from "@/lib/api";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockAdminUsers } from "@/fixtures/users";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import {
   Dialog,
@@ -26,7 +27,17 @@ import {
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCaption,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import {
   Select,
   SelectContent,
@@ -44,7 +55,11 @@ import {
   KeyRound,
   Plus,
   Building2,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
+import { EmptyState } from "@/components/EmptyState";
+import { LoadingSpinner } from "@/components/LoadingSpinner";
 
 type UserRole = "superadmin" | "admin" | "member" | "viewer";
 
@@ -79,8 +94,9 @@ const ROLE_OPTIONS: { value: UserRole; label: string }[] = [
 ];
 
 function AdminUsersPageContent() {
-  const [users, setUsers] = useState<User[]>([]);
-  const [loading, setLoading] = useState(true);
+  const testMode = useTestMode();
+  const [users, setUsers] = useState<User[]>(testMode ? mockAdminUsers : []);
+  const [loading, setLoading] = useState(!testMode);
   const [searchQuery, setSearchQuery] = useState("");
   const [updatingUserId, setUpdatingUserId] = useState<number | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -130,6 +146,10 @@ function AdminUsersPageContent() {
   const currentUser = useAuthStore((state) => state.user);
 
   const fetchUsers = useCallback(async () => {
+    if (testMode) {
+      setUsers(mockAdminUsers);
+      return;
+    }
     setLoading(true);
     try {
       const response = await apiClient.get<{ users: User[]; total: number }>("/users/");
@@ -140,11 +160,11 @@ function AdminUsersPageContent() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [testMode]);
 
   useEffect(() => {
-    fetchUsers();
-  }, [fetchUsers]);
+    if (!testMode) fetchUsers();
+  }, [fetchUsers, testMode]);
 
   const handleRoleChange = async (userId: number, newRole: UserRole) => {
     setUpdatingUserId(userId);
@@ -474,193 +494,197 @@ const handleCreateUser = async () => {
   const canManageUser = (user: User) => user.id !== currentUser?.id;
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-300">
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">User Management</h1>
-          <p className="text-muted-foreground mt-1">Manage system users and their permissions</p>
-        </div>
+        <PageTitleHeader
+          title="User Management"
+          description="Manage system users and their permissions"
+        />
         <Button onClick={() => setCreateDialogOpen(true)}>
           <Plus className="mr-2 h-4 w-4" />
           Add User
         </Button>
       </div>
-      <Card>
-        <CardHeader className="pb-4">
-          <div className="flex items-center gap-4">
-            <div className="relative flex-1 max-w-md">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-              <Input
-                placeholder="Search by username or name..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="pl-10"
-                aria-label="Search users"
-              />
-            </div>
-            <Badge variant="secondary">{filteredUsers.length} users</Badge>
-          </div>
-        </CardHeader>
-        <CardContent className="p-0">
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <caption className="sr-only">System Users</caption>
-              <thead>
-                <tr className="border-b bg-muted/50">
-                  <th scope="col" className="text-left p-4 font-medium">
+      <div className="space-y-4">
+        {/* Search */}
+        <div className="relative">
+          <Search
+            className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true"
+          />
+          <Input
+            placeholder="Search by username or name..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="pl-10 w-1/2"
+            aria-label="Search users"
+          />
+        </div>
+
+        {/* Users Table */}
+        <div className="rounded-sm border">
+          <Table>
+            <TableCaption className="sr-only">System Users</TableCaption>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-left p-4">
+                  <button type="button" className="flex items-center gap-1 font-medium hover:text-foreground">
                     Username
-                  </th>
-                  <th scope="col" className="text-left p-4 font-medium">
+                  </button>
+                </TableHead>
+                <TableHead className="text-left p-4">
+                  <button type="button" className="flex items-center gap-1 font-medium hover:text-foreground">
                     Full Name
-                  </th>
-                  <th scope="col" className="text-left p-4 font-medium">
-                    Role
-                  </th>
-                  <th scope="col" className="text-left p-4 font-medium">
-                    Status
-                  </th>
-                  <th scope="col" className="text-left p-4 font-medium">
+                  </button>
+                </TableHead>
+                <TableHead className="text-left p-4">Role</TableHead>
+                <TableHead className="text-left p-4">Status</TableHead>
+                <TableHead className="text-left p-4">
+                  <button type="button" className="flex items-center gap-1 font-medium hover:text-foreground">
                     Created
-                  </th>
-                  <th scope="col" className="text-right p-4 font-medium">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {loading ? (
-                  <tr>
-                    <td colSpan={6} className="p-8 text-center">
-                      <Loader2
-                        className="w-6 h-6 animate-spin mx-auto text-muted-foreground"
-                        role="status"
-                        aria-live="polite"
-                      />
-                      <span className="sr-only">Loading users</span>
-                    </td>
-                  </tr>
-                ) : filteredUsers.length === 0 ? (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="p-8 text-center text-muted-foreground"
-                      role="status"
-                      aria-live="polite"
-                    >
-                      {searchQuery ? "No users match your search" : "No users found"}
-                    </td>
-                  </tr>
-                ) : (
-                  filteredUsers.map((user) => (
-                    <tr key={user.id} className="border-b hover:bg-muted/50">
-                      <td className="p-4 font-medium">{user.username}</td>
-                      <td className="p-4">{user.full_name}</td>
-                      <td className="p-4">
-                        <select
-                          value={user.role}
-                          onChange={(e) => handleRoleChange(user.id, e.target.value as UserRole)}
-                          disabled={updatingUserId === user.id || user.id === currentUser?.id}
-                          aria-label={`Change role for ${user.username}`}
-                          className="h-9 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-                        >
+                    <span className="inline-flex flex-col">
+                      <ChevronUp className="h-3 w-3 text-muted-foreground/30" aria-hidden="true" />
+                      <ChevronDown className="h-3 w-3 -mt-1 text-muted-foreground/30" aria-hidden="true" />
+                    </span>
+                  </button>
+                </TableHead>
+                <TableHead className="text-right p-4">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {loading ? (
+                <TableRow>
+                  <TableCell colSpan={6} className="p-8">
+                    <LoadingSpinner label="Loading users…" />
+                  </TableCell>
+                </TableRow>
+              ) : filteredUsers.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={6} className="p-8">
+                    <EmptyState
+                      icon={Users}
+                      title={searchQuery ? "No users match your search" : "No users found"}
+                      className="py-0"
+                    />
+                  </TableCell>
+                </TableRow>
+              ) : (
+                filteredUsers.map((user) => (
+                  <TableRow key={user.id}>
+                    <TableCell className="p-4 font-medium">{user.username}</TableCell>
+                    <TableCell className="p-4">{user.full_name}</TableCell>
+                    <TableCell className="p-4">
+                      <Select
+                        value={user.role}
+                        onValueChange={(v) => handleRoleChange(user.id, v as UserRole)}
+                        disabled={updatingUserId === user.id || user.id === currentUser?.id}
+                      >
+                        <SelectTrigger aria-label={`Change role for ${user.username}`}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
                           {ROLE_OPTIONS.map((opt) => (
-                            <option key={opt.value} value={opt.value}>
+                            <SelectItem key={opt.value} value={opt.value}>
                               {opt.label}
-                            </option>
+                            </SelectItem>
                           ))}
-                        </select>
-                      </td>
-                      <td className="p-4">
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            role="switch"
-                            aria-checked={user.is_active}
-                            aria-label={`${user.is_active ? "Deactivate" : "Activate"} user ${user.username}`}
-                            onClick={() => handleActiveToggle(user.id, !user.is_active)}
-                            disabled={updatingUserId === user.id || user.id === currentUser?.id}
-                            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${
-                              user.is_active ? "bg-primary" : "bg-input"
+                        </SelectContent>
+                      </Select>
+                    </TableCell>
+                    <TableCell className="p-4">
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={user.is_active}
+                          aria-label={`${user.is_active ? "Deactivate" : "Activate"} user ${user.username}`}
+                          onClick={() => handleActiveToggle(user.id, !user.is_active)}
+                          disabled={updatingUserId === user.id || user.id === currentUser?.id}
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${
+                            user.is_active ? "bg-primary" : "bg-input"
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-5 w-5 rounded-full bg-background shadow transition-transform ${
+                              user.is_active ? "translate-x-5" : "translate-x-0.5"
                             }`}
-                          >
-                            <span
-                              className={`inline-block h-5 w-5 rounded-full bg-background shadow transition-transform ${
-                                user.is_active ? "translate-x-5" : "translate-x-0.5"
-                              }`}
-                            />
-                          </button>
-                          <Badge variant={user.is_active ? "default" : "secondary"}>
-                            {user.is_active ? "Active" : "Inactive"}
-                          </Badge>
-                        </div>
-                      </td>
-                      <td className="p-4 text-muted-foreground">{formatDate(user.created_at)}</td>
-                      <td className="p-4 text-right">
-                        <div className="flex items-center justify-end gap-1">
-                          {canManageUser(user) && (
-                            <>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => openOrgsSheet(user)}
-                                aria-label={`Manage organizations for ${user.username}`}
-                                title="Manage Organizations"
-                              >
-                                <Building2 className="w-4 h-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => openGroupsSheet(user)}
-                                aria-label={`Manage groups for ${user.username}`}
-                                title="Manage Groups"
-                              >
-                                <Users className="w-4 h-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => openEditDialog(user)}
-                                aria-label={`Edit user ${user.username}`}
-                                title="Edit User"
-                              >
-                                <Pencil className="w-4 h-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => openPasswordDialog(user)}
-                                aria-label={`Reset password for ${user.username}`}
-                                title="Reset Password"
-                              >
-                                <KeyRound className="w-4 h-4" />
-                              </Button>
-                            </>
-                          )}
-                          {canDeleteUser(user) && (
+                          />
+                        </button>
+                        <Badge variant={user.is_active ? "default" : "secondary"}>
+                          {user.is_active ? "Active" : "Inactive"}
+                        </Badge>
+                      </div>
+                    </TableCell>
+                    <TableCell className="p-4 text-muted-foreground">{formatDate(user.created_at)}</TableCell>
+                    <TableCell className="p-4 text-right">
+                      <div className="flex items-center justify-end gap-1">
+                        {canManageUser(user) && (
+                          <>
                             <Button
                               variant="ghost"
                               size="icon"
-                              onClick={() => {
-                                setUserToDelete(user);
-                                setDeleteDialogOpen(true);
-                              }}
-                              aria-label={`Delete user ${user.username}`}
-                              className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                              className="h-8 w-8"
+                              onClick={() => openOrgsSheet(user)}
+                              aria-label={`Manage organizations for ${user.username}`}
+                              title="Manage Organizations"
                             >
-                              <Trash2 className="w-4 h-4" />
+                              <Building2 className="w-4 h-4" />
                             </Button>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </CardContent>
-      </Card>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8"
+                              onClick={() => openGroupsSheet(user)}
+                              aria-label={`Manage groups for ${user.username}`}
+                              title="Manage Groups"
+                            >
+                              <Users className="w-4 h-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8"
+                              onClick={() => openEditDialog(user)}
+                              aria-label={`Edit user ${user.username}`}
+                              title="Edit User"
+                            >
+                              <Pencil className="w-4 h-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8"
+                              onClick={() => openPasswordDialog(user)}
+                              aria-label={`Reset password for ${user.username}`}
+                              title="Reset Password"
+                            >
+                              <KeyRound className="w-4 h-4" />
+                            </Button>
+                          </>
+                        )}
+                        {canDeleteUser(user) && (
+                          <Button
+                            variant="destructive"
+                            size="icon"
+                            className="h-8 w-8"
+                            onClick={() => {
+                              setUserToDelete(user);
+                              setDeleteDialogOpen(true);
+                            }}
+                            aria-label={`Delete user ${user.username}`}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </div>
 
       {/* Delete User Dialog */}
       <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
@@ -719,18 +743,21 @@ const handleCreateUser = async () => {
             </div>
             <div className="space-y-2">
               <Label htmlFor="edit-role">Role</Label>
-              <select
-                id="edit-role"
+              <Select
                 value={editRole}
-                onChange={(e) => setEditRole(e.target.value as UserRole)}
-                className="h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                onValueChange={(v) => setEditRole(v as UserRole)}
               >
-                {ROLE_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
+                <SelectTrigger id="edit-role">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {ROLE_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           </div>
           <DialogFooter>
@@ -848,7 +875,7 @@ const handleCreateUser = async () => {
               {isLoadingGroups ? (
                 <div className="space-y-3">
                   {Array.from({ length: 5 }).map((_, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 rounded-md border">
+                    <div key={i} className="flex items-center gap-3 p-3 rounded-sm border">
                       <Skeleton className="h-4 w-4" />
                       <div className="flex-1 space-y-2">
                         <Skeleton className="h-4 w-32" />
@@ -870,7 +897,7 @@ const handleCreateUser = async () => {
                   {filteredGroups.map((group) => (
                     <div
                       key={group.id}
-                      className="flex items-start space-x-3 rounded-md border p-3 hover:bg-muted/50 transition-colors"
+                      className="flex items-start space-x-3 rounded-sm border p-3 hover:bg-muted/50 transition-colors"
                     >
                       <Checkbox
                         id={`group-${group.id}`}
@@ -967,7 +994,7 @@ const handleCreateUser = async () => {
               {isLoadingOrgs ? (
                 <div className="space-y-3">
                   {Array.from({ length: 5 }).map((_, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 rounded-md border">
+                    <div key={i} className="flex items-center gap-3 p-3 rounded-sm border">
                       <Skeleton className="h-4 w-4" />
                       <div className="flex-1 space-y-2">
                         <Skeleton className="h-4 w-32" />
@@ -992,7 +1019,7 @@ const handleCreateUser = async () => {
                     return (
                       <div
                         key={org.id}
-                        className={`flex items-start space-x-3 rounded-md border p-3 transition-colors ${isMember ? "border-primary/50 bg-primary/5" : "hover:bg-muted/50"}`}
+                        className={`flex items-start space-x-3 rounded-sm border p-3 transition-colors ${isMember ? "border-primary/50 bg-primary/5" : "hover:bg-muted/50"}`}
                       >
                         <Checkbox
                           id={`org-${org.id}`}

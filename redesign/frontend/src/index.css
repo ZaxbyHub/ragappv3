@@ -64,7 +64,7 @@
 }
 
 .prose pre {
-  @apply bg-muted/50 border border-border rounded-lg p-4 overflow-x-auto;
+  @apply bg-muted/50 border border-border rounded p-4 overflow-x-auto;
 }
 
 .prose code {

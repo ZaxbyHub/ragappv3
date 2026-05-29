@@ -6,11 +6,14 @@
  *   |_____||_____||_____||_____||_____||_____||_____||_____||_____||_____|
  *
  *   RAGAPP - Retrieval Augmented Generation Application
- *   Material 3 Theme with Warm Neutral Palette
+ *   Monochromatic Luxury Theme - Restrained Teal
  */
 
 /* Google Fonts — preloaded via <link> in index.html for non-blocking load */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Commissioner:wght@100..900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Electrolize&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Spline+Sans:wght@300..700&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -18,42 +21,42 @@
 
 @layer base {
   /*
-   * Material 3-inspired Theme - Warm Neutral Palette
-   * No purple bias, earthy warm tones
+   * Monochromatic Luxury Theme - Restrained Teal Palette
+   * Single hue family, premium understated feel
    */
   :root {
-    /* Surface Colors - Warm neutrals */
-    --background: 40 30% 97%;           /* Warm off-white */
-    --foreground: 30 15% 15%;           /* Dark warm gray */
-    --card: 40 25% 99%;                 /* Slightly warmer white */
-    --card-foreground: 30 15% 15%;
-    --popover: 40 30% 97%;
-    --popover-foreground: 30 15% 15%;
+    /* Surface Colors - Warm cream with barely perceptible teal tint */
+    --background: 200 8% 97%;           /* Warm cream */
+    --foreground: 200 15% 12%;           /* Near-black with cool tint */
+    --card: 200 8% 99%;                  /* Almost pure white */
+    --card-foreground: 200 15% 12%;
+    --popover: 200 8% 97%;
+    --popover-foreground: 200 15% 12%;
     
-    /* Primary - Warm amber/brown */
-    --primary: 30 60% 35%;              /* Warm brown */
-    --primary-foreground: 40 30% 97%;
+    /* Primary - Sophisticated muted teal */
+    --primary: 195 45% 38%;              /* Muted teal */
+    --primary-foreground: 200 8% 99%;
     
-    /* Secondary - Soft taupe */
-    --secondary: 35 20% 90%;            /* Light taupe */
-    --secondary-foreground: 30 20% 25%;
+    /* Secondary - Desaturated teal-gray */
+    --secondary: 195 12% 92%;            /* Subtle teal tint gray */
+    --secondary-foreground: 200 15% 22%;
     
-    /* Muted - Soft warm gray */
-    --muted: 35 15% 92%;
-    --muted-foreground: 30 10% 45%;
+    /* Muted - Very subtle teal-gray */
+    --muted: 195 10% 94%;
+    --muted-foreground: 195 10% 45%;
     
-    /* Accent - Warm terracotta */
-    --accent: 25 50% 55%;               /* Terracotta */
-    --accent-foreground: 40 30% 97%;
+    /* Accent - Light grey with barely perceptible blue tint */
+    --accent: 195 42% 86%;
+    --accent-foreground: 215 15% 12%;
     
-    /* Destructive - Warm red */
-    --destructive: 5 70% 55%;
-    --destructive-foreground: 40 30% 97%;
+    /* Destructive - Rose red */
+    --destructive: 345 65% 52%;
+    --destructive-foreground: 200 8% 99%;
     
     /* Borders and Inputs */
-    --border: 35 20% 85%;
-    --input: 35 20% 88%;
-    --ring: 30 60% 35%;
+    --border: 195 12% 88%;
+    --input: 195 12% 90%;
+    --ring: 195 45% 38%;
     
     /* Success - Green for positive states */
     --success: 142 70% 30%;
@@ -69,33 +72,33 @@
   }
 
   .dark {
-    /* Dark mode - Warm dark palette */
-    --background: 30 15% 10%;           /* Warm dark gray */
-    --foreground: 40 20% 95%;
-    --card: 30 12% 13%;
-    --card-foreground: 40 20% 95%;
-    --popover: 30 15% 10%;
-    --popover-foreground: 40 20% 95%;
+    /* Dark mode - Near-black luxury feel */
+    --background: 210 12% 7%;           /* Near-black with cool tint */
+    --foreground: 200 10% 95%;           /* Soft white */
+    --card: 210 12% 10%;                /* Slightly lifted surface */
+    --card-foreground: 200 10% 95%;
+    --popover: 210 12% 7%;
+    --popover-foreground: 200 10% 95%;
     
-    /* Primary - Warm amber in dark */
-    --primary: 35 70% 65%;              /* Warm amber */
-    --primary-foreground: 30 15% 10%;
+    /* Primary - Muted bright teal (luxury watch dial feel) */
+    --primary: 195 40% 62%;             /* Sophisticated teal glow */
+    --primary-foreground: 210 12% 7%;
     
-    /* Secondary - Dark taupe */
-    --secondary: 30 12% 22%;
-    --secondary-foreground: 40 20% 95%;
+    /* Secondary - Dark teal-gray */
+    --secondary: 195 10% 16%;
+    --secondary-foreground: 200 10% 95%;
     
     /* Muted */
-    --muted: 30 12% 22%;
-    --muted-foreground: 35 10% 67%;
+    --muted: 195 10% 16%;
+    --muted-foreground: 195 10% 62%;
     
-    /* Accent */
-    --accent: 25 50% 45%;
-    --accent-foreground: 40 20% 95%;
+    /* Accent - Medium grey with barely perceptible blue tint */
+    --accent: 215 10% 30%;
+    --accent-foreground: 215 10% 95%;
     
     /* Destructive */
-    --destructive: 5 60% 50%;
-    --destructive-foreground: 40 20% 95%;
+    --destructive: 345 50% 58%;
+    --destructive-foreground: 200 10% 95%;
     
     /* Success - Lighter green for dark backgrounds */
     --success: 142 60% 50%;
@@ -103,13 +106,13 @@
     --success-subdued: 142 45% 40%;
     --success-subdued-foreground: 0 0% 100%;
 
-    --warning: 35 75% 55%;
+    --warning: 40 70% 55%;
     --warning-foreground: 0 0% 100%;
 
     /* Borders */
-    --border: 30 12% 22%;
-    --input: 30 12% 25%;
-    --ring: 35 70% 65%;
+    --border: 195 10% 18%;
+    --input: 195 10% 21%;
+    --ring: 195 40% 62%;
   }
 }
 
@@ -123,57 +126,91 @@
   }
   
   body {
-    @apply bg-background text-foreground antialiased;
+    @apply text-foreground antialiased;
     /* Premium UI font stack: Inter → system-ui fallback */
-    font-family: 'Inter', 'Spline Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-    
-    /* Subtle gradient background */
-    background: linear-gradient(
-      135deg,
-      hsl(var(--background)) 0%,
-      hsl(40 25% 94%) 50%,
-      hsl(35 20% 92%) 100%
-    );
-    background-attachment: fixed;
+    font-family: 'Spline Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-weight: 400;
     min-height: 100vh;
   }
 
-  /* Dark mode gradient override */
-  .dark body {
-    background: linear-gradient(
-      135deg,
-      hsl(var(--background)) 0%,
-      hsl(30 12% 12%) 50%,
-      hsl(25 10% 11%) 100%
-    );
-  }
+  /*
+   * Background layer system — all decorative backgrounds live on pseudo-elements
+   * so they layer correctly without being hidden behind body’s own background.
+   *
+   *   ::before  → gradient base + bloom overlays (bottom)
+   *   ::after   → dot-grid pattern (middle)
+   *   content   → app UI (top)
+   */
 
-  /* Subtle pattern overlay */
+  /* Layer 1: Gradient base + bloom overlays */
   body::before {
     content: '';
     position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-image:
-      radial-gradient(circle at 20% 80%, hsl(30 40% 70% / 0.03) 0%, transparent 50%),
-      radial-gradient(circle at 80% 20%, hsl(25 35% 65% / 0.03) 0%, transparent 50%);
+    inset: 0;
+    background:
+      radial-gradient(circle at 20% 80%, hsl(195 30% 55% / 0.03) 0%, transparent 50%),
+      radial-gradient(circle at 80% 20%, hsl(195 20% 50% / 0.03) 0%, transparent 50%),
+      linear-gradient(
+        135deg,
+        hsl(var(--background)) 0%,
+        hsl(200 8% 98%) 50%,
+        hsl(195 10% 96%) 100%
+      );
+    background-attachment: fixed;
     pointer-events: none;
     z-index: -999;
   }
 
-  /* Dark mode overlay */
   .dark body::before {
-    background-image:
-      radial-gradient(circle at 20% 80%, hsl(30 40% 30% / 0.05) 0%, transparent 50%),
-      radial-gradient(circle at 80% 20%, hsl(25 35% 25% / 0.05) 0%, transparent 50%);
+    background:
+      radial-gradient(circle at 20% 80%, hsl(195 30% 40% / 0.05) 0%, transparent 50%),
+      radial-gradient(circle at 80% 20%, hsl(195 18% 35% / 0.05) 0%, transparent 50%),
+      linear-gradient(
+        135deg,
+        hsl(var(--background)) 0%,
+        hsl(210 12% 9%) 50%,
+        hsl(215 10% 8%) 100%
+      );
   }
 
-  /* Headings use Source Serif 4 */
+  /* Layer 2: Diagonal hatch lines */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image: repeating-linear-gradient(
+      -45deg,
+      transparent,
+      transparent 12px,
+      hsl(var(--foreground) / 0.04) 12px,
+      hsl(var(--foreground) / 0.04) 12.5px
+    );
+    pointer-events: none;
+    z-index: -998;
+    mask-image: radial-gradient(ellipse at center, black 40%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse at center, black 40%, transparent 80%);
+  }
+
+  .dark body::after {
+    background-image: repeating-linear-gradient(
+      -45deg,
+      transparent,
+      transparent 12px,
+      hsl(var(--foreground) / 0.06) 12px,
+      hsl(var(--foreground) / 0.06) 12.5px
+    );
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+  }
+
+  /* Headings use Commissioner */
   h1, h2, h3, h4, h5, h6 {
-    font-family: 'Source Serif 4', Georgia, serif;
+    font-family: 'Commissioner', Georgia, serif;
     font-weight: 600;
+  }
+
+  .font-electrolize {
+    font-family: 'Electrolize', monospace;
   }
 
   /* Selection color */

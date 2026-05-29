@@ -15,19 +15,37 @@ import {
   type WikiClaim,
   type WikiLintFinding,
 } from "@/lib/api";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockWikiPages, mockWikiLintFindings } from "@/fixtures/wiki";
 
 export function useWikiData(vaultId: number | null) {
-  const [pages, setPages] = useState<WikiPage[]>([]);
+  const testMode = useTestMode();
+  const [pages, setPages] = useState<WikiPage[]>(testMode ? mockWikiPages : []);
   const [selectedPage, setSelectedPage] = useState<WikiPage | null>(null);
   const [entities, setEntities] = useState<WikiEntity[]>([]);
   const [claims, setClaims] = useState<WikiClaim[]>([]);
-  const [lintFindings, setLintFindings] = useState<WikiLintFinding[]>([]);
+  const [lintFindings, setLintFindings] = useState<WikiLintFinding[]>(testMode ? mockWikiLintFindings : []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const fetchPages = useCallback(
     async (params?: { page_type?: string; status?: string; search?: string }) => {
       if (!vaultId) return;
+      if (testMode) {
+        let filtered = mockWikiPages;
+        if (params?.page_type) {
+          filtered = filtered.filter((p) => p.page_type === params.page_type);
+        }
+        if (params?.status) {
+          filtered = filtered.filter((p) => p.status === params.status);
+        }
+        if (params?.search) {
+          const q = params.search.toLowerCase();
+          filtered = filtered.filter((p) => p.title.toLowerCase().includes(q) || p.summary?.toLowerCase().includes(q));
+        }
+        setPages(filtered);
+        return;
+      }
       setLoading(true);
       setError(null);
       try {
@@ -39,10 +57,15 @@ export function useWikiData(vaultId: number | null) {
         setLoading(false);
       }
     },
-    [vaultId]
+    [vaultId, testMode]
   );
 
   const openPage = useCallback(async (pageId: number) => {
+    if (testMode) {
+      const page = mockWikiPages.find((p) => p.id === pageId) ?? null;
+      setSelectedPage(page);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
@@ -53,7 +76,7 @@ export function useWikiData(vaultId: number | null) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [testMode]);
 
   const closePage = useCallback(() => setSelectedPage(null), []);
 
@@ -105,9 +128,13 @@ export function useWikiData(vaultId: number | null) {
 
   const fetchLintFindings = useCallback(async () => {
     if (!vaultId) return;
+    if (testMode) {
+      setLintFindings(mockWikiLintFindings);
+      return;
+    }
     const res = await listWikiLintFindings({ vault_id: vaultId });
     setLintFindings(res.findings);
-  }, [vaultId]);
+  }, [vaultId, testMode]);
 
   const runLint = useCallback(async () => {
     if (!vaultId) return [];

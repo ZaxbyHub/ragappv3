@@ -22,11 +22,16 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Database, Plus, Pencil, Trash2, FileText, Brain, MessageSquare, Loader2 } from "lucide-react";
+import { EmptyState } from "@/components/EmptyState";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { listOrganizations } from "@/lib/api";
 import type { Vault, Organization } from "@/lib/api";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockVaults, mockOrganizations } from "@/fixtures/vaults";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 export default function VaultsPage() {
+  const testMode = useTestMode();
   const { vaults, loading, fetchVaults, addVault, editVault, removeVault, activeVaultId, setActiveVault } = useVaultStore();
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
@@ -40,13 +45,19 @@ export default function VaultsPage() {
   const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
+    if (testMode) {
+      useVaultStore.setState({ vaults: mockVaults, loading: false, error: null });
+      setOrgs(mockOrganizations);
+      if (mockOrganizations.length === 1) setOrgId(mockOrganizations[0].id);
+      return;
+    }
     fetchVaults();
     listOrganizations().then((data) => {
       setOrgs(data);
       // Auto-select if user has exactly one org
       if (data.length === 1) setOrgId(data[0].id);
     }).catch(() => {});
-  }, [fetchVaults]);
+  }, [fetchVaults, testMode]);
 
   function openCreateDialog() {
     setName("");
@@ -153,13 +164,12 @@ export default function VaultsPage() {
   const canAdminVault = (vault: Vault) => vault.current_user_permission === "admin";
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Vaults</h1>
-          <p className="text-muted-foreground">Manage your knowledge vaults</p>
-        </div>
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <PageTitleHeader
+          title="Vaults"
+          description="Manage your knowledge vaults"
+        />
         <Button onClick={openCreateDialog}>
           <Plus className="mr-2 h-4 w-4" /> New Vault
         </Button>
@@ -167,11 +177,11 @@ export default function VaultsPage() {
 
       {/* Vault Cards Grid */}
       {vaults.length === 0 && (
-        <div className="flex flex-col items-center justify-center py-16 text-center text-muted-foreground">
-          <Database className="h-12 w-12 mb-4 opacity-30" />
-          <p className="text-lg font-medium">No vaults yet</p>
-          <p className="text-sm mt-1">Create a vault to organize your documents into separate knowledge bases.</p>
-        </div>
+        <EmptyState
+          icon={Database}
+          title="No vaults yet"
+          description="Create a vault to organize your documents into separate knowledge bases."
+        />
       )}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {vaults.map(vault => {
@@ -233,12 +243,11 @@ export default function VaultsPage() {
                     <Pencil className="h-4 w-4" />
                   </Button>
                   <Button
-                    variant="ghost"
+                    variant="destructive"
                     size="sm"
                     onClick={() => openDeleteDialog(vault)}
                     disabled={!canEditVault}
                     title={canEditVault ? "Delete vault" : unavailableReason}
-                    className="text-destructive hover:text-destructive"
                   >
                     <Trash2 className="h-4 w-4" />
                   </Button>
@@ -252,13 +261,13 @@ export default function VaultsPage() {
 
       {/* Create Dialog */}
       <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-<DialogContent aria-labelledby="create-vault-title" aria-describedby="create-vault-desc">
-        <DialogHeader>
-          <DialogTitle id="create-vault-title">Create New Vault</DialogTitle>
-          <DialogDescription id="create-vault-desc">
-            Add a new knowledge vault to organize your documents and memories.
-          </DialogDescription>
-        </DialogHeader>
+        <DialogContent aria-labelledby="create-vault-title" aria-describedby="create-vault-desc">
+          <DialogHeader>
+            <DialogTitle id="create-vault-title">Create New Vault</DialogTitle>
+            <DialogDescription id="create-vault-desc">
+              Add a new knowledge vault to organize your documents and memories.
+            </DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div>
               <Label htmlFor="vault-name">Vault Name</Label>
@@ -324,13 +333,13 @@ export default function VaultsPage() {
 
       {/* Edit Dialog */}
       <Dialog open={editDialogOpen} onOpenChange={setEditDialogOpen}>
-<DialogContent aria-labelledby="edit-vault-title" aria-describedby="edit-vault-desc">
-        <DialogHeader>
-          <DialogTitle id="edit-vault-title">Edit Vault</DialogTitle>
-          <DialogDescription id="edit-vault-desc">
-            Update vault name or description.
-          </DialogDescription>
-        </DialogHeader>
+        <DialogContent aria-labelledby="edit-vault-title" aria-describedby="edit-vault-desc">
+          <DialogHeader>
+            <DialogTitle id="edit-vault-title">Edit Vault</DialogTitle>
+            <DialogDescription id="edit-vault-desc">
+              Update vault name or description.
+            </DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div>
               <Label htmlFor="vault-name">Vault Name</Label>

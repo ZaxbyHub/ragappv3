@@ -63,7 +63,7 @@ export function CodeViewer({ source }: CodeViewerProps) {
 
       <div className="flex-1 overflow-auto">
         <pre className={cn(
-          "p-4 rounded-lg bg-muted/30 overflow-x-auto",
+          "p-4 rounded bg-muted/30 overflow-x-auto",
           "text-sm font-mono leading-relaxed"
         )}>
           <code>{displayContent || source.snippet || "No code available"}</code>

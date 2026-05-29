@@ -6,6 +6,16 @@ import type { NavItemId } from "./navigationTypes";
 
 const mockLogout = vi.hoisted(() => vi.fn());
 
+// Under vitest, the named icons from "@hugeicons/core-free-icons" resolve to
+// undefined, so the real HugeiconsIcon throws "currentIcon is not iterable" and
+// crashes every render. Mock the renderer to a harmless stub so the rebranded
+// component mounts. Identity of the SVG is not assertable; tests assert on the
+// stable aria-labels instead.
+vi.mock("@hugeicons/react", () => ({
+  HugeiconsIcon: () => null,
+  IconSvgElement: undefined,
+}));
+
 // Mock useThemeStore before importing NavigationRail (NavigationRail imports useThemeStore)
 vi.mock("@/stores/useThemeStore", () => ({
   useThemeStore: vi.fn(() => ({
@@ -28,6 +38,7 @@ const mockHealthStatus = {
   embeddings: true,
   chat: true,
   loading: false,
+  lastChecked: Date.now(),
 };
 
 describe("NavigationRail", () => {
@@ -46,15 +57,17 @@ describe("NavigationRail", () => {
         </MemoryRouter>
       );
 
-      // Check for all expected nav items (9 items total)
+      // Check for all expected nav items visible to an admin user.
       expect(screen.getByLabelText("Chat")).toBeInTheDocument();
       expect(screen.getByLabelText("Documents")).toBeInTheDocument();
       expect(screen.getByLabelText("Memory")).toBeInTheDocument();
+      expect(screen.getByLabelText("Wiki")).toBeInTheDocument();
+      expect(screen.getByLabelText("KMS")).toBeInTheDocument();
       expect(screen.getByLabelText("Vaults")).toBeInTheDocument();
       expect(screen.getByLabelText("Settings")).toBeInTheDocument();
       expect(screen.getByLabelText("Groups")).toBeInTheDocument();
       expect(screen.getByLabelText("Users")).toBeInTheDocument();
-      expect(screen.getByLabelText("Orgs")).toBeInTheDocument();
+      expect(screen.getByLabelText("Organizations")).toBeInTheDocument();
       expect(screen.getByLabelText("Profile")).toBeInTheDocument();
     });
 
@@ -84,7 +97,7 @@ describe("NavigationRail", () => {
       );
 
       const chatButton = screen.getByLabelText("Chat");
-      expect(chatButton).toHaveClass("bg-primary/10");
+      expect(chatButton).toHaveClass("bg-accent");
     });
 
     it("shows active indicator for active item", () => {

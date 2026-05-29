@@ -1,7 +1,15 @@
 import { useEffect, useState, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { RefreshCw, RotateCcw, X, Loader2 } from "lucide-react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { RefreshCw, RotateCcw, X, Loader2, ClipboardList } from "lucide-react";
+import { EmptyState } from "@/components/EmptyState";
 import { toast } from "sonner";
 import {
   listWikiJobs,
@@ -111,18 +119,22 @@ export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <h3 className="text-sm font-semibold shrink-0">Compile Jobs</h3>
         <div className="flex items-center gap-2">
-          <select
-            className="text-xs border border-input rounded px-2 py-1 bg-background"
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
+          <Select
+            value={statusFilter || "all"}
+            onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}
           >
-            <option value="">All statuses</option>
-            <option value="pending">Pending</option>
-            <option value="running">Running</option>
-            <option value="completed">Completed</option>
-            <option value="failed">Failed</option>
-            <option value="cancelled">Cancelled</option>
-          </select>
+            <SelectTrigger className="text-xs h-8 w-[140px]">
+              <SelectValue placeholder="All statuses" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All statuses</SelectItem>
+              <SelectItem value="pending">Pending</SelectItem>
+              <SelectItem value="running">Running</SelectItem>
+              <SelectItem value="completed">Completed</SelectItem>
+              <SelectItem value="failed">Failed</SelectItem>
+              <SelectItem value="cancelled">Cancelled</SelectItem>
+            </SelectContent>
+          </Select>
           <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
             {loading ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -139,7 +151,11 @@ export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps
 
       {/* Job list */}
       {jobs.length === 0 && !loading && (
-        <p className="text-xs text-muted-foreground text-center py-4">No jobs found.</p>
+        <EmptyState
+          icon={ClipboardList}
+          title="No jobs found"
+          description="Jobs will appear here when wiki compilations are queued."
+        />
       )}
 
       {jobs.map((job) => (
@@ -156,7 +172,7 @@ export function WikiJobsPanel({ vaultId, refreshSignal = 0 }: WikiJobsPanelProps
                 )}
               </div>
               <span
-                className={`text-xs rounded px-1.5 py-0.5 shrink-0 font-medium ${STATUS_COLORS[job.status] ?? ""}`}
+                className={`text-xs rounded-sm px-1.5 py-0.5 shrink-0 font-medium ${STATUS_COLORS[job.status] ?? ""}`}
               >
                 {job.status}
               </span>

@@ -61,7 +61,7 @@ export const MessageBubble = memo(function MessageBubble({
             {/* Message bubble */}
             <div
               className={cn(
-                "rounded-2xl rounded-tr-sm px-4 py-3 text-sm leading-relaxed",
+                "rounded-tl-2xl rounded-bl-2xl rounded-br-2xl rounded-tr px-4 py-3 text-sm leading-relaxed",
                 "bg-primary text-primary-foreground",
                 "max-w-full break-words"
               )}
@@ -71,7 +71,7 @@ export const MessageBubble = memo(function MessageBubble({
 
             {/* Error */}
             {message.error && (
-              <div className="mt-2 flex items-start gap-2 rounded-lg bg-destructive/10 border border-destructive/20 p-3 text-left">
+              <div className="mt-2 flex items-start gap-2 rounded-sm bg-destructive/10 border border-destructive/20 p-3 text-left">
                 <AlertCircle className="h-4 w-4 text-destructive flex-shrink-0 mt-0.5" aria-hidden />
                 <div>
                   <p className="text-sm font-medium text-destructive">Error</p>

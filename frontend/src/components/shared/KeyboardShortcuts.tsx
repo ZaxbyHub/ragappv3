@@ -56,7 +56,7 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
         <dl className="space-y-3 mt-4">
           {shortcuts.map(({ key, description }) => (
             <div key={key} className="flex justify-between items-center">
-              <dt className="font-mono text-sm bg-muted px-2 py-1 rounded">{key}</dt>
+              <dt className="font-mono text-sm bg-muted px-2 py-1 rounded-sm">{key}</dt>
               <dd className="text-sm text-muted-foreground">{description}</dd>
             </div>
           ))}

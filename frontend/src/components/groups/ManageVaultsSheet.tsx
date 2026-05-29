@@ -169,7 +169,7 @@ export function ManageVaultsSheet({
             {isLoading ? (
               <div className="space-y-3">
                 {Array.from({ length: 5 }).map((_, i) => (
-                  <div key={i} className="p-3 rounded-md border space-y-2">
+                  <div key={i} className="p-3 rounded-sm border space-y-2">
                     <Skeleton className="h-4 w-32" />
                     <Skeleton className="h-3 w-full" />
                     <Skeleton className="h-9 w-32" />
@@ -193,7 +193,7 @@ export function ManageVaultsSheet({
                   return (
                     <div
                       key={vault.id}
-                      className={`flex items-start space-x-3 rounded-md border p-3 transition-colors ${
+                      className={`flex items-start space-x-3 rounded-sm border p-3 transition-colors ${
                         hasAccess
                           ? "border-primary/50 bg-primary/5"
                           : "hover:bg-muted/50"

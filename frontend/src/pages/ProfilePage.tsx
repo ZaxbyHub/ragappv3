@@ -2,11 +2,15 @@ import { useState, useEffect } from "react";
 import { toast } from "sonner";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { changePassword, listOrganizations, listVaults, type Organization, type Vault } from "@/lib/api";
+import { useTestMode } from "@/fixtures/TestModeContext";
+import { mockOrganizations, mockVaults } from "@/fixtures/vaults";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { User, Lock, Loader2, Save, Building2, Database } from "lucide-react";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 type UserRole = "superadmin" | "admin" | "member" | "viewer";
 
@@ -18,6 +22,7 @@ const ROLE_LABELS: Record<UserRole, string> = {
 };
 
 function ProfilePageContent() {
+  const testMode = useTestMode();
   const user = useAuthStore((state) => state.user);
   const updateProfile = useAuthStore((state) => state.updateProfile);
 
@@ -30,18 +35,19 @@ function ProfilePageContent() {
   const [changingPassword, setChangingPassword] = useState(false);
   const [passwordError, setPasswordError] = useState("");
 
-  const [orgs, setOrgs] = useState<Organization[]>([]);
-  const [vaults, setVaults] = useState<Vault[]>([]);
-  const [loadingAccess, setLoadingAccess] = useState(true);
+  const [orgs, setOrgs] = useState<Organization[]>(testMode ? mockOrganizations : []);
+  const [vaults, setVaults] = useState<Vault[]>(testMode ? mockVaults : []);
+  const [loadingAccess, setLoadingAccess] = useState(!testMode);
 
   useEffect(() => {
+    if (testMode) return;
     setLoadingAccess(true);
     Promise.allSettled([listOrganizations(), listVaults()]).then(([orgResult, vaultResult]) => {
       if (orgResult.status === "fulfilled") setOrgs(orgResult.value);
       if (vaultResult.status === "fulfilled") setVaults(vaultResult.value.vaults ?? []);
       setLoadingAccess(false);
     });
-  }, []);
+  }, [testMode]);
 
   const handleUpdateProfile = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -101,10 +107,12 @@ function ProfilePageContent() {
   }
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-300">
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight">Profile</h1>
-        <p className="text-muted-foreground mt-1">Manage your account settings</p>
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <PageTitleHeader
+          title="Profile"
+          description="Manage your account settings"
+        />
       </div>
 
       <Card>
@@ -117,16 +125,16 @@ function ProfilePageContent() {
         <CardContent>
           <form onSubmit={handleUpdateProfile} className="space-y-4">
             <div className="space-y-2">
-              <label htmlFor="username" className="text-sm font-medium">Username</label>
+              <Label htmlFor="username">Username</Label>
               <Input id="username" value={user.username} disabled aria-label="Username" className="bg-muted" />
               <p className="text-xs text-muted-foreground">Username cannot be changed</p>
             </div>
             <div className="space-y-2">
-              <label htmlFor="full-name" className="text-sm font-medium">Full Name</label>
+              <Label htmlFor="full-name">Full Name</Label>
               <Input id="full-name" placeholder="Your full name..." value={fullName} onChange={(e) => setFullName(e.target.value)} disabled={updatingProfile} aria-label="Full name" />
             </div>
             <div className="space-y-2">
-              <label htmlFor="role" className="text-sm font-medium">Role</label>
+              <Label htmlFor="role">Role</Label>
               <div>
                 <Badge variant="secondary">{ROLE_LABELS[user.role]}</Badge>
               </div>
@@ -152,21 +160,21 @@ function ProfilePageContent() {
         <CardContent>
           <form onSubmit={handleChangePassword} className="space-y-4">
             {passwordError && (
-              <div role="alert" aria-live="assertive" className="rounded-md border border-destructive bg-destructive/10 px-4 py-3 text-sm text-destructive">
+              <div role="alert" aria-live="assertive" className="rounded-sm border border-destructive bg-destructive/10 px-4 py-3 text-sm text-destructive">
                 {passwordError}
               </div>
             )}
             <div className="space-y-2">
-              <label htmlFor="current-password" className="text-sm font-medium">Current Password</label>
+              <Label htmlFor="current-password">Current Password</Label>
               <Input id="current-password" type="password" placeholder="Enter current password..." value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} disabled={changingPassword} aria-label="Current password" />
             </div>
             <div className="space-y-2">
-              <label htmlFor="new-password" className="text-sm font-medium">New Password</label>
+              <Label htmlFor="new-password">New Password</Label>
               <Input id="new-password" type="password" placeholder="Enter new password..." value={newPassword} onChange={(e) => setNewPassword(e.target.value)} disabled={changingPassword} aria-label="New password" />
               <p className="text-xs text-muted-foreground">Must be at least 8 characters</p>
             </div>
             <div className="space-y-2">
-              <label htmlFor="confirm-password" className="text-sm font-medium">Confirm New Password</label>
+              <Label htmlFor="confirm-password">Confirm New Password</Label>
               <Input id="confirm-password" type="password" placeholder="Confirm new password..." value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} disabled={changingPassword} aria-label="Confirm new password" />
             </div>
             <div className="flex justify-end">

@@ -172,7 +172,7 @@ export function GroupFormDialog({
               <div
                 role="alert"
                 aria-live="polite"
-                className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+                className="rounded-sm border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
               >
                 {rootError}
               </div>

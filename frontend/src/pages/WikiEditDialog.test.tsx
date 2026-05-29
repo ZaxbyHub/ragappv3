@@ -125,8 +125,9 @@ describe("WikiEditDialog", () => {
       target: { value: "A summary" },
     });
     fireEvent.change(markdownField(), { target: { value: "# Body" } });
-    // Drive the status Select to "verified" via the mocked SelectItem.
-    fireEvent.click(screen.getByRole("button", { name: "verified" }));
+    // Drive the status Select to "verified" via the mocked SelectItem. The mock
+    // renders the item's children (the human label), so query by "Verified".
+    fireEvent.click(screen.getByRole("button", { name: "Verified" }));
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
@@ -168,8 +169,8 @@ describe("WikiEditDialog", () => {
   // 5. Template auto-fill
   it("fills the markdown with the template for a newly chosen page type (create mode)", () => {
     renderDialog({ open: true });
-    // Default markdown is the entity template; switch to "procedure".
-    fireEvent.click(screen.getByRole("button", { name: "procedure" }));
+    // Default markdown is the entity template; switch to "Procedure".
+    fireEvent.click(screen.getByRole("button", { name: "Procedure" }));
     const ta = markdownField();
     expect(ta.value).toContain("## Purpose");
     expect(ta.value).toContain("## Steps");
@@ -180,7 +181,7 @@ describe("WikiEditDialog", () => {
     const ta = markdownField();
     // User types custom content that is not a template.
     fireEvent.change(ta, { target: { value: "My own notes, untouched." } });
-    fireEvent.click(screen.getByRole("button", { name: "system" }));
+    fireEvent.click(screen.getByRole("button", { name: "System" }));
     expect(ta.value).toBe("My own notes, untouched.");
   });
 
@@ -205,7 +206,7 @@ describe("WikiEditDialog", () => {
     };
     renderDialog({ open: true, page });
     expect(screen.getByText("Edit Page")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "procedure" }));
+    fireEvent.click(screen.getByRole("button", { name: "Procedure" }));
     expect(markdownField().value).toBe("Original content body.");
   });
 });

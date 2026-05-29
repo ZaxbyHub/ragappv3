@@ -34,7 +34,6 @@ export function VaultSelector({ className }: VaultSelectorProps) {
       <DropdownMenuTrigger asChild>
         <Button
           variant="outline"
-          size="sm"
           className={cn("gap-2", className)}
           aria-label={
             activeVault

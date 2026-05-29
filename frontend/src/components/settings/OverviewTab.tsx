@@ -73,7 +73,7 @@ export function OverviewTab({
               <StatusDot ok={health.backend} />
               Backend
             </span>
-            <span className="text-muted-foreground">
+            <span className="text-muted-foreground capitalize">
               {health.backend ? "ok" : "down"}
             </span>
           </div>
@@ -82,7 +82,7 @@ export function OverviewTab({
               <StatusDot ok={health.embeddings} />
               Embedding service
             </span>
-            <span className="text-muted-foreground">
+            <span className="text-muted-foreground capitalize">
               {health.embeddings ? "ok" : "down"}
             </span>
           </div>
@@ -91,7 +91,7 @@ export function OverviewTab({
               <StatusDot ok={health.chat} />
               Chat service
             </span>
-            <span className="text-muted-foreground">
+            <span className="text-muted-foreground capitalize">
               {health.chat ? "ok" : "down"}
             </span>
           </div>

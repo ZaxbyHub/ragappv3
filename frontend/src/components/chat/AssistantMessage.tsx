@@ -2,6 +2,7 @@
 import { useState, useMemo, useCallback } from "react";
 import { motion, useReducedMotion } from "framer-motion";
 import { Bot, AlertCircle, Sparkles, Zap } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import type { Message } from "@/stores/useChatStore";
 import type { Source } from "@/lib/api";
 import { useChatShellStore } from "@/stores/useChatShellStore";
@@ -176,15 +177,15 @@ export function AssistantMessage({
 
         {/* Error */}
         {message.error && (
-          <div className="mt-3 flex items-start gap-2 rounded-lg bg-destructive/10 border border-destructive/20 p-3">
+          <div className="mt-3 flex items-start gap-2 rounded-sm bg-destructive/10 border border-destructive/20 p-3">
             <AlertCircle className="h-4 w-4 text-destructive flex-shrink-0 mt-0.5" aria-hidden />
             <div className="min-w-0">
               <p className="text-sm font-medium text-destructive">Error</p>
               <p className="text-xs text-destructive/80 mt-0.5">{message.error}</p>
               {onRetry && (
-                <button onClick={onRetry} className="mt-2 text-xs text-destructive underline hover:no-underline">
+                <Button variant="link" size="sm" className="text-destructive text-xs h-auto p-0 mt-2" onClick={onRetry}>
                   Try again →
-                </button>
+                </Button>
               )}
             </div>
           </div>
@@ -192,7 +193,7 @@ export function AssistantMessage({
 
         {/* Stopped */}
         {message.stopped && !message.error && (
-          <div className="mt-3 inline-flex items-center gap-2 rounded-md bg-muted border border-border px-3 py-1.5">
+          <div className="mt-3 inline-flex items-center gap-2 rounded-sm bg-muted border border-border px-3 py-1.5">
             <span className="text-xs font-medium text-muted-foreground">Stopped</span>
           </div>
         )}
@@ -217,7 +218,7 @@ export function AssistantMessage({
 
         {/* Debug panel */}
         {import.meta.env.DEV && isDebugActive && (
-          <div className="mt-3 p-3 rounded-lg bg-muted border text-xs font-mono">
+          <div className="mt-3 p-3 rounded-sm bg-muted border text-xs font-mono">
             <div className="text-muted-foreground mb-1">Debug Info:</div>
             <div>Message ID: {message.id}</div>
             <div>Sources: {message.sources?.length ?? 0}</div>

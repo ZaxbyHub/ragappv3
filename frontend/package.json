@@ -1,5 +1,5 @@
 {
-  "name": "knowledgevault-frontend",
+  "name": "meridian-frontend",
   "private": true,
   "version": "1.0.3",
   "type": "module",
@@ -16,6 +16,8 @@
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
+    "@hugeicons/core-free-icons": "^4.1.4",
+    "@hugeicons/react": "^1.1.6",
     "@radix-ui/react-accordion": "^1.2.12",
     "@radix-ui/react-checkbox": "^1.1.2",
     "@radix-ui/react-dialog": "^1.1.15",

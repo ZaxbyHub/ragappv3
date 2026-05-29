@@ -21,11 +21,24 @@ import { Bold, Italic, Heading1, Link, List, Code } from "lucide-react";
 import type { WikiPage } from "@/lib/api";
 
 const PAGE_TYPES = [
-  "entity", "procedure", "system", "acronym", "qa",
-  "contradiction", "open_question", "overview", "manual",
+  {value: "entity", label: "Entity"},
+  {value: "procedure", label: "Procedure"},
+  {value: "system", label: "System"},
+  {value: "acronym", label: "Acronym"},
+  {value: "qa", label: "QA"},
+  {value: "contradiction", label: "Contradiction"},
+  {value: "open_question", label: "Open Question"},
+  {value: "overview", label: "Overview"},
+  {value: "manual", label: "Manual"},
 ] as const;
 
-const STATUSES = ["draft", "needs_review", "verified", "stale", "archived"] as const;
+const STATUSES = [
+  {value: "draft", label: "Draft"},
+  {value: "needs_review", label: "Needs Review"},
+  {value: "verified", label: "Verified"},
+  {value: "stale", label: "Stale"},
+  {value: "archived", label: "Archived"},
+] as const;
 
 const TEMPLATES: Record<string, string> = {
   entity: "# {title}\n\n## Overview\n\n## Key Facts\n\n## Related Entities\n",
@@ -206,11 +219,11 @@ export function WikiEditDialog({ open, page, vaultId: _vaultId, onClose, onSave 
               <Label htmlFor="wiki-type">Type</Label>
               <Select value={pageType} onValueChange={setPageType}>
                 <SelectTrigger id="wiki-type">
-                  <SelectValue />
+                  <SelectValue className="capitalize" />
                 </SelectTrigger>
                 <SelectContent>
                   {PAGE_TYPES.map((t) => (
-                    <SelectItem key={t} value={t} className="capitalize">{t}</SelectItem>
+                    <SelectItem key={t.value} value={t.value} className="capitalize" textValue={t.label}>{t.label}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
@@ -223,7 +236,7 @@ export function WikiEditDialog({ open, page, vaultId: _vaultId, onClose, onSave 
                 </SelectTrigger>
                 <SelectContent>
                   {STATUSES.map((s) => (
-                    <SelectItem key={s} value={s} className="capitalize">{s}</SelectItem>
+                    <SelectItem key={s.value} value={s.value} className="capitalize" textValue={s.label}>{s.label}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>

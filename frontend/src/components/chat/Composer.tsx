@@ -522,7 +522,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                   key={att.id}
                   data-testid={`attachment-${att.status}`}
                   className={cn(
-                    "flex items-center gap-2 rounded-lg border px-2 py-1.5 text-xs",
+                    "flex items-center gap-2 rounded-sm border px-2 py-1.5 text-xs",
                     att.status === "error" && "border-destructive/50 bg-destructive/5",
                     att.status === "indexed" && "border-success/50 bg-success/5",
                     att.status === "uploaded" && "border-amber-500/40 bg-amber-500/5",
@@ -618,7 +618,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -6 }}
                 transition={{ duration: 0.12 }}
-                className="absolute bottom-full left-0 z-50 mb-2 w-72 overflow-hidden rounded-lg border border-border bg-popover shadow-lg"
+                className="absolute bottom-full left-0 z-50 mb-2 w-72 overflow-hidden rounded-sm border border-border bg-popover shadow-lg"
               >
                 <div className="max-h-64 overflow-y-auto py-1">
                   {filteredCmds.length === 0 ? (
@@ -636,7 +636,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                           i === selectedCmd ? "bg-accent text-accent-foreground" : "text-popover-foreground hover:bg-accent/50"
                         )}
                       >
-                        <span className={cn("flex h-8 w-8 items-center justify-center rounded-md", i === selectedCmd ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground")}>
+                        <span className={cn("flex h-8 w-8 items-center justify-center rounded-sm", i === selectedCmd ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground")}>
                           {cmd.icon}
                         </span>
                         <div>
@@ -711,7 +711,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
               <div
                 role="radiogroup"
                 aria-label="Chat mode"
-                className="flex h-8 items-center rounded-md border border-input text-xs overflow-hidden"
+                className="flex h-8 items-center rounded-sm border border-input text-xs overflow-hidden"
               >
                 <button
                   type="button"

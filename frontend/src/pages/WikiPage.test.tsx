@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import React from "react";
 
@@ -36,13 +36,36 @@ vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
 }));
 
+// Radix Tabs cannot be activated via fireEvent.click in jsdom (pointer-capture /
+// activation semantics). Mock the primitive so TabsTrigger is a plain button that
+// invokes onValueChange — same approach the repo uses for ui/tabs and ui/select.
+// This lets us drive the page-type tabs that live in WikiPage's toolbar.
+vi.mock("@/components/ui/tabs", async () => {
+  const ReactMod = await import("react");
+  const Ctx = ReactMod.createContext<(v: string) => void>(() => {});
+  return {
+    Tabs: ({ onValueChange, children }: any) =>
+      ReactMod.createElement(Ctx.Provider, { value: onValueChange }, children),
+    TabsList: ({ children }: any) => ReactMod.createElement("div", null, children),
+    TabsTrigger: ({ value, children }: any) => {
+      const onValueChange = ReactMod.useContext(Ctx);
+      return ReactMod.createElement(
+        "button",
+        { role: "tab", onClick: () => onValueChange(value) },
+        children
+      );
+    },
+  };
+});
+
 // Mock child wiki page components to isolate the parent
 vi.mock("@/pages/WikiPageList", () => ({
-  WikiPageList: ({ onCreateClick }: { onCreateClick: () => void }) => (
-    <div data-testid="wiki-page-list">
-      <button onClick={onCreateClick} data-testid="create-page-btn">New Page</button>
-    </div>
-  ),
+  WikiPageList: () => <div data-testid="wiki-page-list">Page List</div>,
+  PAGE_TYPES: [
+    { value: "", label: "All" },
+    { value: "overview", label: "Overview" },
+    { value: "entity", label: "Entities" },
+  ],
 }));
 
 vi.mock("@/pages/WikiPageDetail", () => ({
@@ -190,9 +213,9 @@ describe("WikiPage", () => {
     // Dialog not open initially
     expect(queryByTestId("wiki-edit-dialog")).toBeNull();
 
-    // Simulate clicking the create button inside WikiPageList
+    // Simulate clicking the New Page button in the toolbar
     await act(async () => {
-      screen.getByTestId("create-page-btn").click();
+      screen.getByRole("button", { name: /new page/i }).click();
     });
 
     expect(screen.getByTestId("wiki-edit-dialog")).toBeInTheDocument();
@@ -218,6 +241,61 @@ describe("WikiPage", () => {
 
     await waitFor(() => {
       expect(runWikiLint).toHaveBeenCalledWith(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Search and filter toolbar
+  //
+  // These cases were relocated from WikiPageList.test.tsx. During the rebrand the
+  // search box and page-type tabs moved out of WikiPageList (now a pure list) and
+  // into WikiPage's toolbar, which drives fetchPages → listWikiPages with the
+  // query. WikiPageList no longer renders those affordances or accepts onFilter,
+  // so the equivalent assertions live here against the real toolbar.
+  // ---------------------------------------------------------------------------
+  describe("Search and filter toolbar", () => {
+    it("search submit (button) calls listWikiPages with the query", async () => {
+      render(<WikiPage />);
+      fireEvent.change(screen.getByPlaceholderText("Search wiki..."), {
+        target: { value: "alpha" },
+      });
+      (listWikiPages as ReturnType<typeof vi.fn>).mockClear();
+      fireEvent.click(screen.getByRole("button", { name: "Search" }));
+      await waitFor(() => {
+        expect(listWikiPages).toHaveBeenCalledWith({
+          vault_id: 1,
+          page_type: undefined,
+          search: "alpha",
+        });
+      });
+    });
+
+    it("search submit on Enter calls listWikiPages with the query", async () => {
+      render(<WikiPage />);
+      const input = screen.getByPlaceholderText("Search wiki...");
+      fireEvent.change(input, { target: { value: "beta" } });
+      (listWikiPages as ReturnType<typeof vi.fn>).mockClear();
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => {
+        expect(listWikiPages).toHaveBeenCalledWith({
+          vault_id: 1,
+          page_type: undefined,
+          search: "beta",
+        });
+      });
+    });
+
+    it("changing the page-type tab calls listWikiPages with the page_type", async () => {
+      render(<WikiPage />);
+      (listWikiPages as ReturnType<typeof vi.fn>).mockClear();
+      fireEvent.click(screen.getByRole("tab", { name: "Entities" }));
+      await waitFor(() => {
+        expect(listWikiPages).toHaveBeenCalledWith({
+          vault_id: 1,
+          page_type: "entity",
+          search: undefined,
+        });
+      });
     });
   });
 });

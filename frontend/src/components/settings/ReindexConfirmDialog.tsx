@@ -49,7 +49,7 @@ export function ReindexConfirmDialog({
         <ul className="my-2 list-disc space-y-1 pl-6 text-sm text-foreground">
           {dirtyReindexFields.map((field) => (
             <li key={field}>
-              <code className="rounded bg-muted px-1 py-0.5 text-xs">
+              <code className="rounded-sm bg-muted px-1 py-0.5 text-xs">
                 {field}
               </code>
             </li>

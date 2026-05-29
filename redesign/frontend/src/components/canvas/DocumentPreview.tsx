@@ -45,7 +45,7 @@ export function DocumentPreview({ source }: DocumentPreviewProps) {
       </div>
 
       <div className="flex-1 overflow-auto">
-        <div className={cn("prose prose-sm dark:prose-invert max-w-none", "p-4 rounded-lg bg-muted/30")}>
+        <div className={cn("prose prose-sm dark:prose-invert max-w-none", "p-4 rounded bg-muted/30")}>
           <pre className="whitespace-pre-wrap font-sans text-sm leading-relaxed">
             {displayContent || source.snippet || "No content available"}
           </pre>

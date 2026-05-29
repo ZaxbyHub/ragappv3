@@ -121,7 +121,7 @@ export function DocumentCard({
               />
             )}
             <div
-              className="flex-shrink-0 p-2 bg-muted rounded-md"
+              className="flex-shrink-0 p-2 bg-muted rounded-sm"
               aria-hidden="true"
             >
               <FileIcon filename={document.filename} className="w-5 h-5" />
@@ -165,7 +165,7 @@ export function DocumentCard({
                   <DropdownMenuItem
                     onClick={() => onDelete(document.id)}
                     disabled={isDeleting}
-                    className="text-destructive focus:text-destructive"
+                    className="text-destructive focus:text-destructive bg-destructive/10 hover:!bg-destructive/20"
                     aria-label={`Delete ${document.filename}`}
                   >
                     <Trash2 className="w-4 h-4 mr-2" />

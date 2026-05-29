@@ -26,8 +26,8 @@ const sizeClasses = {
 
 export function EmptyState({ icon: Icon, title, description, action, size = "md" }: EmptyStateProps) {
   return (
-    <Card>
-      <CardContent className="py-12 text-center">
+    <Card className="flex-shrink-0 w-full flex flex-col flex-1">
+      <CardContent className="py-12 text-center flex-1">
         <div className={`${sizeClasses[size]} mx-auto mb-4 rounded-full bg-muted flex items-center justify-center`} aria-hidden="true">
           <Icon className="w-1/2 h-1/2 text-muted-foreground" />
         </div>
