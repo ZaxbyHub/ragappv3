@@ -103,6 +103,19 @@ If scope cannot be determined, review the narrowest safe scope available and sta
 
 Before launching explorers, build a compact `swarm-pr-review-context` in scratch or as a local artifact if file writes are allowed.
 
+### PR Branch Checkout (mandatory)
+
+If the review targets a pull request or a branch other than the current working tree, you MUST `git fetch` and `git checkout` the target branch **before reading any files or computing the diff**. Explorer agents read code via the filesystem — if the working tree is on `master` but the PR is on `origin/feature-branch`, explorers read the wrong code and produce invalid candidates. The diff tool also operates on the checked-out branch. If the working tree is dirty, stash changes or warn before checking out.
+
+```bash
+git fetch origin <branch-name>
+git checkout <branch-name>
+```
+
+If the branch does not exist locally (e.g., a remote-only PR branch), use `git checkout --track origin/<branch-name>` instead.
+
+After checkout, scope all subsequent analysis (diff, repo graph, file reads, explorer context packs) to the checked-out branch. If the branch includes merged commits from prior PRs (common when branching off an already-merged base), scope analysis to the **specific PR commit**, not the full branch accumulation.
+
 The context pack must include, when available:
 
 ```json
@@ -207,13 +220,6 @@ Ingest deterministic signals as candidate generators. They are never final findi
 
 Use available local artifacts first. Run safe read-only or standard project validation commands only when appropriate for the environment.
 
-> Repo note: the exact commands that reproduce this repo's CI gates
-> (backend `ruff check .`, frontend typecheck/lint/test/build, the
-> `scripts/check_*.py` contract scripts) are documented in the
-> `ci-compatibility-audit` skill, derived from `.github/workflows/ci.yml`. Use
-> those as the canonical lint/typecheck/build/contract signal source rather
-> than guessing commands.
-
 Candidate signal sources include:
 
 - CI failures and logs,
@@ -289,6 +295,27 @@ Explorers must not use `CONFIRMED`, `DISPROVED`, or `PRE_EXISTING`.
 ## Phase 4: Triggered Swarm Plugin Micro-Lanes
 
 After base lanes start, inspect the context pack risk triggers. Launch focused micro-lanes for triggered categories only. Do not launch irrelevant micro-lanes.
+
+### Mandatory Micro-Lane Trigger Checklist
+
+Before proceeding to Phase 5, the orchestrator MUST enumerate the trigger keywords present in the diff, PR body, test changes, and context pack against the risk trigger map below. For each match, launch the corresponding micro-lane. **Skipping this checklist is a skill violation** — missed micro-lanes are the most common orchestration failure in PR reviews.
+
+Print and fill before dispatching micro-lanes:
+
+```text
+[TRIGGER CHECK] diff keywords scanned: ___
+[TRIGGER CHECK] triggers matched: ___
+[TRIGGER CHECK] micro-lanes launched: ___
+[TRIGGER CHECK] triggers matched but intentionally skipped: ___ (valid reasons: trigger keyword appears only in a comment/string literal with no behavioral impact, or micro-lane scope fully covered by a base lane already dispatched)
+```
+
+Common triggers that are frequently missed:
+
+- `vi.mock`, `vi.fn`, `vi.hoisted`, mock removal, fixture additions → **Test infrastructure** micro-lane
+- `import`, `require`, new dependency, version bump → **Dependencies** micro-lane (if not already covered by Lane 3)
+- `schema`, `interface`, `type`, `JSONL`, migration → **Evidence schema drift** micro-lane (if Swarm plugin)
+- `git`, `branch`, `checkout`, `reset` → **Git safety** micro-lane
+- `shell`, `exec`, `command`, file writes → **Shell/write authority** micro-lane
 
 Each micro-lane receives:
 
