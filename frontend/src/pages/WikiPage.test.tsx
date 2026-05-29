@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import React from "react";
@@ -19,6 +19,11 @@ vi.mock("@/lib/api", () => ({
   searchWiki: vi.fn().mockResolvedValue({ pages: [], claims: [], entities: [], query: "" }),
   promoteMemoryToWiki: vi.fn(),
   updateMemory: vi.fn(),
+  // WikiPage mounts useWikiEventStream, which reads these from @/lib/api.
+  API_BASE_URL: "/api",
+  getJwtAccessToken: vi.fn(() => null),
+  refreshAccessToken: vi.fn(),
+  getWikiActivityFeed: vi.fn().mockResolvedValue([]),
 }));
 
 // Mock vault store
@@ -90,6 +95,30 @@ vi.mock("@/pages/WikiLintPanel", () => ({
 // ---------------------------------------------------------------------------
 import WikiPage from "./WikiPage";
 import { listWikiPages, listWikiLintFindings, runWikiLint } from "@/lib/api";
+
+// WikiPage opens an authenticated wiki-events fetch stream on mount
+// (useWikiEventStream). Stub fetch with an open (never-resolving) stream so
+// these rendering tests make no real request and trigger no reconnect.
+beforeEach(() => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        body: {
+          getReader: () => ({
+            read: () => new Promise<{ value?: Uint8Array; done: boolean }>(() => {}),
+            cancel: vi.fn(),
+          }),
+        },
+      } as unknown as Response)
+    )
+  );
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 // ---------------------------------------------------------------------------
 // Navigation type test (no rendering needed)

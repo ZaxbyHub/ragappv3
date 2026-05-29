@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { WikiPageList, PAGE_TYPES } from "./WikiPageList";
@@ -14,11 +14,8 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { AlertCircle, Layers, Search, Plus, Activity } from "lucide-react";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { EmptyState } from "@/components/EmptyState";
-import { API_BASE_URL, getWikiActivityFeed } from "@/lib/api";
-
-export function wikiEventsUrl(vaultId: number | string): string {
-  return `${API_BASE_URL}/wiki/events?vault_id=${encodeURIComponent(String(vaultId))}`;
-}
+import { getWikiActivityFeed } from "@/lib/api";
+import { useWikiEventStream } from "@/hooks/useWikiEventStream";
 
 export default function WikiPage() {
   const { activeVaultId } = useVaultStore();
@@ -34,7 +31,6 @@ export default function WikiPage() {
   const [search, setSearch] = useState("");
   const [activeType, setActiveType] = useState("");
   const [jobsRefreshSignal, setJobsRefreshSignal] = useState(0);
-  const eventSourceRef = useRef<EventSource | null>(null);
 
   const {
     pages,
@@ -69,41 +65,15 @@ export default function WikiPage() {
 
   // Subscribe to wiki compile job completion events for the active vault.
   // On any terminal job event, refetch pages, lint findings, and bump the
-  // refresh signal so an open WikiJobsPanel reloads too. The auth cookie is
-  // carried over withCredentials; EventSource cannot set Authorization headers.
-  useEffect(() => {
-    if (!activeVaultId) return;
-    // jsdom (vitest) does not provide EventSource. Skip cleanly so unit tests
-    // that don't exercise the live stream still mount the page.
-    if (typeof EventSource === "undefined") return;
-    const url = wikiEventsUrl(activeVaultId);
-    const es = new EventSource(url, { withCredentials: true });
-    eventSourceRef.current = es;
-
-    es.onmessage = (ev) => {
-      try {
-        const data = JSON.parse(ev.data) as { type?: string };
-        if (data.type === "job_completed" || data.type === "job_failed") {
-          fetchPages();
-          fetchLintFindings();
-          setJobsRefreshSignal((n) => n + 1);
-        }
-      } catch {
-        // Ignore malformed events; SSE keepalives are comment lines and never
-        // reach onmessage.
-      }
-    };
-
-    es.onerror = () => {
-      // Browser auto-reconnects with exponential backoff for SSE. No-op here.
-    };
-
-    return () => {
-      es.close();
-      eventSourceRef.current = null;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeVaultId]);
+  // refresh signal so an open WikiJobsPanel reloads too. Uses an authenticated
+  // fetch stream (Bearer header) rather than EventSource — see
+  // useWikiEventStream for why EventSource always 401s here.
+  const handleJobTerminal = useCallback(() => {
+    fetchPages();
+    fetchLintFindings();
+    setJobsRefreshSignal((n) => n + 1);
+  }, [fetchPages, fetchLintFindings]);
+  useWikiEventStream(activeVaultId, handleJobTerminal);
 
   // Fetch activity feed when panel opens
   useEffect(() => {
