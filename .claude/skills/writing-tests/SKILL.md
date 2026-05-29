@@ -21,6 +21,21 @@ The authoritative testing policy and conventions live in
 - Cover negative paths (403/422, cross-vault isolation, cascade deletes, error branches). Security-sensitive code has `*_adversarial` companion tests.
 - No test theater — a test must exercise what its name claims.
 
+## Writing tests surfaces source bugs — fix them, don't document them
+
+Test-writing is a discovery mechanism. When writing a test reveals that the
+source behavior is wrong, fix the source. Do not:
+
+- ship the test as `@unittest.expectedFailure` / `pytest.mark.xfail` to
+  "document" the broken behavior,
+- write a separate test pinning the buggy behavior as "current behavior",
+- leave a comment like "this will fail until X is fixed" without fixing X.
+
+If a test can only pass as `expectedFailure`/`xfail`, that is a signal that
+the source has a bug. Fix the source in the same session and make the test a
+real passing assertion. An xfail in a committed test is deferred work; per
+this repo's standing rule, deferral is the user's decision, not yours.
+
 ## Backend (pytest + unittest)
 
 - `unittest.TestCase` / `IsolatedAsyncioTestCase` run under pytest; `asyncio_mode = "auto"` (no marker needed). `conftest.py` sets test env and clears `app.*` modules.

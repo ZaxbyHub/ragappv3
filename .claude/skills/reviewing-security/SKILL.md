@@ -26,6 +26,23 @@ Enumerate and inspect:
 - Are errors swallowed instead of handled?
 - Are there security-relevant defaults that fail open?
 
+## Sibling-endpoint consistency check
+
+When a security class is fixed at named locations (e.g., existence-oracle
+403→404, missing vault scoping, auth-before-fetch ordering), always grep for
+all sibling handlers with the same structural pattern and verify each instance.
+
+A fix applied to 3 of 4 endpoints is not a fix — it is a newly introduced
+inconsistency. The unfixed sibling is often harder to find than the original
+because the original finding gives false confidence that the class is closed.
+
+Checklist when fixing an endpoint security class:
+1. Grep for the same structural pattern (guard condition, status code, query
+   shape) across all route handlers in the same file and sibling route files.
+2. For each sibling, confirm the fix is present OR confirm the sibling is not
+   reachable / not affected and state why.
+3. Update tests for ALL affected siblings, not just the originally-named ones.
+
 ## Hard fail conditions
 - missing auth or authz on privileged path
 - injection or path traversal risk
