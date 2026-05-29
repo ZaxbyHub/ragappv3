@@ -32,6 +32,11 @@ file you are editing over anything summarized here.
 - Three agent runners, three skill trees (`.claude/`, `.agents/`, `.opencode/`). Mirror repo-specific skills across all three, or keep them thin pointers to canonical docs.
 - Before push/PR: run `ci-compatibility-audit`. For tests: `writing-tests` / `docs/engineering/testing.md`. For commits/PRs: `commit-pr`.
 
+**Hugeicons + lucide mixed icon discrimination**
+- The navigation rail (`NavigationRail.tsx`) mixes `@hugeicons/core-free-icons` icons (type `IconSvgElement` — a readonly array) with `lucide-react` icons (type `React.ComponentType`, rendered as `forwardRef` objects). When adding new nav items or any component that accepts a `ComponentType | IconSvgElement` union, discriminate with `Array.isArray`, NOT `typeof === "function"`. Lucide `forwardRef` components have `typeof === "object"`, not `"function"` — the wrong guard routes them to `HugeiconsIcon`, which spreads its `icon` prop (`[...icon]`) and throws `TypeError: currentIcon is not iterable` at render time on every authenticated page.
+- Canonical pattern: `function isHugeicon(icon): icon is IconSvgElement { return Array.isArray(icon); }` — use this as a JSX type guard.
+- `HugeiconsIcon` is safe for any prop that resolves to an actual hugeicons array export. Never pass a React component type to it, even if it looks like a valid JSX element.
+
 **TypeScript tsconfig boundary (Vite context)**
 - `tsconfig.node.json` covers only `vite.config.ts`. `tsconfig.json` covers `src/` and references `tsconfig.node.json` as a composite project.
 - Do NOT add files from `src/` to `tsconfig.node.json`'s `include` array and do NOT import `src/` files from `vite.config.ts` or `vite.paths.ts`. Doing so produces `Output file has not been built from source file` — a TypeScript composite conflict because both tsconfigs would include the same file.

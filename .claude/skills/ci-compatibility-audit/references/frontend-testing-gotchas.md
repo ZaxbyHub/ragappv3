@@ -91,3 +91,61 @@ virtualization suites.
 `vi.mock(path, factory)` is hoisted above imports. The factory may not
 reference module-scope variables; use a dynamic `await import("react")` inside
 the factory (as above) rather than a top-level `import React`.
+
+## 5. `window.matchMedia`, `vi.stubEnv` ordering, and the renderer-mock anti-pattern
+
+**`window.matchMedia` is not in jsdom.** Any component that transitively
+imports `useThemeStore` will crash with `window.matchMedia is not a function`
+because that store calls `matchMedia` at module-load time. The global
+`frontend/src/test/setup.ts` does NOT stub it. Add a `beforeAll` stub
+whenever your test renders a component that imports the theme store:
+
+```tsx
+beforeAll(() => {
+  if (!window.matchMedia) {
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      value: (query: string) => ({
+        matches: false, media: query, onchange: null,
+        addEventListener: () => {}, removeEventListener: () => {},
+        addListener: () => {}, removeListener: () => {},
+        dispatchEvent: () => false,
+      }),
+    });
+  }
+});
+```
+
+Affected: `NavigationRail`, `PageShell`, and anything that renders the app
+shell — because `NavigationRail` imports `useThemeStore` directly.
+
+**`vi.stubEnv` must be at the top level (module scope), before any `import()`.**
+Vite replaces `import.meta.env.*` at module-evaluation time. Calling
+`vi.stubEnv` in `beforeAll` is too late if the test then does
+`const App = await import("../App")` — the module was already evaluated with
+the original env values. Place `vi.stubEnv` calls at the top of the test file:
+
+```ts
+// TOP OF FILE — before any imports or describe blocks
+vi.stubEnv("VITE_APP_BASENAME", "/meridian");
+
+describe("...", () => {
+  it("...", async () => {
+    const App = (await import("../App")).default; // gets the stubbed env
+  });
+});
+```
+
+**Anti-pattern: don't mock third-party renderers to silence crashes.** If a
+component crashes at render and you mock the crashing sub-component to
+`() => null` just to make the test pass, you mask a real production bug. The
+correct fix is to pass valid inputs to the sub-component. For DOM assertions
+that don't require SVG identity, assert on stable structure instead —
+aria-labels, roles, text content, or `querySelector("svg")`.
+
+The canonical mistake in this repo: `NavigationRail.test.tsx` previously
+contained `vi.mock("@hugeicons/react", () => ({ HugeiconsIcon: () => null }))`.
+The comment claimed "icons resolve to undefined under vitest" — they actually
+resolve correctly; the real problem was a wrong type discriminator passing a
+lucide `forwardRef` object to `HugeiconsIcon`, which spread it and crashed.
+The mock hid this crash from CI for the entire PR #140 lifetime.

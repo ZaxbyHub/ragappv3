@@ -143,6 +143,7 @@ Examples in-tree: `tests/unit/graph/graph-query.test.ts` (`normalizeGraphPath â€
 - Test error paths: what happens with `null`, `undefined`, empty string, oversized input?
 - Use temp directories (`fs.mkdtemp`) for file I/O tests. Clean up in `afterEach`.
 - Assert on specific values, not just truthiness: `expect(result.status).toBe('pending')` not `expect(result).toBeTruthy()`.
+- **Verify regression tests are non-vacuous:** before committing, stash or revert ONLY the source fix (leave the new test in place), run it, and confirm it fails with the original bug. Restore the fix and confirm it passes. A test that passes on both fixed and unfixed code is not a regression guard.
 
 ### DO NOT
 

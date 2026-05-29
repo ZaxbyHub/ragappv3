@@ -20,6 +20,7 @@ The authoritative testing policy and conventions live in
 - Assert real behavior: backend → status **+** body **+** DB state change; frontend → callback args / DOM, not just "it rendered".
 - Cover negative paths (403/422, cross-vault isolation, cascade deletes, error branches). Security-sensitive code has `*_adversarial` companion tests.
 - No test theater — a test must exercise what its name claims.
+- **Verify regression tests are non-vacuous:** before committing, stash or revert ONLY the source fix (leave the new test in place), run it, and confirm it fails with the original bug. Restore the fix and confirm it passes. A test that passes on both fixed and unfixed code is not a regression guard — it is theater.
 
 ## Backend (pytest + unittest)
 
