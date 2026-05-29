@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from "@testing-library/react";
+import { renderHook, waitFor, cleanup } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const refreshAccessTokenMock = vi.hoisted(() => vi.fn());
@@ -101,6 +101,7 @@ describe("useWikiEventStream", () => {
   });
 
   afterEach(() => {
+    cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
@@ -168,26 +169,53 @@ describe("useWikiEventStream", () => {
     await waitFor(() => expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1));
   });
 
+  it("reconnects with the refreshed token after a 401 token_expired response", async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(401, "token_expired"))
+      .mockResolvedValue(controllableSse().response);
+    refreshAccessTokenMock.mockResolvedValue("refreshed-jwt-token");
+    getJwtAccessTokenMock
+      .mockReturnValueOnce("test-jwt-token")
+      .mockReturnValue("refreshed-jwt-token");
+
+    renderHook(() => useWikiEventStream(42, vi.fn()));
+
+    // Wait for the initial fetch and the refresh.
+    await vi.waitFor(() => expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1));
+
+    // Advance past RECONNECT_BASE_MS (1000 ms) so the backoff timer fires.
+    await vi.advanceTimersByTimeAsync(1100);
+
+    // The hook returns "error" after successful refresh, which triggers reconnect.
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    // Verify the second fetch uses the refreshed token.
+    const [, init] = fetchMock.mock.calls[1];
+    expect(init.headers.Authorization).toBe("Bearer refreshed-jwt-token");
+  });
+
   it("stops retrying on a 401 token_expired response when refresh fails", async () => {
+    vi.useFakeTimers();
     fetchMock.mockResolvedValueOnce(errorResponse(401, "token_expired"));
     refreshAccessTokenMock.mockResolvedValue(null);
 
     renderHook(() => useWikiEventStream(42, vi.fn()));
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    await Promise.resolve();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(2000);
     expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("stops (does not refresh) on a 401 token_invalid response", async () => {
+    vi.useFakeTimers();
     fetchMock.mockResolvedValue(errorResponse(401, "token_invalid"));
 
     renderHook(() => useWikiEventStream(42, vi.fn()));
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    // Give any erroneous reconnect a chance to fire; it must not.
-    await Promise.resolve();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(2000);
     expect(refreshAccessTokenMock).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -231,6 +259,32 @@ describe("useWikiEventStream", () => {
     unmount();
   });
 
+  it("doubles the reconnect backoff on consecutive errors", async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(500, "server_error"))
+      .mockResolvedValueOnce(errorResponse(500, "server_error"))
+      .mockResolvedValueOnce(controllableSse().response);
+
+    renderHook(() => useWikiEventStream(42, vi.fn()));
+
+    // Initial fetch fires immediately.
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // First error retry fires at RECONNECT_BASE_MS (1000 ms).
+    await vi.advanceTimersByTimeAsync(1100);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    // Second error retry fires at 2000 ms (doubled from 1000).
+    // Advance only 1500 ms — should NOT trigger yet (needs 2000 ms from last retry).
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // still 2
+
+    // Advance past the 2000 ms mark — should trigger now.
+    await vi.advanceTimersByTimeAsync(600);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+  });
+
   it("reassembles partial SSE payloads across read calls", async () => {
     const { response, emit, close } = controllableSse();
     fetchMock.mockResolvedValue(response);
@@ -241,6 +295,24 @@ describe("useWikiEventStream", () => {
 
     emit('data: {"type":"job_');
     emit('completed"}\n\n');
+    close();
+
+    await waitFor(() => expect(onTerminal).toHaveBeenCalledTimes(1));
+  });
+
+  it("reassembles SSE payloads split across three chunks and at boundary", async () => {
+    const { response, emit, close } = controllableSse();
+    fetchMock.mockResolvedValue(response);
+    const onTerminal = vi.fn();
+    renderHook(() => useWikiEventStream(42, onTerminal));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // Three-chunk split
+    emit('data: {"type":"job_');
+    emit('completed"}\n');
+    emit('\n');
+
     close();
 
     await waitFor(() => expect(onTerminal).toHaveBeenCalledTimes(1));
@@ -274,34 +346,78 @@ describe("useWikiEventStream", () => {
     // whatever backoff was accumulated from a prior error-reconnect cycle.
     vi.useFakeTimers();
 
-    // First connection: immediately done (clean server close).
-    const doneResponse = {
-      ok: true,
-      status: 200,
-      body: {
-        getReader: () => ({
-          read: vi.fn().mockResolvedValue({ value: undefined, done: true }),
-          cancel: vi.fn(),
-        }),
-      },
-    } as unknown as Response;
-
-    // Second connection: open (never done), so the hook stays connected.
+    // Sequence: error (doubles backoff 1000→2000) → clean disconnect (resets to 1000)
+    // → reconnect fires at the reset 1000ms interval, not at the elevated 2000ms.
     fetchMock
-      .mockResolvedValueOnce(doneResponse)
+      .mockResolvedValueOnce(errorResponse(500, "server_error"))
+      .mockResolvedValueOnce(doneResponse())
       .mockResolvedValue(controllableSse().response);
 
     renderHook(() => useWikiEventStream(42, vi.fn()));
 
-    // Wait for the first fetch to fire.
+    // Wait for the initial fetch to fire.
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 
-    // Advance past the base reconnect delay (1 s) but well under the max (30 s).
-    // If backoff were not reset the second fetch would never fire within 2 s.
-    await vi.advanceTimersByTimeAsync(1500);
+    // First reconnect fires at RECONNECT_BASE_MS (1000 ms) after the error.
+    await vi.advanceTimersByTimeAsync(1100);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Clean disconnect (doneResponse) resets backoff to RECONNECT_BASE_MS (1000 ms).
+    // Advance timers to let the next reconnect fire at the reset 1000 ms interval.
+    await vi.advanceTimersByTimeAsync(1100);
 
-    vi.useRealTimers();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("reconnects after a network error (fetch throws)", async () => {
+    vi.useFakeTimers();
+    fetchMock
+      .mockRejectedValueOnce(new TypeError("Network error"))
+      .mockResolvedValueOnce(controllableSse().response);
+
+    renderHook(() => useWikiEventStream(42, vi.fn()));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(1100);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("retries (does not refresh) on a 401 when no token is present", async () => {
+    vi.useFakeTimers();
+    getJwtAccessTokenMock.mockReturnValue(null);
+    fetchMock
+      .mockResolvedValueOnce(errorResponse(401, "token_expired"))
+      .mockResolvedValueOnce(controllableSse().response);
+
+    renderHook(() => useWikiEventStream(42, vi.fn()));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(refreshAccessTokenMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1100);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("stops if aborted during token refresh", async () => {
+    vi.useFakeTimers();
+    let resolveRefresh: ((token: string | null) => void) | undefined;
+    refreshAccessTokenMock.mockImplementation(() => {
+      return new Promise((resolve) => {
+        resolveRefresh = resolve;
+      });
+    });
+    fetchMock.mockResolvedValueOnce(errorResponse(401, "token_expired"));
+
+    const { unmount } = renderHook(() => useWikiEventStream(42, vi.fn()));
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    // Abort while refresh is pending.
+    unmount();
+
+    // Now resolve the refresh — the hook should have already stopped.
+    if (resolveRefresh) resolveRefresh("new-token");
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
