@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     """Number of chunks to keep after reranking."""
     initial_retrieval_top_k: int = 20
     """Chunks fetched from vector store BEFORE reranking."""
+    reranker_timeout_seconds: float = 12.0
+    """HTTP timeout (seconds) for the TEI reranker endpoint. On timeout or failure the
+    query degrades to un-reranked vector order, so keep this comfortably above the
+    reranker's p99 latency to avoid quality regressions and circuit-breaker trips
+    (reranking_cb fail_max=3 → a 30s outage for all callers). Lower it only to bound
+    worst-case pre-generation latency. Read once when the HTTP client is first created."""
 
     # ── Hybrid search configuration ─────────────────────────────────────────
     hybrid_search_enabled: bool = True
@@ -163,6 +169,13 @@ class Settings(BaseSettings):
     memory_context_top_k: int = 3
     """Maximum memories actually injected into the prompt after relevance filtering.
     Applied after threshold filtering; further limits prompt context pollution."""
+    memory_dense_max_candidates: int = 1000
+    """Maximum memories scanned by the dense (cosine) memory search on the full,
+    unfiltered path, ordered by recency before similarity ranking. Dense is now the
+    sole path to purely-semantic recall (it is no longer pre-filtered to FTS hits), so
+    this bounds the Python-side cosine work while giving semantic recall a wide pool.
+    For vaults larger than this, the oldest memories fall outside the dense scan; raise
+    it (at O(n) CPU cost) if a vault needs deeper recency reach."""
     rag_trace_in_response: bool = False
     """When True, RAG queries emit a ``trace`` field in the streaming
     done event with detailed retrieval/generation observability. Default
@@ -762,6 +775,16 @@ class Settings(BaseSettings):
         """Validate RRF k parameters are >= 1 (prevents ZeroDivisionError in 1/(k+rank))."""
         if v < 1:
             raise ValueError("RRF k must be >= 1")
+        return v
+
+    @field_validator("reranker_timeout_seconds", mode="after")
+    @classmethod
+    def validate_reranker_timeout_seconds(cls, v: float) -> float:
+        """Validate the reranker HTTP timeout is positive. A value <= 0 makes
+        httpx time out on every reranking request, silently degrading every
+        query to un-reranked vector order — so we fail fast at startup instead."""
+        if v <= 0:
+            raise ValueError("reranker_timeout_seconds must be > 0")
         return v
 
     @field_validator("default_chat_mode", mode="after")

@@ -340,6 +340,43 @@ class TestFTSStatusTrackingSingleScale(unittest.IsolatedAsyncioTestCase):
     # ── test_fts_exceptions_not_incremented_on_empty (single-scale) ────────────
 
     @pytest.mark.asyncio
+    async def test_dense_failure_degrades_to_fts_single_scale(self):
+        """If the dense (vector) arm raises, the concurrent dense+FTS gather
+        degrades to FTS-only results instead of aborting the whole hybrid
+        search (gather uses return_exceptions=True)."""
+        fts_results = [{"id": "fts_1", "text": "fts result"}]
+
+        # Dense builder whose .to_list() raises (transient LanceDB failure).
+        dense_builder = MagicMock()
+        dense_builder.where.return_value = dense_builder
+        dense_builder.limit.return_value = dense_builder
+        dense_builder.to_list = AsyncMock(side_effect=RuntimeError("dense boom"))
+
+        fts_builder = _make_fts_mock_builder(fts_results)
+
+        async def search_side_effect(query, query_type=None, **kwargs):
+            if query_type == "vector":
+                return dense_builder
+            elif query_type == "fts":
+                return fts_builder
+            return MagicMock()
+
+        self.store.table.search = AsyncMock(side_effect=search_side_effect)
+
+        with patch("app.services.vector_store.settings"):
+            results = await self.store._search_single_scale(
+                embedding=[0.1] * 384,
+                scale="default",
+                fetch_k=10,
+                query_text="test query",
+                hybrid=True,
+            )
+
+        # FTS results survived the dense failure rather than the search crashing.
+        self.assertGreater(len(results), 0)
+        self.assertIn("fts_1", [r.get("id") for r in results])
+
+    @pytest.mark.asyncio
     async def test_fts_exceptions_not_incremented_on_empty_single_scale(self):
         """FTS empty (not exception) → _fts_exceptions stays 0 in _search_single_scale."""
         dense_builder = _make_dense_mock_builder(self.dense_results)

@@ -195,8 +195,18 @@ class VectorStore:
                     # and the churn-based rebuild path never triggers.
                     try:
                         existing_indices = await self.table.list_indices()
+                        # Detect the existing ANN index by NAME, consistent with
+                        # every other index check in this class. LanceDB names a
+                        # vector index on the "embedding" column "embedding_idx"
+                        # by default. The previous check matched the literal
+                        # "IVF_PQ" against idx.index_type, but LanceDB reports the
+                        # type as "IvfPq" (mixed-case, no underscore) — so the
+                        # check was ALWAYS False, leaving _last_index_build_row_count
+                        # at 0 and forcing a full IVF_PQ rebuild on the first search
+                        # after every startup (a multi-second to multi-minute stall
+                        # on large tables).
                         has_ivfpq = any(
-                            "IVF_PQ" in str(getattr(idx, "index_type", ""))
+                            getattr(idx, "name", None) == "embedding_idx"
                             for idx in existing_indices
                         )
                         if has_ivfpq:
@@ -799,45 +809,70 @@ class VectorStore:
         # NOTE: Using query_type="vector" to bypass LanceDB's buggy auto-detection
         # which can cause UnboundLocalError when embedding_conf is None
         embedding_np = np.array(embedding, dtype=np.float32)
-        query = await self.table.search(embedding_np, query_type="vector")
-        if bypass_vector_index and hasattr(query, "bypass_vector_index"):
-            query = query.bypass_vector_index()
-        if combined_filter:
-            query = query.where(combined_filter)
-        dense_results = await query.limit(fetch_k).to_list()
 
-        # If hybrid disabled, return dense results only
+        async def _run_dense() -> List[Dict[str, Any]]:
+            query = await self.table.search(embedding_np, query_type="vector")
+            if bypass_vector_index and hasattr(query, "bypass_vector_index"):
+                query = query.bypass_vector_index()
+            if combined_filter:
+                query = query.where(combined_filter)
+            return await query.limit(fetch_k).to_list()
+
+        # If hybrid disabled, return dense results only (skip the FTS round-trip).
         if not hybrid or not query_text:
-            return dense_results
+            return await _run_dense()
 
-        # BM25 FTS hybrid search with fts_status tracking
-        fts_status = 'ok'
-        try:
-            fts_query = await self.table.search(query_text, query_type="fts")
-            fts_filter_parts = [scale_filter]
-            if vault_id:
-                safe_vault_id = _lance_escape(vault_id)
-                fts_filter_parts.append(f"vault_id = '{safe_vault_id}'")
-            if filter_expr:
-                fts_filter_parts.append(f"({filter_expr})")
-            fts_combined_filter = " AND ".join(f"({f})" for f in fts_filter_parts)
-            fts_query = fts_query.where(fts_combined_filter)
-            fts_results = await fts_query.limit(fetch_k).to_list()
-            if fts_results:
-                logger.info(
-                    f"Hybrid search (BM25 FTS) succeeded for scale {scale}: {len(fts_results)} FTS results (alpha={hybrid_alpha})"
+        async def _run_fts():
+            # Returns (results, fts_status). Self-contained try/except so a
+            # concurrent gather degrades to dense-only on FTS failure and the
+            # _fts_exceptions counter is still incremented (preserving the
+            # original sequential semantics) rather than aborting the search.
+            try:
+                fts_query = await self.table.search(query_text, query_type="fts")
+                fts_filter_parts = [scale_filter]
+                if vault_id:
+                    safe_vault_id = _lance_escape(vault_id)
+                    fts_filter_parts.append(f"vault_id = '{safe_vault_id}'")
+                if filter_expr:
+                    fts_filter_parts.append(f"({filter_expr})")
+                fts_combined_filter = " AND ".join(f"({f})" for f in fts_filter_parts)
+                fts_query = fts_query.where(fts_combined_filter)
+                results = await fts_query.limit(fetch_k).to_list()
+                if results:
+                    logger.info(
+                        f"Hybrid search (BM25 FTS) succeeded for scale {scale}: {len(results)} FTS results (alpha={hybrid_alpha})"
+                    )
+                    return results, 'ok'
+                return results, 'empty'
+            except Exception as e:
+                logger.warning(
+                    f"FTS search failed for scale {scale} (falling back to dense-only): {type(e).__name__}: {e}"
                 )
-                fts_status = 'ok'
-            else:
-                fts_status = 'empty'
-        except Exception as e:
+                with _fts_lock:
+                    self._fts_exceptions += 1
+                return [], 'failed'
+
+        # Run the dense (ANN) and BM25 FTS arms concurrently — independent
+        # LanceDB queries feeding an order-insensitive RRF fusion. Use
+        # return_exceptions=True (consistent with the multi-scale path) so a
+        # transient dense failure degrades to FTS-only results instead of
+        # aborting the whole hybrid search; _run_fts already self-handles errors.
+        dense_raw, fts_pair = await asyncio.gather(
+            _run_dense(), _run_fts(), return_exceptions=True
+        )
+        if isinstance(dense_raw, BaseException):
             logger.warning(
-                f"FTS search failed for scale {scale} (falling back to dense-only): {type(e).__name__}: {e}"
+                f"Dense search failed for scale {scale} (using FTS-only): "
+                f"{type(dense_raw).__name__}: {dense_raw}"
             )
-            fts_results = []
-            fts_status = 'failed'
-            with _fts_lock:
-                self._fts_exceptions += 1
+            dense_results = []
+        else:
+            dense_results = dense_raw
+        if isinstance(fts_pair, BaseException):
+            # _run_fts swallows its own errors; this is defense-in-depth only.
+            fts_results, fts_status = [], 'failed'
+        else:
+            fts_results, fts_status = fts_pair
 
         # RRF Fusion for this scale
         k_rrf = 60 if settings.rrf_legacy_mode else settings.hybrid_rrf_k
@@ -1021,11 +1056,9 @@ class VectorStore:
             # NOTE: Using query_type="vector" to bypass LanceDB's buggy auto-detection
             # which can cause UnboundLocalError when embedding_conf is None
             embedding_np = np.array(embedding, dtype=np.float32)
-            query = await self.table.search(embedding_np, query_type="vector")
-            if bypass_vector_index and hasattr(query, "bypass_vector_index"):
-                query = query.bypass_vector_index()
 
-            # Apply vault filter if specified
+            # Apply vault filter if specified (pure string building — cheap, done
+            # once and shared by the dense arm).
             _filter_expr = filter_expr
             if vault_id is not None:
                 safe_vault_id = _lance_escape(vault_id)
@@ -1035,41 +1068,67 @@ class VectorStore:
                 else:
                     _filter_expr = vault_filter
 
-            if _filter_expr:
-                query = query.where(_filter_expr)
+            async def _run_dense() -> List[Dict[str, Any]]:
+                query = await self.table.search(embedding_np, query_type="vector")
+                if bypass_vector_index and hasattr(query, "bypass_vector_index"):
+                    query = query.bypass_vector_index()
+                if _filter_expr:
+                    query = query.where(_filter_expr)
+                return await query.limit(fetch_k).to_list()
 
-            dense_results = await query.limit(fetch_k).to_list()
-
-            # If hybrid disabled, return dense results only
+            # If hybrid disabled, return dense results only (skip FTS round-trip).
             if not hybrid or not query_text:
                 logger.debug(
                     "Dense-only search (hybrid disabled or no query text)"
                 )
-                return dense_results
+                return await _run_dense()
 
-            # BM25 FTS hybrid search with fts_status tracking
-            fts_status = 'ok'
-            try:
-                fts_query = await self.table.search(query_text, query_type="fts")
-                if vault_id:
-                    safe_vault_id = _lance_escape(vault_id)
-                    fts_query = fts_query.where(f"vault_id = '{safe_vault_id}'")
-                if filter_expr:
-                    fts_query = fts_query.where(filter_expr)
-                fts_results = await fts_query.limit(fetch_k).to_list()
-                if fts_results:
-                    logger.info(
-                        f"Hybrid search (BM25 FTS) succeeded: {len(fts_results)} FTS results (alpha={hybrid_alpha})"
-                    )
-                    fts_status = 'ok'
-                else:
-                    fts_status = 'empty'
-            except Exception as e:
-                logger.warning(f"FTS search failed (falling back to dense-only): {type(e).__name__}: {e}")
-                fts_results = []
-                fts_status = 'failed'
-                with _fts_lock:
-                    self._fts_exceptions += 1
+            async def _run_fts():
+                # Returns (results, fts_status). Self-contained try/except so a
+                # concurrent gather degrades to dense-only on FTS failure and the
+                # _fts_exceptions counter is still incremented (preserving the
+                # original sequential semantics) rather than aborting the search.
+                try:
+                    fts_query = await self.table.search(query_text, query_type="fts")
+                    if vault_id:
+                        safe_vault_id = _lance_escape(vault_id)
+                        fts_query = fts_query.where(f"vault_id = '{safe_vault_id}'")
+                    if filter_expr:
+                        fts_query = fts_query.where(filter_expr)
+                    results = await fts_query.limit(fetch_k).to_list()
+                    if results:
+                        logger.info(
+                            f"Hybrid search (BM25 FTS) succeeded: {len(results)} FTS results (alpha={hybrid_alpha})"
+                        )
+                        return results, 'ok'
+                    return results, 'empty'
+                except Exception as e:
+                    logger.warning(f"FTS search failed (falling back to dense-only): {type(e).__name__}: {e}")
+                    with _fts_lock:
+                        self._fts_exceptions += 1
+                    return [], 'failed'
+
+            # Run the dense (ANN) and BM25 FTS arms concurrently — independent
+            # LanceDB queries feeding an order-insensitive RRF fusion. Use
+            # return_exceptions=True (consistent with the multi-scale path) so a
+            # transient dense failure degrades to FTS-only results instead of
+            # aborting the whole hybrid search; _run_fts already self-handles errors.
+            dense_raw, fts_pair = await asyncio.gather(
+                _run_dense(), _run_fts(), return_exceptions=True
+            )
+            if isinstance(dense_raw, BaseException):
+                logger.warning(
+                    f"Dense search failed (using FTS-only): "
+                    f"{type(dense_raw).__name__}: {dense_raw}"
+                )
+                dense_results = []
+            else:
+                dense_results = dense_raw
+            if isinstance(fts_pair, BaseException):
+                # _run_fts swallows its own errors; this is defense-in-depth only.
+                fts_results, fts_status = [], 'failed'
+            else:
+                fts_results, fts_status = fts_pair
 
             # RRF Fusion using shared utility
             k_rrf = 60 if settings.rrf_legacy_mode else settings.hybrid_rrf_k

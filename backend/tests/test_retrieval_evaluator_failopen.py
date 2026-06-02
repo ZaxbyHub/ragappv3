@@ -1,0 +1,55 @@
+"""Fail-open contract for RetrievalEvaluator.evaluate().
+
+CRAG self-evaluation must NOT degrade an answer when the evaluator itself
+fails. The documented contract (and every in-function fallback) is to return
+``CONFIDENT`` — the no-op verdict that injects no relevance hint and does not
+trigger distillation synthesis. A regression had the exception path returning
+``AMBIGUOUS``, which silently altered prompt framing on evaluator outages.
+"""
+
+import unittest
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.services.retrieval_evaluator import RetrievalEvaluator
+
+
+class TestRetrievalEvaluatorFailOpen(unittest.IsolatedAsyncioTestCase):
+    @pytest.mark.asyncio
+    async def test_exception_fails_open_to_confident(self):
+        """LLM error during evaluation → CONFIDENT (not AMBIGUOUS)."""
+        client = MagicMock()
+        client.chat_completion = AsyncMock(side_effect=RuntimeError("LLM down"))
+        evaluator = RetrievalEvaluator(client)
+
+        verdict = await evaluator.evaluate("q", [{"text": "a relevant chunk"}])
+
+        self.assertEqual(verdict, "CONFIDENT")
+
+    @pytest.mark.asyncio
+    async def test_empty_response_fails_open_to_confident(self):
+        """Empty model response → CONFIDENT, no exception."""
+        client = MagicMock()
+        client.chat_completion = AsyncMock(return_value="")
+        evaluator = RetrievalEvaluator(client)
+
+        verdict = await evaluator.evaluate("q", [{"text": "chunk"}])
+
+        self.assertEqual(verdict, "CONFIDENT")
+
+    @pytest.mark.asyncio
+    async def test_no_chunks_returns_confident_without_calling_llm(self):
+        """No chunks to evaluate → CONFIDENT, LLM not invoked."""
+        client = MagicMock()
+        client.chat_completion = AsyncMock()
+        evaluator = RetrievalEvaluator(client)
+
+        verdict = await evaluator.evaluate("q", [])
+
+        self.assertEqual(verdict, "CONFIDENT")
+        client.chat_completion.assert_not_awaited()
+
+
+if __name__ == "__main__":
+    unittest.main()

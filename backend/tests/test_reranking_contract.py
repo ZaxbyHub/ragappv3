@@ -295,6 +295,41 @@ async def test_rerank_endpoint_raw_logits_produce_sigmoid_scores(service_with_ur
 
 
 # ---------------------------------------------------------------------------
+# Timeout configuration: TEI client honors settings.reranker_timeout_seconds
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rerank_endpoint_uses_configured_timeout(service_with_url, sample_chunks, monkeypatch):
+    """The lazily-created TEI HTTP client uses settings.reranker_timeout_seconds
+    rather than a hardcoded value, so operators can bound worst-case latency."""
+    import app.services.reranking as reranking_module
+
+    monkeypatch.setattr(service_with_url, "_http_client", None)
+    monkeypatch.setattr(reranking_module.settings, "reranker_timeout_seconds", 7.5)
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = [{"index": 0, "score": 1.0}]
+    mock_response.raise_for_status = MagicMock()
+
+    captured = {}
+
+    def fake_client_ctor(*args, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        inst = MagicMock()
+        inst.post = AsyncMock(return_value=mock_response)
+        return inst
+
+    # Patch the SSRF/DNS guard so the test does not depend on resolving the
+    # fake endpoint host — we only care that the lazily-created client picks up
+    # the configured timeout.
+    with patch("app.services.reranking.assert_url_safe", return_value=None), \
+            patch("httpx.AsyncClient", side_effect=fake_client_ctor):
+        await service_with_url.rerank("test query", sample_chunks)
+
+    assert captured["timeout"] == 7.5
+
+
+# ---------------------------------------------------------------------------
 # 7. Unconditional sigmoid normalization tests
 # ---------------------------------------------------------------------------
 

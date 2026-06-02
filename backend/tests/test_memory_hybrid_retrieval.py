@@ -132,6 +132,40 @@ class TestHybridSemanticPath(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_semantic_only_memory_surfaces_even_when_fts_has_other_hits(self):
+        """Regression: dense search must run UNFILTERED, not restricted to the
+        FTS candidate set.
+
+        Previously, when FTS returned any lexical hit, dense search was
+        pre-filtered to exactly those ids — so a purely-semantic memory (no
+        shared tokens with the query) became unreachable whenever FTS matched
+        something else. Here memory A lexically matches the query token "brief",
+        while memory B shares no tokens but is a strong dense match; B must still
+        appear in the fused results.
+        """
+        embedder = _StubEmbedder()
+        store, path = _make_store(embedding_service=embedder)
+        try:
+            # A: lexical FTS hit for the single-token query "brief" — so the FTS
+            # candidate set is non-empty (the condition under which the old code
+            # restricted dense to those ids).
+            store.add_memory("brief notes draft", category="task", vault_id=1)
+            # B: semantic-only — shares NO token with "brief", but its concepts
+            # ("concise"→brief dim) make it a strong dense match.
+            store.add_memory("concise summary writing", category="pref", vault_id=1)
+
+            # Query "brief" (single token): FTS matches only A, while dense (now
+            # unfiltered) also finds B. On the old FTS-gated code, dense was
+            # restricted to [A] and B was dropped — this assertion would fail.
+            results = store.search_memories("brief", limit=5, vault_id=1)
+            contents = [r.content for r in results]
+            self.assertTrue(
+                any("summary writing" in c for c in contents),
+                f"semantic-only memory missing (dense was likely FTS-gated): {contents}",
+            )
+        finally:
+            os.remove(path)
+
     def test_score_type_is_rrf_when_both_paths_match(self):
         embedder = _StubEmbedder()
         store, path = _make_store(embedding_service=embedder)
