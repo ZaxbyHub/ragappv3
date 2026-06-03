@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.api.deps import require_role
 from app.config import settings
 from app.models.database import get_pool
+from app.security import csrf_protect
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -128,6 +129,7 @@ async def list_organizations(user: dict = Depends(require_role("member"))):
 async def create_organization(
     req: OrganizationCreateRequest,
     user: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Create a new organization with the current user as owner."""
     pool = get_pool(str(settings.sqlite_path))
@@ -274,6 +276,7 @@ async def update_organization(
     org_id: int,
     req: OrganizationUpdateRequest,
     user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Update organization details (admin or owner only)."""
     pool = get_pool(str(settings.sqlite_path))
@@ -426,6 +429,7 @@ async def add_org_member(
     org_id: int,
     req: OrgMemberRequest,
     user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Add a member to organization (admin or owner only)."""
     pool = get_pool(str(settings.sqlite_path))
@@ -521,6 +525,7 @@ async def update_org_member_role(
     member_user_id: int,
     req: OrgMemberUpdateRequest,
     user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Update a member's role (admin or owner only)."""
     pool = get_pool(str(settings.sqlite_path))
@@ -597,6 +602,7 @@ async def remove_org_member(
     org_id: int,
     member_user_id: int,
     user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Remove a member from organization (admin or owner only)."""
     pool = get_pool(str(settings.sqlite_path))
@@ -672,6 +678,7 @@ async def transfer_ownership(
     org_id: int,
     req: TransferOwnershipRequest,
     user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Transfer organization ownership to another member (current owner or superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
@@ -744,6 +751,7 @@ async def transfer_ownership(
 async def delete_organization(
     org_id: int,
     user: dict = Depends(require_role("superadmin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Delete organization and all associated data (superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))

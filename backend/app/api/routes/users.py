@@ -287,6 +287,18 @@ async def update_user(
                 detail=f"Invalid role. Must be one of: {', '.join(valid_roles)}",
             )
 
+        # Privilege-escalation guard: only a superadmin may grant the
+        # superadmin role or modify a user who is already a superadmin. An
+        # ordinary admin must not be able to promote anyone (including via a
+        # second account) past their own level.
+        if user.get("role") != "superadmin" and (
+            body.role == "superadmin" or target_row[3] == "superadmin"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Only a superadmin can grant or modify the superadmin role",
+            )
+
         update_fields.append("role = ?")
         update_values.append(body.role)
 

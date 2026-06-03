@@ -16,6 +16,7 @@ from app.api.deps import (
     require_role,
 )
 from app.models.database import transaction_context
+from app.security import csrf_protect
 
 router = APIRouter(prefix="/groups", tags=["groups"])
 
@@ -228,6 +229,7 @@ async def create_group(
     user: dict = Depends(require_role("admin")),
     db: sqlite3.Connection = Depends(get_db),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Create a new group.
@@ -381,6 +383,7 @@ async def update_group(
     user: dict = Depends(require_role("admin")),
     db: sqlite3.Connection = Depends(get_db),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Update a group.
@@ -518,6 +521,7 @@ async def delete_group(
     user: dict = Depends(require_role("admin")),
     db: sqlite3.Connection = Depends(get_db),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Delete a group.
@@ -665,6 +669,7 @@ async def update_group_members(
     user: dict = Depends(require_role("admin")),
     db: sqlite3.Connection = Depends(get_db),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Update a group's members (replaces all existing members).
@@ -832,6 +837,7 @@ async def update_group_vaults(
     user: dict = Depends(require_role("admin")),
     db: sqlite3.Connection = Depends(get_db),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Update a group's vault access (replaces all existing access).

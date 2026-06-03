@@ -84,6 +84,11 @@ class LLMClient:
         if base_url is not None:
             new_base_url = base_url.rstrip("/")
             if new_base_url != self.base_url:
+                # Re-validate against SSRF on hot-update: the SettingsUpdate
+                # validator only checks URL format, not IP resolution, so an
+                # admin pointing this at an internal address (e.g. cloud
+                # metadata) must still be rejected here before it takes effect.
+                assert_url_safe(new_base_url)
                 self.base_url = new_base_url
                 changed = True
         if model is not None and model != self.model:

@@ -21,6 +21,7 @@ from app.api.deps import (
 )
 from app.config import settings
 from app.limiter import limiter
+from app.security import csrf_protect
 from app.services.memory_store import MemoryRecord, MemoryStore, MemoryStoreError
 
 logger = logging.getLogger(__name__)
@@ -287,6 +288,7 @@ async def create_memory(
     body: MemoryCreateRequest,
     memory_store: MemoryStore = Depends(get_memory_store),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Create a new memory.
@@ -335,6 +337,7 @@ async def update_memory(
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     memory_store: MemoryStore = Depends(get_memory_store),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Update an existing memory.
@@ -496,6 +499,7 @@ async def delete_memory(
     memory_id: int,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Delete a memory.
@@ -582,6 +586,7 @@ async def search_memories_post(
     request: MemorySearchRequest,
     memory_store: MemoryStore = Depends(get_memory_store),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Search memories via POST (request body).
 
@@ -602,6 +607,7 @@ async def search_memories_post(
 async def backfill_memory_embeddings(
     memory_store: MemoryStore = Depends(get_memory_store),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Trigger embedding backfill for memories missing embeddings or with stale models.
 

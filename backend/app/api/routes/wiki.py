@@ -528,10 +528,12 @@ async def update_wiki_claim(
 
         # Fetch every source row for this claim and require at least
         # one verifiable quote against the file's parsed_text.
-        source_rows = db.execute(
-            "SELECT * FROM wiki_claim_sources WHERE claim_id = ?",
-            (claim_id,),
-        ).fetchall()
+        source_rows = await asyncio.to_thread(
+            lambda: db.execute(
+                "SELECT * FROM wiki_claim_sources WHERE claim_id = ?",
+                (claim_id,),
+            ).fetchall()
+        )
         verified = False
         any_file_source = False
         any_quote = False
@@ -547,10 +549,12 @@ async def update_wiki_claim(
             if not quote or file_id is None:
                 continue
             any_file_source = True
-            file_row = db.execute(
-                "SELECT parsed_text FROM files WHERE id = ?",
-                (int(file_id),),
-            ).fetchone()
+            file_row = await asyncio.to_thread(
+                lambda fid=int(file_id): db.execute(
+                    "SELECT parsed_text FROM files WHERE id = ?",
+                    (fid,),
+                ).fetchone()
+            )
             if not file_row:
                 continue
             try:

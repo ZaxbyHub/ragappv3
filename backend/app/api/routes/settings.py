@@ -8,7 +8,7 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
 from app.config import settings
-from app.security import CSRFManager, issue_csrf_token
+from app.security import CSRFManager, csrf_protect, issue_csrf_token
 from app.services.ssrf import URLBlocked, assert_url_safe
 
 router = APIRouter()
@@ -788,6 +788,7 @@ def post_settings(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
     _role: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Apply settings update and persist to database."""
     _enforce_curator_required_when_enabled(update)
@@ -807,6 +808,7 @@ def put_settings(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
     _role: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Update settings (upserts into settings_kv)."""
     _enforce_curator_required_when_enabled(update)
@@ -894,6 +896,7 @@ class _CuratorTestBody(BaseModel):
 async def test_curator_connection(
     body: Optional[_CuratorTestBody] = None,
     _role: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Validate the curator endpoint by issuing a tiny JSON-only ping.
 

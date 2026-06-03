@@ -459,7 +459,7 @@ class TestUpdateOrganization:
     def test_duplicate_name_returns_409(self, client):
         """Updating org name to an existing org's name returns 409."""
         _ = _create_org("Unique Org A", 2)
-        _ = _create_org("Unique Org B", 2)
+        org2_id = _create_org("Unique Org B", 2)
 
         response = client.patch(
             f"/api/organizations/{org2_id}",
