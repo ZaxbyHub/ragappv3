@@ -208,8 +208,12 @@ class RAGEngine:
         else:
             self.prompt_builder = PromptBuilderService()
 
-        # Query transformer instance (lazy-loaded)
-        self._query_transformer: Optional[QueryTransformer] = None
+        # Query transformer instances (lazy-loaded per active LLM client) so the
+        # in-process LRU cache persists across requests. Keyed by id(client),
+        # mirroring ``_retrieval_evaluators`` below. A single shared instance would
+        # be incorrect: QueryTransformer binds to one client and bakes that model's
+        # identity into its cache keys, so Thinking/Instant must not share one.
+        self._query_transformers: Dict[int, QueryTransformer] = {}
 
         # Retrieval evaluator instances (lazy-loaded per active LLM client).
         self._retrieval_evaluators: Dict[int, RetrievalEvaluator] = {}
@@ -229,6 +233,23 @@ class RAGEngine:
     def instant_client(self) -> LLMClient:
         """LLM client for Instant mode. Falls back to ``self.llm_client`` when no explicit override was passed at construction."""
         return self._instant_client_override or self.llm_client
+
+    def _get_query_transformer(self, client: LLMClient) -> QueryTransformer:
+        """Return a per-client cached ``QueryTransformer``.
+
+        Caching per ``id(client)`` lets the transformer's in-process LRU cache
+        persist across requests (a fresh instance per request made it dead
+        weight). Thinking and Instant resolve to different clients and thus
+        different cached transformers, so a cache key — which encodes model
+        identity — never crosses models. When no client overrides are configured,
+        both modes resolve to ``self.llm_client`` (same id → one shared instance).
+        """
+        key = id(client)
+        transformer = self._query_transformers.get(key)
+        if transformer is None:
+            transformer = QueryTransformer(client)
+            self._query_transformers[key] = transformer
+        return transformer
 
     # ------------------------------------------------------------------
     # Live settings properties
@@ -456,7 +477,7 @@ class RAGEngine:
             and is_followup_query(user_input)
         ):
             try:
-                followup_transformer = QueryTransformer(active_client)
+                followup_transformer = self._get_query_transformer(active_client)
                 rewritten = await followup_transformer.rewrite_followup(
                     user_input, chat_history
                 )
@@ -487,7 +508,7 @@ class RAGEngine:
             and not skip_query_transformation
         ):
             try:
-                query_transformer = QueryTransformer(active_client)
+                query_transformer = self._get_query_transformer(active_client)
                 transformed_queries = await query_transformer.transform(
                     retrieval_query
                 )
@@ -563,6 +584,39 @@ class RAGEngine:
         )
 
         effective_alpha = self.hybrid_alpha
+
+        # Launch memory retrieval concurrently with the document pipeline.
+        # Memory search (FTS + dense + RRF over SQLite) is independent of document
+        # retrieval, so we start it here — past the embedding-failure early return
+        # above — and await it just before prompt building. The inner coroutine
+        # swallows all errors (→ []), so awaiting it never raises. This overlaps
+        # memory latency with the expensive vector search + rerank + CRAG phase
+        # instead of paying it sequentially afterward.
+        memory_task: Optional[asyncio.Task] = None
+        if settings.memory_retrieval_enabled:
+
+            async def _memory_retrieve() -> List[Any]:
+                try:
+                    candidates = await asyncio.to_thread(
+                        self.memory_store.search_memories,
+                        user_input,
+                        settings.memory_retrieval_top_k,
+                        vault_id=vault_id,
+                    )
+                    # Apply context_top_k cap so prompt context stays bounded
+                    # even when memory_retrieval_top_k is large.
+                    capped = candidates[:effective_memory_top_k]
+                    logger.info(
+                        "[query] Memory: %d candidates → %d after context_top_k cap",
+                        len(candidates),
+                        len(capped),
+                    )
+                    return capped
+                except Exception as exc:
+                    logger.error("Memory search failed: %s", exc)
+                    return []
+
+            memory_task = asyncio.create_task(_memory_retrieve())
 
         # Wiki + KMS retrieval: run in parallel when both are enabled.
         async def _wiki_retrieve() -> List[Any]:
@@ -811,29 +865,13 @@ class RAGEngine:
                 "fallback": True,
             }
 
-        # Search memories (hybrid: FTS + dense + RRF, with FTS fallback).
-        # Gated by ``memory_retrieval_enabled`` so operators can disable
-        # the path during incident response without redeploying.
-        memories = []
-        if settings.memory_retrieval_enabled:
-            try:
-                candidates = await asyncio.to_thread(
-                    self.memory_store.search_memories,
-                    user_input,
-                    settings.memory_retrieval_top_k,
-                    vault_id=vault_id,
-                )
-                # Apply context_top_k cap after relevance filtering so prompt context
-                # stays bounded even when top_k is large.
-                memories = candidates[:effective_memory_top_k]
-                logger.info(
-                    "[query] Memory: %d candidates → %d after context_top_k cap",
-                    len(candidates),
-                    len(memories),
-                )
-            except Exception as exc:
-                logger.error("Memory search failed: %s", exc)
-                memories = []
+        # Collect memories from the task launched concurrently above (hybrid:
+        # FTS + dense + RRF). The inner coroutine already applied the
+        # context_top_k cap and swallowed errors, so awaiting here never raises
+        # and yields [] on any failure or when memory retrieval is disabled.
+        memories: List[Any] = []
+        if memory_task is not None:
+            memories = await memory_task
 
         # Build messages using prompt builder service
         messages = self.prompt_builder.build_messages(

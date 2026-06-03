@@ -179,7 +179,9 @@ class RerankingService:
         }
         await asyncio.to_thread(assert_url_safe, self.reranker_url)
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=30.0)
+            self._http_client = httpx.AsyncClient(
+                timeout=settings.reranker_timeout_seconds
+            )
         try:
             response = await reranking_cb(self._http_client.post)(url, json=payload)
             response.raise_for_status()

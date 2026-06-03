@@ -495,10 +495,13 @@ class MemoryStore:
                 sql += " ORDER BY id DESC LIMIT ?"
                 params += (limit * 3,)
             else:
-                # Full scan: bounded by default 200 to prevent unbounded memory usage
-                # while still providing good recall for vaults with many memories
+                # Full scan: bounded by ``memory_dense_max_candidates`` (ordered by
+                # recency before similarity ranking) to prevent unbounded Python-side
+                # cosine work while giving semantic recall a wide pool. Dense is now
+                # the sole semantic-recall path (no longer pre-filtered to FTS hits),
+                # so this bound is the recall ceiling for very large vaults.
                 sql += " ORDER BY id DESC LIMIT ?"
-                params += (max(limit * 3, 200),)
+                params += (max(limit * 3, settings.memory_dense_max_candidates),)
             rows = conn.execute(sql, params).fetchall()
         finally:
             self.pool.release_connection(conn)
@@ -549,10 +552,7 @@ class MemoryStore:
         # FTS results — always run.
         fts_records = self._fts_search(query, limit, vault_id)
 
-        # Extract candidate IDs for dense search pre-filtering
-        fts_candidate_ids = [r.id for r in fts_records] if fts_records else None
-
-        # Dense results — best-effort, filtered to FTS candidates only.
+        # Dense results — best-effort, run UNFILTERED across the vault.
         # Synchronously embed when we already have an event loop (this method
         # is invoked via to_thread from async code). Never let dense errors
         # break the call.
@@ -572,7 +572,13 @@ class MemoryStore:
                 )
                 query_emb = None
             if query_emb:
-                dense_records = self._dense_search(query_emb, limit, vault_id, candidate_ids=fts_candidate_ids)
+                # Run dense UNFILTERED (no candidate_ids restriction) so a
+                # semantically-relevant memory sharing no lexical tokens with the
+                # query can still surface. Previously dense was pre-filtered to the
+                # FTS hit set, which made semantic-only recall impossible whenever
+                # FTS returned any candidate. RRF fusion below still rewards
+                # memories found by both arms.
+                dense_records = self._dense_search(query_emb, limit, vault_id)
 
         # No dense path → return FTS as-is.
         if not dense_records:

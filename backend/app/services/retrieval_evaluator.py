@@ -90,7 +90,12 @@ class RetrievalEvaluator:
                 return "CONFIDENT"
 
         except Exception as e:
+            # Fail-open to CONFIDENT, matching the documented contract and every
+            # other fallback in this method (empty chunks / empty / unexpected
+            # response). CONFIDENT is the no-op verdict: it injects no relevance
+            # hint into the prompt and does not trigger distillation synthesis, so
+            # an evaluator outage cannot silently degrade an otherwise-good answer.
             logger.warning(
-                "Retrieval evaluation failed: %s, defaulting to AMBIGUOUS", e
+                "Retrieval evaluation failed: %s, defaulting to CONFIDENT", e
             )
-            return "AMBIGUOUS"
+            return "CONFIDENT"

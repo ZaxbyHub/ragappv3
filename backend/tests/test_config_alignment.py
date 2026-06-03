@@ -309,6 +309,20 @@ class TestRefactoredValidators:
                 Settings()
             assert "embedding_batch_size must be >= 1" in str(exc_info.value)
 
+    def test_reranker_timeout_seconds_valid(self):
+        """reranker_timeout_seconds should accept positive values."""
+        with patch.dict("os.environ", {"RERANKER_TIMEOUT_SECONDS": "5"}):
+            settings = Settings()
+            assert settings.reranker_timeout_seconds == 5.0
+
+    def test_reranker_timeout_seconds_rejects_zero(self):
+        """reranker_timeout_seconds <= 0 makes httpx time out on every rerank
+        call, silently degrading every query to un-reranked order — reject it."""
+        with patch.dict("os.environ", {"RERANKER_TIMEOUT_SECONDS": "0"}):
+            with pytest.raises(ValidationError) as exc_info:
+                Settings()
+            assert "reranker_timeout_seconds must be > 0" in str(exc_info.value)
+
     def test_document_parsing_strategy_valid_values(self):
         """document_parsing_strategy should accept 'fast', 'hi_res', 'auto'."""
         for strategy in ["fast", "hi_res", "auto"]:
