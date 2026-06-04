@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from fastapi import Cookie, Depends, Header, HTTPException, Request
 
 from app.config import Settings, settings
+from app.utils.paths import normalize_root_path
 from app.models.database import SQLiteConnectionPool, get_pool
 from app.security import get_csrf_manager  # noqa: F401
 from app.services.auth_service import (
@@ -272,6 +273,7 @@ async def get_current_active_user(
     # Enforce must_change_password: flagged users can only access explicit
     # auth recovery routes. Include both router-local and mounted runtime paths.
     if user.get("must_change_password"):
+        # Base paths always included (no prefix)
         exempt_paths = {
             "/auth/change-password",
             "/auth/login",

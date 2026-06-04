@@ -206,9 +206,8 @@ export const useAuthStore = create<AuthState>()(
             full_name: fullName,
           });
 
-          // Backend returns flat response, construct User object manually
-          const { access_token, id, username: uname, full_name, role, is_active } = response.data as any;
-          const user: User = { id, username: uname, full_name, role, is_active };
+          const { access_token, user: userData } = response.data as any;
+          const user: User = { id: userData.id, username: userData.username, full_name: userData.full_name, role: userData.role, is_active: true };
 
           // Update store state
           set({

@@ -183,11 +183,11 @@ async def list_users(
 
     try:
         if q:
-            search_pattern = f"%{q}%"
-            count_cursor = await asyncio.to_thread(conn.execute, "SELECT COUNT(*) FROM users WHERE username LIKE ? OR full_name LIKE ?", (search_pattern, search_pattern))
+            search_pattern = f"%{q.replace('%', '\\%').replace('_', '\\_')}%"
+            count_cursor = await asyncio.to_thread(conn.execute, "SELECT COUNT(*) FROM users WHERE username LIKE ? ESCAPE '\\' OR full_name LIKE ? ESCAPE '\\'", (search_pattern, search_pattern))
             total = (await asyncio.to_thread(count_cursor.fetchone))[0]
             cursor = await asyncio.to_thread(conn.execute, """SELECT id, username, full_name, role, is_active, created_at
-                   FROM users WHERE username LIKE ? OR full_name LIKE ?
+                   FROM users WHERE username LIKE ? ESCAPE '\\' OR full_name LIKE ? ESCAPE '\\'
                    ORDER BY id LIMIT ? OFFSET ?""", (search_pattern, search_pattern, limit, skip))
         else:
             count_cursor = await asyncio.to_thread(conn.execute, "SELECT COUNT(*) FROM users")
@@ -373,11 +373,33 @@ async def admin_reset_password(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Hash the new password
-    hashed_password = hash_password(body.new_password)
+    hashed_password = await async_hash_password(body.new_password)
 
-    # Update password and force password change on next login
-    await asyncio.to_thread(db.execute, "UPDATE users SET hashed_password = ?, must_change_password = 1 WHERE id = ?", (hashed_password, user_id))
-    await asyncio.to_thread(db.commit)
+    def _admin_reset_password_db():
+        exclusive_started = False
+        try:
+            db.execute("BEGIN EXCLUSIVE")
+            exclusive_started = True
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            db.execute("UPDATE users SET hashed_password = ?, must_change_password = 1 WHERE id = ?", (hashed_password, user_id))
+            try:
+                db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+            except sqlite3.OperationalError:
+                # user_sessions table may not exist yet (e.g., test fixtures, pre-migration)
+                logger.warning("Could not delete user_sessions for user %d (table may not exist)", user_id)
+            db.execute("COMMIT")
+        except Exception:
+            if exclusive_started:
+                try:
+                    db.execute("ROLLBACK")
+                except Exception:
+                    pass
+            raise
+
+    await asyncio.to_thread(_admin_reset_password_db)
 
     return {
         "message": "Password reset successfully",
@@ -576,7 +598,9 @@ async def update_user_organizations(
     """Replace user's organization memberships (admin/superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
     conn = pool.get_connection()
-    try:
+
+    def _update_orgs():
+        # Verify user exists
         cursor = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="User not found")
@@ -638,6 +662,10 @@ async def update_user_organizations(
                 "joined_at": row[4],
             })
         return {"organizations": orgs}
+
+    try:
+        result = await asyncio.to_thread(_update_orgs)
+        return result
     finally:
         pool.release_connection(conn)
 

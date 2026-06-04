@@ -5,6 +5,7 @@ import hmac
 import logging
 import os
 import secrets
+import sqlite3
 import threading
 import time
 from typing import Callable, Dict
@@ -73,11 +74,74 @@ class _InMemoryCSRFStore:
         return True
 
 
+class _SQLiteCSRFStore:
+    """Worker-safe SQLite-backed CSRF token store.
+
+    All workers share the same SQLite database file, so tokens generated
+    by one worker are visible to all workers. Replaces _InMemoryCSRFStore
+    as the primary fallback when Redis is unavailable.
+    """
+
+    def __init__(self, db_path: str, ttl: int = 900) -> None:
+        self.ttl = ttl
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS csrf_tokens (token_hash TEXT PRIMARY KEY, created_at REAL NOT NULL, expires_at REAL NOT NULL)"
+        )
+        self._conn.commit()
+
+    def _cleanup_expired(self) -> None:
+        try:
+            self._conn.execute(
+                "DELETE FROM csrf_tokens WHERE expires_at <= ?",
+                (time.time(),),
+            )
+            self._conn.commit()
+        except sqlite3.Error:
+            pass
+
+    def setex(self, key: str, ttl: int, value: str) -> None:
+        expires_at = time.time() + ttl
+        self._conn.execute(
+            "INSERT OR REPLACE INTO csrf_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
+            (key, time.time(), expires_at),
+        )
+        self._conn.commit()
+
+    def get(self, key: str) -> str | None:
+        cursor = self._conn.execute(
+            "SELECT 1 FROM csrf_tokens WHERE token_hash = ? AND expires_at > ?",
+            (key, time.time()),
+        )
+        return "1" if cursor.fetchone() else None
+
+    def expire(self, key: str, ttl: int) -> None:
+        expires_at = time.time() + ttl
+        self._conn.execute(
+            "UPDATE csrf_tokens SET expires_at = ? WHERE token_hash = ?",
+            (expires_at, key),
+        )
+        self._conn.commit()
+
+    def delete(self, key: str) -> None:
+        self._conn.execute(
+            "DELETE FROM csrf_tokens WHERE token_hash = ?", (key,)
+        )
+        self._conn.commit()
+
+    def ping(self) -> bool:
+        try:
+            self._conn.execute("SELECT 1")
+            return True
+        except sqlite3.Error:
+            return False
+
+
 class CSRFManager:
-    def __init__(self, redis_url: str, ttl: int = 900) -> None:
+    def __init__(self, redis_url: str, ttl: int = 900, db_path: str = "") -> None:
         self.ttl = ttl
         self._redis: redis.Redis | None = None
-        self._fallback_store: _InMemoryCSRFStore | None = None
+        self._fallback_store: _InMemoryCSRFStore | _SQLiteCSRFStore | None = None
         self._use_fallback = False
         self._lock = threading.Lock()
 
@@ -86,11 +150,19 @@ class CSRFManager:
             self._redis.ping()
             logger.info("CSRFManager connected to Redis successfully")
         except Exception as exc:
-            logger.warning(
-                "Redis unavailable for CSRF, using in-memory fallback: %s", exc
-            )
+            logger.warning("Redis unavailable for CSRF: %s", exc)
             self._use_fallback = True
-            self._fallback_store = _InMemoryCSRFStore(ttl=ttl)
+            self._fallback_store = None
+            # Try SQLite first (shared across workers), then fall back to in-memory
+            if db_path:
+                try:
+                    self._fallback_store = _SQLiteCSRFStore(db_path, ttl=ttl)
+                    logger.info("CSRFManager using SQLite-backed store at %s", db_path)
+                except Exception as sqlexc:
+                    logger.warning("SQLite CSRF store init failed: %s", sqlexc)
+            if not self._fallback_store:
+                self._fallback_store = _InMemoryCSRFStore(ttl=ttl)
+                logger.warning("CSRFManager using in-memory fallback (not worker-safe!)")
 
     def _get_store(self):
         """Returns the active store (Redis or in-memory fallback)."""

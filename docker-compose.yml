@@ -85,6 +85,7 @@ services:
       - UVICORN_RELOAD=false
       - APP_ROOT_PATH=${APP_ROOT_PATH:-}
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      # PRODUCTION: set to your domain, e.g. https://knowledgevault.example.com
       - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
       - OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
       - OLLAMA_CHAT_URL=${OLLAMA_CHAT_URL:-http://host.docker.internal:11434}
@@ -112,8 +113,10 @@ services:
       - TRI_VECTOR_SEARCH_ENABLED=false
       - FLAG_EMBEDDING_URL=
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      # REQUIRED — no default, backend rejects empty values
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-to-a-random-64-char-string}
+      # REQUIRED — generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - PARENT_RETRIEVAL_ENABLED=${PARENT_RETRIEVAL_ENABLED:-true}
       - PARENT_WINDOW_CHARS=${PARENT_WINDOW_CHARS:-6000}

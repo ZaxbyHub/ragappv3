@@ -155,8 +155,8 @@ class TestAuthRoutes(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(data["role"], "superadmin")
-        self.assertEqual(data["username"], "admin")
+        self.assertEqual(data["user"]["role"], "superadmin")
+        self.assertEqual(data["user"]["username"], "admin")
 
     def test_register_second_user_is_member(self):
         """Register second user and verify role is member."""
@@ -172,8 +172,8 @@ class TestAuthRoutes(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(data["role"], "member")
-        self.assertEqual(data["username"], "user2")
+        self.assertEqual(data["user"]["role"], "member")
+        self.assertEqual(data["user"]["username"], "user2")
 
     def test_register_duplicate_username(self):
         """Register same username twice should return 409."""
