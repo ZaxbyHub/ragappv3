@@ -9,10 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
+    assign_user_to_default_vault,
     get_db,
     require_admin_role,
     require_role,
 )
+from app.api.routes.auth import async_hash_password
 from app.config import settings
 from app.models.database import get_pool
 from app.security import csrf_protect
@@ -115,7 +117,7 @@ async def create_user(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Hash the password
-    hashed_password = hash_password(body.password)
+    hashed_password = await async_hash_password(body.password)
 
     pool = get_pool(str(settings.sqlite_path))
     conn = pool.get_connection()
@@ -140,6 +142,8 @@ async def create_user(
         row = await asyncio.to_thread(cursor.fetchone)
         if row is None:
             raise RuntimeError("Failed to retrieve created user")
+
+        assign_user_to_default_vault(conn, user_id)
 
         await asyncio.to_thread(conn.commit)
 
@@ -279,6 +283,18 @@ async def update_user(
         # Prevent changing own role
         if user_id == user.get("id"):
             raise HTTPException(status_code=400, detail="Cannot change your own role")
+
+        # Only superadmin can assign superadmin role
+        if body.role == "superadmin" and user.get("role") != "superadmin":
+            raise HTTPException(
+                status_code=403,
+                detail="Only superadmin can assign superadmin role",
+            )
+        if target_row[3] == "superadmin" and user.get("role") != "superadmin":
+            raise HTTPException(
+                status_code=403,
+                detail="Only superadmin can change role of superadmin users",
+            )
 
         valid_roles = ["superadmin", "admin", "member", "viewer"]
         if body.role not in valid_roles:

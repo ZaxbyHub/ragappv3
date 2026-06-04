@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import sqlite3
 from collections.abc import Callable
@@ -19,6 +20,8 @@ from app.services.auth_service import (
     TokenInvalidError,
     decode_access_token,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class UserRole(IntEnum):
@@ -268,7 +271,7 @@ async def get_current_active_user(
 
     # Enforce must_change_password: flagged users can only access exempt routes
     if user.get("must_change_password"):
-        exempt_paths = {"/auth/change-password", "/auth/login"}
+        exempt_paths = {"/auth/change-password", "/auth/login", "/api/auth/change-password", "/api/auth/login"}
         # Normalize path to prevent bypass via trailing slash variants
         normalized_path = request.url.path.rstrip("/") or "/"
         if normalized_path not in exempt_paths:
@@ -589,3 +592,33 @@ async def get_user_primary_org(user_id: int, db: sqlite3.Connection) -> int | No
     if len(orgs) == 1:
         return orgs[0]
     raise MultipleOrgError(f"User {user_id} belongs to multiple organizations: {orgs}")
+
+
+def assign_user_to_default_vault(db: sqlite3.Connection, user_id: int) -> None:
+    """
+    Assign a user to the Default vault with read permission.
+
+    Idempotent — uses INSERT OR IGNORE. Creates the Default vault if it
+    doesn't exist. Gracefully handles pre-migration state when the vaults
+    or vault_members tables don't exist yet.
+    """
+    try:
+        cursor = db.execute("SELECT id FROM vaults WHERE name = ?", ("Default",))
+        row = cursor.fetchone()
+        if row:
+            vault_id = row[0]
+        else:
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO vaults (name, description) VALUES (?, ?)",
+                ("Default", "Default vault for all users"),
+            )
+            vault_id = cursor.lastrowid or db.execute(
+                "SELECT id FROM vaults WHERE name = ?", ("Default",)
+            ).fetchone()[0]
+        db.execute(
+            "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission) VALUES (?, ?, ?)",
+            (vault_id, user_id, "read"),
+        )
+    except sqlite3.OperationalError:
+        # vaults or vault_members table doesn't exist yet (pre-migration)
+        logger.warning("Could not assign user %d to Default vault (tables may not exist yet)", user_id)

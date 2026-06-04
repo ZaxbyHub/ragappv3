@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from app.api.deps import get_current_active_user, get_db
+from app.api.deps import assign_user_to_default_vault, get_current_active_user, get_db
 from app.limiter import limiter
 from app.security import csrf_protect, get_csrf_manager, issue_csrf_token
 from app.services.auth_service import (
@@ -164,7 +164,7 @@ async def register(
     db=Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Register a new user. First user becomes superadmin."""
+    """Register a new user. First user becomes superadmin. Issues CSRF token on success."""
     if not body.username or len(body.username) < 3:
         raise HTTPException(
             status_code=400, detail="Username must be at least 3 characters"
@@ -183,23 +183,21 @@ async def register(
     if existing:
         raise HTTPException(status_code=409, detail="Username already exists")
 
-    # First user becomes superadmin
-    user_count = await asyncio.to_thread(
-        lambda: db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    )
-    role = "superadmin" if user_count == 0 else "member"
-
     hashed_pw = await async_hash_password(body.password)
 
     try:
         def _register_db():
             try:
+                # Atomic: count read and insert are in the same transaction
+                user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                role = "superadmin" if user_count == 0 else "member"
                 user_id = db.execute(
                     "INSERT INTO users (username, hashed_password, full_name, role, is_active) VALUES (?, ?, ?, ?, 1)",
                     (body.username, hashed_pw, body.full_name, role),
                 ).lastrowid
+                assign_user_to_default_vault(db, user_id)
                 db.commit()
-                return user_id
+                return user_id, role
             except Exception:
                 try:
                     db.rollback()
@@ -207,7 +205,7 @@ async def register(
                     pass
                 raise
 
-        user_id = await asyncio.to_thread(_register_db)
+        user_id, role = await asyncio.to_thread(_register_db)
     except Exception:
         logger.error("Failed to create user with default assignments", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
@@ -251,6 +249,10 @@ async def register(
         max_age=REFRESH_TOKEN_MAX_AGE_DAYS * 24 * 60 * 60,
         path=refresh_cookie_path(),
     )
+
+    # Issue CSRF token matching login/refresh pattern
+    csrf_manager = get_csrf_manager(request)
+    issue_csrf_token(response, csrf_manager)
 
     return {
         "id": user_id,
@@ -508,13 +510,14 @@ async def setup_status(db=Depends(get_db)):
 
 @router.get("/me")
 async def get_me(user: dict = Depends(get_current_active_user)):
-    """Get current user profile."""
+    """Get current user profile. Includes must_change_password flag."""
     return {
         "id": user["id"],
         "username": user["username"],
         "full_name": user.get("full_name", ""),
         "role": user["role"],
         "is_active": user["is_active"],
+        "must_change_password": user.get("must_change_password", False),
     }
 
 
@@ -589,7 +592,7 @@ async def change_password(
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Change current user's password. Requires current password verification.
-    Revokes all existing sessions and returns new tokens.
+    Revokes all existing sessions, clears must_change_password flag, and returns new tokens.
     """
     user_id = user["id"]
     username = user["username"]
@@ -630,6 +633,10 @@ async def change_password(
                 )
                 db.execute(
                     "DELETE FROM user_sessions WHERE user_id = ?",
+                    (user_id,),
+                )
+                db.execute(
+                    "UPDATE users SET must_change_password = 0 WHERE id = ?",
                     (user_id,),
                 )
                 db.commit()
