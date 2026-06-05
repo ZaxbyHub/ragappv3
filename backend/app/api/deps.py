@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 from fastapi import Cookie, Depends, Header, HTTPException, Request
 
 from app.config import Settings, settings
-from app.utils.paths import normalize_root_path
 from app.models.database import SQLiteConnectionPool, get_pool
 from app.security import get_csrf_manager  # noqa: F401
 from app.services.auth_service import (
@@ -274,6 +273,8 @@ async def get_current_active_user(
     # auth recovery routes. Include both router-local and mounted runtime paths.
     if user.get("must_change_password"):
         # Base paths always included (no prefix)
+        # Note: request.url.path does NOT include root_path (FastAPI strips it before routing),
+        # so prefixed paths like /meridian/api/... are never seen here — only /api/...
         exempt_paths = {
             "/auth/change-password",
             "/auth/login",

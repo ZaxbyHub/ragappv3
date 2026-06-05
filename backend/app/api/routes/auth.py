@@ -263,6 +263,7 @@ async def register(
             "username": body.username,
             "full_name": body.full_name or "",
             "role": role,
+            "is_active": True,
         },
         "message": "Registration successful",
     }

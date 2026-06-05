@@ -183,7 +183,8 @@ async def list_users(
 
     try:
         if q:
-            search_pattern = f"%{q.replace('%', '\\%').replace('_', '\\_')}%"
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            search_pattern = f"%{escaped}%"
             count_cursor = await asyncio.to_thread(conn.execute, "SELECT COUNT(*) FROM users WHERE username LIKE ? ESCAPE '\\' OR full_name LIKE ? ESCAPE '\\'", (search_pattern, search_pattern))
             total = (await asyncio.to_thread(count_cursor.fetchone))[0]
             cursor = await asyncio.to_thread(conn.execute, """SELECT id, username, full_name, role, is_active, created_at
@@ -387,16 +388,19 @@ async def admin_reset_password(
             db.execute("UPDATE users SET hashed_password = ?, must_change_password = 1 WHERE id = ?", (hashed_password, user_id))
             try:
                 db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
-            except sqlite3.OperationalError:
-                # user_sessions table may not exist yet (e.g., test fixtures, pre-migration)
-                logger.warning("Could not delete user_sessions for user %d (table may not exist)", user_id)
+            except sqlite3.OperationalError as e:
+                err_str = str(e)
+                if "no such table" in err_str:
+                    # user_sessions table may not exist yet (e.g., test fixtures, pre-migration)
+                    logger.warning("Could not delete user_sessions for user %d (table may not exist)", user_id)
+                else:
+                    raise
             db.execute("COMMIT")
         except Exception:
-            if exclusive_started:
-                try:
-                    db.execute("ROLLBACK")
-                except Exception:
-                    pass
+            try:
+                db.execute("ROLLBACK")
+            except Exception:
+                pass
             raise
 
     await asyncio.to_thread(_admin_reset_password_db)
@@ -626,24 +630,28 @@ async def update_user_organizations(
             if missing:
                 raise HTTPException(status_code=400, detail=f"Organizations not found: {sorted(missing)}")
 
-        # Delete existing memberships (except owner roles to protect org ownership)
-        conn.execute(
-            "DELETE FROM org_members WHERE user_id = ? AND role != 'owner'",
-            (user_id,),
-        )
-
-        # Insert new memberships
-        for m in memberships:
-            cursor = conn.execute(
-                "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
-                (m.org_id, user_id),
+        try:
+            # Delete existing memberships (except owner roles to protect org ownership)
+            conn.execute(
+                "DELETE FROM org_members WHERE user_id = ? AND role != 'owner'",
+                (user_id,),
             )
-            if not cursor.fetchone():
-                conn.execute(
-                    "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
-                    (m.org_id, user_id, m.role),
+
+            # Insert new memberships
+            for m in memberships:
+                cursor = conn.execute(
+                    "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
+                    (m.org_id, user_id),
                 )
-        conn.commit()
+                if not cursor.fetchone():
+                    conn.execute(
+                        "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+                        (m.org_id, user_id, m.role),
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
         # Return updated list
         cursor = conn.execute(
