@@ -271,6 +271,7 @@ async def _fetch_accessible_vaults(
     return vaults
 
 
+@router.get("/vaults/", response_model=VaultListResponse, include_in_schema=False)
 @router.get("/vaults", response_model=VaultListResponse)
 async def list_vaults(
     user: dict = Depends(require_role("admin")),
@@ -316,6 +317,7 @@ async def get_vault(
     return vault
 
 
+@router.post("/vaults/", response_model=VaultResponse, status_code=201, include_in_schema=False)
 @router.post("/vaults", response_model=VaultResponse, status_code=201)
 @limiter.limit(settings.vault_create_rate_limit)
 async def create_vault(

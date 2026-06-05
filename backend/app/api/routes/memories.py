@@ -207,6 +207,7 @@ async def _perform_memory_search(
     ]
 
 
+@router.get("/memories/", response_model=MemoryListResponse, include_in_schema=False)
 @router.get("/memories", response_model=MemoryListResponse)
 async def list_memories(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
@@ -280,6 +281,7 @@ async def list_memories(
     return MemoryListResponse(memories=memories)
 
 
+@router.post("/memories/", response_model=MemoryResponse, include_in_schema=False)
 @router.post("/memories", response_model=MemoryResponse)
 @limiter.limit(settings.memory_mutation_rate_limit)
 async def create_memory(
