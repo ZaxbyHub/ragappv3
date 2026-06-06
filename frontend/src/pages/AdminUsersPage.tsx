@@ -751,7 +751,7 @@ const handleCreateUser = async () => {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {ROLE_OPTIONS.map((opt) => (
+                  {ROLE_OPTIONS.filter((r) => r.value !== "superadmin" || isSuperAdmin).map((opt) => (
                     <SelectItem key={opt.value} value={opt.value}>
                       {opt.label}
                     </SelectItem>

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "*",
+        "command": "python scripts/copilot-pr-publication-gate.py",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}

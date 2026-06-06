@@ -850,6 +850,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_page_hierarchy_and_versioning(sqlite_path)
     migrate_add_wiki_supporting_tables(sqlite_path)
     migrate_add_wiki_claims_normalized_text(sqlite_path)
+    migrate_assign_orphan_users_to_default_vault(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -2739,3 +2740,43 @@ def transaction_context(conn: sqlite3.Connection):
     except Exception:
         conn.rollback()
         raise
+
+
+def migrate_assign_orphan_users_to_default_vault(sqlite_path: str) -> None:
+    """
+    Migration: Assign existing users without vault access to the Default vault.
+
+    Idempotent — uses INSERT OR IGNORE and a NOT IN subquery to only insert
+    rows for users who have zero vault_members entries.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+
+        # Find the Default vault ID
+        cursor = conn.execute("SELECT id FROM vaults WHERE name = ?", ("Default",))
+        row = cursor.fetchone()
+        if not row:
+            # Create Default vault if it doesn't exist
+            cursor = conn.execute(
+                "INSERT INTO vaults (name, description) VALUES (?, ?)",
+                ("Default", "Default vault for all users"),
+            )
+            default_vault_id = cursor.lastrowid
+        else:
+            default_vault_id = row[0]
+
+        # Assign all users without any vault_members to Default vault
+        conn.execute(
+            """INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission)
+               SELECT ?, id, 'read' FROM users
+               WHERE id NOT IN (SELECT DISTINCT user_id FROM vault_members)""",
+            (default_vault_id,),
+        )
+        conn.commit()
+        logger.info("Orphan users assigned to Default vault")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
