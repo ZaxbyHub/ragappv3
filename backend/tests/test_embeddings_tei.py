@@ -28,8 +28,10 @@ except ImportError:
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
+from app.services.circuit_breaker import CircuitBreakerError
 from app.services.embeddings import EmbeddingError, EmbeddingService
 
 
@@ -172,3 +174,87 @@ class TestTeiRoundTrip:
 
         with pytest.raises(EmbeddingError):
             await service.embed_single("x")
+
+    async def test_embed_passage_applies_doc_prefix_in_tei_mode(self, mock_tei_settings):
+        # LC5-07: the document prefix must be prepended to the TEI inputs payload.
+        mock_tei_settings.embedding_doc_prefix = "PASSAGE: "
+        service = EmbeddingService()
+        service._client = MagicMock()
+        service._client.post = AsyncMock(
+            return_value=_mock_response(200, [[0.5, 0.6]])
+        )
+
+        vec = await service.embed_passage("hello")
+
+        assert vec == [0.5, 0.6]
+        assert service._client.post.call_args.kwargs["json"] == {
+            "inputs": "PASSAGE: hello"
+        }
+
+    async def test_embed_batch_rejects_non_list_response(self, mock_tei_settings):
+        # LC5-03: TEI batch guard — a non-list (e.g. error object) must raise.
+        service = EmbeddingService()
+        service._client = MagicMock()
+        service._client.post = AsyncMock(
+            return_value=_mock_response(200, {"error": "boom"})
+        )
+
+        with pytest.raises(EmbeddingError):
+            await service.embed_batch(["a", "b"], batch_size=10)
+
+    async def test_embed_batch_non_200_raises(self, mock_tei_settings):
+        # LC5-01: a non-200 from a TEI batch call surfaces as EmbeddingError.
+        service = EmbeddingService()
+        service._client = MagicMock()
+        service._client.post = AsyncMock(return_value=_mock_response(503, []))
+
+        with pytest.raises(EmbeddingError):
+            await service.embed_batch(["a"], batch_size=10)
+
+    async def test_embed_single_timeout_wrapped(self, mock_tei_settings):
+        # LC5-02: httpx.TimeoutException -> EmbeddingError (passthrough breaker).
+        service = EmbeddingService()
+        service._client = MagicMock()
+        service._client.post = AsyncMock(side_effect=httpx.TimeoutException("t"))
+
+        with patch("app.services.embeddings.embeddings_cb", lambda fn: fn):
+            with pytest.raises(EmbeddingError):
+                await service.embed_single("x")
+
+    async def test_embed_single_http_error_wrapped(self, mock_tei_settings):
+        # LC5-02: httpx.HTTPError -> EmbeddingError.
+        service = EmbeddingService()
+        service._client = MagicMock()
+        service._client.post = AsyncMock(side_effect=httpx.HTTPError("boom"))
+
+        with patch("app.services.embeddings.embeddings_cb", lambda fn: fn):
+            with pytest.raises(EmbeddingError):
+                await service.embed_single("x")
+
+    async def test_embed_single_circuit_breaker_open_wrapped(self, mock_tei_settings):
+        # F-C10 regression: an open circuit breaker must surface as EmbeddingError
+        # from the single-embed path (parity with the batch path), not as a raw
+        # CircuitBreakerError.
+        service = EmbeddingService()
+        service._client = MagicMock()
+        service._client.post = AsyncMock(return_value=_mock_response(200, [[0.1]]))
+
+        def open_breaker(_fn):
+            async def _raise(*args, **kwargs):
+                raise CircuitBreakerError("circuit open")
+            return _raise
+
+        with patch("app.services.embeddings.embeddings_cb", open_breaker):
+            with pytest.raises(EmbeddingError) as exc:
+                await service.embed_single("x")
+        assert "circuit breaker" in str(exc.value).lower()
+
+
+class TestTeiHttpsDetection:
+    """LC5-08: HTTPS native-TEI URLs resolve to the tei mode and /embed route."""
+
+    def test_https_bare_8080_resolves_to_native_embed(self, mock_tei_settings):
+        mock_tei_settings.ollama_embedding_url = "https://localhost:8080"
+        service = EmbeddingService()
+        assert service.provider_mode == "tei"
+        assert service.embeddings_url == "https://localhost:8080/embed"

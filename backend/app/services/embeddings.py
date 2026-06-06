@@ -142,9 +142,12 @@ class EmbeddingService:
         # Persistent HTTP client — created once, reused for all embedding calls.
         # URL is passed per-request from `embeddings_url`, so this pool survives
         # endpoint changes.
+        # follow_redirects=False so a 30x from the embedding host cannot bypass
+        # the SSRF guard by redirecting to a private/internal address.
         self._client = httpx.AsyncClient(
             timeout=self.timeout,
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            follow_redirects=False,
         )
 
         # LRU cache. Cache keys include the live model/url/prefix fingerprints,
@@ -405,6 +408,8 @@ class EmbeddingService:
 
             return embedding
 
+        except CircuitBreakerError as e:
+            raise EmbeddingError(f"Embedding service circuit breaker is open: {e}")
         except httpx.TimeoutException:
             raise EmbeddingError("Embedding request timed out")
         except httpx.HTTPError:

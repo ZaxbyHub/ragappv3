@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Native TEI embedding endpoint support**: the embedding client now supports a third provider mode for HuggingFace Text Embeddings Inference (TEI) servers that expose only the native `POST /embed` route (`{"inputs": ...}`, raw array-of-arrays response) and not the OpenAI-compatible `/v1/embeddings` route. Detection: an explicit `/embed` path or a bare `host:8080` URL resolves to native TEI; an explicit `/v1/embeddings` path still selects OpenAI mode. The model-availability check (`ModelChecker`) and the startup `STRICT_EMBEDDING_MODEL_CHECK` now probe TEI's `/info` endpoint (at the server root) for native-TEI URLs. The Settings UI documents the native-TEI URL form.
 - **Wiki master switch enforced (Phase 1)**: `wiki_enabled` is now a hard gate — all wiki routes (GET/POST/PUT/DELETE) return HTTP 503 when disabled. Previously the flag was documented but inert. Job enqueueing in `document_processor.py` is also gated on `wiki_enabled AND wiki_compile_on_ingest`. The flag is now persisted in `NEW_DIRECT_KEYS` for runtime reload.
 - **KMS content search (Phase 1.5)**: Document body text is now searchable via `GET /api/documents?search=`. A new `files_content_fts` FTS5 external-content table indexes `files.parsed_text`; triggers keep it in sync; `list_documents` ORs content-FTS hits alongside metadata-FTS hits. Fixes DD-C002, the critical blocker from issue #119.
 - **KMS RAG integration (Phase 2)**: KMS entries now surface in chat as `[K#]` citations alongside wiki `[W#]` citations. `KMSRetrievalService` performs FTS-backed retrieval (gated by `kms_enabled`), injected into the RAG pipeline after wiki retrieval. The SSE `done` event emits `kms_used`; `kms_refs` is persisted per chat message. The frontend renders `KMSCards` (emerald theme) after assistant messages and adds a "Knowledge" tab in the right-pane source viewer.
@@ -34,6 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Bare `host:8080` embedding URL now routes to native TEI `/embed`** (previously OpenAI `/v1/embeddings`). This affects only embedding URLs configured with **no path** on port 8080: such URLs previously appended `/v1/embeddings` (OpenAI mode) and now append `/embed` (native TEI mode). Default deployments are unaffected — the shipped `OLLAMA_EMBEDDING_URL` uses an explicit `/v1/embeddings` path, which still selects OpenAI mode. Operators running an OpenAI-compatible embedding server on a bare `:8080` URL should set an explicit `/v1/embeddings` path to keep OpenAI-mode behavior.
 - bcrypt password verification (cost factor 14, ~400ms) now offloaded to dedicated ThreadPoolExecutor(4) via async_verify_password(), preventing event-loop blocking during login and password-change under concurrent load
 - All authentication endpoints now use async bcrypt operations via async_verify_password() and async_hash_password()
 - VectorStore write lock now has configurable asyncio.wait_for timeout (default 30s) via @asynccontextmanager _acquire_write_lock(); all 8 write paths updated

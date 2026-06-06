@@ -259,15 +259,17 @@ class TestLifespanSSRFGuard(unittest.TestCase):
         with open(lifespan_path, "r") as f:
             source = f.read()
 
-        # Find the strict_embedding_model_check block (TEI validation section)
-        tei_start = source.find("strict_embedding_model_check")
+        # The TEI /info validation lives in the _validate_tei_embedding_model
+        # helper; bound the block to that function definition.
+        tei_start = source.find("async def _validate_tei_embedding_model")
         self.assertGreater(
             tei_start,
             0,
-            "lifespan.py should have strict_embedding_model_check block",
+            "lifespan.py should define _validate_tei_embedding_model",
         )
-        # Find the next app.state.vector_store to bound the TEI block
-        tei_end = source.find("app.state.vector_store", tei_start)
+        # The helper is defined immediately before the @asynccontextmanager
+        # lifespan; use that to bound the block.
+        tei_end = source.find("@asynccontextmanager", tei_start)
         tei_block = source[tei_start:tei_end]
 
         # Within that block, info_url is defined first, then assert_url_safe is called
@@ -342,9 +344,9 @@ class TestLifespanSSRFGuard(unittest.TestCase):
         with open(lifespan_path, "r") as f:
             source = f.read()
 
-        # Find the TEI validation block
-        tei_block_start = source.find("strict_embedding_model_check")
-        tei_block_end = source.find("app.state.vector_store", tei_block_start)
+        # Find the TEI validation block (the _validate_tei_embedding_model helper)
+        tei_block_start = source.find("async def _validate_tei_embedding_model")
+        tei_block_end = source.find("@asynccontextmanager", tei_block_start)
         tei_block = source[tei_block_start:tei_block_end]
 
         # URLBlocked should be caught separately, not re-raised

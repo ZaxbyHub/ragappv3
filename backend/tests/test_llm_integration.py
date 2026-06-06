@@ -210,6 +210,129 @@ class TestModelChecker(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_detect_provider_type_native_tei(self):
+        """Bare port 8080 and explicit /embed paths resolve to native TEI."""
+        checker = ModelChecker()
+        # Bare TEI default port -> native TEI
+        self.assertEqual(checker._detect_provider_type("http://localhost:8080"), "tei")
+        self.assertEqual(checker._detect_provider_type("http://localhost:8080/"), "tei")
+        # Explicit native /embed path -> native TEI (any port)
+        self.assertEqual(
+            checker._detect_provider_type("http://localhost:9000/embed"), "tei"
+        )
+        # Explicit OpenAI path must NOT be hijacked by TEI detection
+        self.assertEqual(
+            checker._detect_provider_type("http://localhost:8080/v1/embeddings"),
+            "openai_compatible",
+        )
+        # LM Studio default port stays OpenAI-compatible
+        self.assertEqual(
+            checker._detect_provider_type("http://localhost:1234"), "openai_compatible"
+        )
+        # Ollama default port stays Ollama
+        self.assertEqual(
+            checker._detect_provider_type("http://localhost:11434"), "ollama"
+        )
+
+    def test_check_model_availability_tei_uses_info_endpoint(self):
+        """Native TEI availability probes <root>/info and matches model_id."""
+        async def run_test():
+            checker = ModelChecker()
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = {
+                "model_id": "microsoft/harrier-oss-v1-0.6b",
+                "max_input_length": 8192,
+            }
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_response)
+
+            result = await checker._check_model_availability(
+                mock_client,
+                "http://localhost:8080",
+                "microsoft/harrier-oss-v1-0.6b",
+            )
+
+            self.assertTrue(result["available"])
+            self.assertIsNone(result["error"])
+            mock_client.get.assert_called_once()
+            self.assertEqual(
+                mock_client.get.call_args[0][0], "http://localhost:8080/info"
+            )
+
+        asyncio.run(run_test())
+
+    def test_check_model_availability_tei_strips_embed_suffix(self):
+        """An explicit /embed URL still probes the server-root /info."""
+        async def run_test():
+            checker = ModelChecker()
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.raise_for_status = MagicMock()
+            # Lenient last-segment match: config has the bare name, live is qualified.
+            mock_response.json.return_value = {"model_id": "BAAI/bge-m3"}
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_response)
+
+            result = await checker._check_model_availability(
+                mock_client,
+                "http://localhost:8080/embed",
+                "bge-m3",
+            )
+
+            self.assertTrue(result["available"])
+            self.assertEqual(
+                mock_client.get.call_args[0][0], "http://localhost:8080/info"
+            )
+
+        asyncio.run(run_test())
+
+    def test_check_model_availability_tei_mismatch(self):
+        """A mismatched live TEI model_id reports unavailable with detail."""
+        async def run_test():
+            checker = ModelChecker()
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = {"model_id": "BAAI/bge-m3"}
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_response)
+
+            result = await checker._check_model_availability(
+                mock_client,
+                "http://localhost:8080",
+                "nomic-embed-text",
+            )
+
+            self.assertFalse(result["available"])
+            self.assertIn("not found", result["error"])
+            self.assertIn("BAAI/bge-m3", result["error"])
+
+        asyncio.run(run_test())
+
+    def test_check_model_availability_tei_non_dict_info(self):
+        """A non-dict /info body reports unavailable without raising (LC5-12)."""
+        async def run_test():
+            checker = ModelChecker()
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.raise_for_status = MagicMock()
+            mock_response.json.return_value = ["unexpected", "list", "body"]
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_response)
+
+            result = await checker._check_model_availability(
+                mock_client,
+                "http://localhost:8080",
+                "BAAI/bge-m3",
+            )
+
+            self.assertFalse(result["available"])
+            self.assertIn("model_id", result["error"])
+
+        asyncio.run(run_test())
+
 
 class TestLLMClient(unittest.TestCase):
     """Test cases for LLMClient."""
