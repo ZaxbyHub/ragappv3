@@ -1069,6 +1069,7 @@ async def upload_document_root(
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     user: dict = Depends(require_vault_permission("write")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Upload endpoint at root /documents for frontend compatibility.
@@ -1106,6 +1107,7 @@ async def upload_document(
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     user: dict = Depends(require_vault_permission("write")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Upload a file with strict security controls and queue it for indexing.
@@ -1378,6 +1380,7 @@ async def scan_directories(
     background_processor: BackgroundProcessor = Depends(get_background_processor),
     db_pool: SQLiteConnectionPool = Depends(get_db_pool),
     user: dict = Depends(require_admin_role),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Trigger a scan of configured directories for new files.
@@ -1536,6 +1539,7 @@ async def delete_document(
     user: dict = Depends(get_current_active_user),
     vector_store: VectorStore = Depends(get_vector_store),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Delete a document by ID.
@@ -1604,6 +1608,7 @@ async def batch_delete_documents(
     user: dict = Depends(require_document_admin),
     vector_store: VectorStore = Depends(get_vector_store),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Batch delete documents by IDs.
@@ -1676,6 +1681,7 @@ async def delete_all_vault_documents(
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_vault_permission("admin")),
     vector_store: VectorStore = Depends(get_vector_store),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Delete all documents in a vault.

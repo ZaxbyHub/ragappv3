@@ -4,15 +4,16 @@ description: >
   Apply when writing tests, modifying test files, fixing test failures, debugging CI failures,
   adding test coverage, creating adversarial tests, or reviewing any file under tests/.
   Also apply when implementing features or fixes that require corresponding test changes.
-  Enforces framework-specific rules (bun:test for TypeScript, unittest/pytest for Python),
-  mock isolation, cross-platform compatibility, and CI pipeline awareness.
+  Enforces framework-specific rules (RAGAPPv3 frontend uses Vitest/npm; bun:test
+  guidance below applies only to opencode-swarm/similar projects), unittest/pytest
+  patterns, mock isolation, cross-platform compatibility, and CI pipeline awareness.
   Load this skill before touching any test file.
 effort: medium
 ---
 
 # Writing Tests
 
-This skill covers two test ecosystems found in this workspace:
+This skill covers multiple test ecosystems found in this workspace:
 
 - **TypeScript (bun:test)** — used by opencode-swarm and similar projects
 - **Python (unittest/pytest)** — used by ragappv3 backend and similar projects
@@ -21,7 +22,10 @@ RAGAPPv3 frontend is an npm/Vite/Vitest project under `frontend/`, not Bun. For 
 
 RAGAPPv3 CI also runs repository quality contract scripts from the repo root: `python scripts/check_config_contract.py` and `python scripts/check_pr_scope_drift.py`.
 
-Load the relevant section based on the test file's framework. Check for `import unittest` / `import pytest` (Python) vs `import from 'bun:test'` (TypeScript).
+Load the relevant section based on the test file's framework. For this repo's
+frontend, use Vitest/npm even if generic TypeScript guidance below mentions Bun.
+Check for `import unittest` / `import pytest` (Python) vs the actual frontend
+Vitest imports or opencode-swarm `bun:test` imports.
 
 ---
 
@@ -426,6 +430,39 @@ app.dependency_overrides.clear()
 ```
 
 Always clear `dependency_overrides` after the test to prevent leaks.
+
+### RAGAPPv3: CSRF on mutating endpoints
+
+Most state-mutating RAGAPPv3 routes depend on `csrf_protect`. Route tests don't
+reconstruct the cookie/header double-submit — `backend/tests/conftest.py`
+auto-bypasses CSRF via the **pytest-only** `RAGAPP_CSRF_TEST_BYPASS` env flag
+(honoured by `security.csrf_protect` only when `PYTEST_CURRENT_TEST` is also set,
+so it cannot disable CSRF in production). Classification is automatic: a test
+**module whose source mentions "csrf"** is left to exercise the *real* validator;
+every other module is bypassed, which works for both the shared `app.main` app
+and tests that build their own `FastAPI()`. Filename alone is not used for
+classification. To test real CSRF enforcement, ensure the module source
+references csrf; to just call a protected endpoint, do nothing.
+
+### RAGAPPv3: the CI dependency set is reduced
+
+CI installs only `backend/requirements-ci.txt` + `requirements-dev.txt`, which
+**omit** `lancedb`, `pyarrow`, `unstructured`, and `sentence-transformers`
+(stubbed per-file at test time). A dev machine with the full `requirements.txt`
+can pass a backend test locally that fails in CI at import (`ModuleNotFoundError`).
+To validate a backend **test-scope** change (e.g. adding a file to the CI pytest
+list) faithfully — and faster, with no multi-GB model loads — reproduce the CI
+env rather than trusting the local run:
+
+```bash
+python -m venv /tmp/civenv
+/tmp/civenv/bin/pip install -r backend/requirements-ci.txt -r backend/requirements-dev.txt
+cd backend && /tmp/civenv/bin/python -m pytest -q tests/<candidate_file>.py
+```
+
+Corollary: the per-file `lancedb`/`pyarrow`/`unstructured` import stubs are
+**load-bearing for CI, not dead boilerplate** — don't remove them without
+confirming the file still collects under the reduced set.
 
 ## Mock Exception Types MUST Match Production Catch Clauses
 

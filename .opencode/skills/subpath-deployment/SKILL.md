@@ -181,6 +181,35 @@ the streaming UX. See deployment docs for the corresponding NGINX directives.
 
 ---
 
+## SSE streaming auth — DO NOT use EventSource for authenticated endpoints
+
+**Locked decision (N-7):** Any SSE endpoint guarded by `get_current_active_user`
+must be consumed via `fetch`, not the browser `EventSource` API.
+
+**Why:** This app's auth is Bearer-token-in-memory. The access JWT lives in a JS
+module variable (`_jwtAccessToken` in `frontend/src/lib/api.ts`) and is attached
+to requests by an axios interceptor. No `access_token` cookie is ever set
+(only `refresh_token` scoped to `/api/auth/refresh` and the CSRF cookie are
+issued). The browser `EventSource` API cannot set custom headers, so it arrives
+at the backend with no usable credential and always gets `401 Not Authenticated`.
+The browser's native EventSource auto-reconnect then floods the console with 401s.
+
+**The established pattern** is `frontend/src/hooks/useWikiEventStream.ts`:
+- `fetch(url, { method: "GET", headers: { Authorization: "Bearer <token>" }, signal })`
+- Read `response.body.getReader()` and parse SSE lines with a dedicated dispatcher
+  (split on `\n`, strip `data:`, dispatch on `data.type`; do NOT reuse `parseSSEStream`
+  from `api.ts` — it is chat-specific and uses `parsed.type` to gate content forwarding,
+  not `data.type` as the terminal-event key)
+- On `401 token_expired`: call `refreshAccessToken()` and retry
+- On `401 token_invalid` / `user_inactive`: stop; do not reconnect
+- Return `'clean' | 'error' | 'stop'` from the connection function so the outer
+  reconnect loop can reset backoff to the base delay after a clean server close
+
+**Do not reach for EventSource** when adding new SSE endpoints to this codebase,
+regardless of whether the deployment is at root or under a subpath prefix.
+
+---
+
 ## Contract atomicity rule
 
 When changing any env var default across this system, all of these must be

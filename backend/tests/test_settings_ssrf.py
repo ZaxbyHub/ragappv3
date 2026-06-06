@@ -429,5 +429,177 @@ class TestSSRFServiceUnit(unittest.TestCase):
             assert_url_safe("http://192.168.1.1")
 
 
+class TestEmbeddingUrlSettingsGate(unittest.TestCase):
+    """SSRF gate on ollama_embedding_url at settings-change time (F-002).
+
+    EmbeddingService reads settings.ollama_embedding_url live on every call and
+    only validates at construction, so the change boundary
+    (_apply_settings_update) must reject a private/internal embedding URL before
+    it ever lands in the live settings singleton.
+    """
+
+    def test_private_embedding_url_rejected_before_mutation(self):
+        from fastapi import HTTPException
+
+        from app.api.routes.settings import SettingsUpdate, _apply_settings_update
+        from app.config import settings as live_settings
+
+        original = live_settings.ollama_embedding_url
+        update = SettingsUpdate(
+            ollama_embedding_url="http://169.254.169.254/latest/meta-data/"
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            _apply_settings_update(update)
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        # The bad URL must never reach the live settings singleton.
+        self.assertEqual(live_settings.ollama_embedding_url, original)
+
+    def test_loopback_embedding_url_rejected(self):
+        from fastapi import HTTPException
+
+        from app.api.routes.settings import SettingsUpdate, _apply_settings_update
+
+        update = SettingsUpdate(ollama_embedding_url="http://127.0.0.1:11434/api/embeddings")
+        with self.assertRaises(HTTPException) as ctx:
+            _apply_settings_update(update)
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_malformed_embedding_url_rejected_as_422(self):
+        from fastapi import HTTPException
+
+        from app.api.routes.settings import SettingsUpdate, _apply_settings_update
+        from app.config import settings as live_settings
+
+        original = live_settings.ollama_embedding_url
+        update = SettingsUpdate(
+            ollama_embedding_url="http://example.com:bad/api/embeddings"
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            _apply_settings_update(update)
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(live_settings.ollama_embedding_url, original)
+
+    def test_invalid_ipv6_embedding_url_rejected_as_422(self):
+        from fastapi import HTTPException
+
+        from app.api.routes.settings import SettingsUpdate, _apply_settings_update
+        from app.config import settings as live_settings
+
+        original = live_settings.ollama_embedding_url
+        update = SettingsUpdate(ollama_embedding_url="http://[::1")
+
+        with self.assertRaises(HTTPException) as ctx:
+            _apply_settings_update(update)
+
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(live_settings.ollama_embedding_url, original)
+
+
+class TestChatUrlSettingsGate(unittest.TestCase):
+    """Regression coverage for validating chat URLs before partial writes."""
+
+    def _make_settings_conn(self, key: str, value: str):
+        import json
+        import sqlite3
+
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            """
+            CREATE TABLE settings_kv (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO settings_kv (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (key, json.dumps(value)),
+        )
+        conn.commit()
+        return conn
+
+    def _settings_value(self, conn, key: str) -> str:
+        import json
+
+        row = conn.execute("SELECT value FROM settings_kv WHERE key = ?", (key,)).fetchone()
+        self.assertIsNotNone(row)
+        return json.loads(row[0])
+
+    def test_post_settings_rejects_chat_url_before_mutation_or_persistence(self):
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+
+        from app.api.routes.settings import SettingsUpdate, post_settings
+        from app.config import settings as live_settings
+
+        existing_url = "https://example.com/chat"
+        rejected_url = "http://169.254.169.254/latest/meta-data/"
+        original_live = live_settings.ollama_chat_url
+        conn = self._make_settings_conn("ollama_chat_url", existing_url)
+        fake_client = MagicMock()
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    thinking_llm_client=fake_client,
+                    instant_llm_client=None,
+                )
+            )
+        )
+        update = SettingsUpdate(ollama_chat_url=rejected_url)
+
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                post_settings(update, request, conn, _role={}, _csrf_token="test")
+
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(live_settings.ollama_chat_url, original_live)
+            self.assertEqual(self._settings_value(conn, "ollama_chat_url"), existing_url)
+            fake_client.reconfigure.assert_not_called()
+        finally:
+            live_settings.ollama_chat_url = original_live
+            conn.close()
+
+    def test_put_settings_rejects_instant_url_before_mutation_or_persistence(self):
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+
+        from app.api.routes.settings import SettingsUpdate, put_settings
+        from app.config import settings as live_settings
+
+        existing_url = "https://example.com/instant"
+        rejected_url = "http://127.0.0.1:1234/v1/chat/completions"
+        original_live = live_settings.instant_chat_url
+        conn = self._make_settings_conn("instant_chat_url", existing_url)
+        fake_client = MagicMock()
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    thinking_llm_client=None,
+                    instant_llm_client=fake_client,
+                )
+            )
+        )
+        update = SettingsUpdate(instant_chat_url=rejected_url)
+
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                put_settings(update, request, conn, _role={}, _csrf_token="test")
+
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertEqual(live_settings.instant_chat_url, original_live)
+            self.assertEqual(self._settings_value(conn, "instant_chat_url"), existing_url)
+            fake_client.reconfigure.assert_not_called()
+        finally:
+            live_settings.instant_chat_url = original_live
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

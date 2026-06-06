@@ -96,6 +96,7 @@ class TestChangePassword(unittest.TestCase):
         # Create FastAPI app and configure dependency overrides
         from app.api.deps import get_db
         from app.main import app as main_app
+        from app.security import CSRFManager, csrf_protect
 
         # Override the get_db dependency to use our test pool
         def get_test_db():
@@ -106,6 +107,16 @@ class TestChangePassword(unittest.TestCase):
                 self.test_pool.release_connection(conn)
 
         main_app.dependency_overrides[get_db] = get_test_db
+
+        # The login/register handlers issue a fresh CSRF token in their body via
+        # get_csrf_manager() + issue_csrf_token(), so the app needs a csrf_manager
+        # on state (Redis-unavailable -> in-memory fallback) or they 503. These
+        # tests exercise the change-password *flow*, not CSRF enforcement (that is
+        # covered in test_csrf_auth.py), so we also stub csrf_protect to a
+        # pass-through.
+        self.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
+        main_app.state.csrf_manager = self.csrf_manager
+        main_app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
 
         # Create test client with dependency overrides
         self.client = TestClient(main_app)
@@ -188,7 +199,8 @@ class TestChangePassword(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("access_token", data)
-        self.assertIn("refresh_token", data)
+        # refresh_token is delivered as an httpOnly cookie, not in the JSON body
+        # (asserted below) — matching login/register.
         self.assertEqual(data["token_type"], "bearer")
 
         # New access token should be different from old one
@@ -328,10 +340,11 @@ class TestChangePassword(unittest.TestCase):
         )
         access_token = login_response.json()["access_token"]
 
-        # Get user ID and verify multiple sessions exist
+        # Get user ID and verify multiple sessions exist. register() auto-logs
+        # the user in (1 session) and the 4 logins add 4 more → 5 total.
         user_id = self._get_user_id("multisession")
         session_count_before = self._get_session_count(user_id)
-        self.assertEqual(session_count_before, 4)  # 4 sessions created
+        self.assertEqual(session_count_before, 5)
 
         # Change password
         response = self.client.post(
@@ -396,11 +409,13 @@ class TestChangePassword(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
 
     def test_change_password_user_not_found_edge_case(self):
-        """User not found returns 404 (edge case with valid auth token).
+        """Deleted user with a still-valid token is rejected at the auth layer.
 
-        This tests the scenario where get_current_active_user returns a user
-        but the user no longer exists in the database. This is unlikely with
-        proper auth flow but should be handled.
+        get_current_active_user re-queries the DB on every request, so once the
+        user row is gone it raises 401 ``token_invalid`` before the
+        change-password handler ever runs. (The handler's own 404 path is
+        therefore unreachable via the normal dependency chain — the 401 is the
+        real, and stronger, contract.)
         """
         # Register and login to get a valid token
         self.client.post(
@@ -428,9 +443,9 @@ class TestChangePassword(unittest.TestCase):
             json={"current_password": "Password123", "new_password": "NewPass456"},
         )
 
-        # Should return 404 User not found
-        self.assertEqual(response.status_code, 404)
-        self.assertIn("not found", response.json()["detail"].lower())
+        # The auth dependency rejects the deleted user before the handler runs.
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["detail"], "token_invalid")
 
     def test_change_password_same_password_valid(self):
         """Can change to a different but structurally similar password."""
@@ -457,7 +472,8 @@ class TestChangePassword(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         self.assertIn("access_token", data)
-        self.assertIn("refresh_token", data)
+        # refresh_token is delivered as an httpOnly cookie, not in the JSON body.
+        self.assertIn("refresh_token", response.cookies)
 
         # New password should work for login
         login2_response = self.client.post(

@@ -101,8 +101,8 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest --tb=short -v tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py
+        run: pytest --tb=short -v tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py tests/test_csrf_auth.py tests/test_change_password.py tests/test_deps_auth_must_change_password.py tests/test_settings_ssrf.py tests/test_embeddings_cache.py
 
       - name: Coverage report (informational)
-        run: pytest --cov=app --cov-report=term-missing -q tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py
+        run: pytest --cov=app --cov-report=term-missing -q tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py tests/test_csrf_auth.py tests/test_change_password.py tests/test_deps_auth_must_change_password.py tests/test_settings_ssrf.py tests/test_embeddings_cache.py
         continue-on-error: true

@@ -248,6 +248,7 @@ async def update_user(
     body: UpdateUserRequest,
     user: dict = Depends(require_admin_role),
     db: sqlite3.Connection = Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Edit user fields (admin/superadmin only).
 
@@ -303,6 +304,18 @@ async def update_user(
                 detail=f"Invalid role. Must be one of: {', '.join(valid_roles)}",
             )
 
+        # Privilege-escalation guard: only a superadmin may grant the
+        # superadmin role or modify a user who is already a superadmin. An
+        # ordinary admin must not be able to promote anyone (including via a
+        # second account) past their own level.
+        if user.get("role") != "superadmin" and (
+            body.role == "superadmin" or target_row[3] == "superadmin"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Only a superadmin can grant or modify the superadmin role",
+            )
+
         update_fields.append("role = ?")
         update_values.append(body.role)
 
@@ -342,6 +355,7 @@ async def admin_reset_password(
     body: AdminResetPasswordRequest,
     user: dict = Depends(require_admin_role),
     db: sqlite3.Connection = Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Admin reset password (admin/superadmin only).
 
@@ -376,6 +390,7 @@ async def update_user_role(
     user_id: int,
     body: UpdateRoleRequest,
     user: dict = Depends(require_role("superadmin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Update user role (superadmin only). Cannot demote last superadmin."""
     valid_roles = ["superadmin", "admin", "member", "viewer"]
@@ -423,6 +438,7 @@ async def update_user_active(
     user_id: int,
     body: UpdateActiveRequest,
     user: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Activate/deactivate user (admin/superadmin only). Cannot deactivate last superadmin.
 
@@ -475,6 +491,7 @@ async def update_user_active(
 async def delete_user(
     user_id: int,
     user: dict = Depends(require_role("superadmin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Delete user (superadmin only). Cannot delete last superadmin or self."""
     pool = get_pool(str(settings.sqlite_path))

@@ -151,6 +151,11 @@ class EmbeddingService:
         # so a settings change naturally invalidates cached entries.
         self._embed_cache = LRUCache(maxsize=1000)
 
+        # Memoized (base_url, resolved_tuple) so provider-mode detection runs
+        # once per configured URL instead of on every one of the ~19 property
+        # reads per embedding call.
+        self._resolved_cache: Optional[tuple] = None
+
     def _get_global_batch_semaphore(self) -> asyncio.Semaphore:
         """Return the process-wide embedding batch semaphore for the current loop."""
         limit = getattr(settings, "embedding_global_concurrent_batches", None)
@@ -209,7 +214,12 @@ class EmbeddingService:
             raise EmbeddingError("Embedding service is not configured")
         if not base_url.startswith(("http://", "https://")):
             raise EmbeddingError("Invalid embedding URL configuration")
-        return self._detect_provider_mode(base_url)
+        cached = self._resolved_cache
+        if cached is not None and cached[0] == base_url:
+            return cached[1]
+        resolved = self._detect_provider_mode(base_url)
+        self._resolved_cache = (base_url, resolved)
+        return resolved
 
     def _detect_provider_mode(self, base_url: str) -> tuple:
         """

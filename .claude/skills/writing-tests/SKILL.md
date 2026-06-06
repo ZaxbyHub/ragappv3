@@ -27,6 +27,21 @@ The authoritative testing policy and conventions live in
 - `unittest.TestCase` / `IsolatedAsyncioTestCase` run under pytest; `asyncio_mode = "auto"` (no marker needed). `conftest.py` sets test env and clears `app.*` modules.
 - Route tests use the **`SimpleConnectionPool` + `app.dependency_overrides`** harness — canonical example `backend/tests/test_tags_routes.py`: tempdir → `init_db` → `run_migrations`; override `get_db` / `get_vector_store` (AsyncMock) / `get_current_active_user` / `csrf_protect`; restore in teardown.
 - Seed rows in FK order; verify cascades by deleting the parent (FKs are ON).
+- **CSRF on mutating endpoints:** most state-mutating routes now depend on
+  `csrf_protect`. Route tests don't reconstruct the cookie/header double-submit —
+  `conftest.py` auto-bypasses CSRF via the pytest-only `RAGAPP_CSRF_TEST_BYPASS`
+  env flag (honoured by `security.csrf_protect` only when `PYTEST_CURRENT_TEST`
+  is also set). Classification is automatic: a test **module whose source
+  mentions "csrf"** is left to exercise the *real* validator (don't rely on the
+  bypass there); every other module gets the bypass, which works for both the
+  shared `app.main` app and tests that build their own `FastAPI()`. Filename
+  alone is not used for classification. To test real CSRF enforcement, ensure
+  the module source references csrf; to just hit a protected endpoint, do
+  nothing.
+- **Per-file `lancedb`/`pyarrow`/`unstructured` stubs are load-bearing for CI**,
+  not redundant boilerplate — CI installs `requirements-ci.txt`, which omits
+  those packages (see `ci-compatibility-audit`). Removing a stub can break
+  collection in CI even though it passes locally with the full deps installed.
 - **CI pins Python 3.11.** Local 3.14+ fails some tests with `RuntimeError: There is no current event loop` — a local artifact, not a regression. Avoid manual `asyncio.get_event_loop()` in new tests.
 
 ## Frontend (Vitest + RTL + jsdom)

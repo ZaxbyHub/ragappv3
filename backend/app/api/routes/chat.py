@@ -27,6 +27,7 @@ from app.config import settings
 from app.limiter import limiter
 from app.models.chat_mode import ChatMode
 from app.models.database import get_pool
+from app.security import csrf_protect
 from app.services.citation_validator import repair_against_sources_and_memories
 from app.services.rag_engine import RAGEngine, RAGEngineError
 from app.services.wiki_citation_helpers import (
@@ -209,6 +210,7 @@ def stream_chat_response(
     rag_engine: Optional[RAGEngine],
     vault_id: Optional[int] = None,
     mode: Optional[ChatMode] = None,
+    user_id: Optional[int] = None,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
@@ -281,7 +283,11 @@ def stream_chat_response(
                     score_type = chunk.get("score_type", score_type)
         except Exception as e:
             logger.error(
-                "Chat stream failed: message_len=%d, history_len=%d, exception=%s, error=%s",
+                "Chat stream failed: user_id=%s, vault_id=%s, mode=%s, "
+                "message_len=%d, history_len=%d, exception=%s, error=%s",
+                user_id,
+                vault_id,
+                mode.value if mode is not None else None,
                 len(message),
                 len(history),
                 type(e).__name__,
@@ -457,6 +463,7 @@ async def chat(
     rag_engine: RAGEngine = Depends(get_rag_engine),
     user: dict = Depends(get_current_active_user),
     evaluate=Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Chat endpoint for RAG-based conversational interface.
@@ -517,6 +524,7 @@ async def chat_stream(
     rag_engine: RAGEngine = Depends(get_rag_engine),
     user: dict = Depends(get_current_active_user),
     evaluate=Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Streaming chat endpoint that accepts a sequence of chat messages."""
     if not body.messages:
@@ -551,6 +559,7 @@ async def chat_stream(
         rag_engine,
         vault_id=body.vault_id,
         mode=effective_mode,
+        user_id=user.get("id"),
     )
 
 
@@ -820,6 +829,7 @@ async def create_session(
     request: CreateSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Create a new chat session.
@@ -859,6 +869,7 @@ async def fork_session(
     request: ForkSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Fork a chat session from a specific message index.
@@ -1282,6 +1293,7 @@ async def add_message(
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     rag_engine: Optional[RAGEngine] = Depends(get_rag_engine),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Add a message to a chat session.
@@ -1488,6 +1500,7 @@ async def set_message_feedback(
     request: FeedbackRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Set or clear feedback (thumbs up/down) on a chat message.
@@ -1574,6 +1587,7 @@ async def update_session(
     request: UpdateSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Update a chat session's title.
@@ -1618,6 +1632,7 @@ async def delete_session(
     session_id: int,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Delete a chat session.

@@ -188,7 +188,11 @@ async def register(
     try:
         def _register_db():
             try:
-                # Atomic: count read and insert are in the same transaction
+                # BEGIN IMMEDIATE takes the write lock up front so the first-user
+                # COUNT and the INSERT are atomic. Reading the count outside the
+                # transaction let two concurrent first-registrations both observe
+                # count == 0 and both get promoted to superadmin.
+                db.execute("BEGIN IMMEDIATE")
                 user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 role = "superadmin" if user_count == 0 else "member"
                 user_id = db.execute(
@@ -736,6 +740,7 @@ async def revoke_session(
     session_id: int,
     user: dict = Depends(get_current_active_user),
     db=Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Revoke a specific session.
 
@@ -783,6 +788,7 @@ async def revoke_all_sessions(
     request: Request,
     user: dict = Depends(get_current_active_user),
     db=Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Revoke all sessions except the current one.
 

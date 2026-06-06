@@ -142,6 +142,14 @@ class TestUserRoutes:
 
         app.dependency_overrides[deps.get_db] = override_get_db
 
+        # Mutating user endpoints now require csrf_protect. This standalone app
+        # has no csrf_manager on state, so override the dependency to a
+        # pass-through — these tests assert auth/role/validation behavior, not
+        # CSRF wiring (that lives in test_csrf_auth.py).
+        from app.security import csrf_protect
+
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+
         # Store for cleanup
         self.test_pool = test_pool
         self.original_get_pool = original_get_pool

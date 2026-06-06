@@ -74,7 +74,11 @@ def assert_url_safe(url: str) -> None:
     if not url or not url.strip():
         raise URLBlocked("URL is empty.")
 
-    parsed = urlparse(url.strip())
+    try:
+        parsed = urlparse(url.strip())
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise URLBlocked(f"URL is malformed: {exc}") from exc
     if parsed.scheme not in ("http", "https"):
         raise URLBlocked(
             f"URL scheme must be http or https (got {parsed.scheme!r})."
@@ -93,7 +97,7 @@ def assert_url_safe(url: str) -> None:
         candidates = [host]
     except ValueError:
         try:
-            infos = socket.getaddrinfo(host, parsed.port or 80, type=socket.SOCK_STREAM)
+            infos = socket.getaddrinfo(host, parsed_port or 80, type=socket.SOCK_STREAM)
         except OSError as e:
             raise URLBlocked(
                 f"URL host {host!r} did not resolve: {e}"

@@ -26,6 +26,7 @@ from app.api.deps import (
 )
 from app.config import settings
 from app.limiter import limiter
+from app.security import csrf_protect
 from app.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -323,6 +324,7 @@ async def create_vault(
     body: VaultCreateRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Create a new vault.
@@ -435,6 +437,7 @@ async def update_vault(
     request: VaultUpdateRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Update vault name/description.
@@ -525,6 +528,7 @@ async def delete_vault(
     conn: sqlite3.Connection = Depends(get_db),
     vector_store: VectorStore = Depends(get_vector_store),
     user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Delete vault with cascade cleanup.
@@ -550,8 +554,10 @@ async def delete_vault(
     vault_name = row[1]
 
     try:
-        # Start transaction
-        await asyncio.to_thread(conn.execute, "BEGIN TRANSACTION")
+        # Start transaction. BEGIN IMMEDIATE acquires the write lock up front
+        # so a concurrent deletion/mutation of the same vault cannot interleave
+        # between our reads and writes (avoids SQLITE_BUSY mid-cascade).
+        await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
 
         # Delete vector chunks for this vault
         try:
@@ -705,6 +711,7 @@ async def update_vault_groups(
     request: VaultGroupsUpdateRequest,
     user: dict = Depends(require_vault_permission("admin")),
     conn: sqlite3.Connection = Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """
     Update which groups have access to this vault.

@@ -269,9 +269,15 @@ async def get_current_active_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Enforce must_change_password: flagged users can only access exempt routes
+    # Enforce must_change_password: flagged users can only access explicit
+    # auth recovery routes. Include both router-local and mounted runtime paths.
     if user.get("must_change_password"):
-        exempt_paths = {"/auth/change-password", "/auth/login", "/api/auth/change-password", "/api/auth/login"}
+        exempt_paths = {
+            "/auth/change-password",
+            "/auth/login",
+            "/api/auth/change-password",
+            "/api/auth/login",
+        }
         # Normalize path to prevent bypass via trailing slash variants
         normalized_path = request.url.path.rstrip("/") or "/"
         if normalized_path not in exempt_paths:

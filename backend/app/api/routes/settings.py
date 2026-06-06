@@ -8,7 +8,7 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
 from app.config import settings
-from app.security import CSRFManager, issue_csrf_token
+from app.security import CSRFManager, csrf_protect, issue_csrf_token
 from app.services.ssrf import URLBlocked, assert_url_safe
 
 router = APIRouter()
@@ -425,6 +425,11 @@ ALLOWED_FIELDS = [
 # Enforced at PUT-time so the backend never silently accepts a half-configured
 # curator (which would then surface as a runtime error during compile).
 _CURATOR_REQUIRED_WHEN_ENABLED = ("wiki_llm_curator_url", "wiki_llm_curator_model")
+_URL_FIELDS_TO_VALIDATE = {
+    "ollama_embedding_url": "embedding URL",
+    "ollama_chat_url": "chat URL",
+    "instant_chat_url": "instant chat URL",
+}
 
 
 def _persist_settings(conn: sqlite3.Connection, update: SettingsUpdate) -> None:
@@ -473,6 +478,21 @@ def _enforce_curator_required_when_enabled(update: SettingsUpdate) -> None:
                 f"{', '.join(missing)}. Provide URL and model, or disable the curator."
             ),
         )
+
+
+def _validate_updated_urls(update: SettingsUpdate) -> None:
+    """Validate updated model URLs before mutating or persisting settings."""
+    for field, label in _URL_FIELDS_TO_VALIDATE.items():
+        value = getattr(update, field)
+        if not value:
+            continue
+        try:
+            assert_url_safe(value)
+        except URLBlocked as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsafe {label}: {exc}",
+            ) from exc
 
 
 class SettingsResponse(BaseModel):
@@ -758,6 +778,11 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
 
 def _apply_settings_update(update: SettingsUpdate) -> SettingsResponse:
     """Shared logic to apply settings update and return updated settings."""
+    # SSRF: validate updated model URLs before mutating the live settings
+    # singleton or writing settings_kv rows. EmbeddingService reads its URL live
+    # and LLM clients reconfigure after persistence, so rejected URLs must fail
+    # at this boundary to avoid partial writes.
+    _validate_updated_urls(update)
     updated = False
     for field in ALLOWED_FIELDS:
         value = getattr(update, field)
@@ -788,6 +813,7 @@ def post_settings(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
     _role: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Apply settings update and persist to database."""
     _enforce_curator_required_when_enabled(update)
@@ -807,6 +833,7 @@ def put_settings(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
     _role: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Update settings (upserts into settings_kv)."""
     _enforce_curator_required_when_enabled(update)
@@ -894,6 +921,7 @@ class _CuratorTestBody(BaseModel):
 async def test_curator_connection(
     body: Optional[_CuratorTestBody] = None,
     _role: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Validate the curator endpoint by issuing a tiny JSON-only ping.
 

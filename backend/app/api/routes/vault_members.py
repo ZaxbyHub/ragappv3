@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.api.deps import require_vault_permission
 from app.config import settings
 from app.models.database import get_pool
+from app.security import csrf_protect
 
 router = APIRouter(prefix="/vaults/{vault_id}/members", tags=["vault-members"])
 group_access_router = APIRouter(
@@ -124,6 +125,7 @@ def add_vault_member(
     vault_id: int,
     request: VaultMemberCreateRequest,
     current_user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Add a member to a vault."""
     pool = get_pool(str(settings.sqlite_path))
@@ -194,6 +196,7 @@ def update_vault_member(
     member_user_id: int,
     request: VaultMemberUpdateRequest,
     current_user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Update a vault member's permission."""
     pool = get_pool(str(settings.sqlite_path))
@@ -254,6 +257,7 @@ def remove_vault_member(
     vault_id: int,
     member_user_id: int,
     current_user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Remove a member from a vault."""
     pool = get_pool(str(settings.sqlite_path))
@@ -362,6 +366,7 @@ def grant_vault_group_access(
     vault_id: int,
     request: VaultGroupAccessCreateRequest,
     current_user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Grant a group access to a vault."""
     pool = get_pool(str(settings.sqlite_path))
@@ -448,6 +453,7 @@ def update_vault_group_access(
     group_id: int,
     request: VaultGroupAccessUpdateRequest,
     current_user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Update a group's permission for a vault."""
     pool = get_pool(str(settings.sqlite_path))
@@ -510,6 +516,7 @@ def revoke_vault_group_access(
     vault_id: int,
     group_id: int,
     current_user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Remove a group's access from a vault."""
     pool = get_pool(str(settings.sqlite_path))

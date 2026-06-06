@@ -294,6 +294,45 @@ class TestCSRFProtection(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         self.assertIn("CSRF", response.json()["detail"])
 
+    def test_post_change_password_without_csrf_returns_403(self):
+        """POST /auth/change-password without CSRF token should return 403.
+
+        Regression guard: test_change_password.py exercises this endpoint with
+        the test-only CSRF bypass enabled, so it never proves CSRF is enforced.
+        This suite runs the real validator and locks that contract in.
+        """
+        csrf_cookie, csrf_token = self._get_csrf_cookie_and_header()
+
+        # Register + login (with CSRF) to obtain an access token.
+        reg_response = self.client.post(
+            "/api/auth/register",
+            json={"username": "cpwcsrf", "password": "Password123"},
+            cookies={"X-CSRF-Token": csrf_cookie},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        self.assertEqual(
+            reg_response.status_code, 200, f"Registration failed: {reg_response.json()}"
+        )
+        login_response = self.client.post(
+            "/api/auth/login",
+            json={"username": "cpwcsrf", "password": "Password123"},
+            cookies={"X-CSRF-Token": csrf_cookie},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        self.assertEqual(
+            login_response.status_code, 200, f"Login failed: {login_response.json()}"
+        )
+        access_token = login_response.json()["access_token"]
+
+        # Change-password without a CSRF header must be rejected.
+        response = self.client.post(
+            "/api/auth/change-password",
+            json={"current_password": "Password123", "new_password": "NewPass456"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("CSRF", response.json()["detail"])
+
     def test_get_setup_status_without_csrf_returns_200(self):
         """GET /auth/setup-status should NOT require CSRF token and return 200."""
         response = self.client.get("/api/auth/setup-status")
