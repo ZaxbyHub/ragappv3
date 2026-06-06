@@ -244,6 +244,7 @@ async def update_user(
     body: UpdateUserRequest,
     user: dict = Depends(require_admin_role),
     db: sqlite3.Connection = Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Edit user fields (admin/superadmin only).
 
@@ -338,6 +339,7 @@ async def admin_reset_password(
     body: AdminResetPasswordRequest,
     user: dict = Depends(require_admin_role),
     db: sqlite3.Connection = Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Admin reset password (admin/superadmin only).
 
@@ -372,6 +374,7 @@ async def update_user_role(
     user_id: int,
     body: UpdateRoleRequest,
     user: dict = Depends(require_role("superadmin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Update user role (superadmin only). Cannot demote last superadmin."""
     valid_roles = ["superadmin", "admin", "member", "viewer"]
@@ -419,6 +422,7 @@ async def update_user_active(
     user_id: int,
     body: UpdateActiveRequest,
     user: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Activate/deactivate user (admin/superadmin only). Cannot deactivate last superadmin.
 
@@ -471,6 +475,7 @@ async def update_user_active(
 async def delete_user(
     user_id: int,
     user: dict = Depends(require_role("superadmin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Delete user (superadmin only). Cannot delete last superadmin or self."""
     pool = get_pool(str(settings.sqlite_path))

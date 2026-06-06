@@ -133,6 +133,39 @@ class TestMustChangePasswordEnforcement:
         assert result["must_change_password"] is True
 
     @pytest.mark.asyncio
+    async def test_must_change_password_allowed_on_prefixed_change_password_route(
+        self, mock_settings_jwt_mode, mock_db
+    ):
+        """
+        User with must_change_password=1 accessing the *real* runtime path
+        POST /api/auth/change-password → allowed.
+
+        Regression test for the deadlock: the auth router mounts under "/api",
+        so request.url.path is "/api/auth/change-password" at runtime. An exact
+        match against "/auth/change-password" never fired, permanently locking
+        flagged users out of the only recovery endpoint. Suffix matching fixes it.
+        """
+        from app.api.deps import get_current_active_user
+
+        token = _make_token(42)
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.return_value = (
+            42, "testuser", "Test User", "member", 1, 1  # must_change_password=1
+        )
+
+        mock_request = _mock_request("/api/auth/change-password")
+
+        result = await get_current_active_user(
+            request=mock_request,
+            authorization=f"Bearer {token}",
+            access_token=None,
+            db=mock_conn,
+        )
+
+        assert result["id"] == 42
+        assert result["must_change_password"] is True
+
+    @pytest.mark.asyncio
     async def test_must_change_password_allowed_on_login_route(
         self, mock_settings_jwt_mode, mock_db
     ):

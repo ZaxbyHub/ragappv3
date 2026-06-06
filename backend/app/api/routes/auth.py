@@ -183,23 +183,24 @@ async def register(
     if existing:
         raise HTTPException(status_code=409, detail="Username already exists")
 
-    # First user becomes superadmin
-    user_count = await asyncio.to_thread(
-        lambda: db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    )
-    role = "superadmin" if user_count == 0 else "member"
-
     hashed_pw = await async_hash_password(body.password)
 
     try:
         def _register_db():
             try:
+                # BEGIN IMMEDIATE takes the write lock up front so the first-user
+                # COUNT and the INSERT are atomic. Reading the count outside the
+                # transaction let two concurrent first-registrations both observe
+                # count == 0 and both get promoted to superadmin.
+                db.execute("BEGIN IMMEDIATE")
+                user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                role = "superadmin" if user_count == 0 else "member"
                 user_id = db.execute(
                     "INSERT INTO users (username, hashed_password, full_name, role, is_active) VALUES (?, ?, ?, ?, 1)",
                     (body.username, hashed_pw, body.full_name, role),
                 ).lastrowid
                 db.commit()
-                return user_id
+                return user_id, role
             except Exception:
                 try:
                     db.rollback()
@@ -207,7 +208,7 @@ async def register(
                     pass
                 raise
 
-        user_id = await asyncio.to_thread(_register_db)
+        user_id, role = await asyncio.to_thread(_register_db)
     except Exception:
         logger.error("Failed to create user with default assignments", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
@@ -515,6 +516,7 @@ async def get_me(user: dict = Depends(get_current_active_user)):
         "full_name": user.get("full_name", ""),
         "role": user["role"],
         "is_active": user["is_active"],
+        "must_change_password": user.get("must_change_password", False),
     }
 
 
@@ -729,6 +731,7 @@ async def revoke_session(
     session_id: int,
     user: dict = Depends(get_current_active_user),
     db=Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Revoke a specific session.
 
@@ -776,6 +779,7 @@ async def revoke_all_sessions(
     request: Request,
     user: dict = Depends(get_current_active_user),
     db=Depends(get_db),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Revoke all sessions except the current one.
 

@@ -266,12 +266,17 @@ async def get_current_active_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Enforce must_change_password: flagged users can only access exempt routes
+    # Enforce must_change_password: flagged users can only access exempt routes.
+    # Match on path *suffix* because the auth router is mounted under the "/api"
+    # prefix (and optionally a deployment root_path), so the real runtime path is
+    # e.g. "/api/auth/change-password". An exact-equality check against
+    # "/auth/change-password" never matched and locked flagged users out of the
+    # only recovery endpoint.
     if user.get("must_change_password"):
-        exempt_paths = {"/auth/change-password", "/auth/login"}
+        exempt_suffixes = ("/auth/change-password", "/auth/login")
         # Normalize path to prevent bypass via trailing slash variants
         normalized_path = request.url.path.rstrip("/") or "/"
-        if normalized_path not in exempt_paths:
+        if not any(normalized_path.endswith(suffix) for suffix in exempt_suffixes):
             raise HTTPException(
                 status_code=403,
                 detail="must_change_password",

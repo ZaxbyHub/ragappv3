@@ -34,9 +34,11 @@ Backend job:
 - `ruff check .`
 - `pytest --tb=short -v` over an **enumerated, narrow subset** of test files —
   currently `tests/test_path_prefix.py tests/test_auth_routes.py
-  tests/test_main_catchall.py tests/test_csrf_auth.py`, **not** the whole
-  `tests/` tree. Adding a file to this list is what "expanding CI test scope"
-  means; that file must pass under the reduced CI dependency set.
+  tests/test_main_catchall.py tests/test_csrf_auth.py tests/test_change_password.py
+  tests/test_deps_auth_must_change_password.py tests/test_settings_ssrf.py
+  tests/test_embeddings_cache.py`, **not** the whole `tests/` tree. Adding a
+  file to this list is what "expanding CI test scope" means; that file must pass
+  under the reduced CI dependency set.
 - informational coverage (`continue-on-error: true`) over the same subset
 
 Repository contract job:
@@ -62,7 +64,7 @@ cd frontend && npm ci --engine-strict && npm run typecheck && npm run lint
 cd frontend && npm test -- src/lib/api.test.ts src/lib/api.csrf.test.ts src/lib/api.sse.test.ts src/pages/WikiPage.sse.test.tsx src/stores/useAuthStore.api-base.test.ts
 cd frontend && npm test && npm run build
 cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/api npm run build
-cd backend && ruff check . && pytest --tb=short -v tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py tests/test_csrf_auth.py
+cd backend && ruff check . && pytest --tb=short -v tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py tests/test_csrf_auth.py tests/test_change_password.py tests/test_deps_auth_must_change_password.py tests/test_settings_ssrf.py tests/test_embeddings_cache.py
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
 ```

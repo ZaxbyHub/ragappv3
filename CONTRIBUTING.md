@@ -86,7 +86,7 @@ so your PR goes green on the first try:
 ```bash
 ruff check .
 # CI-targeted subset:
-pytest --tb=short -q tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py tests/test_csrf_auth.py
+pytest --tb=short -q tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py tests/test_csrf_auth.py tests/test_change_password.py tests/test_deps_auth_must_change_password.py tests/test_settings_ssrf.py tests/test_embeddings_cache.py
 # ...and the tests for the area you changed, e.g.:
 pytest -q tests/test_tags_routes.py
 ```

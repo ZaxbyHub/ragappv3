@@ -97,23 +97,26 @@ the factory (as above) rather than a top-level `import React`.
 **`window.matchMedia` is not in jsdom.** Any component that transitively
 imports `useThemeStore` will crash with `window.matchMedia is not a function`
 because that store calls `matchMedia` at module-load time. The global
-`frontend/src/test/setup.ts` does NOT stub it. Add a `beforeAll` stub
-whenever your test renders a component that imports the theme store:
+`frontend/src/test/setup.ts` does NOT stub it. For import-time users, install
+the stub before the affected module is imported: put a broad stub in
+`frontend/src/test/setup.ts`, or use a top-level stub followed by a dynamic
+import in the test. A `beforeAll` stub is only safe when the affected component
+is imported after the hook runs; it is too late for static imports.
 
 ```tsx
-beforeAll(() => {
-  if (!window.matchMedia) {
-    Object.defineProperty(window, "matchMedia", {
-      writable: true,
-      value: (query: string) => ({
-        matches: false, media: query, onchange: null,
-        addEventListener: () => {}, removeEventListener: () => {},
-        addListener: () => {}, removeListener: () => {},
-        dispatchEvent: () => false,
-      }),
-    });
-  }
-});
+if (!window.matchMedia) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: false, media: query, onchange: null,
+      addEventListener: () => {}, removeEventListener: () => {},
+      addListener: () => {}, removeListener: () => {},
+      dispatchEvent: () => false,
+    }),
+  });
+}
+
+const { default: NavigationRail } = await import("@/components/layout/NavigationRail");
 ```
 
 Affected: `NavigationRail`, `PageShell`, and anything that renders the app

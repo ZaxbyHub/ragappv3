@@ -29,6 +29,20 @@ import pytest
 from app.services.embeddings import EmbeddingError, EmbeddingService, LRUCache
 
 
+@pytest.fixture(autouse=True)
+def allow_local_services_for_mocked_embedding_urls():
+    """Embedding cache tests use mocked localhost clients; keep the opt-in local."""
+    previous = os.environ.get("ALLOW_LOCAL_SERVICES")
+    os.environ["ALLOW_LOCAL_SERVICES"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("ALLOW_LOCAL_SERVICES", None)
+        else:
+            os.environ["ALLOW_LOCAL_SERVICES"] = previous
+
+
 class TestLRUCache:
     """Test suite for LRUCache class."""
 
@@ -709,3 +723,39 @@ class TestCacheKeyFormat:
             assert result3 == [0.1, 0.2, 0.3]
             # API should be called again because model changed
             assert mock_post.call_count == 2
+
+
+class TestResolvedUrlCache:
+    """_resolved_cache memoizes provider-mode detection per URL (ARCH-007).
+
+    Detection runs once per configured URL and is invalidated when the live
+    ollama_embedding_url changes, so the ~19 property reads per embedding call
+    don't each re-parse the URL.
+    """
+
+    def test_detection_memoized_and_invalidated_on_url_change(self):
+        mock_settings = MagicMock()
+        mock_settings.ollama_embedding_url = "http://localhost:11434/api/embeddings"
+        mock_settings.embedding_model = "nomic-embed-text"
+
+        # Patch the SSRF guard to a no-op so a loopback test URL doesn't trip it
+        # at construction (the guard is covered in test_settings_ssrf.py).
+        with patch("app.services.embeddings.settings", mock_settings), patch(
+            "app.services.embeddings.assert_url_safe", lambda *a, **k: None
+        ):
+            service = EmbeddingService()
+            with patch.object(
+                service,
+                "_detect_provider_mode",
+                wraps=service._detect_provider_mode,
+            ) as spy:
+                # Repeated reads of the same URL → detection runs exactly once.
+                _ = service.embeddings_url
+                _ = service.provider_mode
+                _ = service.embeddings_url
+                assert spy.call_count == 1
+
+                # Changing the live URL invalidates the cache → detection re-runs.
+                mock_settings.ollama_embedding_url = "http://localhost:1234/v1/embeddings"
+                assert service.provider_mode == "openai"
+                assert spy.call_count == 2
