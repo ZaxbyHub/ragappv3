@@ -1748,6 +1748,8 @@ class TestVaultResponseOrgId(unittest.TestCase):
         self.assertGreater(len(vaults), 0)
         for vault in vaults:
             self.assertIn("org_id", vault)
+        created_vault = next(v for v in vaults if v["name"] == "ListVault")
+        self.assertIsNone(created_vault["org_id"])
 
     def test_get_single_vault_includes_org_id(self):
         """GET /api/vaults/{id} includes org_id=None for a vault without an org."""

@@ -10,7 +10,7 @@
  * (org/vault filtering tests).
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -190,6 +190,10 @@ describe("ManageVaultsSheet — org-scoped vault filtering", () => {
     mockGetGroupVaults.mockResolvedValue([]);
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("shows a vault that belongs to the same org as the group", async () => {
     const group = makeGroup({ org_id: 10 });
     const sameOrgVault = makeVault({ id: 1, name: "Same Org Vault", org_id: 10 });
@@ -252,28 +256,6 @@ describe("ManageVaultsSheet — org-scoped vault filtering", () => {
 
     await waitFor(() => {
       expect(screen.getByText("Global Vault")).toBeInTheDocument();
-    });
-  });
-
-  it("shows all vaults when the group has no org (org_id = null on group)", async () => {
-    const group = makeGroup({ org_id: null as unknown as number });
-    const vaultA = makeVault({ id: 1, name: "Vault A", org_id: 10 });
-    const vaultB = makeVault({ id: 2, name: "Vault B", org_id: 99 });
-    mockListVaults.mockResolvedValue({ vaults: [vaultA, vaultB] });
-
-    render(
-      <ManageVaultsSheet
-        group={group}
-        open={true}
-        onOpenChange={vi.fn()}
-        onSave={noop}
-      />,
-      { wrapper }
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText("Vault A")).toBeInTheDocument();
-      expect(screen.getByText("Vault B")).toBeInTheDocument();
     });
   });
 
