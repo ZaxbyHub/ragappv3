@@ -190,4 +190,223 @@ describe("useSendMessage", () => {
       });
     });
   });
+
+  describe("error-path coverage (issue #55)", () => {
+    type StreamHandlers = {
+      onMessage: (chunk: string) => void;
+      onSources: (sources: unknown[]) => void;
+      onMemories: (memories: unknown[]) => void;
+      onWiki: (wikiRefs: unknown[]) => void;
+      onKMS: (kmsRefs: unknown[]) => void;
+      onMode: (mode: string) => void;
+      onError: (error: Error) => void;
+      onComplete: () => Promise<void> | void;
+    };
+
+    // Install a chatStream mock that captures the handlers so each test can
+    // fire them at will. The captured handler is read from a mutable cell
+    // so subsequent mock invocations (e.g. retries) update the reference
+    // and trigger calls operate on the latest invocation.
+    function installCapturingStreamMock(): { trigger: { error: (e: Error) => void; complete: () => void } } {
+      const cell: { current: StreamHandlers | null } = { current: null };
+      apiMocks.chatStream.mockImplementation((_messages: unknown, handlers: StreamHandlers) => {
+        cell.current = handlers;
+        return vi.fn(); // abort function
+      });
+      return {
+        trigger: {
+          error: (e: Error) => {
+            if (!cell.current) throw new Error("chatStream was not invoked yet");
+            cell.current.onError(e);
+          },
+          complete: () => {
+            if (!cell.current) throw new Error("chatStream was not invoked yet");
+            void cell.current.onComplete();
+          },
+        },
+      };
+    }
+
+    it("flips isStreaming to true synchronously when send begins", async () => {
+      // Arrange: a stream that never completes, so we can observe the
+      // mid-flight isStreaming value.
+      apiMocks.chatStream.mockImplementation((_messages: unknown, _handlers: StreamHandlers) => {
+        return vi.fn();
+      });
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "Stream start" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      // Don't await — observe store state immediately after kicking off the send.
+      act(() => {
+        void result.current.handleSend();
+      });
+
+      // isStreaming must be true right after the send call returns, before any
+      // stream events have fired. This guards the immediate flip behavior.
+      expect(useChatStore.getState().isStreaming).toBe(true);
+    });
+
+    it("handles AbortError: clears isStreaming, abortFn, streamingMessageId, sendingRef — without stamping an error on the message", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "Will be aborted" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      // The send should have created the assistant message and marked it as
+      // streaming. Capture the streamingMessageId so we can inspect the
+      // message after abort.
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+      expect(useChatStore.getState().isStreaming).toBe(true);
+
+      // Simulate the AbortError bubbling up through the SSE stream.
+      await act(async () => {
+        capture.trigger.error(new DOMException("aborted", "AbortError"));
+      });
+
+      await waitFor(() => {
+        expect(useChatStore.getState().isStreaming).toBe(false);
+      });
+      expect(useChatStore.getState().abortFn).toBeNull();
+      expect(useChatStore.getState().streamingMessageId).toBeNull();
+
+      // Aborts must NOT mark the assistant message with an error field —
+      // they're a normal user action, not a failure.
+      const assistant = useChatStore.getState().messagesById[streamingId!];
+      expect(assistant).toBeDefined();
+      expect(assistant?.error).toBeUndefined();
+
+      // refreshHistory must NOT be called for an aborted send (no onComplete fired).
+      expect(refreshHistory).not.toHaveBeenCalled();
+
+      // sendingRef must have been cleared: a subsequent send must not be silently dropped.
+      useChatStore.setState({ input: "second send" });
+      await act(async () => {
+        await result.current.handleSend();
+      });
+      // chatStream called twice total — once for the aborted send, once for the follow-up.
+      expect(apiMocks.chatStream).toHaveBeenCalledTimes(2);
+    });
+
+    it("handles AbortError when error.message mentions 'abort' but name is not 'AbortError'", async () => {
+      // The code also matches /aborted|abort/i on message — exercise that branch.
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "Will be aborted via message" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+
+      await act(async () => {
+        // Plain Error (not DOMException) — only the message regex will catch this.
+        capture.trigger.error(new Error("Request was aborted by client"));
+      });
+
+      await waitFor(() => {
+        expect(useChatStore.getState().isStreaming).toBe(false);
+      });
+      expect(useChatStore.getState().abortFn).toBeNull();
+      expect(useChatStore.getState().streamingMessageId).toBeNull();
+      const assistant = useChatStore.getState().messagesById[streamingId!];
+      expect(assistant?.error).toBeUndefined();
+    });
+
+    it("network error: stamps a friendly 'Connection lost' message and rolls back streaming state", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "Will fail with network error" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+      expect(useChatStore.getState().isStreaming).toBe(true);
+
+      await act(async () => {
+        capture.trigger.error(new TypeError("Failed to fetch"));
+      });
+
+      await waitFor(() => {
+        expect(useChatStore.getState().isStreaming).toBe(false);
+      });
+      expect(useChatStore.getState().abortFn).toBeNull();
+      expect(useChatStore.getState().streamingMessageId).toBeNull();
+
+      const assistant = useChatStore.getState().messagesById[streamingId!];
+      expect(assistant?.error).toBe(
+        "Connection lost. Check your network and try again."
+      );
+      // refreshHistory is only called from onComplete, which never fired.
+      expect(refreshHistory).not.toHaveBeenCalled();
+    });
+
+    it("non-network, non-abort error: stamps the raw error.message on the assistant message", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "Will fail with server error" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+
+      await act(async () => {
+        capture.trigger.error(new Error("upstream LLM returned 500"));
+      });
+
+      await waitFor(() => {
+        expect(useChatStore.getState().isStreaming).toBe(false);
+      });
+      const assistant = useChatStore.getState().messagesById[streamingId!];
+      expect(assistant?.error).toBe("upstream LLM returned 500");
+    });
+
+    it("failure rollback: after a non-abort error, sendingRef is reset so a follow-up send is not silently dropped", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "First send will fail" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+      expect(apiMocks.chatStream).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        capture.trigger.error(new Error("boom"));
+      });
+
+      await waitFor(() => {
+        expect(useChatStore.getState().isStreaming).toBe(false);
+      });
+
+      // Now retry — must not be blocked by the previous send's sendingRef.
+      useChatStore.setState({ input: "Second send" });
+      await act(async () => {
+        await result.current.handleSend();
+      });
+      expect(apiMocks.chatStream).toHaveBeenCalledTimes(2);
+    });
+  });
 });
