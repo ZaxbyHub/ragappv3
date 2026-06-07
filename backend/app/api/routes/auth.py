@@ -12,7 +12,12 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import assign_user_to_default_vault, get_current_active_user, get_db
 from app.limiter import limiter
-from app.security import CSRF_COOKIE_NAME, csrf_protect, get_csrf_manager, issue_csrf_token
+from app.security import (
+    CSRF_COOKIE_NAME,
+    csrf_protect,
+    get_csrf_manager,
+    issue_csrf_token,
+)
 from app.services.auth_service import (
     async_hash_password,
     async_verify_password,
@@ -188,11 +193,11 @@ async def register(
     try:
         def _register_db():
             try:
-                # BEGIN IMMEDIATE takes the write lock up front so the first-user
-                # COUNT and the INSERT are atomic. Reading the count outside the
-                # transaction let two concurrent first-registrations both observe
-                # count == 0 and both get promoted to superadmin.
+                # Clear any dangling implicit transaction from the outer SELECT check
+                if db.in_transaction:
+                    db.rollback()
                 db.execute("BEGIN IMMEDIATE")
+                # Atomic: count read and insert are in the same transaction
                 user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 role = "superadmin" if user_count == 0 else "member"
                 user_id = db.execute(
@@ -388,6 +393,7 @@ async def login(
             "username": db_username,
             "full_name": full_name,
             "role": role,
+            "is_active": bool(is_active),
         },
     }
 

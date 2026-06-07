@@ -45,6 +45,38 @@ class TestRejectInsecureDefaults:
         assert settings.users_enabled is False
         assert settings.admin_secret_token == "some-token"
 
+    # --- JWT_SECRET_KEY validators ---
+
+    def test_users_enabled_with_empty_jwt_secret_key_raises(self):
+        """users_enabled=True, jwt_secret_key="" should raise ValueError."""
+        with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
+            Settings(users_enabled=True, admin_secret_token="secure-token-123", jwt_secret_key="")
+
+    def test_users_enabled_with_whitespace_jwt_secret_key_raises(self):
+        """users_enabled=True, jwt_secret_key="   " should raise ValueError."""
+        with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
+            Settings(users_enabled=True, admin_secret_token="secure-token-123", jwt_secret_key="   ")
+
+    def test_users_enabled_with_default_jwt_secret_key_raises(self):
+        """users_enabled=True, jwt_secret_key="change-me-to-a-random-64-char-string" should raise ValueError."""
+        with pytest.raises(ValueError, match="JWT_SECRET_KEY"):
+            Settings(
+                users_enabled=True,
+                admin_secret_token="secure-token-123",
+                jwt_secret_key="change-me-to-a-random-64-char-string",
+            )
+
+    def test_users_enabled_with_valid_jwt_secret_key_succeeds(self):
+        """users_enabled=True, jwt_secret_key=<valid> should not raise."""
+        # Should not raise
+        settings = Settings(
+            users_enabled=True,
+            admin_secret_token="secure-token-123",
+            jwt_secret_key="a-legitimate-secret-key-that-is-long-enough-for HS256",
+        )
+        assert settings.users_enabled is True
+        assert settings.jwt_secret_key == "a-legitimate-secret-key-that-is-long-enough-for HS256"
+
 
 class TestValidateHydeConfig:
     """Tests for the validate_hyde_config model validator."""

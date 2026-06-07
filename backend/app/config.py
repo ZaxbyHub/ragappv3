@@ -845,7 +845,7 @@ class Settings(BaseSettings):
                 "ADMIN_SECRET_TOKEN must be set when USERS_ENABLED=True. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
             )
-        if self.users_enabled and self.jwt_secret_key == "change-me-to-a-random-64-char-string":
+        if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == "change-me-to-a-random-64-char-string"):
             raise ValueError(
                 "JWT_SECRET_KEY must be changed from the default when USERS_ENABLED=True. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'

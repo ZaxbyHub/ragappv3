@@ -51,6 +51,12 @@ vi.mock('@/lib/api', () => ({
     total_size_bytes: 3072,
     documents_by_status: { processed: 2 },
   }),
+  listTags: vi.fn().mockResolvedValue([]),
+  listFolders: vi.fn().mockResolvedValue([]),
+  createFolder: vi.fn().mockResolvedValue({ id: 1, name: 'mock', vault_id: 1, parent_folder_id: null }),
+  updateFolder: vi.fn().mockResolvedValue({ id: 1, name: 'updated', vault_id: 1, parent_folder_id: null }),
+  deleteFolder: vi.fn().mockResolvedValue(undefined),
+  downloadDocument: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock react-dropzone

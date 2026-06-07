@@ -89,6 +89,7 @@ class _SQLiteCSRFStore:
             "CREATE TABLE IF NOT EXISTS csrf_tokens (token_hash TEXT PRIMARY KEY, created_at REAL NOT NULL, expires_at REAL NOT NULL)"
         )
         self._conn.commit()
+        self._lock = threading.Lock()
 
     def _cleanup_expired(self) -> None:
         try:
@@ -101,57 +102,62 @@ class _SQLiteCSRFStore:
             pass
 
     def setex(self, key: str, ttl: int, value: str) -> None:
-        self._cleanup_expired()
-        expires_at = time.time() + ttl
-        try:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO csrf_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
-                (key, time.time(), expires_at),
-            )
-            self._conn.commit()
-        except sqlite3.Error as exc:
-            logger.error("SQLite CSRF store error during setex: %s", exc)
-            raise RuntimeError("CSRF storage unavailable") from exc
+        with self._lock:
+            self._cleanup_expired()
+            expires_at = time.time() + ttl
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO csrf_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
+                    (key, time.time(), expires_at),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                logger.error("SQLite CSRF store error during setex: %s", exc)
+                raise RuntimeError("CSRF storage unavailable") from exc
 
     def get(self, key: str) -> str | None:
-        try:
-            cursor = self._conn.execute(
-                "SELECT 1 FROM csrf_tokens WHERE token_hash = ? AND expires_at > ?",
-                (key, time.time()),
-            )
-            return "1" if cursor.fetchone() else None
-        except sqlite3.Error as exc:
-            logger.error("SQLite CSRF store error during get: %s", exc)
-            raise RuntimeError("CSRF storage unavailable") from exc
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    "SELECT 1 FROM csrf_tokens WHERE token_hash = ? AND expires_at > ?",
+                    (key, time.time()),
+                )
+                return "1" if cursor.fetchone() else None
+            except sqlite3.Error as exc:
+                logger.error("SQLite CSRF store error during get: %s", exc)
+                raise RuntimeError("CSRF storage unavailable") from exc
 
     def expire(self, key: str, ttl: int) -> None:
-        expires_at = time.time() + ttl
-        try:
-            self._conn.execute(
-                "UPDATE csrf_tokens SET expires_at = ? WHERE token_hash = ?",
-                (expires_at, key),
-            )
-            self._conn.commit()
-        except sqlite3.Error as exc:
-            logger.error("SQLite CSRF store error during expire: %s", exc)
-            raise RuntimeError("CSRF storage unavailable") from exc
+        with self._lock:
+            expires_at = time.time() + ttl
+            try:
+                self._conn.execute(
+                    "UPDATE csrf_tokens SET expires_at = ? WHERE token_hash = ?",
+                    (expires_at, key),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                logger.error("SQLite CSRF store error during expire: %s", exc)
+                raise RuntimeError("CSRF storage unavailable") from exc
 
     def delete(self, key: str) -> None:
-        try:
-            self._conn.execute(
-                "DELETE FROM csrf_tokens WHERE token_hash = ?", (key,)
-            )
-            self._conn.commit()
-        except sqlite3.Error as exc:
-            logger.error("SQLite CSRF store error during delete: %s", exc)
-            raise RuntimeError("CSRF storage unavailable") from exc
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM csrf_tokens WHERE token_hash = ?", (key,)
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                logger.error("SQLite CSRF store error during delete: %s", exc)
+                raise RuntimeError("CSRF storage unavailable") from exc
 
     def ping(self) -> bool:
-        try:
-            self._conn.execute("SELECT 1")
-            return True
-        except sqlite3.Error:
-            return False
+        with self._lock:
+            try:
+                self._conn.execute("SELECT 1")
+                return True
+            except sqlite3.Error:
+                return False
 
 
 class CSRFManager:
@@ -231,7 +237,7 @@ class CSRFManager:
         if exists:
             try:
                 store.expire(key, self.ttl)
-            except (redis.RedisError, ConnectionError, TimeoutError):
+            except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError):
                 logger.warning("Failed to extend CSRF token TTL")
             return True
         return False
@@ -240,7 +246,7 @@ class CSRFManager:
         store = self._get_store()
         try:
             store.delete(f"csrf:{token}")
-        except (redis.RedisError, ConnectionError, TimeoutError):
+        except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError):
             logger.warning("Failed to revoke CSRF token (storage error)")
 
 

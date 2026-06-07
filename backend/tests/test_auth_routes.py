@@ -226,6 +226,26 @@ class TestAuthRoutes(unittest.TestCase):
         self.assertEqual(data["token_type"], "bearer")
         self.assertEqual(data["user"]["username"], "logintest")
 
+    def test_login_response_contains_is_active(self):
+        """Regression: login response must include is_active in user object (F-001)."""
+        # Register a new user
+        self.client.post(
+            "/api/auth/register",
+            json={"username": "isactiveuser", "password": "Password123"},
+        )
+
+        # Login
+        response = self.client.post(
+            "/api/auth/login", json={"username": "isactiveuser", "password": "Password123"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("user", data)
+        self.assertIn("is_active", data["user"])
+        self.assertIsInstance(data["user"]["is_active"], bool)
+        self.assertTrue(data["user"]["is_active"])
+
     def test_login_wrong_password(self):
         """Login with wrong password should return 401."""
         # First register

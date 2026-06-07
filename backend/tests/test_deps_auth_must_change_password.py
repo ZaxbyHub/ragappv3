@@ -463,3 +463,35 @@ class TestMustChangePasswordEnforcement:
         )
 
         assert result["id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_must_change_password_blocked_on_users_route(
+        self, mock_settings_jwt_mode, mock_db
+    ):
+        """
+        User with must_change_password=1 AND role=admin accessing GET /api/users → 403.
+
+        Regression test for F-001: /api/users was in the exempt_paths set, allowing
+        flagged admin users to bypass must_change_password enforcement and access
+        user management routes (create/list users).
+        """
+        from app.api.deps import get_current_active_user
+
+        token = _make_token(99)
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.return_value = (
+            99, "adminuser", "Admin User", "admin", 1, 1  # admin + flagged
+        )
+
+        mock_request = _mock_request("/api/users")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_active_user(
+                request=mock_request,
+                authorization=f"Bearer {token}",
+                access_token=None,
+                db=mock_conn,
+            )
+
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail == "must_change_password"

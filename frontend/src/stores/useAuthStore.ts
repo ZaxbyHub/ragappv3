@@ -207,7 +207,7 @@ export const useAuthStore = create<AuthState>()(
           });
 
           const { access_token, user: userData } = response.data as any;
-          const user: User = { id: userData.id, username: userData.username, full_name: userData.full_name, role: userData.role, is_active: true };
+          const user: User = { id: userData.id, username: userData.username, full_name: userData.full_name, role: userData.role, is_active: userData.is_active ?? true };
 
           // Update store state
           set({

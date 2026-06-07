@@ -18,7 +18,7 @@ from app.api.routes.auth import async_hash_password
 from app.config import settings
 from app.models.database import get_pool
 from app.security import csrf_protect
-from app.services.auth_service import hash_password, password_strength_check
+from app.services.auth_service import password_strength_check
 
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
@@ -377,10 +377,8 @@ async def admin_reset_password(
     hashed_password = await async_hash_password(body.new_password)
 
     def _admin_reset_password_db():
-        exclusive_started = False
         try:
             db.execute("BEGIN EXCLUSIVE")
-            exclusive_started = True
         except sqlite3.OperationalError:
             pass
 
