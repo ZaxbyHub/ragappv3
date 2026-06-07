@@ -650,6 +650,143 @@ class TestRetryCountAndCancellation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Issue 104: _reset_job_to_pending must retry on transient DB errors
+# ---------------------------------------------------------------------------
+
+class TestResetJobToPendingRetry(unittest.IsolatedAsyncioTestCase):
+    """Regression for issue #104: bounded retry on the auto-retry reset path.
+
+    A transient DB error (e.g. SQLite 'database is locked') on the original
+    one-shot reset left the job stranded in 'failed' state until manual API
+    retry. The processor now wraps the reset in a bounded retry with short
+    exponential backoff so the auto-retry pipeline self-heals.
+    """
+
+    async def asyncSetUp(self):
+        from app.models.database import SQLiteConnectionPool, run_migrations
+
+        td = tempfile.mkdtemp()
+        db_path = str(Path(td) / "test.db")
+        run_migrations(db_path)
+        self.pool = SQLiteConnectionPool(db_path, max_size=2)
+        with self.pool.connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'T')")
+            conn.commit()
+            from app.services.wiki_store import WikiStore
+            self.store = WikiStore(conn)
+            # Plant a job in the exact state the retry-handler expects: failed,
+            # retry_count < MAX_RETRIES, so the next claim is an auto-retry.
+            self.job = self.store.create_job(vault_id=1, trigger_type="manual")
+            self.store.claim_next_pending_job()
+            self.store.fail_job(self.job.id, "handler exploded")
+
+    async def asyncTearDown(self):
+        self.pool.close_all()
+
+    async def test_transient_failure_is_retried_and_recovers(self):
+        """A single transient error must NOT leave the job stuck in 'failed'."""
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+
+        proc = WikiCompileProcessor(self.pool)
+        real = proc._reset_job_to_pending
+        calls = {"n": 0}
+
+        def flaky(job_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real(job_id)
+
+        proc._reset_job_to_pending = flaky
+        # The helper should retry and ultimately succeed.
+        await proc._reset_job_to_pending_with_retry(self.job.id)
+
+        self.assertEqual(calls["n"], 2, "Reset should have been attempted twice")
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (self.job.id,)
+            ).fetchone()
+        self.assertEqual(dict(row)["status"], "pending")
+
+    async def test_two_transient_failures_still_recover(self):
+        """A second transient error is also recovered (succeeds on the 3rd attempt)."""
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+
+        proc = WikiCompileProcessor(self.pool)
+        real = proc._reset_job_to_pending
+        calls = {"n": 0}
+
+        def flaky(job_id):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return real(job_id)
+
+        proc._reset_job_to_pending = flaky
+        await proc._reset_job_to_pending_with_retry(self.job.id)
+
+        self.assertEqual(calls["n"], 3, "Reset should have been attempted three times")
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (self.job.id,)
+            ).fetchone()
+        self.assertEqual(dict(row)["status"], "pending")
+
+    async def test_persistent_failure_propagates_after_bounded_attempts(self):
+        """When every attempt fails, the helper must surface the last error.
+
+        The outer poll-loop guard catches and logs it; the job remains in
+        'failed' (which is the correct observable state when the DB is
+        genuinely unreachable).
+        """
+        from app.services.wiki_compile_processor import (
+            RESET_RETRY_ATTEMPTS,
+            WikiCompileProcessor,
+        )
+
+        proc = WikiCompileProcessor(self.pool)
+        calls = {"n": 0}
+
+        def always_fail(job_id):
+            calls["n"] += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        proc._reset_job_to_pending = always_fail
+        with self.assertRaises(sqlite3.OperationalError):
+            await proc._reset_job_to_pending_with_retry(self.job.id)
+
+        self.assertEqual(calls["n"], RESET_RETRY_ATTEMPTS)
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (self.job.id,)
+            ).fetchone()
+        # Persistent failure → job stays in 'failed' (same as pre-fix behavior).
+        self.assertEqual(dict(row)["status"], "failed")
+
+    async def test_immediate_success_does_not_retry(self):
+        """Happy path: the first attempt must be enough — no extra calls."""
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+
+        proc = WikiCompileProcessor(self.pool)
+        calls = {"n": 0}
+        real = proc._reset_job_to_pending
+
+        def counting(job_id):
+            calls["n"] += 1
+            return real(job_id)
+
+        proc._reset_job_to_pending = counting
+        await proc._reset_job_to_pending_with_retry(self.job.id)
+
+        self.assertEqual(calls["n"], 1, "Happy path must not trigger retries")
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (self.job.id,)
+            ).fetchone()
+        self.assertEqual(dict(row)["status"], "pending")
+
+
+# ---------------------------------------------------------------------------
 # Per-claim citation precision
 # ---------------------------------------------------------------------------
 
