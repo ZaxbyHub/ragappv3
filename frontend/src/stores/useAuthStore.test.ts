@@ -202,7 +202,7 @@ describe("useAuthStore", () => {
       mockPost?.mockResolvedValueOnce({
         data: {
           access_token: "jwt123",
-          ...mockUser,
+          user: mockUser,
         },
       });
 
@@ -222,7 +222,7 @@ describe("useAuthStore", () => {
       mockPost?.mockResolvedValueOnce({
         data: {
           access_token: "jwt123",
-          ...mockUser,
+          user: mockUser,
         },
       });
 
@@ -242,11 +242,13 @@ describe("useAuthStore", () => {
       mockPost?.mockResolvedValueOnce({
         data: {
           access_token: "jwt789",
-          id: 2,
-          username: "newuser2",
-          full_name: "New User 2",
-          role: "member",
-          is_active: true,
+          user: {
+            id: 2,
+            username: "newuser2",
+            full_name: "New User 2",
+            role: "member",
+            is_active: true,
+          },
         },
       });
 
