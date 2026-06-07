@@ -46,7 +46,14 @@ def setup_test_db(db_path: str) -> sqlite3.Connection:
             role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
             is_active INTEGER NOT NULL DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login_at TIMESTAMP
+            last_login_at TIMESTAMP,
+            -- Columns added by later migrations; kept in sync with the
+            -- canonical users schema (app/models/database.py) so auth
+            -- dependencies that SELECT them (e.g. deps.get_current_user) do
+            -- not raise "no such column".
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TIMESTAMP
         )
     """)
 
