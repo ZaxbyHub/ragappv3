@@ -398,6 +398,95 @@ class TestMarkClaimsStale(unittest.TestCase):
         ).fetchone()
         self.assertNotEqual(dict(row)["status"], "superseded")
 
+    # ------------------------------------------------------------------
+    # mark_claims_stale_by_memory — mirrors the file variant above.
+    # Sole-source memory → 'superseded' + 'stale' lint finding; multi-source
+    # (memory + file) → only 'weak_provenance' finding, claim stays active.
+    # ------------------------------------------------------------------
+
+    def _make_claim_with_memory_source(self, claim_id_label="test", memory_id=42):
+        claim = self.store.create_claim(
+            vault_id=1,
+            claim_text=f"Memory claim {claim_id_label}",
+            source_type="memory",
+        )
+        self.store.attach_source(
+            claim_id=claim.id,
+            source_kind="memory",
+            memory_id=memory_id,
+            source_label=f"memory:{memory_id}",
+            confidence=0.9,
+        )
+        self.conn.commit()
+        return claim
+
+    def test_sole_memory_source_claim_becomes_stale(self):
+        claim = self._make_claim_with_memory_source(memory_id=42)
+        result = self.store.mark_claims_stale_by_memory(memory_id=42, vault_id=1)
+        self.assertEqual(result["stale"], 1)
+        self.assertEqual(result["weak_provenance"], 0)
+        row = self.conn.execute(
+            "SELECT status FROM wiki_claims WHERE id = ?", (claim.id,)
+        ).fetchone()
+        self.assertEqual(dict(row)["status"], "superseded")
+        # Lint finding references the memory id, not a file id.
+        finding = self.conn.execute(
+            "SELECT finding_type, title, severity, related_claim_ids_json "
+            "FROM wiki_lint_findings WHERE vault_id = ? ORDER BY id DESC LIMIT 1",
+            (1,),
+        ).fetchone()
+        self.assertEqual(dict(finding)["finding_type"], "stale")
+        self.assertEqual(dict(finding)["severity"], "medium")
+        self.assertIn("memory_id=42", dict(finding)["title"])
+
+    def test_memory_source_with_other_source_not_stale(self):
+        claim = self._make_claim_with_memory_source(memory_id=42)
+        # Add a file source so the claim has a second provenance path.
+        self.store.attach_source(
+            claim_id=claim.id,
+            source_kind="document",
+            file_id=1,
+            source_label="file:1",
+            confidence=0.5,
+        )
+        self.conn.commit()
+        result = self.store.mark_claims_stale_by_memory(memory_id=42, vault_id=1)
+        self.assertEqual(result["stale"], 0)
+        self.assertEqual(result["weak_provenance"], 1)
+        row = self.conn.execute(
+            "SELECT status FROM wiki_claims WHERE id = ?", (claim.id,)
+        ).fetchone()
+        self.assertNotEqual(dict(row)["status"], "superseded")
+        finding = self.conn.execute(
+            "SELECT finding_type, title, severity FROM wiki_lint_findings "
+            "WHERE vault_id = ? ORDER BY id DESC LIMIT 1", (1,),
+        ).fetchone()
+        self.assertEqual(dict(finding)["finding_type"], "weak_provenance")
+        self.assertEqual(dict(finding)["severity"], "low")
+        self.assertIn("memory_id=42", dict(finding)["title"])
+
+    def test_memory_vault_scope_respected(self):
+        claim = self._make_claim_with_memory_source(memory_id=42)
+        result = self.store.mark_claims_stale_by_memory(memory_id=42, vault_id=999)
+        # Wrong vault — no claims should be stale or weak.
+        self.assertEqual(result["stale"], 0)
+        self.assertEqual(result["weak_provenance"], 0)
+        row = self.conn.execute(
+            "SELECT status FROM wiki_claims WHERE id = ?", (claim.id,)
+        ).fetchone()
+        self.assertNotEqual(dict(row)["status"], "superseded")
+        # And no lint finding should have been written either.
+        finding_count = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id = ?", (999,)
+        ).fetchone()[0]
+        self.assertEqual(finding_count, 0)
+
+    def test_memory_unknown_id_is_noop(self):
+        # No claim has memory_id=7777; running the method should not raise
+        # and should report zero stale/weak findings.
+        result = self.store.mark_claims_stale_by_memory(memory_id=7777, vault_id=1)
+        self.assertEqual(result, {"stale": 0, "weak_provenance": 0})
+
 
 # ---------------------------------------------------------------------------
 # WikiCompileProcessor lifecycle
