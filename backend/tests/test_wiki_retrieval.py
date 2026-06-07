@@ -487,5 +487,150 @@ class TestWikiRetrievalEndToEnd(unittest.TestCase):
         self.assertEqual(self.service.retrieve("nonexistentword", vault_id=1), [])
 
 
+class TestEntityMismatchFilterExpandedMatch(unittest.TestCase):
+    """Regression test for issue #102: entity mismatch filter over-rejects
+    valid FTS claim results.
+
+    Scenario: query "who is AFOMIS deputy chief?" extracts entity candidate
+    "AFOMIS".  FTS finds a claim whose ``subject`` column is "AFOMIS" and
+    ``claim_text`` mentions "deputy chief" — but the claim_text itself does
+    NOT contain the literal "AFOMIS".  The entity's alias "Air Force Medical
+    Information Systems" appears in the page title.  Before the fix, the
+    claim was rejected because the filter only checked claim_text + title
+    against raw entity candidates.  After the fix, the filter also checks
+    the claim's subject/object fields and uses canonical names + aliases
+    from matched entities.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from queue import Empty, Queue
+
+        from app.models.database import init_db, run_migrations
+
+        self._tmp = tempfile.mkdtemp()
+        db = str(Path(self._tmp) / "app.db")
+        init_db(db)
+        run_migrations(db)
+
+        class _Pool:
+            def __init__(self, path):
+                self._path = path
+                self._q = Queue(maxsize=5)
+
+            def get_connection(self):
+                try:
+                    return self._q.get_nowait()
+                except Empty:
+                    c = sqlite3.connect(self._path, check_same_thread=False)
+                    c.row_factory = sqlite3.Row
+                    return c
+
+            def release_connection(self, c):
+                try:
+                    self._q.put_nowait(c)
+                except Exception:
+                    c.close()
+
+            def close_all(self):
+                while True:
+                    try:
+                        self._q.get_nowait().close()
+                    except Empty:
+                        break
+
+        self._pool = _Pool(db)
+        self.service = WikiRetrievalService(pool=self._pool)
+
+        conn = sqlite3.connect(db)
+        try:
+            # vault
+            conn.execute(
+                "INSERT INTO vaults (id, name) VALUES (?, ?)",
+                (99, "EntityMismatchTest"),
+            )
+            # entity page
+            conn.execute(
+                "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, "
+                "markdown, status) VALUES (10, 99, 'afomis', 'AFOMIS', "
+                "'entity', '# AFOMIS', 'verified')"
+            )
+            # AFOMIS entity with an alias
+            conn.execute(
+                "INSERT INTO wiki_entities (id, vault_id, canonical_name, "
+                "entity_type, aliases_json, page_id) VALUES "
+                "(1, 99, 'AFOMIS', 'organization', "
+                "'[\"Air Force Medical Information Systems\"]', 10)"
+            )
+            # claim page — title does NOT contain "AFOMIS"
+            conn.execute(
+                "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, "
+                "markdown, status) VALUES (11, 99, 'personnel', "
+                "'Personnel Roster', "
+                "'entity', '# Personnel', 'verified')"
+            )
+            # Claim: subject="AFOMIS" (FTS matches this), claim_text has
+            # "deputy chief" but NOT "AFOMIS".
+            conn.execute(
+                "INSERT INTO wiki_claims (id, vault_id, page_id, claim_text, "
+                "subject, predicate, object, "
+                "claim_type, source_type, status, confidence) VALUES "
+                "(20, 99, 11, 'Major General Justin Woods serves as deputy chief.', "
+                "'AFOMIS', 'has_deputy_chief', 'Justin Woods', "
+                "'fact', 'document', 'active', 0.9)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        import shutil
+
+        self._pool.close_all()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_fts_claim_passes_when_subject_contains_entity(self):
+        """FTS finds a claim via subject column; the entity mismatch filter
+        must accept it because the claim's subject matches the entity."""
+        results = self.service.retrieve(
+            "who is AFOMIS deputy chief?", vault_id=99
+        )
+        claim_results = [r for r in results if r.claim_id == 20]
+        self.assertTrue(
+            claim_results,
+            "FTS claim should pass entity mismatch filter when claim "
+            "subject matches entity (issue #102)",
+        )
+
+    def test_fts_claim_rejected_when_no_match_at_all(self):
+        """A claim whose text, subject, and object contain none of the
+        entity names/aliases should still be rejected."""
+        conn = self._pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO wiki_claims (id, vault_id, page_id, claim_text, "
+                "subject, predicate, object, "
+                "claim_type, source_type, status, confidence) VALUES "
+                "(21, 99, 11, 'The weather is sunny today.', "
+                "'WeatherService', 'reports', 'sunny', "
+                "'fact', 'document', 'active', 0.7)"
+            )
+            conn.commit()
+        finally:
+            self._pool.release_connection(conn)
+
+        results = self.service.retrieve(
+            "who is AFOMIS deputy chief?", vault_id=99
+        )
+        # Claim 21 should NOT appear
+        claim_21 = [r for r in results if r.claim_id == 21]
+        self.assertEqual(
+            claim_21,
+            [],
+            "unrelated claim should be filtered out by entity mismatch",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
