@@ -198,7 +198,7 @@ def test_delete_cookie_uses_refresh_cookie_path():
     assert len(delete_calls) > 0, "Expected at least one delete_cookie call"
     for call in delete_calls:
         if "refresh" in call.lower() or "path=" in call:
-            assert "refresh_cookie_path()" in call, (
+            assert "refresh_cookie_path()" in call or "csrf_cookie_path()" in call, (
                 f"delete_cookie uses hardcoded path: {call}"
             )
 

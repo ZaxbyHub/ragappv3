@@ -272,6 +272,9 @@ async def get_current_active_user(
     # Enforce must_change_password: flagged users can only access explicit
     # auth recovery routes. Include both router-local and mounted runtime paths.
     if user.get("must_change_password"):
+        # Base paths always included (no prefix)
+        # Note: request.url.path does NOT include root_path (FastAPI strips it before routing),
+        # so prefixed paths like /meridian/api/... are never seen here — only /api/...
         exempt_paths = {
             "/auth/change-password",
             "/auth/login",

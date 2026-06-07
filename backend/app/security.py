@@ -5,6 +5,7 @@ import hmac
 import logging
 import os
 import secrets
+import sqlite3
 import threading
 import time
 from typing import Callable, Dict
@@ -73,11 +74,97 @@ class _InMemoryCSRFStore:
         return True
 
 
+class _SQLiteCSRFStore:
+    """Worker-safe SQLite-backed CSRF token store.
+
+    All workers share the same SQLite database file, so tokens generated
+    by one worker are visible to all workers. Replaces _InMemoryCSRFStore
+    as the primary fallback when Redis is unavailable.
+    """
+
+    def __init__(self, db_path: str, ttl: int = 900) -> None:
+        self.ttl = ttl
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS csrf_tokens (token_hash TEXT PRIMARY KEY, created_at REAL NOT NULL, expires_at REAL NOT NULL)"
+        )
+        self._conn.commit()
+        self._lock = threading.Lock()
+
+    def _cleanup_expired(self) -> None:
+        try:
+            self._conn.execute(
+                "DELETE FROM csrf_tokens WHERE expires_at <= ?",
+                (time.time(),),
+            )
+            self._conn.commit()
+        except sqlite3.Error:
+            pass
+
+    def setex(self, key: str, ttl: int, value: str) -> None:
+        with self._lock:
+            self._cleanup_expired()
+            expires_at = time.time() + ttl
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO csrf_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
+                    (key, time.time(), expires_at),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                logger.error("SQLite CSRF store error during setex: %s", exc)
+                raise RuntimeError("CSRF storage unavailable") from exc
+
+    def get(self, key: str) -> str | None:
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    "SELECT 1 FROM csrf_tokens WHERE token_hash = ? AND expires_at > ?",
+                    (key, time.time()),
+                )
+                return "1" if cursor.fetchone() else None
+            except sqlite3.Error as exc:
+                logger.error("SQLite CSRF store error during get: %s", exc)
+                raise RuntimeError("CSRF storage unavailable") from exc
+
+    def expire(self, key: str, ttl: int) -> None:
+        with self._lock:
+            expires_at = time.time() + ttl
+            try:
+                self._conn.execute(
+                    "UPDATE csrf_tokens SET expires_at = ? WHERE token_hash = ?",
+                    (expires_at, key),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                logger.error("SQLite CSRF store error during expire: %s", exc)
+                raise RuntimeError("CSRF storage unavailable") from exc
+
+    def delete(self, key: str) -> None:
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM csrf_tokens WHERE token_hash = ?", (key,)
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                logger.error("SQLite CSRF store error during delete: %s", exc)
+                raise RuntimeError("CSRF storage unavailable") from exc
+
+    def ping(self) -> bool:
+        with self._lock:
+            try:
+                self._conn.execute("SELECT 1")
+                return True
+            except sqlite3.Error:
+                return False
+
+
 class CSRFManager:
-    def __init__(self, redis_url: str, ttl: int = 900) -> None:
+    def __init__(self, redis_url: str, ttl: int = 900, db_path: str = "") -> None:
         self.ttl = ttl
         self._redis: redis.Redis | None = None
-        self._fallback_store: _InMemoryCSRFStore | None = None
+        self._fallback_store: _InMemoryCSRFStore | _SQLiteCSRFStore | None = None
         self._use_fallback = False
         self._lock = threading.Lock()
 
@@ -86,11 +173,19 @@ class CSRFManager:
             self._redis.ping()
             logger.info("CSRFManager connected to Redis successfully")
         except Exception as exc:
-            logger.warning(
-                "Redis unavailable for CSRF, using in-memory fallback: %s", exc
-            )
+            logger.warning("Redis unavailable for CSRF: %s", exc)
             self._use_fallback = True
-            self._fallback_store = _InMemoryCSRFStore(ttl=ttl)
+            self._fallback_store = None
+            # Try SQLite first (shared across workers), then fall back to in-memory
+            if db_path:
+                try:
+                    self._fallback_store = _SQLiteCSRFStore(db_path, ttl=ttl)
+                    logger.info("CSRFManager using SQLite-backed store at %s", db_path)
+                except Exception as sqlexc:
+                    logger.warning("SQLite CSRF store init failed: %s", sqlexc)
+            if not self._fallback_store:
+                self._fallback_store = _InMemoryCSRFStore(ttl=ttl)
+                logger.warning("CSRFManager using in-memory fallback (not worker-safe!)")
 
     def _get_store(self):
         """Returns the active store (Redis or in-memory fallback)."""
@@ -123,7 +218,7 @@ class CSRFManager:
         key = f"csrf:{token}"
         try:
             store.setex(key, self.ttl, "1")
-        except (redis.RedisError, ConnectionError, TimeoutError) as exc:
+        except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError) as exc:
             logger.error("Storage error during token generation: %s", exc)
             raise HTTPException(status_code=503, detail="CSRF storage unavailable")
         return token
@@ -136,13 +231,13 @@ class CSRFManager:
         key = f"csrf:{token}"
         try:
             exists = store.get(key)
-        except (redis.RedisError, ConnectionError, TimeoutError) as exc:
+        except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError) as exc:
             logger.error("Storage error during token validation: %s", exc)
             raise HTTPException(status_code=503, detail="CSRF storage unavailable")
         if exists:
             try:
                 store.expire(key, self.ttl)
-            except (redis.RedisError, ConnectionError, TimeoutError):
+            except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError):
                 logger.warning("Failed to extend CSRF token TTL")
             return True
         return False
@@ -151,7 +246,7 @@ class CSRFManager:
         store = self._get_store()
         try:
             store.delete(f"csrf:{token}")
-        except (redis.RedisError, ConnectionError, TimeoutError):
+        except (redis.RedisError, ConnectionError, TimeoutError, RuntimeError):
             logger.warning("Failed to revoke CSRF token (storage error)")
 
 

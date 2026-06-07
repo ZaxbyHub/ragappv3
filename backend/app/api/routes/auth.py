@@ -12,7 +12,12 @@ from pydantic import BaseModel, Field
 
 from app.api.deps import assign_user_to_default_vault, get_current_active_user, get_db
 from app.limiter import limiter
-from app.security import csrf_protect, get_csrf_manager, issue_csrf_token
+from app.security import (
+    CSRF_COOKIE_NAME,
+    csrf_protect,
+    get_csrf_manager,
+    issue_csrf_token,
+)
 from app.services.auth_service import (
     async_hash_password,
     async_verify_password,
@@ -20,7 +25,7 @@ from app.services.auth_service import (
     create_refresh_token,
     password_strength_check,
 )
-from app.utils.paths import refresh_cookie_path
+from app.utils.paths import csrf_cookie_path, refresh_cookie_path
 
 logger = logging.getLogger(__name__)
 
@@ -188,11 +193,11 @@ async def register(
     try:
         def _register_db():
             try:
-                # BEGIN IMMEDIATE takes the write lock up front so the first-user
-                # COUNT and the INSERT are atomic. Reading the count outside the
-                # transaction let two concurrent first-registrations both observe
-                # count == 0 and both get promoted to superadmin.
+                # Clear any dangling implicit transaction from the outer SELECT check
+                if db.in_transaction:
+                    db.rollback()
                 db.execute("BEGIN IMMEDIATE")
+                # Atomic: count read and insert are in the same transaction
                 user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 role = "superadmin" if user_count == 0 else "member"
                 user_id = db.execute(
@@ -254,19 +259,18 @@ async def register(
         path=refresh_cookie_path(),
     )
 
-    # Issue CSRF token matching login/refresh pattern
-    csrf_manager = get_csrf_manager(request)
-    issue_csrf_token(response, csrf_manager)
-
     return {
-        "id": user_id,
-        "username": body.username,
-        "full_name": body.full_name,
-        "role": role,
-        "is_active": True,
         "access_token": access_token,
         "token_type": "bearer",
-        "message": "User registered successfully",
+        "expires_in": 900,
+        "user": {
+            "id": user_id,
+            "username": body.username,
+            "full_name": body.full_name or "",
+            "role": role,
+            "is_active": True,
+        },
+        "message": "Registration successful",
     }
 
 
@@ -389,6 +393,7 @@ async def login(
             "username": db_username,
             "full_name": full_name,
             "role": role,
+            "is_active": bool(is_active),
         },
     }
 
@@ -500,6 +505,7 @@ async def logout(
             logger.error("Failed to delete session during logout", exc_info=True)
 
     response.delete_cookie(key=REFRESH_TOKEN_COOKIE_NAME, path=refresh_cookie_path())
+    response.delete_cookie(key=CSRF_COOKIE_NAME, path=csrf_cookie_path())
     return {"message": "Logged out successfully"}
 
 
@@ -617,6 +623,10 @@ async def change_password(
     # Verify current password
     if not await async_verify_password(body.current_password, current_hashed_pw):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+    # Reject if new password matches current (verify against stored hash)
+    if await async_verify_password(body.new_password, current_hashed_pw):
+        raise HTTPException(status_code=400, detail="New password must differ from current password")
 
     # Validate new password strength
     try:

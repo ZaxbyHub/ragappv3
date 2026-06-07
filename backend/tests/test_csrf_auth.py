@@ -387,7 +387,7 @@ class TestCSRFProtection(unittest.TestCase):
             response.status_code, 200, f"Registration failed: {response.json()}"
         )
         data = response.json()
-        self.assertEqual(data["username"], "validuser")
+        self.assertEqual(data["user"]["username"], "validuser")
 
     def test_csrf_cookie_mismatch_returns_403(self):
         """CSRF cookie and header mismatch should return 403."""

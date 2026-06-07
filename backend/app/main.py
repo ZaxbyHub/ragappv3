@@ -174,7 +174,7 @@ if static_dir.exists():
                 or normalized_path.startswith("assets/")
             ):
                 raise HTTPException(status_code=404, detail="Not found")
-            if is_unstripped_prefix(full_path, settings.app_root_path):
+            if is_unstripped_prefix(full_path.lower(), settings.app_root_path.lower()):
                 raise HTTPException(
                     status_code=404,
                     detail=(

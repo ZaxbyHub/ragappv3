@@ -416,7 +416,8 @@ async def lifespan(app: FastAPI):
     app.state.toggle_manager = ToggleManager(app.state.db_pool)
     try:
         app.state.csrf_manager = CSRFManager(
-            settings.redis_url, settings.csrf_token_ttl
+            settings.redis_url, settings.csrf_token_ttl,
+            db_path=settings.sqlite_path,
         )
     except Exception as e:
         logger.warning(f"CSRF manager init failed (continuing): {e}")
