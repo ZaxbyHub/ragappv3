@@ -9,6 +9,7 @@ wiki claim when its source_quote verifies against the chunk it cites.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import re
@@ -34,6 +35,17 @@ _COMPILE_CHUNK_SIZE = 2000
 _CITE_STRIP_RE = re.compile(r"\[(?:S|M|W)\d+\]")
 
 logger = logging.getLogger(__name__)
+
+# Module-level executor used when _maybe_run_curator is called from
+# inside a running event loop. The previous per-call
+# ``with ThreadPoolExecutor(max_workers=1) as ex: ...`` pattern paid
+# the executor-construction cost on every curator invocation
+# (issue #109 — DD-C010). A single shared executor avoids that and
+# keeps the worker thread warm across calls. Curator calls are
+# infrequent and never overlap heavily, so max_workers=1 is fine.
+_CURATOR_OFFLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="wiki-curator"
+)
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -1049,43 +1061,35 @@ class WikiCompiler:
 
         try:
             # The compiler is sync, but CuratorClient.propose is async.
-            # Use a fresh event loop only when there isn't one already
-            # running (background processor calls us from inside one).
+            # When called from inside a running event loop (e.g. an
+            # async FastAPI handler), we can't block on the same loop —
+            # run_coroutine_threadsafe().result() would deadlock it. The
+            # safe sync→async bridge from inside a running loop is to
+            # run the coroutine in a worker thread. Reuse a module-level
+            # executor (issue #109) so we don't pay the per-call cost
+            # of constructing+tearing-down a ThreadPoolExecutor on the
+            # curator hot path.
+            coro = curator.curate(
+                vault_id=vault_id,
+                file_id=file_id,
+                chunks=chunks,
+                deterministic_summary=deterministic_summary,
+                existing_entities_brief=existing_brief,
+                deterministic_dedupe_keys=dedupe_seed,
+            )
             try:
-                loop = asyncio.get_running_loop()
+                running_loop = asyncio.get_running_loop()
             except RuntimeError:
-                loop = None
-            if loop is None:
-                cur_result = asyncio.run(
-                    curator.curate(
-                        vault_id=vault_id,
-                        file_id=file_id,
-                        chunks=chunks,
-                        deterministic_summary=deterministic_summary,
-                        existing_entities_brief=existing_brief,
-                        deterministic_dedupe_keys=dedupe_seed,
-                    )
-                )
+                running_loop = None
+            if running_loop is None:
+                cur_result = asyncio.run(coro)
             else:
-                # Schedule on the running loop and block until done.
-                # We can't do `loop.run_until_complete` from inside the
-                # loop, so spin a separate thread.
-                import concurrent.futures
-
-                def _runner():
-                    return asyncio.run(
-                        curator.curate(
-                            vault_id=vault_id,
-                            file_id=file_id,
-                            chunks=chunks,
-                            deterministic_summary=deterministic_summary,
-                            existing_entities_brief=existing_brief,
-                            deterministic_dedupe_keys=dedupe_seed,
-                        )
-                    )
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                    cur_result = ex.submit(_runner).result()
+                # The thread is required to break the event-loop deadlock;
+                # the executor is shared across calls so we only construct
+                # it once per process.
+                cur_result = _CURATOR_OFFLOAD_EXECUTOR.submit(
+                    asyncio.run, coro
+                ).result()
         except Exception as e:  # broad — curator must never fail the job
             logger.warning(
                 "wiki curator: orchestration failed for vault=%s file=%s: %s",
