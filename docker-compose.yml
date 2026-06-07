@@ -87,9 +87,18 @@ services:
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
       # PRODUCTION: set to your domain, e.g. https://knowledgevault.example.com
       - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
-      - OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
+      - OLLAMA_EMBEDDING_URL=${OLLAMA_EMBEDDING_URL:-http://harrier-embed:8080/v1/embeddings}
       - OLLAMA_CHAT_URL=${OLLAMA_CHAT_URL:-http://host.docker.internal:11434}
       - INSTANT_CHAT_URL=${INSTANT_CHAT_URL:-http://host.docker.internal:1234}
+      # SECURITY: when ALLOW_LOCAL_SERVICES=1, the SSRF guard that blocks
+      # private/loopback/link-local targets is DISABLED for the outbound
+      # model/reranker calls. It defaults to 1 because the bundled
+      # harrier-embed/reranker live on the private Docker network and would
+      # otherwise be unreachable at startup. Set to 0 to re-enable the guard
+      # when every model endpoint is public. ALLOW_LOCAL_CURATOR is a separate,
+      # opt-in (empty) guard for the wiki curator.
+      - ALLOW_LOCAL_SERVICES=${ALLOW_LOCAL_SERVICES:-1}
+      - ALLOW_LOCAL_CURATOR=${ALLOW_LOCAL_CURATOR:-}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/harrier-oss-v1-0.6b}
       - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
       - CHAT_MODEL=${CHAT_MODEL:-gemma-4-26b-a4b-it-apex}
@@ -103,7 +112,7 @@ services:
       - INSTANT_SKIP_RETRIEVAL_EVALUATION=${INSTANT_SKIP_RETRIEVAL_EVALUATION:-true}
       - INSTANT_SKIP_DISTILLATION_SYNTHESIS=${INSTANT_SKIP_DISTILLATION_SYNTHESIS:-true}
       - INSTANT_SKIP_FOLLOWUP_REWRITE=${INSTANT_SKIP_FOLLOWUP_REWRITE:-false}
-      - RERANKER_URL=http://reranker:8081
+      - RERANKER_URL=${RERANKER_URL:-http://reranker:8081}
       - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
       - RERANKING_ENABLED=${RERANKING_ENABLED:-true}
       - RERANKER_TOP_N=${RERANKER_TOP_N:-7}
