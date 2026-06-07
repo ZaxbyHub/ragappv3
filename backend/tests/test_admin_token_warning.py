@@ -31,18 +31,30 @@ class AdminTokenWarningTestBase(unittest.TestCase):
         self.original_level = self.logger.level
         self.logger.setLevel(logging.DEBUG)
 
+        # Snapshot the app.* module table so tearDown can restore it. These
+        # tests reload app.main to re-trigger its module-load warning; the
+        # restore prevents a re-imported app.config from minting a second
+        # `settings` singleton that diverges from the one app code captured at
+        # import time (which leaked into later route tests as
+        # "no such table: users").
+        self._app_modules_snapshot = {
+            k: v for k, v in sys.modules.items() if k == "app" or k.startswith("app.")
+        }
+
     def tearDown(self):
         """Clean up log handler after each test."""
         self.logger.removeHandler(self.handler)
         self.logger.setLevel(self.original_level)
 
-        # Clear any cached main module to ensure fresh reload
-        if "app.main" in sys.modules:
-            del sys.modules["app.main"]
-        # Also clear main's child imports to avoid stale references
-        modules_to_clear = [k for k in sys.modules.keys() if k.startswith("app")]
-        for mod in modules_to_clear:
-            del sys.modules[mod]
+        # Restore the app.* module table to its pre-test state. Each test body
+        # does its own fresh `del sys.modules["app.main"]; import app.main` to
+        # exercise the startup warning; here we only undo the side effects so
+        # the shared `app.config.settings` singleton stays identical to the one
+        # other modules hold, keeping later tests isolated.
+        for mod in [k for k in sys.modules if k == "app" or k.startswith("app.")]:
+            if mod not in self._app_modules_snapshot:
+                del sys.modules[mod]
+        sys.modules.update(self._app_modules_snapshot)
 
     def _get_critical_logs(self):
         """Filter and return all CRITICAL level log records."""
