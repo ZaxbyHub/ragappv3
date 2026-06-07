@@ -179,8 +179,24 @@ class WikiRetrievalService:
     borrows a connection, runs queries, and returns the connection.
     """
 
-    def __init__(self, pool: Any) -> None:
+    def __init__(
+        self,
+        pool: Any,
+        fts_page_search_max_candidates: Optional[int] = None,
+    ) -> None:
         self._pool = pool
+        # Configurable FTS page-search fallback threshold (issue #101).
+        # Resolved lazily so tests and ad-hoc construction don't pay the
+        # Settings import cost; production callers in lifespan.py get the
+        # live value from app.config.settings (env-overridable via
+        # WIKI_FTS_PAGE_SEARCH_MAX_CANDIDATES).
+        if fts_page_search_max_candidates is None:
+            from app.config import settings
+
+            fts_page_search_max_candidates = (
+                settings.wiki_fts_page_search_max_candidates
+            )
+        self._fts_page_search_max_candidates = max(0, fts_page_search_max_candidates)
 
     def _acquire(self) -> sqlite3.Connection:
         # Support both the production SQLiteConnectionPool
@@ -263,8 +279,10 @@ class WikiRetrievalService:
                 if key not in candidates or ev.score > candidates[key].score:
                     candidates[key] = ev
 
-        # 4. FTS page search (fallback, lower score)
-        if normalized_query and len(candidates) < 5:
+        # 4. FTS page search (fallback, lower score). Threshold is
+        #    configurable via wiki_fts_page_search_max_candidates (issue #101);
+        #    a value of 0 forces this fallback to run for every query.
+        if normalized_query and len(candidates) < self._fts_page_search_max_candidates:
             fts_page_results = self._fts_page_search(conn, normalized_query, vault_id)
             for ev in fts_page_results:
                 if entity_candidates:
