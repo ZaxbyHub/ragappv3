@@ -57,6 +57,8 @@ class TestFTSStatusTrackingSearch(unittest.IsolatedAsyncioTestCase):
         self.store.table.schema = AsyncMock(return_value=MagicMock())
         self.store._embedding_dim = 384
         self.store._fts_exceptions = 0
+        import asyncio as _asyncio
+        self.store._search_semaphore = _asyncio.Semaphore(10)
 
         # Default dense results (always return something so fusion has data)
         self.dense_results = [
@@ -231,6 +233,8 @@ class TestFTSStatusTrackingSingleScale(unittest.IsolatedAsyncioTestCase):
         self.store.table = MagicMock()
         self.store._embedding_dim = 384
         self.store._fts_exceptions = 0
+        import asyncio as _asyncio
+        self.store._search_semaphore = _asyncio.Semaphore(10)
 
         self.dense_results = [
             {"id": f"doc_{i}", "text": f"doc text {i}", "_distance": 0.1 * i}

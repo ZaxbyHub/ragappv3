@@ -24,6 +24,12 @@ def _make_embedding() -> list:
 class TestExactMatchPromoteAdversarial:
     """Attack vectors for exact-match promotion logic."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_ssrf(self):
+        with patch("app.services.embeddings.assert_url_safe"), \
+             patch("app.services.llm_client.assert_url_safe"):
+            yield
+
     @pytest.fixture
     def mock_settings(self):
         """Patch all settings flags used by exact-match promotion."""
@@ -112,6 +118,7 @@ class TestExactMatchPromoteAdversarial:
                 _,
                 _,
                 exact_match_promoted,
+                _,
             ) = await engine._execute_retrieval(query_embeddings, "test query", vault_id=None)
 
         ids = [r["id"] for r in vector_results]
@@ -154,6 +161,7 @@ class TestExactMatchPromoteAdversarial:
                 _,
                 _,
                 exact_match_promoted,
+                _,
             ) = await engine._execute_retrieval(query_embeddings, "test query", vault_id=None)
 
         # Promotion should not happen because original_top1_id is None (guard at line 528)
@@ -193,6 +201,7 @@ class TestExactMatchPromoteAdversarial:
                 _,
                 _,
                 exact_match_promoted,
+                _,
             ) = await engine._execute_retrieval(query_embeddings, "test query", vault_id=None)
 
         # original_top1_id = "" — is not None, so promotion guard passes.
@@ -235,6 +244,7 @@ class TestExactMatchPromoteAdversarial:
                 _,
                 _,
                 exact_match_promoted,
+                _,
             ) = await engine._execute_retrieval(query_embeddings, "test query", vault_id=None)
 
         # Verify result count is exactly 8 (fusion deduplicates but preserves count)
@@ -277,6 +287,7 @@ class TestExactMatchPromoteAdversarial:
                 _,
                 _,
                 exact_match_promoted,
+                _,
             ) = await engine._execute_retrieval(query_embeddings, "test query", vault_id=None)
 
         assert len(vector_results) == 5, f"Expected exactly 5 results, got {len(vector_results)}"
@@ -326,6 +337,7 @@ class TestExactMatchPromoteAdversarial:
                 _,
                 _,
                 exact_match_promoted,
+                _,
             ) = await engine._execute_retrieval(query_embeddings, "test query", vault_id=None)
 
         ids = [r.get("id") for r in vector_results]
@@ -375,6 +387,7 @@ class TestExactMatchPromoteAdversarial:
                 _,
                 _,
                 exact_match_promoted,
+                _,
             ) = await engine._execute_retrieval(query_embeddings, "test query", vault_id=None)
 
         # Verify we have 5+ results to make position 4 meaningful

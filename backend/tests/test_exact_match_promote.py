@@ -79,6 +79,16 @@ def make_chunk(chunk_id: str, text: str = "Sample chunk text") -> Dict:
 class TestExactMatchPromotion(unittest.IsolatedAsyncioTestCase):
     """Tests for exact-match promotion logic in _execute_retrieval."""
 
+    def setUp(self):
+        self._ssrf_embed = patch("app.services.embeddings.assert_url_safe")
+        self._ssrf_llm = patch("app.services.llm_client.assert_url_safe")
+        self._ssrf_embed.start()
+        self._ssrf_llm.start()
+
+    def tearDown(self):
+        self._ssrf_embed.stop()
+        self._ssrf_llm.stop()
+
     def _make_engine(self, vector_store: VectorStore) -> RAGEngine:
         """Create a RAGEngine with faked dependencies."""
         engine = RAGEngine()
