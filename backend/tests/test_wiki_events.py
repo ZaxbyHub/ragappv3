@@ -415,5 +415,224 @@ class TestSSEEventGenerator(unittest.IsolatedAsyncioTestCase):
         bus.unsubscribe(vault_id, queue)
 
 
+# ---------------------------------------------------------------------------
+# Consumer-side observability regression tests
+#
+# Mirror the publisher-side WARNING-with-exc_info contract from issue #106
+# (PR #196) for the consumer-side paths in WikiEventBus. Issue #201
+# consolidated these follow-ups: F-1 (inner-fallback silent swallow) and
+# F-2 (publish_page_change / publish_claim_change lack try/except).
+# ---------------------------------------------------------------------------
+
+
+class TestWikiEventBusInnerFailureLogging(unittest.TestCase):
+    """F-1 (issue #201): inner-fallback drain failure must log WARNING with
+    exc_info and structured context, not DEBUG."""
+
+    LOGGER_NAME = "app.services.wiki_events"
+
+    def test_inner_drain_failure_emits_warning_with_traceback(self) -> None:
+        """When the slow-consumer drain-and-retry itself fails, a WARNING
+        record with exc_info and vault/event context must be emitted."""
+        import logging
+
+        bus = WikiEventBus()
+        # Fill the queue past maxsize so the next put_nowait raises QueueFull.
+        q = bus.subscribe(vault_id=1)
+        for i in range(64):
+            q.put_nowait({"idx": i})
+        # Unsubscribe the queue concurrently so the drain path's get_nowait
+        # fails. The set semantics make the queue "gone" from bus._subs'
+        # perspective only after discard; reaching into the underlying
+        # asyncio.Queue's _get/_put internals via the public API is
+        # thread-unsafe, so simulate by wrapping the queue in a shim that
+        # makes get_nowait raise after the QueueFull retry path runs.
+        class _FlakyQueue:
+            def __init__(self, real: asyncio.Queue) -> None:
+                self._real = real
+                self._fail_get = True
+
+            def put_nowait(self, item):
+                return self._real.put_nowait(item)
+
+            def get_nowait(self):
+                if self._fail_get:
+                    self._fail_get = False
+                    raise RuntimeError("simulated concurrent unsubscribe")
+                return self._real.get_nowait()
+
+        flaky = _FlakyQueue(q)
+        bus._subs[1] = {flaky}  # type: ignore[assignment]
+
+        with self.assertLogs(self.LOGGER_NAME, level=logging.DEBUG) as cap:
+            bus.publish(
+                vault_id=1,
+                event={"type": "job_completed", "job_id": 42},
+            )
+
+        warnings = [r for r in cap.records if r.levelno >= logging.WARNING]
+        self.assertEqual(
+            len(warnings),
+            1,
+            f"expected exactly one WARNING, got {len(warnings)}: "
+            f"{[r.getMessage() for r in warnings]}",
+        )
+        rec = warnings[0]
+        # Operators need the traceback to diagnose the failure.
+        self.assertTrue(
+            any(r is rec for r in warnings if rec.exc_info),
+            "Expected exc_info on the WARNING record",
+        )
+        # Message must include structured context to help on-call pinpoint
+        # the dropped terminal-state event.
+        msg = rec.getMessage()
+        self.assertIn("vault_id=1", msg)
+        self.assertIn("event_type=job_completed", msg)
+
+
+class TestWikiEventBusPublishHelperFailureLogging(unittest.TestCase):
+    """F-2 (issue #201): publish_page_change and publish_claim_change must
+    never propagate exceptions, and must log WARNING with exc_info and
+    structured context when the underlying publish raises."""
+
+    LOGGER_NAME = "app.services.wiki_events"
+
+    def _bus_with_failing_publish(self) -> WikiEventBus:
+        bus = WikiEventBus()
+        # Force a non-QueueFull exception from publish() by raising
+        # unconditionally from a shim publish. We override the bound method
+        # so the helper methods call into our shim via self.publish.
+        from app.services.wiki_events import WikiEventBus as _Cls
+
+        original_publish = _Cls.publish
+
+        def _raise(self_, vault_id, event):  # noqa: ANN001
+            raise RuntimeError("simulated publish failure")
+
+        _Cls.publish = _raise  # type: ignore[assignment]
+        self.addCleanup(lambda: setattr(_Cls, "publish", original_publish))
+        return bus
+
+    def test_publish_page_change_failure_emits_warning_and_does_not_raise(
+        self,
+    ) -> None:
+        import logging
+
+        bus = self._bus_with_failing_publish()
+        with self.assertLogs(self.LOGGER_NAME, level=logging.DEBUG) as cap:
+            try:
+                bus.publish_page_change(
+                    vault_id=1, page_id=42, action="created", user_id=7
+                )
+            except Exception as exc:  # pragma: no cover — guard rail
+                self.fail(f"publish_page_change must not raise, got {exc!r}")
+
+        warnings = [r for r in cap.records if r.levelno >= logging.WARNING]
+        self.assertEqual(
+            len(warnings),
+            1,
+            f"expected exactly one WARNING, got {len(warnings)}: "
+            f"{[r.getMessage() for r in warnings]}",
+        )
+        rec = warnings[0]
+        self.assertTrue(
+            rec.exc_info is not None,
+            "Expected exc_info on the WARNING record",
+        )
+        msg = rec.getMessage()
+        self.assertIn("page_change", msg)
+        self.assertIn("vault_id=1", msg)
+        self.assertIn("page_id=42", msg)
+        self.assertIn("action=created", msg)
+
+    def test_publish_claim_change_failure_emits_warning_and_does_not_raise(
+        self,
+    ) -> None:
+        import logging
+
+        bus = self._bus_with_failing_publish()
+        with self.assertLogs(self.LOGGER_NAME, level=logging.DEBUG) as cap:
+            try:
+                bus.publish_claim_change(
+                    vault_id=2, claim_id=99, action="deleted", user_id=3
+                )
+            except Exception as exc:  # pragma: no cover — guard rail
+                self.fail(f"publish_claim_change must not raise, got {exc!r}")
+
+        warnings = [r for r in cap.records if r.levelno >= logging.WARNING]
+        self.assertEqual(
+            len(warnings),
+            1,
+            f"expected exactly one WARNING, got {len(warnings)}: "
+            f"{[r.getMessage() for r in warnings]}",
+        )
+        rec = warnings[0]
+        self.assertTrue(
+            rec.exc_info is not None,
+            "Expected exc_info on the WARNING record",
+        )
+        msg = rec.getMessage()
+        self.assertIn("claim_change", msg)
+        self.assertIn("vault_id=2", msg)
+        self.assertIn("claim_id=99", msg)
+        self.assertIn("action=deleted", msg)
+
+    def test_publish_page_change_success_does_not_warn(self) -> None:
+        import logging
+
+        bus = WikiEventBus()
+        bus.subscribe(vault_id=1)  # need a subscriber to deliver
+        records = []
+
+        class _CapturingHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger(self.LOGGER_NAME)
+        handler = _CapturingHandler(level=logging.WARNING)
+        prev_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.WARNING)
+        try:
+            bus.publish_page_change(vault_id=1, page_id=1, action="created")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(prev_level)
+        self.assertEqual(
+            [r for r in records if r.levelno >= logging.WARNING],
+            [],
+            "Expected no WARNING logs on successful publish_page_change, got: "
+            f"{[r.getMessage() for r in records]}",
+        )
+
+    def test_publish_claim_change_success_does_not_warn(self) -> None:
+        import logging
+
+        bus = WikiEventBus()
+        bus.subscribe(vault_id=1)  # need a subscriber to deliver
+        records = []
+
+        class _CapturingHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger(self.LOGGER_NAME)
+        handler = _CapturingHandler(level=logging.WARNING)
+        prev_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.WARNING)
+        try:
+            bus.publish_claim_change(vault_id=1, claim_id=1, action="created")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(prev_level)
+        self.assertEqual(
+            [r for r in records if r.levelno >= logging.WARNING],
+            [],
+            "Expected no WARNING logs on successful publish_claim_change, got: "
+            f"{[r.getMessage() for r in records]}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

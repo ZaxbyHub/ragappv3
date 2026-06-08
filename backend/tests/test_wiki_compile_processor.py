@@ -608,10 +608,15 @@ class TestPublishEventFailureLogging(unittest.TestCase):
                 )
 
         warnings = [r for r in cap.records if r.levelno >= logging.WARNING]
-        self.assertTrue(
-            warnings,
-            "Expected a WARNING-level log on SSE publish failure, got "
-            f"{[r.levelname for r in cap.records]}",
+        # Exactly one WARNING is expected. A regression emitting multiple
+        # WARNING records (e.g. a spurious extra from logging internals or a
+        # future change) would otherwise only have the first checked, hiding
+        # the duplicate.
+        self.assertEqual(
+            len(warnings),
+            1,
+            f"expected exactly one WARNING, got {len(warnings)}: "
+            f"{[r.getMessage() for r in warnings]}",
         )
         # Operators need the traceback to diagnose the failure.
         self.assertTrue(
@@ -630,7 +635,7 @@ class TestPublishEventFailureLogging(unittest.TestCase):
         from app.services.wiki_events import WikiEventBus
 
         class _StubBus(WikiEventBus):
-            def publish(self, vault_id, event):  # noqa: D401
+            def publish(self, vault_id: int, event: dict) -> None:
                 return None
 
         proc = self._make_proc()
