@@ -40,7 +40,8 @@ from app.services.embeddings import EmbeddingError, EmbeddingService
 @pytest.fixture(autouse=True)
 def mock_settings():
     """Mock settings for all tests."""
-    with patch('app.services.embeddings.settings') as mock_settings:
+    with patch('app.services.embeddings.settings') as mock_settings, \
+         patch('app.services.embeddings.assert_url_safe'):
         mock_settings.ollama_embedding_url = "http://localhost:11434/api/embeddings"
         mock_settings.embedding_model = "nomic-embed-text"
         mock_settings.embedding_doc_prefix = ""

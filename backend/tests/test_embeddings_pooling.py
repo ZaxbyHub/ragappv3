@@ -38,7 +38,8 @@ from app.services.embeddings import EmbeddingService
 @pytest.fixture(autouse=True)
 def mock_settings():
     """Mock settings for all tests."""
-    with patch('app.services.embeddings.settings') as mock_settings:
+    with patch('app.services.embeddings.settings') as mock_settings, \
+         patch('app.services.embeddings.assert_url_safe'):
         mock_settings.ollama_embedding_url = "http://localhost:11434/api/embeddings"
         mock_settings.embedding_model = "nomic-embed-text"
         mock_settings.embedding_doc_prefix = ""
@@ -145,18 +146,16 @@ class TestEmbeddingServiceCloseMethod:
         """EmbeddingService should have a close method."""
         service = EmbeddingService()
         assert hasattr(service, 'close'), "EmbeddingService should have close method"
-        # Clean up
         import asyncio
-        asyncio.get_event_loop().run_until_complete(service.close())
+        asyncio.run(service.close())
 
     def test_close_is_async_method(self, mock_settings):
         """The close method should be async (coroutine function)."""
         service = EmbeddingService()
         assert inspect.iscoroutinefunction(service.close), \
             "close() should be an async method (coroutine function)"
-        # Clean up
         import asyncio
-        asyncio.get_event_loop().run_until_complete(service.close())
+        asyncio.run(service.close())
 
     @pytest.mark.asyncio
     async def test_close_is_idempotent(self, mock_settings):
