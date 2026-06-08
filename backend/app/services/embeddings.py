@@ -330,13 +330,18 @@ class EmbeddingService:
                 )
                 raise EmbeddingError("Embedding API response is invalid")
         elif self.provider_mode == "tei":
-            # Native TEI format: a raw JSON array of embedding arrays, e.g. [[...]]
-            if not isinstance(data, list) or len(data) == 0:
+            # Native TEI returns a raw JSON array of embedding arrays, e.g.
+            # [[...]]. Some TEI-compatible servers wrap it as
+            # {"embeddings": [[...]]}; accept both shapes.
+            rows = data.get("embeddings") if isinstance(data, dict) else data
+            if not isinstance(rows, list) or len(rows) == 0:
                 logger.error(
-                    "Embedding API response is not a non-empty array in TEI mode"
+                    "Embedding API response in TEI mode is not a non-empty list "
+                    "or {'embeddings': [...]} object, got %s",
+                    type(data).__name__,
                 )
                 raise EmbeddingError("Embedding API response is invalid")
-            embedding = data[0]
+            embedding = rows[0]
             if not isinstance(embedding, list):
                 logger.error(
                     "Embedding API response first element is not a list in TEI mode"
@@ -723,14 +728,19 @@ class EmbeddingService:
                 # OpenAI format: data[].embedding
                 embeddings = [item["embedding"] for item in data["data"]]
             elif self.provider_mode == "tei":
-                # Native TEI format: a raw JSON array of embedding arrays.
-                if not isinstance(data, list):
+                # Native TEI returns a raw JSON array of embedding arrays. Some
+                # TEI-compatible servers wrap it as {"embeddings": [[...]]};
+                # accept both shapes.
+                embeddings = (
+                    data.get("embeddings") if isinstance(data, dict) else data
+                )
+                if not isinstance(embeddings, list):
                     logger.error(
                         f"Unexpected response format for {self.provider_mode} mode: "
-                        f"expected a list, got {type(data).__name__}"
+                        f"expected a list or {{'embeddings': [...]}}, got "
+                        f"{type(data).__name__}"
                     )
                     raise EmbeddingError("Unexpected response from embedding service")
-                embeddings = data
             else:
                 # Ollama format may vary - try common formats
                 if "embeddings" in data:

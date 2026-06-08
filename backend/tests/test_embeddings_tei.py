@@ -157,6 +157,35 @@ class TestTeiRoundTrip:
         assert args[0] == "http://localhost:8080/embed"
         assert kwargs["json"] == {"inputs": ["a", "b"]}
 
+    async def test_embed_single_accepts_embeddings_dict_wrapper(self, mock_tei_settings):
+        # Some TEI-compatible servers wrap the response as {"embeddings": [[...]]}.
+        service = EmbeddingService()
+        service._client = MagicMock()
+        service._client.post = AsyncMock(
+            return_value=_mock_response(200, {"embeddings": [[0.1, 0.2, 0.3]]})
+        )
+
+        vec = await service.embed_single("query text")
+
+        assert vec == [0.1, 0.2, 0.3]
+        args, kwargs = service._client.post.call_args
+        assert args[0] == "http://localhost:8080/embed"
+        assert kwargs["json"] == {"inputs": "query text"}
+
+    async def test_embed_batch_accepts_embeddings_dict_wrapper(self, mock_tei_settings):
+        service = EmbeddingService()
+        service._client = MagicMock()
+        service._client.post = AsyncMock(
+            return_value=_mock_response(200, {"embeddings": [[0.1, 0.2], [0.3, 0.4]]})
+        )
+
+        out = await service.embed_batch(["a", "b"], batch_size=10)
+
+        assert out == [[0.1, 0.2], [0.3, 0.4]]
+        args, kwargs = service._client.post.call_args
+        assert args[0] == "http://localhost:8080/embed"
+        assert kwargs["json"] == {"inputs": ["a", "b"]}
+
     async def test_embed_single_rejects_empty_array(self, mock_tei_settings):
         service = EmbeddingService()
         service._client = MagicMock()
