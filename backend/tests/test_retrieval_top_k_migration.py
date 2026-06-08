@@ -82,7 +82,10 @@ class TestRAGEngineRetrievalTopK(unittest.TestCase):
         """Setup async event loop for tests."""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        yield
+        from unittest.mock import patch as _patch
+        with _patch("app.services.embeddings.assert_url_safe"), \
+             _patch("app.services.llm_client.assert_url_safe"):
+            yield
         self.loop.close()
 
     def test_rag_engine_uses_retrieval_top_k(self):

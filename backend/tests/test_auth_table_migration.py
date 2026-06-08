@@ -497,7 +497,7 @@ class TestExistingTablesUnchanged:
             cursor = conn.execute("PRAGMA table_info(vaults)")
             columns = {row[1] for row in cursor.fetchall()}
 
-            expected_columns = {"id", "name", "description", "created_at", "updated_at"}
+            expected_columns = {"id", "name", "description", "created_at", "updated_at", "owner_id", "org_id", "visibility"}
             assert expected_columns == columns, (
                 f"vaults table schema changed. Expected: {expected_columns}, Got: {columns}"
             )

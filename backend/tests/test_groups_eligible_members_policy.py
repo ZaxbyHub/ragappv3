@@ -369,8 +369,6 @@ class TestGetEligibleMembersEvaluatePolicy:
 
     def test_evaluate_is_called_with_correct_params(self, monkeypatch):
         """Verify evaluate is called with (user, 'group', group_id, 'read') for eligible_members."""
-        from app.api import deps
-
         call_tracker = {"calls": []}
 
         async def mock_evaluate(principal, resource_type, resource_id, action):
@@ -387,7 +385,8 @@ class TestGetEligibleMembersEvaluatePolicy:
         app = FastAPI()
         app.include_router(auth_router, prefix="/api")
         app.include_router(groups_router, prefix="/api")
-        monkeypatch.setattr(deps, "get_evaluate_policy", lambda: lambda: mock_evaluate)
+        from app.api.deps import get_evaluate_policy as _real_get_evaluate_policy
+        app.dependency_overrides[_real_get_evaluate_policy] = lambda: mock_evaluate
 
         client = TestClient(app)
 
@@ -420,17 +419,14 @@ class TestGetEligibleMembersEvaluatePolicy:
 
     def test_evaluate_returns_false_gives_403(self, monkeypatch):
         """When evaluate returns False, user gets 403 Forbidden."""
-        from app.api import deps
-
         async def mock_evaluate_always_false(principal, resource_type, resource_id, action):
             return False
 
         app = FastAPI()
         app.include_router(auth_router, prefix="/api")
         app.include_router(groups_router, prefix="/api")
-        monkeypatch.setattr(
-            deps, "get_evaluate_policy", lambda: lambda: mock_evaluate_always_false
-        )
+        from app.api.deps import get_evaluate_policy as _real_get_evaluate_policy
+        app.dependency_overrides[_real_get_evaluate_policy] = lambda: mock_evaluate_always_false
 
         client = TestClient(app)
 

@@ -272,9 +272,8 @@ class TestEvaluatePolicyWiring:
         app.include_router(groups_router, prefix="/api")
 
         # Override the dependency to inject our mock
-        from app.api import deps
-
-        monkeypatch.setattr(deps, "get_evaluate_policy", lambda: lambda: mock_evaluate)
+        from app.api.deps import get_evaluate_policy as _real_get_evaluate_policy
+        app.dependency_overrides[_real_get_evaluate_policy] = lambda: mock_evaluate
 
         client = TestClient(app)
 
@@ -305,8 +304,6 @@ class TestEvaluatePolicyWiring:
 
     def test_create_group_calls_evaluate_with_correct_params(self, monkeypatch):
         """Verify evaluate is called with (user, 'group', 0, 'create') for create_group."""
-        from app.api import deps
-
         call_tracker = {"calls": []}
 
         async def mock_evaluate(principal, resource_type, resource_id, action):
@@ -323,7 +320,8 @@ class TestEvaluatePolicyWiring:
         app = FastAPI()
         app.include_router(auth_router, prefix="/api")
         app.include_router(groups_router, prefix="/api")
-        monkeypatch.setattr(deps, "get_evaluate_policy", lambda: lambda: mock_evaluate)
+        from app.api.deps import get_evaluate_policy as _real_get_evaluate_policy
+        app.dependency_overrides[_real_get_evaluate_policy] = lambda: mock_evaluate
 
         client = TestClient(app)
 
@@ -346,8 +344,6 @@ class TestEvaluatePolicyWiring:
 
     def test_get_group_calls_evaluate_with_correct_params(self, monkeypatch):
         """Verify evaluate is called with (user, 'group', group_id, 'read') for get_group."""
-        from app.api import deps
-
         call_tracker = {"calls": []}
 
         async def mock_evaluate(principal, resource_type, resource_id, action):
@@ -364,7 +360,8 @@ class TestEvaluatePolicyWiring:
         app = FastAPI()
         app.include_router(auth_router, prefix="/api")
         app.include_router(groups_router, prefix="/api")
-        monkeypatch.setattr(deps, "get_evaluate_policy", lambda: lambda: mock_evaluate)
+        from app.api.deps import get_evaluate_policy as _real_get_evaluate_policy
+        app.dependency_overrides[_real_get_evaluate_policy] = lambda: mock_evaluate
 
         client = TestClient(app)
 
@@ -386,8 +383,6 @@ class TestEvaluatePolicyWiring:
 
     def test_update_group_calls_evaluate_with_correct_params(self, monkeypatch):
         """Verify evaluate is called with (user, 'group', group_id, 'update') for update_group."""
-        from app.api import deps
-
         call_tracker = {"calls": []}
 
         async def mock_evaluate(principal, resource_type, resource_id, action):
@@ -404,7 +399,8 @@ class TestEvaluatePolicyWiring:
         app = FastAPI()
         app.include_router(auth_router, prefix="/api")
         app.include_router(groups_router, prefix="/api")
-        monkeypatch.setattr(deps, "get_evaluate_policy", lambda: lambda: mock_evaluate)
+        from app.api.deps import get_evaluate_policy as _real_get_evaluate_policy
+        app.dependency_overrides[_real_get_evaluate_policy] = lambda: mock_evaluate
 
         client = TestClient(app)
 
@@ -428,8 +424,6 @@ class TestEvaluatePolicyWiring:
 
     def test_delete_group_calls_evaluate_with_correct_params(self, monkeypatch):
         """Verify evaluate is called with (user, 'group', group_id, 'delete') for delete_group."""
-        from app.api import deps
-
         call_tracker = {"calls": []}
 
         async def mock_evaluate(principal, resource_type, resource_id, action):
@@ -446,7 +440,8 @@ class TestEvaluatePolicyWiring:
         app = FastAPI()
         app.include_router(auth_router, prefix="/api")
         app.include_router(groups_router, prefix="/api")
-        monkeypatch.setattr(deps, "get_evaluate_policy", lambda: lambda: mock_evaluate)
+        from app.api.deps import get_evaluate_policy as _real_get_evaluate_policy
+        app.dependency_overrides[_real_get_evaluate_policy] = lambda: mock_evaluate
 
         client = TestClient(app)
 

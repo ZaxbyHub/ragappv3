@@ -263,7 +263,7 @@ class TestPagination:
 
     def test_list_groups_default_pagination(self, client):
         """List groups returns paginated response by default."""
-        org_id = _create_org("Pagination Org")
+        org_id = 1  # admin1 is a member of org 1
         for i in range(15):
             _create_group(org_id, f"Group {i}")
 
@@ -282,7 +282,7 @@ class TestPagination:
 
     def test_list_groups_page_parameter(self, client):
         """List groups respects page parameter."""
-        org_id = _create_org("Page Test Org")
+        org_id = 1  # admin1 is a member of org 1
         for i in range(10):
             _create_group(org_id, f"Group {i}")
 
@@ -326,7 +326,7 @@ class TestPagination:
 
     def test_list_groups_empty_page(self, client):
         """List groups returns empty groups for out of range page."""
-        org_id = _create_org("Empty Page Org")
+        org_id = 1  # admin1 is a member of org 1
         _create_group(org_id, "Single Group")
 
         response = client.get(
@@ -349,7 +349,7 @@ class TestSearch:
 
     def test_list_groups_search_basic(self, client):
         """List groups filters by name using search parameter."""
-        org_id = _create_org("Search Org")
+        org_id = 1  # admin1 is a member of org 1
         _create_group(org_id, "Alpha Team")
         _create_group(org_id, "Beta Squad")
         _create_group(org_id, "Alpha Leaders")
@@ -365,7 +365,7 @@ class TestSearch:
 
     def test_list_groups_search_case_insensitive(self, client):
         """List groups search is case insensitive."""
-        org_id = _create_org("Case Search Org")
+        org_id = 1  # admin1 is a member of org 1
         _create_group(org_id, "lowercase")
         _create_group(org_id, "UPPERCASE")
         _create_group(org_id, "MixedCase")
@@ -394,7 +394,7 @@ class TestSearch:
 
     def test_list_groups_search_partial_match(self, client):
         """List groups search matches partial strings."""
-        org_id = _create_org("Partial Search Org")
+        org_id = 1  # admin1 is a member of org 1
         _create_group(org_id, "Engineering Team")
         _create_group(org_id, "Engineering Managers")
         _create_group(org_id, "Sales Team")
@@ -417,7 +417,7 @@ class TestLikeInjection:
 
     def test_search_literal_percent_matches_percent(self, client):
         """Searching for % matches groups with literal % in name."""
-        org_id = _create_org("Percent Org")
+        org_id = 1  # admin1 is a member of org 1
         _create_group(org_id, "100% Complete")
         _create_group(org_id, "Half Done")
         _create_group(org_id, "Zero Percent")
@@ -433,7 +433,7 @@ class TestLikeInjection:
 
     def test_search_literal_underscore_matches_underscore(self, client):
         """Searching for _ matches groups with literal _ in name."""
-        org_id = _create_org("Underscore Org")
+        org_id = 1  # admin1 is a member of org 1
         _create_group(org_id, "Test_A")
         _create_group(org_id, "TestB")
         _create_group(org_id, "Test_C")
@@ -451,7 +451,7 @@ class TestLikeInjection:
 
     def test_search_escaped_backslash(self, client):
         """Searching for \\ matches groups with literal \\ in name."""
-        org_id = _create_org("Backslash Org")
+        org_id = 1  # admin1 is a member of org 1
         _create_group(org_id, "path\\to\\file")
         _create_group(org_id, "normal/path")
 
@@ -466,7 +466,7 @@ class TestLikeInjection:
 
     def test_search_wildcards_are_escaped(self, client):
         """Wildcards in search term are treated as literals."""
-        org_id = _create_org("Wildcard Escape Org")
+        org_id = 1  # admin1 is a member of org 1
         _create_group(org_id, "test%value")
         _create_group(org_id, "test_value")
         _create_group(org_id, "testnormal")

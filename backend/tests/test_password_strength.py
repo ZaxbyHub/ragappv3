@@ -324,7 +324,7 @@ class TestPasswordStrengthAuthRouteIntegration(unittest.TestCase):
         # Should succeed (not fail due to password strength)
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(data["username"], "validuser")
+        self.assertEqual(data["user"]["username"], "validuser")
 
     def test_register_no_uppercase_returns_400(self):
         """POST /auth/register with no uppercase 'password123' → 400."""
