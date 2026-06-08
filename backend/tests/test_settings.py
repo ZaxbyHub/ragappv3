@@ -93,6 +93,8 @@ class TestSettingsResponseFields(unittest.TestCase):
     """Tests for SettingsResponse including reranking and hybrid search fields."""
 
     def setUp(self):
+        self._orig_users_enabled = settings.users_enabled
+        settings.users_enabled = False
         self.client = TestClient(app)
         self.client.headers.update(
             {"Authorization": f"Bearer {settings.admin_secret_token}"}
@@ -116,6 +118,7 @@ class TestSettingsResponseFields(unittest.TestCase):
     def tearDown(self):
         # Restore get_db dependency
         app.dependency_overrides.pop(self._get_db, None)
+        settings.users_enabled = self._orig_users_enabled
 
     def test_settings_response_includes_reranker_fields(self):
         """Test GET /api/settings includes reranking configuration fields."""
@@ -199,6 +202,8 @@ class TestSettingsUpdateValidation(unittest.TestCase):
     """Tests for SettingsUpdate validation of new fields."""
 
     def setUp(self):
+        self._orig_users_enabled = settings.users_enabled
+        settings.users_enabled = False
         self.client = TestClient(app)
         self.client.headers.update(
             {"Authorization": f"Bearer {settings.admin_secret_token}"}
@@ -222,6 +227,7 @@ class TestSettingsUpdateValidation(unittest.TestCase):
     def tearDown(self):
         # Restore get_db dependency
         app.dependency_overrides.pop(self._get_db, None)
+        settings.users_enabled = self._orig_users_enabled
 
     def test_post_settings_valid_reranker_config(self):
         """Test POST /api/settings with valid reranker configuration."""
@@ -423,6 +429,8 @@ class TestConnectionEndpoint(unittest.TestCase):
     """Tests for the /api/settings/connection endpoint."""
 
     def setUp(self):
+        self._orig_users_enabled = settings.users_enabled
+        settings.users_enabled = False
         self.client = TestClient(app)
         self.client.headers.update(
             {"Authorization": f"Bearer {settings.admin_secret_token}"}
@@ -446,6 +454,7 @@ class TestConnectionEndpoint(unittest.TestCase):
     def tearDown(self):
         # Restore get_db dependency
         app.dependency_overrides.pop(self._get_db, None)
+        settings.users_enabled = self._orig_users_enabled
 
     @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
     @patch("app.api.routes.settings.httpx.AsyncClient")
