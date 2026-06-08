@@ -603,5 +603,92 @@ class TestChatUrlSettingsGate(unittest.TestCase):
             conn.close()
 
 
+class TestRerankerUrlSettingsGate(unittest.TestCase):
+    """SSRF + format gate on reranker_url at settings-change time (C-SEC-006).
+
+    reranker_url is a persisted, user-settable field that was historically
+    excluded from both the URL format validator and the PUT-time SSRF check, so
+    a private/internal reranker URL could be saved without validation. It is now
+    validated like the other model URLs.
+    """
+
+    def setUp(self):
+        # The SSRF guard only blocks private/loopback targets when
+        # ALLOW_LOCAL_SERVICES is unset. Pop it for the lifetime of these tests
+        # so the rejection assertions are deterministic regardless of the
+        # ambient environment (sibling localhost tests require it set).
+        self._orig_allow_local = os.environ.pop("ALLOW_LOCAL_SERVICES", None)
+
+    def tearDown(self):
+        if self._orig_allow_local is not None:
+            os.environ["ALLOW_LOCAL_SERVICES"] = self._orig_allow_local
+        else:
+            os.environ.pop("ALLOW_LOCAL_SERVICES", None)
+
+    def test_private_reranker_url_rejected_before_mutation(self):
+        from fastapi import HTTPException
+
+        from app.api.routes.settings import SettingsUpdate, _apply_settings_update
+        from app.config import settings as live_settings
+
+        original = live_settings.reranker_url
+        update = SettingsUpdate(reranker_url="http://169.254.169.254:8081")
+
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                _apply_settings_update(update)
+
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertIn("reranker", str(ctx.exception.detail).lower())
+            # The bad URL must never reach the live settings singleton.
+            self.assertEqual(live_settings.reranker_url, original)
+        finally:
+            live_settings.reranker_url = original
+
+    def test_loopback_reranker_url_rejected(self):
+        from fastapi import HTTPException
+
+        from app.api.routes.settings import SettingsUpdate, _apply_settings_update
+        from app.config import settings as live_settings
+
+        original = live_settings.reranker_url
+        update = SettingsUpdate(reranker_url="http://127.0.0.1:8081")
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                _apply_settings_update(update)
+            self.assertEqual(ctx.exception.status_code, 422)
+            self.assertIn("reranker", str(ctx.exception.detail).lower())
+            self.assertEqual(live_settings.reranker_url, original)
+        finally:
+            live_settings.reranker_url = original
+
+    def test_public_reranker_url_accepted(self):
+        # Positive path: an SSRF-safe reranker URL passes the gate. assert_url_safe
+        # is patched so the test does not depend on live DNS resolution.
+        from app.api.routes.settings import SettingsUpdate, _validate_updated_urls
+
+        update = SettingsUpdate(reranker_url="https://reranker.prod.example:8081")
+        with patch("app.api.routes.settings.assert_url_safe") as mock_safe:
+            _validate_updated_urls(update)  # must not raise
+        mock_safe.assert_any_call("https://reranker.prod.example:8081")
+
+    def test_reranker_url_with_credentials_rejected(self):
+        from pydantic import ValidationError
+
+        from app.api.routes.settings import SettingsUpdate
+
+        # Format validator now covers reranker_url: embedded credentials rejected.
+        with self.assertRaises(ValidationError):
+            SettingsUpdate(reranker_url="http://user:pass@reranker:8081")
+
+    def test_reranker_url_non_http_scheme_rejected(self):
+        from pydantic import ValidationError
+
+        from app.api.routes.settings import SettingsUpdate
+
+        with self.assertRaises(ValidationError):
+            SettingsUpdate(reranker_url="ftp://reranker:8081")
+
+
 if __name__ == "__main__":
     unittest.main()
