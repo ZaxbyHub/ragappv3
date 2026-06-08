@@ -79,23 +79,23 @@ def _reset_rate_limiter():
     try:
         from app.limiter import limiter
         limiter.reset()
-    except Exception:
+    except (ImportError, AttributeError):
         pass
     try:
         from app.services.circuit_breaker import embeddings_cb
         embeddings_cb.reset()
-    except Exception:
+    except (ImportError, AttributeError):
         pass
     yield
     try:
         from app.limiter import limiter
         limiter.reset()
-    except Exception:
+    except (ImportError, AttributeError):
         pass
     try:
         from app.services.circuit_breaker import embeddings_cb
         embeddings_cb.reset()
-    except Exception:
+    except (ImportError, AttributeError):
         pass
 
 
