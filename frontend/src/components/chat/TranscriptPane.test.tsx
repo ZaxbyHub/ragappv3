@@ -92,6 +92,14 @@ vi.mock("@/lib/api", () => ({
 vi.mock("react-router-dom", () => ({
   useNavigate: () => mockNavigate,
 }));
+vi.mock("sonner", () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+    warning: vi.fn(),
+    info: vi.fn(),
+  },
+}));
 vi.mock("./MessageBubble", () => ({
   MessageBubble: ({ message, onFork, userInitial }: { message: { id: string; role: string; content: string }; onFork?: () => void; userInitial?: string }) => (
     <div data-testid="message-bubble" data-message-id={message.id} data-user-initial={userInitial}>
@@ -146,6 +154,7 @@ vi.mock("@tanstack/react-virtual", () => ({
 import { useSendMessage, MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
 import { useChatHistory } from "@/hooks/useChatHistory";
 import { forkChatSession } from "@/lib/api";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Helper to render Composer with required providers
@@ -327,6 +336,39 @@ describe("TranscriptPane", () => {
       );
       expect(mockRefreshHistory).toHaveBeenCalledTimes(1);
       expect(mockNavigate).toHaveBeenCalledWith("/chat/20");
+    });
+
+    it("does not load the transcript when the fork response has no messages (issue #83)", async () => {
+      vi.mocked(forkChatSession).mockResolvedValue({
+        id: 99,
+        vault_id: 1,
+        title: "Empty Branch",
+        created_at: "2026-05-15T00:00:00Z",
+        updated_at: "2026-05-15T00:00:00Z",
+        forked_from_session_id: 10,
+        fork_message_index: 1,
+        messages: [],
+      });
+      mockChatState.activeChatId = "10";
+      _mockMessageCount = 2;
+      setMockMessages([
+        { id: "m1", role: "user", content: "Question" },
+        { id: "m2", role: "assistant", content: "Answer" },
+      ]);
+
+      render(<TranscriptPane />);
+
+      await userEvent.click(screen.getByLabelText("Fork m2"));
+
+      await waitFor(() => expect(forkChatSession).toHaveBeenCalledTimes(1));
+      await waitFor(() =>
+        expect(toast.warning).toHaveBeenCalledWith(
+          expect.stringMatching(/no messages/i)
+        )
+      );
+      expect(mockChatState.loadChat).not.toHaveBeenCalled();
+      expect(mockRefreshHistory).not.toHaveBeenCalled();
+      expect(mockNavigate).not.toHaveBeenCalled();
     });
   });
 

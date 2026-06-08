@@ -408,6 +408,10 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     setIsForking(true);
     try {
       const forked = await forkChatSession(parseInt(activeChatId), msgIndex);
+      if (!forked.messages?.length) {
+        toast.warning("Fork returned no messages — staying on the current session.");
+        return;
+      }
       const forkMessages = forked.messages.map((m) => ({
         id: m.id.toString(),
         role: m.role as "user" | "assistant",
