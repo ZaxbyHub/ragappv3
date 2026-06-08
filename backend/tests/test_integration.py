@@ -374,6 +374,12 @@ class TestIntegration(unittest.TestCase):
         """Clean up temporary files."""
         import shutil
 
+        from app.main import app
+        from app.api.deps import get_current_active_user
+        from app.security import csrf_protect
+        app.dependency_overrides.pop(get_current_active_user, None)
+        app.dependency_overrides.pop(csrf_protect, None)
+
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 

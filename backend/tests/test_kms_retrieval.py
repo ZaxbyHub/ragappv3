@@ -65,12 +65,13 @@ class TestKMSRetrieval(unittest.TestCase):
         # Seed a vault and entries.
         conn = sqlite3.connect(self._db)
         try:
-            conn.execute("INSERT INTO vaults (id, name) VALUES (1, 'V1')")
-            conn.execute("INSERT INTO vaults (id, name) VALUES (2, 'V2')")
-            self._insert(conn, 1, "Onboarding Guide", "How to set up zlorptanium access.", "published")
-            self._insert(conn, 1, "Archived Note", "Old zlorptanium info.", "archived")
-            self._insert(conn, 1, "Draft Note", "Draft zlorptanium details.", "draft")
-            self._insert(conn, 2, "Other Vault", "Different zlorptanium entry.", "published")
+            # High IDs avoid conflicting with the Default vault auto-inserted by migrations.
+            conn.execute("INSERT INTO vaults (id, name) VALUES (100, 'V1')")
+            conn.execute("INSERT INTO vaults (id, name) VALUES (200, 'V2')")
+            self._insert(conn, 100, "Onboarding Guide", "How to set up zlorptanium access.", "published")
+            self._insert(conn, 100, "Archived Note", "Old zlorptanium info.", "archived")
+            self._insert(conn, 100, "Draft Note", "Draft zlorptanium details.", "draft")
+            self._insert(conn, 200, "Other Vault", "Different zlorptanium entry.", "published")
             conn.commit()
         finally:
             conn.close()
@@ -90,7 +91,7 @@ class TestKMSRetrieval(unittest.TestCase):
         )
 
     def test_returns_published_and_draft_excludes_archived(self):
-        results = self.service.retrieve("zlorptanium", vault_id=1)
+        results = self.service.retrieve("zlorptanium", vault_id=100)
         titles = {r.title for r in results}
         self.assertIn("Onboarding Guide", titles)
         self.assertIn("Draft Note", titles)
@@ -99,7 +100,7 @@ class TestKMSRetrieval(unittest.TestCase):
         self.assertNotIn("Other Vault", titles)
 
     def test_labels_assigned_sequentially(self):
-        results = self.service.retrieve("zlorptanium", vault_id=1)
+        results = self.service.retrieve("zlorptanium", vault_id=100)
         self.assertTrue(results)
         self.assertEqual(results[0].label_placeholder, "K1")
         for i, r in enumerate(results, 1):
@@ -111,16 +112,16 @@ class TestKMSRetrieval(unittest.TestCase):
 
     def test_disabled_returns_empty(self):
         settings.kms_enabled = False
-        self.assertEqual(self.service.retrieve("zlorptanium", vault_id=1), [])
+        self.assertEqual(self.service.retrieve("zlorptanium", vault_id=100), [])
 
     def test_no_match_returns_empty(self):
-        self.assertEqual(self.service.retrieve("nonexistentterm", vault_id=1), [])
+        self.assertEqual(self.service.retrieve("nonexistentterm", vault_id=100), [])
 
     def test_empty_query_returns_empty(self):
-        self.assertEqual(self.service.retrieve("!!! ???", vault_id=1), [])
+        self.assertEqual(self.service.retrieve("!!! ???", vault_id=100), [])
 
     def test_to_dict_shape(self):
-        results = self.service.retrieve("zlorptanium", vault_id=1)
+        results = self.service.retrieve("zlorptanium", vault_id=100)
         d = results[0].to_dict()
         for key in ("kms_label", "entry_id", "title", "excerpt", "score", "score_type"):
             self.assertIn(key, d)
