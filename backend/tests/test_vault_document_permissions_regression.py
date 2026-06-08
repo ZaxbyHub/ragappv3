@@ -58,19 +58,19 @@ def permission_client():
             (3, "member", "fake", "member"),
         )
         conn.execute(
-            "INSERT INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
             (1, "Default Vault", "", "private"),
         )
         conn.execute(
-            "INSERT INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
             (2, "Admin Vault", "", "private"),
         )
         conn.execute(
-            "INSERT INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
             (3, "Other Vault", "", "private"),
         )
         conn.execute(
-            "INSERT INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO vaults (id, name, description, visibility) VALUES (?, ?, ?, ?)",
             (4, "Public Vault", "", "public"),
         )
         conn.execute(

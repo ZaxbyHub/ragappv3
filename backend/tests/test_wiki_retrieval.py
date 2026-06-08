@@ -216,7 +216,7 @@ class TestWikiRetrievalEndToEnd(unittest.TestCase):
 
         conn = sqlite3.connect(db)
         try:
-            conn.execute("INSERT INTO vaults (id, name) VALUES (1, 'V1')")
+            conn.execute("INSERT OR REPLACE INTO vaults (id, name) VALUES (1, 'V1')")
             conn.execute(
                 "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, markdown, status) "
                 "VALUES (1, 1, 'runbook', 'Runbook', 'overview', '# Runbook', 'verified')"
