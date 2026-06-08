@@ -432,6 +432,8 @@ class TestIntegration(unittest.TestCase):
         self.assertIn("file_id", upload_data)
         # status is now 'pending' (queued for async processing), not 'indexed'
         self.assertIn(upload_data["status"], ["pending", "indexed"])
+        # Verify the upload actually enqueued background processing
+        app.state.background_processor.enqueue.assert_called_once()
 
         # Step 2: Verify document is listed
         response = client.get("/api/documents")
