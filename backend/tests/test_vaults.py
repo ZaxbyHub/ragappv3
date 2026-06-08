@@ -1696,11 +1696,15 @@ class TestVaultResponseOrgId(unittest.TestCase):
             "is_active": True,
             "must_change_password": False,
         }
+        from app.security import csrf_protect
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        self._csrf_protect = csrf_protect
         self._db_path = db_path
 
     def tearDown(self):
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_active_user, None)
+        app.dependency_overrides.pop(getattr(self, '_csrf_protect', None), None)
         if hasattr(self, '_connection_pool'):
             self._connection_pool.close_all()
         import shutil

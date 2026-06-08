@@ -229,6 +229,7 @@ class TestSettingsUpdateValidation(unittest.TestCase):
         app.dependency_overrides.pop(self._get_db, None)
         settings.users_enabled = self._orig_users_enabled
 
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
     def test_post_settings_valid_reranker_config(self):
         """Test POST /api/settings with valid reranker configuration."""
         payload = {
@@ -382,6 +383,7 @@ class TestSettingsUpdateValidation(unittest.TestCase):
 
         self.assertEqual(response.status_code, 422)
 
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
     def test_post_settings_valid_reranker_url(self):
         """Test POST /api/settings with valid reranker URL."""
         # reranker_url is now SSRF-validated at PUT time (like the other model
@@ -406,6 +408,7 @@ class TestSettingsUpdateValidation(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["reranker_url"], "")
 
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
     def test_post_settings_combined_new_fields(self):
         """Test POST /api/settings with multiple new fields in one request."""
         payload = {
