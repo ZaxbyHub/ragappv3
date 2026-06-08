@@ -64,6 +64,28 @@ def _bypass_csrf_for_csrf_naive_tests(request):
             os.environ[env_key] = prev
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Reset the in-memory rate limiter before every test.
+
+    Tests that share the FastAPI app instance share the same MemoryStorage
+    bucket. Without a reset, a test file that issues many requests to a
+    rate-limited endpoint can exhaust the quota and cause 429 errors in
+    subsequent test files, producing spurious failures.
+    """
+    try:
+        from app.limiter import limiter
+        limiter.reset()
+    except Exception:
+        pass
+    yield
+    try:
+        from app.limiter import limiter
+        limiter.reset()
+    except Exception:
+        pass
+
+
 def pytest_configure(config):
     """Called before test collection.
 
