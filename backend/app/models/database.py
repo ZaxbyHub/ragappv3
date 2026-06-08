@@ -2837,26 +2837,77 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
 
     Idempotent — if the CHECK constraints already exist (new databases), the
     function exits early after detecting them in the schema SQL.
+
+    Normalisation: any pre-existing value that is not a valid JSON array
+    (NULL, empty string, JSON null, objects, scalars, malformed JSON) is
+    silently coerced to '[]' during the backfill.  Uses json_valid() as the
+    outer guard so that truly malformed text (which would raise an
+    OperationalError inside json_type()) is handled safely.
     """
+    # Use autocommit mode so we can wrap DDL + DML in a single explicit
+    # transaction.  Python's sqlite3 with the default isolation_level=''
+    # auto-commits DDL statements (RENAME, CREATE TABLE) outside any
+    # implicit transaction, which would leave the database in a broken
+    # half-migrated state if the INSERT later fails.  Matches the pattern
+    # used by migrate_add_curator_claim_support and
+    # migrate_widen_wiki_claim_sources.
     conn = sqlite3.connect(sqlite_path)
+    conn.isolation_level = None
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
 
-        # Check if CHECK constraints already exist (fresh databases)
-        cursor = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='wiki_lint_findings'"
-        )
-        row = cursor.fetchone()
+        # Recovery prologue: if a prior run crashed after RENAME but before
+        # COMMIT, _wiki_lint_findings_old may be present alongside an empty
+        # (or absent) wiki_lint_findings.  Restore the canonical name so the
+        # rest of the migration can proceed correctly.
+        old_present = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='_wiki_lint_findings_old'"
+        ).fetchone()
+        new_present = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='wiki_lint_findings'"
+        ).fetchone()
+
+        if old_present and not new_present:
+            # Crashed after RENAME before CREATE TABLE; rename back and retry.
+            logger.warning(
+                "migrate_add_wiki_lint_findings_json_check: detected "
+                "_wiki_lint_findings_old without wiki_lint_findings; restoring."
+            )
+            conn.execute(
+                "ALTER TABLE _wiki_lint_findings_old "
+                "RENAME TO wiki_lint_findings"
+            )
+            old_present = None
+        elif old_present and new_present:
+            # Both tables exist: a prior INSERT failed after DDL committed.
+            # Drop the stale backup so the RENAME below won't collide.
+            logger.warning(
+                "migrate_add_wiki_lint_findings_json_check: detected stale "
+                "_wiki_lint_findings_old alongside wiki_lint_findings; "
+                "dropping stale table before re-running migration."
+            )
+            conn.execute("DROP TABLE _wiki_lint_findings_old")
+            old_present = None
+
+        # Check if the table exists at all
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='wiki_lint_findings'"
+        ).fetchone()
         if not row:
-            # Table doesn't exist yet — nothing to migrate
             return
-        schema_sql = row[0]
-        if "json_type(related_page_ids_json)" in schema_sql:
-            # CHECK constraints already present
+        if "json_type(related_page_ids_json)" in row[0]:
+            # CHECK constraints already present — nothing to do.
             return
 
-        # Recreate the table with CHECK constraints
-        conn.execute("ALTER TABLE wiki_lint_findings RENAME TO _wiki_lint_findings_old;")
+        # Wrap the entire RENAME → CREATE → INSERT → DROP sequence in one
+        # explicit transaction so a mid-migration failure is fully atomic.
+        conn.execute("BEGIN")
+        conn.execute(
+            "ALTER TABLE wiki_lint_findings RENAME TO _wiki_lint_findings_old"
+        )
         conn.execute("""
             CREATE TABLE wiki_lint_findings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2876,8 +2927,13 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
                     'open','acknowledged','resolved','dismissed')),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+            )
         """)
+        # Normalise: any value that is not a valid JSON array (NULL, empty
+        # string, JSON null, object, scalar, or malformed JSON) is coerced to
+        # '[]'.  json_valid() is used as the outer guard because json_type()
+        # raises OperationalError on malformed JSON (e.g. 'not-json'), while
+        # json_valid() returns 0 without raising for all invalid inputs.
         conn.execute("""
             INSERT INTO wiki_lint_findings
                 (id, vault_id, finding_type, severity, title, details,
@@ -2885,20 +2941,27 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
                  status, created_at, updated_at)
             SELECT
                 id, vault_id, finding_type, severity, title, details,
-                COALESCE(NULLIF(related_page_ids_json, ''), '[]'),
-                COALESCE(NULLIF(related_claim_ids_json, ''), '[]'),
+                CASE WHEN json_valid(related_page_ids_json)
+                          AND json_type(related_page_ids_json) = 'array'
+                     THEN related_page_ids_json ELSE '[]' END,
+                CASE WHEN json_valid(related_claim_ids_json)
+                          AND json_type(related_claim_ids_json) = 'array'
+                     THEN related_claim_ids_json ELSE '[]' END,
                 status, created_at, updated_at
-            FROM _wiki_lint_findings_old;
+            FROM _wiki_lint_findings_old
         """)
-        conn.execute("DROP TABLE _wiki_lint_findings_old;")
+        conn.execute("DROP TABLE _wiki_lint_findings_old")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_wiki_lint_findings_vault_status_severity
-            ON wiki_lint_findings(vault_id, status, severity);
+            ON wiki_lint_findings(vault_id, status, severity)
         """)
-        conn.commit()
+        conn.execute("COMMIT")
         logger.info("Added CHECK constraints to wiki_lint_findings JSON columns")
     except Exception:
-        conn.rollback()
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         conn.close()

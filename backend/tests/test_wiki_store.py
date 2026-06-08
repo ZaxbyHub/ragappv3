@@ -1291,4 +1291,10 @@ class TestWikiLintFindingJsonCheckConstraints(unittest.TestCase):
             "SELECT name FROM sqlite_master WHERE name='_wiki_lint_findings_old'"
         ).fetchone()
         self.assertIsNone(stale)
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO wiki_lint_findings "
+                "(vault_id, finding_type, severity, title, related_page_ids_json) "
+                "VALUES (1, 'orphan', 'low', 'bad', '{}')"
+            )
         conn.close()
