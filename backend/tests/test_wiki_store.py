@@ -990,3 +990,311 @@ class TestWikiClaimsUniqueConstraint(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(idx)
         conn.close()
+
+
+class TestWikiLintFindingJsonCheckConstraints(unittest.TestCase):
+    """Regression test for issue #107: CHECK(json_type(...)=array) on JSON columns."""
+
+    def _make_db(self) -> tuple:
+        from app.models.database import run_migrations
+
+        td = tempfile.mkdtemp()
+        db_path = str(Path(td) / "test.db")
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.row_factory = sqlite3.Row
+        conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'Test')")
+        conn.commit()
+        return conn, db_path
+
+    def _make_old_schema_db(self) -> tuple:
+        """Return (conn, db_path) with old schema (no CHECK constraints)."""
+        td = tempfile.mkdtemp()
+        db_path = str(Path(td) / "test.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE wiki_lint_findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                finding_type TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'medium',
+                title TEXT NOT NULL,
+                details TEXT DEFAULT '',
+                related_page_ids_json TEXT DEFAULT '[]',
+                related_claim_ids_json TEXT DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        return conn, db_path
+
+    def test_rejects_non_array_related_page_ids_json(self):
+        """INSERT with a non-array value for related_page_ids_json must fail."""
+        conn, _ = self._make_db()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO wiki_lint_findings
+                   (vault_id, finding_type, severity, title, related_page_ids_json)
+                   VALUES (1, 'orphan', 'low', 'test', '"not_an_array"')"""
+            )
+        conn.close()
+
+    def test_rejects_non_array_related_claim_ids_json(self):
+        """INSERT with a non-array value for related_claim_ids_json must fail."""
+        conn, _ = self._make_db()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO wiki_lint_findings
+                   (vault_id, finding_type, severity, title, related_claim_ids_json)
+                   VALUES (1, 'orphan', 'low', 'test', '42')"""
+            )
+        conn.close()
+
+    def test_rejects_null_in_json_column(self):
+        """INSERT with NULL for related_page_ids_json must fail (not an array)."""
+        conn, _ = self._make_db()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO wiki_lint_findings
+                   (vault_id, finding_type, severity, title, related_page_ids_json)
+                   VALUES (1, 'orphan', 'low', 'test', NULL)"""
+            )
+        conn.close()
+
+    def test_accepts_valid_empty_array(self):
+        """INSERT with '[]' should succeed (the default)."""
+        conn, _ = self._make_db()
+        conn.execute(
+            """INSERT INTO wiki_lint_findings
+               (vault_id, finding_type, severity, title)
+               VALUES (1, 'orphan', 'low', 'test')"""
+        )
+        row = conn.execute(
+            "SELECT related_page_ids_json, related_claim_ids_json "
+            "FROM wiki_lint_findings WHERE vault_id = 1"
+        ).fetchone()
+        self.assertEqual(row[0], "[]")
+        self.assertEqual(row[1], "[]")
+        conn.close()
+
+    def test_accepts_valid_nonempty_array(self):
+        """INSERT with a valid JSON array of IDs should succeed."""
+        conn, _ = self._make_db()
+        conn.execute(
+            """INSERT INTO wiki_lint_findings
+               (vault_id, finding_type, severity, title,
+                related_page_ids_json, related_claim_ids_json)
+               VALUES (1, 'orphan', 'low', 'test', '[1,2,3]', '[10]')"""
+        )
+        row = conn.execute(
+            "SELECT related_page_ids_json FROM wiki_lint_findings WHERE vault_id = 1"
+        ).fetchone()
+        self.assertEqual(row[0], "[1,2,3]")
+        conn.close()
+
+    def test_migration_idempotent(self):
+        """Running the migration on an already-migrated database is a no-op."""
+        from app.models.database import migrate_add_wiki_lint_findings_json_check
+
+        conn, db_path = self._make_db()
+        conn.close()
+        # Should not raise on second run
+        migrate_add_wiki_lint_findings_json_check(db_path)
+        migrate_add_wiki_lint_findings_json_check(db_path)
+
+    def test_migration_backfills_check_on_old_schema(self):
+        """Migration adds CHECK constraints to a table created without them."""
+        from app.models.database import migrate_add_wiki_lint_findings_json_check
+
+        td = tempfile.mkdtemp()
+        db_path = str(Path(td) / "test.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE wiki_lint_findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                finding_type TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'medium',
+                title TEXT NOT NULL,
+                details TEXT DEFAULT '',
+                related_page_ids_json TEXT DEFAULT '[]',
+                related_claim_ids_json TEXT DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute(
+            """INSERT INTO wiki_lint_findings
+               (vault_id, finding_type, severity, title,
+                related_page_ids_json, related_claim_ids_json)
+               VALUES (1, 'orphan', 'low', 'old finding', '[1]', '[2]')"""
+        )
+        conn.commit()
+        conn.close()
+        migrate_add_wiki_lint_findings_json_check(db_path)
+
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT title, related_page_ids_json FROM wiki_lint_findings"
+        ).fetchone()
+        self.assertEqual(row[0], "old finding")
+        self.assertEqual(row[1], "[1]")
+
+        # CHECK constraint now rejects non-array values
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO wiki_lint_findings
+                   (vault_id, finding_type, severity, title, related_page_ids_json)
+                   VALUES (1, 'orphan', 'low', 'bad', 'null')"""
+            )
+        conn.close()
+
+    def test_migration_normalises_null_to_empty_array(self):
+        """Migration coerces NULL values in JSON columns to '[]'."""
+        from app.models.database import migrate_add_wiki_lint_findings_json_check
+
+        conn, db_path = self._make_old_schema_db()
+        conn.execute(
+            "INSERT INTO wiki_lint_findings "
+            "(vault_id, finding_type, severity, title, "
+            " related_page_ids_json, related_claim_ids_json) "
+            "VALUES (1, 'orphan', 'low', 'null-row', NULL, NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        migrate_add_wiki_lint_findings_json_check(db_path)
+
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT related_page_ids_json, related_claim_ids_json "
+            "FROM wiki_lint_findings WHERE title='null-row'"
+        ).fetchone()
+        self.assertEqual(row[0], "[]")
+        self.assertEqual(row[1], "[]")
+        conn.close()
+
+    def test_migration_normalises_non_array_json_to_empty_array(self):
+        """Migration coerces non-array JSON ('null', '{}', '42') to '[]'."""
+        from app.models.database import migrate_add_wiki_lint_findings_json_check
+
+        conn, db_path = self._make_old_schema_db()
+        rows = [
+            (1, "orphan", "low", "json-null",    "null",    "null"),
+            (1, "orphan", "low", "json-object",  "{}",      "{}"),
+            (1, "orphan", "low", "json-number",  "42",      "42"),
+            (1, "orphan", "low", "json-string",  '"hello"', '"world"'),
+        ]
+        conn.executemany(
+            "INSERT INTO wiki_lint_findings "
+            "(vault_id, finding_type, severity, title, "
+            " related_page_ids_json, related_claim_ids_json) "
+            "VALUES (?,?,?,?,?,?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+
+        migrate_add_wiki_lint_findings_json_check(db_path)
+
+        conn = sqlite3.connect(db_path)
+        migrated = {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                "SELECT title, related_page_ids_json, related_claim_ids_json "
+                "FROM wiki_lint_findings"
+            ).fetchall()
+        }
+        conn.close()
+        for title in ("json-null", "json-object", "json-number", "json-string"):
+            self.assertEqual(migrated[title], ("[]", "[]"), msg=f"row '{title}'")
+
+    def test_migration_preserves_valid_arrays_and_normalises_invalid(self):
+        """Migration preserves valid arrays; drifted values become '[]'."""
+        from app.models.database import migrate_add_wiki_lint_findings_json_check
+
+        conn, db_path = self._make_old_schema_db()
+        conn.execute(
+            "INSERT INTO wiki_lint_findings "
+            "(vault_id, finding_type, severity, title, "
+            " related_page_ids_json, related_claim_ids_json) "
+            "VALUES (1, 'orphan', 'low', 'valid', '[1,2,3]', '[10]')"
+        )
+        conn.execute(
+            "INSERT INTO wiki_lint_findings "
+            "(vault_id, finding_type, severity, title, "
+            " related_page_ids_json, related_claim_ids_json) "
+            "VALUES (1, 'stale', 'medium', 'drifted', 'not-json', '{}')"
+        )
+        conn.commit()
+        conn.close()
+
+        migrate_add_wiki_lint_findings_json_check(db_path)
+
+        conn = sqlite3.connect(db_path)
+        migrated = {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                "SELECT title, related_page_ids_json, related_claim_ids_json "
+                "FROM wiki_lint_findings"
+            ).fetchall()
+        }
+        conn.close()
+        self.assertEqual(migrated["valid"],   ("[1,2,3]", "[10]"))
+        self.assertEqual(migrated["drifted"], ("[]",      "[]"))
+
+    def test_migration_recovery_from_partial_commit(self):
+        """Recovery prologue handles a stale _wiki_lint_findings_old table."""
+        from app.models.database import migrate_add_wiki_lint_findings_json_check
+
+        # Simulate a prior run that crashed after RENAME but before CREATE:
+        # _wiki_lint_findings_old exists, wiki_lint_findings does not.
+        td = tempfile.mkdtemp()
+        db_path = str(Path(td) / "test.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE _wiki_lint_findings_old (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                finding_type TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'medium',
+                title TEXT NOT NULL,
+                details TEXT DEFAULT '',
+                related_page_ids_json TEXT DEFAULT '[]',
+                related_claim_ids_json TEXT DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute(
+            "INSERT INTO _wiki_lint_findings_old "
+            "(vault_id, finding_type, severity, title) "
+            "VALUES (1, 'orphan', 'low', 'rescued')"
+        )
+        conn.commit()
+        conn.close()
+
+        migrate_add_wiki_lint_findings_json_check(db_path)
+
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT title, related_page_ids_json FROM wiki_lint_findings"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "rescued")
+        self.assertEqual(row[1], "[]")
+        stale = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='_wiki_lint_findings_old'"
+        ).fetchone()
+        self.assertIsNone(stale)
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO wiki_lint_findings "
+                "(vault_id, finding_type, severity, title, related_page_ids_json) "
+                "VALUES (1, 'orphan', 'low', 'bad', '{}')"
+            )
+        conn.close()
