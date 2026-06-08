@@ -66,22 +66,35 @@ def _bypass_csrf_for_csrf_naive_tests(request):
 
 @pytest.fixture(autouse=True)
 def _reset_rate_limiter():
-    """Reset the in-memory rate limiter before every test.
+    """Reset the in-memory rate limiter and circuit breakers before every test.
 
     Tests that share the FastAPI app instance share the same MemoryStorage
     bucket. Without a reset, a test file that issues many requests to a
     rate-limited endpoint can exhaust the quota and cause 429 errors in
     subsequent test files, producing spurious failures.
+
+    Similarly, tests that trip the embeddings circuit breaker leave it open for
+    subsequent tests.
     """
     try:
         from app.limiter import limiter
         limiter.reset()
     except Exception:
         pass
+    try:
+        from app.services.circuit_breaker import embeddings_cb
+        embeddings_cb.reset()
+    except Exception:
+        pass
     yield
     try:
         from app.limiter import limiter
         limiter.reset()
+    except Exception:
+        pass
+    try:
+        from app.services.circuit_breaker import embeddings_cb
+        embeddings_cb.reset()
     except Exception:
         pass
 

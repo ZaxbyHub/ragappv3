@@ -341,6 +341,8 @@ class EmbeddingService:
             EmbeddingError: If the API request fails or returns non-200 status.
         """
         # Validate text input
+        if text is None:
+            raise EmbeddingError("Text cannot be None")
         if not text.strip():
             raise EmbeddingError("Text cannot be empty or whitespace only")
 
@@ -499,6 +501,8 @@ class EmbeddingService:
         effective_max = self.MAX_TEXT_LENGTH - prefix_len
 
         for idx, text in enumerate(texts):
+            if text is None:
+                raise EmbeddingError(f"Text at index {idx} is None")
             if not text.strip():
                 raise EmbeddingError(f"Text at index {idx} is empty or whitespace only")
             if len(text) > effective_max:
