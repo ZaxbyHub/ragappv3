@@ -33,6 +33,7 @@ from app.api.deps import (
     require_role,
     require_vault_permission,
 )
+from app.services.auth_service import TokenInvalidError
 
 # =============================================================================
 # AUTH HEADER INJECTION TESTS
@@ -64,7 +65,7 @@ class TestAuthHeaderInjection:
                 # Should either reject or safely handle the malformed sub
                 with pytest.raises((HTTPException, ValueError, sqlite3.InterfaceError)):
                     await get_current_active_user(
-                        authorization="Bearer valid.token.here", db=mock_db
+                        request=MagicMock(), authorization="Bearer valid.token.here", db=mock_db
                     )
 
     @pytest.mark.asyncio
@@ -83,7 +84,7 @@ class TestAuthHeaderInjection:
             # Should reject header with newlines
             with pytest.raises(HTTPException) as exc_info:
                 await get_current_active_user(
-                    authorization=malicious_auth, db=MagicMock()
+                    request=MagicMock(), authorization=malicious_auth, db=MagicMock()
                 )
 
             # Should not accept the malformed header
@@ -102,7 +103,7 @@ class TestAuthHeaderInjection:
 
             with pytest.raises(HTTPException) as exc_info:
                 await get_current_active_user(
-                    authorization=malicious_auth, db=MagicMock()
+                    request=MagicMock(), authorization=malicious_auth, db=MagicMock()
                 )
 
             assert exc_info.value.status_code in [401, 403]
@@ -131,13 +132,15 @@ class TestOversizedToken:
 
             with patch("app.api.deps.decode_access_token") as mock_decode:
                 # Should handle or reject oversized token
-                mock_decode.return_value = None  # Token invalid/expired
+                mock_decode.side_effect = TokenInvalidError("Invalid token")
 
                 mock_db = MagicMock()
 
                 # Should either reject oversized token or handle gracefully
                 with pytest.raises(HTTPException) as exc_info:
-                    await get_current_active_user(authorization=auth_header, db=mock_db)
+                    await get_current_active_user(
+                        request=MagicMock(), authorization=auth_header, db=mock_db
+                    )
 
                 assert exc_info.value.status_code in [401, 403]
 
@@ -156,12 +159,14 @@ class TestOversizedToken:
 
             with patch("app.api.deps.decode_access_token") as mock_decode:
                 # JWT library should reject null bytes
-                mock_decode.return_value = None
+                mock_decode.side_effect = TokenInvalidError("Invalid token")
 
                 mock_db = MagicMock()
 
                 with pytest.raises(HTTPException) as exc_info:
-                    await get_current_active_user(authorization=auth_header, db=mock_db)
+                    await get_current_active_user(
+                        request=MagicMock(), authorization=auth_header, db=mock_db
+                    )
 
                 assert exc_info.value.status_code in [401, 403]
 
@@ -240,9 +245,17 @@ class TestEvaluatePolicyNegativeResourceId:
         """
         principal = {"id": 1, "role": "admin"}
 
-        result = await evaluate_policy(
-            principal=principal, resource_type="vault", resource_id=-1, action="read"
-        )
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        mock_conn.execute.return_value = mock_cursor
+        mock_pool = MagicMock()
+        mock_pool.get_connection.return_value = mock_conn
+
+        with patch("app.api.deps.get_pool", return_value=mock_pool):
+            result = await evaluate_policy(
+                principal=principal, resource_type="vault", resource_id=-1, action="read"
+            )
 
         # Admin role grants read access to all vaults (by design)
         assert result is True
@@ -291,9 +304,17 @@ class TestEvaluatePolicyZeroResourceId:
         """
         principal = {"id": 1, "role": "admin"}
 
-        result = await evaluate_policy(
-            principal=principal, resource_type="vault", resource_id=0, action="read"
-        )
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = []
+        mock_conn.execute.return_value = mock_cursor
+        mock_pool = MagicMock()
+        mock_pool.get_connection.return_value = mock_conn
+
+        with patch("app.api.deps.get_pool", return_value=mock_pool):
+            result = await evaluate_policy(
+                principal=principal, resource_type="vault", resource_id=0, action="read"
+            )
 
         # Admin role grants read access to all vaults (by design)
         assert result is True

@@ -298,6 +298,13 @@ class TestUserGroupMembershipSetup:
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "test.db")
 
+        # Ensure settings.users_enabled=True so JWT tokens are accepted.
+        # The conftest may have loaded settings with users_enabled=False via a
+        # prior test file; mutate it here and restore on teardown.
+        from app.config import settings as _app_settings
+        self._prev_users_enabled = _app_settings.users_enabled
+        _app_settings.users_enabled = True
+
         # Clear the global pool cache to ensure test isolation
         from app.models.database import _pool_cache
 
@@ -392,6 +399,10 @@ class TestUserGroupMembershipSetup:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
+
+        # Restore settings
+        from app.config import settings as _app_settings
+        _app_settings.users_enabled = self._prev_users_enabled
 
         # Restore original get_pool
         users.get_pool = self.original_get_pool
@@ -713,6 +724,11 @@ class TestVaultGroupMembershipSetup:
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "test.db")
 
+        # Ensure settings.users_enabled=True so JWT tokens are accepted.
+        from app.config import settings as _app_settings
+        self._prev_users_enabled = _app_settings.users_enabled
+        _app_settings.users_enabled = True
+
         # Clear the global pool cache to ensure test isolation
         from app.models.database import _pool_cache
 
@@ -805,6 +821,10 @@ class TestVaultGroupMembershipSetup:
         self.client.close()
         _pool_cache.clear()
         self.conn.close()
+
+        # Restore settings
+        from app.config import settings as _app_settings
+        _app_settings.users_enabled = self._prev_users_enabled
 
         # Restore original get_pool
         deps.get_pool = self.original_deps_pool
