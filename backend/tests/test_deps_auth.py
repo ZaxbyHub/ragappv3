@@ -654,7 +654,7 @@ class TestGetUserAccessibleVaultIds:
         user = {"id": 1, "role": "superadmin"}
         mock_conn, mock_cursor = mock_db
 
-        result = get_user_accessible_vault_ids(user, mock_conn)
+        result = await get_user_accessible_vault_ids(user, mock_conn)
 
         assert result == []
 
@@ -666,7 +666,7 @@ class TestGetUserAccessibleVaultIds:
         user = {"id": 2, "role": "admin"}
         mock_conn, mock_cursor = mock_db
 
-        result = get_user_accessible_vault_ids(user, mock_conn)
+        result = await get_user_accessible_vault_ids(user, mock_conn)
 
         assert result == []
 
@@ -688,10 +688,11 @@ class TestGetUserAccessibleVaultIds:
             [(10,), (20,)],   # vault IDs from SELECT id FROM vaults
             [(10, 'read'), (20, 'write')],  # vault_members permissions
             [],                # vault_group_access
-            [],                # vaults visibility
+            [],                # vaults visibility=public
+            [],                # vaults visibility=org
         ]
 
-        result = get_user_accessible_vault_ids(user, mock_conn)
+        result = await get_user_accessible_vault_ids(user, mock_conn)
 
         assert sorted(result) == [10, 20]
 
@@ -707,10 +708,11 @@ class TestGetUserAccessibleVaultIds:
             [(30,), (40,)],   # vault IDs from SELECT id FROM vaults
             [],                # vault_members
             [(30, 'read'), (40, 'write')],  # vault_group_access
-            [],                # vaults visibility
+            [],                # vaults visibility=public
+            [],                # vaults visibility=org
         ]
 
-        result = get_user_accessible_vault_ids(user, mock_conn)
+        result = await get_user_accessible_vault_ids(user, mock_conn)
 
         assert sorted(result) == [30, 40]
 
@@ -728,10 +730,11 @@ class TestGetUserAccessibleVaultIds:
             [(10,), (20,), (30,)],  # vault IDs from SELECT id FROM vaults
             [(10, 'read'), (20, 'read')],  # vault_members
             [(20, 'read'), (30, 'read')],  # vault_group_access
-            [],                # vaults visibility
+            [],                # vaults visibility=public
+            [],                # vaults visibility=org
         ]
 
-        result = get_user_accessible_vault_ids(user, mock_conn)
+        result = await get_user_accessible_vault_ids(user, mock_conn)
 
         # Should be deduplicated and sorted
         assert sorted(result) == [10, 20, 30]
@@ -744,10 +747,10 @@ class TestGetUserAccessibleVaultIds:
         user = {"id": 3, "role": "member"}
         mock_conn, mock_cursor = mock_db
 
-        # Both queries return empty
-        mock_cursor.fetchall.side_effect = [[], []]
+        # All queries return empty
+        mock_cursor.fetchall.side_effect = [[], [], [], [], []]
 
-        result = get_user_accessible_vault_ids(user, mock_conn)
+        result = await get_user_accessible_vault_ids(user, mock_conn)
 
         assert result == []
 
@@ -976,7 +979,7 @@ class TestEvaluatePolicy:
             (1, 2, "admin"),
         )
 
-        assert get_effective_vault_permission(conn, admin, 1) == "admin"
+        assert await get_effective_vault_permission(conn, admin, 1) == "admin"
         assert await _evaluate_policy(conn, admin, "vault", 1, "admin") is True
         assert await _evaluate_policy(conn, admin, "vault", 1, "delete") is True
 
@@ -1000,11 +1003,11 @@ class TestEvaluatePolicy:
             (1, 10, "admin"),
         )
 
-        assert get_effective_vault_permission(conn, member, 1) == "admin"
+        assert await get_effective_vault_permission(conn, member, 1) == "admin"
         assert await _evaluate_policy(conn, member, "vault", 1, "delete") is True
 
         public_only = {"id": 5, "role": "member"}
-        assert get_effective_vault_permission(conn, public_only, 3) == "read"
+        assert await get_effective_vault_permission(conn, public_only, 3) == "read"
         assert await _evaluate_policy(conn, public_only, "vault", 3, "read") is True
         assert await _evaluate_policy(conn, public_only, "vault", 3, "write") is False
 
@@ -1018,19 +1021,19 @@ class TestEvaluatePolicy:
         non_member = {"id": 6, "role": "member"}
 
         # vault 4 is public but scoped to org 10 — non-member cannot access
-        assert get_effective_vault_permission(conn, non_member, 4) is None
+        assert await get_effective_vault_permission(conn, non_member, 4) is None
         assert await _evaluate_policy(conn, non_member, "vault", 4, "read") is False
 
         # vault 3 is public with no org_id — still globally accessible regardless of membership
-        assert get_effective_vault_permission(conn, non_member, 3) == "read"
+        assert await get_effective_vault_permission(conn, non_member, 3) == "read"
         assert await _evaluate_policy(conn, non_member, "vault", 3, "read") is True
 
         # Org member (user 5, member of org 10) can access vault 4
         org_member = {"id": 5, "role": "member"}
-        assert get_effective_vault_permission(conn, org_member, 4) == "read"
+        assert await get_effective_vault_permission(conn, org_member, 4) == "read"
         assert await _evaluate_policy(conn, org_member, "vault", 4, "read") is True
 
-    def test_get_effective_vault_permissions_batches_permission_queries(self):
+    async def test_get_effective_vault_permissions_batches_permission_queries(self):
         """Multiple vault permissions are resolved with constant-query batching."""
         from app.api.deps import get_effective_vault_permissions
 
@@ -1053,7 +1056,7 @@ class TestEvaluatePolicy:
         statements = []
         conn.set_trace_callback(statements.append)
 
-        assert get_effective_vault_permissions(conn, member, [1, 2, 3]) == {
+        assert await get_effective_vault_permissions(conn, member, [1, 2, 3]) == {
             1: "read",
             2: "admin",
             3: "read",
@@ -1064,9 +1067,9 @@ class TestEvaluatePolicy:
             for statement in statements
             if statement.lstrip().upper().startswith("SELECT")
         )
-        assert select_count == 3
+        assert select_count == 4
 
-    def test_get_user_accessible_vault_ids_includes_public_read(self):
+    async def test_get_user_accessible_vault_ids_includes_public_read(self):
         """Accessible vault enumeration includes effective public read access."""
         from app.api.deps import get_user_accessible_vault_ids
 
@@ -1074,9 +1077,9 @@ class TestEvaluatePolicy:
         user = {"id": 5, "role": "member"}
 
         # user 5 is now an org_member of org 10, so they also see vault 4 (org-scoped public)
-        assert sorted(get_user_accessible_vault_ids(user, conn)) == [3, 4]
+        assert sorted(await get_user_accessible_vault_ids(user, conn)) == [3, 4]
 
-    def test_get_user_accessible_vault_ids_excludes_org_scoped_public_for_non_member(self):
+    async def test_get_user_accessible_vault_ids_excludes_org_scoped_public_for_non_member(self):
         """Non-org-member cannot access public vault with non-null org_id."""
         from app.api.deps import get_user_accessible_vault_ids
 
@@ -1084,7 +1087,7 @@ class TestEvaluatePolicy:
         # user 6 has no org_membership in org 10 (only user 5 does)
         non_member = {"id": 6, "role": "member"}
 
-        result = get_user_accessible_vault_ids(non_member, conn)
+        result = await get_user_accessible_vault_ids(non_member, conn)
 
         # vault 4 is public but org-scoped (org_id=10) — non-member must not see it
         assert 4 not in result

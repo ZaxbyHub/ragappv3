@@ -25,6 +25,19 @@ import pytest
 from app.services.vector_store import VectorStore
 
 
+def _table_mock():
+    """VectorStore table mock with async stubs for count_rows, list_indices, and search."""
+    t = MagicMock()
+    t.count_rows = AsyncMock(return_value=0)
+    t.list_indices = AsyncMock(return_value=[])
+    # Single-scale path: table.search → query with chainable limit().to_list()
+    query_mock = MagicMock()
+    query_mock.where.return_value = query_mock
+    query_mock.limit.return_value.to_list = AsyncMock(return_value=[])
+    t.search = AsyncMock(return_value=query_mock)
+    return t
+
+
 class TestAdversarialLargeScaleCount(unittest.IsolatedAsyncioTestCase):
     """Test with large number of scales to verify semaphore prevents resource exhaustion."""
 
@@ -39,8 +52,9 @@ class TestAdversarialLargeScaleCount(unittest.IsolatedAsyncioTestCase):
 
     def create_vector_store(self) -> VectorStore:
         store = VectorStore(db_path=self.db_path)
-        store.table = MagicMock()
+        store.table = _table_mock()
         store._embedding_dim = self.embedding_dim
+        store._search_semaphore = asyncio.Semaphore(4)
         return store
 
     @pytest.mark.asyncio
@@ -76,7 +90,7 @@ class TestAdversarialLargeScaleCount(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # Generate 20 scales
         scales = [str(128 * (i + 1)) for i in range(20)]
@@ -108,8 +122,9 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
 
     def create_vector_store(self) -> VectorStore:
         store = VectorStore(db_path=self.db_path)
-        store.table = MagicMock()
+        store.table = _table_mock()
         store._embedding_dim = self.embedding_dim
+        store._search_semaphore = asyncio.Semaphore(4)
         return store
 
     @pytest.mark.asyncio
@@ -127,6 +142,7 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
             vault_id=None,
             query_text="",
             hybrid=True,
+            **kwargs,
         ):
             queried_scales.append(scale)
             return [{"id": f"doc_{scale}", "text": f"From {scale}", "_rrf_score": 0.5}]
@@ -136,12 +152,13 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # Scale string with whitespace
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_chunk_sizes = " 512 , 1024 , 2048 "
+            mock_settings.multi_scale_rrf_k = 60
 
             await store.search(embedding=[0.0] * self.embedding_dim, limit=10)
 
@@ -164,6 +181,7 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
             vault_id=None,
             query_text="",
             hybrid=True,
+            **kwargs,
         ):
             queried_scales.append(scale)
             return [{"id": f"doc_{scale}", "text": f"From {scale}", "_rrf_score": 0.5}]
@@ -173,12 +191,13 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # Scale string with duplicates - code doesn't deduplicate, tests behavior
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_chunk_sizes = "512,512,1024,1024"
+            mock_settings.multi_scale_rrf_k = 60
 
             await store.search(embedding=[0.0] * self.embedding_dim, limit=10)
 
@@ -200,6 +219,7 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
             vault_id=None,
             query_text="",
             hybrid=True,
+            **kwargs,
         ):
             queried_scales.append(scale)
             return [{"id": f"doc_{scale}", "text": f"From {scale}", "_rrf_score": 0.5}]
@@ -209,12 +229,13 @@ class TestAdversarialScaleStringParsing(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # Scale string with empty entries
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_chunk_sizes = "512,,1024,"
+            mock_settings.multi_scale_rrf_k = 60
 
             await store.search(embedding=[0.0] * self.embedding_dim, limit=10)
 
@@ -236,8 +257,9 @@ class TestAdversarialExceptions(unittest.IsolatedAsyncioTestCase):
 
     def create_vector_store(self) -> VectorStore:
         store = VectorStore(db_path=self.db_path)
-        store.table = MagicMock()
+        store.table = _table_mock()
         store._embedding_dim = self.embedding_dim
+        store._search_semaphore = asyncio.Semaphore(4)
         return store
 
     @pytest.mark.asyncio
@@ -253,6 +275,7 @@ class TestAdversarialExceptions(unittest.IsolatedAsyncioTestCase):
             vault_id=None,
             query_text="",
             hybrid=True,
+            **kwargs,
         ):
             if scale in ("512", "768"):
                 raise RuntimeError(f"Simulated failure for scale {scale}")
@@ -267,11 +290,12 @@ class TestAdversarialExceptions(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_chunk_sizes = "512,768,1024,1536,2048"
+            mock_settings.multi_scale_rrf_k = 60
 
             # Should NOT raise - return_exceptions=True should catch all
             results = await store.search(embedding=[0.0] * self.embedding_dim, limit=10)
@@ -302,7 +326,7 @@ class TestAdversarialExceptions(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = True
@@ -330,8 +354,9 @@ class TestAdversarialConcurrency(unittest.IsolatedAsyncioTestCase):
 
     def create_vector_store(self) -> VectorStore:
         store = VectorStore(db_path=self.db_path)
-        store.table = MagicMock()
+        store.table = _table_mock()
         store._embedding_dim = self.embedding_dim
+        store._search_semaphore = asyncio.Semaphore(4)
         return store
 
     @pytest.mark.asyncio
@@ -362,7 +387,7 @@ class TestAdversarialConcurrency(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = True
@@ -395,8 +420,9 @@ class TestAdversarialInvalidConfig(unittest.IsolatedAsyncioTestCase):
 
     def create_vector_store(self) -> VectorStore:
         store = VectorStore(db_path=self.db_path)
-        store.table = MagicMock()
+        store.table = _table_mock()
         store._embedding_dim = self.embedding_dim
+        store._search_semaphore = asyncio.Semaphore(4)
         return store
 
     @pytest.mark.asyncio
@@ -424,7 +450,7 @@ class TestAdversarialInvalidConfig(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # Single "0" scale should not enter multi-scale branch
         with patch("app.services.vector_store.settings") as mock_settings:
@@ -459,7 +485,7 @@ class TestAdversarialInvalidConfig(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = True
@@ -485,8 +511,9 @@ class TestAdversarialSQLInjection(unittest.IsolatedAsyncioTestCase):
 
     def create_vector_store(self) -> VectorStore:
         store = VectorStore(db_path=self.db_path)
-        store.table = MagicMock()
+        store.table = _table_mock()
         store._embedding_dim = self.embedding_dim
+        store._search_semaphore = asyncio.Semaphore(4)
         return store
 
     @pytest.mark.asyncio
@@ -515,7 +542,7 @@ class TestAdversarialSQLInjection(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # SQL injection attempt in vault_id
         injection_vault_id = "'; DROP TABLE chunks; --"
@@ -556,7 +583,7 @@ class TestAdversarialSQLInjection(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # SQL injection in filter_expr - user-provided filter_expr is passed through as-is
         injection_filter = "1=1; DROP TABLE chunks; --"
@@ -590,8 +617,9 @@ class TestAdversarialLargeFetchK(unittest.IsolatedAsyncioTestCase):
 
     def create_vector_store(self) -> VectorStore:
         store = VectorStore(db_path=self.db_path)
-        store.table = MagicMock()
+        store.table = _table_mock()
         store._embedding_dim = self.embedding_dim
+        store._search_semaphore = asyncio.Semaphore(4)
         return store
 
     @pytest.mark.asyncio
@@ -610,6 +638,7 @@ class TestAdversarialLargeFetchK(unittest.IsolatedAsyncioTestCase):
             vault_id=None,
             query_text="",
             hybrid=True,
+            **kwargs,
         ):
             captured_fetch_k.append(fetch_k)
             return [{"id": f"doc_{scale}", "text": f"From {scale}", "_rrf_score": 0.5}]
@@ -619,12 +648,13 @@ class TestAdversarialLargeFetchK(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # Very large limit triggers large fetch_k = limit * 2
         with patch("app.services.vector_store.settings") as mock_settings:
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_chunk_sizes = "512,1024"
+            mock_settings.multi_scale_rrf_k = 60
 
             await store.search(embedding=[0.0] * self.embedding_dim, limit=1000000)
 
@@ -646,8 +676,9 @@ class TestAdversarialSemaphoreEdgeCases(unittest.IsolatedAsyncioTestCase):
 
     def create_vector_store(self) -> VectorStore:
         store = VectorStore(db_path=self.db_path)
-        store.table = MagicMock()
+        store.table = _table_mock()
         store._embedding_dim = self.embedding_dim
+        store._search_semaphore = asyncio.Semaphore(4)
         return store
 
     @pytest.mark.asyncio
@@ -687,7 +718,7 @@ class TestAdversarialSemaphoreEdgeCases(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         store.db = mock_db
-        store.table = MagicMock()
+        store.table = _table_mock()
 
         # Use 8 scales to test concurrency
         with patch("app.services.vector_store.settings") as mock_settings:

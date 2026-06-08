@@ -31,7 +31,7 @@ class TestNoneThresholdLoggingFix:
             engine.retrieval_window = 0
             return engine
 
-    def test_none_max_distance_none_relevance_threshold_no_filtering(self, engine, caplog):
+    async def test_none_max_distance_none_relevance_threshold_no_filtering(self, engine, caplog):
         """
         ATTACK: Both thresholds are None - no filtering should occur.
 
@@ -50,7 +50,7 @@ class TestNoneThresholdLoggingFix:
 
         with caplog.at_level(logging.WARNING):
             # This should NOT raise TypeError
-            result = engine._filter_relevant(results)
+            result = await engine._filter_relevant(results)
 
         # With no threshold, all results should pass through (no filtering)
         assert len(result) == 2
@@ -60,11 +60,13 @@ class TestNoneThresholdLoggingFix:
         fallback_warnings = [m for m in warning_messages if 'Threshold filtering removed all' in str(m)]
         assert len(fallback_warnings) == 0, "No fallback expected when no threshold is set"
 
-    def test_none_max_distance_with_relevance_threshold_logging(self, engine, caplog):
+    async def test_none_max_distance_with_relevance_threshold_logging(self, engine, caplog):
         """
         ATTACK: max_distance_threshold is None but relevance_threshold has value.
 
-        The fix should use relevance_threshold value in the log message.
+        Scores 0.1 and 0.2 are both below relevance_threshold=0.3, so both are
+        filtered out. The old fallback-to-all behavior was removed; the current
+        implementation returns [] and sets no_match=True.
         """
         engine.max_distance_threshold = None
         engine.relevance_threshold = 0.3
@@ -75,21 +77,23 @@ class TestNoneThresholdLoggingFix:
         ]
 
         with caplog.at_level(logging.WARNING):
-            result = engine._filter_relevant(results)
+            result = await engine._filter_relevant(results)
 
-        assert len(result) > 0
+        # All results are below threshold; no fallback: returns empty list
+        assert len(result) == 0
+        assert engine.document_retrieval.no_match is True
 
-        # Verify the warning was logged with the relevance_threshold value
+        # No fallback warning should be logged
         warning_messages = [r.message for r in caplog.records if r.levelname == 'WARNING']
-        fallback_warnings = [m for m in warning_messages if 'max_distance_threshold' in str(m)]
-        assert len(fallback_warnings) > 0
+        fallback_warnings = [m for m in warning_messages if 'Threshold filtering removed all' in str(m)]
+        assert len(fallback_warnings) == 0
 
-        # The warning should contain the threshold value (0.3)
-        assert '0.300' in str(fallback_warnings[0]) or '0.3' in str(fallback_warnings[0])
-
-    def test_valid_max_distance_threshold_logging(self, engine, caplog):
+    async def test_valid_max_distance_threshold_logging(self, engine, caplog):
         """
-        CONTROL: Valid max_distance_threshold should format with %.3f normally.
+        CONTROL: Valid max_distance_threshold=0.75 filters distances 0.8 and 0.9.
+
+        Both distances exceed the threshold; the old fallback-to-all behavior was
+        removed. Current implementation returns [] and sets no_match=True.
         """
         engine.max_distance_threshold = 0.75
         engine.relevance_threshold = 0.5
@@ -100,21 +104,23 @@ class TestNoneThresholdLoggingFix:
         ]
 
         with caplog.at_level(logging.WARNING):
-            result = engine._filter_relevant(results)
+            result = await engine._filter_relevant(results)
 
-        assert len(result) > 0
+        # All results exceed threshold; no fallback: returns empty list
+        assert len(result) == 0
+        assert engine.document_retrieval.no_match is True
 
-        # Verify the warning was logged with formatted float
+        # No fallback warning should be logged
         warning_messages = [r.message for r in caplog.records if r.levelname == 'WARNING']
-        fallback_warnings = [m for m in warning_messages if 'max_distance_threshold' in str(m)]
-        assert len(fallback_warnings) > 0
+        fallback_warnings = [m for m in warning_messages if 'Threshold filtering removed all' in str(m)]
+        assert len(fallback_warnings) == 0
 
-        # Should be formatted with 3 decimal places
-        assert '0.750' in str(fallback_warnings[0])
-
-    def test_zero_threshold_logging(self, engine, caplog):
+    async def test_zero_threshold_logging(self, engine, caplog):
         """
-        ATTACK: Zero threshold should format correctly with %.3f.
+        ATTACK: Zero threshold filters distance=0.1 (exceeds 0.0).
+
+        The old fallback-to-all behavior was removed; current implementation
+        returns [] and sets no_match=True. No TypeError from %.3f on 0.0.
         """
         engine.max_distance_threshold = 0.0
 
@@ -123,20 +129,18 @@ class TestNoneThresholdLoggingFix:
         ]
 
         with caplog.at_level(logging.WARNING):
-            result = engine._filter_relevant(results)
+            result = await engine._filter_relevant(results)
 
-        assert len(result) > 0
+        # Distance 0.1 > threshold 0.0 → filtered; no fallback
+        assert len(result) == 0
+        assert engine.document_retrieval.no_match is True
 
-        warning_messages = [r.message for r in caplog.records if r.levelname == 'WARNING']
-        fallback_warnings = [m for m in warning_messages if 'max_distance_threshold' in str(m)]
-
-        if fallback_warnings:
-            # Zero should be formatted as 0.000
-            assert '0.000' in str(fallback_warnings[0])
-
-    def test_negative_threshold_logging(self, engine, caplog):
+    async def test_negative_threshold_logging(self, engine, caplog):
         """
-        ATTACK: Negative threshold should format correctly with %.3f.
+        ATTACK: Negative threshold (-0.5) filters distance=0.1 (0.1 > -0.5).
+
+        The old fallback-to-all behavior was removed; current implementation
+        returns [] and sets no_match=True. No TypeError from %.3f on -0.5.
         """
         engine.max_distance_threshold = -0.5
 
@@ -145,16 +149,11 @@ class TestNoneThresholdLoggingFix:
         ]
 
         with caplog.at_level(logging.WARNING):
-            result = engine._filter_relevant(results)
+            result = await engine._filter_relevant(results)
 
-        assert len(result) > 0
-
-        warning_messages = [r.message for r in caplog.records if r.levelname == 'WARNING']
-        fallback_warnings = [m for m in warning_messages if 'max_distance_threshold' in str(m)]
-
-        if fallback_warnings:
-            # Negative should be formatted as -0.500
-            assert '-0.500' in str(fallback_warnings[0])
+        # Distance 0.1 > threshold -0.5 → filtered; no fallback
+        assert len(result) == 0
+        assert engine.document_retrieval.no_match is True
 
 
 class TestNoneThresholdTypeErrorPrevention:
@@ -172,7 +171,7 @@ class TestNoneThresholdTypeErrorPrevention:
             engine.retrieval_window = 0
             return engine
 
-    def test_no_typeerror_when_both_thresholds_none(self, engine):
+    async def test_no_typeerror_when_both_thresholds_none(self, engine):
         """
         CRITICAL ATTACK: Ensure no TypeError when both thresholds are None.
 
@@ -187,13 +186,13 @@ class TestNoneThresholdTypeErrorPrevention:
 
         # This must NOT raise TypeError
         try:
-            engine._filter_relevant(results)
+            await engine._filter_relevant(results)
         except TypeError as e:
             if "must be real number, not NoneType" in str(e):
                 pytest.fail(f"BUG: TypeError raised when both thresholds are None: {e}")
             raise
 
-    def test_no_typeerror_with_legacy_score_mode(self, engine):
+    async def test_no_typeerror_with_legacy_score_mode(self, engine):
         """
         ATTACK: Legacy score mode with None max_distance_threshold.
 
@@ -208,7 +207,7 @@ class TestNoneThresholdTypeErrorPrevention:
 
         # This must NOT raise TypeError
         try:
-            engine._filter_relevant(results)
+            await engine._filter_relevant(results)
         except TypeError as e:
             if "must be real number, not NoneType" in str(e):
                 pytest.fail(f"BUG: TypeError raised in legacy mode: {e}")
