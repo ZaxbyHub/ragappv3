@@ -957,6 +957,98 @@ class TestCompilerCuratorGating(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Regression: running-loop path uses a shared executor (issue #109 — DD-C010)
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorRunningLoopSharedExecutor(unittest.IsolatedAsyncioTestCase):
+    """Issue #109: when called from inside a running event loop, the
+    running-loop branch must reuse a single module-level executor
+    instead of constructing (and tearing down) a fresh
+    ``ThreadPoolExecutor(max_workers=1)`` for every curator call.
+    """
+
+    def setUp(self):
+        self._snap = {
+            f: getattr(settings, f)
+            for f in (
+                "wiki_llm_curator_enabled",
+                "wiki_llm_curator_run_on_ingest",
+                "wiki_llm_curator_url",
+                "wiki_llm_curator_model",
+            )
+        }
+        settings.wiki_llm_curator_enabled = True
+        settings.wiki_llm_curator_run_on_ingest = True
+        settings.wiki_llm_curator_url = "https://api.example.com"
+        settings.wiki_llm_curator_model = "qwen-1b"
+
+    def tearDown(self):
+        for f, v in self._snap.items():
+            setattr(settings, f, v)
+
+    async def test_running_loop_branch_uses_shared_executor(self):
+        """The running-loop branch must not construct a new
+        ThreadPoolExecutor per call — it must submit to the module-level
+        shared executor. The thread is still required to break the
+        event-loop deadlock; only the executor-construction overhead is
+        removed.
+        """
+        from app.services.wiki_compiler import (
+            _CURATOR_OFFLOAD_EXECUTOR,
+            WikiCompiler,
+        )
+        from app.services.wiki_curator import CuratorResult
+
+        compiler = WikiCompiler.__new__(WikiCompiler)  # type: ignore
+        compiler._db = MagicMock()
+        compiler._store = MagicMock()
+
+        class _E:
+            acronyms: list = []
+            persons: list = []
+            role_claims: list = []
+
+        fake_result = CuratorResult()
+        fake_result.accepted = []  # type: ignore[assignment]
+        fake_result.lint_findings = []  # type: ignore[assignment]
+        fake_result.errors = []  # type: ignore[assignment]
+
+        async def _fake_curate(**_kwargs):
+            return fake_result
+
+        # The running-loop branch must not construct a new
+        # ThreadPoolExecutor per call — it must submit to the
+        # module-level shared executor. The thread is still required
+        # to break the event-loop deadlock; only the
+        # executor-construction overhead is removed.
+        with patch(
+            "app.services.wiki_compiler.CuratorClient"
+        ), patch(
+            "app.services.wiki_compiler.WikiCurator"
+        ) as cur_ctor, patch(
+            "app.services.wiki_compiler._CURATOR_OFFLOAD_EXECUTOR",
+            wraps=_CURATOR_OFFLOAD_EXECUTOR,
+        ) as shared_executor:
+            cur_ctor.return_value.curate = _fake_curate
+            res = compiler._maybe_run_curator(
+                vault_id=1,
+                file_id=42,
+                text="text",
+                trigger="ingest",
+                deterministic_extraction=_E(),
+                page_id=1,
+                existing_entities=[],
+            )
+
+        # Result flowed through the running-loop branch.
+        self.assertIsInstance(res, dict)
+        self.assertEqual(res["accepted"], 0)
+        # Shared executor was used exactly once.
+        shared_executor.submit.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # PUT /wiki/claims re-verification
 # ---------------------------------------------------------------------------
 
