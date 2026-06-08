@@ -148,13 +148,14 @@ class FakeLLMClient:
         self._stream_chunks = stream_chunks if stream_chunks is not None else []
         self.last_messages: Optional[List[Dict[str, str]]] = None
 
-    async def chat_completion(self, messages: List[Dict[str, str]]) -> str:
+    async def chat_completion(self, messages: List[Dict[str, str]], **kwargs) -> str:
         self.last_messages = messages
         return self._response
 
     async def chat_completion_stream(
         self,
-        messages: List[Dict[str, str]]
+        messages: List[Dict[str, str]],
+        **kwargs,
     ) -> AsyncIterator[str]:
         self.last_messages = messages
         for chunk in self._stream_chunks:
@@ -356,7 +357,7 @@ class TestRAGEngineScoreTracking:
         # Patch _execute_retrieval to return the correct tuple format with False for rerank_success
         async def mock_retrieval(*args, **kwargs):
             # Return properly formatted dicts (not RAGSource) to avoid AttributeError in .get() calls
-            return [{"id": "chunk1", "text": "Relevant chunk 1", "file_id": "doc1", "_distance": 0.2, "metadata": {}}], None, "CONFIDENT", False, "distance", "dense_only", 0, "fallback", False, False
+            return [{"id": "chunk1", "text": "Relevant chunk 1", "file_id": "doc1", "_distance": 0.2, "metadata": {}}], None, "CONFIDENT", False, "distance", "dense_only", 0, "fallback", False, False, {}
 
         with patch.object(engine, '_execute_retrieval', mock_retrieval):
             results = []

@@ -193,9 +193,9 @@ class TestRetryDocumentAuditWiring(unittest.IsolatedAsyncioTestCase):
         self.assertIn("str(current_user", source)
 
     async def test_user_id_fallback_to_auth(self):
-        """When current_user is None, falls back to auth.get('user_id', 'unknown')."""
+        """When current_user is None, falls back to user.get('id', 'unknown')."""
         source = inspect.getsource(retry_document)
-        self.assertIn("auth.get", source)
+        self.assertIn("user.get", source)
         self.assertIn('"unknown"', source)
 
     async def test_both_call_sites_compute_user_id(self):

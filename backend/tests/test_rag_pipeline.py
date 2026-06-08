@@ -193,13 +193,14 @@ class FakeLLMClient:
         self._stream_chunks = stream_chunks if stream_chunks is not None else []
         self.last_messages: Optional[List[Dict[str, str]]] = None
 
-    async def chat_completion(self, messages: List[Dict[str, str]]) -> str:
+    async def chat_completion(self, messages: List[Dict[str, str]], **kwargs) -> str:
         self.last_messages = messages
         return self._response
 
     async def chat_completion_stream(
         self,
-        messages: List[Dict[str, str]]
+        messages: List[Dict[str, str]],
+        **kwargs,
     ) -> AsyncIterator[str]:
         self.last_messages = messages
         for chunk in self._stream_chunks:
@@ -696,7 +697,11 @@ class TestRAGEnginePipeline(unittest.IsolatedAsyncioTestCase):
         async def mock_get_chunks_by_uid(chunk_uids):
             return adjacent_chunks
 
-        with patch.object(fake_vector, 'get_chunks_by_uid', side_effect=mock_get_chunks_by_uid):
+        from app.config import settings as app_settings
+
+        with patch.object(fake_vector, 'get_chunks_by_uid', side_effect=mock_get_chunks_by_uid), \
+             patch.object(app_settings, 'context_distillation_enabled', False), \
+             patch.object(app_settings, 'parent_retrieval_enabled', False):
             engine = RAGEngine(
                 embedding_service=fake_embedding,
                 vector_store=fake_vector,
@@ -717,7 +722,7 @@ class TestRAGEnginePipeline(unittest.IsolatedAsyncioTestCase):
             # Debug: print what we got
             print(f"DEBUG: Got {len(done_msg.get('sources', []))} sources")
             for s in done_msg.get("sources", []):
-                print(f"  Source: {s.file_id}, chunk_index={s.metadata.get('chunk_index')}")
+                print(f"  Source: {s.get('file_id')}, chunk_index={s.get('metadata', {}).get('chunk_index')}")
 
             # Should include main chunk plus adjacent chunks (3 total)
             # Note: This test may fail due to distance threshold filtering.

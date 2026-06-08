@@ -179,6 +179,7 @@ def _make_engine(
     engine._retrieval_evaluator = None
     engine._retrieval_evaluators = {}
     engine._wiki_retrieval = None
+    engine._kms_retrieval = None
     engine._get_indexed_file_ids = lambda vault_id: None
     async def _no_supersession_warning(chunks):
         return None
