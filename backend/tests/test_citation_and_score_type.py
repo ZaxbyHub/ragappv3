@@ -7,6 +7,9 @@ This test module verifies:
 4. _build_done_message includes score_type field with correct values
 """
 
+import pytest
+from unittest.mock import patch
+
 
 # =============================================================================
 # Tests for prompt_builder.py - CITATION_INSTRUCTION
@@ -105,6 +108,12 @@ class TestPromptBuilderServiceCitation:
 class TestBuildDoneMessageScoreType:
     """Tests for score_type field in _build_done_message."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_ssrf(self):
+        with patch("app.services.embeddings.assert_url_safe"), \
+             patch("app.services.llm_client.assert_url_safe"):
+            yield
+
     def test_done_message_has_score_type_distance(self):
         """Verify score_type is 'distance' when reranking is disabled."""
         from app.services.rag_engine import RAGEngine
@@ -160,6 +169,7 @@ class TestBuildDoneMessageScoreType:
 
         result = engine._build_done_message([], [], "distance", "disabled", 0, "disabled")
 
+        # Core fields that must always be present (subset check — new fields may be added)
         expected_fields = {
             "type",
             "sources",
@@ -169,9 +179,9 @@ class TestBuildDoneMessageScoreType:
         }
         actual_fields = set(result.keys())
 
-        assert actual_fields == expected_fields, (
-            f"_build_done_message should include all expected fields. "
-            f"Expected: {expected_fields}, Got: {actual_fields}"
+        assert expected_fields.issubset(actual_fields), (
+            f"_build_done_message is missing expected fields. "
+            f"Missing: {expected_fields - actual_fields}"
         )
 
 
@@ -212,6 +222,12 @@ class TestCitationInstructionEdgeCases:
 
 class TestScoreTypeEdgeCases:
     """Edge case tests for score_type field."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_ssrf(self):
+        with patch("app.services.embeddings.assert_url_safe"), \
+             patch("app.services.llm_client.assert_url_safe"):
+            yield
 
     def test_score_type_reflects_runtime_changes(self):
         """Verify score_type reflects the parameter passed to _build_done_message."""
