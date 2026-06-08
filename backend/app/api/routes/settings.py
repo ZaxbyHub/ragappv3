@@ -234,7 +234,7 @@ class SettingsUpdate(BaseModel):
             raise ValueError("hybrid_alpha must be between 0 and 1")
         return v
 
-    @field_validator("ollama_embedding_url", "ollama_chat_url", "instant_chat_url", mode="before")
+    @field_validator("ollama_embedding_url", "ollama_chat_url", "instant_chat_url", "reranker_url", mode="before")
     @classmethod
     def validate_ollama_url(cls, v):
         if v is None:
@@ -429,6 +429,7 @@ _URL_FIELDS_TO_VALIDATE = {
     "ollama_embedding_url": "embedding URL",
     "ollama_chat_url": "chat URL",
     "instant_chat_url": "instant chat URL",
+    "reranker_url": "reranker URL",
 }
 
 
@@ -796,6 +797,7 @@ def _apply_settings_update(update: SettingsUpdate) -> SettingsResponse:
     return SettingsResponse.model_validate(_build_settings_dict())
 
 
+@router.get("/settings/", response_model=SettingsResponse, include_in_schema=False)
 @router.get("/settings", response_model=SettingsResponse)
 def get_settings(
     user: dict = Depends(get_current_active_user),
@@ -807,6 +809,7 @@ def get_settings(
     return SettingsResponse.model_validate(settings_dict)
 
 
+@router.post("/settings/", include_in_schema=False)
 @router.post("/settings")
 def post_settings(
     update: SettingsUpdate,
@@ -827,6 +830,7 @@ def post_settings(
     return result
 
 
+@router.put("/settings/", include_in_schema=False)
 @router.put("/settings")
 def put_settings(
     update: SettingsUpdate,

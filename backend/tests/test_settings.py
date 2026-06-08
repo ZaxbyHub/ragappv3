@@ -384,13 +384,17 @@ class TestSettingsUpdateValidation(unittest.TestCase):
 
     def test_post_settings_valid_reranker_url(self):
         """Test POST /api/settings with valid reranker URL."""
-        payload = {"reranker_url": "https://reranker.example.com:443"}
+        # reranker_url is now SSRF-validated at PUT time (like the other model
+        # URLs), so it must resolve to an allowed host. Use localhost to match
+        # the sibling reranker tests (passes under ALLOW_LOCAL_SERVICES=1); a
+        # non-resolving placeholder host would now be rejected by the guard.
+        payload = {"reranker_url": "http://localhost:8000"}
 
         response = self.client.post("/api/settings", json=payload)
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(data["reranker_url"], "https://reranker.example.com:443")
+        self.assertEqual(data["reranker_url"], "http://localhost:8000")
 
     def test_post_settings_empty_reranker_url(self):
         """Test POST /api/settings with empty reranker URL is allowed."""

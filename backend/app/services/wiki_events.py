@@ -54,7 +54,20 @@ class WikiEventBus:
                     q.get_nowait()
                     q.put_nowait(event)
                 except Exception:
-                    logger.debug("wiki event bus: dropped event for vault %d", vault_id)
+                    # The outer QueueFull drop is intentional and acceptable
+                    # (SSE clients refetch on any event). The inner failure
+                    # (drain-and-retry itself fails — e.g. concurrent
+                    # unsubscribe) is operationally significant: a terminal-
+                    # state wiki event can be silently lost. Surface at
+                    # WARNING with exc_info so operators can diagnose.
+                    event_type = event.get("type") if isinstance(event, dict) else None
+                    logger.warning(
+                        "wiki event bus: failed to deliver event to slow consumer "
+                        "(vault_id=%s event_type=%s); event dropped after drain failure",
+                        vault_id,
+                        event_type,
+                        exc_info=True,
+                    )
 
     def publish_page_change(
         self,
@@ -63,7 +76,15 @@ class WikiEventBus:
         action: str,
         user_id: Optional[int] = None,
     ) -> None:
-        """Publish a wiki page change event (created/updated/deleted)."""
+        """Publish a wiki page change event (created/updated/deleted).
+
+        Best-effort fan-out: a publish failure must never propagate to the
+        caller. The underlying ``publish`` swallows slow-consumer drops
+        (intentional, see comment in ``publish``), but a non-QueueFull inner
+        failure could still escape and would otherwise propagate uncaught
+        into the FastAPI route handler. Log at WARNING so operators can
+        diagnose lost terminal-state notifications.
+        """
         event: dict = {
             "type": "page_change",
             "page_id": page_id,
@@ -71,7 +92,17 @@ class WikiEventBus:
         }
         if user_id is not None:
             event["user_id"] = user_id
-        self.publish(vault_id, event)
+        try:
+            self.publish(vault_id, event)
+        except Exception:
+            logger.warning(
+                "wiki event bus: failed to publish page_change "
+                "(vault_id=%s page_id=%s action=%s)",
+                vault_id,
+                page_id,
+                action,
+                exc_info=True,
+            )
 
     def publish_claim_change(
         self,
@@ -80,7 +111,11 @@ class WikiEventBus:
         action: str,
         user_id: Optional[int] = None,
     ) -> None:
-        """Publish a wiki claim change event (created/updated/deleted)."""
+        """Publish a wiki claim change event (created/updated/deleted).
+
+        Best-effort fan-out: a publish failure must never propagate to the
+        caller. See ``publish_page_change`` for rationale.
+        """
         event: dict = {
             "type": "claim_change",
             "claim_id": claim_id,
@@ -88,7 +123,17 @@ class WikiEventBus:
         }
         if user_id is not None:
             event["user_id"] = user_id
-        self.publish(vault_id, event)
+        try:
+            self.publish(vault_id, event)
+        except Exception:
+            logger.warning(
+                "wiki event bus: failed to publish claim_change "
+                "(vault_id=%s claim_id=%s action=%s)",
+                vault_id,
+                claim_id,
+                action,
+                exc_info=True,
+            )
 
 
 _bus: Optional[WikiEventBus] = None

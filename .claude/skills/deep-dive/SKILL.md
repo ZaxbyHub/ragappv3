@@ -101,7 +101,8 @@ After both reviewers return, perform a lightweight sync pass:
 1. Cross-reference findings between reviewers — flag correlations
 2. Deduplicate any findings both reviewers verified independently
 3. For NEEDS_MORE_EVIDENCE findings: if the other reviewer verified a related finding, merge
-4. Produce a unified findings list with verified/rejected status
+4. **Correction cross-check**: The reviewer may have corrected factual claims about the code (e.g., "pool is 10 not 5", "connections are sequential not simultaneous"). Ensure every correction is reflected in the final severity and description. If a VERIFIED finding had its mechanism corrected, re-evaluate whether the severity is still appropriate after correction.
+5. Produce a unified findings list with verified/rejected status
 
 ## Step 6 — Critic Challenge (HIGH/CRITICAL only)
 
@@ -118,6 +119,8 @@ For verified findings rated HIGH or CRITICAL, dispatch sequential critic passes:
 - Final severity is the critic's assessed severity
 
 CRITICAL: Do NOT challenge MEDIUM/LOW/INFO findings. Only HIGH and CRITICAL go through critic review.
+
+**MEDIUM-finding correction pass (optional)**: If Step 5b's correction cross-check reveals a MEDIUM finding where the reviewer corrected a factual claim about the code (e.g., wrong pool size, wrong connection pattern, wrong multiplier), the architect should adjust the severity and description in the final report accordingly. Do NOT dispatch the critic for these — the architect's own reasoning, informed by the reviewer's corrections, is sufficient.
 
 ## Step 7 — Final Report
 

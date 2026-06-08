@@ -1,10 +1,13 @@
 """Tests for WikiCompileProcessor and the new WikiCompiler job methods."""
 
 import asyncio
+import logging
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 def _make_env():
@@ -570,6 +573,104 @@ class TestWikiCompileProcessorLifecycle(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Regression for issue #106: SSE _publish_event must log at WARNING (not DEBUG)
+# when event delivery fails. Terminal-state notifications are operationally
+# significant and must not be silently dropped.
+# ---------------------------------------------------------------------------
+
+class TestPublishEventFailureLogging(unittest.TestCase):
+    """Ensure _publish_event surfaces failures at WARNING level (issue #106)."""
+
+    LOGGER_NAME = "app.services.wiki_compile_processor"
+
+    def _make_job(self):
+        return SimpleNamespace(id=42, vault_id=1, trigger_type="manual")
+
+    def _make_proc(self):
+        from unittest.mock import MagicMock
+
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+
+        # _publish_event never touches self._pool, so a sentinel is fine.
+        return WikiCompileProcessor(pool=MagicMock())  # type: ignore[arg-type]
+
+    def test_publish_failure_emits_warning_with_traceback(self):
+        proc = self._make_proc()
+        with patch(
+            "app.services.wiki_events.get_wiki_event_bus",
+            side_effect=RuntimeError("simulated SSE bus failure"),
+        ):
+            with self.assertLogs(self.LOGGER_NAME, level=logging.DEBUG) as cap:
+                proc._publish_event(
+                    self._make_job(),
+                    "job_completed",
+                    result={"page": None, "claims": [], "entities": [], "skipped": False},
+                )
+
+        warnings = [r for r in cap.records if r.levelno >= logging.WARNING]
+        # Exactly one WARNING is expected. A regression emitting multiple
+        # WARNING records (e.g. a spurious extra from logging internals or a
+        # future change) would otherwise only have the first checked, hiding
+        # the duplicate.
+        self.assertEqual(
+            len(warnings),
+            1,
+            f"expected exactly one WARNING, got {len(warnings)}: "
+            f"{[r.getMessage() for r in warnings]}",
+        )
+        # Operators need the traceback to diagnose the failure.
+        self.assertTrue(
+            any(r.exc_info for r in warnings),
+            "Expected exc_info on the WARNING record so operators can see the cause",
+        )
+        # Message must include the context that helps an on-call engineer
+        # pinpoint the dropped terminal-state event.
+        msg = warnings[0].getMessage()
+        self.assertIn("event publish failed", msg)
+        self.assertIn("job_id=42", msg)
+        self.assertIn("vault_id=1", msg)
+        self.assertIn("event=job_completed", msg)
+
+    def test_publish_success_does_not_warn(self):
+        from app.services.wiki_events import WikiEventBus
+
+        class _StubBus(WikiEventBus):
+            def publish(self, vault_id: int, event: dict) -> None:
+                return None
+
+        proc = self._make_proc()
+        records = []
+
+        class _CapturingHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger(self.LOGGER_NAME)
+        handler = _CapturingHandler(level=logging.WARNING)
+        prev_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.WARNING)
+        try:
+            with patch(
+                "app.services.wiki_events.get_wiki_event_bus", return_value=_StubBus()
+            ):
+                proc._publish_event(
+                    self._make_job(),
+                    "job_completed",
+                    result={"page": None, "claims": [], "entities": [], "skipped": False},
+                )
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(prev_level)
+        self.assertEqual(
+            [r for r in records if r.levelno >= logging.WARNING],
+            [],
+            "Expected no WARNING logs on successful publish, got: "
+            f"{[r.getMessage() for r in records]}",
+        )
+
+
+# ---------------------------------------------------------------------------
 # retry_count tracking and cancellation semantics
 # ---------------------------------------------------------------------------
 
@@ -647,6 +748,143 @@ class TestRetryCountAndCancellation(unittest.TestCase):
         ).fetchone()
         self.assertEqual(dict(row)["status"], "cancelled")
         self.assertEqual(dict(row)["retry_count"], 0)
+
+
+# ---------------------------------------------------------------------------
+# Issue 104: _reset_job_to_pending must retry on transient DB errors
+# ---------------------------------------------------------------------------
+
+class TestResetJobToPendingRetry(unittest.IsolatedAsyncioTestCase):
+    """Regression for issue #104: bounded retry on the auto-retry reset path.
+
+    A transient DB error (e.g. SQLite 'database is locked') on the original
+    one-shot reset left the job stranded in 'failed' state until manual API
+    retry. The processor now wraps the reset in a bounded retry with short
+    exponential backoff so the auto-retry pipeline self-heals.
+    """
+
+    async def asyncSetUp(self):
+        from app.models.database import SQLiteConnectionPool, run_migrations
+
+        td = tempfile.mkdtemp()
+        db_path = str(Path(td) / "test.db")
+        run_migrations(db_path)
+        self.pool = SQLiteConnectionPool(db_path, max_size=2)
+        with self.pool.connection() as conn:
+            conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'T')")
+            conn.commit()
+            from app.services.wiki_store import WikiStore
+            self.store = WikiStore(conn)
+            # Plant a job in the exact state the retry-handler expects: failed,
+            # retry_count < MAX_RETRIES, so the next claim is an auto-retry.
+            self.job = self.store.create_job(vault_id=1, trigger_type="manual")
+            self.store.claim_next_pending_job()
+            self.store.fail_job(self.job.id, "handler exploded")
+
+    async def asyncTearDown(self):
+        self.pool.close_all()
+
+    async def test_transient_failure_is_retried_and_recovers(self):
+        """A single transient error must NOT leave the job stuck in 'failed'."""
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+
+        proc = WikiCompileProcessor(self.pool)
+        real = proc._reset_job_to_pending
+        calls = {"n": 0}
+
+        def flaky(job_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real(job_id)
+
+        proc._reset_job_to_pending = flaky
+        # The helper should retry and ultimately succeed.
+        await proc._reset_job_to_pending_with_retry(self.job.id)
+
+        self.assertEqual(calls["n"], 2, "Reset should have been attempted twice")
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (self.job.id,)
+            ).fetchone()
+        self.assertEqual(dict(row)["status"], "pending")
+
+    async def test_two_transient_failures_still_recover(self):
+        """A second transient error is also recovered (succeeds on the 3rd attempt)."""
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+
+        proc = WikiCompileProcessor(self.pool)
+        real = proc._reset_job_to_pending
+        calls = {"n": 0}
+
+        def flaky(job_id):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return real(job_id)
+
+        proc._reset_job_to_pending = flaky
+        await proc._reset_job_to_pending_with_retry(self.job.id)
+
+        self.assertEqual(calls["n"], 3, "Reset should have been attempted three times")
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (self.job.id,)
+            ).fetchone()
+        self.assertEqual(dict(row)["status"], "pending")
+
+    async def test_persistent_failure_propagates_after_bounded_attempts(self):
+        """When every attempt fails, the helper must surface the last error.
+
+        The outer poll-loop guard catches and logs it; the job remains in
+        'failed' (which is the correct observable state when the DB is
+        genuinely unreachable).
+        """
+        from app.services.wiki_compile_processor import (
+            RESET_RETRY_ATTEMPTS,
+            WikiCompileProcessor,
+        )
+
+        proc = WikiCompileProcessor(self.pool)
+        calls = {"n": 0}
+
+        def always_fail(job_id):
+            calls["n"] += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        proc._reset_job_to_pending = always_fail
+        with self.assertRaises(sqlite3.OperationalError):
+            await proc._reset_job_to_pending_with_retry(self.job.id)
+
+        self.assertEqual(calls["n"], RESET_RETRY_ATTEMPTS)
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (self.job.id,)
+            ).fetchone()
+        # Persistent failure → job stays in 'failed' (same as pre-fix behavior).
+        self.assertEqual(dict(row)["status"], "failed")
+
+    async def test_immediate_success_does_not_retry(self):
+        """Happy path: the first attempt must be enough — no extra calls."""
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+
+        proc = WikiCompileProcessor(self.pool)
+        calls = {"n": 0}
+        real = proc._reset_job_to_pending
+
+        def counting(job_id):
+            calls["n"] += 1
+            return real(job_id)
+
+        proc._reset_job_to_pending = counting
+        await proc._reset_job_to_pending_with_retry(self.job.id)
+
+        self.assertEqual(calls["n"], 1, "Happy path must not trigger retries")
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (self.job.id,)
+            ).fetchone()
+        self.assertEqual(dict(row)["status"], "pending")
 
 
 # ---------------------------------------------------------------------------

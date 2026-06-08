@@ -46,7 +46,8 @@ export function ModelConnectionSettings({
             )}
             <p id="ollama_embedding_url-desc" className="text-xs text-muted-foreground">
               URL for the embedding model service (e.g., HuggingFace TEI, Ollama, OpenAI-compatible).
-              Examples: http://harrier-embed:8080/v1/embeddings (TEI) or http://localhost:11434 (Ollama)
+              Examples: http://harrier-embed:8080 (native TEI /embed), http://harrier-embed:8080/v1/embeddings
+              (TEI OpenAI-compatible), or http://localhost:11434 (Ollama)
             </p>
           </div>
 

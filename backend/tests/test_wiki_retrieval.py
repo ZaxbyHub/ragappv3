@@ -119,6 +119,246 @@ class TestWikiRetrievalServiceNullVault(unittest.TestCase):
         pool.get.assert_not_called()
 
 
+class TestWikiRetrievalServiceFtsPageSearchThreshold(unittest.TestCase):
+    """Regression tests for issue #101: the FTS page-search fallback threshold
+    was hardcoded in wiki_retrieval._retrieve_sync. After the fix, the
+    threshold is configurable via wiki_fts_page_search_max_candidates and
+    flows through WikiRetrievalService.__init__.
+    """
+
+    def test_explicit_constructor_threshold_is_honored(self):
+        pool = MagicMock()
+        svc = WikiRetrievalService(pool=pool, fts_page_search_max_candidates=7)
+        self.assertEqual(svc._fts_page_search_max_candidates, 7)
+
+    def test_default_threshold_reads_from_settings(self):
+        from app.config import settings
+
+        pool = MagicMock()
+        svc = WikiRetrievalService(pool=pool)
+        self.assertEqual(
+            svc._fts_page_search_max_candidates,
+            settings.wiki_fts_page_search_max_candidates,
+        )
+
+    def test_zero_threshold_is_allowed_and_unclamped_to_zero(self):
+        # 0 means "always run the FTS page-search fallback" — a valid
+        # operator-controlled behavior, not a misconfiguration.
+        pool = MagicMock()
+        svc = WikiRetrievalService(pool=pool, fts_page_search_max_candidates=0)
+        self.assertEqual(svc._fts_page_search_max_candidates, 0)
+
+    def test_negative_threshold_is_clamped_to_zero(self):
+        # Negative values are nonsensical; clamp to 0 (always-run).
+        pool = MagicMock()
+        svc = WikiRetrievalService(pool=pool, fts_page_search_max_candidates=-3)
+        self.assertEqual(svc._fts_page_search_max_candidates, 0)
+
+    def test_phase4_skipped_when_candidates_meet_threshold(self):
+        """When the FTS claim search alone (phase 3) yields >= threshold
+        candidates, the FTS page-search fallback (phase 4) must NOT run.
+
+        We stand up a real FTS5 virtual table mirroring the production
+        schema, run a real retrieve(), and assert via a spy on
+        _fts_page_search that the spy was never called.
+        """
+        import tempfile
+        from pathlib import Path
+        from queue import Empty, Queue
+
+        from app.models.database import init_db, run_migrations
+
+        tmp = tempfile.mkdtemp()
+        db = str(Path(tmp) / "app.db")
+        init_db(db)
+        run_migrations(db)
+
+        class _Pool:
+            def __init__(self, path):
+                self._path = path
+                self._q = Queue(maxsize=5)
+
+            def get_connection(self):
+                try:
+                    return self._q.get_nowait()
+                except Empty:
+                    c = sqlite3.connect(self._path, check_same_thread=False)
+                    c.row_factory = sqlite3.Row
+                    return c
+
+            def release_connection(self, c):
+                try:
+                    self._q.put_nowait(c)
+                except Exception:
+                    c.close()
+
+            def close_all(self):
+                while True:
+                    try:
+                        self._q.get_nowait().close()
+                    except Empty:
+                        break
+
+        try:
+            pool = _Pool(db)
+            conn = sqlite3.connect(db)
+            try:
+                # Use a unique vault id to avoid collisions across runs.
+                # The production code in TestWikiRetrievalEndToEnd hardcodes
+                # vault_id=1 and page_id=1, which is what causes the local
+                # IntegrityError on stale test data; this test only needs
+                # the FTS claim path to be populated, so any vault id works.
+                conn.execute(
+                    "INSERT INTO vaults (id, name) VALUES (?, ?)",
+                    (7777, "ThresholdTest"),
+                )
+                for pid in (1, 2, 3):
+                    conn.execute(
+                        "INSERT INTO wiki_pages (id, vault_id, slug, title, "
+                        "page_type, markdown, status) VALUES (?, 7777, ?, ?, "
+                        "'overview', '# x', 'verified')",
+                        (pid, f"page-{pid}", f"Page {pid}"),
+                    )
+                # Three FTS claim hits so phase 3 fills >= 3 candidates.
+                # claim_id == page_id here is sufficient for this test —
+                # the schema doesn't enforce a particular mapping.
+                for cid, txt in (
+                    (1, "zlorptanium reactor alpha"),
+                    (2, "zlorptanium reactor beta"),
+                    (3, "zlorptanium reactor gamma"),
+                ):
+                    conn.execute(
+                        "INSERT INTO wiki_claims (id, vault_id, page_id, "
+                        "claim_text, claim_type, source_type, status, "
+                        "confidence) VALUES (?, 7777, ?, ?, 'fact', "
+                        "'document', 'active', 0.9)",
+                        (cid, cid, txt),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            # threshold=3: phase 3 yields 3 candidates, which meets the
+            # threshold, so phase 4 must be skipped.
+            svc = WikiRetrievalService(
+                pool=pool, fts_page_search_max_candidates=3
+            )
+            phase4_calls = {"n": 0}
+
+            def spy(*args, **kwargs):
+                phase4_calls["n"] += 1
+                return []
+
+            svc._fts_page_search = spy
+            results = svc.retrieve("zlorptanium reactor", vault_id=7777)
+            self.assertGreaterEqual(
+                len(results), 3, "phase 3 should yield at least 3 candidates"
+            )
+            self.assertEqual(
+                phase4_calls["n"],
+                0,
+                "phase 4 must not run when candidates meet the threshold",
+            )
+
+            pool.close_all()
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_phase4_runs_when_candidates_below_threshold(self):
+        """Inverse of the above: with threshold=3 and only 1 candidate from
+        phases 1-3, the FTS page-search fallback MUST run.
+        """
+        import tempfile
+        from pathlib import Path
+        from queue import Empty, Queue
+
+        from app.models.database import init_db, run_migrations
+
+        tmp = tempfile.mkdtemp()
+        db = str(Path(tmp) / "app.db")
+        init_db(db)
+        run_migrations(db)
+
+        class _Pool:
+            def __init__(self, path):
+                self._path = path
+                self._q = Queue(maxsize=5)
+
+            def get_connection(self):
+                try:
+                    return self._q.get_nowait()
+                except Empty:
+                    c = sqlite3.connect(self._path, check_same_thread=False)
+                    c.row_factory = sqlite3.Row
+                    return c
+
+            def release_connection(self, c):
+                try:
+                    self._q.put_nowait(c)
+                except Exception:
+                    c.close()
+
+            def close_all(self):
+                while True:
+                    try:
+                        self._q.get_nowait().close()
+                    except Empty:
+                        break
+
+        try:
+            pool = _Pool(db)
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    "INSERT INTO vaults (id, name) VALUES (?, ?)",
+                    (8888, "ThresholdTest2"),
+                )
+                # Single FTS claim hit; threshold=3 forces phase 4 to run.
+                conn.execute(
+                    "INSERT INTO wiki_pages (id, vault_id, slug, title, "
+                    "page_type, markdown, status) VALUES (1, 8888, 'p', "
+                    "'P', 'overview', '# x', 'verified')"
+                )
+                conn.execute(
+                    "INSERT INTO wiki_claims (id, vault_id, page_id, "
+                    "claim_text, claim_type, source_type, status, "
+                    "confidence) VALUES (1, 8888, 1, "
+                    "'zlorptanium reactor alpha', 'fact', 'document', "
+                    "'active', 0.9)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            svc = WikiRetrievalService(
+                pool=pool, fts_page_search_max_candidates=3
+            )
+            phase4_calls = {"n": 0}
+
+            def spy(*args, **kwargs):
+                phase4_calls["n"] += 1
+                return []
+
+            svc._fts_page_search = spy
+            results = svc.retrieve("zlorptanium reactor", vault_id=8888)
+            # Phase 3 contributes 1 candidate; phase 4 must be invoked to
+            # try to fill the rest.
+            self.assertGreaterEqual(len(results), 1)
+            self.assertGreaterEqual(
+                phase4_calls["n"],
+                1,
+                "phase 4 must run when candidates fall below threshold",
+            )
+
+            pool.close_all()
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestWikiRetrievalServiceEmptyDb(unittest.TestCase):
     def _make_service_with_conn(self):
         conn = sqlite3.connect(":memory:")
@@ -245,6 +485,151 @@ class TestWikiRetrievalEndToEnd(unittest.TestCase):
 
     def test_no_match_returns_empty(self):
         self.assertEqual(self.service.retrieve("nonexistentword", vault_id=1), [])
+
+
+class TestEntityMismatchFilterExpandedMatch(unittest.TestCase):
+    """Regression test for issue #102: entity mismatch filter over-rejects
+    valid FTS claim results.
+
+    Scenario: query "who is AFOMIS deputy chief?" extracts entity candidate
+    "AFOMIS".  FTS finds a claim whose ``subject`` column is "AFOMIS" and
+    ``claim_text`` mentions "deputy chief" — but the claim_text itself does
+    NOT contain the literal "AFOMIS".  The entity's alias "Air Force Medical
+    Information Systems" appears in the page title.  Before the fix, the
+    claim was rejected because the filter only checked claim_text + title
+    against raw entity candidates.  After the fix, the filter also checks
+    the claim's subject/object fields and uses canonical names + aliases
+    from matched entities.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from queue import Empty, Queue
+
+        from app.models.database import init_db, run_migrations
+
+        self._tmp = tempfile.mkdtemp()
+        db = str(Path(self._tmp) / "app.db")
+        init_db(db)
+        run_migrations(db)
+
+        class _Pool:
+            def __init__(self, path):
+                self._path = path
+                self._q = Queue(maxsize=5)
+
+            def get_connection(self):
+                try:
+                    return self._q.get_nowait()
+                except Empty:
+                    c = sqlite3.connect(self._path, check_same_thread=False)
+                    c.row_factory = sqlite3.Row
+                    return c
+
+            def release_connection(self, c):
+                try:
+                    self._q.put_nowait(c)
+                except Exception:
+                    c.close()
+
+            def close_all(self):
+                while True:
+                    try:
+                        self._q.get_nowait().close()
+                    except Empty:
+                        break
+
+        self._pool = _Pool(db)
+        self.service = WikiRetrievalService(pool=self._pool)
+
+        conn = sqlite3.connect(db)
+        try:
+            # vault
+            conn.execute(
+                "INSERT INTO vaults (id, name) VALUES (?, ?)",
+                (99, "EntityMismatchTest"),
+            )
+            # entity page
+            conn.execute(
+                "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, "
+                "markdown, status) VALUES (10, 99, 'afomis', 'AFOMIS', "
+                "'entity', '# AFOMIS', 'verified')"
+            )
+            # AFOMIS entity with an alias
+            conn.execute(
+                "INSERT INTO wiki_entities (id, vault_id, canonical_name, "
+                "entity_type, aliases_json, page_id) VALUES "
+                "(1, 99, 'AFOMIS', 'organization', "
+                "'[\"Air Force Medical Information Systems\"]', 10)"
+            )
+            # claim page — title does NOT contain "AFOMIS"
+            conn.execute(
+                "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, "
+                "markdown, status) VALUES (11, 99, 'personnel', "
+                "'Personnel Roster', "
+                "'entity', '# Personnel', 'verified')"
+            )
+            # Claim: subject="AFOMIS" (FTS matches this), claim_text has
+            # "deputy chief" but NOT "AFOMIS".
+            conn.execute(
+                "INSERT INTO wiki_claims (id, vault_id, page_id, claim_text, "
+                "subject, predicate, object, "
+                "claim_type, source_type, status, confidence) VALUES "
+                "(20, 99, 11, 'Major General Justin Woods serves as deputy chief.', "
+                "'AFOMIS', 'has_deputy_chief', 'Justin Woods', "
+                "'fact', 'document', 'active', 0.9)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        import shutil
+
+        self._pool.close_all()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_fts_claim_passes_when_subject_contains_entity(self):
+        """FTS finds a claim via subject column; the entity mismatch filter
+        must accept it because the claim's subject matches the entity."""
+        results = self.service.retrieve(
+            "who is AFOMIS deputy chief?", vault_id=99
+        )
+        claim_results = [r for r in results if r.claim_id == 20]
+        self.assertTrue(
+            claim_results,
+            "FTS claim should pass entity mismatch filter when claim "
+            "subject matches entity (issue #102)",
+        )
+
+    def test_fts_claim_rejected_when_no_match_at_all(self):
+        """A claim whose text, subject, and object contain none of the
+        entity names/aliases should still be rejected."""
+        conn = self._pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO wiki_claims (id, vault_id, page_id, claim_text, "
+                "subject, predicate, object, "
+                "claim_type, source_type, status, confidence) VALUES "
+                "(21, 99, 11, 'The weather is sunny today.', "
+                "'WeatherService', 'reports', 'sunny', "
+                "'fact', 'document', 'active', 0.7)"
+            )
+            conn.commit()
+        finally:
+            self._pool.release_connection(conn)
+
+        results = self.service.retrieve(
+            "who is AFOMIS deputy chief?", vault_id=99
+        )
+        # Claim 21 should NOT appear
+        claim_21 = [r for r in results if r.claim_id == 21]
+        self.assertEqual(
+            claim_21,
+            [],
+            "unrelated claim should be filtered out by entity mismatch",
+        )
 
 
 if __name__ == "__main__":

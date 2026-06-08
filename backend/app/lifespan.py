@@ -207,6 +207,71 @@ async def _safe_await(coro, name, timeout=10):
         logger.warning(f"{name} failed: {e} (continuing)")
 
 
+async def _validate_tei_embedding_model(embedding_service) -> None:
+    """Validate that the live TEI model matches the configured EMBEDDING_MODEL.
+
+    Probes the embedding server's ``/info`` endpoint (served at the host root,
+    not under the embeddings route) and raises ``RuntimeError`` on a genuine
+    model-id mismatch so startup fails fast on an embedding-space mismatch.
+    Network failures, SSRF blocks, and non-200 responses are treated as
+    "skip validation" (logged, non-fatal) so startup is not blocked when the
+    endpoint simply does not expose ``/info``.
+    """
+    try:
+        import httpx
+
+        # follow_redirects=False so a 30x from the embedding host cannot bypass
+        # the SSRF guard by redirecting to a private/internal address.
+        async with httpx.AsyncClient(
+            timeout=10.0, follow_redirects=False
+        ) as client:
+            # TEI exposes /info at the server root, not under the embeddings
+            # route. Strip the resolved embeddings endpoint suffix (native
+            # /embed, OpenAI /v1/embeddings, or Ollama /api/embeddings) so the
+            # probe reaches <host>/info for native TEI as well as the
+            # OpenAI-compatible variant.
+            _emb_url = embedding_service.embeddings_url.rstrip("/")
+            for _suffix in ("/embed", "/v1/embeddings", "/api/embeddings"):
+                if _emb_url.endswith(_suffix):
+                    _emb_url = _emb_url[: -len(_suffix)]
+                    break
+            info_url = _emb_url.rstrip("/") + "/info"
+            assert_url_safe(info_url)
+            response = await client.get(info_url)
+            if response.status_code == 200:
+                info_data = response.json()
+                live_model_id = info_data.get("model_id", "").split("/")[-1]
+                configured_model = settings.embedding_model.split("/")[-1]
+                if live_model_id and live_model_id != configured_model:
+                    error_msg = (
+                        f"EMBEDDING_MODEL mismatch! Configured: '{configured_model}', "
+                        f"Live TEI: '{live_model_id}'. "
+                        f"Embedding space mismatch will cause incorrect retrieval. "
+                        f"Set STRICT_EMBEDDING_MODEL_CHECK=false to disable this check."
+                    )
+                    logger.error("=" * 60)
+                    logger.error("STARTUP VALIDATION FAILED: %s", error_msg)
+                    logger.error("=" * 60)
+                    raise RuntimeError(error_msg)
+                else:
+                    logger.info("TEI model validation passed: %s", live_model_id)
+            else:
+                logger.warning(
+                    "TEI /info endpoint returned %d, skipping model validation",
+                    response.status_code,
+                )
+    except httpx.TimeoutException:
+        logger.warning("TEI /info endpoint timed out, skipping model validation")
+    except URLBlocked as e:
+        logger.warning(
+            "TEI /info endpoint blocked by SSRF guard: %s (continuing)", e
+        )
+    except Exception as e:
+        if isinstance(e, RuntimeError):
+            raise  # Re-raise our own error
+        logger.warning("TEI model validation failed (continuing): %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
@@ -270,47 +335,7 @@ async def lifespan(app: FastAPI):
 
     # Validate that live TEI model matches EMBEDDING_MODEL config
     if settings.strict_embedding_model_check:
-        try:
-            import httpx
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                info_url = (
-                    app.state.embedding_service.embeddings_url.rstrip("/") + "/info"
-                )
-                assert_url_safe(info_url)
-                response = await client.get(info_url)
-                if response.status_code == 200:
-                    info_data = response.json()
-                    live_model_id = info_data.get("model_id", "").split("/")[-1]
-                    configured_model = settings.embedding_model.split("/")[-1]
-                    if live_model_id and live_model_id != configured_model:
-                        error_msg = (
-                            f"EMBEDDING_MODEL mismatch! Configured: '{configured_model}', "
-                            f"Live TEI: '{live_model_id}'. "
-                            f"Embedding space mismatch will cause incorrect retrieval. "
-                            f"Set STRICT_EMBEDDING_MODEL_CHECK=false to disable this check."
-                        )
-                        logger.error("=" * 60)
-                        logger.error("STARTUP VALIDATION FAILED: %s", error_msg)
-                        logger.error("=" * 60)
-                        raise RuntimeError(error_msg)
-                    else:
-                        logger.info("TEI model validation passed: %s", live_model_id)
-                else:
-                    logger.warning(
-                        "TEI /info endpoint returned %d, skipping model validation",
-                        response.status_code,
-                    )
-        except httpx.TimeoutException:
-            logger.warning("TEI /info endpoint timed out, skipping model validation")
-        except URLBlocked as e:
-            logger.warning(
-                "TEI /info endpoint blocked by SSRF guard: %s (continuing)", e
-            )
-        except Exception as e:
-            if isinstance(e, RuntimeError):
-                raise  # Re-raise our own error
-            logger.warning("TEI model validation failed (continuing): %s", e)
+        await _validate_tei_embedding_model(app.state.embedding_service)
 
     app.state.vector_store = VectorStore()
     # Critical: fail fast if the vector store cannot connect or initialize its table.

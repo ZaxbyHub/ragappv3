@@ -61,6 +61,15 @@ WORKDIR /app
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download the spaCy model used by unstructured's NLP paths. spaCy installs
+# models into root-owned site-packages, so a first-parse runtime download as the
+# non-root appuser fails with a permission error. Fetching it here (as root)
+# bakes it into the image so document parsing works on a fresh container.
+# Like the apt/pip steps above, this needs network access at build time; for
+# restricted/airgapped builds pass a proxy via Docker's standard build args
+# (HTTP_PROXY/HTTPS_PROXY) or pre-seed the model from a mirror.
+RUN python -m spacy download en_core_web_sm
+
 # Copy backend code
 COPY backend/app ./app
 

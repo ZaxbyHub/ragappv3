@@ -169,6 +169,85 @@ vi.mock('@/lib/formatters', () => ({
   formatDate: (date: string) => date,
 }));
 
+// Test control for the UploadDropzone mock: the factory installs a global
+// handle so tests can drive the onRejected / onFiles callbacks that the page
+// passes to the dropzone. The mock renders a tiny "test bench" so we can
+// assert whether the real component (and the page-level wiring) is connected.
+const dropzoneTestHandle: {
+  current: {
+    onFiles: ((files: File[]) => void) | null;
+    onRejected: ((names: string[]) => void) | null;
+  };
+} = {
+  current: { onFiles: null, onRejected: null },
+};
+vi.mock('@/components/documents/UploadDropzone', () => ({
+  UploadDropzone: (props: {
+    onFiles: (files: File[]) => void;
+    onRejected: (names: string[]) => void;
+  }) => {
+    dropzoneTestHandle.current.onFiles = props.onFiles;
+    dropzoneTestHandle.current.onRejected = props.onRejected;
+    return (
+      <div data-testid="upload-dropzone-stub">
+        <button
+          type="button"
+          data-testid="dropzone-trigger-rejected"
+          onClick={() =>
+            dropzoneTestHandle.current.onRejected?.(['a.exe (too large)', 'b.xyz (unsupported)'])
+          }
+        >
+          trigger rejected
+        </button>
+        <button
+          type="button"
+          data-testid="dropzone-trigger-rejected-empty"
+          onClick={() => dropzoneTestHandle.current.onRejected?.([])}
+        >
+          trigger rejected empty
+        </button>
+        <button
+          type="button"
+          data-testid="dropzone-trigger-rejected-new"
+          onClick={() => dropzoneTestHandle.current.onRejected?.(['c.txt (too large)'])}
+        >
+          trigger rejected new
+        </button>
+        <button
+          type="button"
+          data-testid="dropzone-trigger-files"
+          onClick={() => dropzoneTestHandle.current.onFiles?.([])}
+        >
+          trigger files
+        </button>
+      </div>
+    );
+  },
+}));
+
+vi.mock('@/components/documents/RejectedFilesBanner', () => ({
+  RejectedFilesBanner: ({ files, onDismiss }: { files: string[]; onDismiss: () => void }) => {
+    if (files.length === 0) return null;
+    return (
+      <div data-testid="rejected-files-banner" role="status" aria-live="polite">
+        <span data-testid="rejected-files-count">
+          {files.length === 1 ? '1 file was rejected' : `${files.length} files were rejected`}
+        </span>
+        <ul data-testid="rejected-files-list">
+          {files.map((file, index) => (
+            <li key={index} data-testid="rejected-files-item">
+              {file}
+            </li>
+          ))}
+        </ul>
+        <button type="button" aria-label="Dismiss rejected files list" onClick={onDismiss}>
+          Dismiss
+        </button>
+      </div>
+    );
+  },
+}));
+
 // Import component after mocks
 import DocumentsPage from '@/pages/DocumentsPage';
 import { useVaultStore } from '@/stores/useVaultStore';
@@ -856,6 +935,126 @@ describe('DocumentsPage - Drag to Resize Filename Column', () => {
       });
 
       expect(container).toBeTruthy();
+    });
+  });
+
+  describe('Rejected files banner (issue #55)', () => {
+    // Reset the per-component handle so a stale callback from a prior render
+    // can't bleed into the next test.
+    beforeEach(() => {
+      dropzoneTestHandle.current.onFiles = null;
+      dropzoneTestHandle.current.onRejected = null;
+    });
+
+    it('does not render the rejected-files banner when no rejection has occurred', async () => {
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('upload-dropzone-stub')).toBeInTheDocument();
+      });
+      expect(screen.queryByTestId('rejected-files-banner')).not.toBeInTheDocument();
+    });
+
+    it('renders the rejected-files banner with the rejected file list when the dropzone reports rejections', async () => {
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('upload-dropzone-stub')).toBeInTheDocument();
+      });
+      // The page must have wired up onRejected for the test stub to be functional.
+      expect(dropzoneTestHandle.current.onRejected).toBeTypeOf('function');
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('dropzone-trigger-rejected'));
+      });
+
+      const banner = await screen.findByTestId('rejected-files-banner');
+      expect(banner).toBeInTheDocument();
+      expect(screen.getByTestId('rejected-files-count').textContent).toBe(
+        '2 files were rejected'
+      );
+      const items = screen.getAllByTestId('rejected-files-item');
+      expect(items).toHaveLength(2);
+      expect(items[0]).toHaveTextContent('a.exe (too large)');
+      expect(items[1]).toHaveTextContent('b.xyz (unsupported)');
+    });
+
+    it('clears the rejected-files banner when the dismiss button is clicked', async () => {
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('upload-dropzone-stub')).toBeInTheDocument();
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('dropzone-trigger-rejected'));
+      });
+      expect(await screen.findByTestId('rejected-files-banner')).toBeInTheDocument();
+
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('Dismiss rejected files list'));
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('rejected-files-banner')).not.toBeInTheDocument();
+      });
+    });
+
+    it('does not re-render the rejected-files banner after dismiss unless a new rejection arrives', async () => {
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('upload-dropzone-stub')).toBeInTheDocument();
+      });
+
+      // 1) Reject two files, banner appears.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('dropzone-trigger-rejected'));
+      });
+      expect(await screen.findByTestId('rejected-files-banner')).toBeInTheDocument();
+
+      // 2) Dismiss — banner disappears.
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('Dismiss rejected files list'));
+      });
+      await waitFor(() => {
+        expect(screen.queryByTestId('rejected-files-banner')).not.toBeInTheDocument();
+      });
+
+      // 3) Firing onRejected with an empty list must NOT bring the banner back.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('dropzone-trigger-rejected-empty'));
+      });
+      expect(screen.queryByTestId('rejected-files-banner')).not.toBeInTheDocument();
+
+      // 4) Sanity: a fresh non-empty rejection does re-show the banner with the
+      //    new file list — this proves the dismiss doesn't permanently break
+      //    the wiring.
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('dropzone-trigger-rejected-new'));
+      });
+      const banner = await screen.findByTestId('rejected-files-banner');
+      expect(banner).toBeInTheDocument();
+      expect(screen.getByTestId('rejected-files-count').textContent).toBe(
+        '1 file was rejected'
+      );
+      expect(screen.getByTestId('rejected-files-item')).toHaveTextContent('c.txt (too large)');
     });
   });
 });

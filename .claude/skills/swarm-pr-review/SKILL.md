@@ -20,6 +20,8 @@ This workflow is designed for the Swarm plugin itself and any repo that benefits
 
 Never APPROVE a PR with unresolved CRITICAL findings. Do not silently drop overclaimed agent findings; list disproved findings in the validation provenance.
 
+**Self-review awareness**: If the orchestrator authored code included in the PR scope (e.g., from earlier turns in the same session), include a `"orchestrator_authored_files": [...]` field in the context pack. Reviewers receiving this context pack should apply extra scrutiny to those files. The Anti-Self-Review Rule still applies — the orchestrator must not classify candidates for those files.
+
 ---
 
 ## Review Modes

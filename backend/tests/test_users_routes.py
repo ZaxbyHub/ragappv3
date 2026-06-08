@@ -29,12 +29,16 @@ from app.services.auth_service import create_access_token, hash_password
 
 
 def setup_test_db(db_path: str) -> sqlite3.Connection:
-    """Set up test database with schema and initial users."""
+    """Set up test database with schema and initial users.
+
+    Includes all tables touched by the current user-management routes:
+    users, organizations, org_members, groups, and group_members.
+    """
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
 
-    # Create users table
+    # Create users table (matches full production schema)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +49,65 @@ def setup_test_db(db_path: str) -> sqlite3.Connection:
             is_active INTEGER NOT NULL DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_login_at TIMESTAMP,
-            must_change_password INTEGER NOT NULL DEFAULT 0
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            locked_until TIMESTAMP
+        )
+    """)
+
+    # Organizations table: required by delete_user (org ownership guard)
+    # and get/update_user_organizations endpoints.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS organizations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            description TEXT DEFAULT '',
+            slug TEXT UNIQUE,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (created_by) REFERENCES users(id)
+        )
+    """)
+
+    # Organization members table: queried by delete_user to prevent
+    # orphaning organizations when deleting an owner.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS org_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member')),
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(org_id, user_id)
+        )
+    """)
+
+    # Groups table: required by get/update_user_groups endpoints.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
+            UNIQUE(org_id, name)
+        )
+    """)
+
+    # Group members table: required by get/update_user_groups endpoints.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS group_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE(group_id, user_id)
         )
     """)
 
@@ -64,6 +126,10 @@ def setup_test_db(db_path: str) -> sqlite3.Connection:
     # Create indexes
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_org_id ON org_members(org_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_org_members_user_id ON org_members(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON group_members(group_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id)")
 
     conn.commit()
     return conn

@@ -16,8 +16,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-POLL_INTERVAL = 5  # seconds between polls when queue is empty
-MAX_RETRIES = 3    # max automatic retries before a job is permanently failed
+POLL_INTERVAL = 5        # seconds between polls when queue is empty
+MAX_RETRIES = 3           # max automatic retries before a job is permanently failed
+RESET_RETRY_ATTEMPTS = 3  # attempts to recover a job from 'failed' → 'pending' after a transient DB error
+RESET_RETRY_BASE_DELAY = 0.5  # seconds; doubled per attempt (0.5, 1.0, 2.0)
 
 
 class WikiCompileProcessor:
@@ -102,7 +104,7 @@ class WikiCompileProcessor:
                                 job.id, new_retry_count, MAX_RETRIES, backoff,
                             )
                             await asyncio.sleep(backoff)
-                            await asyncio.to_thread(self._reset_job_to_pending, job.id)
+                            await self._reset_job_to_pending_with_retry(job.id)
                         else:
                             logger.error(
                                 "WikiCompileProcessor: job id=%d permanently failed after %d retries",
@@ -149,6 +151,37 @@ class WikiCompileProcessor:
         with self._pool.connection() as conn:
             WikiStore(conn).reset_job_to_pending(job_id)
 
+    async def _reset_job_to_pending_with_retry(self, job_id: int) -> None:
+        """Reset a 'failed' job to 'pending' with bounded retry on transient DB errors.
+
+        A single transient failure (e.g. SQLite 'database is locked') on the original
+        one-shot call would leave the job stuck in 'failed' until manual API retry.
+        This helper retries the reset a few times with short exponential backoff so
+        the auto-retry pipeline self-heals. Non-recoverable failures propagate to the
+        outer poll-loop guard, which logs and continues with the next job.
+        """
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, RESET_RETRY_ATTEMPTS + 1):
+            try:
+                await asyncio.to_thread(self._reset_job_to_pending, job_id)
+                if attempt > 1:
+                    logger.warning(
+                        "WikiCompileProcessor: job id=%d reset recovered on attempt %d/%d",
+                        job_id, attempt, RESET_RETRY_ATTEMPTS,
+                    )
+                return
+            except Exception as exc:  # noqa: BLE001 — propagate only after final attempt
+                last_exc = exc
+                if attempt < RESET_RETRY_ATTEMPTS:
+                    delay = RESET_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        "WikiCompileProcessor: job id=%d reset attempt %d/%d failed: %s; retrying in %.1fs",
+                        job_id, attempt, RESET_RETRY_ATTEMPTS, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
+
     def _publish_event(self, job, event_type: str, *, result: Optional[dict] = None, error: Optional[str] = None) -> None:
         """Fan out a terminal-state event to SSE subscribers for the vault.
 
@@ -176,7 +209,18 @@ class WikiCompileProcessor:
                 payload["error"] = error
             get_wiki_event_bus().publish(job.vault_id, payload)
         except Exception as exc:  # noqa: BLE001 — fan-out must never fail the loop
-            logger.debug("WikiCompileProcessor: event publish failed: %s", exc)
+            # WARNING (not DEBUG): these are terminal-state events (job
+            # completed/failed) that subscribers expect in real time. A dropped
+            # notification is operationally significant — surface it so the
+            # event is visible to operators, not only at debug verbosity.
+            logger.warning(
+                "WikiCompileProcessor: event publish failed (job_id=%s vault_id=%s event=%s): %s",
+                job.id,
+                job.vault_id,
+                event_type,
+                exc,
+                exc_info=True,
+            )
 
     def _dispatch(self, job) -> dict:
         """Dispatch a job to the appropriate handler. Runs in a thread."""

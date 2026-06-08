@@ -142,9 +142,12 @@ class EmbeddingService:
         # Persistent HTTP client — created once, reused for all embedding calls.
         # URL is passed per-request from `embeddings_url`, so this pool survives
         # endpoint changes.
+        # follow_redirects=False so a 30x from the embedding host cannot bypass
+        # the SSRF guard by redirecting to a private/internal address.
         self._client = httpx.AsyncClient(
             timeout=self.timeout,
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            follow_redirects=False,
         )
 
         # LRU cache. Cache keys include the live model/url/prefix fingerprints,
@@ -228,9 +231,18 @@ class EmbeddingService:
         Detection strategy:
         - If URL path includes '/api/embeddings' -> Ollama mode
         - If URL path includes '/v1/embeddings' -> OpenAI mode
+        - If URL path ends with '/embed' -> native TEI mode
         - If no explicit embeddings path:
           - Port 1234 -> OpenAI mode (LM Studio default)
+          - Port 8080 -> native TEI mode (Text Embeddings Inference default)
           - Otherwise -> Ollama mode
+
+        Native TEI servers (HuggingFace Text Embeddings Inference) always expose
+        the route ``POST /embed`` with an ``{"inputs": ...}`` payload, but only
+        some deployments additionally expose the OpenAI-compatible
+        ``/v1/embeddings`` route. A bare ``host:8080`` URL is therefore resolved
+        to the native ``/embed`` route so it works against any TEI build, while
+        an explicit ``/v1/embeddings`` path still selects OpenAI mode.
 
         Args:
             base_url: The configured embedding URL
@@ -248,6 +260,9 @@ class EmbeddingService:
         elif "/v1/embeddings" in path:
             # Already has OpenAI path, use as-is
             return ("openai", base_url)
+        elif path.rstrip("/").endswith("/embed"):
+            # Already has native TEI path, use as-is
+            return ("tei", base_url)
 
         # No explicit path - determine by port
         port = parsed.port
@@ -256,9 +271,9 @@ class EmbeddingService:
             base_url = base_url.rstrip("/") + "/v1/embeddings"
             return ("openai", base_url)
         elif port == 8080:
-            # TEI default port - use OpenAI mode
-            base_url = base_url.rstrip("/") + "/v1/embeddings"
-            return ("openai", base_url)
+            # TEI default port - use native TEI mode (POST /embed)
+            base_url = base_url.rstrip("/") + "/embed"
+            return ("tei", base_url)
         else:
             # Default to Ollama mode
             base_url = base_url.rstrip("/") + "/api/embeddings"
@@ -276,15 +291,19 @@ class EmbeddingService:
         """
         if self.provider_mode == "openai":
             return {"model": self.embedding_model, "input": text}
+        elif self.provider_mode == "tei":
+            # Native TEI serves a single model, so no model field is sent.
+            return {"inputs": text}
         else:  # ollama mode
             return {"model": self.embedding_model, "prompt": text}
 
-    def _extract_embedding(self, data: dict) -> List[float]:
+    def _extract_embedding(self, data) -> List[float]:
         """
         Extract embedding vector from API response based on provider mode.
 
         Args:
-            data: Parsed JSON response from the API
+            data: Parsed JSON response from the API. A mapping for OpenAI/Ollama
+                modes, or a list-of-lists for native TEI mode.
 
         Returns:
             List of float values representing the embedding vector
@@ -308,6 +327,24 @@ class EmbeddingService:
             if embedding is None:
                 logger.error(
                     "Embedding API response missing 'data[0].embedding' field in OpenAI mode"
+                )
+                raise EmbeddingError("Embedding API response is invalid")
+        elif self.provider_mode == "tei":
+            # Native TEI returns a raw JSON array of embedding arrays, e.g.
+            # [[...]]. Some TEI-compatible servers wrap it as
+            # {"embeddings": [[...]]}; accept both shapes.
+            rows = data.get("embeddings") if isinstance(data, dict) else data
+            if not isinstance(rows, list) or len(rows) == 0:
+                logger.error(
+                    "Embedding API response in TEI mode is not a non-empty list "
+                    "or {'embeddings': [...]} object, got %s",
+                    type(data).__name__,
+                )
+                raise EmbeddingError("Embedding API response is invalid")
+            embedding = rows[0]
+            if not isinstance(embedding, list):
+                logger.error(
+                    "Embedding API response first element is not a list in TEI mode"
                 )
                 raise EmbeddingError("Embedding API response is invalid")
         else:  # ollama mode
@@ -388,6 +425,8 @@ class EmbeddingService:
 
             return embedding
 
+        except CircuitBreakerError as e:
+            raise EmbeddingError(f"Embedding service circuit breaker is open: {e}")
         except httpx.TimeoutException:
             raise EmbeddingError("Embedding request timed out")
         except httpx.HTTPError:
@@ -652,6 +691,10 @@ class EmbeddingService:
             # Build payload with array of inputs
             if self.provider_mode == "openai":
                 payload = {"model": self.embedding_model, "input": texts}
+            elif self.provider_mode == "tei":
+                # Native TEI accepts a list under "inputs" and returns a raw
+                # array of embedding arrays in the same order.
+                payload = {"inputs": texts}
             else:  # ollama mode
                 payload = {"model": self.embedding_model, "input": texts}
 
@@ -688,6 +731,20 @@ class EmbeddingService:
             if self.provider_mode == "openai":
                 # OpenAI format: data[].embedding
                 embeddings = [item["embedding"] for item in data["data"]]
+            elif self.provider_mode == "tei":
+                # Native TEI returns a raw JSON array of embedding arrays. Some
+                # TEI-compatible servers wrap it as {"embeddings": [[...]]};
+                # accept both shapes.
+                embeddings = (
+                    data.get("embeddings") if isinstance(data, dict) else data
+                )
+                if not isinstance(embeddings, list):
+                    logger.error(
+                        f"Unexpected response format for {self.provider_mode} mode: "
+                        f"expected a list or {{'embeddings': [...]}}, got "
+                        f"{type(data).__name__}"
+                    )
+                    raise EmbeddingError("Unexpected response from embedding service")
             else:
                 # Ollama format may vary - try common formats
                 if "embeddings" in data:

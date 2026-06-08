@@ -354,6 +354,14 @@ class Settings(BaseSettings):
     # ── Wiki / Knowledge Compiler configuration ──────────────────────────
     wiki_enabled: bool = True
     """Master switch for the Knowledge Compiler / wiki subsystem."""
+    wiki_fts_page_search_max_candidates: int = 5
+    """Upper bound on the candidate-pool size that triggers the FTS page-search
+    fallback (phase 4 of wiki retrieval). Page search only runs when the
+    candidates dict from phases 1–3 contains fewer than this many entries.
+    Lower values (e.g. 0) make page search more aggressive; higher values
+    make it rarer. Default 5 preserves the historical hardcoded threshold;
+    issue #101 reported a default of 3 — operators that want to recover the
+    original behavior can set WIKI_FTS_PAGE_SEARCH_MAX_CANDIDATES=3."""
     wiki_compile_on_ingest: bool = True
     """Run wiki compile when a document finishes indexing."""
     wiki_compile_on_query: bool = True

@@ -57,7 +57,11 @@ class ModelChecker:
         await asyncio.to_thread(assert_url_safe, settings.ollama_chat_url)
         await asyncio.to_thread(assert_url_safe, settings.instant_chat_url)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        # follow_redirects=False so a 30x from a model host cannot bypass the
+        # SSRF guard by redirecting to a private/internal address.
+        async with httpx.AsyncClient(
+            timeout=self.timeout, follow_redirects=False
+        ) as client:
             # Check embedding model
             result['embedding_model'] = await self._check_model_availability(
                 client,
@@ -83,19 +87,22 @@ class ModelChecker:
 
     def _detect_provider_type(self, base_url: str) -> str:
         """
-        Detect whether the endpoint is Ollama or OpenAI-compatible.
+        Detect whether the endpoint is Ollama, OpenAI-compatible, or native TEI.
 
-        Detection rules:
+        Detection rules (kept consistent with
+        ``EmbeddingService._detect_provider_mode``):
         - explicit /api/tags path => Ollama
         - explicit /v1/models or /v1/embeddings path => OpenAI-compatible
-        - no explicit path + port 1234 => OpenAI-compatible
+        - explicit /embed path => native TEI
+        - no explicit path + port 8080 => native TEI (TEI default)
+        - no explicit path + port 1234/8000/5000/5001 => OpenAI-compatible
         - otherwise Ollama
 
         Args:
             base_url: The base URL of the endpoint
 
         Returns:
-            'ollama' or 'openai_compatible'
+            'ollama', 'openai_compatible', or 'tei'
         """
         url_lower = base_url.lower().rstrip('/')
 
@@ -107,12 +114,19 @@ class ModelChecker:
         if '/v1/models' in url_lower or '/v1/embeddings' in url_lower:
             return 'openai_compatible'
 
-        # Check for common OpenAI-compatible ports (vLLM 8000, LM Studio 1234, etc.)
-        # without explicit path
-        OPENAI_COMPATIBLE_PORTS = {8000, 1234, 8080, 5000, 5001}
+        # Check for explicit native TEI path (POST /embed)
+        if url_lower.endswith('/embed'):
+            return 'tei'
+
+        # Port-based detection when no explicit path disambiguates the endpoint.
+        # Native TEI defaults to 8080; other common OpenAI-compatible servers
+        # (vLLM 8000, LM Studio 1234, etc.) use the ports below.
+        OPENAI_COMPATIBLE_PORTS = {8000, 1234, 5000, 5001}
         try:
             from urllib.parse import urlparse
             parsed = urlparse(base_url)
+            if parsed.port == 8080 or parsed.netloc.endswith(':8080'):
+                return 'tei'
             if parsed.port in OPENAI_COMPATIBLE_PORTS or any(
                 parsed.netloc.endswith(f':{p}') for p in OPENAI_COMPATIBLE_PORTS
             ):
@@ -149,7 +163,9 @@ class ModelChecker:
         """
         provider_type = self._detect_provider_type(base_url)
 
-        if provider_type == 'openai_compatible':
+        if provider_type == 'tei':
+            return await self._check_tei_model(client, base_url, model_name)
+        elif provider_type == 'openai_compatible':
             return await self._check_openai_compatible_model(client, base_url, model_name)
         else:
             return await self._check_ollama_model(client, base_url, model_name)
@@ -190,6 +206,74 @@ class ModelChecker:
             return {
                 'available': False,
                 'error': f"Model '{model_name}' not found. Available models: {', '.join(available_model_names) or 'none'}"
+            }
+
+        except httpx.TimeoutException:
+            return {
+                'available': False,
+                'error': f"Request timed out after {self.timeout}s"
+            }
+        except httpx.HTTPStatusError as e:
+            return {
+                'available': False,
+                'error': f"HTTP error {e.response.status_code}: {e.response.text}"
+            }
+        except httpx.RequestError as e:
+            return {
+                'available': False,
+                'error': f"Request failed: {str(e)}"
+            }
+        except (ValueError, TypeError, RuntimeError) as e:
+            return {
+                'available': False,
+                'error': f"Unexpected error: {str(e)}"
+            }
+
+    async def _check_tei_model(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        model_name: str
+    ) -> Dict[str, Any]:
+        """
+        Check model availability using native TEI's /info endpoint.
+
+        Native HuggingFace TEI serves a single model and exposes its identity at
+        ``<root>/info`` as ``{"model_id": "...", ...}``. The /info route lives at
+        the server root, not under the /embed route, so any trailing /embed is
+        stripped before probing.
+        """
+        root = base_url.rstrip('/')
+        if root.endswith('/embed'):
+            root = root[: -len('/embed')]
+        url = f"{root.rstrip('/')}/info"
+
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+            live_model_id = data.get('model_id', '') if isinstance(data, dict) else ''
+            if not live_model_id:
+                return {
+                    'available': False,
+                    'error': "TEI /info response missing 'model_id'"
+                }
+
+            # TEI serves one model; compare leniently by the last path segment
+            # (e.g. "microsoft/harrier-oss-v1-0.6b" vs "harrier-oss-v1-0.6b").
+            if (
+                live_model_id == model_name
+                or live_model_id.split('/')[-1] == model_name.split('/')[-1]
+            ):
+                return {'available': True, 'error': None}
+
+            return {
+                'available': False,
+                'error': (
+                    f"Model '{model_name}' not found. "
+                    f"Live TEI model: '{live_model_id}'"
+                )
             }
 
         except httpx.TimeoutException:

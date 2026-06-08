@@ -866,3 +866,127 @@ class TestWikiStoreSearchFacetsAndHierarchy(unittest.TestCase):
         self.assertEqual(self.store.get_page(child.id).parent_id, parent.id)
         # Root page has no parent.
         self.assertIsNone(parent.parent_id)
+
+
+class TestWikiClaimsUniqueConstraint(unittest.TestCase):
+    """Regression: wiki_claims UNIQUE(vault_id, claim_text) — issue #112."""
+
+    def setUp(self):
+        self.store, self.conn = _make_store()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_duplicate_claim_raises_integrity_error(self):
+        """Inserting a claim with the same (vault_id, claim_text) raises."""
+        import sqlite3
+
+        self.store.create_claim(
+            vault_id=1, claim_text="The sky is blue", source_type="manual"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.create_claim(
+                vault_id=1, claim_text="The sky is blue", source_type="manual"
+            )
+
+    def test_same_claim_text_different_vault_is_allowed(self):
+        """Same claim_text in different vaults is not a conflict."""
+        self.store.create_claim(
+            vault_id=1, claim_text="Shared fact", source_type="manual"
+        )
+        # vault 2 may not exist in FK terms but the UNIQUE index is on
+        # (vault_id, claim_text), so a different vault_id is fine.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO vaults (id, name) VALUES (2, 'Vault 2')"
+        )
+        self.conn.commit()
+        claim2 = self.store.create_claim(
+            vault_id=2, claim_text="Shared fact", source_type="manual"
+        )
+        self.assertIsNotNone(claim2)
+
+    def test_unique_index_exists_after_migration(self):
+        """The unique index is present after run_migrations."""
+        from app.models.database import run_migrations
+
+        db_path = str(Path(tempfile.mkdtemp()) / "test_unique.db")
+        run_migrations(db_path)
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        indexes = {
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        conn.close()
+        self.assertIn("idx_wiki_claims_unique_vault_claim", indexes)
+
+    def test_migration_deduplicates_existing_rows(self):
+        """Migration removes duplicate rows and creates the unique index."""
+        from app.models.database import (
+            migrate_add_wiki_claims_unique_claim_text,
+        )
+
+        db_path = str(Path(tempfile.mkdtemp()) / "test_dedup.db")
+        # Build a minimal legacy schema WITHOUT the UNIQUE constraint to
+        # simulate a database created before this fix.
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""
+            CREATE TABLE vaults (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE wiki_pages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                page_type TEXT NOT NULL DEFAULT 'entity',
+                slug TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE wiki_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                page_id INTEGER REFERENCES wiki_pages(id) ON DELETE SET NULL,
+                claim_text TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                status TEXT NOT NULL DEFAULT 'active',
+                confidence REAL DEFAULT 0.0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'V');
+        """)
+        conn.commit()
+        # Insert duplicate rows (no unique constraint in this legacy schema).
+        conn.execute(
+            "INSERT INTO wiki_claims (vault_id, claim_text, source_type, status) "
+            "VALUES (1, 'dup claim', 'manual', 'active')"
+        )
+        conn.execute(
+            "INSERT INTO wiki_claims (vault_id, claim_text, source_type, status) "
+            "VALUES (1, 'dup claim', 'manual', 'active')"
+        )
+        conn.commit()
+        count_before = conn.execute(
+            "SELECT COUNT(*) FROM wiki_claims WHERE claim_text = 'dup claim'"
+        ).fetchone()[0]
+        self.assertEqual(count_before, 2)
+        conn.close()
+
+        # Run the migration — should deduplicate and create the unique index.
+        migrate_add_wiki_claims_unique_claim_text(db_path)
+        conn = sqlite3.connect(db_path)
+        count_after = conn.execute(
+            "SELECT COUNT(*) FROM wiki_claims WHERE claim_text = 'dup claim'"
+        ).fetchone()[0]
+        self.assertEqual(count_after, 1)
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_wiki_claims_unique_vault_claim'"
+        ).fetchone()
+        self.assertIsNotNone(idx)
+        conn.close()

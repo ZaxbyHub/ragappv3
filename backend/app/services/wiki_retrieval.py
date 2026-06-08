@@ -87,6 +87,10 @@ class WikiEvidence:
     matched_entity: Optional[str] = None
     matched_predicate: Optional[str] = None
     filtered_reason: Optional[str] = None
+    # Internal fields for entity mismatch filtering (issue #102).
+    # Populated by _fts_claim_search; not exposed in to_dict().
+    _claim_subject: Optional[str] = None
+    _claim_object: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -179,8 +183,24 @@ class WikiRetrievalService:
     borrows a connection, runs queries, and returns the connection.
     """
 
-    def __init__(self, pool: Any) -> None:
+    def __init__(
+        self,
+        pool: Any,
+        fts_page_search_max_candidates: Optional[int] = None,
+    ) -> None:
         self._pool = pool
+        # Configurable FTS page-search fallback threshold (issue #101).
+        # Resolved lazily so tests and ad-hoc construction don't pay the
+        # Settings import cost; production callers in lifespan.py get the
+        # live value from app.config.settings (env-overridable via
+        # WIKI_FTS_PAGE_SEARCH_MAX_CANDIDATES).
+        if fts_page_search_max_candidates is None:
+            from app.config import settings
+
+            fts_page_search_max_candidates = (
+                settings.wiki_fts_page_search_max_candidates
+            )
+        self._fts_page_search_max_candidates = max(0, fts_page_search_max_candidates)
 
     def _acquire(self) -> sqlite3.Connection:
         # Support both the production SQLiteConnectionPool
@@ -225,6 +245,18 @@ class WikiRetrievalService:
         # 1. Exact entity match
         matched_entities = self._entity_exact_match(conn, entity_candidates, vault_id)
 
+        # Build expanded entity text set for mismatch filtering (issue #102).
+        # The raw entity_candidates (e.g. "AFOMIS") may not appear as a
+        # substring in every valid claim — some claims reference the entity
+        # only through the relation graph.  Include canonical names and
+        # aliases from matched entities so that related claims pass through.
+        _expanded_entity_texts: set[str] = {e.lower() for e in entity_candidates}
+        for ent in matched_entities:
+            _expanded_entity_texts.add(ent.canonical_name.lower())
+            for alias in ent.aliases:
+                if isinstance(alias, str) and alias:
+                    _expanded_entity_texts.add(alias.lower())
+
         # 2. Relation lookup from matched entities
         if matched_entities:
             for entity in matched_entities:
@@ -250,12 +282,22 @@ class WikiRetrievalService:
             fts_claim_results = self._fts_claim_search(conn, normalized_query, vault_id)
             for ev in fts_claim_results:
                 # Entity mismatch filter: if we have explicit entity candidates,
-                # reject claims where none of those entities appear in claim text
-                if entity_candidates:
+                # reject claims where none of the expanded entity texts appear
+                # in claim text.  Uses canonical names + aliases from the
+                # relation graph, not just raw query tokens (issue #102).
+                if _expanded_entity_texts:
                     claim_text_lower = (ev.claim_text or "").lower()
                     page_title_lower = ev.title.lower()
-                    combined = claim_text_lower + " " + page_title_lower
-                    if not any(ent.lower() in combined for ent in entity_candidates):
+                    # Also check claim's structured subject/object fields
+                    # (issue #102) — FTS may match on these even when the
+                    # entity name is absent from claim_text.
+                    claim_subject_lower = (ev._claim_subject or "").lower()
+                    claim_object_lower = (ev._claim_object or "").lower()
+                    combined = (
+                        claim_text_lower + " " + page_title_lower
+                        + " " + claim_subject_lower + " " + claim_object_lower
+                    )
+                    if not any(ent in combined for ent in _expanded_entity_texts):
                         ev.filtered_reason = f"entity_mismatch: {entity_candidates}"
                         filtered_log.append(f"{ev.label_placeholder}:entity_mismatch")
                         continue
@@ -263,13 +305,15 @@ class WikiRetrievalService:
                 if key not in candidates or ev.score > candidates[key].score:
                     candidates[key] = ev
 
-        # 4. FTS page search (fallback, lower score)
-        if normalized_query and len(candidates) < 5:
+        # 4. FTS page search (fallback, lower score). Threshold is
+        #    configurable via wiki_fts_page_search_max_candidates (issue #101);
+        #    a value of 0 forces this fallback to run for every query.
+        if normalized_query and len(candidates) < self._fts_page_search_max_candidates:
             fts_page_results = self._fts_page_search(conn, normalized_query, vault_id)
             for ev in fts_page_results:
-                if entity_candidates:
+                if _expanded_entity_texts:
                     title_lower = ev.title.lower()
-                    if not any(ent.lower() in title_lower for ent in entity_candidates):
+                    if not any(ent in title_lower for ent in _expanded_entity_texts):
                         ev.filtered_reason = f"entity_mismatch: {entity_candidates}"
                         filtered_log.append(f"{ev.label_placeholder}:entity_mismatch")
                         continue
@@ -476,6 +520,8 @@ class WikiRetrievalService:
                 freshness=d.get("last_compiled_at"),
                 source_count=source_count,
                 provenance_summary=provenance,
+                _claim_subject=d.get("subject"),
+                _claim_object=d.get("object"),
             ))
         return results
 

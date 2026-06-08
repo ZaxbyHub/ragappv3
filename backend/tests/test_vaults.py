@@ -1653,5 +1653,149 @@ class TestFetchAccessibleVaultsAdversarial(unittest.TestCase):
             self._connection_pool.release_connection(conn)
 
 
+
+
+class TestVaultResponseOrgId(unittest.TestCase):
+    """Tests for VaultResponse.org_id field mapping and org-scoped vault filtering.
+
+    Verifies that:
+    - org_id is None when a vault has no organization assigned.
+    - org_id is correctly populated from the database row for org-scoped vaults.
+    - The /api/vaults list endpoint returns org_id in each vault response.
+    """
+
+    def setUp(self):
+        self.client = TestClient(app)
+        self._temp_dir = tempfile.mkdtemp()
+        db_path = str(Path(self._temp_dir) / "test.db")
+        from app.models.database import init_db
+        init_db(db_path)
+        self._connection_pool = SimpleConnectionPool(db_path)
+
+        conn = self._connection_pool.get_connection()
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
+            (1, "admin", "abc123", "superadmin", 1),
+        )
+        conn.commit()
+        self._connection_pool.release_connection(conn)
+
+        def override_get_db():
+            c = self._connection_pool.get_connection()
+            try:
+                yield c
+            finally:
+                self._connection_pool.release_connection(c)
+
+        app.dependency_overrides[get_db] = override_get_db
+        app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": 1,
+            "username": "admin",
+            "full_name": "Admin",
+            "role": "superadmin",
+            "is_active": True,
+            "must_change_password": False,
+        }
+        self._db_path = db_path
+
+    def tearDown(self):
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_active_user, None)
+        if hasattr(self, '_connection_pool'):
+            self._connection_pool.close_all()
+        import shutil
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def _insert_org(self, conn, name):
+        cursor = conn.execute(
+            "INSERT INTO organizations (name, created_by) VALUES (?, ?)",
+            (name, 1),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+    # ---- org_id field tests ----
+
+    def test_vault_response_org_id_is_none_for_global_vault(self):
+        """A vault created without an org returns org_id=None in the response."""
+        resp = self.client.post("/api/vaults", json={"name": "GlobalVault", "description": ""})
+        self.assertEqual(resp.status_code, 201)
+        data = resp.json()
+        self.assertIn("org_id", data)
+        self.assertIsNone(data["org_id"])
+
+    def test_vault_response_org_id_is_populated_for_org_vault(self):
+        """A vault created with an explicit org_id returns that org_id in the response."""
+        conn = self._connection_pool.get_connection()
+        org_id = self._insert_org(conn, "Acme Corp")
+        # Also add creator as org member so the route accepts org_id
+        conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (org_id, 1, "owner"),
+        )
+        conn.commit()
+        self._connection_pool.release_connection(conn)
+
+        resp = self.client.post(
+            "/api/vaults",
+            json={"name": "AcmeVault", "description": "", "org_id": org_id},
+        )
+        self.assertEqual(resp.status_code, 201)
+        data = resp.json()
+        self.assertEqual(data["org_id"], org_id)
+
+    def test_list_vaults_includes_org_id_field(self):
+        """GET /api/vaults returns org_id for every vault in the list."""
+        resp_create = self.client.post(
+            "/api/vaults", json={"name": "ListVault", "description": ""}
+        )
+        self.assertEqual(resp_create.status_code, 201)
+
+        resp_list = self.client.get("/api/vaults")
+        self.assertEqual(resp_list.status_code, 200)
+        vaults = resp_list.json()["vaults"]
+        self.assertGreater(len(vaults), 0)
+        for vault in vaults:
+            self.assertIn("org_id", vault)
+        created_vault = next(v for v in vaults if v["name"] == "ListVault")
+        self.assertIsNone(created_vault["org_id"])
+
+    def test_get_single_vault_includes_org_id(self):
+        """GET /api/vaults/{id} includes org_id=None for a vault without an org."""
+        resp = self.client.post("/api/vaults", json={"name": "SingleVault", "description": ""})
+        self.assertEqual(resp.status_code, 201)
+        vault_id = resp.json()["id"]
+
+        resp_get = self.client.get(f"/api/vaults/{vault_id}")
+        self.assertEqual(resp_get.status_code, 200)
+        self.assertIn("org_id", resp_get.json())
+        self.assertIsNone(resp_get.json()["org_id"])
+
+    def test_org_vault_org_id_preserved_after_update(self):
+        """org_id is not cleared when a vault's name or description is updated."""
+        conn = self._connection_pool.get_connection()
+        org_id = self._insert_org(conn, "UpdateOrg")
+        conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (org_id, 1, "owner"),
+        )
+        conn.commit()
+        self._connection_pool.release_connection(conn)
+
+        resp = self.client.post(
+            "/api/vaults",
+            json={"name": "OrgVaultUpdate", "description": "", "org_id": org_id},
+        )
+        self.assertEqual(resp.status_code, 201)
+        vault_id = resp.json()["id"]
+
+        resp_put = self.client.put(
+            f"/api/vaults/{vault_id}",
+            json={"description": "Updated description"},
+        )
+        self.assertEqual(resp_put.status_code, 200)
+        self.assertEqual(resp_put.json()["org_id"], org_id)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -403,7 +403,8 @@ CREATE TABLE IF NOT EXISTS wiki_claims (
     -- can still record the operator who promoted/reviewed it.
     created_by_kind TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(vault_id, claim_text)
 );
 
 CREATE TABLE IF NOT EXISTS wiki_claim_sources (
@@ -850,6 +851,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_page_hierarchy_and_versioning(sqlite_path)
     migrate_add_wiki_supporting_tables(sqlite_path)
     migrate_add_wiki_claims_normalized_text(sqlite_path)
+    migrate_add_wiki_claims_unique_claim_text(sqlite_path)
     migrate_assign_orphan_users_to_default_vault(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
@@ -1392,7 +1394,8 @@ def migrate_add_wiki_tables(sqlite_path: str) -> None:
                 created_by INTEGER,
                 created_by_kind TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(vault_id, claim_text)
             );
 
             CREATE TABLE IF NOT EXISTS wiki_claim_sources (
@@ -2347,6 +2350,42 @@ def migrate_add_wiki_relations_unique(sqlite_path: str) -> None:
         conn.execute(
             "CREATE UNIQUE INDEX idx_wiki_relations_unique_triple "
             "ON wiki_relations(subject_entity_id, predicate, object_entity_id)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_wiki_claims_unique_claim_text(sqlite_path: str) -> None:
+    """Migration: add UNIQUE constraint on wiki_claims(vault_id, claim_text).
+
+    Deduplicates existing rows first (keeps highest id per vault+claim pair),
+    then creates a unique index.  Idempotent.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_claims'"
+        ).fetchone()
+        if not tbl:
+            return
+
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_claims_unique_vault_claim'"
+        ).fetchone()
+        if idx:
+            return
+
+        # Remove duplicate rows (keep the latest / highest-id per vault+claim pair)
+        conn.execute(
+            """DELETE FROM wiki_claims WHERE id NOT IN (
+                SELECT MAX(id) FROM wiki_claims
+                GROUP BY vault_id, claim_text
+            )"""
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_wiki_claims_unique_vault_claim "
+            "ON wiki_claims(vault_id, claim_text)"
         )
         conn.commit()
     finally:
