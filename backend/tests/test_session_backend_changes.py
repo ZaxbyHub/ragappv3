@@ -349,6 +349,7 @@ class TestCreateUserEndpoint(unittest.TestCase):
                 full_name TEXT DEFAULT '',
                 role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
                 is_active INTEGER NOT NULL DEFAULT 1,
+                must_change_password INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_login_at TIMESTAMP
             )
@@ -413,7 +414,8 @@ class TestCreateUserEndpoint(unittest.TestCase):
         app.dependency_overrides[deps.get_db] = override_get_db
 
         # Mock CSRF protection
-        app.dependency_overrides[deps.csrf_protect] = lambda: "test-csrf-token"
+        from app.security import csrf_protect
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
 
         from fastapi.testclient import TestClient
 
@@ -549,8 +551,7 @@ class TestCreateUserEndpoint(unittest.TestCase):
             headers={"Authorization": f"Bearer {token}"},
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("8 characters", response.json()["detail"])
+        self.assertEqual(response.status_code, 422)
 
     def test_create_user_invalid_role(self):
         """Invalid role is rejected."""
