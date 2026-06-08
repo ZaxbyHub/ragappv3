@@ -105,6 +105,16 @@ def pytest_configure(config):
     Sets environment variables and clears all app.* modules from the
     import cache so they re-import with test-compatible settings.
     """
+    # Pre-import pyarrow/pandas while real modules are available.
+    # Many test files stub sys.modules["pyarrow"] at module-level, which
+    # breaks pandas on subsequent imports. Caching them here first prevents
+    # later stubs from affecting already-loaded submodules.
+    try:
+        import pyarrow  # noqa: F401
+        import pandas  # noqa: F401
+    except ImportError:
+        pass
+
     os.environ["ADMIN_SECRET_TOKEN"] = "test-admin-key"
     os.environ["USERS_ENABLED"] = "false"
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
