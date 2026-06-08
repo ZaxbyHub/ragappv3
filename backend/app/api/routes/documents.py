@@ -113,6 +113,7 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 
 async def _optional_current_user(
+    request: Request,
     authorization: str | None = Header(None),
     db: sqlite3.Connection = Depends(get_db),
 ) -> dict | None:
@@ -120,7 +121,9 @@ async def _optional_current_user(
     if not settings.users_enabled or not authorization:
         return None
     try:
-        return await get_current_active_user(authorization=authorization, db=db)
+        return await get_current_active_user(
+            request=request, authorization=authorization, db=db
+        )
     except HTTPException:
         return None
 

@@ -33,10 +33,13 @@ class TestEvalFeatureGate:
         test_app.dependency_overrides.clear()
 
     def _get_client(self, app):
-        """Get test client with mocked embedding service."""
-        from app.api.deps import get_embedding_service
+        """Get test client with mocked embedding service and auth."""
+        from app.api.deps import get_embedding_service, require_admin_role
 
         app.dependency_overrides[get_embedding_service] = lambda: self._mock_service
+        app.dependency_overrides[require_admin_role] = lambda: {
+            "id": 1, "username": "admin", "role": "admin", "is_active": True
+        }
         return TestClient(app)
 
     def test_eval_disabled_returns_501(self, setup_app):

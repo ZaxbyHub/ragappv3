@@ -10,7 +10,7 @@ Tests cover:
 import os
 import sys
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -29,6 +29,13 @@ except ImportError:
     import types
 
     sys.modules["pyarrow"] = types.ModuleType("pyarrow")
+
+try:
+    import ragas
+except ImportError:
+    import types
+
+    sys.modules["ragas"] = types.ModuleType("ragas")
 
 from fastapi.testclient import TestClient
 
@@ -542,14 +549,24 @@ class TestRAGASEndpointIntegration(unittest.TestCase):
         mock_service.embed_single = AsyncMock(return_value=[0.1] * 384)
         self._mock_service = mock_service
 
-        from app.api.deps import get_embedding_service
+        from app.api.deps import get_current_active_user, get_embedding_service
+        from app.config import settings
 
         self._get_embedding_service = get_embedding_service
+        self._get_current_active_user = get_current_active_user
         self.app.dependency_overrides[get_embedding_service] = lambda: mock_service
+        self.app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": 1, "username": "admin", "role": "admin", "is_active": True,
+            "must_change_password": 0,
+        }
+        self._eval_patcher = patch("app.config.settings.eval_enabled", True, create=True)
+        self._eval_patcher.start()
 
     def tearDown(self):
         """Clean up dependency overrides."""
+        self._eval_patcher.stop()
         self.app.dependency_overrides.pop(self._get_embedding_service, None)
+        self.app.dependency_overrides.pop(self._get_current_active_user, None)
 
     def test_endpoint_valid_request_returns_200(self):
         """Valid request should return 200 with metrics."""

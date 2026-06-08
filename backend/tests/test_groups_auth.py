@@ -340,22 +340,24 @@ class TestListGroups:
         assert len(data["groups"]) == 2
 
     def test_list_groups_skip_limit(self, client):
-        """List groups respects skip and limit parameters."""
+        """List groups respects page and per_page parameters."""
         # Create org and multiple groups
         org_id = _create_org("Paginate Org", 2)
         for i in range(5):
             _create_group(org_id, f"Group {i}")
 
-        # Test limit
-        response = client.get("/api/groups?limit=2", headers=auth_headers(admin_token))
+        # Test per_page limit
+        response = client.get(
+            "/api/groups?per_page=2", headers=auth_headers(admin_token)
+        )
         assert response.status_code == 200
         data = response.json()
         assert data["total"] == 5
         assert len(data["groups"]) == 2
 
-        # Test skip
+        # Test page 2 with per_page=2 (equivalent to skip=2&limit=2)
         response = client.get(
-            "/api/groups?skip=2&limit=2", headers=auth_headers(admin_token)
+            "/api/groups?page=2&per_page=2", headers=auth_headers(admin_token)
         )
         assert response.status_code == 200
         data = response.json()

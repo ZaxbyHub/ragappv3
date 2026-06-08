@@ -352,10 +352,12 @@ class TestChatStreaming(unittest.TestCase):
 
         events = self._parse_sse_events(response.text)
 
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[0]['data'].get("type"), "content")
-        self.assertEqual(events[0]['data'].get("content"), "Complete response")
-        self.assertEqual(events[1]['data'].get("type"), "done")
+        # mode event is emitted first, then content, then done
+        non_mode = [e for e in events if e.get('data', {}).get('type') != 'mode']
+        self.assertEqual(len(non_mode), 2)
+        self.assertEqual(non_mode[0]['data'].get("type"), "content")
+        self.assertEqual(non_mode[0]['data'].get("content"), "Complete response")
+        self.assertEqual(non_mode[1]['data'].get("type"), "done")
 
     def test_sse_parser_handles_multiline_data(self):
         """Test SSE parser handles multi-line data fields."""

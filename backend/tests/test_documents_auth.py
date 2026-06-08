@@ -70,6 +70,7 @@ from app.api.deps import (
     get_db,
     get_db_pool,
     get_embedding_service,
+    get_secret_manager,
     get_vector_store,
 )
 from app.api.routes.documents import _allowed_document_roots, _path_is_within
@@ -145,6 +146,9 @@ class TestDocumentAuthBase(unittest.TestCase):
         app.dependency_overrides[get_background_processor] = lambda: (
             self._mock_background_processor
         )
+        _mock_sm = MagicMock()
+        _mock_sm.get_hmac_key.return_value = (b"test-hmac-key-32bytes-padding!!", "v1")
+        app.dependency_overrides[get_secret_manager] = lambda: _mock_sm
 
         # Seed test users and vaults
         conn = self._connection_pool.get_connection()
@@ -239,6 +243,7 @@ class TestDocumentAuthBase(unittest.TestCase):
         app.dependency_overrides.pop(get_embedding_service, None)
         app.dependency_overrides.pop(get_db_pool, None)
         app.dependency_overrides.pop(get_background_processor, None)
+        app.dependency_overrides.pop(get_secret_manager, None)
 
         if hasattr(self, "_connection_pool"):
             self._connection_pool.close_all()

@@ -49,6 +49,18 @@ def setup_test_db(db_path: str) -> sqlite3.Connection:
         )
     """)
 
+    # Create org_members table (needed by delete_user route's org-owner check)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS org_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            org_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT 'member',
+            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(org_id, user_id)
+        )
+    """)
+
     # Create indexes
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
