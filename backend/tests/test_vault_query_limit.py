@@ -92,14 +92,20 @@ class TestVaultQueryLimit(unittest.TestCase):
         )
         self.conn.commit()
 
-        # Mock get_effective_vault_permission and get_effective_vault_permissions
-        self._original_get_effective_vault_permission = None
-        self._original_get_effective_vault_permissions = None
+        # Save originals so tearDown can fully restore them.
+        import app.api.routes.vaults as _vaults_module
+        self._original_get_effective_vault_permission = _vaults_module.get_effective_vault_permission
+        self._original_get_effective_vault_permissions = _vaults_module.get_effective_vault_permissions
 
     def tearDown(self):
         """Clean up database connection and temp directory."""
         if hasattr(self, 'conn') and self.conn:
             self.conn.close()
+        import app.api.routes.vaults as _vaults_module
+        if self._original_get_effective_vault_permission is not None:
+            _vaults_module.get_effective_vault_permission = self._original_get_effective_vault_permission
+        if self._original_get_effective_vault_permissions is not None:
+            _vaults_module.get_effective_vault_permissions = self._original_get_effective_vault_permissions
         import shutil
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
