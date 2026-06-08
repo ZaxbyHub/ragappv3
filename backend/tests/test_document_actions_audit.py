@@ -61,6 +61,7 @@ class TestOptionalCurrentUser(unittest.TestCase):
     def test_returns_none_when_jwt_raises_httpexception(self):
         """When get_current_active_user raises HTTPException, returns None."""
         import asyncio
+
         from fastapi import HTTPException
 
         with patch.object(settings, "users_enabled", True):

@@ -109,8 +109,9 @@ class TestAuthRoutesAdversarial(unittest.TestCase):
 
         # Bypass CSRF checks: override the dependency and provide a stub token manager
         # so auth endpoints that issue new tokens (login, register) can complete.
-        from app.security import csrf_protect
         from unittest.mock import MagicMock
+
+        from app.security import csrf_protect
         main_app.dependency_overrides[csrf_protect] = lambda: "test-bypass"
         _stub = MagicMock()
         _stub.generate_token.return_value = "test-token"

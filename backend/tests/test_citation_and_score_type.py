@@ -7,9 +7,9 @@ This test module verifies:
 4. _build_done_message includes score_type field with correct values
 """
 
-import pytest
 from unittest.mock import patch
 
+import pytest
 
 # =============================================================================
 # Tests for prompt_builder.py - CITATION_INSTRUCTION
