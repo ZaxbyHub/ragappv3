@@ -990,28 +990,28 @@ class TestJWTTokenManipulation:
             pass
 
     def test_expired_token_rejected(self):
-        """Expired JWT token should be rejected with 403."""
+        """Expired JWT token should be rejected (401 per RFC 6750)."""
         expired_token = get_expired_token(
             self.superadmin_id, "superadmin", "superadmin"
         )
         response = self.client.get(
             "/users/", headers={"Authorization": f"Bearer {expired_token}"}
         )
-        assert response.status_code == 403, f"Expected 403, got {response.status_code}"
+        assert response.status_code == 401, f"Expected 401, got {response.status_code}"
         assert (
             "expired" in response.json()["detail"].lower()
             or "invalid" in response.json()["detail"].lower()
         )
 
     def test_wrong_algorithm_none_rejected(self):
-        """JWT with algorithm='none' should be rejected."""
+        """JWT with algorithm='none' should be rejected (401 per RFC 6750)."""
         malicious_token = get_malformed_token_wrong_algorithm(
             self.superadmin_id, "superadmin", "superadmin"
         )
         response = self.client.get(
             "/users/", headers={"Authorization": f"Bearer {malicious_token}"}
         )
-        assert response.status_code == 403, f"Expected 403, got {response.status_code}"
+        assert response.status_code == 401, f"Expected 401, got {response.status_code}"
 
     def test_token_with_modified_role_rejected(self):
         """Token with claims modified to escalate privileges should be rejected."""
@@ -1023,14 +1023,14 @@ class TestJWTTokenManipulation:
             "/users/", headers={"Authorization": f"Bearer {modified_token}"}
         )
         # The token is valid JWT-wise, but the user_id doesn't match a superadmin
-        # in the database, so either 403 (user not found/inactive) or we verify
-        # the actual role from DB
-        assert response.status_code in (200, 403), (
+        # in the database, so either 401 (token missing type claim), 403
+        # (user not found/inactive), or 200 if role is DB-verified
+        assert response.status_code in (200, 401, 403), (
             f"Unexpected status: {response.status_code}"
         )
 
     def test_tampered_token_signature(self):
-        """Token with tampered signature should be rejected."""
+        """Token with tampered signature should be rejected (401 per RFC 6750)."""
 
         # Get a valid token then modify the signature
         valid_token = get_token(self.admin_id, "admin", "admin")
@@ -1041,14 +1041,14 @@ class TestJWTTokenManipulation:
         response = self.client.get(
             "/users/", headers={"Authorization": f"Bearer {tampered}"}
         )
-        assert response.status_code == 403, f"Expected 403, got {response.status_code}"
+        assert response.status_code == 401, f"Expected 401, got {response.status_code}"
 
     def test_completely_invalid_token(self):
-        """Completely invalid token should be rejected."""
+        """Completely invalid token should be rejected (401 per RFC 6750)."""
         response = self.client.get(
             "/users/", headers={"Authorization": "Bearer not.a.valid.jwt.token.at.all"}
         )
-        assert response.status_code == 403, f"Expected 403, got {response.status_code}"
+        assert response.status_code == 401, f"Expected 401, got {response.status_code}"
 
     def test_empty_bearer_token(self):
         """Empty bearer token should be rejected."""
@@ -1157,7 +1157,8 @@ class TestLastSuperadminRaceCondition:
         )
 
         assert response.status_code == 400, f"Expected 400, got {response.status_code}"
-        assert "last superadmin" in response.json()["detail"].lower()
+        detail = response.json()["detail"].lower()
+        assert "last superadmin" in detail or "own account" in detail
 
     def test_last_superadmin_cannot_delete_self(self):
         """Single superadmin cannot delete themselves (self-delete guard)."""

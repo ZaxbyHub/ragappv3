@@ -27,7 +27,7 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
         with patch("app.services.background_tasks.asyncio.create_task", side_effect=fake_create_task):
             await processor.start()
 
-    assert created_workers == ["worker-0", "worker-1"]
+    assert created_workers == ["worker-0", "worker-1", "enrichment-worker"]
 
 
 @pytest.mark.asyncio
@@ -115,7 +115,8 @@ async def test_embedding_global_semaphore_limits_batches_across_documents():
     EmbeddingService._global_batch_semaphore_limit = None
     EmbeddingService._global_batch_semaphore_loop = None
 
-    with patch("app.services.embeddings.settings") as mock_settings:
+    with patch("app.services.embeddings.settings") as mock_settings, \
+         patch("app.services.embeddings.assert_url_safe"):
         mock_settings.ollama_embedding_url = "http://localhost:8080/v1/embeddings"
         mock_settings.embedding_model = "test-model"
         mock_settings.embedding_doc_prefix = ""

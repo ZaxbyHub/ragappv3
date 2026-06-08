@@ -472,8 +472,8 @@ class EmailIngestionService:
         """
         if not filename:
             return filename
-        # Use basename to extract just the filename, removing any path components
-        return os.path.basename(filename)
+        # Normalize Windows backslash separators then extract basename
+        return os.path.basename(filename.replace("\\", "/"))
 
     def _extract_vault_name(self, subject: str) -> Optional[str]:
         """

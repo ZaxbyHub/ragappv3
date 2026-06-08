@@ -130,7 +130,9 @@ def setup_db(monkeypatch):
 
 @pytest.fixture
 def client():
+    from app.security import csrf_protect
     app = FastAPI()
+    app.dependency_overrides[csrf_protect] = lambda: "test-bypass"
     app.include_router(users_router_module.router)  # router has prefix="/users" built-in
     return TestClient(app)
 
