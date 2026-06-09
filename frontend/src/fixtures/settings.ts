@@ -60,7 +60,7 @@ export const mockSettings: SettingsResponse = import.meta.env.DEV ? ({
     chat_model: "kv",
     chunk_size_chars: "default",
   },
-  max_file_size_mb: 50,
+  max_file_size_mb: 100,
   allowed_extensions: [".pdf", ".docx", ".md", ".txt", ".html", ".csv", ".json", ".sql"],
   backend_cors_origins: ["http://localhost:5173", "http://localhost:3000"],
 }) : ({} as SettingsResponse);

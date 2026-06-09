@@ -32,9 +32,17 @@ vi.mock("sonner", () => ({
 }));
 
 import { useUploadStore } from "./useUploadStore";
+import { MAX_UPLOAD_FILE_SIZE_BYTES } from "@/lib/uploadLimits";
+import { toast } from "sonner";
 
 function makeFile(name: string, bytes = 4): File {
   return new File([new Uint8Array(bytes)], name, { type: "text/plain" });
+}
+
+function makeFileWithReportedSize(name: string, bytes: number): File {
+  const file = makeFile(name);
+  Object.defineProperty(file, "size", { value: bytes });
+  return file;
 }
 
 function resetStore() {
@@ -50,6 +58,7 @@ beforeEach(() => {
   resetStore();
   uploadDocumentMock.mockReset();
   getDocumentStatusMock.mockReset();
+  vi.mocked(toast.error).mockClear();
 });
 
 afterEach(() => {
@@ -57,6 +66,35 @@ afterEach(() => {
 });
 
 describe("useUploadStore — async-aware contract", () => {
+  it("rejects files over the 100 MB per-file limit before queueing", () => {
+    useUploadStore.getState().addUploads(
+      [makeFileWithReportedSize("too-large.pdf", MAX_UPLOAD_FILE_SIZE_BYTES + 1)],
+      1
+    );
+
+    expect(useUploadStore.getState().uploads).toEqual([]);
+    expect(uploadDocumentMock).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledWith(
+      "too-large.pdf is too large. Max size: 100 MB."
+    );
+  });
+
+  it("normalizes upload 413 errors to the 100 MB per-file limit", async () => {
+    const error = new Error("Request Entity Too Large") as Error & { status: number };
+    error.status = 413;
+    uploadDocumentMock.mockRejectedValue(error);
+
+    useUploadStore.getState().addUploads([makeFile("large.pdf")], 1);
+    await vi.advanceTimersByTimeAsync(1);
+
+    const u = useUploadStore.getState().uploads[0];
+    expect(u.status).toBe("error");
+    expect(u.error).toBe("File too large. Max size: 100 MB.");
+    expect(toast.error).toHaveBeenCalledWith(
+      "Failed to upload large.pdf: File too large. Max size: 100 MB."
+    );
+  });
+
   it("network 100% does NOT mark indexed; status moves to processing and waits for backend", async () => {
     let progressCb: (n: number) => void = () => {};
     uploadDocumentMock.mockImplementation((_file, onProgress) => {

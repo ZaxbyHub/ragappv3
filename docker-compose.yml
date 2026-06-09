@@ -87,6 +87,7 @@ services:
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
       # PRODUCTION: set to your domain, e.g. https://knowledgevault.example.com
       - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-100}
       - OLLAMA_EMBEDDING_URL=${OLLAMA_EMBEDDING_URL:-http://harrier-embed:8080/v1/embeddings}
       - OLLAMA_CHAT_URL=${OLLAMA_CHAT_URL:-http://host.docker.internal:11434}
       - INSTANT_CHAT_URL=${INSTANT_CHAT_URL:-http://host.docker.internal:1234}

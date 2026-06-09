@@ -50,6 +50,7 @@ import { FolderTree } from "@/components/documents/FolderTree";
 import { MoveFolderDialog } from "@/components/documents/MoveFolderDialog";
 import { MoveToFolderDialog } from "@/components/documents/MoveToFolderDialog";
 import { ConfirmDialog, type ConfirmDialogState } from "@/components/documents/ConfirmDialog";
+import { isUploadTooLarge, uploadSizeExceededMessage } from "@/lib/uploadLimits";
 
 const FILENAME_COL_WIDTH_KEY = "ragapp_doc_table_filename_col";
 const FILENAME_COL_WIDTH_DEFAULT = 250;
@@ -389,9 +390,18 @@ export default function DocumentsPage() {
         toast.error("Select a vault with write access before uploading");
         return;
       }
-      addUploads(acceptedFiles, activeVaultId ?? undefined);
-      setRejectedFiles([]);
-      toast.success(`Added ${acceptedFiles.length} file(s) to upload queue`);
+      const oversizedFiles = acceptedFiles.filter(isUploadTooLarge);
+      if (oversizedFiles.length > 0) {
+        const rejected = oversizedFiles.map((file) => uploadSizeExceededMessage(file.name));
+        setRejectedFiles(rejected);
+        rejected.forEach((message) => toast.error(`File rejected: ${message}`));
+      } else {
+        setRejectedFiles([]);
+      }
+      const queueableFiles = acceptedFiles.filter((file) => !isUploadTooLarge(file));
+      if (queueableFiles.length === 0) return;
+      addUploads(queueableFiles, activeVaultId ?? undefined);
+      toast.success(`Added ${queueableFiles.length} file(s) to upload queue`);
     },
     [addUploads, activeVaultId, canWriteActiveVault, hasSelectedVault]
   );

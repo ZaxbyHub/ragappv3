@@ -560,6 +560,8 @@ Deploy KnowledgeVault behind a reverse proxy for additional security layers:
 server {
     listen 443 ssl http2;
     server_name knowledgevault.example.com;
+    # Must be larger than MAX_FILE_SIZE_MB to allow multipart overhead.
+    client_max_body_size 125m;
     
     # TLS configuration
     ssl_certificate /etc/ssl/certs/knowledgevault.crt;
@@ -638,6 +640,8 @@ location = /knowledgevault {
 }
 
 location /knowledgevault/ {
+    # Must be larger than MAX_FILE_SIZE_MB to allow multipart overhead.
+    client_max_body_size 125m;
     proxy_pass http://knowledgevault:9090/;
     proxy_http_version 1.1;
     proxy_set_header Host $host;

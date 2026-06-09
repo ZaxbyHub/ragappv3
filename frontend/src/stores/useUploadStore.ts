@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { uploadDocument, getDocumentStatus } from "@/lib/api";
 import type { DocumentStatusResponse } from "@/lib/api";
+import { isUploadTooLarge, normalizeUploadErrorMessage, uploadSizeExceededMessage } from "@/lib/uploadLimits";
 import { toast } from "sonner";
 
 /**
@@ -196,6 +197,12 @@ export const useUploadStore = create<UploadState>((set, get) => ({
       toast.error("No vault selected. Please select a vault before uploading.");
       return;
     }
+    const acceptedFiles = files.filter((file) => {
+      if (!isUploadTooLarge(file)) return true;
+      toast.error(uploadSizeExceededMessage(file.name));
+      return false;
+    });
+    if (acceptedFiles.length === 0) return;
     const generateId = (f: File) => {
       if (typeof crypto !== "undefined" && crypto.randomUUID) {
         return crypto.randomUUID();
@@ -204,7 +211,7 @@ export const useUploadStore = create<UploadState>((set, get) => ({
     };
 
     const now = Date.now();
-    const newUploads: UploadFile[] = files.map((file) => ({
+    const newUploads: UploadFile[] = acceptedFiles.map((file) => ({
       id: generateId(file),
       file,
       uploadProgress: 0,
@@ -470,7 +477,7 @@ export const useUploadStore = create<UploadState>((set, get) => ({
             }
           }
         } catch (err) {
-          const errorMsg = err instanceof Error ? err.message : "Upload failed";
+          const errorMsg = normalizeUploadErrorMessage(err);
           get().setStatus(pendingUpload.id, "error", errorMsg);
           toast.error(`Failed to upload ${pendingUpload.file.name}: ${errorMsg}`);
         }

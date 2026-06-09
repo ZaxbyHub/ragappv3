@@ -475,7 +475,7 @@ class Settings(BaseSettings):
     audit_hmac_key_version: str = "v1"
 
     # Security settings
-    max_file_size_mb: int = 50
+    max_file_size_mb: int = 100
     allowed_extensions: set[str] = {
         ".txt",
         ".md",

@@ -682,7 +682,7 @@ groups:
 **Symptoms:** 413 Payload Too Large or 500 Server Error
 
 **Resolution:**
-- Check `max_file_size_mb` setting (default: 50MB)
+- Check `max_file_size_mb` setting (default: 100MB)
 - Verify uploads directory has disk space
 - Check document processor logs for parsing errors
 

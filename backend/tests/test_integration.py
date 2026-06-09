@@ -852,8 +852,11 @@ class TestIntegration(unittest.TestCase):
 
         client = TestClient(app)
 
-        # Create content larger than max_file_size_mb
-        large_content = b"x" * (60 * 1024 * 1024)  # 60 MB
+        # Regression F-001: use the configured limit so this remains above
+        # max_file_size_mb after future default changes.
+        from app.config import settings
+
+        large_content = b"x" * ((settings.max_file_size_mb + 1) * 1024 * 1024)
 
         response = client.post(
             "/api/documents/upload?vault_id=1",

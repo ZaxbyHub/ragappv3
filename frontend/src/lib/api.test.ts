@@ -27,4 +27,15 @@ describe("API path configuration", () => {
     expect(API_BASE_URL).toBe("/knowledgevault/api");
     expect(loginRedirectPath()).toBe("/knowledgevault/login");
   });
+
+  it("derives meridian API path from basename when VITE_API_URL is empty", async () => {
+    vi.stubEnv("VITE_API_URL", "");
+    vi.stubEnv("VITE_APP_BASENAME", "/meridian");
+    vi.resetModules();
+
+    const { API_BASE_URL, loginRedirectPath } = await import("./api");
+
+    expect(API_BASE_URL).toBe("/meridian/api");
+    expect(loginRedirectPath()).toBe("/meridian/login");
+  });
 });

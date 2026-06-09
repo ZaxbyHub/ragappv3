@@ -1185,7 +1185,7 @@ async def _do_upload(
             if int(content_length) > max_size_bytes:
                 raise HTTPException(
                     status_code=413,
-                    detail=f"File too large. Max size: {settings.max_file_size_mb}MB",
+                    detail=f"File too large. Max size: {settings_dep.max_file_size_mb} MB",
                 )
         except ValueError:
             pass  # Invalid content-length header, will check during streaming
@@ -1248,7 +1248,7 @@ async def _do_upload(
                         temp_file_path.unlink(missing_ok=True)
                     raise HTTPException(
                         status_code=413,
-                        detail=f"File too large. Max size: {settings.max_file_size_mb}MB",
+                        detail=f"File too large. Max size: {settings_dep.max_file_size_mb} MB",
                     )
                 await f.write(chunk)
 

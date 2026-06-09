@@ -3,8 +3,7 @@ import { useDropzone, type FileRejection } from "react-dropzone";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Upload, Info } from "lucide-react";
-
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+import { MAX_UPLOAD_FILE_SIZE_BYTES, formatUploadSizeLimit } from "@/lib/uploadLimits";
 
 interface UploadDropzoneProps {
   hasSelectedVault: boolean;
@@ -42,7 +41,7 @@ export function UploadDropzone({
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     onDropRejected,
-    maxSize: MAX_FILE_SIZE,
+    maxSize: MAX_UPLOAD_FILE_SIZE_BYTES,
     disabled: !hasSelectedVault || !canWriteActiveVault,
   });
 
@@ -63,7 +62,7 @@ export function UploadDropzone({
         <div className="flex flex-col items-center justify-center text-center">
           <Badge variant="secondary" className="mb-3 gap-1.5 text-xs font-medium">
             <Info className="h-3 w-3" aria-hidden="true" />
-            Max 50 MB
+            Max {formatUploadSizeLimit()}
           </Badge>
           <Upload className="w-12 h-12 text-muted-foreground mb-4" />
           <p className="text-lg font-medium">
@@ -74,7 +73,7 @@ export function UploadDropzone({
                 : "Drag & drop files here, or click to select"}
           </p>
           <p className="text-sm text-muted-foreground mt-1">
-            Supports PDF, DOCX, TXT, MD files (max 50MB each). Uploads continue in background.
+            Supports PDF, DOCX, TXT, MD files (max {formatUploadSizeLimit()} each). Uploads continue in background.
           </p>
         </div>
       </CardContent>

@@ -40,6 +40,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Document upload limit raised to 100 MB**: the backend `max_file_size_mb`
+  default, `.env.example`, `docker-compose.yml` env forwarding, frontend
+  preflight, and schema parser guardrail now allow 100 MB per document upload.
+  Reverse proxies must allow multipart upload overhead, for example with nginx
+  `client_max_body_size 125m;`.
 - **`OLLAMA_EMBEDDING_URL` and `RERANKER_URL` are now overridable in `docker-compose.yml`** via `${VAR:-<bundled default>}`. They were previously hardcoded, so host/`.env` overrides were silently ignored; the bundled defaults are unchanged.
 - **Bare `host:8080` embedding URL now routes to native TEI `/embed`** (previously OpenAI `/v1/embeddings`). This affects only embedding URLs configured with **no path** on port 8080: such URLs previously appended `/v1/embeddings` (OpenAI mode) and now append `/embed` (native TEI mode). Default deployments are unaffected — the shipped `OLLAMA_EMBEDDING_URL` uses an explicit `/v1/embeddings` path, which still selects OpenAI mode. Operators running an OpenAI-compatible embedding server on a bare `:8080` URL should set an explicit `/v1/embeddings` path to keep OpenAI-mode behavior.
 - bcrypt password verification (cost factor 14, ~400ms) now offloaded to dedicated ThreadPoolExecutor(4) via async_verify_password(), preventing event-loop blocking during login and password-change under concurrent load

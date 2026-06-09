@@ -16,8 +16,8 @@ class SchemaParser:
     capturing table names and column definitions.
     """
 
-    # Maximum file size in bytes (50MB)
-    MAX_FILE_SIZE = 50 * 1024 * 1024
+    # Maximum file size in bytes (100MB)
+    MAX_FILE_SIZE = 100 * 1024 * 1024
 
     # Regex pattern to match CREATE TABLE blocks
     # Handles optional VIRTUAL keyword, IF NOT EXISTS, schema prefix, backticks/quotes
@@ -63,7 +63,7 @@ class SchemaParser:
         if file_size > self.MAX_FILE_SIZE:
             raise ValueError(
                 f"File size {file_size} bytes exceeds maximum allowed size "
-                f"of {self.MAX_FILE_SIZE} bytes (50MB)"
+                f"of {self.MAX_FILE_SIZE} bytes (100MB)"
             )
 
         # Read file content with encoding error handling
