@@ -4,6 +4,7 @@ Handles building system prompts, user messages, and formatting context for LLM.
 """
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from html import escape as _xml_escape
 
 from app.config import settings
 from app.services.document_retrieval import RAGSource
@@ -91,7 +92,7 @@ def format_wiki_evidence(evidence: "WikiEvidence", index: int) -> str:
         header += f" | sources: {prov}"
 
     body = evidence.claim_text or evidence.excerpt or ""
-    return f"{header}\n<wiki_evidence>{body}</wiki_evidence>"
+    return f"{header}\n<wiki_evidence>{_xml_escape(body)}</wiki_evidence>"
 
 
 def format_kms_evidence(evidence: "KMSEvidence", index: int) -> str:
@@ -102,7 +103,7 @@ def format_kms_evidence(evidence: "KMSEvidence", index: int) -> str:
     source_type = evidence.source_type or ""
     header = f"{label} {title} | status: {status} | type: {source_type}"
     body = evidence.excerpt or evidence.summary or ""
-    return f"{header}\n<kms_evidence>{body}</kms_evidence>"
+    return f"{header}\n<kms_evidence>{_xml_escape(body)}</kms_evidence>"
 
 
 class PromptBuilderService:
@@ -181,7 +182,7 @@ class PromptBuilderService:
         # distinctly from documents. Labels are 1-based and match the
         # ``memory_label`` exposed to the frontend.
         memory_context = [
-            f"[M{idx + 1}] <memory>{mem.content}</memory>"
+            f"[M{idx + 1}] <memory>{_xml_escape(mem.content)}</memory>"
             for idx, mem in enumerate(memories)
             if mem.content
         ]
@@ -263,7 +264,7 @@ class PromptBuilderService:
         if memory_text:
             user_content += f"Memories:\n{memory_text}\n\n"
 
-        user_content += f"Question: {user_input}"
+        user_content += f"Question: <user_query>{_xml_escape(user_input)}</user_query>"
         messages.append({"role": "user", "content": user_content})
         return messages
 
@@ -321,9 +322,9 @@ class PromptBuilderService:
                 # Fallback: append the small chunk as a MATCH annotation at the end
                 marked = f"{parent_text}\n\n[[MATCH: {match_text}]]"
 
-            return f"{header}\n<document>{marked}</document>"
+            return f"{header}\n<document>{_xml_escape(marked)}</document>"
 
-        return f"{header}\n<document>{chunk.text}</document>"
+        return f"{header}\n<document>{_xml_escape(chunk.text)}</document>"
 
     def build_system_prompt(self) -> str:
         """Return the system prompt.

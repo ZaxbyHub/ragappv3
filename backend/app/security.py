@@ -258,9 +258,20 @@ def get_csrf_manager(request: Request) -> CSRFManager:
 
 
 def require_scope(scope: str) -> Callable:
+    """Require a specific scope derived from a server-side token→scopes mapping.
+
+    The X-Scopes header is INTENTIONALLY IGNORED for security — it was a
+    privilege-escalation vector where any caller with a valid admin token
+    could claim any scope. Scopes now derive from settings.admin_token_scopes
+    (a server-side dict) keyed on the verified admin token.
+
+    Authentication is verified FIRST via secrets.compare_digest (constant-time),
+    then authorization is checked via the server-side scope mapping. This
+    order prevents timing side-channels in the dict lookup and ensures the
+    scope decision is only made for authenticated callers.
+    """
     def dependency(
         authorization: str | None = Header(None),
-        x_scopes: str = Header(""),
     ) -> dict[str, str]:
         if not authorization:
             raise HTTPException(status_code=401, detail="Authorization header missing")
@@ -270,11 +281,21 @@ def require_scope(scope: str) -> Callable:
         if len(parts) < 2 or not parts[1].strip():
             raise HTTPException(status_code=401, detail="Invalid authorization header")
         token = parts[1].strip()
-        scopes = [s.strip().lower() for s in x_scopes.split(",") if s.strip()]
-        if scope.lower() not in scopes:
-            raise HTTPException(status_code=403, detail="Missing required scope")
+        # Guard: if admin_secret_token is empty/unset, fail explicitly rather
+        # than silently accepting any token (which would happen because
+        # compare_digest(token, "") is True when token == "").
+        if not settings.admin_secret_token:
+            raise HTTPException(status_code=503, detail="Authentication not configured")
+        # Authentication FIRST: verify token identity with constant-time comparison.
+        # This must happen before any authz decision to avoid timing side-channels
+        # and to ensure the scope lookup is only performed for authenticated callers.
         if not secrets.compare_digest(token, settings.admin_secret_token):
             raise HTTPException(status_code=403, detail="Unauthorized token")
+        # Authorization: derive scopes from server-side mapping (NOT from any
+        # client-supplied header). The X-Scopes header is intentionally ignored.
+        token_scopes = settings.admin_token_scopes.get(token, [])
+        if scope.lower() not in [s.lower() for s in token_scopes]:
+            raise HTTPException(status_code=403, detail="Missing required scope")
         return {"user_id": token}
 
     return dependency

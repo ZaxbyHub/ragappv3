@@ -174,8 +174,8 @@ class BackgroundProcessor:
         """
         self.max_retries = max_retries
         self.retry_delay = retry_delay
-        self.queue: asyncio.Queue[TaskItem] = asyncio.Queue()
-        self.enrichment_queue: asyncio.Queue[EnrichmentTaskItem] = asyncio.Queue()
+        self.queue: asyncio.Queue[TaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
+        self.enrichment_queue: asyncio.Queue[EnrichmentTaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
         self.shutdown_event = asyncio.Event()
         self.processor = DocumentProcessor(
             chunk_size_chars=chunk_size_chars,

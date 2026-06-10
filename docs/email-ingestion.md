@@ -697,7 +697,7 @@ subject = "Valid text ERROR: Fake error message More valid text"
 
 **API Authentication (Status Endpoint):**
 - Requires Bearer token: `Authorization: Bearer <admin_secret_token>`
-- Requires admin scope: `X-Scopes: admin:config`
+- Scopes are derived server-side from the `admin_token_scopes` token→scopes mapping (no client-supplied header)
 - Token validation via `secrets.compare_digest()` (timing-safe)
 
 ### Secure Defaults
@@ -772,19 +772,17 @@ subject = "Valid text ERROR: Fake error message More valid text"
 
 **Using curl:**
 ```bash
-curl -X GET http://localhost:8080/api/email/status \
-  -H "Authorization: Bearer your_admin_secret_token" \
-  -H "X-Scopes: admin:config"
+curl -X GET http://localhost:9090/api/email/status \
+  -H "Authorization: Bearer your_admin_secret_token"
 ```
 
 **Using PowerShell:**
 ```powershell
 $headers = @{
-  "Authorization" = "Bearer your_admin_secret_token"
-  "X-Scopes" = "admin:config"
+    "Authorization" = "Bearer your_admin_secret_token"
 }
 
-$response = Invoke-WebRequest -Uri "http://localhost:8080/api/email/status" -Headers $headers
+$response = Invoke-WebRequest -Uri "http://localhost:9090/api/email/status" -Headers $headers
 $response.Content | ConvertFrom-Json
 ```
 
@@ -793,11 +791,10 @@ $response.Content | ConvertFrom-Json
 import requests
 
 headers = {
-    "Authorization": "Bearer your_admin_secret_token",
-    "X-Scopes": "admin:config"
+    "Authorization": "Bearer your_admin_secret_token"
 }
 
-response = requests.get("http://localhost:8080/api/email/status", headers=headers)
+response = requests.get("http://localhost:9090/api/email/status", headers=headers)
 status = response.json()
 print(f"Healthy: {status['healthy']}")
 print(f"Last poll: {status['last_poll']}")
@@ -949,8 +946,7 @@ grep IMAP_ENABLED .env
 
 # 2. Check status endpoint
 curl -H "Authorization: Bearer <token>" \
-     -H "X-Scopes: admin:config" \
-     http://localhost:8080/api/email/status
+     http://localhost:9090/api/email/status
 
 # 3. Test IMAP connection manually
 openssl s_client -connect mail.yourdomain.com:993
@@ -1064,8 +1060,7 @@ grep -i "vault.*not found" /var/log/knowledgevault/app.log
 ```bash
 # 1. Check error rate
 curl -s -H "Authorization: Bearer <token>" \
-     -H "X-Scopes: admin:config" \
-     http://localhost:8080/api/email/status | jq '{processed: .emails_processed_today, failed: .emails_failed_today}'
+     http://localhost:9090/api/email/status | jq '{processed: .emails_processed_today, failed: .emails_failed_today}'
 
 # 2. Check failed files in database
 sqlite3 /data/knowledgevault/app.db "SELECT id, filename, error_message FROM files WHERE status='error' AND source='email' ORDER BY created_at DESC LIMIT 10;"
@@ -1155,8 +1150,7 @@ grep IMAP_POLL_INTERVAL .env
 
 # 2. Check current backoff delay
 curl -s -H "Authorization: Bearer <token>" \
-     -H "X-Scopes: admin:config" \
-     http://localhost:8080/api/email/status | jq '.current_backoff_delay'
+     http://localhost:9090/api/email/status | jq '.current_backoff_delay'
 
 # 3. Monitor processing time
 grep "Processing email" /var/log/knowledgevault/app.log | tail -10

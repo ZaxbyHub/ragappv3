@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     """Minimum sub-batch size for adaptive batching fallback."""
 
     # ── Ingestion performance configuration ──────────────────────────────────
+    ingestion_queue_max_size: int = 1000
+    """Max size for the ingestion and enrichment asyncio.Queue (backpressure bound).
+    1000 follows the Python/asyncio best-practice range (100-1000) for I/O-bound RAG workers.
+    """
     ingestion_worker_count: int = 2
     """Number of concurrent document ingestion workers (1-16)."""
     optimize_mode: str = "periodic"
@@ -461,6 +465,11 @@ class Settings(BaseSettings):
     admin_secret_token: str = (
         ""  # Must be set via environment variable - no default for security
     )
+
+    # Server-side token→scopes mapping for require_scope dependency.
+    # Keys are admin tokens; values are lists of scopes authorized for that token.
+    # The X-Scopes HTTP header is IGNORED — scopes derive only from this mapping.
+    admin_token_scopes: dict[str, list[str]] = {}
 
     # User authentication
     users_enabled: bool = True
@@ -866,6 +875,18 @@ class Settings(BaseSettings):
                 "In single-admin mode this token is the sole authentication mechanism. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
             )
+        return self
+
+    @model_validator(mode="after")
+    def _build_admin_token_scopes_default(self) -> "Settings":
+        """Seed admin_token_scopes from admin_secret_token when the field is empty.
+
+        This provides a working default for deployments that set ADMIN_SECRET_TOKEN
+        but don't explicitly configure admin_token_scopes. The key is the actual
+        configured token value, which is available after env loading.
+        """
+        if not self.admin_token_scopes and self.admin_secret_token:
+            self.admin_token_scopes = {self.admin_secret_token: ["admin:config"]}
         return self
 
     @model_validator(mode="after")

@@ -6,15 +6,15 @@ including health, statistics, and IMAP inbox status.
 """
 
 import asyncio
-import secrets
 from typing import Optional
 
 import aioimaplib
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.api.deps import get_email_service, get_settings
 from app.config import Settings, settings
+from app.security import require_scope
 from app.services.email_service import EmailIngestionService
 
 router = APIRouter()
@@ -29,35 +29,6 @@ class EmailStatusResponse(BaseModel):
     emails_failed_today: int
     unseen_emails: int
     current_backoff_delay: Optional[int]  # seconds or None if connected
-
-
-def require_admin_scope(scope: str):
-    """
-    Dependency that requires admin scope authentication.
-
-    Validates that the request has a valid Bearer token with the required scope.
-
-    Args:
-        scope: Required scope (e.g., "admin:config")
-
-    Returns:
-        Dependency function that validates auth headers
-    """
-    async def dependency(
-        authorization: str = Header(...),
-        x_scopes: str = Header(""),
-    ) -> dict[str, str]:
-        if not authorization.lower().startswith("bearer "):
-            raise HTTPException(status_code=403, detail="Invalid auth token")
-        token = authorization.split(" ", 1)[1]
-        if not secrets.compare_digest(token, settings.admin_secret_token):
-            raise HTTPException(status_code=403, detail="Unauthorized")
-        scopes = [s.strip().lower() for s in x_scopes.split(",") if s.strip()]
-        if scope.lower() not in scopes:
-            raise HTTPException(status_code=403, detail="Missing required scope")
-        return {"user_id": token}
-
-    return dependency
 
 
 async def _get_unseen_count(
@@ -132,7 +103,7 @@ async def _get_unseen_count(
                 pass
 
 
-async def _get_today_stats(pool) -> tuple[int, int]:
+def _get_today_stats(pool) -> tuple[int, int]:
     """
     Query database for today's email processing stats.
 
@@ -182,7 +153,7 @@ async def _get_today_stats(pool) -> tuple[int, int]:
 async def get_email_status(
     email_service: EmailIngestionService = Depends(get_email_service),
     app_settings: Settings = Depends(get_settings),
-    auth: dict = Depends(require_admin_scope("admin:config")),
+    auth: dict = Depends(require_scope("admin:config")),
 ):
     """
     Get email ingestion service status.
@@ -192,7 +163,7 @@ async def get_email_status(
 
     Requires:
         - Valid Bearer token in Authorization header
-        - admin:config scope in X-Scopes header
+        - Valid token with admin:config scope (server-side scope derivation)
 
     Returns:
         EmailStatusResponse with:
@@ -215,7 +186,7 @@ async def get_email_status(
     last_poll = last_poll_time.isoformat() if last_poll_time else None
 
     # Get today's stats (processed and failed counts)
-    processed_today, failed_today = await _get_today_stats(email_service.pool)
+    processed_today, failed_today = await asyncio.to_thread(_get_today_stats, email_service.pool)
 
     # Get unseen email count from IMAP (if enabled)
     if enabled:
