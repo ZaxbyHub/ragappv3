@@ -3,8 +3,8 @@
 Handles building system prompts, user messages, and formatting context for LLM.
 """
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from html import escape as _xml_escape
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from app.config import settings
 from app.services.document_retrieval import RAGSource

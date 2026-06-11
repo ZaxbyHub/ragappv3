@@ -30,7 +30,6 @@ from fastapi.testclient import TestClient
 from app.config import Settings, settings
 from app.security import require_scope
 
-
 # =============================================================================
 # Test fixtures
 # =============================================================================
@@ -396,7 +395,6 @@ class TestEmailRoutesUseRequireScope:
         from unittest.mock import MagicMock, PropertyMock
 
         from app.api.routes import email as email_module
-        from app.config import Settings
 
         app = FastAPI()
         app.include_router(email_module.router)

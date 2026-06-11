@@ -14,14 +14,14 @@ Tests follow the same triple-assertion pattern as test_prompt_builder_xml_escape
 3. assertNotIn bare tag between markers (no unescaped injection in the content zone)
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.services.document_retrieval import RAGSource
+import pytest
+
 from app.services.context_distiller import ContextDistiller
+from app.services.document_retrieval import RAGSource
 from app.services.query_transformer import QueryTransformer
 from app.services.retrieval_evaluator import RetrievalEvaluator
-
 
 # ------------------------------------------------------------------
 # QueryTransformer tests

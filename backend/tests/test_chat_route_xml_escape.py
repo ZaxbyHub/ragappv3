@@ -5,8 +5,9 @@ endpoint (chat.py:1194) properly escapes user input so that closing
 </user_message> tags cannot break the XML boundary structure.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from app.api.routes.chat import _auto_name_session
 from app.services.llm_client import LLMClient

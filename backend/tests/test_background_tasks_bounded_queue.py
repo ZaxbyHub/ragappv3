@@ -20,7 +20,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from app.config import Settings, settings
-from app.services.background_tasks import BackgroundProcessor, TaskItem, EnrichmentTaskItem
+from app.services.background_tasks import (
+    BackgroundProcessor,
+    EnrichmentTaskItem,
+    TaskItem,
+)
 
 
 class TestBackgroundTasksBoundedQueue:

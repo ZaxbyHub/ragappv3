@@ -9,11 +9,11 @@ import asyncio
 from typing import Optional
 
 import aioimaplib
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from app.api.deps import get_email_service, get_settings
-from app.config import Settings, settings
+from app.config import Settings
 from app.security import require_scope
 from app.services.email_service import EmailIngestionService
 
