@@ -590,7 +590,7 @@ class TestChatEndpoint(unittest.TestCase):
 
     def setUp(self):
         self.client = TestClient(app)
-        from app.api.deps import get_current_active_user
+        from app.api.deps import get_current_active_user, get_evaluate_policy
         from app.security import csrf_protect
 
         app.dependency_overrides[get_current_active_user] = lambda: {
@@ -598,8 +598,14 @@ class TestChatEndpoint(unittest.TestCase):
             "is_active": 1, "must_change_password": 0,
         }
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+
+        async def allow_policy(user, resource_type, resource_id, action):
+            return True
+
+        app.dependency_overrides[get_evaluate_policy] = lambda: allow_policy
         self._get_current_active_user = get_current_active_user
         self._csrf_protect = csrf_protect
+        self._get_evaluate_policy = get_evaluate_policy
 
     def tearDown(self):
         from app.api.deps import get_rag_engine
@@ -607,6 +613,7 @@ class TestChatEndpoint(unittest.TestCase):
         app.dependency_overrides.pop(get_rag_engine, None)
         app.dependency_overrides.pop(self._get_current_active_user, None)
         app.dependency_overrides.pop(self._csrf_protect, None)
+        app.dependency_overrides.pop(self._get_evaluate_policy, None)
 
     def _set_mock_rag_engine(self, mock_query_fn):
         """Helper to override get_rag_engine with a mock that uses the given query function."""
