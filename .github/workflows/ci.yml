@@ -78,6 +78,7 @@ jobs:
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: backend
@@ -101,8 +102,8 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest --tb=short -v tests/
+        run: pytest --tb=short -v --timeout=300 tests/
 
       - name: Coverage report (informational)
-        run: pytest --cov=app --cov-report=term-missing -q tests/
+        run: pytest --cov=app --cov-report=term-missing -q --timeout=300 tests/
         continue-on-error: true
