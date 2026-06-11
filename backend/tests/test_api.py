@@ -53,11 +53,11 @@ except ImportError:
     sys.modules["unstructured.documents.elements"] = _unstructured.documents.elements
 
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_llm_health_checker, get_model_checker
+from app.api.deps import get_db, get_llm_health_checker, get_model_checker
 from app.main import app
 
 
@@ -130,6 +130,9 @@ class TestAPI(unittest.TestCase):
             "id": 0, "username": "admin", "role": "superadmin",
             "is_active": 1, "must_change_password": 0,
         }
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.fetchall.return_value = []
+        app.dependency_overrides[get_db] = lambda: mock_conn
         try:
             response = self.client.get("/api/settings")
             self.assertEqual(response.status_code, 200)
@@ -145,6 +148,7 @@ class TestAPI(unittest.TestCase):
                 self.assertIn(key, data)
         finally:
             app.dependency_overrides.pop(get_current_active_user, None)
+            app.dependency_overrides.pop(get_db, None)
 
 
 if __name__ == "__main__":
