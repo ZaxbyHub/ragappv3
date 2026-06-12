@@ -19,7 +19,7 @@ Frontend job:
 - frontend toolchain graph check with `node --version`, `npm --version`, `npm ls vite vitest @vitejs/plugin-react jsdom`, `npm exec vite -- --version`, and `npm exec vitest -- --version`
 - `npm run typecheck`
 - `npm run lint`
-- API smoke tests for shared API, CSRF/SSE streaming, wiki SSE URL, and auth API-base behavior
+- API smoke tests for shared API, CSRF/SSE streaming, wiki SSE UL, and auth API-base behavior
 - `npm test`
 - `npm run build`
 - subpath build with `VITE_APP_BASENAME=/knowledgevault` and `VITE_API_URL=/knowledgevault/api`
@@ -32,19 +32,22 @@ Backend job:
   `sentence-transformers`; those are stubbed at test time, see caveats below)
 - `pip install -r requirements-dev.txt`
 - `ruff check .`
-- `pytest --tb=short -v` over an **enumerated, narrow subset** of test files —
-  currently `tests/test_path_prefix.py tests/test_auth_routes.py
-  tests/test_main_catchall.py tests/test_csrf_auth.py tests/test_change_password.py
-  tests/test_deps_auth_must_change_password.py tests/test_settings_ssrf.py
-  tests/test_embeddings_cache.py`, **not** the whole `tests/` tree. Adding a
-  file to this list is what "expanding CI test scope" means; that file must pass
-  under the reduced CI dependency set.
-- informational coverage (`continue-on-error: true`) over the same subset
+- `pytest --tb=short -v --timeout=300 tests/` — **full backend suite (3918 tests since PR #215 / FR-4)**.
+  Job timeout is **60m** (raised from 30m in PR #215 to accommodate the 3918-test full suite + coverage step on slow CI Linux runners; local baseline is ~3-5m, CI is ~18m, plus coverage runs another ~18m).
+  `--timeout=300` caps per-test hangs at 5 min. The conftest.py has 4 fixtures (CSRF bypass, rate-limiter reset, SQLite pool reset, bcrypt cache for 'pass123' test password) that the test suite relies on.
+- informational coverage (`continue-on-error: true`) over the same suite, also with `--timeout=300`
 
 Repository contract job:
 
 - `python scripts/check_config_contract.py`
 - `python scripts/check_pr_scope_drift.py`
+
+> **Note (post-PR #215):** Earlier versions of this skill documented a
+> "narrow pytest subset" (8 test files). That subset was the pre-FR-4 state.
+> PR #215 (issue #209) expanded CI to the full `pytest tests/` suite as part
+> of the defense-in-depth hardening. Adding files to the suite is now
+> automatic — just add the test file. The legacy "narrow subset" concept is
+> no longer applicable. The local mirror command below reflects this.
 
 ## Checks
 
@@ -56,6 +59,7 @@ Repository contract job:
 - Pull request diff checks have enough fetch depth.
 - Local validation commands mirror CI when possible.
 - Truncated CI output does not hide the command exit status.
+- For the 60m job timeout: tests with `pytest-timeout=300` per-test are bounded, but the cumulative suite (~36m with coverage) MUST fit. If you add tests that take cumulatively >20m, the job will fail. Profile slow tests with `pytest --durations=20`.
 
 ## Local Mirror Commands
 
@@ -64,7 +68,7 @@ cd frontend && npm ci --engine-strict && npm run typecheck && npm run lint
 cd frontend && npm test -- src/lib/api.test.ts src/lib/api.csrf.test.ts src/lib/api.sse.test.ts src/pages/WikiPage.sse.test.tsx src/stores/useAuthStore.api-base.test.ts
 cd frontend && npm test && npm run build
 cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/api npm run build
-cd backend && ruff check . && pytest --tb=short -v tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py tests/test_csrf_auth.py tests/test_change_password.py tests/test_deps_auth_must_change_password.py tests/test_settings_ssrf.py tests/test_embeddings_cache.py
+cd backend && ruff check . && pytest --tb=short -v --timeout=300 tests/
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
 ```
@@ -73,6 +77,12 @@ Run these before pushing so a CI-only lint/type failure doesn't cost a
 push → fail → fixup-commit round trip. If `frontend/node_modules` is absent,
 run `npm ci --engine-strict` first.
 
+For the backend test step, the full `pytest tests/` run takes ~3-5m locally and ~18m on CI Linux. Run your changed-area tests first for fast feedback:
+```bash
+cd backend && pytest -q tests/<file>::<Class>::<test>
+```
+Then run the full suite before pushing.
+
 ## Environment caveats (so local results aren't misread)
 
 - **CI's dependency set is reduced — "locally green" ≠ "CI green".** CI installs
@@ -80,8 +90,8 @@ run `npm ci --engine-strict` first.
   `pyarrow`, `unstructured`, and `sentence-transformers`. A dev machine usually
   has the *full* `requirements.txt` installed, so a backend test can pass locally
   yet fail in CI at import (`ModuleNotFoundError`) or behave differently. To
-  validate a backend **test-scope** change (e.g. adding a file to the CI pytest
-  list) faithfully, reproduce the CI env instead of trusting the local run:
+  validate a backend **test-scope** change (e.g. adding a new test file) faithfully,
+  reproduce the CI env instead of trusting the local run:
   ```bash
   python -m venv /tmp/civenv
   /tmp/civenv/bin/pip install -r backend/requirements-ci.txt -r backend/requirements-dev.txt
@@ -103,6 +113,13 @@ run `npm ci --engine-strict` first.
   test harness uses the removed implicit-event-loop pattern. These are **false
   failures from the local interpreter, not regressions**. Prefer a 3.11 venv;
   the `ruff check .` lint gate and CI-targeted tests are what matter.
+- **Backend conftest.py fixtures (post-PR #215):** 4 autouse fixtures now run for
+  every test — CSRF bypass (CSRF-naive modules), rate-limiter reset, SQLite
+  pool reset (clears the singleton pool between tests), and bcrypt cache
+  (pre-computes the bcrypt hash for 'pass123' once per session). If a new test
+  hangs in CI on what looks like a pool or bcrypt issue, check whether the test
+  relies on the pool or auth_service in a way that the fixtures don't handle.
+  Pattern reference: `tests/conftest.py`.
 - **Frontend jsdom gotchas** (router context for `<Link>`, driving Radix
   `Select`, virtualized lists): see `references/frontend-testing-gotchas.md`
   for the repo's established mock patterns before improvising.

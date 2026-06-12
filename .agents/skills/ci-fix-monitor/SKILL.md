@@ -5,7 +5,10 @@ description: >
   is green. Load when asked to watch CI, diagnose red checks, or drive a PR to
   passing. Maps the three real CI jobs (Frontend, Backend, Quality contracts),
   enforces diagnose-before-fix, and covers re-push / rebase. This repo has NO
-  dist-check, biome, bun, or per-OS matrix — ignore that guidance.
+  dist-check, biome, bun, or per-OS matrix — ignore that guidance. Updated for
+  PR #215 (issue #209): Backend now runs the full `pytest tests/` suite
+  (3918 tests, ~18m on CI Linux) — NOT the old 3-file subset. Job timeout is
+  60m. pytest-timeout=300 caps per-test hangs.
 ---
 
 # CI Fix & Monitor Protocol (RAGAPPv3)
@@ -26,14 +29,18 @@ CI is a single PR-triggered workflow (`.github/workflows/ci.yml`, triggered on
 | Job | Steps that can fail | Run locally from |
 |-----|--------------------|------------------|
 | **Frontend** | `npm ci --engine-strict`, toolchain graph check, `npm run typecheck`, `npm run lint` (`--max-warnings 0`), API smoke subset, `npm test`, `npm run build`, two subpath builds | `frontend/` |
-| **Backend** | `ruff check .`, targeted `pytest --tb=short -v` (`test_path_prefix.py`, `test_auth_routes.py`, `test_main_catchall.py`) | `backend/` |
+| **Backend** | `ruff check .`, **`pytest --tb=short -v --timeout=300 tests/`** (full suite, 3918 tests), `pytest --cov=app --cov-report=term-missing -q --timeout=300 tests/` (coverage) | `backend/` |
 | **Quality contracts** | `python scripts/check_config_contract.py`, `python scripts/check_pr_scope_drift.py` | repo root |
 
-> The backend job runs only that **targeted pytest subset** — a green Backend
-> job does not prove your changed area passes. Run the changed-area tests too.
+> The Backend job runs the **full pytest tests/** suite since PR #215 / FR-4
+> (issue #209). It takes ~18m on CI Linux (5.6x slower than local). A green
+> Backend job DOES prove the changed area passes (as long as the touched
+> test file isn't skipped via markers). Run the changed-area tests too for
+> faster local feedback.
 >
 > The coverage step (`continue-on-error: true`) cannot fail the job — never
-> chase a red there.
+> chase a red there. BUT the job timeout (60m after #215) can be hit by the
+> test+coverage combo on very slow runners.
 
 ## Tool availability
 
@@ -63,6 +70,11 @@ marker:
 - **Backend → pytest**: a Python traceback ending in `assert X == Y` (the diff
   tells you expected vs actual) or an error like `database is locked` /
   `Incorrect number of bindings`. Note the `<file>.py::<Class>::<test>`.
+  - For pytest-timeout failures: look for `TimeoutExpired` and the test name.
+  - For C-level hangs (no log output, pytest-timeout=300 doesn't fire): the
+    hang is in a native extension (bcrypt hashpw, sqlite3.connect, fcntl
+    locks). Look for the last PASSED test before silence and audit its
+    test setUp/tearDown for blocking I/O.
 - **Frontend → typecheck/build**: `error TS####` with file + line. `npm run
   build` runs `tsc` first, so a type error fails the build too.
 - **Frontend → lint**: an eslint warning line — CI uses `--max-warnings 0`, so a
@@ -81,6 +93,7 @@ Do not guess the cause from the job name. Read the log.
 | **Introduced by this PR** | Failure references a file/area your branch touched | Fix it before merge |
 | **Pre-existing on `master`** | Same check fails on `master`'s latest run, unrelated to your diff | Document in PR body; do not fix unless scoped |
 | **Environment / branch drift** | `npm ci` lockfile mismatch, or `check_pr_scope_drift.py` empty diff because base history isn't fetched | Re-sync (rebase onto `master`, refetch `origin/master`) |
+| **C-level hang (silent)** | pytest -v produces zero output for 30+ min, no TimeoutExpired | Native extension hang. Find the last PASSED test, audit its setUp/tearDown for blocking I/O (bcrypt, sqlite3, fcntl). Apply targeted fix. |
 
 Confirm "pre-existing" by reproducing on `master` in a throwaway worktree (see
 `running-tests` → *Confirming a pre-existing failure*) before claiming it.
@@ -101,33 +114,35 @@ ruff check .
 ```
 
 ### Backend (pytest)
-Read the production `except` clause before adjusting a mock — a mock raising
-bare `Exception` when prod catches specific types is the #1 false 500. Fix code
-or test, then:
+
+For PR-introduced test failures, reproduce in isolation:
 ```bash
 cd backend && pytest --tb=short -v tests/<file>.py::<Class>::<test>
-# plus the CI subset:
-pytest --tb=short -v tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py
 ```
 
-### Frontend (typecheck / lint / test / build)
+For full-suite reproduction (mimics CI):
 ```bash
-cd frontend
-npm run typecheck      # fix TS errors
-npm run lint           # zero-warning gate — fix every warning
-npm test               # vitest run
-npm run build          # tsc && vite build
+cd backend && pytest --tb=short -v --timeout=300 tests/
+# Expect ~18m on CI Linux, ~3-5m locally. If you don't have 3-5m, use a narrower scope.
 ```
 
-### Quality contracts
-```bash
-git fetch origin master            # scope-drift needs base history locally
-python scripts/check_config_contract.py
-python scripts/check_pr_scope_drift.py
-```
-`check_pr_scope_drift.py` flags real drift (e.g. auth tests changed without
-matching auth runtime/doc changes, CI/tooling changes without a contract
-update). **Fix the underlying drift — do not game the diff** to silence it.
+#### Common Backend test failure patterns (from PR #215 diagnostic history)
+
+1. **Missing dependency override**: Test setUp only overrides `get_current_active_user` but the endpoint uses `Depends(get_evaluate_policy)` or `Depends(get_db)`. FastAPI resolves all dependencies even if not called → real DB connection acquired → pool hang. **Fix**: add the missing override in setUp, matching what the endpoint actually needs.
+
+2. **Singleton connection pool pollution**: `_pool_cache` in `app/models/database.py` persists across the full test run. The conftest.py `pytest_configure` only deletes `app.*` modules at startup, not between tests. **Fix**: add an autouse fixture in `tests/conftest.py` that closes all pools in `_pool_cache` and clears the cache both before AND after yield. Pattern in `tests/conftest.py::_reset_db_pool`.
+
+3. **Cumulative bcrypt slowness**: bcrypt cost factor 14 = ~1 sec per hash. If a test creates 50+ users in a loop, setUp is 38 sec; multiple test classes → cumulative 5+ min. **Fix**: session-scoped autouse fixture in conftest.py that pre-computes the bcrypt hash for common test passwords ('pass123') once at session start. CRITICAL: patch `pwd_context.hash` (the underlying CryptContext method), NOT `hash_password` (the wrapper). Test modules that do `from app.services.auth_service import hash_password` capture the reference at import time, bypassing module-level patches. See `tests/conftest.py::_cache_bcrypt_hash_for_test_passwords`.
+
+4. **Test passes for the wrong reason**: a test that inspects `call_args[0][0]` (positional) when the production code calls with kwargs may pass by inspecting the LAST call (which is from a different code path). **Fix**: use `call_args_list` and find the right call by signature. Always verify WHICH call the test inspects.
+
+5. **Bounded queue with no consumer (deadlock)**: When adding `asyncio.Queue(maxsize=N)` for DoS mitigation, audit all `put()` call sites. If `put()` happens BEFORE any consumer task is spawned, deadlock on >N items. **Fix**: spawn consumers before producers. Pattern in `BackgroundProcessor.start()`.
+
+#### When the suite is too slow for the 60m job timeout
+
+The full suite (3918 tests) takes ~18m on CI Linux. Plus coverage step (re-runs all tests with --cov) = ~36m total. If the job hits 60m, the most likely cause is:
+- A test in a tight loop calling a slow function (e.g., bcrypt) — see pattern 3 above
+- The CI runner is unusually slow (transient) — re-trigger by force-pushing an empty commit
 
 ## Step 5 — Branch drift / rebase
 
@@ -151,6 +166,11 @@ pushing again — do not stack pushes on un-confirmed CI. If checks stall in
 `queued`, re-fetch status manually and report the stall rather than waiting
 indefinitely.
 
+For multi-iteration CI fix runs: keep each fix commit SMALL and focused.
+A single-line test update or single-config change is better than a
+multi-file refactor when the goal is to bisect which fix worked. Reviewers
+read each commit; giant commits hide intent.
+
 ## Step 7 — Verify all green
 
 Do not declare victory until all three required jobs (Frontend, Backend, Quality
@@ -166,5 +186,11 @@ contracts) are green. A `skipped` check is acceptable only if it is skipped on
 - Do NOT raise the eslint `--max-warnings` threshold to dodge a warning.
 - Do NOT look for dist-check, biome, bun, or a per-OS matrix — this repo has
   none of them.
+- Do NOT stack pushes on un-confirmed CI. Wait for the next result.
+- Do NOT make speculative fixes without reading the log — pytest-timeout
+  doesn't fire on C-level hangs; the actual hang may be a different mechanism
+  than your hypothesis suggests.
+- Do NOT add multi-file refactors in CI fix commits — keep each fix focused
+  to make the intent reviewable.
 - After a rebase, a `--force-with-lease` push is expected; a plain push will be
   rejected.
