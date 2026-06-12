@@ -212,3 +212,67 @@ unenforced (fail-loud `reject_insecure_defaults`).
 8. M5 partial-index status
 9. M8 rAF streaming batching
 10. E1 wire semantic chunker; E2 eval harness (the two biggest "state of the art" gaps)
+
+---
+
+# Second Pass — Orchestrator Expert Review (same session)
+
+Direct code reading by the orchestrator after the swarm review, focused on retrieval
+math, prompt construction, streaming filters, and auth subtleties.
+
+## NEW FINDINGS
+
+**P1 [MEDIUM-HIGH] Recency blending mathematically dominates relevance in RRF fusion.**
+`fusion.py:58-61` blends `rrf_score * 0.9 + recency * 0.1`. With default weights
+(original 1.0 + step_back 0.5, k=60), the maximum possible weighted RRF score is
+(1.0+0.5)/61 ≈ 0.0246 → ×0.9 ≈ 0.022, while the recency term spans 0→0.1 — the
+"tiebreaker" (comment at `rag_engine.py:1077`) has ~4.5× the dynamic range of the
+relevance signal. Compounding: recency is min-max normalized over the candidate set
+(`rag_engine.py:1097-1103`), so two upload batches minutes apart get full 0↔1
+separation; and `processed_at` is ingestion time, not document date — re-uploading a
+file makes it "newest". Active by default (`retrieval_recency_weight=0.1`,
+`stepback_enabled=True` → multi-variant). The reranker (default on, top_n=7) repairs
+final ordering for candidates that survive the fetch_k cut, so visible damage
+concentrates at the fetch_k cutoff and in rerank-degraded queries — but candidate
+selection is systematically biased toward recently-uploaded content. Fix: normalize
+RRF scores before blending (divide by max), or use a rank-based recency boost, or
+drop the weight ~10×.
+
+**P2 [MEDIUM] Streaming think-tag filter silently truncates legitimate answers.**
+`llm_client.py:369-381,412-415` treats the bare substring `_lhs` as a thinking-open
+marker: any legitimate occurrence (e.g. `expr_lhs` in code from ingested technical
+docs) flips `_thinking_active=True` and swallows ALL subsequent output until a
+`_rhs`/`</think>` that never comes. Same for a literal `"Thinking Process:"` in
+content (`:382-396`). Failure is silent — the answer just ends early. Fix: anchor
+these legacy markers to message start, or make them configurable/opt-in per model.
+
+**P3 [MEDIUM] Prompt-injection boundary is escapable.** `prompt_builder.py:326`
+embeds `chunk.text` verbatim in `<document>…</document>` (memories likewise at
+`:184`); no escaping of `</document>` exists anywhere (repo-wide grep). A document
+containing a literal close tag breaks out of the declared "SECURITY BOUNDARY"
+(`:136-140`), whose defense is otherwise instruction-only. In shared vaults this is
+a cross-user injection vector (one user's uploaded doc steers another user's chat).
+Fix: neutralize `</document>`, `</memory>`, `[[MATCH:` sequences in evidence text.
+
+**P4 [LOW] bcrypt 72-byte truncation vs 128-char policy** (`auth_service.py:87-88`):
+characters beyond 72 bytes are silently ignored by bcrypt. Also the "only
+whitespace" check (`:89-90`) actually rejects any leading/trailing whitespace with a
+misleading message.
+
+**P5 [LOW] Upstream LLM error text propagates into LLMError messages**
+(`llm_client.py:448-458`), which can reach client-visible error details given the
+absent global error envelope.
+
+## POSITIVES VERIFIED THIS PASS
+Per-request DB user fetch (role changes/deactivation are instant, `deps.py:240-270`);
+single-flight token refresh (`api.ts:131-144`); embedding cache keyed on
+model+URL+prefix fingerprints (`embeddings.py:390-393`); `PRAGMA foreign_keys=ON`
+per pooled connection; SSRF guard on LLM URLs; reasoning content never streamed to
+users; refresh tokens opaque + hashed; RRF implementation otherwise clean.
+
+## REVISED PRIORITY ORDER
+1. H1 abort-on-session-switch · 2. **P1 recency fusion fix** (silent, default-on
+retrieval-quality distortion) · 3. M1 streamed citation validation · 4. **P2 think-tag
+truncation** · 5. **P3 prompt-boundary escaping** · 6. M2 pagination UI · 7. M7 flush
+pending deletes · 8. M3 delete reconciliation · 9. M4 embedding versioning ·
+10. M6 lock file.
