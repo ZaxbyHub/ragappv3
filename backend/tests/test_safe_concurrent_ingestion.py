@@ -27,7 +27,14 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
         with patch("app.services.background_tasks.asyncio.create_task", side_effect=fake_create_task):
             await processor.start()
 
-    assert created_workers == ["worker-0", "worker-1", "enrichment-worker"]
+    # The periodic vector-delete reconciliation sweep is spawned in start()
+    # after the workers/enrichment task (added with the #219 retry queue).
+    assert created_workers == [
+        "worker-0",
+        "worker-1",
+        "enrichment-worker",
+        "vector-delete-sweep",
+    ]
 
 
 @pytest.mark.asyncio

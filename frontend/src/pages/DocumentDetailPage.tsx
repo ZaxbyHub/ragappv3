@@ -201,7 +201,7 @@ export default function DocumentDetailPage() {
           <CardContent className="px-4 pb-3 grid grid-cols-2 gap-3 text-sm">
             <div>
               <p className="text-muted-foreground">Status</p>
-              <StatusBadge status={status} />
+              <StatusBadge status={status} chunksFailed={Number(doc.metadata?.chunks_failed ?? 0)} />
             </div>
             <div>
               <p className="text-muted-foreground">Chunks</p>

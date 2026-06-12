@@ -192,6 +192,7 @@ class BackgroundProcessor:
         )
         self._worker_tasks: List[asyncio.Task] = []
         self._enrichment_worker_task: Optional[asyncio.Task] = None
+        self._vector_delete_sweep_task: Optional[asyncio.Task] = None
         self._running = False
         self.maintenance_service = maintenance_service
         self._write_semaphore: Optional[asyncio.Semaphore] = None
@@ -252,8 +253,24 @@ class BackgroundProcessor:
         await self._recover_stranded_pending_rows()
         await self._recover_stranded_enrichment_rows()
         await self.retry_pending_vector_deletes()
+        # Re-run the vector-delete reconciliation hourly so orphaned chunks
+        # from a failed delete are cleaned without waiting for a restart.
+        self._vector_delete_sweep_task = asyncio.create_task(
+            self._vector_delete_sweep_loop(), name="vector-delete-sweep"
+        )
 
         logger.info(f"Background processor started with {worker_count} worker(s)")
+
+    async def _vector_delete_sweep_loop(self, interval_seconds: float = 3600.0) -> None:
+        """Hourly retry loop for pending vector deletes (startup pass runs first)."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self.retry_pending_vector_deletes()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — sweep must never kill the loop
+                logger.exception("Periodic vector-delete sweep failed")
 
     async def _recover_stranded_pending_rows(self) -> None:
         """Re-enqueue any `files` rows left at status='pending' from a prior process.
@@ -542,6 +559,9 @@ class BackgroundProcessor:
         if self._enrichment_worker_task:
             self._enrichment_worker_task.cancel()
             await asyncio.gather(self._enrichment_worker_task, return_exceptions=True)
+        if self._vector_delete_sweep_task:
+            self._vector_delete_sweep_task.cancel()
+            await asyncio.gather(self._vector_delete_sweep_task, return_exceptions=True)
 
         # Phase 3: Flush optimize on VectorStore if available
         if hasattr(self.processor, 'vector_store') and self.processor.vector_store is not None:
