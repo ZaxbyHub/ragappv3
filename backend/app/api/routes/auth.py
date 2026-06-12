@@ -291,7 +291,7 @@ async def login(
     """Login and receive access token + refresh cookie."""
     row = await asyncio.to_thread(
         lambda: db.execute(
-            "SELECT id, username, hashed_password, full_name, role, is_active, failed_attempts, locked_until FROM users WHERE username = ? COLLATE NOCASE",
+            "SELECT id, username, hashed_password, full_name, role, is_active, failed_attempts, locked_until, must_change_password FROM users WHERE username = ? COLLATE NOCASE",
             (body.username,),
         ).fetchone()
     )
@@ -308,6 +308,7 @@ async def login(
         is_active,
         failed_attempts,
         locked_until,
+        must_change_password,
     ) = row
 
     if not is_active:
@@ -399,6 +400,7 @@ async def login(
             "full_name": full_name,
             "role": role,
             "is_active": bool(is_active),
+            "must_change_password": bool(must_change_password),
         },
     }
 
@@ -712,6 +714,7 @@ async def change_password(
     return {
         "access_token": access_token,
         "token_type": "bearer",
+        "expires_in": 15 * 60,
     }
 
 

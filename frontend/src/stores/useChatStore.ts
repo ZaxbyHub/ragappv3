@@ -202,14 +202,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   loadChat: (chatId, messages) => {
+    // Abort any in-flight stream before switching sessions. Otherwise the orphan
+    // stream keeps running: its onComplete fires later and the assistant reply is
+    // silently dropped (its message id no longer exists), and the new session's
+    // composer stays locked in "Generating". The wrapped abortFn (see
+    // useSendMessage) also clears the send guard. No-op when nothing is streaming.
+    const { abortFn } = get();
+    if (abortFn) abortFn();
     const messageIds = messages.map((m) => m.id);
     const messagesById: Record<string, Message> = {};
     for (const m of messages) messagesById[m.id] = m;
-    set({ activeChatId: chatId, messageIds, messagesById, expandedSources: new Set(), streamingMessageId: null });
+    set({ activeChatId: chatId, messageIds, messagesById, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null });
   },
 
   newChat: () => {
-    set({ activeChatId: null, messageIds: [], messagesById: {}, expandedSources: new Set(), streamingMessageId: null });
+    // Abort any in-flight stream before starting a new chat (see loadChat).
+    const { abortFn } = get();
+    if (abortFn) abortFn();
+    set({ activeChatId: null, messageIds: [], messagesById: {}, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null });
   },
 
   setMessages: (messages) => {

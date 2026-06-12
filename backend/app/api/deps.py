@@ -281,9 +281,20 @@ async def get_current_active_user(
             "/api/auth/change-password",
             "/api/auth/login",
         }
+        # GET /auth/me is exempt so the SPA can rehydrate the current user and
+        # detect the flag on reload — it is a read-only view of the caller's own
+        # identity (no other data, no mutation). Without it, the client's init()
+        # fetchMe() 403s, the user is logged out, and is bounced to login instead
+        # of the forced change-password screen. Only GET is exempt: PATCH /auth/me
+        # (update_me) mutates the profile/password and must stay blocked so the
+        # forced-change flow is the only way out.
+        me_read_paths = {"/auth/me", "/api/auth/me"}
         # Normalize path to prevent bypass via trailing slash variants
         normalized_path = request.url.path.rstrip("/") or "/"
-        if normalized_path not in exempt_paths:
+        is_exempt = normalized_path in exempt_paths or (
+            request.method.upper() == "GET" and normalized_path in me_read_paths
+        )
+        if not is_exempt:
             raise HTTPException(
                 status_code=403,
                 detail="must_change_password",

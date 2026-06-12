@@ -277,6 +277,14 @@ class LLMClient:
         # treated like any other thinking content and suppressed at the source.
         _thinking_active = False
         _buffer = ""
+        # The bare legacy reasoning markers ("_lhs", "Thinking Process:") are only
+        # ever emitted as a prefix to the whole response. Once any real content has
+        # been streamed to the user, a later occurrence of those substrings is
+        # genuine answer text (e.g. an identifier like ``expr_lhs``) and must NOT be
+        # treated as a thinking marker — otherwise the rest of the answer is
+        # silently swallowed. The XML ``<think>`` tag is unambiguous and stays
+        # active anywhere.
+        _content_emitted = False
 
         stream_succeeded = False
         try:
@@ -352,6 +360,7 @@ class LLMClient:
                                 # check whether the buffer is a partial prefix
                                 # of a known marker (hold it) or safe to yield.
                                 think_open_match = _THINK_OPEN_RE.search(_buffer)
+                                _stripped = _buffer.lstrip()
                                 if think_open_match:
                                     logger.debug(
                                         "Filtering thinking content from model response (<think> pattern)"
@@ -359,6 +368,7 @@ class LLMClient:
                                     pre_think = _buffer[: think_open_match.start()]
                                     if pre_think:
                                         yield pre_think
+                                        _content_emitted = True
                                     _thinking_active = True
                                     _buffer = _buffer[think_open_match.end() :]
                                     # Handle inline close in the same buffer
@@ -366,25 +376,35 @@ class LLMClient:
                                     if close_match:
                                         _thinking_active = False
                                         _buffer = _buffer[close_match.end() :]
-                                elif "_lhs" in _buffer:
+                                elif _THINK_PARTIAL_OPEN_RE.match(_buffer):
+                                    # Partial "<think" open tag split across chunk
+                                    # boundaries — hold the buffer until the rest
+                                    # of the tag (or divergent content) arrives.
+                                    pass
+                                elif not _content_emitted and _stripped.startswith("_lhs"):
+                                    # Legacy Qwen _lhs/_rhs reasoning marker. Only
+                                    # honored at the very start of the response: a
+                                    # later "_lhs" is genuine answer text.
                                     logger.debug(
                                         "Filtering thinking content from model response (_lhs/_rhs pattern)"
                                     )
                                     pre_think, _, remainder = _buffer.partition("_lhs")
                                     if pre_think:
                                         yield pre_think
+                                        _content_emitted = True
                                     _thinking_active = True
                                     _buffer = remainder
                                     if "_rhs" in _buffer:
                                         _, _, after_think = _buffer.partition("_rhs")
                                         _thinking_active = False
                                         _buffer = after_think
-                                elif (
-                                    "Thinking Process:".startswith(_buffer)
-                                    or "Thinking Process:" in _buffer
-                                    or _THINK_PARTIAL_OPEN_RE.match(_buffer)
+                                elif not _content_emitted and (
+                                    _stripped.startswith("Thinking Process:")
+                                    or "Thinking Process:".startswith(_stripped)
                                 ):
-                                    # Check for qwen3.5-122b "Thinking Process:" pattern
+                                    # qwen3.5-122b "Thinking Process:" prefix. Only
+                                    # honored before any content is emitted; after
+                                    # that the substring is real answer text.
                                     if "Thinking Process:" in _buffer:
                                         logger.debug(
                                             "Filtering thinking content from model response (Thinking Process pattern)"
@@ -392,15 +412,17 @@ class LLMClient:
                                         pre_marker, _, _ = _buffer.partition("Thinking Process:")
                                         if pre_marker:
                                             yield pre_marker
+                                            _content_emitted = True
                                         _thinking_active = True
                                         _buffer = ""
-                                    # else: still accumulating a partial open
-                                    # marker — hold buffer until full marker
-                                    # arrives or it diverges from any prefix.
+                                    # else: still accumulating a partial prefix —
+                                    # hold buffer until the full marker arrives or
+                                    # it diverges.
                                 elif _buffer:
                                     # No opening pattern and no partial-open
                                     # prefix — safe to yield.
                                     yield _buffer
+                                    _content_emitted = True
                                     _buffer = ""
                             else:
                                 # Currently inside a thinking block — look for any
@@ -422,14 +444,20 @@ class LLMClient:
                                 ):
                                     _buffer = _buffer[-256:]
                             # Yield any buffered content when not in thinking
-                            # mode and not holding a partial open marker.
+                            # mode and not holding a partial open marker. The
+                            # "Thinking Process:" prefix is only held before any
+                            # content has been emitted (afterwards it is real text).
                             if (
                                 not _thinking_active
                                 and _buffer
-                                and not "Thinking Process:".startswith(_buffer)
+                                and not (
+                                    not _content_emitted
+                                    and "Thinking Process:".startswith(_buffer)
+                                )
                                 and not _THINK_PARTIAL_OPEN_RE.match(_buffer)
                             ):
                                 yield _buffer
+                                _content_emitted = True
                                 _buffer = ""
                     stream_succeeded = True
                 except GeneratorExit:

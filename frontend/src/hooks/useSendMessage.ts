@@ -241,7 +241,14 @@ export function useSendMessage(
         effectiveMode,
       );
 
-      setAbortFn(abort);
+      // Wrap the raw abort so any caller that aborts the stream — the Stop
+      // button OR a session switch routed through the store (loadChat/newChat) —
+      // also clears the hook-local in-flight guard. Without this, aborting via
+      // navigation would leave sendingRef stuck true and block the next send.
+      setAbortFn(() => {
+        abort();
+        sendingRef.current = false;
+      });
     },
     [
       setInput,

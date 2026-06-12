@@ -279,11 +279,12 @@ class TestMustChangePasswordExemptPaths(unittest.TestCase):
     # Test 3: After clearing flag, user can access protected routes (GET /api/auth/me)
     # ------------------------------------------------------------------
     def test_user_can_access_protected_routes_after_flag_cleared(self):
-        """After must_change_password is cleared, user can access GET /api/auth/me.
+        """After must_change_password is cleared, user can access protected routes.
 
-        Before the flag is cleared, accessing /api/auth/me returns 403 with
-        "must_change_password". After a successful change-password (which clears
-        the flag), the same user can access it without 403.
+        While flagged, a non-exempt route (/api/vaults) returns 403
+        "must_change_password" (and /api/auth/me is reachable, reporting the flag).
+        After a successful change-password (which clears the flag), the user can
+        access protected routes normally.
         """
         # Register user
         self.client.post(
@@ -303,16 +304,26 @@ class TestMustChangePasswordExemptPaths(unittest.TestCase):
         user_id = self._get_user_id("flaggeduser3")
         self._set_must_change_password(user_id, 1)
 
-        # Before flag is cleared: accessing /api/auth/me should be blocked
-        me_response_before = self.client.get(
-            "/api/auth/me",
+        # Before the flag is cleared, a non-exempt protected route is still blocked.
+        # (/api/auth/me is intentionally exempt — issue #230 — so the SPA can read
+        # the flag and route to the forced change-password screen.)
+        vaults_response_before = self.client.get(
+            "/api/vaults",
             headers={"Authorization": f"Bearer {access_token}"},
         )
         self.assertEqual(
-            me_response_before.status_code, 403,
-            f"Expected 403 before flag clear, got {me_response_before.status_code}"
+            vaults_response_before.status_code, 403,
+            f"Expected 403 before flag clear, got {vaults_response_before.status_code}"
         )
-        self.assertEqual(me_response_before.json()["detail"], "must_change_password")
+        self.assertEqual(vaults_response_before.json()["detail"], "must_change_password")
+
+        # /api/auth/me itself is reachable and reports the flag.
+        me_flagged = self.client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(me_flagged.status_code, 200)
+        self.assertTrue(me_flagged.json()["must_change_password"])
 
         # Change password (clears the flag)
         cp_response = self.client.post(
@@ -334,6 +345,49 @@ class TestMustChangePasswordExemptPaths(unittest.TestCase):
         )
         me_data = me_response_after.json()
         self.assertEqual(me_data["username"], "flaggeduser3")
+
+    # ------------------------------------------------------------------
+    # Test 3b: Only GET /api/auth/me is exempt — PATCH /api/auth/me is blocked
+    # ------------------------------------------------------------------
+    def test_flagged_user_blocked_on_patch_me(self):
+        """A flagged user can GET /api/auth/me but not PATCH it.
+
+        GET is exempt for read-only rehydration; PATCH /api/auth/me (update_me)
+        mutates the profile/password and must stay blocked so the forced
+        change-password flow is the only way out.
+        """
+        self.client.post(
+            "/api/auth/register",
+            json={"username": "patchmeuser", "password": "OldPass123"},
+        )
+        login_response = self.client.post(
+            "/api/auth/login",
+            json={"username": "patchmeuser", "password": "OldPass123"},
+        )
+        self.assertEqual(login_response.status_code, 200)
+        access_token = login_response.json()["access_token"]
+
+        user_id = self._get_user_id("patchmeuser")
+        self._set_must_change_password(user_id, 1)
+
+        # GET is allowed
+        get_resp = self.client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        self.assertEqual(get_resp.status_code, 200)
+
+        # PATCH is blocked by the must_change_password gate
+        patch_resp = self.client.patch(
+            "/api/auth/me",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "X-CSRF-Token": "test-csrf-token",
+            },
+            json={"full_name": "Should Not Apply"},
+        )
+        self.assertEqual(patch_resp.status_code, 403)
+        self.assertEqual(patch_resp.json()["detail"], "must_change_password")
 
     # ------------------------------------------------------------------
     # Test 4: User without must_change_password (already 0) changing password stays 0
@@ -560,7 +614,8 @@ class TestMustChangePasswordExemptPathsVariants(unittest.TestCase):
         """User with must_change_password=1 is blocked on non-exempt routes.
 
         Verifies that the must_change_password check only exempts the specific
-        login and change-password paths; other routes still return 403.
+        login, change-password, and (read-only) me paths; other routes still
+        return 403.
         """
         # Register user
         self.client.post(
@@ -580,13 +635,14 @@ class TestMustChangePasswordExemptPathsVariants(unittest.TestCase):
         user_id = self._get_user_id("flaggedblockuser")
         self._set_must_change_password(user_id, 1)
 
-        # Attempting to access /api/auth/me (non-exempt) should return 403
-        me_response = self.client.get(
-            "/api/auth/me",
+        # Accessing a non-exempt route (/api/vaults) should return 403.
+        # (/api/auth/me is exempt — covered separately — so it is not used here.)
+        vaults_response = self.client.get(
+            "/api/vaults",
             headers={"Authorization": f"Bearer {access_token}"},
         )
-        self.assertEqual(me_response.status_code, 403)
-        self.assertEqual(me_response.json()["detail"], "must_change_password")
+        self.assertEqual(vaults_response.status_code, 403)
+        self.assertEqual(vaults_response.json()["detail"], "must_change_password")
 
 
 if __name__ == "__main__":

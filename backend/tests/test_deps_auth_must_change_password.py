@@ -57,10 +57,11 @@ def _make_token(user_id: int, secret: str = "test-secret-key") -> str:
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
-def _mock_request(path: str) -> MagicMock:
-    """Create a mock Request with a specific URL path."""
+def _mock_request(path: str, method: str = "GET") -> MagicMock:
+    """Create a mock Request with a specific URL path and HTTP method."""
     mock_req = MagicMock()
     mock_req.url.path = path
+    mock_req.method = method
     return mock_req
 
 
@@ -73,14 +74,17 @@ class TestMustChangePasswordEnforcement:
     """Tests for must_change_password route-blocking enforcement."""
 
     @pytest.mark.asyncio
-    async def test_must_change_password_blocked_on_me_route(
+    async def test_must_change_password_allowed_on_me_route(
         self, mock_settings_jwt_mode, mock_db
     ):
         """
-        User with must_change_password=1 accessing GET /api/auth/me → 403 'must_change_password'.
+        User with must_change_password=1 accessing GET /api/auth/me → allowed.
 
-        This is the primary security enforcement: flagged users cannot access
-        any route except /auth/change-password and /auth/login.
+        /auth/me is exempt: it is a read-only view of the caller's own identity
+        (including the must_change_password flag), which the SPA needs to rehydrate
+        the user on reload and route to the forced change-password screen instead of
+        being logged out. (Previously this route returned 403; the exemption was
+        added so the forced-change flow works end-to-end — issue #230.)
         """
         from app.api.deps import get_current_active_user
 
@@ -90,7 +94,38 @@ class TestMustChangePasswordEnforcement:
             42, "testuser", "Test User", "member", 1, 1  # must_change_password=1
         )
 
-        mock_request = _mock_request("/api/auth/me")
+        mock_request = _mock_request("/api/auth/me", method="GET")
+
+        result = await get_current_active_user(
+            request=mock_request,
+            authorization=f"Bearer {token}",
+            access_token=None,
+            db=mock_conn,
+        )
+
+        assert result["id"] == 42
+        assert result["must_change_password"] is True
+
+    @pytest.mark.asyncio
+    async def test_must_change_password_blocked_on_patch_me_route(
+        self, mock_settings_jwt_mode, mock_db
+    ):
+        """
+        User with must_change_password=1 doing PATCH /api/auth/me → 403.
+
+        Only the read-only GET /auth/me is exempt. PATCH /auth/me (update_me)
+        mutates the profile/password and must stay blocked so the forced
+        change-password flow is the only way out.
+        """
+        from app.api.deps import get_current_active_user
+
+        token = _make_token(42)
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.return_value = (
+            42, "testuser", "Test User", "member", 1, 1
+        )
+
+        mock_request = _mock_request("/api/auth/me", method="PATCH")
 
         with pytest.raises(HTTPException) as exc_info:
             await get_current_active_user(
@@ -383,9 +418,12 @@ class TestMustChangePasswordEnforcement:
         self, mock_settings_jwt_mode, mock_db
     ):
         """
-        User with must_change_password=1 AND role=admin accessing /api/auth/me → 403.
+        User with must_change_password=1 AND role=admin accessing a non-exempt
+        route (/vaults) → 403.
 
-        The flag applies regardless of role — even admins must change password on first login.
+        The flag applies regardless of role — even admins must change password on
+        first login. (Uses /vaults rather than /auth/me, which is now exempt — see
+        issue #230.)
         """
         from app.api.deps import get_current_active_user
 
@@ -395,7 +433,7 @@ class TestMustChangePasswordEnforcement:
             99, "adminuser", "Admin User", "admin", 1, 1  # admin + flagged
         )
 
-        mock_request = _mock_request("/api/auth/me")
+        mock_request = _mock_request("/vaults")
 
         with pytest.raises(HTTPException) as exc_info:
             await get_current_active_user(
@@ -409,13 +447,15 @@ class TestMustChangePasswordEnforcement:
         assert exc_info.value.detail == "must_change_password"
 
     @pytest.mark.asyncio
-    async def test_must_change_password_cookie_auth_blocked(
+    async def test_must_change_password_cookie_auth_blocked_on_protected_route(
         self, mock_settings_jwt_mode, mock_db
     ):
         """
-        User with must_change_password=1 authenticating via cookie accessing /api/auth/me → 403.
+        User with must_change_password=1 authenticating via cookie accessing a
+        non-exempt route (/vaults) → 403.
 
-        The must_change_password check must work for cookie-based auth too.
+        The must_change_password check must work for cookie-based auth too. (Uses
+        /vaults rather than /auth/me, which is now exempt — see issue #230.)
         """
         from app.api.deps import get_current_active_user
 
@@ -425,7 +465,7 @@ class TestMustChangePasswordEnforcement:
             42, "testuser", "Test User", "member", 1, 1
         )
 
-        mock_request = _mock_request("/api/auth/me")
+        mock_request = _mock_request("/vaults")
 
         with pytest.raises(HTTPException) as exc_info:
             await get_current_active_user(

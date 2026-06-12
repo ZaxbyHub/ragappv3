@@ -23,7 +23,7 @@ export function ProtectedRoute({ children, testMode = false }: ProtectedRoutePro
   const location = useLocation();
 
   // H-10 fix: Use only the JWT auth store — legacy AuthContext OR removed
-  const { isAuthenticated, isLoading, isInitialized, needsSetup } = useAuthStore();
+  const { isAuthenticated, isLoading, isInitialized, needsSetup, user } = useAuthStore();
 
   // testMode is a development-only convenience (see App.tsx, where it is gated
   // by import.meta.env.DEV so it can never be enabled in a production build).
@@ -69,6 +69,18 @@ export function ProtectedRoute({ children, testMode = false }: ProtectedRoutePro
   // If not authenticated, redirect to login with return location
   if (!isAuthenticated) {
     return <Navigate to="/login" state={{ from: location }} replace />;
+  }
+
+  // Forced password change: a flagged user must change their password before
+  // reaching any other protected route. The change-password screen itself is
+  // exempt; a non-flagged user who lands on it is sent home.
+  const mustChangePassword = !!user?.must_change_password;
+  const onChangePasswordRoute = location.pathname === "/change-password";
+  if (mustChangePassword && !onChangePasswordRoute) {
+    return <Navigate to="/change-password" replace />;
+  }
+  if (!mustChangePassword && onChangePasswordRoute) {
+    return <Navigate to="/" replace />;
   }
 
   return <>{children}</>;

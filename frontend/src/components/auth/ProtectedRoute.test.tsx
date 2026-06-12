@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { ProtectedRoute } from "./ProtectedRoute";
 import { RoleGuard, AdminGuard, SuperAdminGuard } from "./RoleGuard";
 import * as useAuthStoreModule from "@/stores/useAuthStore";
@@ -95,6 +95,90 @@ describe("ProtectedRoute", () => {
     renderWithRouter(<ProtectedRoute><div>Protected Content</div></ProtectedRoute>);
 
     expect(screen.getByText("Protected Content")).toBeInTheDocument();
+  });
+
+  // For cross-route redirects, map the destination to a distinct sentinel so the
+  // redirect target is observable (a bare router would just re-render the same
+  // ProtectedRoute at the new path).
+  const renderWithRoutes = (initialEntry: string) =>
+    render(
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <Routes>
+          <Route path="/change-password" element={<div>CP Screen</div>} />
+          <Route path="/" element={<div>Home Sentinel</div>} />
+          <Route
+            path="*"
+            element={
+              <ProtectedRoute>
+                <div>Protected Content</div>
+              </ProtectedRoute>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+
+  it("redirects flagged user away from a normal route to /change-password", () => {
+    vi.mocked(useAuthStoreModule.useAuthStore).mockReturnValue({
+      isAuthenticated: true,
+      isLoading: false,
+      isInitialized: true,
+      needsSetup: false,
+      user: { id: 1, username: "new", role: "member", must_change_password: true },
+    } as any);
+
+    renderWithRoutes("/documents");
+
+    expect(screen.queryByText("Protected Content")).not.toBeInTheDocument();
+    expect(screen.getByText("CP Screen")).toBeInTheDocument();
+  });
+
+  it("renders the change-password screen for a flagged user on /change-password", () => {
+    vi.mocked(useAuthStoreModule.useAuthStore).mockReturnValue({
+      isAuthenticated: true,
+      isLoading: false,
+      isInitialized: true,
+      needsSetup: false,
+      user: { id: 1, username: "new", role: "member", must_change_password: true },
+    } as any);
+
+    // ProtectedRoute itself wraps the change-password route at runtime, so render
+    // it directly at that path: a flagged user should see the wrapped children.
+    renderWithRouter(
+      <ProtectedRoute><div>Change Password Form</div></ProtectedRoute>,
+      "/change-password"
+    );
+
+    expect(screen.getByText("Change Password Form")).toBeInTheDocument();
+  });
+
+  it("redirects a non-flagged user away from /change-password to home", () => {
+    vi.mocked(useAuthStoreModule.useAuthStore).mockReturnValue({
+      isAuthenticated: true,
+      isLoading: false,
+      isInitialized: true,
+      needsSetup: false,
+      user: { id: 1, username: "user", role: "member", must_change_password: false },
+    } as any);
+
+    render(
+      <MemoryRouter initialEntries={["/change-password"]}>
+        <Routes>
+          <Route path="/" element={<div>Home Sentinel</div>} />
+          <Route
+            path="/change-password"
+            element={
+              <ProtectedRoute>
+                <div>Change Password Form</div>
+              </ProtectedRoute>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    expect(screen.queryByText("Change Password Form")).not.toBeInTheDocument();
+    expect(screen.getByText("Home Sentinel")).toBeInTheDocument();
   });
 });
 

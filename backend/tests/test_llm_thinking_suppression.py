@@ -153,6 +153,49 @@ class TestStreamingSanitizer(unittest.IsolatedAsyncioTestCase):
         out = await self._stream(deltas)
         self.assertEqual(out, "")
 
+    async def test_lhs_substring_mid_content_not_treated_as_marker(self):
+        # A bare "_lhs" that appears AFTER real content has streamed is genuine
+        # answer text (e.g. an identifier) and must not flip the filter into
+        # thinking mode and swallow the rest of the response.
+        deltas = [
+            _delta_chunk(content="The variable "),
+            _delta_chunk(content="expr_lhs holds the left operand."),
+        ]
+        out = await self._stream(deltas)
+        self.assertEqual(out.strip(), "The variable expr_lhs holds the left operand.")
+
+    async def test_thinking_process_mid_content_not_treated_as_marker(self):
+        # "Thinking Process:" mid-answer is real text, not a reasoning marker.
+        deltas = [
+            _delta_chunk(content="Here is my "),
+            _delta_chunk(content="Thinking Process: a numbered list."),
+        ]
+        out = await self._stream(deltas)
+        self.assertEqual(out.strip(), "Here is my Thinking Process: a numbered list.")
+
+    async def test_thinking_process_marker_split_across_chunks_at_start(self):
+        # The "Thinking Process:" prefix split across chunk boundaries at the
+        # very start must still be held (partial-prefix accumulation) and
+        # suppressed as reasoning, with the close marker arriving later.
+        deltas = [
+            _delta_chunk(content="Thinking"),
+            _delta_chunk(content=" Process: planning the answer"),
+            _delta_chunk(content="</think>visible answer"),
+        ]
+        out = await self._stream(deltas)
+        self.assertEqual(out.strip(), "visible answer")
+
+    async def test_thinking_process_marker_split_across_chunks_mid_content(self):
+        # The same split AFTER content has been emitted is genuine text: the
+        # partial-prefix hold is bypassed once content_emitted is set.
+        deltas = [
+            _delta_chunk(content="Answer. "),
+            _delta_chunk(content="Thinking"),
+            _delta_chunk(content=" Process: my steps."),
+        ]
+        out = await self._stream(deltas)
+        self.assertEqual(out.strip(), "Answer. Thinking Process: my steps.")
+
 
 if __name__ == "__main__":
     unittest.main()

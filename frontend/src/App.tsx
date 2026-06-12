@@ -30,6 +30,7 @@ const AdminUsersPage = lazy(() => import("@/pages/AdminUsersPage"));
 const AdminGroupsPage = lazy(() => import("@/pages/AdminGroupsPage"));
 const OrgsPage = lazy(() => import("@/pages/OrgsPage"));
 const ProfilePage = lazy(() => import("@/pages/ProfilePage"));
+const ChangePasswordRequiredPage = lazy(() => import("@/pages/ChangePasswordRequiredPage"));
 const NotFoundPage = lazy(() => import("@/pages/NotFoundPage"));
 const WikiPage = lazy(() => import("@/pages/WikiPage"));
 const KMSPage = lazy(() => import("@/pages/KMSPage"));
@@ -143,6 +144,16 @@ function App() {
               <Route path="/setup" element={<SetupPage />} />
               <Route path="/register" element={<RegisterPage />} />
               <Route path="/login" element={<LoginPage />} />
+              {/* Forced password change — shell-less; ProtectedRoute routes
+                  flagged users here and blocks all other routes until cleared. */}
+              <Route
+                path="/change-password"
+                element={
+                  <ProtectedRoute testMode={TEST_MODE}>
+                    <ChangePasswordRequiredPage />
+                  </ProtectedRoute>
+                }
+              />
               <Route
                 path="/chat"
                 element={

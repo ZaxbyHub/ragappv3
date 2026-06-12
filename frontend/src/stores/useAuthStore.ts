@@ -17,6 +17,8 @@ interface User {
   full_name: string;
   role: "superadmin" | "admin" | "member" | "viewer";
   is_active: boolean;
+  /** When true, the user must change their password before using the app. */
+  must_change_password?: boolean;
 }
 
 interface LoginResponse {

@@ -125,18 +125,50 @@ class TestRRFRecency:
         assert ids_with == ids_without
         assert result_with_none[0]["_rrf_score"] == result_without[0]["_rrf_score"]
 
-    def test_rrf_fuse_recency_blend_correctness(self):
-        """Verify exact formula with known values."""
+    def test_rrf_fuse_recency_normalizes_non_max_score(self):
+        """The non-max document's blended score uses its RRF *normalized* against
+        the strongest hit, not its raw RRF.
+
+        The other recency tests only pin the max-score doc (which normalizes to
+        1.0 trivially) or assert ordering. This pins the rank-1 doc's exact score,
+        which is what distinguishes the normalized blend from the old raw-RRF
+        blend: under the old formula 'b' would score ``(1/62)*(1-w) + rec*w``;
+        under normalization it scores ``((1/62)/(1/61))*(1-w) + rec*w``.
+        """
         result_lists = [
-            [{"id": "doc", "text": "test doc"}],  # rank 0 -> score = 1/61
+            # a: rank 0 -> 1/61 (the max); b: rank 1 -> 1/62
+            [{"id": "a", "text": "doc a"}, {"id": "b", "text": "doc b"}],
         ]
-        rrf_score = 1.0 / 61  # k=60, rank=0
+        recency_scores = {"a": 0.2, "b": 0.2}  # equal recency → ordering is by RRF
+        w = 0.5
+
+        result = rrf_fuse(
+            result_lists, k=60, recency_scores=recency_scores, recency_weight=w
+        )
+        scores = {r["id"]: r["_rrf_score"] for r in result}
+
+        max_rrf = 1 / 61
+        b_norm = (1 / 62) / max_rrf
+        assert scores["a"] == pytest.approx(1.0 * (1 - w) + 0.2 * w)
+        assert scores["b"] == pytest.approx(b_norm * (1 - w) + 0.2 * w)
+        # 'a' still ranks first: equal recency, higher normalized RRF.
+        assert [r["id"] for r in result] == ["a", "b"]
+
+    def test_rrf_fuse_recency_blend_correctness(self):
+        """Verify exact formula with known values.
+
+        RRF scores are normalized against the strongest hit before blending, so a
+        single result (which is the max) contributes a normalized relevance of 1.0.
+        The blended score is therefore ``1.0 * (1 - w) + recency * w``. (Previously
+        the raw RRF score ~1/61 was blended directly, which let recency dominate.)
+        """
+        result_lists = [
+            [{"id": "doc", "text": "test doc"}],  # rank 0; sole hit -> normalized 1.0
+        ]
         recency_score = 0.8
         recency_weight = 0.25
 
-        expected_score = (
-            rrf_score * (1 - recency_weight) + recency_score * recency_weight
-        )
+        expected_score = 1.0 * (1 - recency_weight) + recency_score * recency_weight
 
         result = rrf_fuse(
             result_lists,
@@ -169,8 +201,9 @@ class TestRRFRecency:
         assert ids[0] == "a"  # 'a' has higher combined score
         assert ids[1] == "b"
 
-        # Verify 'a' got blended score
+        # Verify 'a' got blended score. 'a' is the strongest RRF hit (it appears in
+        # both lists), so its RRF normalizes to 1.0 before blending:
+        # 1.0 * (1 - 0.5) + 0.9 * 0.5.
         a_record = next(r for r in result if r["id"] == "a")
-        expected_rrf = (1 / 61) + (1 / 61)  # sum from both lists
-        expected_blended = expected_rrf * 0.5 + 0.9 * 0.5
+        expected_blended = 1.0 * 0.5 + 0.9 * 0.5
         assert a_record["_rrf_score"] == pytest.approx(expected_blended)

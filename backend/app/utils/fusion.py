@@ -51,13 +51,22 @@ def rrf_fuse(
             if uid not in id_to_record:
                 id_to_record[uid] = record
 
-    # Apply recency blending when provided
+    # Apply recency blending when provided.
+    #
+    # Raw RRF scores are tiny (a top hit with k=60 scores ~1/61 ≈ 0.016) while
+    # recency scores span the full [0, 1] range. Blending them directly lets the
+    # recency term — even at a small weight — dominate the relevance signal it is
+    # only meant to break ties on. Normalize each RRF score against the strongest
+    # one in this fusion so both terms live in [0, 1] before weighting; recency
+    # then contributes exactly ``recency_weight`` of the final score.
     if recency_scores and recency_weight > 0.0:
+        max_rrf = max(rrf_scores.values()) if rrf_scores else 0.0
         blended: Dict[str, float] = {}
         for uid, rrf_score in rrf_scores.items():
+            norm_rrf = (rrf_score / max_rrf) if max_rrf > 0.0 else 0.0
             rec_score = recency_scores.get(uid, 0.5)  # neutral for missing
             blended[uid] = (
-                rrf_score * (1.0 - recency_weight) + rec_score * recency_weight
+                norm_rrf * (1.0 - recency_weight) + rec_score * recency_weight
             )
         sorted_uids = sorted(blended.keys(), key=lambda u: blended[u], reverse=True)
         final_scores = blended
