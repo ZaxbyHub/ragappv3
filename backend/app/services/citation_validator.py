@@ -134,11 +134,15 @@ def validate_and_repair_citations(
         return ""
 
     repaired = _CITATION_RE.sub(_replacer, content)
-    # Collapse double spaces introduced by stripped citations.
-    repaired = re.sub(r"  +", " ", repaired)
-    # Drop spaces left before sentence punctuation when a citation was stripped
-    # immediately before it (e.g. "claim . next" -> "claim. next").
-    repaired = re.sub(r"\s+([.,;:!?])", r"\1", repaired)
+    if invalid:
+        # Only tidy whitespace when an invalid citation was actually stripped,
+        # and do it non-destructively. Collapse runs of spaces/tabs only
+        # mid-line (preceded by a non-space char) so leading code indentation is
+        # preserved, and only drop spaces/tabs — never newlines — left before
+        # sentence punctuation. Content with no stripped citations is returned
+        # verbatim (modulo a trailing strip), so code blocks are never mangled.
+        repaired = re.sub(r"(?<=\S)[ \t]{2,}", " ", repaired)
+        repaired = re.sub(r"[ \t]+([.,;:!?])", r"\1", repaired)
     repaired = repaired.strip()
 
     has_evidence = (

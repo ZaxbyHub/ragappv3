@@ -736,6 +736,12 @@ export interface ChatStreamCallbacks {
   onWiki?: (wikiRefs: WikiReference[]) => void;
   onKMS?: (kmsRefs: KMSReference[]) => void;
   onCitationValidation?: (validation: CitationValidationDebug) => void;
+  /**
+   * Canonical, citation-repaired content sent on the `done` event when the
+   * backend stripped invalid citations. Fires before onComplete so the message
+   * content can be reconciled before it is persisted.
+   */
+  onFinalContent?: (content: string) => void;
   /** Resolved chat mode reported by the backend at the start of the stream. */
   onMode?: (mode: "instant" | "thinking") => void;
   onError?: (error: Error) => void;
@@ -1321,6 +1327,11 @@ export async function parseSSEStream(
           }
           if (parsed.citation_validation && typeof parsed.citation_validation === "object") {
             callbacks.onCitationValidation?.(parsed.citation_validation as CitationValidationDebug);
+          }
+          if (typeof parsed.repaired_content === "string") {
+            // Reconcile the message to the citation-clean content before
+            // onComplete persists it (fired only when citations were stripped).
+            callbacks.onFinalContent?.(parsed.repaired_content);
           }
           if (eventType === "done") {
             completeOnce();

@@ -115,11 +115,22 @@ export default function DocumentsPage() {
     };
   }, []);
 
-  // Cleanup pending delete timers on unmount.
+  // Flush pending deletes on unmount. The user already confirmed each delete
+  // (the 3s undo window simply hadn't elapsed); cancelling the timers would
+  // silently discard a confirmed destructive action and the document would
+  // reappear. Instead, execute the deletes best-effort. Fire-and-forget — the
+  // component is unmounting, so there is no toast/refetch to perform.
   useEffect(() => {
+    // Capture the stable ref'd Map instance so the cleanup reads the same one.
+    const timers = pendingDeleteTimersRef.current;
     return () => {
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-      pendingDeleteTimersRef.current.forEach((timer) => clearTimeout(timer));
+      timers.forEach((timer, docId) => {
+        clearTimeout(timer);
+        void deleteDocument(docId).catch(() => {
+          /* best-effort on unmount; nothing to surface */
+        });
+      });
+      timers.clear();
     };
   }, []);
 
@@ -145,6 +156,9 @@ export default function DocumentsPage() {
     wikiStatusMap,
     compilingDocIds,
     handleCompileDocument,
+    total,
+    hasMore,
+    loadMore,
   } = useDocumentPolling({
     activeVaultId,
     search: debouncedSearchQuery,
@@ -687,6 +701,22 @@ export default function DocumentsPage() {
             onDelete={handleDeleteDocument}
             onDownload={handleDownloadDocument}
           />
+          {total > documents.length && (
+            <div className="flex flex-col items-center gap-2 py-4">
+              <p className="text-sm text-muted-foreground">
+                Showing {documents.length} of {total} documents
+              </p>
+              {hasMore && documents.length < 1000 ? (
+                <Button variant="outline" size="sm" onClick={loadMore}>
+                  Load more
+                </Button>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Use search to narrow down the remaining documents.
+                </p>
+              )}
+            </div>
+          )}
         </>
       )}
         </div>

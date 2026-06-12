@@ -314,9 +314,19 @@ def stream_chat_response(
                 "uncited_factual_warning": cv.uncited_factual_warning,
                 "has_evidence": cv.has_evidence,
             }
+            # When invalid citations were stripped, hand the cleaned text to the
+            # client as the canonical content so the hallucinated [S#] chip is
+            # removed from what is displayed-on-completion and persisted. The
+            # raw tokens were already streamed (a brief flicker), but reload and
+            # history now show the repaired content. Only sent when something
+            # actually changed, to avoid needless content swaps on clean answers.
+            repaired_content = (
+                cv.repaired_content if cv.invalid_stripped else None
+            )
         except Exception as cv_exc:  # noqa: BLE001 — defensive
             logger.warning("Citation validation failed: %s", cv_exc)
             citation_validation = None
+            repaired_content = None
 
         # Yield final done event with sources, memories, wiki, and score_type.
         done_payload: Dict[str, Any] = {
@@ -329,6 +339,8 @@ def stream_chat_response(
         }
         if citation_validation is not None:
             done_payload["citation_validation"] = citation_validation
+        if repaired_content is not None:
+            done_payload["repaired_content"] = repaired_content
         yield f"data: {json.dumps(done_payload)}\n\n"
 
         # Enqueue post-answer wiki compile job (non-blocking).

@@ -24,14 +24,20 @@ async function run(events: object[]) {
   const sourcesCalls: unknown[][] = [];
   const memoryCalls: unknown[][] = [];
   const validationCalls: unknown[] = [];
+  const finalContentCalls: string[] = [];
   const errors: string[] = [];
   let completed = false;
+  let finalContentBeforeComplete = false;
 
   const callbacks: ChatStreamCallbacks = {
     onMessage: (c) => contents.push(c),
     onSources: (s) => sourcesCalls.push(s),
     onMemories: (m) => memoryCalls.push(m),
     onCitationValidation: (v) => validationCalls.push(v),
+    onFinalContent: (c) => {
+      finalContentCalls.push(c);
+      if (!completed) finalContentBeforeComplete = true;
+    },
     onError: (e) => errors.push(e.message),
     onComplete: () => {
       completed = true;
@@ -44,6 +50,8 @@ async function run(events: object[]) {
     sourcesCalls,
     memoryCalls,
     validationCalls,
+    finalContentCalls,
+    finalContentBeforeComplete,
     errors,
     completed,
   };
@@ -144,6 +152,33 @@ describe("parseSSEStream — citation_validation", () => {
     const cv = out.validationCalls[0] as { valid: string[]; invalid: string[] };
     expect(cv.invalid).toContain("S99");
     expect(cv.valid).toContain("S1");
+  });
+});
+
+describe("parseSSEStream — repaired_content (#217)", () => {
+  it("forwards repaired_content to onFinalContent before completing", async () => {
+    const out = await run([
+      { type: "content", content: "Claim [S99] here." },
+      {
+        type: "done",
+        sources: [],
+        memories_used: [],
+        score_type: "distance",
+        citation_validation: { valid: [], invalid: ["S99"], uncited_factual_warning: false, has_evidence: true },
+        repaired_content: "Claim here.",
+      },
+    ]);
+    expect(out.finalContentCalls).toEqual(["Claim here."]);
+    expect(out.finalContentBeforeComplete).toBe(true);
+    expect(out.completed).toBe(true);
+  });
+
+  it("does not call onFinalContent when no repaired_content is present", async () => {
+    const out = await run([
+      { type: "content", content: "Clean answer [S1]." },
+      { type: "done", sources: [], memories_used: [], score_type: "distance" },
+    ]);
+    expect(out.finalContentCalls).toEqual([]);
   });
 });
 

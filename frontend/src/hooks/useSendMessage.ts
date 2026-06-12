@@ -161,6 +161,12 @@ export function useSendMessage(
           onMode: (mode) => {
             updateMessage(assistantMessageId, { mode });
           },
+          onFinalContent: (content) => {
+            // Backend stripped invalid citations: adopt the cleaned content so
+            // the hallucinated [S#] chip is removed from the rendered message
+            // and from what onComplete persists.
+            updateMessage(assistantMessageId, { content });
+          },
           onError: (error) => {
             console.error("Chat stream error:", error);
             const isAbort =
