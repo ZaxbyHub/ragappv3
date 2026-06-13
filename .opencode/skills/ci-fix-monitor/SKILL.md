@@ -166,6 +166,11 @@ pushing again — do not stack pushes on un-confirmed CI. If checks stall in
 `queued`, re-fetch status manually and report the stall rather than waiting
 indefinitely.
 
+**CI may not trigger after force-pushes.** If no new check-run appears within
+2 minutes of a force-push, rebase onto latest `origin/master` first — this
+triggers a fresh `pull_request synchronize` event more reliably than close/
+reopen cycles or empty-commit pushes.
+
 For multi-iteration CI fix runs: keep each fix commit SMALL and focused.
 A single-line test update or single-config change is better than a
 multi-file refactor when the goal is to bisect which fix worked. Reviewers

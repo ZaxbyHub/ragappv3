@@ -44,6 +44,34 @@ class TestValidateAndRepair(unittest.TestCase):
         self.assertNotIn("[M5]", result.repaired_content)
         self.assertEqual(result.invalid_citations, ("M5",))
 
+    def test_strip_invalid_collapses_double_space_left_behind(self):
+        # The space pair left where "[S99]" sat is collapsed to one space.
+        result = validate_and_repair_citations(
+            "Real claim [S99] should drop.", source_count=2, memory_count=0
+        )
+        self.assertEqual(result.repaired_content, "Real claim should drop.")
+
+    def test_strip_invalid_preserves_code_indentation(self):
+        # An invalid citation in prose must not collapse indentation of a
+        # following code block (regression for the destructive whitespace pass).
+        content = "See [S99] below:\n    def foo():\n        return 1"
+        result = validate_and_repair_citations(
+            content, source_count=1, memory_count=0
+        )
+        self.assertNotIn("[S99]", result.repaired_content)
+        self.assertIn("\n    def foo():", result.repaired_content)
+        self.assertIn("\n        return 1", result.repaired_content)
+
+    def test_clean_content_with_indentation_unchanged(self):
+        # No invalid citations → content returned verbatim (only outer strip),
+        # so indentation and intentional internal spacing are never mangled.
+        content = "Here is code:\n    x = 1\n        y = 2"
+        result = validate_and_repair_citations(
+            content, source_count=1, memory_count=0
+        )
+        self.assertEqual(result.repaired_content, content)
+        self.assertFalse(result.invalid_stripped)
+
     def test_mixed_valid_and_invalid(self):
         result = validate_and_repair_citations(
             "Good [S1] bad [S99] memory [M1] bad [M9].",

@@ -147,6 +147,87 @@ class TestStreamingSanitizer(unittest.IsolatedAsyncioTestCase):
         out = await self._stream(deltas)
         self.assertEqual(out.strip(), "final answer")
 
+    async def test_mid_content_lhs_substring_does_not_truncate(self):
+        # Regression for issue #227: a bare "_lhs" substring inside a normal
+        # answer (e.g. an identifier like ``expr_lhs`` quoted from a RAG
+        # document) must not be treated as a thinking-block open marker.
+        # The legacy Qwen _lhs/_rhs pattern is only valid as a *prefix* of
+        # the model response.
+        deltas = [
+            _delta_chunk(content="Here is the expr_lhs = 42; result follows."),
+        ]
+        out = await self._stream(deltas)
+        self.assertEqual(out.strip(), "Here is the expr_lhs = 42; result follows.")
+        self.assertNotIn("</think>", out)
+
+    async def test_mid_content_thinking_process_substring_does_not_truncate(self):
+        # Regression for issue #227: a bare "Thinking Process:" substring
+        # appearing mid-answer (e.g. quoted from a document) must not be
+        # treated as a thinking-block open marker. The qwen3.5-122b style
+        # "Thinking Process:" prefix is only valid at the start of the
+        # model response.
+        deltas = [
+            _delta_chunk(
+                content=(
+                    "Sure. The relevant section is titled "
+                    "\"Thinking Process: a primer\" and the answer is 7."
+                )
+            ),
+        ]
+        out = await self._stream(deltas)
+        self.assertIn("Thinking Process: a primer", out)
+        self.assertIn("the answer is 7", out)
+        self.assertNotIn("</think>", out)
+
+    async def test_fragmented_mid_content_lhs_does_not_truncate(self):
+        # The bug also reproduces when the dangerous substring is split across
+        # chunks: arriving content "Here is the expr_l" + "hs = 42." must
+        # not be treated as a thinking-open. (Note: the streaming code is
+        # expected to hold the buffer until a non-marker char arrives, and
+        # then yield the held text as a legitimate answer.)
+        deltas = [
+            _delta_chunk(content="Here is the expr_l"),
+            _delta_chunk(content="hs = 42; result follows."),
+        ]
+        out = await self._stream(deltas)
+        self.assertEqual(
+            out.strip(), "Here is the expr_lhs = 42; result follows."
+        )
+
+    async def test_lhs_rhs_after_preamble_does_not_truncate(self):
+        # Once any non-thinking text has been streamed, a bare "_lhs" / "_rhs"
+        # substring in later deltas is no longer a valid thinking-block
+        # marker. The first delta here is plain prose, the second delta
+        # contains a Qwen-style "_lhs..._rhs" substring as if it were
+        # part of quoted document content.
+        deltas = [
+            _delta_chunk(content="ok then "),
+            _delta_chunk(content="_lhshidden_rhsclean"),
+        ]
+        out = await self._stream(deltas)
+        # The second delta must NOT be swallowed by the thinking filter.
+        self.assertIn("ok then ", out)
+        self.assertIn("_lhshidden_rhsclean", out)
+
+    async def test_lhs_with_leading_whitespace_is_filtered(self):
+        # A whitespace-prefixed "_lhs" at the start of the response is still a
+        # thinking-block marker (Qwen models emit it as the first content), and
+        # must be filtered. The ``lstrip().startswith("_lhs")`` guard handles
+        # this case safely.
+        deltas = [
+            _delta_chunk(content="\n_lhshidden_rhsvisible"),
+        ]
+        out = await self._stream(deltas)
+        self.assertNotIn("hidden", out)
+        self.assertIn("visible", out)
+
+    async def test_unterminated_lhs_block_does_not_leak(self):
+        # Stream ends inside _lhs... with no _rhs — must suppress the thinking
+        # content (same invariant as the <think> unterminated test below).
+        deltas = [_delta_chunk(content="_lhsnever closed")]
+        out = await self._stream(deltas)
+        self.assertEqual(out, "")
+
     async def test_unterminated_think_block_does_not_leak(self):
         # Stream ends inside <think>... — must not yield any thinking text.
         deltas = [_delta_chunk(content="<think>secret never closed")]

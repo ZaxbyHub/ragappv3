@@ -179,6 +179,7 @@ The context pack must include, when available:
 - Pull in relevant `.swarm/evidence/`, `.swarm/state`, `.swarm/knowledge`, or hive/project knowledge entries when present.
 - Historical knowledge may guide candidate generation but cannot confirm a finding by itself.
 - Mark stale, quarantined, or cross-project knowledge as advisory until independently verified in this repo.
+- **Branch-staleness guard**: When the review branch predates recent master commits (e.g., PR #215's test files appeared after the branch was created), explicitly distinguish which diff changes are intentional PR work vs. stale-branch artifacts. Pass the actual fix-commit range (e.g., `sha^..sha`) to explorer context packs rather than `master..HEAD`, otherwise explorers will report files that never existed on the branch as deleted/regressed, generating false-positive CRITICAL findings.
 
 ---
 

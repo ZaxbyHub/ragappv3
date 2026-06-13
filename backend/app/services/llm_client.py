@@ -30,6 +30,10 @@ _THINK_CLOSE_RE = re.compile(r"</think>", re.IGNORECASE)
 # Matches any partial opening sequence — used to decide whether to hold the buffer.
 # Covers: <, <t, <th, <thi, <thin, <think (any case)
 _THINK_PARTIAL_OPEN_RE = re.compile(r"^<[tT]?[hH]?[iI]?[nN]?[kK]?$")
+# Full "Thinking Process:" literal used for the anchored startswith check
+# that distinguishes a real qwen3.5-122b prefix marker from a benign
+# mid-content occurrence (e.g. quoted from a RAG document).
+_THINKING_PROCESS_MARKER = "Thinking Process:"
 
 
 class LLMError(Exception):
@@ -275,7 +279,21 @@ class LLMClient:
         # And two close markers: </think> and _rhs.
         # ``reasoning_content`` deltas are *never* streamed to users; they are
         # treated like any other thinking content and suppressed at the source.
+        #
+        # The ``_in_prefix_region`` flag is True until we yield any
+        # user-visible content. It gates the two bare-substring legacy markers
+        # (``_lhs`` and ``"Thinking Process:"``): these
+        # markers are only valid as a *prefix* of the model response
+        # (Qwen-style models always emit their reasoning up front, before
+        # the actual answer). Once any answer text has been streamed, a
+        # bare ``_lhs`` or ``"Thinking Process:"`` substring appearing in a
+        # later delta is no longer a thinking-block open marker — it is
+        # almost certainly legitimate content (e.g. an identifier like
+        # ``expr_lhs`` or a section title quoted from a RAG document), and
+        # treating it as an open would silently truncate the answer. See
+        # issue #227.
         _thinking_active = False
+        _in_prefix_region = True
         _buffer = ""
         # The bare legacy reasoning markers ("_lhs", "Thinking Process:") are only
         # ever emitted as a prefix to the whole response. Once any real content has
@@ -370,21 +388,21 @@ class LLMClient:
                                         yield pre_think
                                         _content_emitted = True
                                     _thinking_active = True
+                                    _in_prefix_region = False
                                     _buffer = _buffer[think_open_match.end() :]
                                     # Handle inline close in the same buffer
                                     close_match = _THINK_CLOSE_RE.search(_buffer)
                                     if close_match:
                                         _thinking_active = False
                                         _buffer = _buffer[close_match.end() :]
-                                elif _THINK_PARTIAL_OPEN_RE.match(_buffer):
-                                    # Partial "<think" open tag split across chunk
-                                    # boundaries — hold the buffer until the rest
-                                    # of the tag (or divergent content) arrives.
-                                    pass
-                                elif not _content_emitted and _stripped.startswith("_lhs"):
-                                    # Legacy Qwen _lhs/_rhs reasoning marker. Only
-                                    # honored at the very start of the response: a
-                                    # later "_lhs" is genuine answer text.
+                                elif _in_prefix_region and _buffer.lstrip().startswith("_lhs"):
+                                    # Legacy Qwen-style marker. Only valid as a
+                                    # prefix of the model response: once we
+                                    # have streamed any non-thinking answer
+                                    # text, a bare ``_lhs`` substring (e.g.
+                                    # ``expr_lhs``, ``node_lhs``) is just
+                                    # legitimate content and must not be
+                                    # treated as a thinking-block open.
                                     logger.debug(
                                         "Filtering thinking content from model response (_lhs/_rhs pattern)"
                                     )
@@ -393,36 +411,54 @@ class LLMClient:
                                         yield pre_think
                                         _content_emitted = True
                                     _thinking_active = True
+                                    _in_prefix_region = False
                                     _buffer = remainder
                                     if "_rhs" in _buffer:
                                         _, _, after_think = _buffer.partition("_rhs")
                                         _thinking_active = False
                                         _buffer = after_think
-                                elif not _content_emitted and (
-                                    _stripped.startswith("Thinking Process:")
-                                    or "Thinking Process:".startswith(_stripped)
+                                elif _in_prefix_region and (
+                                    _THINKING_PROCESS_MARKER.startswith(_buffer)
+                                    or _buffer.startswith(_THINKING_PROCESS_MARKER)
+                                    or _THINK_PARTIAL_OPEN_RE.match(_buffer)
                                 ):
-                                    # qwen3.5-122b "Thinking Process:" prefix. Only
-                                    # honored before any content is emitted; after
-                                    # that the substring is real answer text.
-                                    if "Thinking Process:" in _buffer:
+                                    # Two related hold-buffer cases, both
+                                    # anchored to the start of the buffer:
+                                    #
+                                    # 1. qwen3.5-122b "Thinking Process:"
+                                    #    prefix — the marker must appear at
+                                    #    the start of the buffer (either as
+                                    #    a full marker or as a partial
+                                    #    prefix still streaming in). A bare
+                                    #    substring match later in the
+                                    #    buffer is treated as legitimate
+                                    #    content. See issue #227.
+                                    #
+                                    # 2. ``<think`` partial prefix — we
+                                    #    hold the buffer while the angle-
+                                    #    bracketed open tag streams in.
+                                    if _THINKING_PROCESS_MARKER in _buffer:
                                         logger.debug(
                                             "Filtering thinking content from model response (Thinking Process pattern)"
                                         )
-                                        pre_marker, _, _ = _buffer.partition("Thinking Process:")
+                                        pre_marker, _, _ = _buffer.partition(
+                                            _THINKING_PROCESS_MARKER
+                                        )
                                         if pre_marker:
                                             yield pre_marker
                                             _content_emitted = True
                                         _thinking_active = True
+                                        _in_prefix_region = False
                                         _buffer = ""
-                                    # else: still accumulating a partial prefix —
-                                    # hold buffer until the full marker arrives or
-                                    # it diverges.
+                                    # else: still accumulating a partial
+                                    # open marker — hold buffer until full
+                                    # marker arrives or it diverges from
+                                    # any prefix.
                                 elif _buffer:
                                     # No opening pattern and no partial-open
                                     # prefix — safe to yield.
                                     yield _buffer
-                                    _content_emitted = True
+                                    _in_prefix_region = False
                                     _buffer = ""
                             else:
                                 # Currently inside a thinking block — look for any
@@ -444,20 +480,27 @@ class LLMClient:
                                 ):
                                     _buffer = _buffer[-256:]
                             # Yield any buffered content when not in thinking
-                            # mode and not holding a partial open marker. The
-                            # "Thinking Process:" prefix is only held before any
-                            # content has been emitted (afterwards it is real text).
+                            # mode and not holding a partial open marker.
+                            # The partial-prefix-holding checks (e.g. for
+                            # ``<think`` or ``Thinking Process:``) only
+                            # apply while we are still in the prefix region
+                            # of the model response; once any non-thinking
+                            # answer text has been streamed, partial
+                            # substrings of those markers are just ordinary
+                            # content and must be yielded. See issue #227.
                             if (
                                 not _thinking_active
                                 and _buffer
                                 and not (
-                                    not _content_emitted
-                                    and "Thinking Process:".startswith(_buffer)
+                                    _in_prefix_region
+                                    and (
+                                        "Thinking Process:".startswith(_buffer)
+                                        or _THINK_PARTIAL_OPEN_RE.match(_buffer)
+                                    )
                                 )
-                                and not _THINK_PARTIAL_OPEN_RE.match(_buffer)
                             ):
                                 yield _buffer
-                                _content_emitted = True
+                                _in_prefix_region = False
                                 _buffer = ""
                     stream_succeeded = True
                 except GeneratorExit:

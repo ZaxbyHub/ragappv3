@@ -519,7 +519,7 @@ def _build_files_fts_query(raw_search: str) -> str:
 async def list_documents(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    per_page: int = Query(50, ge=1, le=200, description="Items per page"),
+    per_page: int = Query(50, ge=1, le=1000, description="Items per page"),
     search: Optional[str] = Query(
         None,
         description="Filter by document name or metadata fields (case-insensitive substring)",

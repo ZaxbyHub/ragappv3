@@ -46,6 +46,14 @@ export function useDocumentPolling({
   const [loading, setLoading] = useState(true);
   const [wikiStatusMap, setWikiStatusMap] = useState<Record<string, DocumentWikiStatus>>({});
   const [compilingDocIds, setCompilingDocIds] = useState<Set<string>>(new Set());
+  // Total documents matching the current query (drives the "load more" control),
+  // and the size of the fetched window. Rather than accumulate discrete pages
+  // (which would fight the status poller that always refetches the window), we
+  // fetch a single window of `pageSize` rows and grow it on demand. The poller
+  // and search/sort refetch the same window, so the list stays consistent.
+  const PAGE_SIZE = 50;
+  const [total, setTotal] = useState(0);
+  const [pageSize, setPageSize] = useState(PAGE_SIZE);
   const pollIntervalMsRef = useRef(2_000);
   const initialLoadDone = useRef(false);
 
@@ -58,14 +66,29 @@ export function useDocumentPolling({
         sortOrder,
         tagId: tagFilterId ?? undefined,
         folderId: folderFilterId ?? undefined,
+        perPage: pageSize,
       });
       setDocuments(response?.documents || []);
+      setTotal(response?.total ?? 0);
     } catch (err) {
       console.error("Failed to fetch documents:", err);
       toast.error(err instanceof Error ? err.message : "Failed to load documents");
       setDocuments([]);
     }
+  }, [activeVaultId, search, sortBy, sortOrder, tagFilterId, folderFilterId, pageSize]);
+
+  // Reset the fetch window to the first page whenever the query changes, so a
+  // new vault/search/sort/filter starts at 50 rows rather than carrying a large
+  // window over. (Capped at the backend per_page max of 1000.)
+  useEffect(() => {
+    setPageSize(PAGE_SIZE);
   }, [activeVaultId, search, sortBy, sortOrder, tagFilterId, folderFilterId]);
+
+  const loadMore = useCallback(() => {
+    setPageSize((prev) => Math.min(prev + PAGE_SIZE, 1000));
+  }, []);
+
+  const hasMore = documents.length < total;
 
   const fetchStats = useCallback(async () => {
     try {
@@ -207,5 +230,8 @@ export function useDocumentPolling({
     wikiStatusMap,
     compilingDocIds,
     handleCompileDocument,
+    total,
+    hasMore,
+    loadMore,
   };
 }

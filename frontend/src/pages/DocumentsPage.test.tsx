@@ -68,14 +68,18 @@ vi.mock('react-dropzone', () => ({
   })),
 }));
 
-// Mock sonner toast
-vi.mock('sonner', () => ({
-  toast: {
+// Mock sonner toast. `toast` is callable (toast("msg", {action,...})) with
+// method shortcuts and dismiss, matching the undo-toast delete path.
+vi.mock('sonner', () => {
+  const toast = Object.assign(vi.fn(), {
     success: vi.fn(),
     error: vi.fn(),
     info: vi.fn(),
-  },
-}));
+    warning: vi.fn(),
+    dismiss: vi.fn(),
+  });
+  return { toast };
+});
 
 // Mock useDebounce hook
 vi.mock('@/hooks/useDebounce', () => ({
@@ -255,7 +259,7 @@ vi.mock('@/components/documents/RejectedFilesBanner', () => ({
 // Import component after mocks
 import DocumentsPage from '@/pages/DocumentsPage';
 import { useVaultStore } from '@/stores/useVaultStore';
-import { getDocumentStats, listDocuments } from '@/lib/api';
+import { getDocumentStats, listDocuments, deleteDocument } from '@/lib/api';
 
 describe('DocumentsPage - Drag to Resize Filename Column', () => {
   let container: HTMLElement;
@@ -1084,6 +1088,77 @@ describe('DocumentsPage - Drag to Resize Filename Column', () => {
         '1 file was rejected'
       );
       expect(screen.getByTestId('rejected-files-item')).toHaveTextContent('c.txt (too large)');
+    });
+  });
+
+  describe('pending delete flush on unmount (#223)', () => {
+    it('executes a confirmed-but-not-yet-elapsed delete when the page unmounts', async () => {
+      vi.mocked(useVaultStore).mockReturnValue({
+        activeVaultId: 2,
+        vaults: [{ id: 2, name: 'Admin Vault', current_user_permission: 'admin' }],
+      } as ReturnType<typeof useVaultStore>);
+
+      let localUnmount: () => void = () => {};
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        localUnmount = result.unmount;
+      });
+
+      // Open the per-row delete confirm and confirm it (starts the 3s undo timer).
+      const deleteButtons = await screen.findAllByLabelText('Delete document');
+      await act(async () => {
+        fireEvent.click(deleteButtons[0]);
+      });
+      const confirmBtn = await screen.findByRole('button', { name: 'Confirm' });
+      await act(async () => {
+        fireEvent.click(confirmBtn);
+      });
+
+      // The real delete is deferred inside the 3s undo window — not called yet.
+      expect(vi.mocked(deleteDocument)).not.toHaveBeenCalled();
+
+      // Unmount within the undo window: the confirmed delete must be flushed,
+      // not silently cancelled.
+      await act(async () => {
+        localUnmount();
+      });
+      expect(vi.mocked(deleteDocument)).toHaveBeenCalledWith('1');
+    });
+  });
+
+  describe('documents pagination (#218)', () => {
+    it('shows a Load more control and fetches a larger window when clicked', async () => {
+      vi.mocked(useVaultStore).mockReturnValue({
+        activeVaultId: 2,
+        vaults: [{ id: 2, name: 'Admin Vault', current_user_permission: 'admin' }],
+      } as ReturnType<typeof useVaultStore>);
+      // 50 of 120 documents returned: more remain on the server.
+      const fiftyDocs = Array.from({ length: 50 }, (_, i) => ({
+        id: String(i + 1),
+        filename: `doc-${i + 1}.pdf`,
+        size: 1024,
+        created_at: '2024-01-01',
+        metadata: { status: 'processed', chunk_count: 1 },
+      }));
+      vi.mocked(listDocuments).mockResolvedValue({ documents: fiftyDocs, total: 120 });
+
+      await act(async () => {
+        render(<DocumentsPage />);
+      });
+
+      expect(await screen.findByText('Showing 50 of 120 documents')).toBeInTheDocument();
+      const loadMore = await screen.findByRole('button', { name: 'Load more' });
+
+      vi.mocked(listDocuments).mockClear();
+      await act(async () => {
+        fireEvent.click(loadMore);
+      });
+      // The next fetch requests a larger window (perPage grew by one page).
+      await waitFor(() => {
+        expect(vi.mocked(listDocuments)).toHaveBeenCalledWith(
+          expect.objectContaining({ perPage: 100 })
+        );
+      });
     });
   });
 });
