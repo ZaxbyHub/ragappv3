@@ -701,12 +701,12 @@ export default function DocumentsPage() {
             onDelete={handleDeleteDocument}
             onDownload={handleDownloadDocument}
           />
-          {total > documents.length && (
+          {total > filteredDocuments.length && (
             <div className="flex flex-col items-center gap-2 py-4">
               <p className="text-sm text-muted-foreground">
-                Showing {documents.length} of {total} documents
+                Showing {filteredDocuments.length} of {total} documents
               </p>
-              {hasMore && documents.length < 1000 ? (
+              {hasMore && filteredDocuments.length < 1000 ? (
                 <Button variant="outline" size="sm" onClick={loadMore}>
                   Load more
                 </Button>

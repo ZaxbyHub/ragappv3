@@ -74,6 +74,7 @@ export function useDocumentPolling({
       console.error("Failed to fetch documents:", err);
       toast.error(err instanceof Error ? err.message : "Failed to load documents");
       setDocuments([]);
+      setTotal(0);
     }
   }, [activeVaultId, search, sortBy, sortOrder, tagFilterId, folderFilterId, pageSize]);
 
