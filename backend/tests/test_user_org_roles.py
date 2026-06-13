@@ -113,6 +113,23 @@ def setup_db(monkeypatch):
         "INSERT INTO organizations (id, name, slug) VALUES (?,?,?)",
         (ORG2_ID, "Org2", "org2"),
     )
+    # Admin must be in both orgs for the caller-org intersection check and
+    # the PF-001 assigned-org validation to pass.
+    conn.execute(
+        "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+        (ORG1_ID, ADMIN_ID, "admin"),
+    )
+    conn.execute(
+        "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+        (ORG2_ID, ADMIN_ID, "admin"),
+    )
+    # Target must share at least one org with the caller for the intersection
+    # check to pass. Use ORG2 (not ORG1) because TestDeleteUserOwnerGuard.test_cannot_delete_org_owner
+    # INSERTs TARGET_ID into ORG1_ID — using ORG2 here avoids a UNIQUE(org_id, user_id) constraint violation.
+    conn.execute(
+        "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+        (ORG2_ID, TARGET_ID, "member"),
+    )
     conn.commit()
     conn.close()
 

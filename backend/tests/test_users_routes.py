@@ -1226,3 +1226,230 @@ class TestGetUserOrganizations(TestUserRoutes):
         )
 
         assert response.status_code == 403
+
+
+class TestUpdateUserOrganizations(TestUserRoutes):
+    """Tests for PUT /users/{user_id}/organizations endpoint.
+
+    Regression coverage for issue #225: a non-superadmin admin must share an
+    org with the target user before reassigning that user's org memberships
+    (parity with the get_user_groups caller-org intersection check).
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_orgs(self):
+        """Seed two organizations; target member starts in org1 only."""
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("Test Org 1", "First test organization"),
+        )
+        self.org1_id = cursor.lastrowid
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("Test Org 2", "Second test organization"),
+        )
+        self.org2_id = cursor.lastrowid
+        # Target member starts in org1; admin and superadmin belong to no org.
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org1_id, self.member_id, "member"),
+        )
+        self.conn.commit()
+        yield
+
+    def _user_org_ids(self, user_id):
+        cursor = self.conn.execute(
+            "SELECT org_id FROM org_members WHERE user_id = ?", (user_id,)
+        )
+        return {row[0] for row in cursor.fetchall()}
+
+    def test_superadmin_can_update_user_organizations(self):
+        """Superadmin bypasses caller-org scoping and can reassign memberships."""
+        token = get_token(self.superadmin_id, "superadmin", "superadmin")
+        response = self.client.put(
+            f"/users/{self.member_id}/organizations",
+            json={
+                "memberships": [
+                    {"org_id": self.org1_id, "role": "member"},
+                    {"org_id": self.org2_id, "role": "admin"},
+                ]
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        orgs = response.json()["organizations"]
+        by_id = {o["id"]: o["role"] for o in orgs}
+        assert by_id == {self.org1_id: "member", self.org2_id: "admin"}
+        assert self._user_org_ids(self.member_id) == {self.org1_id, self.org2_id}
+
+    def test_admin_outside_target_org_rejected_403(self):
+        """Non-superadmin admin who shares no org with the target gets 403."""
+        # Admin belongs to no org; member is only in org1 -> no intersection.
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.put(
+            f"/users/{self.member_id}/organizations",
+            json={"memberships": [{"org_id": self.org2_id, "role": "member"}]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 403
+        assert "outside your organization" in response.json()["detail"]
+        # No mutation occurred: member still in org1 only.
+        assert self._user_org_ids(self.member_id) == {self.org1_id}
+
+    def test_admin_same_org_can_update_user_organizations(self):
+        """Non-superadmin admin sharing an org with the target may reassign."""
+        # Put the admin in org1 so caller and target now overlap.
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org1_id, self.admin_id, "admin"),
+        )
+        self.conn.commit()
+
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.put(
+            f"/users/{self.member_id}/organizations",
+            json={
+                "memberships": [
+                    {"org_id": self.org1_id, "role": "member"},
+                ]
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        orgs = response.json()["organizations"]
+        by_id = {o["id"]: o["role"] for o in orgs}
+        assert by_id == {self.org1_id: "member"}
+        assert self._user_org_ids(self.member_id) == {self.org1_id}
+
+    def test_admin_cannot_assign_to_org_outside_their_scope(self):
+        """Non-superadmin admin cannot assign target to an org the admin
+        does not belong to, even when they share a different org."""
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org1_id, self.admin_id, "admin"),
+        )
+        self.conn.commit()
+
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.put(
+            f"/users/{self.member_id}/organizations",
+            json={
+                "memberships": [
+                    {"org_id": self.org1_id, "role": "member"},
+                    {"org_id": self.org2_id, "role": "member"},
+                ]
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 403
+        assert "not a member of" in response.json()["detail"]
+        assert self._user_org_ids(self.member_id) == {self.org1_id}
+
+
+class TestUserRoutesCsrfParity:
+    """Every mutating /users route must declare csrf_protect (defense-in-depth).
+
+    Regression for issue #225: the two membership PUT routes were the only
+    mutating routes missing the csrf_protect dependency. Auth is carried by the
+    Authorization header, so this is a consistency/defense-in-depth guard, not
+    an active CSRF vector. Asserting the dependency is wired is the most robust
+    way to lock the parity invariant without reconstructing the double-submit
+    cookie/header flow.
+    """
+
+    MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+
+    def _has_csrf(self, route) -> bool:
+        from app.security import csrf_protect
+
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            return False
+        stack = list(dependant.dependencies)
+        while stack:
+            dep = stack.pop()
+            if dep.call is csrf_protect:
+                return True
+            stack.extend(dep.dependencies)
+        return False
+
+    def test_all_mutating_user_routes_have_csrf_protect(self):
+        from app.api.routes import users as users_mod
+
+        missing = []
+        for route in users_mod.router.routes:
+            methods = getattr(route, "methods", None) or set()
+            if methods & self.MUTATING and not self._has_csrf(route):
+                path = getattr(route, "path", "?")
+                missing.append(f"{','.join(sorted(methods & self.MUTATING))} {path}")
+        assert not missing, (
+            "Mutating user routes missing csrf_protect: " + ", ".join(missing)
+        )
+
+
+class TestUpdateUserGroupsCallerOrgCheck(TestUserRoutes):
+    """Regression for PF-002: PUT /users/{id}/groups must enforce caller-org
+    intersection for non-superadmins (parity with get_user_groups and
+    update_user_organizations)."""
+
+    @pytest.fixture(autouse=True)
+    def setup_groups(self):
+        """Seed an org, a group, and a target member in that org."""
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("PF002 Org", "Test org for groups caller-org check"),
+        )
+        self.org_id = cursor.lastrowid
+        cursor = self.conn.execute(
+            "INSERT INTO groups (org_id, name, description) VALUES (?, ?, ?)",
+            (self.org_id, "PF002 Group", "Test group"),
+        )
+        self.group_id = cursor.lastrowid
+        # Target member is in the org so the existing target-org check passes,
+        # but the admin (caller) is NOT in any org -> intersection fails.
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org_id, self.member_id, "member"),
+        )
+        self.conn.commit()
+        yield
+
+    def test_admin_outside_target_org_cannot_update_groups(self):
+        """Non-superadmin admin who shares no org with target gets 403."""
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.put(
+            f"/users/{self.member_id}/groups",
+            json={"group_ids": [self.group_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 403
+        assert "outside your organization" in response.json()["detail"]
+
+    def test_superadmin_can_update_groups_regardless(self):
+        """Superadmin bypasses caller-org scoping."""
+        token = get_token(self.superadmin_id, "superadmin", "superadmin")
+        response = self.client.put(
+            f"/users/{self.member_id}/groups",
+            json={"group_ids": [self.group_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+
+    def test_admin_in_same_org_can_update_groups(self):
+        """Non-superadmin admin who shares an org with target gets 200."""
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org_id, self.admin_id, "member"),
+        )
+        self.conn.commit()
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.put(
+            f"/users/{self.member_id}/groups",
+            json={"group_ids": [self.group_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200

@@ -596,6 +596,7 @@ async def update_user_organizations(
     user_id: int,
     body: UserOrgsUpdateRequest,
     user: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Replace user's organization memberships (admin/superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
@@ -606,6 +607,25 @@ async def update_user_organizations(
         cursor = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="User not found")
+
+        # For non-superadmins, verify caller shares an org with target user
+        # and can only assign orgs they belong to (parity + scope restriction).
+        caller_orgs = None
+        if user.get("role") != "superadmin":
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ?", (user_id,)
+            )
+            target_orgs = {row[0] for row in cursor.fetchall()}
+            caller_id = user.get("id")
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ?", (caller_id,)
+            )
+            caller_orgs = {row[0] for row in cursor.fetchall()}
+            if not target_orgs & caller_orgs:  # intersection
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot update organization memberships of users outside your organization",
+                )
 
         memberships = body.resolved_memberships()
         valid_roles = ("admin", "member")
@@ -627,6 +647,16 @@ async def update_user_organizations(
             missing = set(org_ids) - found
             if missing:
                 raise HTTPException(status_code=400, detail=f"Organizations not found: {sorted(missing)}")
+
+        # Non-superadmins can only assign memberships to orgs they belong to
+        if caller_orgs is not None and memberships:
+            assigned_org_ids = {m.org_id for m in memberships}
+            unauthorized = assigned_org_ids - caller_orgs
+            if unauthorized:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Cannot assign to organizations you are not a member of: {sorted(unauthorized)}",
+                )
 
         try:
             # Delete existing memberships (except owner roles to protect org ownership)
@@ -735,6 +765,7 @@ async def update_user_groups(
     user_id: int,
     body: UserGroupsUpdateRequest,
     user: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
 ):
     """Replace user's group memberships (admin/superadmin only).
 
@@ -749,9 +780,27 @@ async def update_user_groups(
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="User not found")
 
+        # For non-superadmins, verify caller shares an org with target user
+        # (parity with get_user_groups and update_user_organizations).
+        if user.get("role") != "superadmin":
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ?", (user_id,)
+            )
+            target_orgs = {row[0] for row in cursor.fetchall()}
+            caller_id = user.get("id")
+            cursor = conn.execute(
+                "SELECT org_id FROM org_members WHERE user_id = ?", (caller_id,)
+            )
+            caller_orgs = {row[0] for row in cursor.fetchall()}
+            if not target_orgs & caller_orgs:  # intersection
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot update group memberships of users outside your organization",
+                )
+
         # If group_ids is empty, just delete all memberships and return empty list
         if not body.group_ids:
-            cursor.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
+            conn.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
             conn.commit()
             return []
 
