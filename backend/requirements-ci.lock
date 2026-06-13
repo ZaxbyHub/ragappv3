@@ -1,0 +1,126 @@
+aiofiles==25.1.0
+    # via -r requirements-ci.txt
+aioimaplib==2.0.1
+    # via -r requirements-ci.txt
+annotated-doc==0.0.4
+    # via fastapi
+annotated-types==0.7.0
+    # via pydantic
+anyio==4.13.0
+    # via
+    #   httpx
+    #   starlette
+    #   watchfiles
+bcrypt==4.3.0
+    # via
+    #   -r requirements-ci.txt
+    #   passlib
+bleach==6.4.0
+    # via -r requirements-ci.txt
+certifi==2026.5.20
+    # via
+    #   httpcore
+    #   httpx
+cffi==2.0.0
+    # via cryptography
+click==8.4.1
+    # via uvicorn
+cryptography==49.0.0
+    # via -r requirements-ci.txt
+deprecated==1.3.1
+    # via limits
+et-xmlfile==2.0.0
+    # via openpyxl
+fastapi==0.136.3
+    # via -r requirements-ci.txt
+h11==0.16.0
+    # via
+    #   httpcore
+    #   uvicorn
+httpcore==1.0.9
+    # via httpx
+httptools==0.8.0
+    # via uvicorn
+httpx==0.28.1
+    # via -r requirements-ci.txt
+idna==3.18
+    # via
+    #   anyio
+    #   httpx
+limits==5.8.0
+    # via slowapi
+numpy==2.4.6
+    # via
+    #   -r requirements-ci.txt
+    #   pandas
+openpyxl==3.1.5
+    # via -r requirements-ci.txt
+packaging==26.2
+    # via limits
+pandas==3.0.3
+    # via -r requirements-ci.txt
+passlib==1.7.4
+    # via -r requirements-ci.txt
+pycparser==3.0
+    # via cffi
+pydantic==2.13.4
+    # via
+    #   -r requirements-ci.txt
+    #   fastapi
+    #   pydantic-settings
+pydantic-core==2.46.4
+    # via pydantic
+pydantic-settings==2.14.1
+    # via -r requirements-ci.txt
+pyjwt==2.13.0
+    # via -r requirements-ci.txt
+python-dateutil==2.9.0.post0
+    # via pandas
+python-dotenv==1.2.2
+    # via
+    #   pydantic-settings
+    #   uvicorn
+python-magic==0.4.27
+    # via -r requirements-ci.txt
+python-multipart==0.0.32
+    # via -r requirements-ci.txt
+pyyaml==6.0.3
+    # via uvicorn
+rapidfuzz==3.14.5
+    # via -r requirements-ci.txt
+redis==8.0.0
+    # via -r requirements-ci.txt
+six==1.17.0
+    # via python-dateutil
+slowapi==0.1.9
+    # via -r requirements-ci.txt
+starlette==1.3.1
+    # via fastapi
+typing-extensions==4.15.0
+    # via
+    #   anyio
+    #   fastapi
+    #   limits
+    #   pydantic
+    #   pydantic-core
+    #   starlette
+    #   typing-inspection
+typing-inspection==0.4.2
+    # via
+    #   fastapi
+    #   pydantic
+    #   pydantic-settings
+uvicorn==0.49.0
+    # via -r requirements-ci.txt
+uvloop==0.22.1
+    # via uvicorn
+watchfiles==1.2.0
+    # via uvicorn
+webencodings==0.5.1
+    # via bleach
+websockets==16.0
+    # via uvicorn
+wrapt==2.2.1
+    # via deprecated
+xlrd==2.0.2
+    # via -r requirements-ci.txt

@@ -57,9 +57,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies
-COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies (pinned lock file for reproducible builds)
+COPY backend/requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
 # Pre-download the spaCy model used by unstructured's NLP paths. spaCy installs
 # models into root-owned site-packages, so a first-parse runtime download as the

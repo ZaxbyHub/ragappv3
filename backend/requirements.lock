@@ -1,0 +1,620 @@
+accelerate==1.14.0
+    # via unstructured-inference
+aiofiles==25.1.0
+    # via
+    #   -r requirements.txt
+    #   unstructured-client
+aioimaplib==2.0.1
+    # via -r requirements.txt
+annotated-doc==0.0.4
+    # via
+    #   fastapi
+    #   typer
+annotated-types==0.7.0
+    # via pydantic
+anyio==4.13.0
+    # via
+    #   httpx
+    #   starlette
+    #   watchfiles
+bcrypt==4.3.0
+    # via
+    #   -r requirements.txt
+    #   passlib
+beautifulsoup4==4.15.0
+    # via unstructured
+bleach==6.4.0
+    # via -r requirements.txt
+blis==1.3.3
+    # via thinc
+catalogue==2.0.10
+    # via
+    #   spacy
+    #   srsly
+    #   thinc
+certifi==2026.5.20
+    # via
+    #   httpcore
+    #   httpx
+    #   requests
+cffi==2.0.0
+    # via cryptography
+charset-normalizer==3.4.7
+    # via
+    #   pdfminer-six
+    #   requests
+    #   unstructured
+click==8.4.1
+    # via
+    #   huggingface-hub
+    #   python-oxmsg
+    #   typer
+    #   uvicorn
+cloudpathlib==0.24.0
+    # via weasel
+confection==1.3.3
+    # via
+    #   spacy
+    #   thinc
+    #   weasel
+contourpy==1.3.3
+    # via matplotlib
+cryptography==49.0.0
+    # via
+    #   -r requirements.txt
+    #   google-auth
+    #   msoffcrypto-tool
+    #   pdfminer-six
+cuda-bindings==13.3.1
+    # via torch
+cuda-pathfinder==1.5.5
+    # via cuda-bindings
+cuda-toolkit==13.0.2
+    # via torch
+cycler==0.12.1
+    # via matplotlib
+cymem==2.0.13
+    # via
+    #   preshed
+    #   spacy
+    #   thinc
+deprecated==1.3.1
+    # via limits
+deprecation==2.1.0
+    # via lancedb
+emoji==2.15.0
+    # via unstructured
+et-xmlfile==2.0.0
+    # via openpyxl
+fastapi==0.136.3
+    # via -r requirements.txt
+filelock==3.29.3
+    # via
+    #   huggingface-hub
+    #   torch
+    #   unstructured
+filetype==1.2.0
+    # via unstructured
+flatbuffers==25.12.19
+    # via onnxruntime
+fonttools==4.63.0
+    # via matplotlib
+fsspec==2026.4.0
+    # via
+    #   huggingface-hub
+    #   torch
+google-api-core==2.31.0
+    # via google-cloud-vision
+google-auth==2.54.0
+    # via
+    #   google-api-core
+    #   google-cloud-vision
+google-cloud-vision==3.14.0
+    # via unstructured
+googleapis-common-protos==1.75.0
+    # via
+    #   google-api-core
+    #   grpcio-status
+grpcio==1.81.1
+    # via
+    #   google-api-core
+    #   google-cloud-vision
+    #   grpcio-status
+grpcio-status==1.81.1
+    # via google-api-core
+h11==0.16.0
+    # via
+    #   httpcore
+    #   uvicorn
+hf-xet==1.5.1
+    # via huggingface-hub
+html5lib==1.1
+    # via unstructured
+httpcore==1.0.9
+    # via
+    #   httpx
+    #   unstructured-client
+httptools==0.8.0
+    # via uvicorn
+httpx==0.28.1
+    # via
+    #   -r requirements.txt
+    #   huggingface-hub
+    #   unstructured-client
+    #   weasel
+huggingface-hub==1.19.0
+    # via
+    #   accelerate
+    #   sentence-transformers
+    #   timm
+    #   tokenizers
+    #   transformers
+    #   unstructured-inference
+idna==3.18
+    # via
+    #   anyio
+    #   httpx
+    #   requests
+installer==0.7.0
+    # via unstructured
+jinja2==3.1.6
+    # via
+    #   spacy
+    #   torch
+joblib==1.5.3
+    # via scikit-learn
+kiwisolver==1.5.0
+    # via matplotlib
+lance-namespace==0.8.6
+    # via lancedb
+lance-namespace-urllib3-client==0.8.6
+    # via lance-namespace
+lancedb==0.33.0
+    # via -r requirements.txt
+langdetect==1.0.9
+    # via unstructured
+limits==5.8.0
+    # via slowapi
+llvmlite==0.47.0
+    # via numba
+lxml==6.1.1
+    # via
+    #   pikepdf
+    #   python-docx
+    #   python-pptx
+    #   unstructured
+markdown==3.10.2
+    # via unstructured
+markdown-it-py==4.2.0
+    # via rich
+markupsafe==3.0.3
+    # via jinja2
+matplotlib==3.11.0
+    # via unstructured-inference
+mdurl==0.1.2
+    # via markdown-it-py
+ml-dtypes==0.5.4
+    # via onnx
+more-itertools==11.1.0
+    # via openai-whisper
+mpmath==1.3.0
+    # via sympy
+msoffcrypto-tool==6.0.0
+    # via unstructured
+murmurhash==1.0.15
+    # via
+    #   preshed
+    #   spacy
+    #   thinc
+narwhals==2.22.1
+    # via scikit-learn
+networkx==3.6.1
+    # via
+    #   torch
+    #   unstructured
+numba==0.65.1
+    # via
+    #   openai-whisper
+    #   unstructured
+numpy==2.4.6
+    # via
+    #   -r requirements.txt
+    #   accelerate
+    #   blis
+    #   contourpy
+    #   lancedb
+    #   matplotlib
+    #   ml-dtypes
+    #   numba
+    #   onnx
+    #   onnxruntime
+    #   openai-whisper
+    #   opencv-python
+    #   pandas
+    #   scikit-learn
+    #   scipy
+    #   sentence-transformers
+    #   spacy
+    #   thinc
+    #   torchvision
+    #   transformers
+    #   unstructured
+    #   unstructured-inference
+nvidia-cublas==13.1.1.3
+    # via
+    #   nvidia-cudnn-cu13
+    #   nvidia-cusolver
+    #   torch
+nvidia-cuda-cupti==13.0.85
+    # via cuda-toolkit
+nvidia-cuda-nvrtc==13.0.88
+    # via
+    #   cuda-toolkit
+    #   nvidia-cublas
+nvidia-cuda-runtime==13.0.96
+    # via cuda-toolkit
+nvidia-cudnn-cu13==9.20.0.48
+    # via torch
+nvidia-cufft==12.0.0.61
+    # via cuda-toolkit
+nvidia-cufile==1.15.1.6
+    # via cuda-toolkit
+nvidia-curand==10.4.0.35
+    # via cuda-toolkit
+nvidia-cusolver==12.0.4.66
+    # via cuda-toolkit
+nvidia-cusparse==12.6.3.3
+    # via
+    #   cuda-toolkit
+    #   nvidia-cusolver
+nvidia-cusparselt-cu13==0.8.1
+    # via torch
+nvidia-nccl-cu13==2.29.7
+    # via torch
+nvidia-nvjitlink==13.0.88
+    # via
+    #   cuda-toolkit
+    #   nvidia-cufft
+    #   nvidia-cusolver
+    #   nvidia-cusparse
+nvidia-nvshmem-cu13==3.4.5
+    # via torch
+nvidia-nvtx==13.0.85
+    # via cuda-toolkit
+olefile==0.47
+    # via
+    #   msoffcrypto-tool
+    #   python-oxmsg
+onnx==1.21.0
+    # via unstructured-inference
+onnxruntime==1.26.0
+    # via unstructured-inference
+openai-whisper==20250625
+    # via unstructured
+opencv-python==4.13.0.92
+    # via unstructured-inference
+openpyxl==3.1.5
+    # via
+    #   -r requirements.txt
+    #   unstructured
+overrides==7.7.0
+    # via lancedb
+packaging==26.2
+    # via
+    #   accelerate
+    #   deprecation
+    #   huggingface-hub
+    #   lancedb
+    #   limits
+    #   matplotlib
+    #   onnxruntime
+    #   pikepdf
+    #   spacy
+    #   thinc
+    #   transformers
+    #   unstructured-pytesseract
+    #   weasel
+pandas==2.3.3
+    # via
+    #   -r requirements.txt
+    #   unstructured
+    #   unstructured-inference
+passlib==1.7.4
+    # via -r requirements.txt
+pdf2image==1.17.0
+    # via unstructured
+pdfminer-six==20260107
+    # via
+    #   unstructured
+    #   unstructured-inference
+pi-heif==1.4.0
+    # via unstructured
+pikepdf==10.8.0
+    # via unstructured
+pillow==12.2.0
+    # via
+    #   matplotlib
+    #   pdf2image
+    #   pi-heif
+    #   pikepdf
+    #   python-pptx
+    #   torchvision
+    #   unstructured-pytesseract
+preshed==3.0.13
+    # via
+    #   spacy
+    #   thinc
+proto-plus==1.28.0
+    # via
+    #   google-api-core
+    #   google-cloud-vision
+protobuf==7.35.1
+    # via
+    #   google-api-core
+    #   google-cloud-vision
+    #   googleapis-common-protos
+    #   grpcio-status
+    #   onnx
+    #   onnxruntime
+    #   proto-plus
+psutil==7.2.2
+    # via
+    #   accelerate
+    #   unstructured
+pyarrow==24.0.0
+    # via
+    #   -r requirements.txt
+    #   lancedb
+pyasn1==0.6.3
+    # via pyasn1-modules
+pyasn1-modules==0.4.2
+    # via google-auth
+pycparser==3.0
+    # via cffi
+pydantic==2.13.4
+    # via
+    #   -r requirements.txt
+    #   fastapi
+    #   lance-namespace-urllib3-client
+    #   lancedb
+    #   pydantic-settings
+    #   spacy
+    #   thinc
+    #   unstructured-client
+    #   weasel
+pydantic-core==2.46.4
+    # via pydantic
+pydantic-settings==2.14.1
+    # via -r requirements.txt
+pygments==2.20.0
+    # via rich
+pyjwt==2.13.0
+    # via -r requirements.txt
+pypandoc-binary==1.17
+    # via unstructured
+pyparsing==3.3.2
+    # via matplotlib
+pypdf==6.13.2
+    # via
+    #   unstructured
+    #   unstructured-client
+pypdfium2==5.9.0
+    # via
+    #   unstructured-client
+    #   unstructured-inference
+python-dateutil==2.9.0.post0
+    # via
+    #   lance-namespace-urllib3-client
+    #   matplotlib
+    #   pandas
+python-docx==1.2.0
+    # via unstructured
+python-dotenv==1.2.2
+    # via
+    #   pydantic-settings
+    #   uvicorn
+python-iso639==2026.4.20
+    # via unstructured
+python-magic==0.4.27
+    # via
+    #   -r requirements.txt
+    #   unstructured
+python-multipart==0.0.32
+    # via -r requirements.txt
+python-oxmsg==0.0.2
+    # via unstructured
+python-pptx==1.0.2
+    # via unstructured
+pytz==2026.2
+    # via pandas
+pyyaml==6.0.3
+    # via
+    #   accelerate
+    #   huggingface-hub
+    #   timm
+    #   transformers
+    #   uvicorn
+rapidfuzz==3.14.5
+    # via
+    #   -r requirements.txt
+    #   unstructured
+    #   unstructured-inference
+redis==8.0.0
+    # via -r requirements.txt
+regex==2026.5.9
+    # via
+    #   tiktoken
+    #   transformers
+    #   unstructured
+requests==2.34.2
+    # via
+    #   google-api-core
+    #   requests-toolbelt
+    #   spacy
+    #   tiktoken
+    #   unstructured
+requests-toolbelt==1.0.0
+    # via unstructured-client
+rich==15.0.0
+    # via typer
+safetensors==0.8.0
+    # via
+    #   accelerate
+    #   timm
+    #   transformers
+scikit-learn==1.9.0
+    # via sentence-transformers
+scipy==1.17.1
+    # via
+    #   scikit-learn
+    #   sentence-transformers
+    #   unstructured-inference
+sentence-transformers==5.5.1
+    # via -r requirements.txt
+shellingham==1.5.4
+    # via typer
+six==1.17.0
+    # via
+    #   html5lib
+    #   langdetect
+    #   python-dateutil
+slowapi==0.1.9
+    # via -r requirements.txt
+smart-open==7.6.1
+    # via weasel
+soupsieve==2.8.4
+    # via beautifulsoup4
+spacy==3.8.14
+    # via unstructured
+spacy-legacy==3.0.12
+    # via spacy
+spacy-loggers==1.0.5
+    # via spacy
+srsly==2.5.3
+    # via
+    #   spacy
+    #   thinc
+    #   weasel
+starlette==1.3.1
+    # via fastapi
+sympy==1.14.0
+    # via torch
+thinc==8.3.13
+    # via spacy
+threadpoolctl==3.6.0
+    # via scikit-learn
+tiktoken==0.13.0
+    # via openai-whisper
+timm==1.0.27
+    # via unstructured-inference
+tokenizers==0.22.2
+    # via transformers
+torch==2.12.0
+    # via
+    #   accelerate
+    #   openai-whisper
+    #   sentence-transformers
+    #   timm
+    #   torchvision
+    #   unstructured-inference
+torchvision==0.27.0
+    # via timm
+tqdm==4.68.2
+    # via
+    #   huggingface-hub
+    #   lancedb
+    #   openai-whisper
+    #   sentence-transformers
+    #   spacy
+    #   transformers
+    #   unstructured
+transformers==5.12.0
+    # via
+    #   sentence-transformers
+    #   unstructured-inference
+triton==3.7.0
+    # via
+    #   openai-whisper
+    #   torch
+typer==0.25.1
+    # via
+    #   huggingface-hub
+    #   spacy
+    #   transformers
+    #   weasel
+typing-extensions==4.15.0
+    # via
+    #   anyio
+    #   beautifulsoup4
+    #   fastapi
+    #   grpcio
+    #   huggingface-hub
+    #   lance-namespace-urllib3-client
+    #   limits
+    #   onnx
+    #   pydantic
+    #   pydantic-core
+    #   python-docx
+    #   python-oxmsg
+    #   python-pptx
+    #   sentence-transformers
+    #   starlette
+    #   torch
+    #   typing-inspection
+    #   unstructured
+typing-inspection==0.4.2
+    # via
+    #   fastapi
+    #   pydantic
+    #   pydantic-settings
+tzdata==2026.2
+    # via pandas
+unstructured==0.23.1
+    # via -r requirements.txt
+unstructured-client==0.45.0
+    # via unstructured
+unstructured-inference==1.6.13
+    # via unstructured
+unstructured-pytesseract==0.3.15
+    # via unstructured
+urllib3==2.7.0
+    # via
+    #   lance-namespace-urllib3-client
+    #   requests
+uvicorn==0.49.0
+    # via -r requirements.txt
+uvloop==0.22.1
+    # via uvicorn
+wasabi==1.1.3
+    # via
+    #   spacy
+    #   thinc
+    #   weasel
+watchfiles==1.2.0
+    # via uvicorn
+weasel==1.0.0
+    # via spacy
+webencodings==0.5.1
+    # via
+    #   bleach
+    #   html5lib
+websockets==16.0
+    # via uvicorn
+wrapt==2.2.1
+    # via
+    #   deprecated
+    #   smart-open
+    #   unstructured
+xlrd==2.0.2
+    # via
+    #   -r requirements.txt
+    #   unstructured
+xlsxwriter==3.2.9
+    # via python-pptx
+
+# The following packages are considered to be unsafe in a requirements file:
+setuptools==81.0.0
+    # via
+    #   spacy
+    #   thinc
+    #   torch
