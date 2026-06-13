@@ -714,6 +714,7 @@ CREATE TABLE IF NOT EXISTS vector_delete_pending (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     attempts INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS idx_vector_delete_pending_file_id ON vector_delete_pending(file_id);
 -- NOTE: the idx_files_folder_id index is created by migrate_add_folders(), not
 -- here. The files table's executescript path also runs against pre-existing
 -- (legacy) databases where files.folder_id may not exist yet; indexing it here
@@ -2106,6 +2107,10 @@ def migrate_add_vector_delete_pending(sqlite_path: str) -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 attempts INTEGER NOT NULL DEFAULT 0
             )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_vector_delete_pending_file_id
+            ON vector_delete_pending(file_id)
         """)
         conn.commit()
     finally:
