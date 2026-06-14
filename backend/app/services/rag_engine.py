@@ -404,8 +404,19 @@ class RAGEngine:
         stream: bool = False,
         vault_id: Optional[int] = None,
         mode: Optional[ChatMode] = None,
+        require_vault: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Execute a RAG query: embed, search, build prompt, call LLM."""
+        """Execute a RAG query: embed, search, build prompt, call LLM.
+
+        Args:
+            require_vault: When True, raise ValueError if vault_id is None.
+                Callers that serve authenticated user contexts should set this
+                to prevent cross-vault data leakage via an unscoped query.
+        """
+        if require_vault and vault_id is None:
+            raise ValueError(
+                "vault_id is required when require_vault=True"
+            )
         logger.info(
             "[query] START: user_input_len=%d, vault_id=%s, stream=%s",
             len(user_input),
@@ -554,6 +565,13 @@ class RAGEngine:
                     logger.error(
                         "Query embedding failure for original query: %s", result
                     )
+                    if stream:
+                        yield {
+                            "type": "error",
+                            "message": f"Original query embedding failed: {result}",
+                            "code": "EMBEDDING_ERROR",
+                        }
+                        return
                     raise RAGEngineError(f"Original query embedding failed: {result}")
                 logger.warning(
                     "Query embedding failure for variant '%s': %s", variant_type, result
@@ -562,6 +580,13 @@ class RAGEngine:
             elif isinstance(result, BaseException):
                 if variant_type == 'original':
                     logger.error("Query embedding failure for original query: %s", result)
+                    if stream:
+                        yield {
+                            "type": "error",
+                            "message": f"Original query embedding failed: {result}",
+                            "code": "EMBEDDING_ERROR",
+                        }
+                        return
                     raise RAGEngineError(f"Original query embedding failed: {result}")
                 variants_dropped.append(variant_type)
             else:
@@ -1408,7 +1433,13 @@ class RAGEngine:
             max_tokens: Max output tokens for the model.
 
         Yields:
-            Response chunks as dictionaries
+            Response chunks as dictionaries.
+
+        Error Contract:
+            When the LLM raises LLMError during streaming, this method yields
+            an error dict ``{'type': 'error', 'message': str(exc), 'code': 'LLM_ERROR'}``
+            instead of raising. The generator completes normally after the error chunk.
+            This prevents mid-stream exceptions from killing the SSE connection.
         """
         target = client or self.llm_client
         try:
@@ -1435,7 +1466,9 @@ class RAGEngine:
             Response content dictionary
 
         Raises:
-            RAGEngineError: If LLM call fails
+            RAGEngineError: If the LLM call fails with LLMError. Unlike
+                _stream_llm_response which yields error dicts, this method
+                propagates failures as exceptions to the caller.
         """
         target = client or self.llm_client
         try:

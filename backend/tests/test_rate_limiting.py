@@ -25,6 +25,8 @@ MEMORIES_PY = os.path.join(os.path.dirname(__file__), "..", "app", "api", "route
 CONFIG_PY = os.path.join(os.path.dirname(__file__), "..", "app", "config.py")
 LIMITER_PY = os.path.join(os.path.dirname(__file__), "..", "app", "limiter.py")
 
+from app.limiter import get_client_ip
+
 
 def _read_file(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -593,6 +595,253 @@ class TestNoRateLimitOnReadOnlyEndpoints(unittest.TestCase):
             match,
             "GET /chat/sessions should NOT have @limiter.limit decorator immediately before it",
         )
+
+    def test_chat_session_get_no_rate_limit(self):
+        """GET /chat/sessions/{session_id} should NOT have rate limiting (read-only)."""
+        src = _read_file(CHAT_PY)
+        pattern = (
+            r"@router\.get\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, src)
+        self.assertIsNone(
+            match,
+            "GET /chat/sessions/{session_id} should NOT have @limiter.limit decorator immediately before it",
+        )
+
+
+class TestMutatingSessionEndpointsRateLimited(unittest.TestCase):
+    """Verify all mutating session endpoints have rate limiting decorators.
+
+    The 6 mutating session endpoints that must be rate-limited:
+    1. POST /chat/sessions                        - create_session
+    2. POST /chat/sessions/{session_id}/fork      - fork_session
+    3. POST /chat/sessions/{session_id}/messages  - add_message
+    4. PATCH /.../messages/{message_id}/feedback  - set_message_feedback
+    5. PUT /chat/sessions/{session_id}            - update_session
+    6. DELETE /chat/sessions/{session_id}         - delete_session
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read_file(CHAT_PY)
+
+    def test_create_session_has_rate_limit(self):
+        """POST /chat/sessions must have @limiter.limit decorator."""
+        pattern = (
+            r"@router\.post\s*\(\s*[\"']\/chat\/sessions[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "POST /chat/sessions must have @limiter.limit decorator",
+        )
+
+    def test_create_session_uses_settings(self):
+        """POST /chat/sessions must use settings.chat_rate_limit."""
+        pattern = (
+            r"@router\.post\s*\(\s*[\"']\/chat\/sessions[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\(\s*settings\.chat_rate_limit\s*\)"
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "POST /chat/sessions must use @limiter.limit(settings.chat_rate_limit)",
+        )
+
+    def test_fork_session_has_rate_limit(self):
+        """POST /chat/sessions/{session_id}/fork must have @limiter.limit decorator."""
+        pattern = (
+            r"@router\.post\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}\/fork[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "POST /chat/sessions/{session_id}/fork must have @limiter.limit decorator",
+        )
+
+    def test_fork_session_uses_settings(self):
+        """POST /chat/sessions/{session_id}/fork must use settings.chat_rate_limit."""
+        pattern = (
+            r"@router\.post\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}\/fork[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\(\s*settings\.chat_rate_limit\s*\)"
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "POST /chat/sessions/{session_id}/fork must use @limiter.limit(settings.chat_rate_limit)",
+        )
+
+    def test_add_message_has_rate_limit(self):
+        """POST /chat/sessions/{session_id}/messages must have @limiter.limit decorator."""
+        pattern = (
+            r"@router\.post\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}\/messages[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "POST /chat/sessions/{session_id}/messages must have @limiter.limit decorator",
+        )
+
+    def test_add_message_uses_settings(self):
+        """POST /chat/sessions/{session_id}/messages must use settings.chat_rate_limit."""
+        pattern = (
+            r"@router\.post\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}\/messages[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\(\s*settings\.chat_rate_limit\s*\)"
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "POST /chat/sessions/{session_id}/messages must use @limiter.limit(settings.chat_rate_limit)",
+        )
+
+    def test_set_message_feedback_has_rate_limit(self):
+        """PATCH /chat/sessions/{session_id}/messages/{message_id}/feedback must have @limiter.limit."""
+        pattern = (
+            r"@router\.patch\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}\/messages\/\{message_id\}\/feedback[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "PATCH /chat/sessions/{session_id}/messages/{message_id}/feedback must have @limiter.limit decorator",
+        )
+
+    def test_set_message_feedback_uses_settings(self):
+        """PATCH /chat/sessions/{session_id}/messages/{message_id}/feedback must use settings.chat_rate_limit."""
+        pattern = (
+            r"@router\.patch\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}\/messages\/\{message_id\}\/feedback[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\(\s*settings\.chat_rate_limit\s*\)"
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "PATCH /chat/sessions/{session_id}/messages/{message_id}/feedback must use @limiter.limit(settings.chat_rate_limit)",
+        )
+
+    def test_update_session_has_rate_limit(self):
+        """PUT /chat/sessions/{session_id} must have @limiter.limit decorator."""
+        pattern = (
+            r"@router\.put\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "PUT /chat/sessions/{session_id} must have @limiter.limit decorator",
+        )
+
+    def test_update_session_uses_settings(self):
+        """PUT /chat/sessions/{session_id} must use settings.chat_rate_limit."""
+        pattern = (
+            r"@router\.put\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\(\s*settings\.chat_rate_limit\s*\)"
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "PUT /chat/sessions/{session_id} must use @limiter.limit(settings.chat_rate_limit)",
+        )
+
+    def test_delete_session_has_rate_limit(self):
+        """DELETE /chat/sessions/{session_id} must have @limiter.limit decorator."""
+        pattern = (
+            r"@router\.delete\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "DELETE /chat/sessions/{session_id} must have @limiter.limit decorator",
+        )
+
+    def test_delete_session_uses_settings(self):
+        """DELETE /chat/sessions/{session_id} must use settings.chat_rate_limit."""
+        pattern = (
+            r"@router\.delete\s*\(\s*[\"']\/chat\/sessions\/\{session_id\}[\"']"
+            r"[^\n]*\n\s*"
+            r"@limiter\.limit\s*\(\s*settings\.chat_rate_limit\s*\)"
+        )
+        match = re.search(pattern, self.src)
+        self.assertIsNotNone(
+            match,
+            "DELETE /chat/sessions/{session_id} must use @limiter.limit(settings.chat_rate_limit)",
+        )
+
+
+class TestTrustProxyHeaders(unittest.TestCase):
+    """Verify trust_proxy_headers config controls X-Forwarded-For trust behavior."""
+
+    def test_default_does_not_trust_proxy_headers(self):
+        """When trust_proxy_headers is False, get_client_ip should use direct client IP."""
+        mock_request = MagicMock()
+        mock_request.client.host = "127.0.0.1"
+        mock_request.headers = {"X-Forwarded-For": "1.2.3.4"}
+        with patch("app.limiter.settings") as mock_settings:
+            mock_settings.trust_proxy_headers = False
+            client_ip = get_client_ip(mock_request)
+        self.assertEqual(client_ip, "127.0.0.1")
+
+    def test_trust_proxy_headers_true_uses_forwarded(self):
+        """When trust_proxy_headers is True, get_client_ip should use X-Forwarded-For."""
+        mock_request = MagicMock()
+        mock_request.client.host = "127.0.0.1"
+        mock_request.headers = {"X-Forwarded-For": "1.2.3.4"}
+        with patch("app.limiter.settings") as mock_settings:
+            mock_settings.trust_proxy_headers = True
+            client_ip = get_client_ip(mock_request)
+        self.assertEqual(client_ip, "1.2.3.4")
+
+    def test_null_client_falls_back_to_remote_address(self):
+        """When request.client is None, get_client_ip should not crash."""
+        mock_request = MagicMock()
+        mock_request.client = None
+        mock_request.headers = {}
+        with patch("app.limiter.settings") as mock_settings:
+            mock_settings.trust_proxy_headers = False
+            client_ip = get_client_ip(mock_request)
+        # Should return a string, not crash
+        self.assertIsInstance(client_ip, str)
+
+    def test_empty_first_entry_xff_falls_through_to_direct_ip(self):
+        """When X-Forwarded-For has empty first entry, get_client_ip falls through to request.client.host.
+
+        Malformed X-Forwarded-For like " , proxy1" splits to ["", " proxy1"];
+        the empty first entry should NOT be returned as the client IP.
+        Instead the function falls through to use request.client.host.
+        """
+        mock_request = MagicMock()
+        mock_request.client.host = "192.168.1.100"
+        mock_request.headers = {"X-Forwarded-For": " , proxy1"}
+        with patch("app.limiter.settings") as mock_settings:
+            mock_settings.trust_proxy_headers = True
+            client_ip = get_client_ip(mock_request)
+        self.assertEqual(client_ip, "192.168.1.100")
+
+    def test_whitespace_only_first_entry_xff_falls_through(self):
+        """When X-Forwarded-For first entry is whitespace-only, falls through to direct IP."""
+        mock_request = MagicMock()
+        mock_request.client.host = "10.0.0.5"
+        mock_request.headers = {"X-Forwarded-For": "   , proxy2"}
+        with patch("app.limiter.settings") as mock_settings:
+            mock_settings.trust_proxy_headers = True
+            client_ip = get_client_ip(mock_request)
+        self.assertEqual(client_ip, "10.0.0.5")
 
 
 if __name__ == "__main__":

@@ -212,6 +212,7 @@ def stream_chat_response(
     vault_id: Optional[int] = None,
     mode: Optional[ChatMode] = None,
     user_id: Optional[int] = None,
+    require_vault: bool = False,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
@@ -259,7 +260,8 @@ def stream_chat_response(
 
         try:
             async for chunk in rag_engine.query(
-                message, history, stream=True, vault_id=vault_id, mode=mode
+                message, history, stream=True, vault_id=vault_id, mode=mode,
+                require_vault=require_vault,
             ):
                 chunk_type = chunk.get("type")
 
@@ -268,7 +270,8 @@ def stream_chat_response(
                     collected_content.append(content)
                     yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
                 elif chunk_type == "error":
-                    yield f"data: {json.dumps({'type': 'error', 'message': chunk.get('message', 'Chat stream failed'), 'code': chunk.get('code', 'UNKNOWN_ERROR')})}\n\n"
+                    logger.warning("Streaming error chunk received from RAG engine: %s", chunk.get('message', 'unknown'))
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Chat stream failed', 'code': chunk.get('code', 'UNKNOWN_ERROR')})}\n\n"
                     yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
                     return
                 elif chunk_type == "fallback":
@@ -283,7 +286,7 @@ def stream_chat_response(
                     kms_used = chunk.get("kms_used", [])
                     score_type = chunk.get("score_type", score_type)
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Chat stream failed: user_id=%s, vault_id=%s, mode=%s, "
                 "message_len=%d, history_len=%d, exception=%s, error=%s",
                 user_id,
@@ -293,10 +296,9 @@ def stream_chat_response(
                 len(history),
                 type(e).__name__,
                 str(e),
-                exc_info=True,
             )
-            # Include exception type so users can report actionable errors
-            error_msg = f"Chat failed ({type(e).__name__}): {str(e)[:200]}"
+            # Send safe generic message to client; full details already logged above
+            error_msg = "An error occurred during chat processing"
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'INTERNAL_ERROR'})}\n\n"
             return
 
@@ -371,6 +373,7 @@ async def non_stream_chat_response(
     rag_engine: Optional[RAGEngine],
     vault_id: Optional[int] = None,
     mode: Optional[ChatMode] = None,
+    require_vault: bool = False,
 ) -> ChatResponse:
     """
     Generate a non-streaming chat response.
@@ -395,7 +398,8 @@ async def non_stream_chat_response(
 
     try:
         async for chunk in rag_engine.query(
-            message, history, stream=False, vault_id=vault_id, mode=mode
+            message, history, stream=False, vault_id=vault_id, mode=mode,
+            require_vault=require_vault,
         ):
             chunk_type = chunk.get("type")
             logger.debug(
@@ -411,7 +415,11 @@ async def non_stream_chat_response(
                 kms_used = chunk.get("kms_used", [])
                 score_type = chunk.get("score_type", score_type)
     except RAGEngineError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        logger.warning("RAG engine error in non_stream_chat_response: %s", exc)
+        raise HTTPException(status_code=503, detail="Chat processing failed")
+    except ValueError as exc:
+        logger.warning("ValueError in non_stream_chat_response: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid request parameters")
 
     logger.info(
         "[non_stream_chat_response] Final: sources_count=%d, memories_used_count=%d, wiki_used_count=%d",
@@ -515,6 +523,7 @@ async def chat(
                 status_code=403,
                 detail="Searching all vaults requires admin access. Please select a specific vault.",
             )
+    require_vault = user.get("role") not in ("superadmin", "admin")
     effective_mode = ChatMode(body.mode) if body.mode else None
     try:
         return await non_stream_chat_response(
@@ -523,6 +532,7 @@ async def chat(
             rag_engine,
             vault_id=body.vault_id,
             mode=effective_mode,
+            require_vault=require_vault,
         )
     except Exception:
         logger.exception("[chat] UNHANDLED EXCEPTION during chat processing")
@@ -563,7 +573,7 @@ async def chat_stream(
                 status_code=403,
                 detail="Searching all vaults requires admin access. Please select a specific vault.",
             )
-
+    require_vault = user.get("role") not in ("superadmin", "admin")
     history = [msg.model_dump(exclude_none=True) for msg in body.messages[:-1]]
     effective_mode = ChatMode(body.mode) if body.mode else None
     return stream_chat_response(
@@ -573,6 +583,7 @@ async def chat_stream(
         vault_id=body.vault_id,
         mode=effective_mode,
         user_id=user.get("id"),
+        require_vault=require_vault,
     )
 
 
@@ -838,8 +849,10 @@ async def get_session(
 
 
 @router.post("/chat/sessions")
+@limiter.limit(settings.chat_rate_limit)
 async def create_session(
-    request: CreateSessionRequest,
+    request: Request,
+    body: CreateSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
@@ -849,12 +862,12 @@ async def create_session(
 
     Returns the created session with its ID.
     """
-    if not await evaluate_policy(user, "vault", request.vault_id, "write"):
+    if not await evaluate_policy(user, "vault", body.vault_id, "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     query = "INSERT INTO chat_sessions (vault_id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     cursor = await asyncio.to_thread(
-        conn.execute, query, (request.vault_id, user["id"], request.title)
+        conn.execute, query, (body.vault_id, user["id"], body.title)
     )
     await asyncio.to_thread(conn.commit)
 
@@ -875,11 +888,12 @@ async def create_session(
         "updated_at": row[4],
     }
 
-
 @router.post("/chat/sessions/{session_id}/fork")
+@limiter.limit(settings.chat_rate_limit)
 async def fork_session(
+    request: Request,
     session_id: int,
-    request: ForkSessionRequest,
+    body: ForkSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
@@ -938,12 +952,13 @@ async def fork_session(
             (session_id,),
         )
     all_rows = await asyncio.to_thread(messages_result.fetchall)
-    if request.message_index >= len(all_rows):
+
+    if body.message_index >= len(all_rows):
         raise HTTPException(
             status_code=400,
-            detail=f"message_index {request.message_index} is out of bounds for session with {len(all_rows)} messages",
+            detail=f"message_index {body.message_index} is out of bounds for session with {len(all_rows)} messages",
         )
-    forked_rows = all_rows[: request.message_index + 1]
+    forked_rows = all_rows[: body.message_index + 1]
 
     # Side-fetch the original session's mode values in the same row order
     # so they can be re-applied to the copied rows without bifurcating the
@@ -956,7 +971,7 @@ async def fork_session(
             (session_id,),
         )
         source_mode_rows = await asyncio.to_thread(source_mode_result.fetchall)
-        source_modes = [r[0] for r in source_mode_rows[: request.message_index + 1]]
+        source_modes = [r[0] for r in source_mode_rows[: body.message_index + 1]]
 
     # Side-fetch source kms_refs in row order so they can be re-applied to the
     # copied rows without bifurcating the INSERT branches below.
@@ -968,7 +983,7 @@ async def fork_session(
             (session_id,),
         )
         source_kms_rows = await asyncio.to_thread(source_kms_result.fetchall)
-        source_kms_refs = [r[0] for r in source_kms_rows[: request.message_index + 1]]
+        source_kms_refs = [r[0] for r in source_kms_rows[: body.message_index + 1]]
 
     # Create new forked session and copy messages atomically.
     fork_title = f"Branch of {session_row[2] or 'conversation'}"
@@ -977,7 +992,7 @@ async def fork_session(
         cursor = await asyncio.to_thread(
             conn.execute,
             "INSERT INTO chat_sessions (vault_id, user_id, title, forked_from_session_id, fork_message_index, created_at, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-            (vault_id, user["id"], fork_title, session_id, request.message_index),
+            (vault_id, user["id"], fork_title, session_id, body.message_index),
         )
         new_session_id = cursor.lastrowid
 
@@ -1171,7 +1186,7 @@ async def fork_session(
         "vault_id": vault_id,
         "title": fork_title,
         "forked_from_session_id": session_id,
-        "fork_message_index": request.message_index,
+        "fork_message_index": body.message_index,
         "messages": messages,
     }
 
@@ -1300,9 +1315,11 @@ async def _auto_name_session(
 
 
 @router.post("/chat/sessions/{session_id}/messages")
+@limiter.limit(settings.chat_rate_limit)
 async def add_message(
+    request: Request,
     session_id: int,
-    request: AddMessageRequest,
+    body: AddMessageRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     rag_engine: Optional[RAGEngine] = Depends(get_rag_engine),
@@ -1337,11 +1354,11 @@ async def add_message(
     # Role guard is critical: concurrent saves (Promise.all) mean both user and assistant
     # inserts can see COUNT(*)=0 simultaneously. Without the role check, the assistant
     # message could trigger auto-naming with its own response content as the title basis.
-    if is_first_message and session_row[1] is None and request.role == "user":
+    if is_first_message and session_row[1] is None and body.role == "user":
         # Fire-and-forget LLM auto-naming (does not block the response)
         if rag_engine and rag_engine.llm_client is not None:
             task = asyncio.create_task(
-                _auto_name_session(session_id, request.content, rag_engine.llm_client)
+                _auto_name_session(session_id, body.content, rag_engine.llm_client)
             )
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
@@ -1353,18 +1370,18 @@ async def add_message(
             )
 
     # Serialize sources, memories, and wiki_refs to JSON
-    sources_json = json.dumps(request.sources) if request.sources else None
-    memories_json = json.dumps(request.memories) if request.memories else None
-    wiki_refs_json = json.dumps(request.wiki_refs) if request.wiki_refs else None
-    kms_refs_json = json.dumps(request.kms_refs) if request.kms_refs else None
+    sources_json = json.dumps(body.sources) if body.sources else None
+    memories_json = json.dumps(body.memories) if body.memories else None
+    wiki_refs_json = json.dumps(body.wiki_refs) if body.wiki_refs else None
+    kms_refs_json = json.dumps(body.kms_refs) if body.kms_refs else None
 
     # Sanitize assistant content before persistence — defense in depth against
     # any thinking/reasoning trace that slipped past the LLM-time stripper or
     # was injected by a misbehaving client. User content is left untouched.
     persisted_content = (
-        sanitize_chat_messages_content(request.content)
-        if request.role == "assistant"
-        else request.content
+        sanitize_chat_messages_content(body.content)
+        if body.role == "assistant"
+        else body.content
     )
 
     # Detect optional columns (older deployments may lack them).
@@ -1386,7 +1403,7 @@ async def add_message(
         cursor = await asyncio.to_thread(
             conn.execute,
             insert_query,
-            (session_id, request.role, persisted_content, sources_json, memories_json, wiki_refs_json),
+            (session_id, body.role, persisted_content, sources_json, memories_json, wiki_refs_json),
         )
     elif has_memories_col:
         insert_query = """
@@ -1396,7 +1413,7 @@ async def add_message(
         cursor = await asyncio.to_thread(
             conn.execute,
             insert_query,
-            (session_id, request.role, persisted_content, sources_json, memories_json),
+            (session_id, body.role, persisted_content, sources_json, memories_json),
         )
     else:
         insert_query = """
@@ -1406,7 +1423,7 @@ async def add_message(
         cursor = await asyncio.to_thread(
             conn.execute,
             insert_query,
-            (session_id, request.role, persisted_content, sources_json),
+            (session_id, body.role, persisted_content, sources_json),
         )
 
     # Update session's updated_at
@@ -1421,8 +1438,8 @@ async def add_message(
     # Persist chat mode for assistant rows when the column is available.
     # Side-write keeps the main INSERT branching unchanged.
     persisted_mode: Optional[str] = None
-    if has_mode_col and request.mode and request.role == "assistant":
-        persisted_mode = request.mode
+    if has_mode_col and body.mode and body.role == "assistant":
+        persisted_mode = body.mode
         await asyncio.to_thread(
             conn.execute,
             "UPDATE chat_messages SET mode = ? WHERE id = ?",
@@ -1491,7 +1508,7 @@ async def add_message(
 
     # KMS refs round-trip from the request (side-written above); echo back the
     # parsed value so the client can render [K#] cards immediately.
-    kms_refs_out = request.kms_refs if (has_kms_refs_col and request.kms_refs) else None
+    kms_refs_out = body.kms_refs if (has_kms_refs_col and body.kms_refs) else None
 
     return {
         "id": row[0],
@@ -1507,10 +1524,12 @@ async def add_message(
 
 
 @router.patch("/chat/sessions/{session_id}/messages/{message_id}/feedback")
+@limiter.limit(settings.chat_rate_limit)
 async def set_message_feedback(
+    request: Request,
     session_id: int,
     message_id: int,
-    request: FeedbackRequest,
+    body: FeedbackRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
@@ -1522,7 +1541,7 @@ async def set_message_feedback(
     Returns the full updated message row.
     """
     # Validate rating value
-    if request.rating not in ("up", "down", None):
+    if body.rating not in ("up", "down", None):
         raise HTTPException(
             status_code=422,
             detail="rating must be 'up', 'down', or null",
@@ -1565,7 +1584,7 @@ async def set_message_feedback(
     await asyncio.to_thread(
         conn.execute,
         "UPDATE chat_messages SET feedback = ? WHERE id = ?",
-        (request.rating, message_id),
+        (body.rating, message_id),
     )
     await asyncio.to_thread(conn.commit)
 
@@ -1595,9 +1614,11 @@ async def set_message_feedback(
 
 
 @router.put("/chat/sessions/{session_id}")
+@limiter.limit(settings.chat_rate_limit)
 async def update_session(
+    request: Request,
     session_id: int,
-    request: UpdateSessionRequest,
+    body: UpdateSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
@@ -1620,7 +1641,7 @@ async def update_session(
 
     # Update session
     update_query = "UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-    await asyncio.to_thread(conn.execute, update_query, (request.title, session_id))
+    await asyncio.to_thread(conn.execute, update_query, (body.title, session_id))
     await asyncio.to_thread(conn.commit)
 
     # Get updated session (fetch all needed fields)
@@ -1641,7 +1662,9 @@ async def update_session(
 
 
 @router.delete("/chat/sessions/{session_id}")
+@limiter.limit(settings.chat_rate_limit)
 async def delete_session(
+    request: Request,
     session_id: int,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),

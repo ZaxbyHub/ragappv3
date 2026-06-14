@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import asyncio
+import inspect
 from unittest.mock import patch
 
 import pytest
@@ -123,3 +124,38 @@ def test_reconfigure_noop_preserves_breaker_state():
     # Same values — should be a no-op.
     c.reconfigure(base_url="http://old.example:1234", model="old-model")
     assert c._circuit_breaker.current_state == CircuitBreakerState.OPEN
+
+
+def test_llm_client_docstring_max_tokens_defaults_match():
+    """Verify max_tokens parameter defaults match their docstrings (default: 32768).
+
+    Phase 3 Task 3.2 fixed two stale docstring defaults from 2048 to 32768.
+    This test ensures the defaults in signatures and docstrings stay in sync.
+    """
+    # chat_completion — signature default
+    sig = inspect.signature(LLMClient.chat_completion)
+    assert sig.parameters["max_tokens"].default == 32768, (
+        f"chat_completion max_tokens default is {sig.parameters['max_tokens'].default}, expected 32768"
+    )
+    # chat_completion — docstring contains "default: 32768"
+    assert "default: 32768" in (LLMClient.chat_completion.__doc__ or ""), (
+        "chat_completion docstring does not mention 'default: 32768'"
+    )
+    # Verify it does NOT contain the stale value
+    assert "default: 2048" not in (LLMClient.chat_completion.__doc__ or ""), (
+        "chat_completion docstring still contains stale 'default: 2048'"
+    )
+
+    # chat_completion_stream — signature default
+    sig2 = inspect.signature(LLMClient.chat_completion_stream)
+    assert sig2.parameters["max_tokens"].default == 32768, (
+        f"chat_completion_stream max_tokens default is {sig2.parameters['max_tokens'].default}, expected 32768"
+    )
+    # chat_completion_stream — docstring contains "default: 32768"
+    assert "default: 32768" in (LLMClient.chat_completion_stream.__doc__ or ""), (
+        "chat_completion_stream docstring does not mention 'default: 32768'"
+    )
+    # Verify it does NOT contain the stale value
+    assert "default: 2048" not in (LLMClient.chat_completion_stream.__doc__ or ""), (
+        "chat_completion_stream docstring still contains stale 'default: 2048'"
+    )

@@ -424,6 +424,98 @@ data: {"type": "content", "content": "test"}
         self.assertEqual(len(content_events), 1)
         self.assertEqual(content_events[0].get("content"), "Line 1\nLine 2\nLine 3")
 
+    def test_stream_error_does_not_leak_exception_details(self):
+        """DD-A008: Exception details must NOT be sent to the client.
+
+        When rag_engine.query raises an exception, the SSE error event must
+        contain only the generic message 'An error occurred during chat processing'
+        and code 'INTERNAL_ERROR'. The exception type name and exception message
+        must NOT appear anywhere in the error event (they are server-side logged only).
+        """
+        # Use a distinctive exception type and message to make verification strict
+        async def mock_query_that_raises(*args, **kwargs):
+            raise ValueError("Database connection failed — host unreachable")
+            yield  # unreachable, but makes this an async generator  # pragma: no cover
+
+        self._set_mock_rag_engine(mock_query_that_raises)
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={"messages": [{"role": "user", "content": "test"}]}
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        events = self._parse_sse_events(response.text)
+        error_events = [e['data'] for e in events if e.get('data', {}).get("type") == "error"]
+
+        self.assertEqual(len(error_events), 1, "Expected exactly one error event")
+        error_event = error_events[0]
+
+        # Assert 1: exact generic message
+        self.assertEqual(
+            error_event.get("message"),
+            "An error occurred during chat processing",
+            "Error message must be the generic client-safe message",
+        )
+
+        # Assert 2: error code
+        self.assertEqual(
+            error_event.get("code"),
+            "INTERNAL_ERROR",
+            "Error code must be INTERNAL_ERROR",
+        )
+
+        # Assert 3: message does NOT contain exception type name
+        error_message = error_event.get("message", "")
+        self.assertNotIn(
+            "ValueError",
+            error_message,
+            "Error message must NOT contain exception type name",
+        )
+
+        # Assert 4: message does NOT contain exception message
+        self.assertNotIn(
+            "Database connection failed",
+            error_message,
+            "Error message must NOT contain exception details",
+        )
+        self.assertNotIn(
+            "host unreachable",
+            error_message,
+            "Error message must NOT contain exception details",
+        )
+
+    def test_stream_error_does_not_leak_generic_exception(self):
+        """Verify the fix also works for non-ValueError exceptions (e.g. RuntimeError, KeyError)."""
+        async def mock_query_that_raises(*args, **kwargs):
+            raise RuntimeError("Secret internal token: abc123")
+            yield  # unreachable, but makes this an async generator  # pragma: no cover
+
+        self._set_mock_rag_engine(mock_query_that_raises)
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={"messages": [{"role": "user", "content": "test"}]}
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        events = self._parse_sse_events(response.text)
+        error_events = [e['data'] for e in events if e.get('data', {}).get("type") == "error"]
+        self.assertEqual(len(error_events), 1)
+
+        error_message = error_events[0].get("message", "")
+
+        # The generic message must be present
+        self.assertEqual(error_message, "An error occurred during chat processing")
+        # Exception details must NOT be present
+        self.assertNotIn("RuntimeError", error_message)
+        self.assertNotIn("Secret internal token", error_message)
+        self.assertNotIn("abc123", error_message)
+        # Code must be INTERNAL_ERROR
+        self.assertEqual(error_events[0].get("code"), "INTERNAL_ERROR")
+
 
 if __name__ == "__main__":
     unittest.main()

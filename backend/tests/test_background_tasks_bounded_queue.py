@@ -10,6 +10,7 @@ Tests that:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -278,3 +279,72 @@ class TestRecoveryDeadlockRegression:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestEnrichmentWorkerResilience:
+    """
+    Tests for enrichment worker exception isolation.
+
+    The enrichment worker must catch exceptions from run_enrichment_job,
+    log them, call task_done(), and continue processing subsequent items.
+    """
+
+    @pytest.mark.asyncio
+    async def test_enrichment_worker_survives_exception(self):
+        """
+        When run_enrichment_job raises on the first item, the worker must
+        continue and process the second item.
+        """
+        from app.services.background_tasks import BackgroundProcessor
+
+        processor = BackgroundProcessor(
+            max_retries=1,
+            retry_delay=0.01,
+        )
+        try:
+            processed: list[str] = []
+
+            async def fake_run_enrichment_job(**kwargs):
+                processed.append(kwargs["file_id"])
+                if len(processed) == 1:
+                    raise ValueError("first enrichment job failed")
+                return None
+
+            processor.processor.run_enrichment_job = fake_run_enrichment_job
+
+            first = EnrichmentTaskItem(
+                file_id="first",
+                file_path="first.txt",
+                vault_id=1,
+                file_hash="h1",
+                chunks=[],
+                document_text="first",
+            )
+            second = EnrichmentTaskItem(
+                file_id="second",
+                file_path="second.txt",
+                vault_id=1,
+                file_hash="h2",
+                chunks=[],
+                document_text="second",
+            )
+            await processor.enrichment_queue.put(first)
+            await processor.enrichment_queue.put(second)
+            processor.shutdown_event.clear()
+
+            worker = asyncio.create_task(processor._enrichment_worker_loop())
+            try:
+                await asyncio.wait_for(
+                    processor.enrichment_queue.join(), timeout=2.0
+                )
+            finally:
+                processor.shutdown_event.set()
+                worker.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await worker
+
+            assert processed == ["first", "second"], (
+                f"Expected both enrichment items to be processed, got {processed}"
+            )
+        finally:
+            processor._running = False
