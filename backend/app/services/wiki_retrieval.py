@@ -33,7 +33,7 @@ _STOP_WORDS = frozenset(
         "who", "what", "when", "where", "why", "how",
         "is", "are", "was", "were", "be", "been", "being",
         "the", "a", "an", "of", "for", "to", "in", "on", "about",
-        "at", "by", "with", "from", "as", "or", "and", "but",
+        "at", "by", "with", "from", "as", "or", "and", "but", "not",
         "tell", "me", "give", "please", "can", "could", "would",
         "do", "does", "did", "has", "have", "had",
     }
@@ -52,6 +52,9 @@ _PREDICATE_TERMS = {
 
 # Pattern: acronyms are 2+ uppercase letters
 _ACRONYM_RE = re.compile(r"\b([A-Z]{2,})\b")
+
+# FTS5 boolean operators to strip even when they match the acronym pattern
+_FTS5_KEYWORDS = frozenset({"AND", "OR", "NOT", "NEAR"})
 
 # Pattern: question-subject (who is the X chief? → X=entity, chief=predicate)
 _QUESTION_ENTITY_RE = re.compile(
@@ -135,6 +138,9 @@ def normalize_fts_query(query: str) -> str:
         # Strip FTS5 special chars from token
         clean = _FTS5_SPECIAL.sub(" ", tok).strip()
         if not clean:
+            continue
+        # Skip FTS5 boolean operators even in uppercase
+        if clean.upper() in _FTS5_KEYWORDS:
             continue
         # Keep acronyms as-is (2+ uppercase)
         if _ACRONYM_RE.fullmatch(clean):

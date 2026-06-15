@@ -384,6 +384,11 @@ class MemoryStore:
         Always works (no embedding service required). Used both as the
         primary path when no embedding service is configured and as one
         side of the hybrid fusion when one is.
+
+        Vault scoping:
+            ``vault_id=None`` — scan ALL vaults (admin/global mode, no filter).
+            ``vault_id=<int>`` — filter to that vault OR ``vault_id IS NULL``
+            (includes vault-less memories shared across all vaults).
         """
         if not query or not query.strip():
             return []
@@ -466,6 +471,11 @@ class MemoryStore:
         When ``candidate_ids`` is provided, only memories with those IDs
         are considered (pre-filtered by FTS search). Otherwise all memories
         with embeddings are considered.
+
+        Vault scoping:
+            ``vault_id=None`` — scan ALL vaults (admin/global mode, no filter).
+            ``vault_id=<int>`` — filter to that vault OR ``vault_id IS NULL``
+            (includes vault-less memories shared across all vaults).
         """
         if not query_embedding:
             return []

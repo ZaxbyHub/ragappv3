@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from starlette.requests import Request
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -41,6 +43,9 @@ class TestSanitizeOnPersist(unittest.TestCase):
         )
         self._policy_patcher.start()
 
+        self.mock_request = MagicMock(spec=Request)
+        self.mock_request.client.host = "127.0.0.1"
+
     def tearDown(self):
         self._policy_patcher.stop()
         try:
@@ -63,7 +68,8 @@ class TestSanitizeOnPersist(unittest.TestCase):
         result = asyncio.run(
             add_message(
                 session_id=1,
-                request=req,
+                request=self.mock_request,
+                body=req,
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,
@@ -90,7 +96,8 @@ class TestSanitizeOnPersist(unittest.TestCase):
         result = asyncio.run(
             add_message(
                 session_id=1,
-                request=req,
+                request=self.mock_request,
+                body=req,
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,
@@ -125,7 +132,8 @@ class TestSanitizeOnPersist(unittest.TestCase):
         result = asyncio.run(
             add_message(
                 session_id=1,
-                request=req,
+                request=self.mock_request,
+                body=req,
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,

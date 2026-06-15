@@ -28,10 +28,11 @@ class TestNormalizeFtsQuery(unittest.TestCase):
         self.assertIn("AFOMIS", result)
 
     def test_escapes_fts5_operators(self):
-        # FTS5 special chars should be sanitized
+        # FTS5 special chars must be stripped; vacuous isinstance replaced
         raw = normalize_fts_query("AND OR NOT test")
-        # Should not raise and should return something reasonable
-        self.assertIsInstance(raw, str)
+        self.assertIn("test", raw)
+        for ch in r'"()*\-/:;,?!@#$%^&+=<>{}|[]\\':
+            self.assertNotIn(ch, raw, f"char {ch!r} must not appear in output")
 
     def test_empty_query_returns_empty(self):
         self.assertEqual(normalize_fts_query(""), "")
@@ -39,6 +40,130 @@ class TestNormalizeFtsQuery(unittest.TestCase):
     def test_single_acronym_preserved(self):
         result = normalize_fts_query("AFMEDCOM")
         self.assertIn("AFMEDCOM", result)
+
+
+class TestFtsOperatorAdversarial(unittest.TestCase):
+    """Adversarial tests for FTS5 operator stripping in normalize_fts_query."""
+
+    def test_quotes_stripped(self):
+        result = normalize_fts_query('"python java"')
+        self.assertNotIn('"', result)
+        self.assertIn("python", result)
+        self.assertIn("java", result)
+
+    def test_parentheses_stripped(self):
+        result = normalize_fts_query("python (AND java)")
+        self.assertNotIn("(", result)
+        self.assertNotIn(")", result)
+
+    def test_asterisk_stripped(self):
+        result = normalize_fts_query("pyth*")
+        self.assertNotIn("*", result)
+        self.assertIn("pyth", result)
+
+    def test_colon_stripped(self):
+        # Colon is a column-qualifier prefix — must not appear in output
+        result = normalize_fts_query("title:python")
+        self.assertNotIn(":", result)
+        self.assertIn("python", result)
+
+    def test_brackets_stripped(self):
+        result = normalize_fts_query("[secret]")
+        self.assertNotIn("[", result)
+        self.assertNotIn("]", result)
+        # Brackets stripped; "secret" itself is kept (>=2 chars, not a stop word)
+        self.assertIn("secret", result)
+
+    def test_pipe_stripped(self):
+        result = normalize_fts_query("python|java")
+        self.assertNotIn("|", result)
+
+    def test_boolean_and_does_not_crash(self):
+        # AND is an acronym (2+ uppercase) so it passes through, but
+        # since tokens are space-joined the result is safe for FTS5.
+        result = normalize_fts_query("python AND java")
+        self.assertIsInstance(result, str)
+        for ch in r'"()*\-/:;,?!@#$%^&+=<>{}|[]\\':
+            self.assertNotIn(ch, result)
+
+    def test_phrase_query_neutralized(self):
+        # Phrase quotes are stripped; the phrase is kept as a joined string
+        result = normalize_fts_query('"exact phrase"')
+        self.assertNotIn('"', result)
+        # Quotes replaced with spaces, phrase kept as-is (joined)
+        self.assertIn("exact phrase", result)
+
+    def test_prefix_query_neutralized(self):
+        # Trailing wildcard asterisk is stripped
+        result = normalize_fts_query("soft*")
+        self.assertNotIn("*", result)
+        self.assertIn("soft", result)
+
+    def test_near_operator_neutralized(self):
+        # NEAR is an acronym, passes through as-is
+        result = normalize_fts_query("python NEAR java")
+        self.assertIsInstance(result, str)
+        for ch in r'"()*\-/:;,?!@#$%^&+=<>{}|[]\\':
+            self.assertNotIn(ch, result)
+
+    def test_mixed_operators(self):
+        # All special chars stripped; tokens extracted
+        result = normalize_fts_query("(python OR java) AND test*")
+        for ch in '()*"':
+            self.assertNotIn(ch, result)
+        self.assertNotIn("*", result)
+        # meaningful tokens survive
+        self.assertIn("python", result)
+        self.assertIn("java", result)
+
+    def test_no_special_chars_in_output(self):
+        # For any input with FTS5 special chars, the output must NOT contain
+        # any of the FTS5 special characters as standalone characters.
+        inputs = [
+            'python "java"',
+            "python (AND java)",
+            "pyth*",
+            "title:python",
+            "[secret]",
+            "python|java",
+            "python AND java",
+            '"exact phrase"',
+            "soft*",
+            "python NEAR java",
+            "(python OR java) AND test*",
+        ]
+        for raw in inputs:
+            result = normalize_fts_query(raw)
+            for ch in r'"()*\-/:;,?!@#$%^&+=<>{}|[]\\':
+                self.assertNotIn(ch, result, f"input {raw!r}: char {ch!r} must not appear in output {result!r}")
+
+    def test_uppercase_AND_stripped(self):
+        result = normalize_fts_query("Cats AND Dogs")
+        self.assertEqual(result, "cats dogs")
+
+    def test_uppercase_OR_stripped(self):
+        result = normalize_fts_query("Python OR Java")
+        self.assertEqual(result, "python java")
+
+    def test_uppercase_NOT_stripped(self):
+        result = normalize_fts_query("Python NOT Java")
+        self.assertEqual(result, "python java")
+
+    def test_uppercase_NEAR_stripped(self):
+        result = normalize_fts_query("Python NEAR Java")
+        self.assertEqual(result, "python java")
+
+    def test_lowercase_not_in_stop_words(self):
+        result = normalize_fts_query("often not python")
+        self.assertEqual(result, "often python")
+
+    def test_mixed_case_And_treated_as_word(self):
+        result = normalize_fts_query("Cats And Dogs")
+        self.assertEqual(result, "cats dogs")
+
+    def test_real_acronyms_still_preserved(self):
+        result = normalize_fts_query("API AND SQL")
+        self.assertEqual(result, "API SQL")
 
 
 class TestExtractQueryIntent(unittest.TestCase):

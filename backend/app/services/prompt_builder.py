@@ -193,7 +193,9 @@ class PromptBuilderService:
         # Truncate history to last N messages to prevent context overflow
         max_history = 20
         for entry in chat_history[-max_history:]:
-            messages.append(entry)
+            safe_entry = dict(entry)
+            safe_entry["content"] = _xml_escape(safe_entry.get("content") or "")
+            messages.append(safe_entry)
 
         # Build structured context
         user_content_parts: List[str] = []

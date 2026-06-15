@@ -668,6 +668,8 @@ class BackgroundProcessor:
                     chunks=item.chunks,
                     document_text=item.document_text,
                 )
+            except Exception:
+                logger.exception("Enrichment job failed for file_id=%s", item.file_id)
             finally:
                 self.enrichment_queue.task_done()
 
@@ -745,8 +747,10 @@ class BackgroundProcessor:
             task: The failed task
             error_message: Error message from the failure
 
-        Requeues the task with incremented attempt count if retries remain,
-        otherwise logs the permanent failure.
+        Requeues the task with incremented attempt count if retries remain.
+        When retries are exhausted (permanent failure) and ``task.file_id`` is set,
+        writes ``status='error'``, ``error_message``, and ``phase='error'`` to the
+        corresponding ``files`` row so the file is not left stuck in 'processing'.
         """
         # Don't requeue if shutdown is in progress
         if self.shutdown_event.is_set():
@@ -778,6 +782,21 @@ class BackgroundProcessor:
             )
             await self.queue.put(new_task)
         else:
+            # Mark file as error in database so it doesn't stay in 'processing'
+            if task.file_id is not None and self.processor.pool is not None:
+                try:
+                    with self.processor.pool.connection() as conn:
+                        conn.execute(
+                            "UPDATE files SET status='error', "
+                            "error_message=?, phase='error' WHERE id = ?",
+                            (error_message[:500], task.file_id),
+                        )
+                        conn.commit()
+                except Exception:
+                    logger.warning(
+                        "Failed to update file status to 'error' "
+                        "for file_id=%s", task.file_id,
+                    )
             logger.error(
                 f"Task permanently failed for {task.file_path} "
                 f"after {self.max_retries} attempts: {error_message}"

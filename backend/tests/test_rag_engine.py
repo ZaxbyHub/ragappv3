@@ -3,7 +3,7 @@
 import os
 import sys
 import unittest
-from typing import Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, cast
 from unittest.mock import patch
 
 import pytest
@@ -47,7 +47,7 @@ except ImportError:
     sys.modules['unstructured.documents.elements'] = _unstructured.documents.elements
 
 from app.services.embeddings import EmbeddingService
-from app.services.llm_client import LLMClient
+from app.services.llm_client import LLMClient, LLMError
 from app.services.memory_store import MemoryRecord, MemoryStore
 from app.services.rag_engine import EmbeddingError, RAGEngine, RAGEngineError
 from app.services.vector_store import VectorStore
@@ -76,12 +76,20 @@ class FakeVectorStore:
     def __init__(self, results: List[Dict]):
         self._results = results
 
-    def search(self, embedding: List[float], limit: int = 10, filter_expr=None, vault_id=None, query_text=None, hybrid=False, **kwargs):
-        return self._results[:limit]
+    async def search(self, embedding: List[float], limit: int = 10, filter_expr=None, vault_id=None, query_text=None, hybrid=False, **kwargs):
+        results = self._results
+        if vault_id is not None:
+            target = str(vault_id)
+            results = [r for r in results if str(r.get("vault_id")) == target]
+        return results[:limit]
 
     def get_chunks_by_uid(self, chunk_uids: List[str]):
         # Return empty list for fake - real implementation would fetch from DB
         return []
+
+    def get_fts_exceptions(self) -> int:
+        # Match real VectorStore interface — no FTS exceptions in fake
+        return 0
 
 
 class FakeMemoryStore:
@@ -102,14 +110,17 @@ class FakeMemoryStore:
 
 
 class FakeLLMClient:
-    def __init__(self, response: str, stream_chunks: Optional[List[str]] = None):
+    def __init__(self, response: str, stream_chunks: Optional[List[str]] = None, raise_llm_error: bool = False):
         self._response = response
         self._stream_chunks = stream_chunks or []
+        self._raise_llm_error = raise_llm_error
 
     async def chat_completion(self, messages, **kwargs):
         return self._response
 
     async def chat_completion_stream(self, messages, **kwargs):
+        if self._raise_llm_error:
+            raise LLMError("Simulated LLM streaming error")
         for chunk in self._stream_chunks:
             yield chunk
 
@@ -144,7 +155,6 @@ class RAGEngineTests(unittest.IsolatedAsyncioTestCase):
         done = results[-1]
         self.assertEqual("done", done["type"])
         # memories_used must contain only the cited memory as a structured dict.
-        # Note: sources may be empty due to pre-existing vector store integration issues in test mocks.
         self.assertEqual(1, len(done["memories_used"]))
         self.assertEqual("M1", done["memories_used"][0]["memory_label"])
         self.assertEqual(memory.content, done["memories_used"][0]["content"])
@@ -290,6 +300,265 @@ class RAGEngineTests(unittest.IsolatedAsyncioTestCase):
         formatted = engine._format_chunk(chunk)
         self.assertIn("document", formatted)
         self.assertIn("some text", formatted)
+
+    async def test_rag_engine_vault_isolation(self):
+        """FakeVectorStore and engine-level query must filter results by vault_id."""
+        vector_results = [
+            {"text": "shared topic", "file_id": "f1", "metadata": {}, "score": 0.9, "vault_id": 1},
+            {"text": "shared topic", "file_id": "f2", "metadata": {}, "score": 0.8, "vault_id": 1},
+            {"text": "shared topic", "file_id": "f3", "metadata": {}, "score": 0.7, "vault_id": 2},
+        ]
+        vector_store = FakeVectorStore(vector_results)
+
+        vault1_results = await vector_store.search([0.1, 0.2], limit=10, vault_id=1)
+        self.assertEqual(2, len(vault1_results))
+        self.assertTrue(
+            all(str(r.get("vault_id")) == "1" for r in vault1_results),
+            "vault_id=1 search returned cross-vault results",
+        )
+
+        vault2_results = await vector_store.search([0.1, 0.2], limit=10, vault_id=2)
+        self.assertEqual(1, len(vault2_results))
+        self.assertEqual("2", str(vault2_results[0].get("vault_id")))
+        self.assertTrue(
+            all(str(r.get("vault_id")) == "2" for r in vault2_results),
+            "vault_id=2 search returned cross-vault results",
+        )
+
+        # Engine-level vault isolation: verify engine.query() respects vault_id
+        engine = RAGEngine()
+        engine.embedding_service = cast(EmbeddingService, FakeEmbeddingService([0.1, 0.2]))
+        engine.vector_store = cast(VectorStore, FakeVectorStore(vector_results))
+        engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+        engine.llm_client = cast(LLMClient, FakeLLMClient(response="answer"))
+
+        from app.config import settings
+        with patch.object(settings, 'query_transformation_enabled', False):
+            vault1_msgs = [msg async for msg in engine.query("shared topic", [], stream=False, vault_id=1)]
+
+        done1 = [m for m in vault1_msgs if isinstance(m, dict) and m.get("type") == "done"]
+        self.assertTrue(len(done1) > 0, "Expected a done message for vault_id=1 query")
+        vault1_sources = done1[0].get("sources", [])
+        self.assertTrue(
+            len(vault1_sources) > 0,
+            "Expected sources for vault_id=1 query",
+        )
+        self.assertTrue(
+            all(s.get("file_id") in ("f1", "f2") for s in vault1_sources),
+            f"vault_id=1 query returned cross-vault sources: {[s.get('file_id') for s in vault1_sources]}",
+        )
+
+        with patch.object(settings, 'query_transformation_enabled', False):
+            vault2_msgs = [msg async for msg in engine.query("shared topic", [], stream=False, vault_id=2)]
+
+        done2 = [m for m in vault2_msgs if isinstance(m, dict) and m.get("type") == "done"]
+        self.assertTrue(len(done2) > 0, "Expected a done message for vault_id=2 query")
+        vault2_sources = done2[0].get("sources", [])
+        self.assertTrue(
+            len(vault2_sources) > 0,
+            "Expected sources for vault_id=2 query",
+        )
+        self.assertTrue(
+            all(s.get("file_id") == "f3" for s in vault2_sources),
+            f"vault_id=2 query returned cross-vault sources: {[s.get('file_id') for s in vault2_sources]}",
+        )
+
+    async def test_followup_rewrite_modifies_retrieval_query(self):
+        """Followup rewrite must change the query used for retrieval."""
+        rewritten_query = "What are the security features of the authentication system?"
+
+        class SpyEmbeddingService:
+            def __init__(self):
+                self.embedded_texts = []
+
+            async def embed_single(self, text):
+                self.embedded_texts.append(text)
+                return [0.1, 0.2]
+
+            async def embed_passage(self, text):
+                self.embedded_texts.append(text)
+                return [0.1, 0.2]
+
+        chat_history = [
+            {"role": "user", "content": "How does the authentication system work?"},
+            {"role": "assistant", "content": "The system uses JWT tokens with RS256 signing..."},
+        ]
+
+        engine = RAGEngine()
+        spy_embedding = SpyEmbeddingService()
+        engine.embedding_service = cast(EmbeddingService, spy_embedding)
+        engine.vector_store = cast(VectorStore, FakeVectorStore([
+            {"text": "chunk", "file_id": "f1", "metadata": {}, "score": 0.9}
+        ]))
+        engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+        engine.llm_client = cast(LLMClient, FakeLLMClient(response=rewritten_query))
+
+        from app.config import settings
+        with patch.object(settings, 'query_transformation_enabled', False):
+            results = [msg async for msg in engine.query("tell me more", chat_history, stream=False)]
+
+        self.assertTrue(
+            any(rewritten_query in t for t in spy_embedding.embedded_texts),
+            f"Expected rewritten query '{rewritten_query}' in embedded texts, got: {spy_embedding.embedded_texts}",
+        )
+        self.assertFalse(
+            any("tell me more" == t for t in spy_embedding.embedded_texts),
+            "Original followup text was used for retrieval instead of rewritten query",
+        )
+
+    async def test_reranker_exception_falls_back_to_unreranked(self):
+        """Reranker exception should fall back to unreranked results with score_type=distance."""
+        class FailingReranker:
+            async def rerank(self, *args, **kwargs):
+                raise RuntimeError("Reranker service unavailable")
+
+        engine = RAGEngine()
+        engine.embedding_service = cast(EmbeddingService, FakeEmbeddingService([0.1, 0.2]))
+        engine.vector_store = cast(VectorStore, FakeVectorStore([
+            {"text": "chunk content", "file_id": "f1", "metadata": {}, "score": 0.9}
+        ]))
+        engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+        engine.llm_client = cast(LLMClient, FakeLLMClient(response="LLM answer"))
+        engine.reranking_enabled = True
+        engine.reranking_service = cast(Any, FailingReranker())
+
+        from app.config import settings
+        with patch.object(settings, 'query_transformation_enabled', False):
+            results = [msg async for msg in engine.query("test query", [], stream=False)]
+
+        # Engine should return results despite reranker failure
+        self.assertGreater(len(results), 0, "Engine should return results despite reranker exception")
+
+        # The done message must have score_type="distance" (not "rerank")
+        done = [r for r in results if isinstance(r, dict) and r.get("type") == "done"]
+        self.assertTrue(len(done) > 0, "Expected a done message")
+        self.assertEqual("distance", done[0]["score_type"],
+                         "Reranker exception should fall back to distance score_type")
+
+        # Original vector results must survive the reranker fallback (not cleared)
+        self.assertGreater(
+            len(done[0].get("sources", [])), 0,
+            "Reranker fallback should preserve original vector results in sources",
+        )
+
+    async def test_streaming_llm_error_yields_error_chunk(self):
+        """LLM error during streaming should yield an error chunk before the generator completes."""
+        engine = RAGEngine()
+        engine.embedding_service = cast(EmbeddingService, FakeEmbeddingService([0.1, 0.2]))
+        engine.vector_store = cast(VectorStore, FakeVectorStore([
+            {"text": "chunk", "file_id": "f1", "metadata": {}, "score": 0.9}
+        ]))
+        engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+        engine.llm_client = cast(
+            LLMClient,
+            FakeLLMClient(response="", stream_chunks=["part1"], raise_llm_error=True),
+        )
+
+        from app.config import settings
+        with patch.object(settings, 'query_transformation_enabled', False):
+            results = [msg async for msg in engine.query("query", [], stream=True)]
+
+        error_chunks = [
+            r for r in results
+            if isinstance(r, dict) and r.get("type") == "error"
+        ]
+        self.assertTrue(
+            len(error_chunks) > 0,
+            "Expected at least one error chunk in streaming results",
+        )
+        self.assertEqual("LLM_ERROR", error_chunks[0]["code"])
+
+    async def test_streaming_original_embedding_failure_yields_error_chunk(self):
+        """When original query embedding fails with stream=True, yield exactly one error chunk."""
+
+        class FailingEmbeddingService:
+            def __init__(self):
+                self.call_count = 0
+
+            async def embed_single(self, text):
+                self.call_count += 1
+                raise EmbeddingError("Original query embed failed")
+
+            async def embed_passage(self, text):
+                # HyDE / passage variants should not be called when original fails
+                raise EmbeddingError("Unexpected passage embed call")
+
+        engine = RAGEngine()
+        engine.embedding_service = cast(EmbeddingService, FailingEmbeddingService())
+        engine.vector_store = cast(VectorStore, FakeVectorStore([]))
+        engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+        engine.llm_client = cast(LLMClient, FakeLLMClient(response=""))
+
+        from app.config import settings
+        with patch.object(settings, 'query_transformation_enabled', False):
+            results = [msg async for msg in engine.query("test", [], stream=True)]
+
+        error_chunks = [r for r in results if isinstance(r, dict) and r.get("type") == "error"]
+        self.assertEqual(1, len(error_chunks), f"Expected exactly 1 error chunk, got: {results}")
+        self.assertEqual("EMBEDDING_ERROR", error_chunks[0]["code"])
+        self.assertIn("Original query embedding failed", error_chunks[0]["message"])
+
+    async def test_query_require_vault_raises_without_vault_id(self):
+        """require_vault=True with vault_id=None must raise ValueError before any async work."""
+        engine = RAGEngine()
+        engine.embedding_service = cast(EmbeddingService, FakeEmbeddingService([0.1, 0.2]))
+        engine.vector_store = cast(VectorStore, FakeVectorStore([]))
+        engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+        engine.llm_client = cast(LLMClient, FakeLLMClient(response=""))
+
+        gen = engine.query("test", [], require_vault=True, vault_id=None)
+        with pytest.raises(ValueError, match="vault_id is required"):
+            async for _ in gen:
+                pass
+
+    async def test_query_require_vault_allows_with_vault_id(self):
+        """require_vault=True with a vault_id must NOT raise the vault guard ValueError."""
+        engine = RAGEngine()
+        engine.embedding_service = cast(EmbeddingService, FakeEmbeddingService([0.1, 0.2]))
+        engine.vector_store = cast(VectorStore, FakeVectorStore([]))
+        engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+        engine.llm_client = cast(LLMClient, FakeLLMClient(response=""))
+
+        gen = engine.query("test", [], require_vault=True, vault_id=42)
+        vault_error_raised = False
+        try:
+            async for _ in gen:
+                pass
+        except ValueError as e:
+            if "vault_id is required" in str(e):
+                vault_error_raised = True
+        # Other errors (e.g. missing embedding service) are acceptable;
+        # the vault guard itself must NOT have fired.
+        self.assertFalse(vault_error_raised, "ValueError about vault_id should not be raised when vault_id is provided")
+
+    async def test_non_streaming_original_embedding_failure_raises(self):
+        """When original query embedding fails with stream=False, raise RAGEngineError."""
+        class FailingEmbeddingService:
+            def __init__(self):
+                self.call_count = 0
+
+            async def embed_single(self, text):
+                self.call_count += 1
+                raise EmbeddingError("Original query embed failed")
+
+            async def embed_passage(self, text):
+                raise EmbeddingError("Unexpected passage embed call")
+
+        engine = RAGEngine()
+        engine.embedding_service = cast(EmbeddingService, FailingEmbeddingService())
+        engine.vector_store = cast(VectorStore, FakeVectorStore([]))
+        engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+        engine.llm_client = cast(LLMClient, FakeLLMClient(response=""))
+
+        from app.config import settings
+        with patch.object(settings, 'query_transformation_enabled', False):
+            with self.assertRaises(RAGEngineError) as ctx:
+                async def consume():
+                    async for _ in engine.query("test", [], stream=False):
+                        pass
+                await consume()
+
+        self.assertIn("Original query embedding failed", str(ctx.exception))
 
 
 class TestVariantFailureHandling:

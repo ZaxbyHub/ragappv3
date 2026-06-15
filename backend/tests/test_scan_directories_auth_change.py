@@ -387,18 +387,22 @@ class TestScanDirectoriesDecoratorVerification(TestScanDirectoriesAuthBase):
 
         The scan route has path "/scan" within the documents router (full path is "/documents/scan").
         """
-        from app.main import app
+        from app.api.routes.documents import router as documents_router
 
-        # Find the scan route from the main app's routes (full path includes prefix)
+        # Find the scan route from the documents router directly
+        # (app.routes may not expose APIRouter routes on all FastAPI versions)
         scan_route = None
-        for route in app.routes:
+        for route in documents_router.routes:
             if hasattr(route, "path") and "/scan" in route.path:
-                # Skip routes that are not the POST scan endpoint
                 if hasattr(route, "methods") and "POST" in route.methods:
                     scan_route = route
                     break
 
-        self.assertIsNotNone(scan_route, f"Could not find POST /scan route in app. Available routes: {[(r.path, getattr(r, 'methods', None)) for r in app.routes if hasattr(r, 'path')]}")
+        self.assertIsNotNone(
+            scan_route,
+            f"Could not find POST /scan route in documents router. "
+            f"Available routes: {[(r.path, getattr(r, 'methods', None)) for r in documents_router.routes if hasattr(r, 'path')]}",
+        )
 
         # Check the dependencies for require_admin_role
         # In FastAPI, the dependency chain is stored in route.dependant.dependencies

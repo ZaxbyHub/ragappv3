@@ -32,6 +32,23 @@ def _lance_escape(value) -> str:
     """Escape a value for use in LanceDB SQL-like where clauses.
 
     Uses SQL-standard doubled single-quote escaping consistently.
+
+    Security note — vault_id injection surface:
+        LanceDB's ``.where()`` method accepts only a string expression, not
+        parameter-bound values. Vault IDs are interpolated into filter strings
+        like ``f"vault_id = '{safe_vault_id}'"`` at multiple call sites in this
+        module (search, FTS search, delete). Without escaping, a crafted
+        vault_id value containing a single quote could break out of the string
+        literal and inject arbitrary filter predicates.
+
+        This function mitigates that risk by doubling all single quotes,
+        following the SQL-standard escaping convention. While LanceDB exposes
+        Expr-based filtering via ``where_expr()``, the ``.where()`` method used
+        throughout this module accepts only string expressions, so string-level
+        escaping is the required defense for this call pattern.
+
+    See also: ``_search_single_scale()`` (lines ~811, ~850), ``search()``
+    (lines ~1080, ~1110), ``delete_by_vault()`` (line ~1338) for call sites.
     """
     return str(value).replace("'", "''")
 

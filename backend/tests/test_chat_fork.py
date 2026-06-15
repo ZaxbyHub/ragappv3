@@ -2,13 +2,21 @@ import json
 import os
 import sqlite3
 import sys
+from unittest.mock import MagicMock
 
 import pytest
+from starlette.requests import Request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.api.routes import chat as chat_routes
 from app.models.database import init_db
+
+
+def _mock_request():
+    request = MagicMock(spec=Request)
+    request.client.host = "127.0.0.1"
+    return request
 
 
 class FailingMessageCopyConnection(sqlite3.Connection):
@@ -54,6 +62,7 @@ async def test_fork_response_returns_inserted_message_ids_and_created_at(
         monkeypatch.setattr(chat_routes, "evaluate_policy", allow_write)
 
         response = await chat_routes.fork_session(
+            _mock_request(),
             source_session_id,
             chat_routes.ForkSessionRequest(message_index=1),
             conn,
@@ -106,6 +115,7 @@ async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
         monkeypatch.setattr(chat_routes, "evaluate_policy", allow_write)
 
         response = await chat_routes.fork_session(
+            _mock_request(),
             source_session_id,
             chat_routes.ForkSessionRequest(message_index=0),
             conn,
@@ -157,6 +167,7 @@ async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path, monkeyp
 
         with pytest.raises(sqlite3.OperationalError, match="forced copy failure"):
             await chat_routes.fork_session(
+                _mock_request(),
                 source_session_id,
                 chat_routes.ForkSessionRequest(message_index=1),
                 conn,

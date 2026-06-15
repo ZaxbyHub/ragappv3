@@ -180,7 +180,7 @@ class LLMClient:
         Args:
             messages: List of message dicts with 'role' and 'content' keys
             temperature: Sampling temperature (default: 0.7)
-            max_tokens: Maximum tokens to generate (default: 2048)
+            max_tokens: Maximum tokens to generate (default: 32768)
 
         Returns:
             The generated content string
@@ -242,7 +242,7 @@ class LLMClient:
         Args:
             messages: List of message dicts with 'role' and 'content' keys
             temperature: Sampling temperature (default: 0.7)
-            max_tokens: Maximum tokens to generate (default: 2048)
+            max_tokens: Maximum tokens to generate (default: 32768)
 
         Yields:
             Content chunks as they arrive from the SSE stream

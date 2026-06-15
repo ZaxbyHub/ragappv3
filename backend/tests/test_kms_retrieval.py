@@ -134,6 +134,90 @@ class TestBuildKmsFtsQuery(unittest.TestCase):
     def test_empty_on_no_tokens(self):
         self.assertEqual(build_kms_fts_query("!!! ???"), "")
 
+    # ── Adversarial / FTS5 injection tests ──────────────────────────────────
+
+    def test_sql_injection_neutralized(self):
+        self.assertEqual(
+            build_kms_fts_query("'; DROP TABLE kms_entries; --"),
+            "drop* table* kms_entries*",
+        )
+
+    def test_fts5_boolean_and_neutralized(self):
+        self.assertEqual(
+            build_kms_fts_query("python AND java"),
+            "python* and* java*",
+        )
+
+    def test_fts5_boolean_or_neutralized(self):
+        self.assertEqual(
+            build_kms_fts_query("python OR java"),
+            "python* or* java*",
+        )
+
+    def test_fts5_boolean_not_neutralized(self):
+        self.assertEqual(
+            build_kms_fts_query("python NOT java"),
+            "python* not* java*",
+        )
+
+    def test_fts5_near_neutralized(self):
+        self.assertEqual(
+            build_kms_fts_query("python NEAR java"),
+            "python* near* java*",
+        )
+
+    def test_column_qualifier_stripped(self):
+        self.assertEqual(
+            build_kms_fts_query("title:secret"),
+            "title* secret*",
+        )
+
+    def test_phrase_query_stripped(self):
+        self.assertEqual(
+            build_kms_fts_query('"exact phrase"'),
+            "exact* phrase*",
+        )
+
+    def test_parentheses_stripped(self):
+        self.assertEqual(
+            build_kms_fts_query("(python OR java)"),
+            "python* or* java*",
+        )
+
+    def test_wildcard_abuse_stripped(self):
+        # Extra asterisks beyond the one the function adds are stripped by regex
+        self.assertEqual(build_kms_fts_query("pyth**"), "pyth*")
+
+    def test_underscore_preserved(self):
+        self.assertEqual(build_kms_fts_query("my_field"), "my_field*")
+
+    def test_token_limit_enforced(self):
+        input_many = " ".join([f"word{i}" for i in range(15)])
+        result = build_kms_fts_query(input_many)
+        tokens = result.split()
+        self.assertEqual(len(tokens), 8)
+        for t in tokens:
+            self.assertTrue(t.endswith("*"))
+
+    def test_no_fts5_special_chars_in_output(self):
+        import re
+        injection_inputs = [
+            "'; DROP TABLE kms_entries; --",
+            "python AND java",
+            "python OR java",
+            "python NOT java",
+            "python NEAR java",
+            "title:secret",
+            '"exact phrase"',
+            "(python OR java)",
+            "pyth**",
+        ]
+        safe_pattern = re.compile(r"^[a-z0-9_* ]+$")
+        for inp in injection_inputs:
+            result = build_kms_fts_query(inp)
+            self.assertRegex(result, safe_pattern,
+                f"Output '{result}' from input '{inp}' contains forbidden characters")
+
 
 if __name__ == "__main__":
     unittest.main()

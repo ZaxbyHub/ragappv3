@@ -693,7 +693,26 @@ Multiple KnowledgeVault instances can share a domain using distinct prefixes (e.
 - Deploy behind corporate VPN
 - Use private subnet access controls
 
-**Reverse Proxy Purpose:**
+### Rate Limiting
+
+KnowledgeVault uses `slowapi` for per-IP rate limiting. The default limits are:
+
+| Endpoint | Limit |
+|----------|-------|
+| Chat endpoints | 30/minute |
+| Search endpoints | 30/minute |
+| Vault creation | 30/minute |
+| Memory mutations | 30/minute |
+
+**Trusting reverse proxy headers:** When deployed behind a reverse proxy, you may want the rate limiter to use the `X-Forwarded-For` header to identify clients instead of the direct connection IP. Set `TRUST_PROXY_HEADERS=true` in `.env`:
+
+```env
+TRUST_PROXY_HEADERS=true
+```
+
+> **Security note:** Only enable `TRUST_PROXY_HEADERS` when behind a trusted reverse proxy (nginx, Caddy, etc.) that you control. The direct connection IP is used by default to prevent IP spoofing.
+
+### Reverse Proxy Purpose
 - TLS termination (HTTPS)
 - Optional additional authentication layer (e.g., Basic Auth for extranet access)
 - Request rate limiting
