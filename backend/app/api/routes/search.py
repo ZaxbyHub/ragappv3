@@ -23,7 +23,11 @@ from app.api.deps import (
 from app.config import settings
 from app.limiter import limiter
 from app.services.embeddings import EmbeddingError, EmbeddingService
-from app.services.vector_store import VectorStore, VectorStoreError
+from app.services.vector_store import (
+    SearchSemaphoreTimeoutError,
+    VectorStore,
+    VectorStoreError,
+)
 
 router = APIRouter()
 
@@ -191,6 +195,8 @@ async def search(
 
         return SearchResponse(results=results)
 
+    except SearchSemaphoreTimeoutError:
+        raise HTTPException(status_code=503, detail="Search temporarily unavailable")
     except EmbeddingError as e:
         raise HTTPException(
             status_code=500, detail=f"Embedding service error: {str(e)}"

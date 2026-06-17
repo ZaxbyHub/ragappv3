@@ -77,6 +77,12 @@ class VectorIndexCreationError(VectorStoreError):
     pass
 
 
+class SearchSemaphoreTimeoutError(VectorStoreError):
+    """Exception raised when search semaphore acquisition times out."""
+
+    pass
+
+
 class VectorStore:
     """LanceDB-based vector store for document chunk embeddings."""
 
@@ -134,6 +140,32 @@ class VectorStore:
             yield
         finally:
             self._write_lock.release()
+
+    @asynccontextmanager
+    async def _acquire_search_semaphore(self):
+        """Acquire the search semaphore with a configurable timeout.
+
+        Yields:
+            None
+
+        Raises:
+            VectorStoreError: If the semaphore acquisition times out.
+        """
+        semaphore = self._get_search_semaphore()
+        try:
+            await asyncio.wait_for(
+                semaphore.acquire(),
+                timeout=settings.search_semaphore_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            raise SearchSemaphoreTimeoutError(
+                f"Search semaphore acquisition timed out after {settings.search_semaphore_timeout_seconds}s; "
+                f"concurrency={semaphore._value}"
+            )
+        try:
+            yield
+        finally:
+            semaphore.release()
 
     async def connect(self) -> "VectorStore":
         """Connect to LanceDB.
@@ -1007,11 +1039,10 @@ class VectorStore:
             if len(scale_strs) > 1:
                 # Multi-scale search: query each scale with limited concurrency
                 # and perform cross-scale RRF
-                _semaphore = self._get_search_semaphore()
 
                 async def _sem_search_single_scale(scale: str) -> List[Dict[str, Any]]:
                     """Semaphore-guarded wrapper for _search_single_scale."""
-                    async with _semaphore:
+                    async with self._acquire_search_semaphore():
                         return await self._search_single_scale(
                             embedding=embedding,
                             scale=scale,
@@ -1068,7 +1099,7 @@ class VectorStore:
         if self.table is None:
             return []
 
-        async with self._get_search_semaphore():
+        async with self._acquire_search_semaphore():
             # Dense vector search
             # NOTE: Using query_type="vector" to bypass LanceDB's buggy auto-detection
             # which can cause UnboundLocalError when embedding_conf is None

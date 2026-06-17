@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from app.config import settings
-from app.models.database import SQLiteConnectionPool, get_pool
+from app.models.database import SQLiteConnectionPool
 from app.utils.fusion import rrf_fuse
 from app.utils.retry import with_retry
 
@@ -141,7 +141,7 @@ class MemoryStore:
         embedding_service: Optional[Any] = None,
     ) -> None:
         if pool is None:
-            pool = get_pool(str(settings.sqlite_path), max_size=2)
+            pool = SQLiteConnectionPool(str(settings.sqlite_path), max_size=settings.memory_store_pool_size)
         self.pool = pool
         # Optional. When None or when its calls fail, we silently fall back
         # to FTS-only retrieval so memory features still work in
@@ -190,6 +190,10 @@ class MemoryStore:
                 self.pool.release_connection(conn)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to store memory embedding (id=%s): %s", memory_id, exc)
+
+    def close_all(self) -> None:
+        """Close all connections in this MemoryStore's dedicated pool."""
+        self.pool.close_all()
 
     async def embed_and_store(self, memory_id: int, content: str) -> None:
         """Public helper: compute and persist the embedding for an existing memory.

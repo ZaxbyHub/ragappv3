@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import (
     assign_user_to_default_vault,
     get_db,
+    invalidate_active_user_cache,
     require_admin_role,
     require_role,
 )
@@ -336,6 +337,8 @@ async def update_user(
     await asyncio.to_thread(db.execute, f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?", tuple(update_values))
     await asyncio.to_thread(db.commit)
 
+    invalidate_active_user_cache(user_id)
+
     # Fetch updated user
     cursor = await asyncio.to_thread(db.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
     row = await asyncio.to_thread(cursor.fetchone)
@@ -403,6 +406,8 @@ async def admin_reset_password(
 
     await asyncio.to_thread(_admin_reset_password_db)
 
+    invalidate_active_user_cache(user_id)
+
     return {
         "message": "Password reset successfully",
         "must_change_password": True,
@@ -447,6 +452,8 @@ async def update_user_role(
         else:
             await asyncio.to_thread(cursor.execute, "UPDATE users SET role = ? WHERE id = ?", (body.role, user_id))
         await asyncio.to_thread(conn.commit)
+
+        invalidate_active_user_cache(user_id)
 
         return {
             "message": f"User role updated to {body.role}",
@@ -500,6 +507,8 @@ async def update_user_active(
         else:
             await asyncio.to_thread(cursor.execute, "UPDATE users SET is_active = ? WHERE id = ?", (1 if body.is_active else 0, user_id))
         await asyncio.to_thread(conn.commit)
+
+        invalidate_active_user_cache(user_id)
 
         status_str = "activated" if body.is_active else "deactivated"
         return {
@@ -555,6 +564,8 @@ async def delete_user(
         else:
             await asyncio.to_thread(cursor.execute, "DELETE FROM users WHERE id = ?", (user_id,))
         await asyncio.to_thread(conn.commit)
+
+        invalidate_active_user_cache(user_id)
 
         return {"message": "User deleted", "user_id": user_id}
     finally:

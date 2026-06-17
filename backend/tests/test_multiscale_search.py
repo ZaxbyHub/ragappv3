@@ -1,10 +1,10 @@
 """
 Tests for multi-scale search with asyncio.Semaphore in VectorStore.
 
-This module tests the asyncio.Semaphore(max=16) addition to limit concurrent
+This module tests the asyncio.Semaphore addition to limit concurrent
 scale searches in the multi-scale search path:
-1. vector_search_concurrency defaults to 16
-2. Multi-scale search with >16 scales returns correct results (semaphore limits but doesn't block)
+1. vector_search_concurrency defaults to 32
+2. Multi-scale search with >32 scales returns correct results (semaphore limits but doesn't block)
 3. Single-scale config (1 scale) does NOT enter the semaphore path
 4. Multi-scale disabled (config=False) does NOT enter the semaphore path
 5. Multi-scale search correctly collects results from all scales
@@ -22,16 +22,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.config import Settings
 from app.services.vector_store import VectorStore
 
 
 class TestVectorSearchConcurrencyDefault(unittest.TestCase):
     """Test cases for vector_search_concurrency default value."""
 
-    def test_vector_search_concurrency_defaults_to_16(self):
-        """Test that vector_search_concurrency default is 16 (mirrors config default)."""
-        # Hardcoded value mirrors the config default in Settings
-        self.assertEqual(16, 16)
+    def test_vector_search_concurrency_defaults_to_32(self):
+        """Test that vector_search_concurrency default is 32 (mirrors config default)."""
+        self.assertEqual(Settings().vector_search_concurrency, 32)
 
 
 class TestMultiScaleSearchSemaphore(unittest.IsolatedAsyncioTestCase):
@@ -102,6 +102,7 @@ class TestMultiScaleSearchSemaphore(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = "512,1024,2048"
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             # Search should NOT raise - should handle the exception gracefully
             results = await store.search(
@@ -149,6 +150,7 @@ class TestMultiScaleSearchSemaphore(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = "512,1024,2048"
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             # Should NOT raise - should return empty list gracefully
             results = await store.search(
@@ -237,15 +239,16 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = "256,512,768,1024,1536,2048"
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             await store.search(
                 embedding=[0.0] * self.embedding_dim,
                 limit=10,
             )
 
-        # Verify semaphore limited concurrency to 16 (or less)
-        # The max concurrent should not exceed vector_search_concurrency (16)
-        self.assertLessEqual(max_concurrent, 16)
+        # Verify semaphore limited concurrency to 4 (or less)
+        # The max concurrent should not exceed the test semaphore size (4)
+        self.assertLessEqual(max_concurrent, 4)
 
     @pytest.mark.asyncio
     async def test_semaphore_parallel_execution_timing(self):
@@ -284,6 +287,7 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = "256,512,768,1024,1536,2048"
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             start_time = time.perf_counter()
             await store.search(
@@ -346,6 +350,7 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = "256,512,1024,2048"
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             await store.search(
                 embedding=[0.0] * self.embedding_dim,
@@ -420,6 +425,7 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_chunk_sizes = (
                 "512,1024,2048"  # Multiple scales but disabled
             )
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             await store.search(
                 embedding=[0.0] * self.embedding_dim,
@@ -470,6 +476,7 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = "512,1024"
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             await store.search(
                 embedding=[0.0] * self.embedding_dim,
@@ -522,6 +529,7 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = " 512 , 1024 "  # Whitespace
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             await store.search(
                 embedding=[0.0] * self.embedding_dim,
@@ -576,6 +584,7 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = "512,,1024"  # Empty value
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             await store.search(
                 embedding=[0.0] * self.embedding_dim,
@@ -650,6 +659,7 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_indexing_enabled = True
             mock_settings.multi_scale_rrf_k = 60
             mock_settings.multi_scale_chunk_sizes = "512,1024,2048"
+            mock_settings.search_semaphore_timeout_seconds = 30.0
 
             results = await store.search(
                 embedding=[0.0] * self.embedding_dim,

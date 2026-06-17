@@ -31,6 +31,7 @@ from app.models.database import get_pool
 from app.security import csrf_protect
 from app.services.citation_validator import repair_against_sources_and_memories
 from app.services.rag_engine import RAGEngine, RAGEngineError
+from app.services.vector_store import SearchSemaphoreTimeoutError
 from app.services.wiki_citation_helpers import (
     build_per_claim_sources as _build_per_claim_sources_impl,
 )
@@ -285,6 +286,22 @@ def stream_chat_response(
                     wiki_used = chunk.get("wiki_used", [])
                     kms_used = chunk.get("kms_used", [])
                     score_type = chunk.get("score_type", score_type)
+        except RAGEngineError as exc:
+            logger.warning(
+                "RAG engine error in stream_chat_response: %s", exc
+            )
+            error_msg = "Chat processing failed"
+            yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'CHAT_PROCESSING_FAILED'})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+            return
+        except SearchSemaphoreTimeoutError as exc:
+            logger.warning(
+                "Search semaphore timeout in stream_chat_response: %s", exc
+            )
+            error_msg = "Search temporarily unavailable"
+            yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'SEARCH_UNAVAILABLE'})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+            return
         except Exception as e:
             logger.exception(
                 "Chat stream failed: user_id=%s, vault_id=%s, mode=%s, "
@@ -417,6 +434,9 @@ async def non_stream_chat_response(
     except RAGEngineError as exc:
         logger.warning("RAG engine error in non_stream_chat_response: %s", exc)
         raise HTTPException(status_code=503, detail="Chat processing failed")
+    except SearchSemaphoreTimeoutError as exc:
+        logger.warning("Search semaphore timeout in non_stream_chat_response: %s", exc)
+        raise HTTPException(status_code=503, detail="Search temporarily unavailable")
     except ValueError as exc:
         logger.warning("ValueError in non_stream_chat_response: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid request parameters")

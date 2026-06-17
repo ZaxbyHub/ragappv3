@@ -23,7 +23,7 @@ from app.services.prompt_builder import PromptBuilderService, calculate_primary_
 from app.services.query_transformer import QueryTransformer
 from app.services.rag_trace import RAGTrace
 from app.services.retrieval_evaluator import RetrievalEvaluator
-from app.services.vector_store import VectorStore
+from app.services.vector_store import SearchSemaphoreTimeoutError, VectorStore
 from app.utils.fusion import rrf_fuse
 
 # Sentinel marking "no per-instance override set" for live-settings properties.
@@ -743,6 +743,8 @@ class RAGEngine:
                     if vector_results
                     else "N/A",
                 )
+            except SearchSemaphoreTimeoutError:
+                raise
             except Exception as exc:
                 fallback_reason = str(exc)
                 vector_results = []
@@ -852,6 +854,8 @@ class RAGEngine:
                     trace.token_pack_truncated = repack_stats.get(
                         "token_pack_truncated", trace.token_pack_truncated
                     )
+            except SearchSemaphoreTimeoutError:
+                raise
             except Exception as exc:
                 logger.warning("Context distillation failed, continuing: %s", exc)
 
@@ -1284,6 +1288,9 @@ class RAGEngine:
 
         except RAGEngineError:
             # Re-raise original query search failures immediately
+            raise
+        except SearchSemaphoreTimeoutError:
+            # Propagate search semaphore timeouts so callers can return 503
             raise
         except Exception as search_error:
             # Handle paraphrase/search task failures - log and return empty results

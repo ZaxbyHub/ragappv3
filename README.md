@@ -240,6 +240,9 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `SEARCH_RATE_LIMIT` | `60` | Maximum search requests per minute per user (0 = unlimited) |
 | `VAULT_CREATE_RATE_LIMIT` | `10` | Maximum vault creation requests per minute per user (0 = unlimited) |
 | `MEMORY_MUTATION_RATE_LIMIT` | `30` | Maximum memory create/update/delete requests per minute per user (0 = unlimited) |
+| `ACTIVE_USER_CACHE_TTL_SECONDS` | `30` | TTL in seconds for cached active-user lookups. Range 5–300. Lower values reduce stale-data window; higher values reduce database load on frequently-accessed endpoints. |
+| `VECTOR_SEARCH_CONCURRENCY` | `32` | Maximum concurrent vector search operations (1-64). Controls search throughput under load. |
+| `SEARCH_SEMAPHORE_TIMEOUT_SECONDS` | `30.0` | Timeout in seconds for search semaphore acquisition (1.0-300.0). On timeout, `/search` and `/chat` endpoints return HTTP 503. |
 | `KMS_ENABLED` | `true` | Master switch for the KMS (Knowledge Management) subsystem |
 | `KMS_COMPILE_ON_INGEST` | `true` | Create/refresh a KMS document entry when a document finishes indexing |
 | `WIKI_ENABLED` | `true` | Master switch for the wiki subsystem. When `false`, all wiki routes return HTTP 503. |

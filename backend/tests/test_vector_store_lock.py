@@ -5,7 +5,7 @@ This module tests:
 1. _acquire_write_lock() acquires and releases the lock correctly
 2. _acquire_write_lock() raises VectorStoreError when timeout is exceeded
 3. Search semaphore size matches config value
-4. Config defaults: vector_search_concurrency is 16, write_lock_timeout_seconds is 30.0
+4. Config defaults: vector_search_concurrency is 32, write_lock_timeout_seconds is 30.0
 5. _acquire_write_lock() correctly releases lock on exception within the async context manager block
 
 Note: _acquire_write_lock is an async context manager (uses @asynccontextmanager), so it must be used
@@ -28,10 +28,10 @@ from app.services.vector_store import VectorStore, VectorStoreError
 class TestWriteLockConfigDefaults(unittest.TestCase):
     """Test cases for write lock config defaults."""
 
-    def test_vector_search_concurrency_default_is_16(self):
-        """Test that vector_search_concurrency defaults to 16."""
+    def test_vector_search_concurrency_default_is_32(self):
+        """Test that vector_search_concurrency defaults to 32."""
         settings = Settings()
-        self.assertEqual(settings.vector_search_concurrency, 16)
+        self.assertEqual(settings.vector_search_concurrency, 32)
 
     def test_write_lock_timeout_seconds_default_is_30(self):
         """Test that write_lock_timeout_seconds defaults to 30.0."""
@@ -179,7 +179,7 @@ class TestSearchSemaphore(unittest.IsolatedAsyncioTestCase):
         """
         Test that _get_search_semaphore() creates a semaphore with the correct size.
 
-        The semaphore._value should equal settings.vector_search_concurrency (default 16).
+        The semaphore._value should equal settings.vector_search_concurrency (default 32).
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -187,7 +187,7 @@ class TestSearchSemaphore(unittest.IsolatedAsyncioTestCase):
         semaphore = store._get_search_semaphore()
 
         # Verify semaphore value matches config
-        self.assertEqual(semaphore._value, 16)
+        self.assertEqual(semaphore._value, 32)
 
     async def test_search_semaphore_reuses_same_instance(self):
         """

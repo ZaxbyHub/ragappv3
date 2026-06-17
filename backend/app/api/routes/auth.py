@@ -10,7 +10,12 @@ from typing import Optional
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from app.api.deps import assign_user_to_default_vault, get_current_active_user, get_db
+from app.api.deps import (
+    assign_user_to_default_vault,
+    get_current_active_user,
+    get_db,
+    invalidate_active_user_cache,
+)
 from app.limiter import limiter
 from app.security import (
     CSRF_COOKIE_NAME,
@@ -589,6 +594,8 @@ async def update_me(
         logger.error("Failed to update user", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
+    invalidate_active_user_cache(user_id)
+
     return {
         "id": row[0],
         "username": row[1],
@@ -672,6 +679,8 @@ async def change_password(
     except Exception:
         logger.error("Failed to change password", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
+
+    invalidate_active_user_cache(user_id)
 
     # Generate new tokens
     access_token = create_access_token(user_id, username, role)

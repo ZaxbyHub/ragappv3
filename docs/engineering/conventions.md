@@ -52,6 +52,7 @@ update this doc when a convention genuinely changes.
 - Service classes take a `db: sqlite3.Connection` (SQLite-backed, e.g. `TagStore(conn)`) or a `db_path: Path` (LanceDB-backed, e.g. `VectorStore`).
 - Return rows as `@dataclass` records (e.g. `MemoryRecord`); convert to dicts at the API boundary with `dataclasses.asdict`.
 - Scope every query that joins user data by vault. Defense-in-depth: join to `files` and require `tag.vault_id = file.vault_id` rather than trusting upstream checks alone.
+- **`MemoryStore` has a dedicated connection pool**: `MemoryStore` creates its own `SQLiteConnectionPool` sized by `settings.memory_store_pool_size` (default 10, minimum 5). This pool is independent of the main app pool and is used for concurrent memory retrieval operations.
 
 ### Async
 - FastAPI handlers are `async`; SQLite is sync. Wrap blocking DB work in `await asyncio.to_thread(...)`. LanceDB/embedding services are natively async.
@@ -60,6 +61,14 @@ update this doc when a convention genuinely changes.
 - `UserRole`: VIEWER(1) < MEMBER(2) < ADMIN(3) < SUPERADMIN(4). Vault permission levels: read(1) < write(2) < admin(3).
 - Authorize through `evaluate = Depends(get_evaluate_policy)` then `await evaluate(user, "vault", vault_id, "read"|"write"|"admin")`. Resolution order: superadmin → app-admin baseline → explicit `vault_members` → `vault_group_access` → `visibility` (public/org).
 - Use `require_vault_permission(...)` / `require_admin_role` / the "admin somewhere" pattern (`require_document_admin`) for endpoint gates. Dependencies resolve before body validation, so an unauthorized caller gets 403 even on a malformed body.
+- **`require_vault_permission` uses DI-injected db**: Unlike the legacy `evaluate_policy()` standalone that opens its own pool connection, `require_vault_permission` passes the injected `db` connection to `get_evaluate_policy(db)`, avoiding a second pool connection per vault-protected request.
+- **`get_effective_vault_permissions` concurrent query pattern**: When SQLite threading mode is `SERIALIZED` (`sqlite3.threadsafety == 3`), four permission sub-queries run concurrently via `asyncio.gather` (`vault_members`, `vault_group_access`, public vaults, org vaults). On non-SERIALIZED builds, a sequential fallback via `asyncio.to_thread` is used to avoid "SQLite objects created in a thread can only be used in that same thread" errors and data corruption. A module-level `_SQLITE_SERIALIZED` flag gates this; a `_warn_fallback_threading()` helper logs the fallback once per process.
+
+### Active-user cache (`get_current_active_user`)
+- `get_current_active_user` caches user-row lookups in a process-local `dict` (`_ACTIVE_USER_CACHE`) keyed by `user_id`, with a configurable TTL via `settings.active_user_cache_ttl_seconds` (default 30 s, range 5–300 s).
+- Cache validity is checked with `time.monotonic()` so clock adjustments do not extend or shorten lifetimes unexpectedly.
+- Cache is thread-safe: `_ACTIVE_USER_CACHE_LOCK` (`threading.Lock`) guards all reads and writes.
+- **Cache invalidation**: `invalidate_active_user_cache(user_id)` removes the cached entry. All user-mutation endpoints (`update_me`, `change_password`, `update_user`, `admin_reset_password`, `update_user_role`, `update_user_active`, `delete_user`) call this after successful writes so the next `get_current_active_user` call fetches fresh data.
 
 ### Config, logging, naming
 - Config via `app/config.py` `Settings` (UPPER_SNAKE env vars → snake_case attrs); `SecretStr` for secrets; insecure defaults rejected at startup. Keep `.env.example` in sync (the `config-env-contract-check` skill audits this).

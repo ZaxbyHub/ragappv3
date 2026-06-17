@@ -6,8 +6,10 @@ import asyncio
 import logging
 import secrets
 import sqlite3
+import time
 from collections.abc import Callable
 from enum import IntEnum
+from threading import Lock
 from typing import TYPE_CHECKING
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request
@@ -22,6 +24,29 @@ from app.services.auth_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+# SQLite thread-safety guard for parallelized vault permission queries.
+# asyncio.to_thread runs callables in separate OS threads; sharing a single
+# sqlite3.Connection across those threads is only safe when SQLite is built
+# with SERIALIZED threading (sqlite3.threadsafety == 3). Otherwise, fall back
+# to sequential to_thread calls to avoid "SQLite objects created in a thread
+# can only be used in that same thread" and subtle data corruption.
+_SQLITE_SERIALIZED = sqlite3.threadsafety == 3
+_FALLBACK_WARNED = False
+
+
+def _warn_fallback_threading() -> None:
+    """Log the sequential fallback warning once per process."""
+    global _FALLBACK_WARNED
+    if _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED = True
+    logger.warning(
+        "SQLite threading mode is %s; get_effective_vault_permissions will "
+        "run sequentially. For parallel execution, use a SERIALIZED build "
+        "(sqlite3.threadsafety == 3).",
+        sqlite3.threadsafety,
+    )
 
 
 class UserRole(IntEnum):
@@ -44,6 +69,27 @@ class UserRole(IntEnum):
 VAULT_PERMISSION_LEVELS = {"read": 1, "write": 2, "admin": 3}
 VAULT_PERMISSION_NAMES = {0: None, 1: "read", 2: "write", 3: "admin"}
 VAULT_ACTION_LEVELS = {"read": 1, "write": 2, "delete": 3, "admin": 3}
+
+_ACTIVE_USER_CACHE: dict[str, tuple[dict, float]] = {}
+_ACTIVE_USER_CACHE_LOCK = Lock()
+_ACTIVE_USER_CACHE_KEY_FORMAT = "active_user:{user_id}"
+
+
+def _build_active_user_cache_key(user_id: int) -> str:
+    return _ACTIVE_USER_CACHE_KEY_FORMAT.format(user_id=user_id)
+
+
+def invalidate_active_user_cache(user_id: int) -> None:
+    """Remove cached active-user state for ``user_id``.
+
+    Mutation endpoints should call this after successful writes so
+    subsequent requests see the updated row. Multiple IDs can be
+    invalidated by calling this function in a loop.
+    """
+    cache_key = _build_active_user_cache_key(user_id)
+    with _ACTIVE_USER_CACHE_LOCK:
+        _ACTIVE_USER_CACHE.pop(cache_key, None)
+
 
 
 # Lazy imports — services are only loaded when their getter is actually called.
@@ -237,30 +283,53 @@ async def get_current_active_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    row = await asyncio.to_thread(
-        lambda: db.execute(
-            "SELECT id, username, full_name, role, is_active, must_change_password FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    )
+    cache_key = _build_active_user_cache_key(user_id)
+    ttl = settings.active_user_cache_ttl_seconds
+    cached_user = None
 
-    if not row:
-        raise HTTPException(
-            status_code=401,
-            detail="token_invalid",
-            headers={"WWW-Authenticate": "Bearer"},
+    if ttl > 0:
+        with _ACTIVE_USER_CACHE_LOCK:
+            cached_entry = _ACTIVE_USER_CACHE.get(cache_key)
+        if cached_entry is not None:
+            _cached_user, expires_at = cached_entry
+            if expires_at > time.monotonic():
+                cached_user = _cached_user
+                user = cached_user
+            else:
+                with _ACTIVE_USER_CACHE_LOCK:
+                    _ACTIVE_USER_CACHE.pop(cache_key, None)
+
+    if cached_user is None:
+        row = await asyncio.to_thread(
+            lambda: db.execute(
+                "SELECT id, username, full_name, role, is_active, must_change_password FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
         )
 
-    user = {
-        "id": row[0],
-        "username": row[1],
-        "full_name": row[2] or "",
-        "role": row[3],
-        "is_active": bool(row[4]),
-        "must_change_password": bool(row[5])
-        if len(row) > 5 and row[5] is not None
-        else False,
-    }
+        if not row:
+            raise HTTPException(
+                status_code=401,
+                detail="token_invalid",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        user = {
+            "id": row[0],
+            "username": row[1],
+            "full_name": row[2] or "",
+            "role": row[3],
+            "is_active": bool(row[4]),
+            "must_change_password": bool(row[5])
+            if len(row) > 5 and row[5] is not None
+            else False,
+        }
+
+        if ttl > 0:
+            with _ACTIVE_USER_CACHE_LOCK:
+                _ACTIVE_USER_CACHE[cache_key] = (user, time.monotonic() + ttl)
+    else:
+        user = cached_user
 
     if not user["is_active"]:
         raise HTTPException(
@@ -335,35 +404,23 @@ async def get_effective_vault_permissions(
     effective_levels = {vault_id: baseline_level for vault_id in normalized_ids}
     placeholders = ",".join("?" for _ in normalized_ids)
 
-    rows = await asyncio.to_thread(
-        lambda: db.execute(
+    def _query_vault_members():
+        return db.execute(
             f"""SELECT vault_id, permission FROM vault_members
                 WHERE user_id = ? AND vault_id IN ({placeholders})""",
             (user_id, *normalized_ids),
         ).fetchall()
-    )
-    for vault_id, permission in rows:
-        effective_levels[vault_id] = max(
-            effective_levels[vault_id],
-            VAULT_PERMISSION_LEVELS.get(permission, 0),
-        )
 
-    rows = await asyncio.to_thread(
-        lambda: db.execute(
+    def _query_group_access():
+        return db.execute(
             f"""SELECT vga.vault_id, vga.permission FROM vault_group_access vga
                JOIN group_members gm ON vga.group_id = gm.group_id
                WHERE gm.user_id = ? AND vga.vault_id IN ({placeholders})""",
             (user_id, *normalized_ids),
         ).fetchall()
-    )
-    for vault_id, permission in rows:
-        effective_levels[vault_id] = max(
-            effective_levels[vault_id],
-            VAULT_PERMISSION_LEVELS.get(permission, 0),
-        )
 
-    rows = await asyncio.to_thread(
-        lambda: db.execute(
+    def _query_public_vaults():
+        return db.execute(
             f"""SELECT v.id FROM vaults v
                 WHERE v.visibility = 'public' AND v.id IN ({placeholders})
                 AND (v.org_id IS NULL OR EXISTS (
@@ -371,15 +428,9 @@ async def get_effective_vault_permissions(
                 ))""",
             (*normalized_ids, user_id),
         ).fetchall()
-    )
-    for (vault_id,) in rows:
-        effective_levels[vault_id] = max(
-            effective_levels[vault_id],
-            VAULT_PERMISSION_LEVELS["read"],
-        )
 
-    rows = await asyncio.to_thread(
-        lambda: db.execute(
+    def _query_org_vaults():
+        return db.execute(
             f"""SELECT v.id FROM vaults v
                 WHERE v.visibility = 'org' AND v.id IN ({placeholders})
                 AND v.org_id IS NOT NULL
@@ -388,8 +439,40 @@ async def get_effective_vault_permissions(
                 )""",
             (*normalized_ids, user_id),
         ).fetchall()
-    )
-    for (vault_id,) in rows:
+
+    if _SQLITE_SERIALIZED:
+        members_rows, group_rows, public_rows, org_rows = await asyncio.gather(
+            asyncio.to_thread(_query_vault_members),
+            asyncio.to_thread(_query_group_access),
+            asyncio.to_thread(_query_public_vaults),
+            asyncio.to_thread(_query_org_vaults),
+        )
+    else:
+        _warn_fallback_threading()
+        members_rows = await asyncio.to_thread(_query_vault_members)
+        group_rows = await asyncio.to_thread(_query_group_access)
+        public_rows = await asyncio.to_thread(_query_public_vaults)
+        org_rows = await asyncio.to_thread(_query_org_vaults)
+
+    for vault_id, permission in members_rows:
+        effective_levels[vault_id] = max(
+            effective_levels[vault_id],
+            VAULT_PERMISSION_LEVELS.get(permission, 0),
+        )
+
+    for vault_id, permission in group_rows:
+        effective_levels[vault_id] = max(
+            effective_levels[vault_id],
+            VAULT_PERMISSION_LEVELS.get(permission, 0),
+        )
+
+    for (vault_id,) in public_rows:
+        effective_levels[vault_id] = max(
+            effective_levels[vault_id],
+            VAULT_PERMISSION_LEVELS["read"],
+        )
+
+    for (vault_id,) in org_rows:
         effective_levels[vault_id] = max(
             effective_levels[vault_id],
             VAULT_PERMISSION_LEVELS["read"],
@@ -494,9 +577,14 @@ def require_vault_permission(*actions: str):
     Usage: Depends(require_vault_permission("read", "admin"))
     """
 
-    async def _check(vault_id: int, user: dict = Depends(get_current_active_user)):
+    async def _check(
+        vault_id: int,
+        user: dict = Depends(get_current_active_user),
+        db: sqlite3.Connection = Depends(get_db),
+    ):
+        evaluate = get_evaluate_policy(db)
         for action in actions:
-            if await evaluate_policy(user, "vault", vault_id, action):
+            if await evaluate(user, "vault", vault_id, action):
                 return user
         raise HTTPException(status_code=403, detail="Insufficient vault permissions")
 

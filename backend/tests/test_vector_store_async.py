@@ -225,6 +225,7 @@ class TestVectorStoreAddChunks(TestVectorStoreAsync):
                 mock_settings.embedding_dim = self.embedding_dim
                 mock_settings.vector_metric = "cosine"
                 mock_settings.write_lock_timeout_seconds = 30
+                mock_settings.search_semaphore_timeout_seconds = 30.0
                 await store.add_chunks(records)
 
             self.assertEqual(await store.count_by_file("file1"), 3)
@@ -345,6 +346,7 @@ class TestVectorStoreAddChunks(TestVectorStoreAsync):
                 mock_settings.embedding_dim = embedding_dim
                 mock_settings.vector_metric = "cosine"
                 mock_settings.write_lock_timeout_seconds = 30
+                mock_settings.search_semaphore_timeout_seconds = 30.0
                 mock_settings.vector_search_concurrency = 4
                 mock_settings.multi_scale_indexing_enabled = False
                 mock_settings.multi_scale_chunk_sizes = ""
