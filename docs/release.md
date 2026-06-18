@@ -89,7 +89,8 @@ Before deploying KnowledgeVault to production, ensure the following:
   INSTANT_MAX_TOKENS=4096
 
   # Concurrency settings (optional, defaults shown)
-  VECTOR_SEARCH_CONCURRENCY=16
+  VECTOR_SEARCH_CONCURRENCY=32
+  SEARCH_SEMAPHORE_TIMEOUT_SECONDS=30.0
   WRITE_LOCK_TIMEOUT_SECONDS=30.0
   
   # Security settings

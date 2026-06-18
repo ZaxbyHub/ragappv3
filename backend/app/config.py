@@ -114,8 +114,10 @@ class Settings(BaseSettings):
     """When True, BackgroundProcessor.stop() calls VectorStore.flush_optimize() during graceful shutdown."""
     ingestion_llm_mode: str = "instant"
     """LLM client used for optional ingestion-time LLM work: 'instant', 'thinking', or 'disabled'."""
-    vector_search_concurrency: int = 16
+    vector_search_concurrency: int = 32
     """Maximum concurrent LanceDB search operations (1-64). Semaphore size for parallel vector searches."""
+    search_semaphore_timeout_seconds: float = 30.0
+    """Timeout in seconds for search semaphore acquisitions. Prevents indefinite blocking if search concurrency is saturated."""
     write_lock_timeout_seconds: float = 30.0
     """Timeout in seconds for write lock acquisitions. Prevents indefinite deadlock if a write operation hangs."""
 
@@ -161,6 +163,10 @@ class Settings(BaseSettings):
     chat pipeline skips the memory_store search step entirely."""
     memory_retrieval_top_k: int = 5
     """Maximum memories returned by hybrid memory search per query."""
+    memory_store_pool_size: int = 10
+    """Dedicated SQLiteConnectionPool max_size for MemoryStore concurrent
+    retrieval operations. Default 10 matches the application pool default
+    and removes the historical bottleneck of 2."""
     memory_relevance_filter_enabled: bool = True
     """When True, apply similarity thresholds to filter out weakly related memories
     before injecting them into the prompt. Prevents unrelated memories from polluting
@@ -225,6 +231,12 @@ class Settings(BaseSettings):
 
     query_transform_cache_ttl_sec: int = 86400
     """Time-to-live in seconds for cached query transformation results. Default 24 hours."""
+
+    active_user_cache_ttl_seconds: int = 30
+    """Time-to-live in seconds for cached active-user lookups in get_current_active_user.
+    0 disables the in-memory cache entirely. Positive values must be between 5 and 300
+    inclusive.
+    """
 
     # ── Retrieval evaluation configuration ────────────────────────────────────
     retrieval_evaluation_enabled: bool = True
@@ -661,6 +673,36 @@ class Settings(BaseSettings):
         return v
 
     # Consolidated range validators using helper functions
+    @field_validator("vector_search_concurrency", mode="after")
+    @classmethod
+    def validate_vector_search_concurrency(cls, v: int) -> int:
+        """Validate vector_search_concurrency is in range 1..64."""
+        return cls._validate_int_range(v, 1, 64, "vector_search_concurrency")
+
+    @field_validator("search_semaphore_timeout_seconds", mode="after")
+    @classmethod
+    def validate_search_semaphore_timeout_seconds(cls, v: float) -> float:
+        """Validate search semaphore timeout is in range 1.0..300.0."""
+        return cls._validate_float_range(v, 1.0, 300.0, "search_semaphore_timeout_seconds")
+
+    @field_validator("write_lock_timeout_seconds", mode="after")
+    @classmethod
+    def validate_write_lock_timeout_seconds(cls, v: float) -> float:
+        """Validate write lock timeout is in range 1.0..300.0."""
+        return cls._validate_float_range(v, 1.0, 300.0, "write_lock_timeout_seconds")
+
+    @field_validator("active_user_cache_ttl_seconds", mode="after")
+    @classmethod
+    def validate_active_user_cache_ttl_seconds(cls, v: int) -> int:
+        """Validate active-user cache TTL is within the allowed range 0..300.
+
+        0 disables the in-memory cache entirely; positive values must be
+        between 5 and 300 seconds.
+        """
+        if v == 0:
+            return v
+        return cls._validate_int_range(v, 5, 300, "active_user_cache_ttl_seconds")
+
     @field_validator("embedding_batch_max_retries", mode="after")
     @classmethod
     def validate_embedding_batch_max_retries(cls, v: int) -> int:
@@ -713,6 +755,21 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"ingestion_queue_max_size must be >= 1 (got {v}); "
                 "0 or negative values create an unbounded asyncio.Queue"
+            )
+        return v
+
+    @field_validator("memory_store_pool_size", mode="after")
+    @classmethod
+    def validate_memory_store_pool_size(cls, v: int) -> int:
+        """Ensure the MemoryStore pool size is at least 5.
+
+        Values below 5 bottleneck concurrent memory retrieval. This validator
+        enforces v >= 5 per FR-004/FR-008.
+        """
+        if v < 5:
+            raise ValueError(
+                f"memory_store_pool_size must be >= 5 (got {v}); "
+                "lower values bottleneck concurrent MemoryStore retrieval"
             )
         return v
 

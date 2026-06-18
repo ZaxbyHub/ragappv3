@@ -27,6 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Document organization (Phase 3)**: Normalized `tags` + `document_tags` tables (vault-scoped, `ON DELETE CASCADE`) with a `TagStore` service and CRUD/assignment routes under `/api/tags`. The document list (`GET /api/documents`) now accepts `sort_by` (`created_at`/`file_name`/`file_size`/`status`), `sort_order`, and `tag_id` filtering, and returns assigned tags per document (batched, no N+1). New `GET /api/documents/{id}` returns a single document with its tags and vault. Frontend: a dedicated document detail page at `/documents/:documentId` (metadata, tag editing, inline text/PDF preview), clickable sortable column headers, a tag filter, and a bulk tag-assignment dialog. `DocumentsPage` decomposed into focused components (`DocumentTable`, `DocumentCardsList`, `UploadQueue`, `UploadDropzone`, `DocumentStatsCards`, `RejectedFilesBanner`, `ConfirmDialog`, `TagFilter`, `BulkTagDialog`) and hooks (`useDocumentPolling`, `useBulkSelection`).
 - **Codebase review skill v8.2**: new `.opencode/skills/codebase-review-swarm/` skill for quote-grounded full-repo audits with Phase 0 inventory, non-diluting selected-track depth, reviewer validation, and Phase 2M MEDIUM/LOW finalization. Writes artifacts under `.swarm/review-v8/runs/<run_id>/`. Thin-pointer adapters in `.claude/skills/` and `.agents/skills/` keep the three runner trees in sync per `AGENTS.md:31`.
 - **Embedding-based semantic chunking wired up (issue #229 E1)**: `semantic_chunking_strategy = "embedding"` now actually selects the existing `EmbeddingSemanticChunker` (cosine-similarity breakpoints over sentence-window embeddings) during ingestion; it previously had no effect and the title-based chunker always ran. The default `"title"` behavior is unchanged, and the embedding strategy falls back to title-based chunking with a warning when no embedding service is available.
+- **Concurrency integration test for vault-protected routes (Phase 4)**: `backend/tests/test_concurrent_vault_requests.py` fires 10 simultaneous mixed read/write/admin vault-protected requests and asserts all return 2xx with zero 503s. Uses the canonical `SimpleConnectionPool` / dependency-override harness. Targets FR-006.
+- **Chat query load benchmark script (Phase 4)**: `backend/scripts/benchmark_chat_queries.py` measures `POST /api/chat` latency at 5, 10, and 20 concurrent users, reporting p50/p95/p99. Uses mocked `RAGEngine` and `VectorStore` so it runs CI-stable without a live LLM. Run with `python backend/scripts/benchmark_chat_queries.py`.
 
 ### Fixed
 
@@ -68,7 +70,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - bcrypt password verification (cost factor 14, ~400ms) now offloaded to dedicated ThreadPoolExecutor(4) via async_verify_password(), preventing event-loop blocking during login and password-change under concurrent load
 - All authentication endpoints now use async bcrypt operations via async_verify_password() and async_hash_password()
 - VectorStore write lock now has configurable asyncio.wait_for timeout (default 30s) via @asynccontextmanager _acquire_write_lock(); all 8 write paths updated
-- VectorStore search concurrency increased from hardcoded 4 to configurable settings.vector_search_concurrency (default 16)
+- VectorStore search concurrency default increased from 16 to 32 (still configurable via VECTOR_SEARCH_CONCURRENCY; 1-64 range)
 - LLM HTTP client pool limits now configurable: `LLM_MAX_CONNECTIONS` (default 100) and `LLM_MAX_KEEPALIVE_CONNECTIONS` (default 50)
 - LanceDB optimize_mode default changed from "after_every_write" to "periodic" to reduce compaction blocking on every chunk write
 - Pull request CI now checks frontend toolchain compatibility, root and subpath frontend builds, configuration contract drift, and high-risk PR test-scope drift.
@@ -96,7 +98,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- New config settings: vector_search_concurrency (default 16), write_lock_timeout_seconds (default 30.0)
+- New config settings: search_semaphore_timeout_seconds (default 30.0, range 1.0-300.0), active_user_cache_ttl_seconds (default 30, 0 disables cache, positive range 5-300, per-process cache), memory_store_pool_size (default 10, min 5)
 - _auth_executor.shutdown() in application teardown for clean ThreadPoolExecutor lifecycle
 
 ## [1.0.6] - 2026-05-02

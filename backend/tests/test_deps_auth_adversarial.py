@@ -18,12 +18,12 @@ Target functions:
 import sqlite3
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 # Add backend to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import HTTPException
 
@@ -586,23 +586,18 @@ class TestRequireVaultPermissionEdgeCases:
         permission_check = require_vault_permission("read")
 
         mock_user = {"id": 1, "role": "member"}
+        mock_db = MagicMock()
+        mock_evaluate = AsyncMock(return_value=False)
+        mock_db_factory = MagicMock(return_value=mock_evaluate)
 
-        # Mock the database pool for evaluate_policy
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = None
-        mock_cursor.fetchall.return_value = []
-        mock_conn.execute.return_value = mock_cursor
-
-        mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
-
-        with patch("app.api.deps.get_pool", return_value=mock_pool):
+        with patch("app.api.deps.get_evaluate_policy", mock_db_factory):
             # Should raise 403 - no access to negative vault ID
             with pytest.raises(HTTPException) as exc_info:
-                await permission_check(vault_id=-1, user=mock_user)
+                await permission_check(vault_id=-1, user=mock_user, db=mock_db)
 
             assert exc_info.value.status_code == 403
+        mock_db_factory.assert_called_once_with(mock_db)
+        mock_evaluate.assert_awaited_with(mock_user, "vault", -1, "read")
 
     @pytest.mark.asyncio
     async def test_require_vault_permission_zero_vault_id(self):
@@ -612,21 +607,17 @@ class TestRequireVaultPermissionEdgeCases:
         permission_check = require_vault_permission("read")
 
         mock_user = {"id": 1, "role": "member"}
+        mock_db = MagicMock()
+        mock_evaluate = AsyncMock(return_value=False)
+        mock_db_factory = MagicMock(return_value=mock_evaluate)
 
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = None
-        mock_cursor.fetchall.return_value = []
-        mock_conn.execute.return_value = mock_cursor
-
-        mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
-
-        with patch("app.api.deps.get_pool", return_value=mock_pool):
+        with patch("app.api.deps.get_evaluate_policy", mock_db_factory):
             with pytest.raises(HTTPException) as exc_info:
-                await permission_check(vault_id=0, user=mock_user)
+                await permission_check(vault_id=0, user=mock_user, db=mock_db)
 
             assert exc_info.value.status_code == 403
+        mock_db_factory.assert_called_once_with(mock_db)
+        mock_evaluate.assert_awaited_with(mock_user, "vault", 0, "read")
 
     @pytest.mark.asyncio
     async def test_require_vault_permission_very_large_vault_id(self):
@@ -636,21 +627,17 @@ class TestRequireVaultPermissionEdgeCases:
         permission_check = require_vault_permission("read")
 
         mock_user = {"id": 1, "role": "member"}
+        mock_db = MagicMock()
+        mock_evaluate = AsyncMock(return_value=False)
+        mock_db_factory = MagicMock(return_value=mock_evaluate)
 
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.fetchone.return_value = None
-        mock_cursor.fetchall.return_value = []
-        mock_conn.execute.return_value = mock_cursor
-
-        mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
-
-        with patch("app.api.deps.get_pool", return_value=mock_pool):
+        with patch("app.api.deps.get_evaluate_policy", mock_db_factory):
             with pytest.raises(HTTPException) as exc_info:
-                await permission_check(vault_id=9999999999, user=mock_user)
+                await permission_check(vault_id=9999999999, user=mock_user, db=mock_db)
 
             assert exc_info.value.status_code == 403
+        mock_db_factory.assert_called_once_with(mock_db)
+        mock_evaluate.assert_awaited_with(mock_user, "vault", 9999999999, "read")
 
     @pytest.mark.asyncio
     async def test_require_vault_permission_empty_actions(self):
@@ -662,13 +649,34 @@ class TestRequireVaultPermissionEdgeCases:
         permission_check = require_vault_permission()
 
         mock_user = {"id": 1, "role": "superadmin"}
+        mock_db = MagicMock()
 
         # Even superadmin with empty actions should fail
         # because there are no actions to check
         with pytest.raises(HTTPException) as exc_info:
-            await permission_check(vault_id=1, user=mock_user)
+            await permission_check(vault_id=1, user=mock_user, db=mock_db)
 
         assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_require_vault_permission_uses_injected_db(self):
+        """
+        Regression: require_vault_permission now uses get_evaluate_policy with
+        the injected db instead of opening a standalone pool connection.
+        """
+        permission_check = require_vault_permission("read")
+
+        mock_user = {"id": 1, "role": "member"}
+        mock_db = MagicMock()
+        mock_evaluate = AsyncMock(return_value=True)
+        mock_db_factory = MagicMock(return_value=mock_evaluate)
+
+        with patch("app.api.deps.get_evaluate_policy", mock_db_factory):
+            result = await permission_check(vault_id=1, user=mock_user, db=mock_db)
+
+        assert result == mock_user
+        mock_db_factory.assert_called_once_with(mock_db)
+        mock_evaluate.assert_awaited_with(mock_user, "vault", 1, "read")
 
 
 # =============================================================================

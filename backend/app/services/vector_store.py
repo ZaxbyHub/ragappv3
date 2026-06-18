@@ -28,6 +28,18 @@ _fts_lock = threading.Lock()
 VECTOR_INDEX_MIN_ROWS = 256
 
 
+def _get_search_semaphore_timeout() -> float:
+    """Return the configured search semaphore timeout, falling back to the default when settings is mocked."""
+    value = settings.search_semaphore_timeout_seconds
+    return value if isinstance(value, (int, float)) else 30.0
+
+
+def _get_vector_search_concurrency() -> int:
+    """Return the configured search semaphore concurrency, falling back to the default when settings is mocked."""
+    value = settings.vector_search_concurrency
+    return value if isinstance(value, int) else 32
+
+
 def _lance_escape(value) -> str:
     """Escape a value for use in LanceDB SQL-like where clauses.
 
@@ -77,6 +89,12 @@ class VectorIndexCreationError(VectorStoreError):
     pass
 
 
+class SearchSemaphoreTimeoutError(VectorStoreError):
+    """Exception raised when search semaphore acquisition times out."""
+
+    pass
+
+
 class VectorStore:
     """LanceDB-based vector store for document chunk embeddings."""
 
@@ -108,7 +126,7 @@ class VectorStore:
     def _get_search_semaphore(self) -> asyncio.Semaphore:
         """Return the shared search semaphore, creating it on first call."""
         if self._search_semaphore is None:
-            self._search_semaphore = asyncio.Semaphore(settings.vector_search_concurrency)
+            self._search_semaphore = asyncio.Semaphore(_get_vector_search_concurrency())
         return self._search_semaphore
 
     @asynccontextmanager
@@ -134,6 +152,32 @@ class VectorStore:
             yield
         finally:
             self._write_lock.release()
+
+    @asynccontextmanager
+    async def _acquire_search_semaphore(self):
+        """Acquire the search semaphore with a configurable timeout.
+
+        Yields:
+            None
+
+        Raises:
+            VectorStoreError: If the semaphore acquisition times out.
+        """
+        semaphore = self._get_search_semaphore()
+        try:
+            await asyncio.wait_for(
+                semaphore.acquire(),
+                timeout=_get_search_semaphore_timeout(),
+            )
+        except asyncio.TimeoutError:
+            raise SearchSemaphoreTimeoutError(
+                f"Search semaphore acquisition timed out after {_get_search_semaphore_timeout()}s; "
+                f"concurrency={getattr(semaphore, '_value', '?')}"
+            )
+        try:
+            yield
+        finally:
+            semaphore.release()
 
     async def connect(self) -> "VectorStore":
         """Connect to LanceDB.
@@ -1007,11 +1051,10 @@ class VectorStore:
             if len(scale_strs) > 1:
                 # Multi-scale search: query each scale with limited concurrency
                 # and perform cross-scale RRF
-                _semaphore = self._get_search_semaphore()
 
                 async def _sem_search_single_scale(scale: str) -> List[Dict[str, Any]]:
                     """Semaphore-guarded wrapper for _search_single_scale."""
-                    async with _semaphore:
+                    async with self._acquire_search_semaphore():
                         return await self._search_single_scale(
                             embedding=embedding,
                             scale=scale,
@@ -1068,7 +1111,7 @@ class VectorStore:
         if self.table is None:
             return []
 
-        async with self._get_search_semaphore():
+        async with self._acquire_search_semaphore():
             # Dense vector search
             # NOTE: Using query_type="vector" to bypass LanceDB's buggy auto-detection
             # which can cause UnboundLocalError when embedding_conf is None

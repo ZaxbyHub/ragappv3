@@ -11,6 +11,7 @@ the `writing-tests` skill in every agent tree and by `AGENTS.md`. Pairs with
 - **New behavior ships with tests.** Features and bug fixes get corresponding tests in the same change. For a bug fix, add a test that reproduces the bug, then make it pass.
 - **Assert behavior, not just status.** Backend: assert HTTP status **and** response body **and** the resulting DB state change. Frontend: assert the callback was invoked with the expected arguments / the expected DOM appeared — not merely that the component rendered.
 - **Test the negative paths.** Cross-vault isolation, permission denials (403), invalid input (422), cascade deletes, and error branches. Security-sensitive paths often have an `*_adversarial` companion test file — follow that precedent.
+- **Pool size and connection validation**: When adding configurable pool sizes or connection limits (e.g. `memory_store_pool_size`), add adversarial tests that verify validation rejects values below the minimum (e.g. 0, negative) and accepts values at or above the minimum.
 - **No test theater.** A test whose name claims a behavior must actually exercise it. (Example fixed in this repo: a TagFilter test named "emits the tag id on selection" that never fired a selection — see `frontend/src/tests/documents-organization.test.tsx`.)
 - **Match the production exception type** in mocks — don't catch/raise bare `Exception` when the code under test catches something specific.
 
@@ -32,7 +33,19 @@ Config: `backend/pyproject.toml` `[tool.pytest.ini_options]` — `testpaths=["te
 - **Per-file `lancedb`/`pyarrow`/`unstructured` import stubs are load-bearing for CI**, not redundant boilerplate — CI installs the reduced `requirements-ci.txt` (see §4), which omits those packages. Removing a stub can break collection in CI even though the file passes locally with the full deps installed.
 
 ### Avoid the local event-loop trap
-CI pins **Python 3.11**. On a newer local interpreter (e.g. 3.14), tests that call `asyncio.get_event_loop()` / `loop.run_until_complete(...)` fail with **`RuntimeError: There is no current event loop`** — this is a local-interpreter artifact, **not a regression**. Known-affected files include `test_document_actions_audit.py`, `test_embeddings_pooling*.py`, `test_exact_match_promote_adversarial.py`, `test_library_vault_id_config.py`, `test_vault_query_limit.py`. Prefer `IsolatedAsyncioTestCase` / `asyncio.run(...)` over manual `get_event_loop()` in new tests; use a 3.11 venv locally when you can. The `ruff` lint gate and the CI-targeted tests are the reliable local signals.
+CI pins **Python 3.11**. On a newer local interpreter (e.g. 3.14), tests that call `asyncio.get_event_loop()` / `loop.run_until_complete(...)` fail with **`RuntimeError: There is no current event loop`** — this is a local-interpreter artifact, **not a regression**. Known-affected files include `test_embeddings_pooling_adversarial.py`, `test_exact_match_promote_adversarial.py`, `test_vault_query_limit.py`. Prefer `IsolatedAsyncioTestCase` / `asyncio.run(...)` over manual `get_event_loop()` in new tests; use a 3.11 venv locally when you can. The `ruff` lint gate and the CI-targeted tests are the reliable local signals.
+
+### Active-user cache tests (`test_active_user_cache.py`)
+Tests for `get_current_active_user` caching live in `backend/tests/test_active_user_cache.py`. Key patterns:
+- **`SimpleConnectionPool` + `app.dependency_overrides`** harness (same as other route tests).
+- Cache state is module-level in `deps.py` (`_ACTIVE_USER_CACHE` dict + `_ACTIVE_USER_CACHE_LOCK`). Tests must reset it in `setUp`/`tearDown` by calling `deps._ACTIVE_USER_CACHE.clear()` — patching `time.monotonic` to control TTL expiry is also necessary for expiry-edge cases.
+- `invalidate_active_user_cache` is tested by inserting a cached entry, calling the function, and asserting the dict is empty.
+
+### Parallel vault permission tests (`test_effective_vault_permissions_parallel.py`)
+Tests for concurrent permission queries live in `backend/tests/test_effective_vault_permissions_parallel.py`. Key patterns:
+- Uses `IsolatedAsyncioTestCase` to test the `asyncio.gather` path in `get_effective_vault_permissions`.
+- The `_SQLITE_SERIALIZED` flag in `deps.py` controls whether the concurrent or sequential branch runs; tests may monkey-patch `deps._SQLITE_SERIALIZED` to force either path.
+- Seeds multiple vaults, groups, and memberships; asserts each vault returns the correct effective permission string.
 
 ---
 
@@ -56,13 +69,11 @@ Canonical examples: `frontend/src/tests/documents-organization.test.tsx`, `front
 
 ## 4. What CI runs vs. what you should run
 
-CI (`.github/workflows/ci.yml`) is **not** the full suite:
+CI (`.github/workflows/ci.yml`) runs the full suite:
 
-- **Backend job:** `ruff check .` + an *enumerated, narrow* pytest subset (`test_path_prefix.py`, `test_auth_routes.py`, `test_main_catchall.py`, `test_csrf_auth.py`, `test_change_password.py`, `test_deps_auth_must_change_password.py`, `test_settings_ssrf.py`, `test_embeddings_cache.py`) + informational coverage over the same list. Adding a file to this list is what "expanding CI test scope" means.
+- **Backend job:** `ruff check .` + the full pytest suite (`pytest --tb=short -v --timeout=300 tests/`).
 - **Frontend job:** `npm run typecheck`, `npm run lint`, API smoke tests, full `npm test`, `npm run build`, and a subpath build.
 - **Quality contracts:** `check_config_contract.py`, `check_pr_scope_drift.py`.
-
-Because the backend CI subset is narrow, **also run the tests for the area you changed** locally (e.g. `pytest -q tests/test_tags_routes.py`). The `ci-compatibility-audit` skill lists the exact local mirror commands; run it before pushing.
 
 **The backend CI dependency set is reduced — "locally green" ≠ "CI green".** CI installs only `requirements-ci.txt` + `requirements-dev.txt`, which omit `lancedb`, `pyarrow`, `unstructured`, and `sentence-transformers` (stubbed per-file at test time). A dev machine usually has the full `requirements.txt`, so a backend test can pass locally yet fail in CI at import (`ModuleNotFoundError`). To validate a backend **test-scope** change (e.g. adding a file to the CI pytest list) faithfully — and faster, with no multi-GB model/db loads — reproduce the CI env instead of trusting the local run:
 

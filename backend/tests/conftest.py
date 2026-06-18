@@ -6,6 +6,7 @@ This ensures settings are initialized with test-compatible values every time.
 """
 
 import os
+import sys
 
 import pytest
 
@@ -137,6 +138,35 @@ def _reset_db_pool():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _reset_active_user_cache():
+    """Clear the active-user cache before and after every test.
+
+    The module-level ``_ACTIVE_USER_CACHE`` in ``app.api.deps`` persists
+    across the full test run. Without a reset, a test that authenticates
+    user_id=1 as 'superadmin' leaves a stale cache entry that causes
+    subsequent tests expecting user_id=1 to be 'testuser' (or a different
+    role) to receive 403 / wrong-user responses.
+
+    We intentionally do NOT acquire ``_ACTIVE_USER_CACHE_LOCK`` here: that
+    lock is a ``threading.Lock`` and holding it across the yield boundary
+    deadlocks when the async test body also tries to acquire it. The cache
+    is only accessed from the test's own event loop, so a plain dict clear
+    is safe at fixture boundaries.
+    """
+    try:
+        from app.api.deps import _ACTIVE_USER_CACHE
+        _ACTIVE_USER_CACHE.clear()
+    except (ImportError, AttributeError):
+        pass
+    yield
+    try:
+        from app.api.deps import _ACTIVE_USER_CACHE
+        _ACTIVE_USER_CACHE.clear()
+    except (ImportError, AttributeError):
+        pass
+
+
 # Cache for bcrypt hash of common test passwords (saves ~1 sec per hash)
 # Created lazily on first test invocation. Keyed by password string.
 _bcrypt_hash_cache: dict = {}
@@ -170,7 +200,7 @@ def _cache_bcrypt_hash_for_test_passwords():
     except ImportError:
         return  # app.services.auth_service not importable; skip this fixture
 
-    # Patch pwd_context.hash (the underlying CryptContext method), NOT
+    # Patch pwd_context.hash (the underlying method that hash_password calls), NOT
     # auth_service.hash_password. The latter is bypassed by tests that do
     # `from app.services.auth_service import hash_password` at module level.
     original_pwd_hash = _auth_module.pwd_context.hash
@@ -210,7 +240,6 @@ def pytest_configure(config):
     # Fix: import pandas first (while pyarrow is absent), THEN install a rich
     # stub with __getattr__ so pandas can import cleanly and later calls to
     # is_pyarrow_array() return False gracefully.
-    import sys
     import types as _types
 
     # Import pandas before any pyarrow stub so it initialises without errors.

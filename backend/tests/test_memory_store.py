@@ -5,6 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pydantic
+
+from app.config import Settings
 from app.models.database import SQLiteConnectionPool, init_db
 from app.services.memory_store import MemoryRecord, MemoryStore, MemoryStoreError
 
@@ -62,14 +65,14 @@ class TestMemoryStore(unittest.TestCase):
         result = self.store.add_memory(
             content="Test memory content",
             category="test_category",
-            tags="[\"tag1\", \"tag2\"]",
+            tags='["tag1", "tag2"]',
             source="test_source"
         )
 
         self.assertIsInstance(result, MemoryRecord)
         self.assertEqual(result.content, "Test memory content")
         self.assertEqual(result.category, "test_category")
-        self.assertEqual(result.tags, "[\"tag1\", \"tag2\"]")
+        self.assertEqual(result.tags, '["tag1", "tag2"]')
         self.assertEqual(result.source, "test_source")
         self.assertIsNotNone(result.id)
         self.assertIsNotNone(result.created_at)
@@ -174,6 +177,62 @@ class TestMemoryStore(unittest.TestCase):
         """Test that whitespace-only text returns None."""
         result = self.store.detect_memory_intent("   \t\n  ")
         self.assertIsNone(result)
+
+
+    def test_memory_store_pool_size_rejects_below_five(self):
+        """Test that Settings rejects memory_store_pool_size values below 5."""
+        with self.assertRaises(pydantic.ValidationError):
+            Settings(memory_store_pool_size=0)
+        with self.assertRaises(pydantic.ValidationError):
+            Settings(memory_store_pool_size=4)
+
+    def test_memory_store_pool_size_accepts_five(self):
+        """Test that Settings accepts memory_store_pool_size=5 (minimum valid value)."""
+        s = Settings(memory_store_pool_size=5)
+        self.assertEqual(s.memory_store_pool_size, 5)
+
+    def test_memory_store_pool_size_accepts_twenty_five(self):
+        """Test that Settings accepts memory_store_pool_size=25."""
+        s = Settings(memory_store_pool_size=25)
+        self.assertEqual(s.memory_store_pool_size, 25)
+
+    def test_default_memory_store_pool_size_is_ten(self):
+        """Test that the default MemoryStore pool size matches settings.memory_store_pool_size (default 10)."""
+        from app.config import settings
+        from app.models.database import _pool_cache
+
+        store = MemoryStore()
+        self.assertEqual(store.pool.max_size, settings.memory_store_pool_size)
+        self.assertEqual(store.pool.max_size, 10)
+        self.assertIsNot(store.pool, _pool_cache.get(str(settings.sqlite_path)))
+        try:
+            store.close_all()
+        finally:
+            from app.services.memory_store import MemoryStore as _MemoryStore
+            _cached = _pool_cache.get(str(settings.sqlite_path))
+            if _cached is not None:
+                _cached.close_all()
+
+    def test_memory_store_pool_size_is_configurable_via_settings(self):
+        """Test that MemoryStore respects an overridden memory_store_pool_size setting."""
+        from app.config import settings
+        from app.models.database import _pool_cache
+
+        original = settings.memory_store_pool_size
+        try:
+            settings.memory_store_pool_size = 25
+            store = MemoryStore()
+            self.assertEqual(store.pool.max_size, 25)
+            self.assertIsNot(store.pool, _pool_cache.get(str(settings.sqlite_path)))
+        finally:
+            settings.memory_store_pool_size = original
+            try:
+                store.close_all()
+            finally:
+                from app.services.memory_store import MemoryStore as _MemoryStore
+                _cached = _pool_cache.get(str(settings.sqlite_path))
+                if _cached is not None:
+                    _cached.close_all()
 
 
 if __name__ == "__main__":
