@@ -137,6 +137,34 @@ def _reset_db_pool():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _reset_active_user_cache():
+    """Clear the active-user cache before and after every test.
+
+    The module-level ``_ACTIVE_USER_CACHE`` in ``app.api.deps`` persists
+    across the full test run. Without a reset, a test that authenticates
+    user_id=1 as 'superadmin' leaves a stale cache entry that causes
+    subsequent tests expecting user_id=1 to be 'testuser' (or a different
+    role) to receive 403 / wrong-user responses — 34 failures in CI.
+
+    Mirrors the ``_reset_db_pool`` pattern: synchronous, try/except
+    ImportError, clear before and after yield.
+    """
+    try:
+        from app.api.deps import _ACTIVE_USER_CACHE, _ACTIVE_USER_CACHE_LOCK
+        with _ACTIVE_USER_CACHE_LOCK:
+            _ACTIVE_USER_CACHE.clear()
+    except (ImportError, AttributeError):
+        pass
+    yield
+    try:
+        from app.api.deps import _ACTIVE_USER_CACHE, _ACTIVE_USER_CACHE_LOCK
+        with _ACTIVE_USER_CACHE_LOCK:
+            _ACTIVE_USER_CACHE.clear()
+    except (ImportError, AttributeError):
+        pass
+
+
 # Cache for bcrypt hash of common test passwords (saves ~1 sec per hash)
 # Created lazily on first test invocation. Keyed by password string.
 _bcrypt_hash_cache: dict = {}
