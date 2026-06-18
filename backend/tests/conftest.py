@@ -138,6 +138,35 @@ def _reset_db_pool():
         pass
 
 
+@pytest.fixture(autouse=True)
+def _reset_active_user_cache():
+    """Clear the active-user cache before and after every test.
+
+    The module-level ``_ACTIVE_USER_CACHE`` in ``app.api.deps`` persists
+    across the full test run. Without a reset, a test that authenticates
+    user_id=1 as 'superadmin' leaves a stale cache entry that causes
+    subsequent tests expecting user_id=1 to be 'testuser' (or a different
+    role) to receive 403 / wrong-user responses.
+
+    We intentionally do NOT acquire ``_ACTIVE_USER_CACHE_LOCK`` here: that
+    lock is a ``threading.Lock`` and holding it across the yield boundary
+    deadlocks when the async test body also tries to acquire it. The cache
+    is only accessed from the test's own event loop, so a plain dict clear
+    is safe at fixture boundaries.
+    """
+    try:
+        from app.api.deps import _ACTIVE_USER_CACHE
+        _ACTIVE_USER_CACHE.clear()
+    except (ImportError, AttributeError):
+        pass
+    yield
+    try:
+        from app.api.deps import _ACTIVE_USER_CACHE
+        _ACTIVE_USER_CACHE.clear()
+    except (ImportError, AttributeError):
+        pass
+
+
 # Cache for bcrypt hash of common test passwords (saves ~1 sec per hash)
 # Created lazily on first test invocation. Keyed by password string.
 _bcrypt_hash_cache: dict = {}
@@ -237,7 +266,6 @@ def pytest_configure(config):
         _pa = _PyArrowModule('pyarrow')
         sys.modules['pyarrow'] = _pa
 
-    os.environ["ACTIVE_USER_CACHE_TTL_SECONDS"] = "0"
     os.environ["ADMIN_SECRET_TOKEN"] = "test-admin-key"
     os.environ["USERS_ENABLED"] = "false"
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
