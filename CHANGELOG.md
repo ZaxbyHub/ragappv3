@@ -98,7 +98,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- New config settings: search_semaphore_timeout_seconds (default 30.0, range 1.0-300.0), active_user_cache_ttl_seconds (default 30, range 5-300, per-process cache), memory_store_pool_size (default 10, min 5)
+- New config settings: search_semaphore_timeout_seconds (default 30.0, range 1.0-300.0), active_user_cache_ttl_seconds (default 30, 0 disables cache, positive range 5-300, per-process cache), memory_store_pool_size (default 10, min 5)
 - _auth_executor.shutdown() in application teardown for clean ThreadPoolExecutor lifecycle
 
 ## [1.0.6] - 2026-05-02

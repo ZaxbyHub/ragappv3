@@ -1,5 +1,6 @@
 """Tests for the active user cache in deps.get_current_active_user."""
 
+import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,16 +15,6 @@ from app.api.deps import (
     invalidate_active_user_cache,
 )
 from app.config import Settings
-
-
-@pytest.fixture(autouse=True)
-def _reset_active_user_cache():
-    """Ensure the module-level active-user cache is empty between tests."""
-    with _ACTIVE_USER_CACHE_LOCK:
-        _ACTIVE_USER_CACHE.clear()
-    yield
-    with _ACTIVE_USER_CACHE_LOCK:
-        _ACTIVE_USER_CACHE.clear()
 
 
 @pytest.fixture
@@ -102,6 +93,8 @@ class TestActiveUserCache:
         cache_key = _build_active_user_cache_key(user_id)
         mock_db = _make_mock_db()
 
+        with _ACTIVE_USER_CACHE_LOCK:
+            _ACTIVE_USER_CACHE.clear()
         assert cache_key not in _ACTIVE_USER_CACHE
 
         result = await get_current_active_user(
@@ -280,9 +273,14 @@ class TestActiveUserCacheTTLValidation:
     """Validation tests for the active_user_cache_ttl_seconds config field."""
 
     def test_ttl_below_minimum_raises(self):
-        """Values below 5 are rejected."""
+        """Values below 5 (and not 0) are rejected."""
         with pytest.raises(ValueError, match="active_user_cache_ttl_seconds must be >= 5"):
             Settings(active_user_cache_ttl_seconds=4)
+
+    def test_ttl_zero_disables_cache(self):
+        """Value 0 is accepted and disables the in-memory active-user cache."""
+        settings = Settings(active_user_cache_ttl_seconds=0)
+        assert settings.active_user_cache_ttl_seconds == 0
 
     def test_ttl_at_minimum_accepts(self):
         """Value at the minimum boundary (5) is accepted."""
@@ -301,5 +299,13 @@ class TestActiveUserCacheTTLValidation:
 
     def test_default_ttl_is_thirty(self):
         """The default TTL matches the spec default of 30 seconds."""
-        settings = Settings()
-        assert settings.active_user_cache_ttl_seconds == 30
+        prev = os.environ.get("ACTIVE_USER_CACHE_TTL_SECONDS")
+        os.environ["ACTIVE_USER_CACHE_TTL_SECONDS"] = "30"
+        try:
+            settings = Settings()
+            assert settings.active_user_cache_ttl_seconds == 30
+        finally:
+            if prev is None:
+                os.environ.pop("ACTIVE_USER_CACHE_TTL_SECONDS", None)
+            else:
+                os.environ["ACTIVE_USER_CACHE_TTL_SECONDS"] = prev

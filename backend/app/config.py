@@ -234,7 +234,8 @@ class Settings(BaseSettings):
 
     active_user_cache_ttl_seconds: int = 30
     """Time-to-live in seconds for cached active-user lookups in get_current_active_user.
-    Must be between 5 and 300 inclusive. 5 is the minimum valid value.
+    0 disables the in-memory cache entirely. Positive values must be between 5 and 300
+    inclusive.
     """
 
     # ── Retrieval evaluation configuration ────────────────────────────────────
@@ -693,7 +694,13 @@ class Settings(BaseSettings):
     @field_validator("active_user_cache_ttl_seconds", mode="after")
     @classmethod
     def validate_active_user_cache_ttl_seconds(cls, v: int) -> int:
-        """Validate active-user cache TTL is within the allowed range 5..300."""
+        """Validate active-user cache TTL is within the allowed range 0..300.
+
+        0 disables the in-memory cache entirely; positive values must be
+        between 5 and 300 seconds.
+        """
+        if v == 0:
+            return v
         return cls._validate_int_range(v, 5, 300, "active_user_cache_ttl_seconds")
 
     @field_validator("embedding_batch_max_retries", mode="after")

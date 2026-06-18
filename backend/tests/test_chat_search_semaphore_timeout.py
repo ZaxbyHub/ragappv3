@@ -21,13 +21,20 @@ class TestSearchSemaphoreTimeoutPropagation(IsolatedAsyncioTestCase):
 
     def setUp(self):
         """Ensure required env vars are set for each test."""
+        self._prev_env = {
+            k: os.environ.get(k)
+            for k in ("ADMIN_SECRET_TOKEN", "USERS_ENABLED")
+        }
         os.environ["ADMIN_SECRET_TOKEN"] = "test-admin-key"
         os.environ["USERS_ENABLED"] = "False"
 
     def tearDown(self):
-        """Restore env vars mutated in setUp."""
-        for key in ("ADMIN_SECRET_TOKEN", "USERS_ENABLED"):
-            os.environ.pop(key, None)
+        """Restore env vars to their pre-setUp state."""
+        for k, v in self._prev_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     def _make_rag_engine(self):
         """Build a mock RAGEngine with an async query generator."""
