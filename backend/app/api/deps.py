@@ -70,6 +70,10 @@ VAULT_PERMISSION_LEVELS = {"read": 1, "write": 2, "admin": 3}
 VAULT_PERMISSION_NAMES = {0: None, 1: "read", 2: "write", 3: "admin"}
 VAULT_ACTION_LEVELS = {"read": 1, "write": 2, "delete": 3, "admin": 3}
 
+# Per-process in-memory cache. Multi-worker deployments (uvicorn --workers > 1,
+# multiple replicas, etc.) do NOT share this dict. Operators running more than
+# one worker must keep active_user_cache_ttl_seconds short or provide external
+# coordination, because invalidate_active_user_cache only affects this process.
 _ACTIVE_USER_CACHE: dict[str, tuple[dict, float]] = {}
 _ACTIVE_USER_CACHE_LOCK = Lock()
 _ACTIVE_USER_CACHE_KEY_FORMAT = "active_user:{user_id}"
@@ -333,7 +337,11 @@ async def get_current_active_user(
 
         if ttl > 0:
             with _ACTIVE_USER_CACHE_LOCK:
-                _ACTIVE_USER_CACHE[cache_key] = (user, time.monotonic() + ttl)
+                # Double-check: if the entry was invalidated between the DB read and
+                # this write-back, do not re-cache a stale snapshot. The narrow race
+                # is bounded by the TTL floor (5s) and single-writer SQLite.
+                if _ACTIVE_USER_CACHE.get(cache_key) is None:
+                    _ACTIVE_USER_CACHE[cache_key] = (user, time.monotonic() + ttl)
     else:
         user = cached_user
 
@@ -375,7 +383,7 @@ async def get_current_active_user(
                 detail="must_change_password",
             )
 
-    return user
+    return dict(user)
 
 
 async def get_effective_vault_permission(
@@ -591,7 +599,7 @@ def require_vault_permission(*actions: str):
         evaluate = get_evaluate_policy(db)
         for action in actions:
             if await evaluate(user, "vault", vault_id, action):
-                return user
+                return dict(user)
         raise HTTPException(status_code=403, detail="Insufficient vault permissions")
 
     return _check

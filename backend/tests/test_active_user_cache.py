@@ -4,6 +4,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from app.api.deps import (
     _ACTIVE_USER_CACHE,
@@ -192,6 +193,87 @@ class TestActiveUserCache:
         invalidate_active_user_cache(user_id)
 
         assert cache_key not in _ACTIVE_USER_CACHE
+
+    @pytest.mark.asyncio
+    async def test_cached_deactivated_user_is_denied_without_db_read(
+        self, mock_settings, mock_decode
+    ):
+        """A user cached while active is rejected if the cached dict has is_active=False.
+
+        This exercises the cache-hit path's is_active check. The real DB still holds
+        an active row, proving the response came from cache, not a fresh read.
+        """
+        user_id = 123
+        cache_key = _build_active_user_cache_key(user_id)
+        deactivated_user = {
+            "id": user_id,
+            "username": "cacheduser",
+            "full_name": "Cached User",
+            "role": "member",
+            "is_active": False,
+            "must_change_password": False,
+        }
+        with _ACTIVE_USER_CACHE_LOCK:
+            _ACTIVE_USER_CACHE[cache_key] = (
+                deactivated_user,
+                time.monotonic() + 60,
+            )
+
+        mock_db = _make_mock_db()  # DB still says active
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_active_user(
+                request=_make_request(),
+                authorization="Bearer valid.token.here",
+                db=mock_db,
+            )
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "user_inactive"
+        mock_db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalidate_cache_then_deactivated_user_returns_401(
+        self, mock_settings, mock_decode
+    ):
+        """After invalidation, a fresh DB read that returns is_active=False raises 401."""
+        user_id = 123
+        cache_key = _build_active_user_cache_key(user_id)
+        active_user = {
+            "id": user_id,
+            "username": "cacheduser",
+            "full_name": "Cached User",
+            "role": "member",
+            "is_active": True,
+            "must_change_password": False,
+        }
+        with _ACTIVE_USER_CACHE_LOCK:
+            _ACTIVE_USER_CACHE[cache_key] = (active_user, time.monotonic() + 60)
+
+        invalidate_active_user_cache(user_id)
+        assert cache_key not in _ACTIVE_USER_CACHE
+
+        mock_db = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = (
+            123,
+            "cacheduser",
+            "Cached User",
+            "member",
+            0,  # is_active = False
+            0,
+        )
+        mock_db.execute.return_value = mock_cursor
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_active_user(
+                request=_make_request(),
+                authorization="Bearer valid.token.here",
+                db=mock_db,
+            )
+
+        assert exc_info.value.status_code == 401
+        assert exc_info.value.detail == "user_inactive"
+        mock_db.execute.assert_called_once()
 
 
 class TestActiveUserCacheTTLValidation:

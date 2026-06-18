@@ -24,6 +24,11 @@ class TestSearchSemaphoreTimeoutPropagation(IsolatedAsyncioTestCase):
         os.environ["ADMIN_SECRET_TOKEN"] = "test-admin-key"
         os.environ["USERS_ENABLED"] = "False"
 
+    def tearDown(self):
+        """Restore env vars mutated in setUp."""
+        for key in ("ADMIN_SECRET_TOKEN", "USERS_ENABLED"):
+            os.environ.pop(key, None)
+
     def _make_rag_engine(self):
         """Build a mock RAGEngine with an async query generator."""
         engine = MagicMock()

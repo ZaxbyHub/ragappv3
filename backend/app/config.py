@@ -684,6 +684,12 @@ class Settings(BaseSettings):
         """Validate search semaphore timeout is in range 1.0..300.0."""
         return cls._validate_float_range(v, 1.0, 300.0, "search_semaphore_timeout_seconds")
 
+    @field_validator("write_lock_timeout_seconds", mode="after")
+    @classmethod
+    def validate_write_lock_timeout_seconds(cls, v: float) -> float:
+        """Validate write lock timeout is in range 1.0..300.0."""
+        return cls._validate_float_range(v, 1.0, 300.0, "write_lock_timeout_seconds")
+
     @field_validator("active_user_cache_ttl_seconds", mode="after")
     @classmethod
     def validate_active_user_cache_ttl_seconds(cls, v: int) -> int:

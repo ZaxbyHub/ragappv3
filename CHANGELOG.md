@@ -70,7 +70,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - bcrypt password verification (cost factor 14, ~400ms) now offloaded to dedicated ThreadPoolExecutor(4) via async_verify_password(), preventing event-loop blocking during login and password-change under concurrent load
 - All authentication endpoints now use async bcrypt operations via async_verify_password() and async_hash_password()
 - VectorStore write lock now has configurable asyncio.wait_for timeout (default 30s) via @asynccontextmanager _acquire_write_lock(); all 8 write paths updated
-- VectorStore search concurrency increased from hardcoded 4 to configurable settings.vector_search_concurrency (default 32)
+- VectorStore search concurrency default increased from 16 to 32 (still configurable via VECTOR_SEARCH_CONCURRENCY; 1-64 range)
 - LLM HTTP client pool limits now configurable: `LLM_MAX_CONNECTIONS` (default 100) and `LLM_MAX_KEEPALIVE_CONNECTIONS` (default 50)
 - LanceDB optimize_mode default changed from "after_every_write" to "periodic" to reduce compaction blocking on every chunk write
 - Pull request CI now checks frontend toolchain compatibility, root and subpath frontend builds, configuration contract drift, and high-risk PR test-scope drift.
@@ -98,7 +98,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- New config settings: vector_search_concurrency (default 32), write_lock_timeout_seconds (default 30.0)
+- New config settings: search_semaphore_timeout_seconds (default 30.0, range 1.0-300.0), active_user_cache_ttl_seconds (default 30, range 5-300, per-process cache), memory_store_pool_size (default 10, min 5)
 - _auth_executor.shutdown() in application teardown for clean ThreadPoolExecutor lifecycle
 
 ## [1.0.6] - 2026-05-02
