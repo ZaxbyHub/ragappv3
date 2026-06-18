@@ -261,21 +261,21 @@ class TestSuperadminShortCircuit:
 
     @pytest.mark.asyncio
     async def test_superadmin_skips_db_queries(self, db_conn):
-        """Superadmin path skips all four async queries entirely."""
-        execute_mock = MagicMock()
+        """Superadmin path short-circuits before any database query."""
 
-        async def fake_get_effective_vault_permissions(db, principal, vault_ids):
-            # Simulate the superadmin short-circuit before any DB access
-            user_role = principal.get("role", "")
-            if user_role == "superadmin":
-                return {vid: "admin" for vid in vault_ids}
-            # If we get here, the short-circuit failed
-            raise AssertionError("Superadmin did not short-circuit — DB was accessed")
+        class FailingConnection:
+            def execute(self, *args, **kwargs):
+                raise AssertionError("Superadmin short-circuit should not query the database")
 
-        with patch("app.api.deps.get_effective_vault_permissions", new=fake_get_effective_vault_permissions):
-            # This would fail if DB queries ran for superadmin
-            result = await fake_get_effective_vault_permissions(db_conn, {"id": 99, "role": "superadmin"}, [1, 2])
-            assert result == {1: "admin", 2: "admin"}
+            def __getattr__(self, name):
+                raise AssertionError(f"Unexpected DB attribute access: {name}")
+
+        failing_db = FailingConnection()
+        superadmin_principal = {"id": 99, "role": "superadmin"}
+
+        result = await get_effective_vault_permissions(failing_db, superadmin_principal, [1, 2])
+
+        assert result == {1: "admin", 2: "admin"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

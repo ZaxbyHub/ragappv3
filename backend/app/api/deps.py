@@ -79,6 +79,14 @@ def _build_active_user_cache_key(user_id: int) -> str:
     return _ACTIVE_USER_CACHE_KEY_FORMAT.format(user_id=user_id)
 
 
+def _get_active_user_cache_ttl() -> int | float:
+    """Return active-user cache TTL if it is a real number, else 0."""
+    ttl = settings.active_user_cache_ttl_seconds
+    if isinstance(ttl, (int, float)):
+        return ttl
+    return 0
+
+
 def invalidate_active_user_cache(user_id: int) -> None:
     """Remove cached active-user state for ``user_id``.
 
@@ -284,19 +292,17 @@ async def get_current_active_user(
         )
 
     cache_key = _build_active_user_cache_key(user_id)
-    ttl = settings.active_user_cache_ttl_seconds
+    ttl = _get_active_user_cache_ttl()
     cached_user = None
 
     if ttl > 0:
         with _ACTIVE_USER_CACHE_LOCK:
             cached_entry = _ACTIVE_USER_CACHE.get(cache_key)
-        if cached_entry is not None:
-            _cached_user, expires_at = cached_entry
-            if expires_at > time.monotonic():
-                cached_user = _cached_user
-                user = cached_user
-            else:
-                with _ACTIVE_USER_CACHE_LOCK:
+            if cached_entry is not None:
+                _cached_user, expires_at = cached_entry
+                if expires_at > time.monotonic():
+                    cached_user = _cached_user
+                else:
                     _ACTIVE_USER_CACHE.pop(cache_key, None)
 
     if cached_user is None:

@@ -28,6 +28,18 @@ _fts_lock = threading.Lock()
 VECTOR_INDEX_MIN_ROWS = 256
 
 
+def _get_search_semaphore_timeout() -> float:
+    """Return the configured search semaphore timeout, falling back to the default when settings is mocked."""
+    value = settings.search_semaphore_timeout_seconds
+    return value if isinstance(value, (int, float)) else 30.0
+
+
+def _get_vector_search_concurrency() -> int:
+    """Return the configured search semaphore concurrency, falling back to the default when settings is mocked."""
+    value = settings.vector_search_concurrency
+    return value if isinstance(value, int) else 32
+
+
 def _lance_escape(value) -> str:
     """Escape a value for use in LanceDB SQL-like where clauses.
 
@@ -114,7 +126,7 @@ class VectorStore:
     def _get_search_semaphore(self) -> asyncio.Semaphore:
         """Return the shared search semaphore, creating it on first call."""
         if self._search_semaphore is None:
-            self._search_semaphore = asyncio.Semaphore(settings.vector_search_concurrency)
+            self._search_semaphore = asyncio.Semaphore(_get_vector_search_concurrency())
         return self._search_semaphore
 
     @asynccontextmanager
@@ -155,12 +167,12 @@ class VectorStore:
         try:
             await asyncio.wait_for(
                 semaphore.acquire(),
-                timeout=settings.search_semaphore_timeout_seconds,
+                timeout=_get_search_semaphore_timeout(),
             )
         except asyncio.TimeoutError:
             raise SearchSemaphoreTimeoutError(
-                f"Search semaphore acquisition timed out after {settings.search_semaphore_timeout_seconds}s; "
-                f"concurrency={semaphore._value}"
+                f"Search semaphore acquisition timed out after {_get_search_semaphore_timeout()}s; "
+                f"concurrency={getattr(semaphore, '_value', '?')}"
             )
         try:
             yield
