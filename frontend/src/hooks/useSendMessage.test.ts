@@ -19,6 +19,41 @@ vi.mock("@/lib/api", () => ({
   getLlmModeHealth: (...args: unknown[]) => apiMocks.getLlmModeHealth(...args),
 }));
 
+type StreamHandlers = {
+  onMessage: (chunk: string) => void;
+  onSources: (sources: unknown[]) => void;
+  onMemories: (memories: unknown[]) => void;
+  onWiki: (wikiRefs: unknown[]) => void;
+  onKMS: (kmsRefs: unknown[]) => void;
+  onMode: (mode: string) => void;
+  onError: (error: Error) => void;
+  onComplete: () => Promise<void> | void;
+};
+
+// Install a chatStream mock that captures the handlers so each test can
+// fire them at will. The captured handler is read from a mutable cell so
+// subsequent mock invocations (e.g. retries) update the reference and
+// trigger calls operate on the latest invocation.
+function installCapturingStreamMock(): { trigger: { error: (e: Error) => void; complete: () => void } } {
+  const cell: { current: StreamHandlers | null } = { current: null };
+  apiMocks.chatStream.mockImplementation((_messages: unknown, handlers: StreamHandlers) => {
+    cell.current = handlers;
+    return vi.fn(); // abort function
+  });
+  return {
+    trigger: {
+      error: (e: Error) => {
+        if (!cell.current) throw new Error("chatStream was not invoked yet");
+        cell.current.onError(e);
+      },
+      complete: () => {
+        if (!cell.current) throw new Error("chatStream was not invoked yet");
+        void cell.current.onComplete();
+      },
+    },
+  };
+}
+
 describe("useSendMessage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -48,7 +83,6 @@ describe("useSendMessage", () => {
       return vi.fn();
     });
   });
-
   it("force-refreshes history after a newly created session is persisted", async () => {
     const refreshHistory = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ input: "What changed?" });
@@ -192,41 +226,6 @@ describe("useSendMessage", () => {
   });
 
   describe("error-path coverage (issue #55)", () => {
-    type StreamHandlers = {
-      onMessage: (chunk: string) => void;
-      onSources: (sources: unknown[]) => void;
-      onMemories: (memories: unknown[]) => void;
-      onWiki: (wikiRefs: unknown[]) => void;
-      onKMS: (kmsRefs: unknown[]) => void;
-      onMode: (mode: string) => void;
-      onError: (error: Error) => void;
-      onComplete: () => Promise<void> | void;
-    };
-
-    // Install a chatStream mock that captures the handlers so each test can
-    // fire them at will. The captured handler is read from a mutable cell
-    // so subsequent mock invocations (e.g. retries) update the reference
-    // and trigger calls operate on the latest invocation.
-    function installCapturingStreamMock(): { trigger: { error: (e: Error) => void; complete: () => void } } {
-      const cell: { current: StreamHandlers | null } = { current: null };
-      apiMocks.chatStream.mockImplementation((_messages: unknown, handlers: StreamHandlers) => {
-        cell.current = handlers;
-        return vi.fn(); // abort function
-      });
-      return {
-        trigger: {
-          error: (e: Error) => {
-            if (!cell.current) throw new Error("chatStream was not invoked yet");
-            cell.current.onError(e);
-          },
-          complete: () => {
-            if (!cell.current) throw new Error("chatStream was not invoked yet");
-            void cell.current.onComplete();
-          },
-        },
-      };
-    }
-
     it("flips isStreaming to true synchronously when send begins", async () => {
       // Arrange: a stream that never completes, so we can observe the
       // mid-flight isStreaming value.
@@ -407,6 +406,121 @@ describe("useSendMessage", () => {
         await result.current.handleSend();
       });
       expect(apiMocks.chatStream).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("abandoned-stream save guard (issue #235)", () => {
+    // When loadChat/newChat aborts an in-flight stream, the orphan stream's
+    // onComplete can still fire asynchronously. The assistant save was already
+    // guarded; the user-save was not, so the old session could end up with a
+    // dangling user message. These tests pin down the guard in both the
+    // loadChat-switch and newChat cases.
+    it("does NOT persist the user message when loadChat aborts the stream before onComplete fires", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "abandoned user" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+      expect(apiMocks.chatStream).toHaveBeenCalledTimes(1);
+
+      // Simulate the user switching sessions mid-stream. loadChat calls
+      // abortFn() (which the wrapping useSendMessage setAbortFn installs),
+      // and then clears messagesById. That's the exact state the orphan
+      // stream's onComplete will observe.
+      await act(async () => {
+        useChatStore.getState().loadChat("99", [
+          { id: "older-1", role: "user", content: "older" },
+        ]);
+      });
+
+      // Sanity: loadChat replaced messagesById with the new session's
+      // messages. The orphan stream's assistant id is gone from the store.
+      const after = useChatStore.getState();
+      expect(after.activeChatId).toBe("99");
+      expect(after.messagesById).toEqual({
+        "older-1": expect.objectContaining({ id: "older-1", role: "user" }),
+      });
+
+      // Now fire onComplete — it should be a no-op for persistence.
+      apiMocks.addChatMessage.mockClear();
+      await act(async () => {
+        capture.trigger.complete();
+      });
+
+      // Critical assertion: addChatMessage is NOT called. The orphan stream
+      // must not persist anything to the old (or any) session.
+      expect(apiMocks.addChatMessage).not.toHaveBeenCalled();
+      // refreshHistory must not be called either — no save happened.
+      expect(refreshHistory).not.toHaveBeenCalled();
+    });
+
+    it("does NOT persist the user message when newChat aborts the stream before onComplete fires", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "abandoned again" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      await act(async () => {
+        useChatStore.getState().newChat();
+      });
+
+      expect(useChatStore.getState().messagesById).toEqual({});
+      expect(useChatStore.getState().messageIds).toEqual([]);
+
+      apiMocks.addChatMessage.mockClear();
+      await act(async () => {
+        capture.trigger.complete();
+      });
+
+      expect(apiMocks.addChatMessage).not.toHaveBeenCalled();
+      expect(refreshHistory).not.toHaveBeenCalled();
+    });
+
+    it("DOES persist both messages when onComplete fires with the assistant message still present", async () => {
+      // Negative control: the guard must not over-trigger. A normal completion
+      // (no session switch in between) must still save both messages.
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "normal completion" });
+      apiMocks.addChatMessage
+        .mockReset()
+        .mockResolvedValueOnce({ id: 200, created_at: "2026-06-01T00:00:00Z" })
+        .mockResolvedValueOnce({ id: 201, created_at: "2026-06-01T00:00:01Z" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      // Don't switch sessions — fire onComplete directly.
+      await act(async () => {
+        capture.trigger.complete();
+      });
+
+      await waitFor(() => {
+        expect(refreshHistory).toHaveBeenCalledWith(true);
+      });
+      // Both the user and assistant message must be persisted.
+      expect(apiMocks.addChatMessage).toHaveBeenCalledTimes(2);
+      expect(apiMocks.addChatMessage).toHaveBeenNthCalledWith(1, 42, {
+        role: "user",
+        content: "normal completion",
+      });
+      expect(apiMocks.addChatMessage).toHaveBeenNthCalledWith(
+        2,
+        42,
+        expect.objectContaining({ role: "assistant" })
+      );
     });
   });
 });

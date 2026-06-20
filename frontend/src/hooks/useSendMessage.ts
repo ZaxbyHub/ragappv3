@@ -199,22 +199,25 @@ export function useSendMessage(
             try {
               const storeState = useChatStore.getState();
               const assistantMsg = storeState.messagesById[assistantMessageId];
+              // If the assistant message is gone from the store, the stream was
+              // abandoned — typically because loadChat/newChat aborted it and
+              // cleared messagesById. The assistant save is already skipped via
+              // the guard below; without this same guard on the user save, the
+              // closure-captured sessionId would persist a dangling user
+              // message to the old session. See issue #235.
+              if (!assistantMsg) return;
               const saves: Promise<ChatSessionMessage>[] = [
                 addChatMessage(sessionId, { role: "user", content }),
+                addChatMessage(sessionId, {
+                  role: "assistant",
+                  content: assistantMsg.content,
+                  sources: assistantMsg.sources ?? undefined,
+                  memories: assistantMsg.memoriesUsed ?? undefined,
+                  wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
+                  kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
+                  mode: assistantMsg.mode,
+                }),
               ];
-              if (assistantMsg) {
-                saves.push(
-                  addChatMessage(sessionId, {
-                    role: "assistant",
-                    content: assistantMsg.content,
-                    sources: assistantMsg.sources ?? undefined,
-                    memories: assistantMsg.memoriesUsed ?? undefined,
-                    wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
-                    kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
-                    mode: assistantMsg.mode,
-                  })
-                );
-              }
               const [userSaveResult, assistantSaveResult] = await Promise.all(saves);
 
               // Atomically migrate temp client IDs to DB-assigned IDs.
@@ -234,7 +237,7 @@ export function useSendMessage(
               };
 
               migrateId(userMessage.id, userSaveResult);
-              if (assistantSaveResult) migrateId(assistantMessageId, assistantSaveResult);
+              migrateId(assistantMessageId, assistantSaveResult);
 
               await refreshHistory(true);
               useChatShellStore.getState().requestSessionListRefresh();
