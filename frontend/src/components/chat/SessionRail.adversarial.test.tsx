@@ -400,6 +400,50 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
 
       expect(input).toBeInTheDocument();
     });
+
+    // Regression (F-001): Escape while renaming must cancel the edit AND mark the
+    // event handled (preventDefault) so the window-scoped Esc-to-stop shortcut
+    // (useEscapeToStop, which defers to !e.defaultPrevented) does not also abort
+    // an in-flight streaming response.
+    it("Escape while renaming cancels edit and prevents default (does not bubble to Esc-to-stop)", async () => {
+      const onRename = vi.fn();
+      render(
+        <Wrapper>
+          <SessionItem
+            session={{
+              id: 1,
+              vault_id: 1,
+              title: "Original",
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+              message_count: 0,
+            }}
+            isActive={false}
+            isPinned={false}
+            onClick={vi.fn()}
+            onRename={onRename}
+            onPinToggle={vi.fn()}
+            onDelete={vi.fn()}
+          />
+        </Wrapper>
+      );
+
+      const sessionElement = screen.getByRole("button", { name: /chat session/i });
+      fireEvent.mouseEnter(sessionElement);
+      fireEvent.click(within(sessionElement).getByLabelText("More options"));
+      fireEvent.click(await screen.findByLabelText("Rename session"));
+
+      const input = screen.getByLabelText("Edit session title");
+
+      // fireEvent.keyDown returns false when a handler called preventDefault on
+      // this cancelable event — i.e. the global Esc-to-stop listener is suppressed.
+      const notPrevented = fireEvent.keyDown(input, { key: "Escape" });
+      expect(notPrevented).toBe(false);
+
+      // Edit mode is exited and no rename was committed.
+      expect(screen.queryByLabelText("Edit session title")).not.toBeInTheDocument();
+      expect(onRename).not.toHaveBeenCalled();
+    });
   });
 
   // ===========================================================================

@@ -2,6 +2,7 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { MemoryRouter, BrowserRouter } from "react-router-dom";
 import { NavigationRail } from "./NavigationRail";
+import { useThemeStore } from "@/stores/useThemeStore";
 import type { NavItemId } from "./navigationTypes";
 
 const mockLogout = vi.hoisted(() => vi.fn());
@@ -217,8 +218,12 @@ describe("NavigationRail", () => {
     });
   });
 
-  describe("Theme Toggle", () => {
-    it("renders theme toggle button", () => {
+  describe("Theme Selector", () => {
+    // Behavior change: the binary light/dark toggle (aria-label "Switch to … mode")
+    // was replaced by a 4-option theme dropdown (Light / Dark / System / High
+    // contrast) so high-contrast is selectable. The trigger now carries a stable
+    // aria-label "Select theme" instead of describing the next toggle target.
+    it("renders the theme selector trigger", () => {
       render(
         <MemoryRouter>
           <NavigationRail
@@ -227,10 +232,10 @@ describe("NavigationRail", () => {
         </MemoryRouter>
       );
 
-      expect(screen.getByLabelText(/switch to .* mode/i)).toBeInTheDocument();
+      expect(screen.getByLabelText("Select theme")).toBeInTheDocument();
     });
 
-    it("shows sun icon in dark mode", () => {
+    it("renders an icon in the trigger reflecting the active theme", () => {
       render(
         <MemoryRouter>
           <NavigationRail
@@ -239,9 +244,37 @@ describe("NavigationRail", () => {
         </MemoryRouter>
       );
 
-      // Default theme is dark, should show sun icon with aria-label "Switch to light mode"
-      const sunIcon = screen.getByLabelText("Switch to light mode");
-      expect(sunIcon).toBeInTheDocument();
+      // Mocked theme is "dark"; the trigger renders an inline icon svg.
+      const trigger = screen.getByLabelText("Select theme");
+      expect(trigger.querySelector("svg")).toBeInTheDocument();
+    });
+
+    // Regression (F-003): in "system" mode the trigger must reflect the RESOLVED
+    // appearance. With the OS preferring dark, the rail previously kept the light
+    // (Sun) icon because it only checked `theme === "dark"`.
+    it("reflects the dark OS preference in system mode (F-003)", () => {
+      vi.mocked(useThemeStore).mockReturnValueOnce({
+        theme: "system",
+        setTheme: vi.fn(),
+      });
+      const originalMatchMedia = window.matchMedia;
+      window.matchMedia = vi.fn().mockReturnValue({
+        matches: true,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }) as unknown as typeof window.matchMedia;
+
+      try {
+        render(
+          <MemoryRouter>
+            <NavigationRail healthStatus={mockHealthStatus} />
+          </MemoryRouter>
+        );
+        const trigger = screen.getByLabelText("Select theme");
+        expect(trigger).toHaveAttribute("data-resolved-appearance", "dark");
+      } finally {
+        window.matchMedia = originalMatchMedia;
+      }
     });
   });
 });

@@ -25,3 +25,22 @@ Object.defineProperty(window, 'confirm', {
 if (!Element.prototype.scrollTo) {
   Element.prototype.scrollTo = vi.fn();
 }
+
+// Mock window.matchMedia — JSDOM does not implement it. Defaults to "not
+// matching" (e.g. light OS preference); individual tests can override
+// window.matchMedia to simulate a dark OS preference.
+if (!window.matchMedia) {
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }),
+  });
+}
