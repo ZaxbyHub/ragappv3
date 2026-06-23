@@ -18,10 +18,12 @@ logSubpathConfig();
 // over the OS setting.
 function ThemedToaster() {
   const theme = useThemeStore((s) => s.theme)
+  // sonner only understands light/dark/system; high-contrast is light-based.
+  const toasterTheme = theme === 'high-contrast' ? 'light' : theme
   return (
     <Toaster
       position="bottom-right"
-      theme={theme}
+      theme={toasterTheme}
       toastOptions={{ className: 'max-w-[90vw] sm:max-w-sm' }}
       richColors
       closeButton

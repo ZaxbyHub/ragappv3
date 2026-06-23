@@ -3,12 +3,21 @@ import {
   ChevronRight,
   Library,
 } from "lucide-react";
-import { useThemeStore } from "@/stores/useThemeStore";
+import { useThemeStore, type Theme } from "@/stores/useThemeStore";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { cn } from "@/lib/utils";
 import { NavLink, useLocation } from "react-router-dom";
 import type { NavItemId, NavigationProps } from "./navigationTypes";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+} from "@/components/ui/dropdown-menu";
 import { useState, useEffect } from "react";
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react";
 import { MessageMultiple01Icon, AiBrain01Icon, Files01Icon, Database02Icon, BookOpenTextIcon, UserSettings01Icon, UserCircleIcon, UserGroupIcon, Setting07Icon, Building03Icon, Sun02Icon, MoonIcon, Logout01Icon } from "@hugeicons/core-free-icons";
@@ -47,6 +56,13 @@ const sectionLabels: Record<NavSection, string> = {
   admin: "Administration",
   account: "Account",
 };
+
+const themeOptions: { value: Theme; label: string }[] = [
+  { value: "light", label: "Light" },
+  { value: "dark", label: "Dark" },
+  { value: "system", label: "System" },
+  { value: "high-contrast", label: "High contrast" },
+];
 
 // Hugeicons icons are IconSvgElement arrays; everything else (lucide icons,
 // etc.) is a React component. lucide icons are forwardRef OBJECTS, not
@@ -101,6 +117,22 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
   useEffect(() => {
     localStorage.setItem(SIDEBAR_EXPANDED_KEY, String(isExpanded));
   }, [isExpanded]);
+
+  // Track the OS color-scheme so the trigger icon reflects the *resolved*
+  // appearance while in "system" mode (otherwise system+dark shows the light
+  // icon, misreporting the active theme).
+  const [systemDark, setSystemDark] = useState(
+    () => window.matchMedia("(prefers-color-scheme: dark)").matches
+  );
+
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  const resolvedDark = theme === "dark" || (theme === "system" && systemDark);
 
   const getActiveItem = (): NavItemId | null => {
     for (const item of navItems) {
@@ -181,20 +213,35 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
 
       {/* Footer */}
       <div className={cn("py-3 px-2 border-t border-border transition-all duration-300 ease-in-out overflow-hidden", isExpanded ? "w-full" : "w-14")}>
-        {/* Theme Toggle */}
-        <button
-          type="button"
-          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-          className="flex items-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground text-sm transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring w-full gap-2 px-3 py-1.5 mb-3 h-8"
-          aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-        >
-          {theme === "dark" ? (
-            <HugeiconsIcon strokeWidth={1.2} icon={Sun02Icon} size={16} className="flex-shrink-0" />
-          ) : (
-            <HugeiconsIcon strokeWidth={1.2} icon={MoonIcon} size={16} className="flex-shrink-0" />
-          )}
-          <span className={cn("text-[11px] opacity-0 blur-sm transition-all duration-200 ease-in-out whitespace-nowrap", !isExpanded && "sr-only", isExpanded && "opacity-100 blur-none")}>{theme === "dark" ? "Light mode" : "Dark mode"}</span>
-        </button>
+        {/* Theme selector */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className="flex items-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground text-sm transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring w-full gap-2 px-3 py-1.5 mb-3 h-8"
+              aria-label="Select theme"
+              data-resolved-appearance={resolvedDark ? "dark" : "light"}
+            >
+              {resolvedDark ? (
+                <HugeiconsIcon strokeWidth={1.2} icon={MoonIcon} size={16} className="flex-shrink-0" />
+              ) : (
+                <HugeiconsIcon strokeWidth={1.2} icon={Sun02Icon} size={16} className="flex-shrink-0" />
+              )}
+              <span className={cn("text-[11px] opacity-0 blur-sm transition-all duration-200 ease-in-out whitespace-nowrap", !isExpanded && "sr-only", isExpanded && "opacity-100 blur-none")}>Theme</span>
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="right" align="end" className="w-44">
+            <DropdownMenuLabel>Theme</DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuRadioGroup value={theme} onValueChange={(value) => setTheme(value as Theme)}>
+              {themeOptions.map((option) => (
+                <DropdownMenuRadioItem key={option.value} value={option.value}>
+                  {option.label}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
 
         {/* Logout */}
         <button

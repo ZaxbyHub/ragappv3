@@ -31,6 +31,7 @@ import { useVaultStore } from "@/stores/useVaultStore";
 import { uploadDocument, getDocumentStatus } from "@/lib/api";
 import { computeEffectiveChatMode } from "@/lib/chatMode";
 import { MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
+import { useEscapeToStop } from "@/hooks/useEscapeToStop";
 import { toast } from "sonner";
 
 // =============================================================================
@@ -182,6 +183,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
       else localStorage.removeItem(k);
     } catch { /* ignore */ }
   }, [activeChatId]);
+
+  // Esc-to-stop: while a response is streaming, Escape stops generation.
+  useEscapeToStop(isStreaming, onStop);
 
   // Auto-grow
   const adjustHeight = useCallback(() => {

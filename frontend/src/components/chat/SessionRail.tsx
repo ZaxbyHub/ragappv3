@@ -273,8 +273,15 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (e.key === "Enter") {
+        // Mark handled so window-level shortcuts don't also react to this key.
+        e.preventDefault();
         handleSaveEdit();
       } else if (e.key === "Escape") {
+        // Cancel title editing only. preventDefault stops this Escape from
+        // bubbling to the window-scoped Esc-to-stop handler (useEscapeToStop,
+        // which defers to !e.defaultPrevented), so cancelling a rename never
+        // also aborts an in-flight streaming response.
+        e.preventDefault();
         handleCancelEdit();
       }
     },

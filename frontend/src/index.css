@@ -114,6 +114,46 @@
     --input: 195 10% 21%;
     --ring: 195 40% 62%;
   }
+
+  /*
+   * High-contrast theme — maximized legibility (WCAG AAA-oriented).
+   * Pure white/black surfaces, fully saturated teal, solid black borders.
+   */
+  .high-contrast {
+    --background: 0 0% 100%;
+    --foreground: 0 0% 0%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 0%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 0%;
+
+    --primary: 195 100% 24%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 0 0% 90%;
+    --secondary-foreground: 0 0% 0%;
+
+    --muted: 0 0% 92%;
+    --muted-foreground: 0 0% 20%;
+
+    --accent: 195 100% 28%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 100% 34%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 100% 21%;
+    --success-foreground: 0 0% 100%;
+    --success-subdued: 142 100% 21%;
+    --success-subdued-foreground: 0 0% 100%;
+
+    --warning: 35 100% 24%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 0 0% 0%;
+    --input: 0 0% 0%;
+    --ring: 195 100% 24%;
+  }
 }
 
 @layer base {
@@ -201,6 +241,19 @@
     );
     mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
     -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+  }
+
+  /*
+   * High-contrast theme drops all decorative noise: the gradient bloom and the
+   * diagonal hatch overlay are non-essential visual texture that works against
+   * the maximized-legibility goal. Render flat surfaces instead.
+   */
+  .high-contrast body::before {
+    background: hsl(var(--background));
+  }
+
+  .high-contrast body::after {
+    background-image: none;
   }
 
   /* Headings use Commissioner */

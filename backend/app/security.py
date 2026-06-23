@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from typing import Callable, Dict
+from urllib.parse import urlsplit
 
 import redis
 from fastapi import Header, HTTPException, Request, Response
@@ -320,12 +321,75 @@ def _csrf_test_bypass_active() -> bool:
     )
 
 
+def _normalize_origin(value: str) -> str | None:
+    """Reduce a URL or origin string to ``scheme://host[:port]`` (lowercased).
+
+    Returns ``None`` when the value cannot be parsed into a scheme + authority,
+    so callers can treat it as "no usable origin".
+    """
+    try:
+        parts = urlsplit(value.strip())
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.netloc:
+        return None
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    # Drop the default port so "https://h" and "https://h:443" compare equal
+    # (browsers omit the default port, but non-browser clients may include it).
+    if (scheme == "https" and netloc.endswith(":443")) or (
+        scheme == "http" and netloc.endswith(":80")
+    ):
+        netloc = netloc.rsplit(":", 1)[0]
+    return f"{scheme}://{netloc}"
+
+
+def _csrf_allowed_origins() -> set[str] | None:
+    """Origin allowlist derived from the configured CORS origins.
+
+    Returns ``None`` to signal "do not enforce" when the allowlist is empty or
+    contains a ``*`` wildcard — enforcing in those cases would either reject all
+    browser traffic or be meaningless. A legitimate browser's ``Origin`` is the
+    app's own public origin, which must already appear in ``backend_cors_origins``
+    for the SPA's credentialed requests to pass CORS, so this list is the
+    authoritative set of trusted origins.
+    """
+    raw = settings.backend_cors_origins or []
+    if any(str(o).strip() == "*" for o in raw):
+        return None
+    allowed = {_normalize_origin(str(o)) for o in raw}
+    allowed.discard(None)
+    return allowed or None
+
+
+def _validate_csrf_origin(request: Request) -> None:
+    """Reject state-changing requests whose Origin/Referer is not trusted.
+
+    Defense-in-depth on top of the double-submit cookie + SameSite=Lax. Kept
+    deliberately conservative to avoid breaking legitimate or proxied traffic:
+      * No ``Origin`` and no ``Referer`` header -> allow (non-browser/legacy
+        clients; matches the existing contract that the token endpoint works
+        without an Origin).
+      * Allowlist empty or wildcard -> allow (enforcement disabled).
+      * Otherwise the request's origin must be in the allowlist.
+    """
+    source = request.headers.get("origin") or request.headers.get("referer")
+    if not source:
+        return
+    allowed = _csrf_allowed_origins()
+    if allowed is None:
+        return
+    if _normalize_origin(source) not in allowed:
+        raise HTTPException(status_code=403, detail="CSRF origin validation failed")
+
+
 def csrf_protect(
     request: Request,
     x_csrf_token: str = Header(""),
 ) -> str:
     if _csrf_test_bypass_active():
         return "test-bypass"
+    _validate_csrf_origin(request)
     csrf_manager = get_csrf_manager(request)
     cookie = request.cookies.get(CSRF_COOKIE_NAME)
     if not cookie or not x_csrf_token or cookie != x_csrf_token:
