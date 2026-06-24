@@ -321,6 +321,123 @@ class TestClaimNextPendingJobAtomicity(unittest.TestCase):
         self.assertIsNone(job2)
         conn.close()
 
+    def test_claim_does_not_issue_sqlite_specific_begin_immediate(self):
+        # Regression guard for issue #105: claim_next_pending_job must not rely
+        # on a backend-specific transaction mode (BEGIN IMMEDIATE) so the query
+        # stays portable to PostgreSQL/MySQL. Asserts no executed SQL begins
+        # with SQLite's BEGIN IMMEDIATE. A proxy records every execute() while
+        # delegating to (and returning real values from) the live connection.
+        store, conn, _ = self._make_store_with_conn()
+        store.create_job(vault_id=1, trigger_type="manual")
+
+        class _RecordingConn:
+            def __init__(self, real):
+                self._real = real
+                self.executed: list[str] = []
+
+            def execute(self, sql, *args, **kwargs):
+                self.executed.append(str(sql).strip())
+                return self._real.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        recorder = _RecordingConn(conn)
+        store._db = recorder  # type: ignore[assignment]
+        try:
+            job = store.claim_next_pending_job()
+        finally:
+            store._db = conn  # type: ignore[assignment]
+
+        self.assertIsNotNone(job, "claim should succeed when a pending job exists")
+        offenders = [s for s in recorder.executed if s.upper().startswith("BEGIN IMMEDIATE")]
+        self.assertFalse(
+            offenders,
+            f"claim_next_pending_job issued a non-portable statement: {offenders}",
+        )
+        conn.close()
+
+    def test_claim_oldest_pending_job_first(self):
+        # Guards the ORDER BY created_at ASC behaviour of the portable
+        # UPDATE ... RETURNING claim: with two pending jobs the older one must
+        # be claimed first, then the younger, then None.
+        store, conn, _ = self._make_store_with_conn()
+        conn.execute(
+            "INSERT INTO wiki_compile_jobs (vault_id, trigger_type, status, created_at)"
+            " VALUES (1, 'manual', 'pending', '2026-01-01T00:00:00')"
+        )
+        conn.execute(
+            "INSERT INTO wiki_compile_jobs (vault_id, trigger_type, status, created_at)"
+            " VALUES (1, 'manual', 'pending', '2026-06-01T00:00:00')"
+        )
+        conn.commit()
+
+        first = store.claim_next_pending_job()
+        second = store.claim_next_pending_job()
+        third = store.claim_next_pending_job()
+
+        assert first is not None, "first claim should succeed"
+        assert second is not None, "second claim should succeed"
+        self.assertIsNone(third)
+        self.assertEqual(first.created_at, "2026-01-01T00:00:00")
+        self.assertEqual(second.created_at, "2026-06-01T00:00:00")
+        conn.close()
+
+    def test_claim_leaves_no_open_transaction_when_queue_empty(self):
+        # The portable single-statement claim must clean up the implicit
+        # transaction sqlite3 opens for a 0-row UPDATE so the connection is not
+        # left holding an open transaction.
+        store, conn, _ = self._make_store_with_conn()
+        self.assertFalse(conn.in_transaction)
+        self.assertIsNone(store.claim_next_pending_job())
+        self.assertFalse(
+            conn.in_transaction,
+            "no dangling transaction should remain after an empty claim",
+        )
+        conn.close()
+
+    def test_claim_rolls_back_on_execute_error(self):
+        # Regression guard for F-001: if execute() or commit() raises an
+        # exception after the UPDATE, the connection must be rolled back so
+        # it is not returned to the pool with an open transaction.
+        store, conn, _ = self._make_store_with_conn()
+        store.create_job(vault_id=1, trigger_type="manual")
+
+        class _FailingConn:
+            def __init__(self, real):
+                self._real = real
+                self._hit = False
+
+            def execute(self, sql, *args, **kwargs):
+                if "RETURNING" in str(sql).upper():
+                    self._hit = True
+                    raise RuntimeError("simulated execute failure")
+                return self._real.execute(sql, *args, **kwargs)
+
+            @property
+            def in_transaction(self):
+                return self._real.in_transaction
+
+            def commit(self):
+                return self._real.commit()
+
+            def rollback(self):
+                return self._real.rollback()
+
+        failing = _FailingConn(conn)
+        store._db = failing  # type: ignore[assignment]
+        with self.assertRaises(RuntimeError):
+            store.claim_next_pending_job()
+        self.assertTrue(
+            failing._hit,
+            "the failing proxy must have been reached",
+        )
+        self.assertFalse(
+            conn.in_transaction,
+            "connection must be clean after a failed claim",
+        )
+        conn.close()
+
     def test_reset_running_jobs_reclaims_orphans(self):
         store, conn, _ = self._make_store_with_conn()
         store.create_job(vault_id=1, trigger_type="manual")
