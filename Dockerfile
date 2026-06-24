@@ -37,7 +37,7 @@ try {
 RUN npm run build
 
 # Stage 2: Backend with Unstructured dependencies
-FROM python:3.11-slim AS backend
+FROM python:3.14-slim AS backend
 
 # Install system dependencies for Unstructured
 # Note: libmagic1 needed for python-magic on Linux
