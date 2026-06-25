@@ -449,11 +449,17 @@ async def update_memory(
             if memory_vault_id is not None:
                 try:
                     from app.services.wiki_store import WikiStore as _WikiStore
+
                     await asyncio.to_thread(
                         lambda: _WikiStore(conn).mark_claims_stale_by_memory(memory_id, memory_vault_id)
                     )
                 except Exception as _wiki_exc:
                     logger.warning("mark_claims_stale_by_memory(%d) failed: %s", memory_id, _wiki_exc)
+                # The mark_claims_stale_by_memory helper no longer commits
+                # (DD-C009 / #108) so the caller controls the transaction
+                # boundary. Commit here so the stale markings persist on
+                # update. The conn is returned to the pool right after.
+                await asyncio.to_thread(conn.commit)
 
         # Fetch updated record
         cursor = await asyncio.to_thread(
