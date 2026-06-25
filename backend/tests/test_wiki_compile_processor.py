@@ -607,6 +607,60 @@ class TestMarkClaimsStale(unittest.TestCase):
         result = self.store.mark_claims_stale_by_memory(memory_id=7777, vault_id=1)
         self.assertEqual(result, {"stale": 0, "weak_provenance": 0})
 
+    # ------------------------------------------------------------------
+    # DD-C009 / #108 — mark_claims_stale_* must NOT auto-commit. The caller
+    # controls the transaction boundary so the stale marking is atomic with
+    # the subsequent DELETE of the source file/memory. If the method
+    # committed independently and the caller's DELETE later rolled back,
+    # the claim would be marked stale while the source row still exists,
+    # leaving orphan lint findings.
+    # ------------------------------------------------------------------
+
+    def test_mark_claims_stale_by_file_does_not_commit(self):
+        # Set up a sole-source claim tied to file_id=1.
+        self._make_claim_with_file_source()
+        # Count lint findings before, so we can detect any orphan.
+        before = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id = 1"
+        ).fetchone()[0]
+        # Call the helper but do NOT commit. With the bug, this would have
+        # already committed, so subsequent rollback would be a no-op and the
+        # stale finding would persist.
+        self.store.mark_claims_stale_by_file(file_id=1, vault_id=1)
+        self.conn.rollback()
+        # Claim must remain active, no orphan finding must have persisted.
+        claim_status = self.conn.execute(
+            "SELECT status FROM wiki_claims WHERE id IN "
+            "(SELECT claim_id FROM wiki_claim_sources WHERE file_id = 1)"
+        ).fetchone()
+        self.assertIsNotNone(claim_status)
+        self.assertNotEqual(dict(claim_status)["status"], "superseded")
+        after = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(after, before)
+
+    def test_mark_claims_stale_by_memory_does_not_commit(self):
+        # Set up a sole-source claim tied to memory_id=42.
+        self._make_claim_with_memory_source(memory_id=42)
+        before = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id = 1"
+        ).fetchone()[0]
+        # Call the helper but do NOT commit. Subsequent rollback must
+        # discard both the claim status update and the lint finding.
+        self.store.mark_claims_stale_by_memory(memory_id=42, vault_id=1)
+        self.conn.rollback()
+        claim_status = self.conn.execute(
+            "SELECT status FROM wiki_claims WHERE id IN "
+            "(SELECT claim_id FROM wiki_claim_sources WHERE memory_id = 42)"
+        ).fetchone()
+        self.assertIsNotNone(claim_status)
+        self.assertNotEqual(dict(claim_status)["status"], "superseded")
+        after = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id = 1"
+        ).fetchone()[0]
+        self.assertEqual(after, before)
+
 
 # ---------------------------------------------------------------------------
 # WikiCompileProcessor lifecycle

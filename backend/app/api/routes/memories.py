@@ -449,9 +449,16 @@ async def update_memory(
             if memory_vault_id is not None:
                 try:
                     from app.services.wiki_store import WikiStore as _WikiStore
+
                     await asyncio.to_thread(
                         lambda: _WikiStore(conn).mark_claims_stale_by_memory(memory_id, memory_vault_id)
                     )
+                    # The mark_claims_stale_by_memory helper no longer commits
+                    # (DD-C009 / #108) so the caller controls the transaction
+                    # boundary. Commit here so the stale markings persist on
+                    # update. Only commit when the helper succeeds to avoid
+                    # persisting partial stale state on mid-loop exceptions.
+                    await asyncio.to_thread(conn.commit)
                 except Exception as _wiki_exc:
                     logger.warning("mark_claims_stale_by_memory(%d) failed: %s", memory_id, _wiki_exc)
 
@@ -525,14 +532,20 @@ async def delete_memory(
         if not await evaluate_policy(user, "vault", memory_vault_id, "admin"):
             raise HTTPException(status_code=403, detail="No admin access to this vault")
 
-    # Mark wiki claims stale before removing the memory record
+    # Mark wiki claims stale before removing the memory record.
+    # Use a savepoint so any partial stale state from a mid-loop exception
+    # is rolled back before the DELETE commits — preventing orphan
+    # lint findings on rows that still exist (DD-C009 / #108).
     if memory_vault_id is not None:
+        await asyncio.to_thread(conn.execute, "SAVEPOINT stale_marking")
         try:
             from app.services.wiki_store import WikiStore as _WikiStore
             await asyncio.to_thread(
                 lambda: _WikiStore(conn).mark_claims_stale_by_memory(memory_id, memory_vault_id)
             )
+            await asyncio.to_thread(conn.execute, "RELEASE SAVEPOINT stale_marking")
         except Exception as _wiki_exc:
+            await asyncio.to_thread(conn.execute, "ROLLBACK TO SAVEPOINT stale_marking")
             logger.warning("mark_claims_stale_by_memory(%d) failed: %s", memory_id, _wiki_exc)
 
     # Delete the memory
