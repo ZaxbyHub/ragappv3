@@ -1164,7 +1164,12 @@ class WikiStore:
                 )
                 weak_count += 1
 
-        self._db.commit()
+        # NOTE: do NOT commit here. The caller controls the transaction
+        # boundary so that the stale marking can be made atomic with the
+        # subsequent DELETE of the source row (file/memory). If this method
+        # committed independently and the caller's DELETE later failed and
+        # rolled back, the claim would be marked stale while the source row
+        # still exists, leaving orphan lint findings (DD-C009 / #108).
         return {"stale": stale_count, "weak_provenance": weak_count}
 
     def mark_claims_stale_by_memory(self, memory_id: int, vault_id: int) -> dict:
@@ -1229,7 +1234,10 @@ class WikiStore:
                 )
                 weak_count += 1
 
-        self._db.commit()
+        # NOTE: do NOT commit here. See mark_claims_stale_by_file for the
+        # rationale (DD-C009 / #108). The caller controls the transaction
+        # boundary so the stale marking is atomic with the subsequent
+        # DELETE of the source memory.
         return {"stale": stale_count, "weak_provenance": weak_count}
 
     def update_lint_finding(self, finding_id: int, vault_id: int, status: str) -> Optional[WikiLintFinding]:
