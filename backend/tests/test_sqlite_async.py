@@ -13,6 +13,8 @@ These tests focus on the SQLite async wrapping without depending on full app sta
 
 import asyncio
 import os
+import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -22,6 +24,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.api.deps import MultipleOrgError, get_user_orgs, get_user_primary_org
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
+
+
+class TestSQLiteConnectionPoolFailures(unittest.TestCase):
+    def test_get_connection_restores_count_when_create_fails(self):
+        temp_dir = tempfile.mkdtemp()
+        shutil.rmtree(temp_dir)
+        pool = SQLiteConnectionPool(os.path.join(temp_dir, "missing.db"), max_size=1)
+
+        with self.assertRaises((sqlite3.Error, OSError)):
+            pool.get_connection()
+
+        self.assertEqual(pool._created_count, 0)
 
 
 class TestSqliteAsyncWrappers(unittest.IsolatedAsyncioTestCase):

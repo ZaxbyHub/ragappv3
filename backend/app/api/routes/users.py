@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
@@ -20,6 +20,7 @@ from app.config import settings
 from app.models.database import get_pool
 from app.security import csrf_protect
 from app.services.auth_service import password_strength_check
+from app.services.security_audit import safe_record_security_event
 
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
@@ -89,6 +90,7 @@ class UserGroupResponse(BaseModel):
 @router.post("", include_in_schema=False)
 @router.post("/")
 async def create_user(
+    request: Request,
     body: CreateUserRequest,
     user: dict = Depends(require_admin_role),
     _csrf_token: str = Depends(csrf_protect),
@@ -148,7 +150,7 @@ async def create_user(
 
         await asyncio.to_thread(conn.commit)
 
-        return {
+        response = {
             "id": row[0],
             "username": row[1],
             "full_name": row[2] or "",
@@ -156,6 +158,16 @@ async def create_user(
             "is_active": bool(row[4]),
             "created_at": row[5],
         }
+        await safe_record_security_event(
+            conn,
+            event_type="user.created",
+            actor=user,
+            target_user_id=row[0],
+            target_username=row[1],
+            request=request,
+            metadata={"role": row[3]},
+        )
+        return response
     except HTTPException:
         await asyncio.to_thread(conn.rollback)
         raise
@@ -247,6 +259,7 @@ async def get_user(
 @router.patch("/{user_id}")
 async def update_user(
     user_id: int,
+    request: Request,
     body: UpdateUserRequest,
     user: dict = Depends(require_admin_role),
     db: sqlite3.Connection = Depends(get_db),
@@ -338,6 +351,18 @@ async def update_user(
     await asyncio.to_thread(db.commit)
 
     invalidate_active_user_cache(user_id)
+    await safe_record_security_event(
+        db,
+        event_type="user.updated",
+        actor=user,
+        target_user_id=user_id,
+        target_username=body.username or target_row[1],
+        request=request,
+        metadata={
+            "fields": [field.split(" = ")[0] for field in update_fields],
+            "role": body.role,
+        },
+    )
 
     # Fetch updated user
     cursor = await asyncio.to_thread(db.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
@@ -356,6 +381,7 @@ async def update_user(
 @router.patch("/{user_id}/password")
 async def admin_reset_password(
     user_id: int,
+    request: Request,
     body: AdminResetPasswordRequest,
     user: dict = Depends(require_admin_role),
     db: sqlite3.Connection = Depends(get_db),
@@ -407,6 +433,14 @@ async def admin_reset_password(
     await asyncio.to_thread(_admin_reset_password_db)
 
     invalidate_active_user_cache(user_id)
+    await safe_record_security_event(
+        db,
+        event_type="user.password_reset",
+        actor=user,
+        target_user_id=user_id,
+        request=request,
+        metadata={"must_change_password": True, "sessions_revoked": True},
+    )
 
     return {
         "message": "Password reset successfully",
@@ -417,6 +451,7 @@ async def admin_reset_password(
 @router.patch("/{user_id}/role")
 async def update_user_role(
     user_id: int,
+    request: Request,
     body: UpdateRoleRequest,
     user: dict = Depends(require_role("superadmin")),
     _csrf_token: str = Depends(csrf_protect),
@@ -454,6 +489,14 @@ async def update_user_role(
         await asyncio.to_thread(conn.commit)
 
         invalidate_active_user_cache(user_id)
+        await safe_record_security_event(
+            conn,
+            event_type="user.role_updated",
+            actor=user,
+            target_user_id=user_id,
+            request=request,
+            metadata={"old_role": current_role, "new_role": body.role},
+        )
 
         return {
             "message": f"User role updated to {body.role}",
@@ -467,6 +510,7 @@ async def update_user_role(
 @router.patch("/{user_id}/active")
 async def update_user_active(
     user_id: int,
+    request: Request,
     body: UpdateActiveRequest,
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
@@ -511,6 +555,14 @@ async def update_user_active(
         invalidate_active_user_cache(user_id)
 
         status_str = "activated" if body.is_active else "deactivated"
+        await safe_record_security_event(
+            conn,
+            event_type="user.active_updated",
+            actor=user,
+            target_user_id=user_id,
+            request=request,
+            metadata={"is_active": body.is_active, "old_is_active": currently_active},
+        )
         return {
             "message": f"User {status_str}",
             "user_id": user_id,
@@ -605,6 +657,7 @@ async def get_user_organizations(
 @router.put("/{user_id}/organizations")
 async def update_user_organizations(
     user_id: int,
+    request: Request,
     body: UserOrgsUpdateRequest,
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
@@ -712,6 +765,19 @@ async def update_user_organizations(
 
     try:
         result = await asyncio.to_thread(_update_orgs)
+        await safe_record_security_event(
+            conn,
+            event_type="membership.organizations_replaced",
+            actor=user,
+            target_user_id=user_id,
+            request=request,
+            metadata={
+                "memberships": [
+                    {"org_id": m.org_id, "role": m.role}
+                    for m in body.resolved_memberships()
+                ]
+            },
+        )
         return result
     finally:
         pool.release_connection(conn)
@@ -774,6 +840,7 @@ async def get_user_groups(
 @router.put("/{user_id}/groups")
 async def update_user_groups(
     user_id: int,
+    request: Request,
     body: UserGroupsUpdateRequest,
     user: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),
@@ -879,6 +946,14 @@ async def update_user_groups(
 
     try:
         groups = await asyncio.to_thread(_update_groups)
+        await safe_record_security_event(
+            conn,
+            event_type="membership.groups_replaced",
+            actor=user,
+            target_user_id=user_id,
+            request=request,
+            metadata={"group_ids": list(body.group_ids)},
+        )
         return {"groups": groups}
     finally:
         pool.release_connection(conn)

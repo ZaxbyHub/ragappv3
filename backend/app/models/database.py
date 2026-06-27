@@ -108,6 +108,8 @@ CREATE TABLE IF NOT EXISTS memories (
     category TEXT,
     tags TEXT,       -- JSON array of tags
     source TEXT,     -- Source reference
+    importance REAL NOT NULL DEFAULT 0.5,
+    expires_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -196,6 +198,26 @@ CREATE TABLE IF NOT EXISTS audit_toggle_log (
     key_version TEXT,
     hmac_sha256 TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS security_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    actor_user_id INTEGER,
+    actor_username TEXT,
+    target_user_id INTEGER,
+    target_username TEXT,
+    ip_address TEXT,
+    user_agent TEXT,
+    metadata_json TEXT,
+    key_version TEXT NOT NULL,
+    hmac_sha256 TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_security_audit_log_event_type ON security_audit_log(event_type);
+CREATE INDEX IF NOT EXISTS idx_security_audit_log_actor_user_id ON security_audit_log(actor_user_id);
+CREATE INDEX IF NOT EXISTS idx_security_audit_log_target_user_id ON security_audit_log(target_user_id);
+CREATE INDEX IF NOT EXISTS idx_security_audit_log_created_at ON security_audit_log(created_at);
 
 -- Secret key metadata for audit hashing
 CREATE TABLE IF NOT EXISTS secret_keys (
@@ -848,6 +870,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_chat_memories_column(sqlite_path)
     migrate_add_chat_mode_column(sqlite_path)
     migrate_add_memory_embedding_column(sqlite_path)
+    migrate_add_memory_retention_columns(sqlite_path)
     migrate_sanitize_existing_chat_messages(sqlite_path)
     migrate_add_wiki_tables(sqlite_path)
     migrate_add_wiki_refs_and_job_input(sqlite_path)
@@ -861,6 +884,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_files_enrichment_status(sqlite_path)
     migrate_add_chunks_failed_column(sqlite_path)
     migrate_add_vector_delete_pending(sqlite_path)
+    migrate_add_security_audit_log(sqlite_path)
     migrate_add_files_search_fts(sqlite_path)
     migrate_add_files_content_fts(sqlite_path)
     migrate_add_curator_claim_support(sqlite_path)
@@ -1344,6 +1368,26 @@ def migrate_add_memory_embedding_column(sqlite_path: str) -> None:
             conn.execute("ALTER TABLE memories ADD COLUMN embedding TEXT")
         if "embedding_model" not in existing_cols:
             conn.execute("ALTER TABLE memories ADD COLUMN embedding_model TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_memory_retention_columns(sqlite_path: str) -> None:
+    """Migration: add memory retention metadata columns."""
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "importance" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5")
+        if "expires_at" not in existing_cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN expires_at TIMESTAMP")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_expires_at
+            ON memories(expires_at)
+        """)
         conn.commit()
     finally:
         conn.close()
@@ -2117,6 +2161,47 @@ def migrate_add_vector_delete_pending(sqlite_path: str) -> None:
         conn.close()
 
 
+def migrate_add_security_audit_log(sqlite_path: str) -> None:
+    """Migration: add append-only security audit event log."""
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS security_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                actor_user_id INTEGER,
+                actor_username TEXT,
+                target_user_id INTEGER,
+                target_username TEXT,
+                ip_address TEXT,
+                user_agent TEXT,
+                metadata_json TEXT,
+                key_version TEXT NOT NULL,
+                hmac_sha256 TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_security_audit_log_event_type
+            ON security_audit_log(event_type)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_security_audit_log_actor_user_id
+            ON security_audit_log(actor_user_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_security_audit_log_target_user_id
+            ON security_audit_log(target_user_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_security_audit_log_created_at
+            ON security_audit_log(created_at)
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def migrate_add_files_search_fts(sqlite_path: str) -> None:
     """Create and backfill the document-list metadata FTS index."""
     conn = sqlite3.connect(sqlite_path)
@@ -2627,17 +2712,15 @@ class SQLiteConnectionPool:
         Raises:
             sqlite3.Error: If connection creation fails.
         """
+        conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         try:
-            conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA busy_timeout=30000;")
             conn.execute("PRAGMA foreign_keys = ON;")
             return conn
         except (sqlite3.Error, OSError):
-            # Decrement created count on any failure
-            with self._lock:
-                self._created_count -= 1
+            conn.close()
             raise
 
     def _validate_connection(self, conn: sqlite3.Connection) -> bool:
@@ -2705,14 +2788,19 @@ class SQLiteConnectionPool:
                 pass
 
             # No available connections, try to create a new one if under limit
+            should_create = False
             with self._lock:
                 if self._created_count < self.max_size:
                     self._created_count += 1
-                    try:
-                        return self._create_connection()
-                    except sqlite3.Error:
+                    should_create = True
+
+            if should_create:
+                try:
+                    return self._create_connection()
+                except (sqlite3.Error, OSError):
+                    with self._lock:
                         self._created_count -= 1
-                        raise
+                    raise
 
             # If at max capacity, block until a connection is available
             try:

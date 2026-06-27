@@ -200,9 +200,18 @@ class FakeMemoryStore:
         tags: Optional[str] = None,
         source: Optional[str] = None,
         vault_id: Optional[int] = None,
+        importance: float = 0.5,
+        expires_at=None,
     ):
         self.added_memories.append(
-            {"content": content, "category": category, "tags": tags, "source": source}
+            {
+                "content": content,
+                "category": category,
+                "tags": tags,
+                "source": source,
+                "importance": importance,
+                "expires_at": expires_at,
+            }
         )
         # Return a simple dict-like object instead of MemoryRecord
         return MagicMock(
@@ -211,6 +220,8 @@ class FakeMemoryStore:
             category=category,
             tags=tags,
             source=source,
+            importance=importance,
+            expires_at=expires_at,
             created_at=None,
             updated_at=None,
         )

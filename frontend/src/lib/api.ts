@@ -5,6 +5,25 @@ import { appPath } from "./paths";
 export const API_BASE_URL = import.meta.env.VITE_API_URL || appPath("/api");
 console.info("[KnowledgeVault] API_BASE_URL:", API_BASE_URL);
 
+const IDEMPOTENT_METHODS = new Set(["get", "head", "options"]);
+const TRANSIENT_STATUS_CODES = new Set([502, 503, 504]);
+const TRANSIENT_RETRY_DELAYS_MS = [300, 900];
+
+export function isTransientRetryableRequest(method?: string, status?: number, hasResponse = true): boolean {
+  if (!method || !IDEMPOTENT_METHODS.has(method.toLowerCase())) {
+    return false;
+  }
+  return !hasResponse || (status !== undefined && TRANSIENT_STATUS_CODES.has(status));
+}
+
+export function transientRetryDelayMs(retryCount: number): number {
+  return TRANSIENT_RETRY_DELAYS_MS[Math.min(retryCount, TRANSIENT_RETRY_DELAYS_MS.length - 1)];
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Module-level JWT token holder - persisted via useAuthStore persist middleware
 let _jwtAccessToken: string | null = null;
 
@@ -261,6 +280,22 @@ apiClient.interceptors.response.use(
       // Clear auth state and redirect to login
       _jwtAccessToken = null;
       redirectToLogin();
+    }
+
+    const retryConfig = error.config;
+    const retryCount = (retryConfig?._transientRetryCount || 0) as number;
+    if (
+      retryConfig &&
+      retryCount < TRANSIENT_RETRY_DELAYS_MS.length &&
+      isTransientRetryableRequest(
+        retryConfig.method,
+        error.response?.status,
+        Boolean(error.response)
+      )
+    ) {
+      retryConfig._transientRetryCount = retryCount + 1;
+      await wait(transientRetryDelayMs(retryCount));
+      return apiClient(retryConfig);
     }
 
     // Extract the most useful error message
