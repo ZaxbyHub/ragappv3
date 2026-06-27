@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from typing import List
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -74,6 +75,11 @@ def _make_store(embedding_service=None) -> tuple[MemoryStore, str]:
     return store, path
 
 
+def _cleanup_store(store: MemoryStore, path: str) -> None:
+    store.close_all()
+    os.remove(path)
+
+
 class TestHybridFallbacks(unittest.TestCase):
     def test_fts_only_when_no_embedding_service(self):
         store, path = _make_store(embedding_service=None)
@@ -86,7 +92,7 @@ class TestHybridFallbacks(unittest.TestCase):
             self.assertIn("concise", top.content.lower())
             self.assertEqual(top.score_type, "fts")
         finally:
-            os.remove(path)
+            _cleanup_store(store, path)
 
     def test_vault_scoping_blocks_cross_vault_results(self):
         store, path = _make_store(embedding_service=None)
@@ -99,7 +105,7 @@ class TestHybridFallbacks(unittest.TestCase):
                 # (global memories) but non-1 specific ids are not.
                 self.assertIn(r.vault_id, (1, None))
         finally:
-            os.remove(path)
+            _cleanup_store(store, path)
 
 
 class TestHybridSemanticPath(unittest.TestCase):
@@ -130,7 +136,7 @@ class TestHybridSemanticPath(unittest.TestCase):
             # "rrf" depending on whether FTS also produced rows.
             self.assertIn(results[0].score_type, ("dense", "rrf"))
         finally:
-            os.remove(path)
+            _cleanup_store(store, path)
 
     def test_semantic_only_memory_surfaces_even_when_fts_has_other_hits(self):
         """Regression: dense search must run UNFILTERED, not restricted to the
@@ -164,7 +170,7 @@ class TestHybridSemanticPath(unittest.TestCase):
                 f"semantic-only memory missing (dense was likely FTS-gated): {contents}",
             )
         finally:
-            os.remove(path)
+            _cleanup_store(store, path)
 
     def test_score_type_is_rrf_when_both_paths_match(self):
         embedder = _StubEmbedder()
@@ -178,7 +184,7 @@ class TestHybridSemanticPath(unittest.TestCase):
             self.assertTrue(results)
             self.assertEqual(results[0].score_type, "rrf")
         finally:
-            os.remove(path)
+            _cleanup_store(store, path)
 
     def test_update_memory_clears_and_refreshes_embedding(self):
         embedder = _StubEmbedder()
@@ -186,7 +192,7 @@ class TestHybridSemanticPath(unittest.TestCase):
         try:
             rec = store.add_memory("brief weekly summary", vault_id=1)
             # Confirm embedding stored.
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 row = conn.execute(
                     "SELECT embedding FROM memories WHERE id = ?", (rec.id,)
                 ).fetchone()
@@ -194,7 +200,7 @@ class TestHybridSemanticPath(unittest.TestCase):
                 first_emb = json.loads(row[0])
 
             store.update_memory_content(rec.id, "weekly format guideline")
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 row = conn.execute(
                     "SELECT content, embedding FROM memories WHERE id = ?", (rec.id,)
                 ).fetchone()
@@ -202,7 +208,7 @@ class TestHybridSemanticPath(unittest.TestCase):
                 self.assertIsNotNone(row[1])
                 self.assertNotEqual(json.loads(row[1]), first_emb)
         finally:
-            os.remove(path)
+            _cleanup_store(store, path)
 
 
 class TestCosineHelper(unittest.TestCase):

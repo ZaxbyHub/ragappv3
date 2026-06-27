@@ -130,6 +130,8 @@ class TestMemoriesAuthBase(unittest.TestCase):
                 tags,
                 source,
                 vault_id,
+                importance,
+                expires_at,
                 created_at,
                 updated_at,
             ):
@@ -139,6 +141,8 @@ class TestMemoriesAuthBase(unittest.TestCase):
                 self.tags = tags
                 self.source = source
                 self.vault_id = vault_id
+                self.importance = importance
+                self.expires_at = expires_at
                 self.created_at = created_at
                 self.updated_at = updated_at
 
@@ -151,6 +155,8 @@ class TestMemoriesAuthBase(unittest.TestCase):
                 tags=kwargs.get("tags"),
                 source=kwargs.get("source"),
                 vault_id=kwargs.get("vault_id"),
+                importance=kwargs.get("importance", 0.5),
+                expires_at=kwargs.get("expires_at"),
                 created_at="2024-01-01T00:00:00",
                 updated_at="2024-01-01T00:00:00",
             )

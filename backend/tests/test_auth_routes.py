@@ -207,6 +207,21 @@ class TestAuthRoutes(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("8 characters", response.json()["detail"])
 
+    def test_setup_status_reports_single_admin_mode_when_users_disabled(self):
+        settings.users_enabled = False
+
+        response = self.client.get("/api/auth/setup-status")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "needs_setup": False,
+                "users_enabled": False,
+                "auth_mode": "single_admin",
+            },
+        )
+
     def test_login_success(self):
         """Register then login, verify access_token returned."""
         # First register

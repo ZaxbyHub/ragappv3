@@ -16,6 +16,7 @@ from app.api.deps import (
     get_db,
     invalidate_active_user_cache,
 )
+from app.config import settings
 from app.limiter import limiter
 from app.security import (
     CSRF_COOKIE_NAME,
@@ -30,6 +31,7 @@ from app.services.auth_service import (
     create_refresh_token,
     password_strength_check,
 )
+from app.services.security_audit import safe_record_security_event
 from app.utils.paths import csrf_cookie_path, refresh_cookie_path
 
 logger = logging.getLogger(__name__)
@@ -268,6 +270,14 @@ async def register(
         max_age=REFRESH_TOKEN_MAX_AGE_DAYS * 24 * 60 * 60,
         path=refresh_cookie_path(),
     )
+    await safe_record_security_event(
+        db,
+        event_type="user.register",
+        target_user_id=user_id,
+        target_username=body.username,
+        request=request,
+        metadata={"role": role},
+    )
 
     return {
         "access_token": access_token,
@@ -302,6 +312,13 @@ async def login(
     )
 
     if not row:
+        await safe_record_security_event(
+            db,
+            event_type="auth.login_failed",
+            target_username=body.username,
+            request=request,
+            metadata={"reason": "unknown_user"},
+        )
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     (
@@ -317,6 +334,14 @@ async def login(
     ) = row
 
     if not is_active:
+        await safe_record_security_event(
+            db,
+            event_type="auth.login_failed",
+            target_user_id=user_id,
+            target_username=db_username,
+            request=request,
+            metadata={"reason": "inactive"},
+        )
         raise HTTPException(status_code=403, detail="User account is inactive")
 
     # Lockout check (before password verify)
@@ -326,6 +351,14 @@ async def login(
             retry_after = int(
                 (locked_until_dt - datetime.now(timezone.utc)).total_seconds()
             )
+            await safe_record_security_event(
+                db,
+                event_type="auth.login_failed",
+                target_user_id=user_id,
+                target_username=db_username,
+                request=request,
+                metadata={"reason": "locked", "retry_after": retry_after},
+            )
             raise HTTPException(
                 status_code=423,
                 detail=f"Account locked. Try again in {retry_after // 60} minutes.",
@@ -334,6 +367,17 @@ async def login(
 
     if not await async_verify_password(body.password, hashed_pw):
         await asyncio.to_thread(_record_failed_attempt_db, db, user_id, failed_attempts)
+        await safe_record_security_event(
+            db,
+            event_type="auth.login_failed",
+            target_user_id=user_id,
+            target_username=db_username,
+            request=request,
+            metadata={
+                "reason": "bad_password",
+                "failed_attempts": failed_attempts + 1,
+            },
+        )
         if failed_attempts + 1 >= 5:
             raise HTTPException(
                 status_code=423,
@@ -394,6 +438,15 @@ async def login(
 
     csrf_manager = get_csrf_manager(request)
     issue_csrf_token(response, csrf_manager)
+    await safe_record_security_event(
+        db,
+        event_type="auth.login_success",
+        actor={"id": user_id, "username": db_username},
+        target_user_id=user_id,
+        target_username=db_username,
+        request=request,
+        metadata={"role": role},
+    )
 
     return {
         "access_token": access_token,
@@ -490,14 +543,26 @@ async def refresh(
 
 @router.post("/logout")
 async def logout(
+    request: Request,
     response: Response,
     refresh_token: Optional[str] = Cookie(None, alias=REFRESH_TOKEN_COOKIE_NAME),
     db=Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Logout and revoke refresh token."""
+    audit_user = None
     if refresh_token:
         token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+        row = await asyncio.to_thread(
+            lambda: db.execute(
+                """SELECT u.id, u.username
+                   FROM user_sessions s JOIN users u ON s.user_id = u.id
+                   WHERE s.refresh_token_hash = ?""",
+                (token_hash,),
+            ).fetchone()
+        )
+        if row:
+            audit_user = {"id": row[0], "username": row[1]}
         try:
             def _logout_db(db_ref, token):
                 try:
@@ -515,6 +580,14 @@ async def logout(
             await asyncio.to_thread(_logout_db, db, token_hash)
         except Exception:
             logger.error("Failed to delete session during logout", exc_info=True)
+    await safe_record_security_event(
+        db,
+        event_type="auth.logout",
+        actor=audit_user,
+        target_user_id=audit_user.get("id") if audit_user else None,
+        target_username=audit_user.get("username") if audit_user else None,
+        request=request,
+    )
 
     response.delete_cookie(key=REFRESH_TOKEN_COOKIE_NAME, path=refresh_cookie_path())
     response.delete_cookie(key=CSRF_COOKIE_NAME, path=csrf_cookie_path())
@@ -524,10 +597,20 @@ async def logout(
 @router.get("/setup-status")
 async def setup_status(db=Depends(get_db)):
     """Check if initial setup is needed (no users exist). No auth required."""
+    if not settings.users_enabled:
+        return {
+            "needs_setup": False,
+            "users_enabled": False,
+            "auth_mode": "single_admin",
+        }
     user_count = await asyncio.to_thread(
         lambda: db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     )
-    return {"needs_setup": user_count == 0}
+    return {
+        "needs_setup": user_count == 0,
+        "users_enabled": True,
+        "auth_mode": "jwt",
+    }
 
 
 @router.get("/me")
@@ -681,6 +764,15 @@ async def change_password(
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
     invalidate_active_user_cache(user_id)
+    await safe_record_security_event(
+        db,
+        event_type="auth.password_changed",
+        actor=user,
+        target_user_id=user_id,
+        target_username=username,
+        request=request,
+        metadata={"sessions_revoked": True},
+    )
 
     # Generate new tokens
     access_token = create_access_token(user_id, username, role)
@@ -729,6 +821,7 @@ async def change_password(
 
 @router.get("/sessions")
 async def list_sessions(
+    request: Request,
     user: dict = Depends(get_current_active_user),
     db=Depends(get_db),
 ):
@@ -737,9 +830,13 @@ async def list_sessions(
     Returns sessions with: id, ip_address, user_agent, created_at, expires_at
     Never returns token hashes.
     """
+    refresh_token = request.cookies.get(REFRESH_TOKEN_COOKIE_NAME)
+    current_token_hash = (
+        hashlib.sha256(refresh_token.encode()).hexdigest() if refresh_token else None
+    )
     rows = await asyncio.to_thread(
         lambda: db.execute(
-            """SELECT id, ip_address, user_agent, created_at, expires_at
+            """SELECT id, user_id, refresh_token_hash, ip_address, user_agent, created_at, expires_at
                FROM user_sessions
                WHERE user_id = ? AND expires_at > datetime('now')
                ORDER BY created_at DESC""",
@@ -752,10 +849,12 @@ async def list_sessions(
         sessions.append(
             {
                 "id": row[0],
-                "ip_address": row[1],
-                "user_agent": row[2],
-                "created_at": row[3],
-                "expires_at": row[4],
+                "user_id": row[1],
+                "ip_address": row[3],
+                "user_agent": row[4],
+                "created_at": row[5],
+                "expires_at": row[6],
+                "is_current": bool(current_token_hash and row[2] == current_token_hash),
             }
         )
 
@@ -765,6 +864,7 @@ async def list_sessions(
 @router.delete("/sessions/{session_id}")
 async def revoke_session(
     session_id: int,
+    request: Request,
     user: dict = Depends(get_current_active_user),
     db=Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
@@ -805,6 +905,15 @@ async def revoke_session(
     except Exception:
         logger.error("Failed to revoke session", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
+    await safe_record_security_event(
+        db,
+        event_type="auth.session_revoked",
+        actor=user,
+        target_user_id=user.get("id"),
+        target_username=user.get("username"),
+        request=request,
+        metadata={"session_id": session_id},
+    )
 
     return Response(status_code=204)
 
@@ -873,6 +982,15 @@ async def revoke_all_sessions(
 
     # Generate new access token
     access_token = create_access_token(user["id"], user["username"], user["role"])
+    await safe_record_security_event(
+        db,
+        event_type="auth.sessions_revoked",
+        actor=user,
+        target_user_id=user.get("id"),
+        target_username=user.get("username"),
+        request=request,
+        metadata={"kept_session_id": current_session_id},
+    )
 
     # Set new refresh cookie
     response.set_cookie(
