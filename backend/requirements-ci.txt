@@ -1,11 +1,11 @@
 # Runtime deps for CI — excludes packages stubbed by conftest.py
 # (lancedb, pyarrow, unstructured[all-docs] are stubbed at test time and
 #  excluded here to avoid multi-GB installs and system-library requirements)
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
+fastapi>=0.138.1
+uvicorn[standard]>=0.49.0
 python-multipart>=0.0.6
 httpx>=0.26.0
-pydantic>=2.5.0
+pydantic>=2.13.4
 pydantic-settings>=2.1.0
 numpy>=1.26.4
 aiofiles>=23.2.0
