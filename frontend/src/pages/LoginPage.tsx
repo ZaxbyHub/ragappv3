@@ -30,7 +30,7 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [showPassword, setShowPassword] = useState(false);
 
-  const { login, needsSetup, isLoading } = useAuthStore();
+  const { login, needsSetup, isLoading, authMode } = useAuthStore();
 
   const navigate = useNavigate();
   const location = useLocation();
@@ -59,6 +59,34 @@ export default function LoginPage() {
   // Redirect to setup if needsSetup is true
   if (needsSetup === true) {
     return <Navigate to="/setup" replace />;
+  }
+
+  if (authMode === "single_admin") {
+    return (
+      <div className="flex min-h-screen items-center justify-center p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="space-y-1">
+            <div className="flex items-center justify-center mb-2">
+              <div className="flex flex-col items-center justify-center">
+                <MeridianLogo className="size-20" />
+                <span className="text-2xl font-bold text-primary font-electrolize tracking-tighter uppercase">
+                  Meridian
+                </span>
+              </div>
+            </div>
+            <CardTitle className="text-2xl text-center">Single-Admin Mode</CardTitle>
+            <CardDescription className="text-center">
+              User accounts are disabled for this deployment.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <p className="text-sm text-muted-foreground text-center">
+              Access is controlled by the configured admin secret. Ask the operator to enable user accounts before signing in here.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    );
   }
 
   const handleSubmit = async (e: React.FormEvent) => {

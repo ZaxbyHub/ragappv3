@@ -69,7 +69,9 @@ class TestMetricPrimitives(unittest.TestCase):
 
 class TestEvalRunner(unittest.TestCase):
     def setUp(self) -> None:
-        self.golden_path = Path(tempfile.mkstemp(suffix=".jsonl")[1])
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        self.golden_path = Path(path)
         self.golden_path.write_text(
             "\n".join(
                 json.dumps(c)
@@ -141,7 +143,9 @@ class TestEvalRunner(unittest.TestCase):
                 cited_source_labels=["S1", "S2"],
             )
         )
-        out = Path(tempfile.mkstemp(suffix=".json")[1])
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        out = Path(path)
         try:
             runner.to_json(out)
             data = json.loads(out.read_text())

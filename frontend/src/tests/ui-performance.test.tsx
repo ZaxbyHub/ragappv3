@@ -9,6 +9,8 @@
  * the correct counts, proving that virtualization is enabled for large
  * datasets without needing to fully render and test all components.
  */
+import { readFileSync } from "node:fs";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, act } from "@testing-library/react";
 
@@ -266,10 +268,14 @@ describe("SC-004: MessageContent Memoization", () => {
 // =============================================================================
 
 describe("SC-005: SessionRail Debounce", () => {
-  it("SessionRail component exists and uses debounce", async () => {
+  it("SessionRail imports and uses the shared debounce hook for search", async () => {
     const { SessionRail } = await import("@/components/chat/SessionRail");
+    const source = readFileSync("src/components/chat/SessionRail.tsx", "utf-8");
+
     expect(SessionRail).toBeDefined();
-  });
+    expect(source).toContain('import { useDebounce } from "@/hooks/useDebounce"');
+    expect(source).toContain("useDebounce(sessionSearchQuery, 300)");
+  }, 15_000);
 });
 
 // =============================================================================

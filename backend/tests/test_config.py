@@ -16,7 +16,11 @@ class TestSettingsDefaults(unittest.TestCase):
 
     def test_settings_defaults(self):
         """Test Settings() loads all defaults with no env overrides."""
-        settings = Settings()
+        settings = Settings(
+            _env_file=None,
+            admin_secret_token="test-admin-token",
+            jwt_secret_key="test-jwt-secret-key",
+        )
 
         self.assertEqual(settings.data_dir, Path("./data"))
         self.assertEqual(
@@ -53,7 +57,11 @@ class TestRagRelevanceThreshold(unittest.TestCase):
 
     def test_rag_relevance_threshold_default(self):
         """Test that default rag_relevance_threshold is None (deprecated)."""
-        settings = Settings()
+        settings = Settings(
+            _env_file=None,
+            admin_secret_token="test-admin-token",
+            jwt_secret_key="test-jwt-secret-key",
+        )
         self.assertIsNone(settings.rag_relevance_threshold)
 
     def test_rag_relevance_threshold_env_override(self):
@@ -61,7 +69,11 @@ class TestRagRelevanceThreshold(unittest.TestCase):
         original_value = os.environ.get("RAG_RELEVANCE_THRESHOLD")
         try:
             os.environ["RAG_RELEVANCE_THRESHOLD"] = "0.5"
-            settings = Settings()
+            settings = Settings(
+                _env_file=None,
+                admin_secret_token="test-admin-token",
+                jwt_secret_key="test-jwt-secret-key",
+            )
             self.assertEqual(settings.rag_relevance_threshold, 0.5)
         finally:
             if original_value is not None:

@@ -1,7 +1,18 @@
 import { useState, useEffect } from "react";
 import { toast } from "sonner";
 import { useAuthStore } from "@/stores/useAuthStore";
-import { changePassword, listOrganizations, listVaults, type Organization, type Vault } from "@/lib/api";
+import {
+  changePassword,
+  listOrganizations,
+  listSessions,
+  listVaults,
+  revokeAllSessions,
+  revokeSession,
+  setJwtAccessToken,
+  type Organization,
+  type Session,
+  type Vault,
+} from "@/lib/api";
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { mockOrganizations, mockVaults } from "@/fixtures/vaults";
 import { Button } from "@/components/ui/button";
@@ -9,7 +20,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { User, Lock, Loader2, Save, Building2, Database } from "lucide-react";
+import { User, Lock, Loader2, Save, Building2, Database, Monitor, LogOut } from "lucide-react";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 type UserRole = "superadmin" | "admin" | "member" | "viewer";
@@ -20,6 +31,14 @@ const ROLE_LABELS: Record<UserRole, string> = {
   member: "Member",
   viewer: "Viewer",
 };
+
+function formatSessionDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString();
+}
 
 function ProfilePageContent() {
   const testMode = useTestMode();
@@ -38,16 +57,28 @@ function ProfilePageContent() {
   const [orgs, setOrgs] = useState<Organization[]>(testMode ? mockOrganizations : []);
   const [vaults, setVaults] = useState<Vault[]>(testMode ? mockVaults : []);
   const [loadingAccess, setLoadingAccess] = useState(!testMode);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [loadingSessions, setLoadingSessions] = useState(!testMode);
+  const [revokingSessionId, setRevokingSessionId] = useState<string | null>(null);
+  const [revokingOthers, setRevokingOthers] = useState(false);
 
   useEffect(() => {
     if (testMode) return;
     setLoadingAccess(true);
-    Promise.allSettled([listOrganizations(), listVaults()]).then(([orgResult, vaultResult]) => {
+    setLoadingSessions(true);
+    Promise.allSettled([listOrganizations(), listVaults(), listSessions()]).then(([orgResult, vaultResult, sessionsResult]) => {
       if (orgResult.status === "fulfilled") setOrgs(orgResult.value);
       if (vaultResult.status === "fulfilled") setVaults(vaultResult.value.vaults ?? []);
+      if (sessionsResult.status === "fulfilled") setSessions(sessionsResult.value.sessions ?? []);
       setLoadingAccess(false);
+      setLoadingSessions(false);
     });
   }, [testMode]);
+
+  const refreshSessions = async () => {
+    const result = await listSessions();
+    setSessions(result.sessions ?? []);
+  };
 
   const handleUpdateProfile = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -94,6 +125,36 @@ function ProfilePageContent() {
       toast.error(message);
     } finally {
       setChangingPassword(false);
+    }
+  };
+
+  const handleRevokeSession = async (sessionId: string) => {
+    setRevokingSessionId(sessionId);
+    try {
+      await revokeSession(Number(sessionId));
+      await refreshSessions();
+      toast.success("Session revoked");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to revoke session";
+      toast.error(message);
+    } finally {
+      setRevokingSessionId(null);
+    }
+  };
+
+  const handleRevokeOtherSessions = async () => {
+    setRevokingOthers(true);
+    try {
+      const result = await revokeAllSessions();
+      setJwtAccessToken(result.access_token);
+      useAuthStore.setState({ accessToken: result.access_token });
+      await refreshSessions();
+      toast.success("Other sessions revoked");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to revoke other sessions";
+      toast.error(message);
+    } finally {
+      setRevokingOthers(false);
     }
   };
 
@@ -187,6 +248,61 @@ function ProfilePageContent() {
               </Button>
             </div>
           </form>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Monitor className="w-5 h-5" />Active Sessions
+          </CardTitle>
+          <CardDescription>Review and revoke signed-in devices</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {loadingSessions ? (
+            <div className="flex items-center gap-2 text-muted-foreground text-sm"><Loader2 className="w-4 h-4 animate-spin" /> Loading...</div>
+          ) : sessions.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No active sessions found.</p>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={handleRevokeOtherSessions}
+                  disabled={revokingOthers || sessions.length <= 1}
+                >
+                  {revokingOthers ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <LogOut className="w-4 h-4 mr-2" />}
+                  Sign Out Other Devices
+                </Button>
+              </div>
+              <ul className="space-y-2">
+                {sessions.map((session) => (
+                  <li key={session.id} className="flex flex-col gap-3 rounded-md border p-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0 space-y-1 text-sm">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{session.user_agent || "Unknown device"}</span>
+                        {session.is_current && <Badge variant="secondary">Current</Badge>}
+                      </div>
+                      <p className="text-muted-foreground">
+                        {session.ip_address || "Unknown IP"} · Created {formatSessionDate(session.created_at)} · Expires {formatSessionDate(session.expires_at)}
+                      </p>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => handleRevokeSession(session.id)}
+                      disabled={session.is_current || revokingSessionId === session.id}
+                      aria-label={session.is_current ? "Current session cannot be revoked here" : "Revoke session"}
+                    >
+                      {revokingSessionId === session.id ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <LogOut className="w-4 h-4 mr-2" />}
+                      Revoke
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </CardContent>
       </Card>
 

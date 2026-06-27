@@ -59,6 +59,8 @@ class MemoryRecord:
     tags: Optional[str]
     source: Optional[str]
     vault_id: Optional[int] = None
+    importance: float = 0.5
+    expires_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     score: Optional[float] = None
@@ -155,6 +157,18 @@ class MemoryStore:
         """
         cursor = conn.execute("PRAGMA table_info(memories)")
         return any(row[1] == "embedding" for row in cursor.fetchall())
+
+    def evict_expired_memories(self) -> int:
+        """Delete expired memories and return the number removed."""
+        conn = self.pool.get_connection()
+        try:
+            cursor = conn.execute(
+                "DELETE FROM memories WHERE expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')"
+            )
+            conn.commit()
+            return int(cursor.rowcount or 0)
+        finally:
+            self.pool.release_connection(conn)
 
     async def _embed_text(self, text: str) -> Optional[List[float]]:
         """Best-effort embed; never raises. Returns None on failure or when
@@ -282,29 +296,36 @@ class MemoryStore:
         tags: Optional[str] = None,
         source: Optional[str] = None,
         vault_id: Optional[int] = None,
+        importance: float = 0.5,
+        expires_at: Optional[str] = None,
     ) -> MemoryRecord:
         if not content or not content.strip():
             raise MemoryStoreError("Memory content cannot be empty")
 
         sql = """
-        INSERT INTO memories (content, category, tags, source, vault_id)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO memories (content, category, tags, source, vault_id, importance, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """
         conn = self.pool.get_connection()
         try:
-            cursor = conn.execute(sql, (content, category, tags, source, vault_id))
+            cursor = conn.execute(
+                sql,
+                (content, category, tags, source, vault_id, importance, expires_at),
+            )
             conn.commit()
             memory_id = cursor.lastrowid
             if memory_id is None:
                 raise MemoryStoreError("Failed to insert memory")
             # Fetch created_at, updated_at, and vault_id for the inserted row
             cursor = conn.execute(
-                "SELECT created_at, updated_at, vault_id FROM memories WHERE id = ?", (memory_id,)
+                "SELECT created_at, updated_at, vault_id, importance, expires_at FROM memories WHERE id = ?", (memory_id,)
             )
             row = cursor.fetchone()
             created_at = row[0] if row else None
             updated_at = row[1] if row else None
             retrieved_vault_id = row[2] if row else None
+            retrieved_importance = row[3] if row else importance
+            retrieved_expires_at = row[4] if row else expires_at
         finally:
             self.pool.release_connection(conn)
 
@@ -329,6 +350,8 @@ class MemoryStore:
             tags=tags,
             source=source,
             vault_id=retrieved_vault_id,
+            importance=float(retrieved_importance or 0.5),
+            expires_at=retrieved_expires_at,
             created_at=created_at,
             updated_at=updated_at,
         )
@@ -414,21 +437,23 @@ class MemoryStore:
             try:
                 if vault_id is None:
                     sql = """
-                    SELECT m.id, m.content, m.category, m.tags, m.source, m.vault_id, m.created_at, m.updated_at, f.rank
+                    SELECT m.id, m.content, m.category, m.tags, m.source, m.vault_id, m.importance, m.expires_at, m.created_at, m.updated_at, f.rank
                     FROM memories_fts f
                     JOIN memories m ON f.rowid = m.id
                     WHERE memories_fts MATCH ?
+                    AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))
                     ORDER BY rank
                     LIMIT ?
                     """
                     params: tuple = (sanitized_query, limit)
                 else:
                     sql = """
-                    SELECT m.id, m.content, m.category, m.tags, m.source, m.vault_id, m.created_at, m.updated_at, f.rank
+                    SELECT m.id, m.content, m.category, m.tags, m.source, m.vault_id, m.importance, m.expires_at, m.created_at, m.updated_at, f.rank
                     FROM memories_fts f
                     JOIN memories m ON f.rowid = m.id
                     WHERE memories_fts MATCH ?
                     AND (m.vault_id = ? OR m.vault_id IS NULL)
+                    AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))
                     ORDER BY rank
                     LIMIT ?
                     """
@@ -450,9 +475,11 @@ class MemoryStore:
                 tags=row[3],
                 source=row[4],
                 vault_id=row[5],
-                created_at=row[6],
-                updated_at=row[7],
-                score=row[8],
+                importance=float(row[6] or 0.5),
+                expires_at=row[7],
+                created_at=row[8],
+                updated_at=row[9],
+                score=row[10],
                 score_type="fts",
             )
             records.append(record)
@@ -490,16 +517,19 @@ class MemoryStore:
                 return []
             if vault_id is None:
                 sql = """
-                SELECT id, content, category, tags, source, vault_id, created_at, updated_at, embedding
-                FROM memories WHERE embedding IS NOT NULL
+                SELECT id, content, category, tags, source, vault_id, importance, expires_at, created_at, updated_at, embedding
+                FROM memories
+                WHERE embedding IS NOT NULL
+                  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
                 """
                 params: tuple = ()
             else:
                 sql = """
-                SELECT id, content, category, tags, source, vault_id, created_at, updated_at, embedding
+                SELECT id, content, category, tags, source, vault_id, importance, expires_at, created_at, updated_at, embedding
                 FROM memories
                 WHERE embedding IS NOT NULL
                   AND (vault_id = ? OR vault_id IS NULL)
+                  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
                 """
                 params = (vault_id,)
             if candidate_ids:
@@ -523,7 +553,7 @@ class MemoryStore:
         scored: List[MemoryRecord] = []
         for row in rows:
             try:
-                vec = json.loads(row[8]) if row[8] else None
+                vec = json.loads(row[10]) if row[10] else None
             except (TypeError, json.JSONDecodeError):
                 vec = None
             if not isinstance(vec, list):
@@ -540,8 +570,10 @@ class MemoryStore:
                     tags=row[3],
                     source=row[4],
                     vault_id=row[5],
-                    created_at=row[6],
-                    updated_at=row[7],
+                    importance=float(row[6] or 0.5),
+                    expires_at=row[7],
+                    created_at=row[8],
+                    updated_at=row[9],
                     score=sim,
                     score_type="dense",
                 )
@@ -564,6 +596,7 @@ class MemoryStore:
         otherwise.
         """
         # FTS results — always run.
+        self.evict_expired_memories()
         fts_records = self._fts_search(query, limit, vault_id)
 
         # Dense results — best-effort, run UNFILTERED across the vault.

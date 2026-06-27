@@ -143,12 +143,20 @@ class TestDataDirDefault:
 
     def test_data_dir_defaults_to_relative_path(self):
         """Data directory should default to './data' relative path."""
-        settings = Settings()
+        settings = Settings(
+            _env_file=None,
+            admin_secret_token="test-admin-token",
+            jwt_secret_key="test-jwt-secret-key",
+        )
         assert settings.data_dir == Path("./data")
 
     def test_data_dir_is_relative_path(self):
         """Data directory should be a relative path."""
-        settings = Settings()
+        settings = Settings(
+            _env_file=None,
+            admin_secret_token="test-admin-token",
+            jwt_secret_key="test-jwt-secret-key",
+        )
         # Verify it's a relative path (not absolute)
         assert not settings.data_dir.is_absolute() or str(settings.data_dir).startswith(
             "./"
@@ -157,7 +165,11 @@ class TestDataDirDefault:
     def test_data_dir_can_be_overridden(self):
         """Data directory can be overridden via environment variable."""
         with patch.dict("os.environ", {"DATA_DIR": "/custom/data/path"}):
-            settings = Settings()
+            settings = Settings(
+                _env_file=None,
+                admin_secret_token="test-admin-token",
+                jwt_secret_key="test-jwt-secret-key",
+            )
             assert settings.data_dir == Path("/custom/data/path")
 
 

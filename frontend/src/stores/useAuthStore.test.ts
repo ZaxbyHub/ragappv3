@@ -408,6 +408,19 @@ describe("useAuthStore", () => {
       expect(useAuthStore.getState().needsSetup).toBe(true);
     });
 
+    it("should set single_admin auth mode when users are disabled", async () => {
+      const { checkSetupStatus } = useAuthStore.getState();
+
+      mockGet?.mockResolvedValueOnce({
+        data: { needs_setup: false, users_enabled: false, auth_mode: "single_admin" },
+      });
+
+      await checkSetupStatus();
+
+      expect(useAuthStore.getState().needsSetup).toBe(false);
+      expect(useAuthStore.getState().authMode).toBe("single_admin");
+    });
+
     it("should set needsSetup to false when server indicates setup is not needed", async () => {
       const { checkSetupStatus } = useAuthStore.getState();
       
@@ -617,6 +630,12 @@ describe("useAuthStore", () => {
       const { setAuthMode } = useAuthStore.getState();
       setAuthMode("jwt");
       expect(useAuthStore.getState().authMode).toBe("jwt");
+    });
+
+    it("should set authMode to single_admin", () => {
+      const { setAuthMode } = useAuthStore.getState();
+      setAuthMode("single_admin");
+      expect(useAuthStore.getState().authMode).toBe("single_admin");
     });
 
     // "apikey" mode removed — JWT is the only auth mode

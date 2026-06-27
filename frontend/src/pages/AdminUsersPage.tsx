@@ -115,7 +115,6 @@ function AdminUsersPageContent() {
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [isResettingPassword, setIsResettingPassword] = useState(false);
-  const [mustChangePassword, setMustChangePassword] = useState(false);
 
   // Manage Groups Sheet State
   const [groupsSheetOpen, setGroupsSheetOpen] = useState(false);
@@ -247,7 +246,6 @@ function AdminUsersPageContent() {
     setUserToResetPassword(user);
     setNewPassword("");
     setConfirmPassword("");
-    setMustChangePassword(false);
     setPasswordDialogOpen(true);
   };
 
@@ -256,7 +254,6 @@ function AdminUsersPageContent() {
     setUserToResetPassword(null);
     setNewPassword("");
     setConfirmPassword("");
-    setMustChangePassword(false);
   };
 
   const handleResetPassword = async () => {
@@ -271,10 +268,9 @@ function AdminUsersPageContent() {
     }
     setIsResettingPassword(true);
     try {
-      const response = await apiClient.patch(`/users/${userToResetPassword.id}/password`, {
+      await apiClient.patch(`/users/${userToResetPassword.id}/password`, {
         new_password: newPassword,
       });
-      setMustChangePassword(response.data.must_change_password ?? true);
       toast.success("Password reset successfully");
       closePasswordDialog();
     } catch (err) {
@@ -811,11 +807,9 @@ const handleCreateUser = async () => {
                 placeholder="Confirm new password"
               />
             </div>
-            {mustChangePassword && (
-              <p className="text-sm text-muted-foreground">
-                User will be required to change their password on next login.
-              </p>
-            )}
+            <p className="text-sm text-muted-foreground">
+              User will be required to change their password on next login.
+            </p>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={closePasswordDialog} disabled={isResettingPassword}>

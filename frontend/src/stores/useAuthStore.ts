@@ -39,7 +39,7 @@ interface AuthState {
   isLoading: boolean;
   isInitialized: boolean;
   needsSetup: boolean | null;
-  authMode: "jwt" | "unknown";
+  authMode: "jwt" | "single_admin" | "unknown";
 
   // Actions
   login: (username: string, password: string) => Promise<void>;
@@ -48,7 +48,7 @@ interface AuthState {
   refreshToken: () => Promise<string | null>;
   fetchMe: () => Promise<void>;
   checkSetupStatus: () => Promise<void>;
-  setAuthMode: (mode: "jwt") => void;
+  setAuthMode: (mode: "jwt" | "single_admin") => void;
   updateProfile: (data: { full_name?: string }) => Promise<void>;
   init: () => Promise<void>;
 
@@ -95,7 +95,7 @@ export const useAuthStore = create<AuthState>()(
 
       _setLoading: (loading: boolean) => set({ isLoading: loading }),
 
-      setAuthMode: (mode: "jwt") => set({ authMode: mode }),
+      setAuthMode: (mode: "jwt" | "single_admin") => set({ authMode: mode }),
 
       init: async () => {
         // Guard: if init is already in-flight, await the same promise instead of
@@ -142,7 +142,8 @@ export const useAuthStore = create<AuthState>()(
             // Backend unreachable
           }
 
-          set({ authMode: "jwt", isLoading: false, isInitialized: true });
+          const authMode = get().authMode === "unknown" ? "jwt" : get().authMode;
+          set({ authMode, isLoading: false, isInitialized: true });
         })();
 
         await _initPromise;
@@ -151,10 +152,13 @@ export const useAuthStore = create<AuthState>()(
 
       checkSetupStatus: async () => {
         try {
-          const response = await authClient.get<{ needs_setup: boolean }>(
+          const response = await authClient.get<{ needs_setup: boolean; auth_mode?: "jwt" | "single_admin"; users_enabled?: boolean }>(
             "/auth/setup-status"
           );
-          set({ needsSetup: response.data.needs_setup });
+          set({
+            needsSetup: response.data.needs_setup,
+            authMode: response.data.auth_mode ?? (response.data.users_enabled === false ? "single_admin" : "jwt"),
+          });
         } catch (error) {
           console.error("Failed to check setup status:", error);
           set({ needsSetup: false });

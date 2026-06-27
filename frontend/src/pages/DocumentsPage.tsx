@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -56,6 +57,7 @@ const FILENAME_COL_WIDTH_KEY = "ragapp_doc_table_filename_col";
 const FILENAME_COL_WIDTH_DEFAULT = 250;
 
 export default function DocumentsPage() {
+  const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedSearchQuery, isSearching] = useDebounce(searchQuery, 300);
   const [isScanning, setIsScanning] = useState(false);
@@ -528,6 +530,7 @@ export default function DocumentsPage() {
       ? {
           title: "No vaults available",
           description: "Create a vault or ask an admin to grant you access to start uploading documents.",
+          action: { label: "Open Vaults", onClick: () => navigate("/vaults") },
         }
       : !hasSelectedVault
         ? {
@@ -540,11 +543,14 @@ export default function DocumentsPage() {
               description: "Search checks filename, type, status, source, sender, subject, and document date.",
             }
           : {
-              title: "No documents yet",
-              description: canWriteActiveVault
-                ? "Upload files to get started."
-                : "Documents will appear here when this vault has indexed files.",
-            };
+            title: "No documents yet",
+            description: canWriteActiveVault
+              ? "Upload files to get started."
+              : "You have read-only access to this vault. Create a vault you administer or ask an admin for write access to upload documents.",
+            action: canWriteActiveVault
+              ? undefined
+              : { label: "Open Vaults", onClick: () => navigate("/vaults") },
+          };
 
   const selectedFileIds = useMemo(
     () => Array.from(selectedIds).map((id) => Number(id)),
@@ -673,7 +679,12 @@ export default function DocumentsPage() {
           <Skeleton className="h-4 w-96 max-w-full" />
         </div>
       ) : filteredDocuments.length === 0 ? (
-        <EmptyState icon={FileText} title={emptyState.title} description={emptyState.description} />
+        <EmptyState
+          icon={FileText}
+          title={emptyState.title}
+          description={emptyState.description}
+          action={emptyState.action}
+        />
       ) : (
         <>
           <DocumentTable

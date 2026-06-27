@@ -6,17 +6,38 @@ Expensive model checks are opt-in via ?deep=true query parameter.
 """
 
 import logging
+import sqlite3
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
-from app.api.deps import get_llm_health_checker, get_model_checker
+from app.api.deps import get_db, get_llm_health_checker, get_model_checker
 from app.services.llm_health import LLMHealthChecker
 from app.services.model_checker import ModelChecker
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _vector_reconciliation_status(conn: sqlite3.Connection) -> dict:
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS pending_count,
+            MIN(created_at) AS oldest_pending_created_at,
+            MAX(attempts) AS max_attempts
+        FROM vector_delete_pending
+        """
+    ).fetchone()
+    pending_count = int(row[0] or 0) if row else 0
+    max_attempts = int(row[2] or 0) if row and row[2] is not None else 0
+    return {
+        "ok": pending_count == 0,
+        "pending_count": pending_count,
+        "oldest_pending_created_at": row[1] if row else None,
+        "max_attempts": max_attempts,
+    }
 
 
 @router.get("/health")
@@ -101,6 +122,27 @@ async def health_check(
         }
 
     return result
+
+
+@router.get("/health/vector-reconciliation")
+async def vector_reconciliation_health(
+    conn: sqlite3.Connection = Depends(get_db),
+):
+    """Return runtime status for pending SQLite-to-vector-store reconciliation."""
+    try:
+        return _vector_reconciliation_status(conn)
+    except sqlite3.Error as exc:
+        logger.warning("Vector reconciliation status probe failed: %s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "pending_count": None,
+                "oldest_pending_created_at": None,
+                "max_attempts": None,
+                "error": str(exc),
+            },
+        )
 
 
 @router.get("/llm-health/modes")
