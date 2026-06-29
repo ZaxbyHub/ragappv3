@@ -717,7 +717,7 @@ class BackgroundProcessor:
                     email_sender=task.email_sender,
                     vault_id=task.vault_id,
                 )
-            if self.processor.should_enqueue_enrichment(result.chunks):
+            if self.processor.should_enqueue_enrichment(result.chunks, result.vault_id, result.file_id):
                 self.processor.set_enrichment_status(result.file_id, "pending")
                 await self.enqueue_enrichment(
                     EnrichmentTaskItem(

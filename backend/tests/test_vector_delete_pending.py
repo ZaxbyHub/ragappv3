@@ -47,7 +47,7 @@ from app.models.database import (
     migrate_add_vector_delete_pending,
     run_migrations,
 )
-from app.services.auth_service import create_access_token
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
 class TestVectorDeletePendingMigration(unittest.TestCase):
@@ -123,6 +123,8 @@ class DocumentsDeleteVectorPendingTestBase(unittest.TestCase):
 
     def setUp(self):
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
         self._temp_dir = tempfile.mkdtemp()
 
         self._original_jwt_secret = settings.jwt_secret_key
@@ -199,7 +201,7 @@ class DocumentsDeleteVectorPendingTestBase(unittest.TestCase):
 
     def _headers(self):
         return {
-            "Authorization": f"Bearer {create_access_token(1, 'superadmin', 'superadmin')}"
+            "Authorization": f"Bearer {create_access_token(1, 'superadmin', 'superadmin', client_fingerprint=compute_client_fingerprint(''))}"
         }
 
     def _seed_file(self, vault_id=2, file_name="test.txt"):

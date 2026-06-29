@@ -3,7 +3,7 @@ import { ErrorState } from '@/components/shared/ErrorState';
 
 interface ErrorBoundaryProps {
   children: React.ReactNode;
-  fallback?: React.ReactNode;
+  fallback?: React.ReactNode | ((resetErrorBoundary: () => void) => React.ReactNode);
 }
 
 interface ErrorBoundaryState {
@@ -31,6 +31,9 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
 
   render(): React.ReactNode {
     if (this.state.hasError) {
+      if (typeof this.props.fallback === "function") {
+        return this.props.fallback(this.handleRetry);
+      }
       if (this.props.fallback) {
         return this.props.fallback;
       }

@@ -35,7 +35,7 @@ from app.api.deps import (
 from app.config import settings
 from app.main import app
 from app.security import csrf_protect
-from app.services.auth_service import create_access_token
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
 class ConcurrentVaultRequestsTest(unittest.TestCase):
@@ -123,6 +123,7 @@ class ConcurrentVaultRequestsTest(unittest.TestCase):
                 user_id,
                 f"concurrent-user-{user_id}",
                 "superadmin" if user_id == 1 else "member",
+                client_fingerprint=compute_client_fingerprint(""),
             )
             for user_id in range(1, 11)
         ]

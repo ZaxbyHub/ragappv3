@@ -6,8 +6,11 @@ import pytest
 
 from app.services.context_distiller import (
     ContextDistiller,
+    DistillResult,
+    SentenceProvenance,
     _cosine_similarity,
     _split_sentences,
+    _split_sentences_with_spans,
 )
 from app.services.rag_engine import RAGSource
 
@@ -82,6 +85,71 @@ class TestSplitSentences:
         """Returns empty list for empty string."""
         result = _split_sentences("")
         assert result == []
+
+
+class TestSplitSentencesWithSpans:
+    """Tests for _split_sentences_with_spans helper function."""
+
+    def test_basic_spans(self):
+        """Spans correctly identify sentence boundaries."""
+        text = "Hello world. This is a test."
+        result = _split_sentences_with_spans(text)
+        assert result == [
+            ("Hello world.", (0, 12)),
+            ("This is a test.", (13, 28)),
+        ]
+        # Verify slice matches sentence text
+        assert text[result[0][1][0]:result[0][1][1]] == "Hello world."
+        assert text[result[1][1][0]:result[1][1][1]] == "This is a test."
+
+    def test_multiple_punctuation_spans(self):
+        """Spans work with ! and ? punctuation."""
+        text = "Hello world! Is this working? Yes it is."
+        result = _split_sentences_with_spans(text)
+        assert result[0][0] == "Hello world!"
+        assert text[result[0][1][0]:result[0][1][1]] == "Hello world!"
+        assert result[1][0] == "Is this working?"
+        assert text[result[1][1][0]:result[1][1][1]] == "Is this working?"
+        assert result[2][0] == "Yes it is."
+        assert text[result[2][1][0]:result[2][1][1]] == "Yes it is."
+
+    def test_no_punctuation_span(self):
+        """Single sentence without punctuation."""
+        text = "Hello world"
+        result = _split_sentences_with_spans(text)
+        assert result == [("Hello world", (0, 11))]
+        assert text[result[0][1][0]:result[0][1][1]] == "Hello world"
+
+    def test_multiple_spaces_spans(self):
+        """Multiple spaces between sentences."""
+        text = "First.    Second.   Third."
+        result = _split_sentences_with_spans(text)
+        assert result[0][0] == "First."
+        assert text[result[0][1][0]:result[0][1][1]] == "First."
+        assert result[1][0] == "Second."
+        assert text[result[1][1][0]:result[1][1][1]] == "Second."
+        assert result[2][0] == "Third."
+        assert text[result[2][1][0]:result[2][1][1]] == "Third."
+
+    def test_empty_string(self):
+        """Empty string returns empty list."""
+        result = _split_sentences_with_spans("")
+        assert result == []
+
+    def test_trailing_whitespace(self):
+        """Trailing whitespace handled correctly."""
+        text = "First. Second.   "
+        result = _split_sentences_with_spans(text)
+        assert result[0][0] == "First."
+        assert result[1][0] == "Second."
+
+    def test_consecutive_punctuation(self):
+        """Handles sentences ending with multiple punctuation."""
+        text = "Wait! Really?? Yes!"
+        result = _split_sentences_with_spans(text)
+        assert result[0][0] == "Wait!"
+        assert result[1][0] == "Really??"
+        assert result[2][0] == "Yes!"
 
 
 class TestDeduplicate:
@@ -161,7 +229,8 @@ class TestDeduplicate:
         # Should have fewer sources (duplicates removed)
         # source0: 2 sentences kept, source1: 0 (all dup), source2: 1 kept
         # source1 gets dropped as < 50 chars
-        assert len(result) == 2
+        assert isinstance(result, DistillResult)
+        assert len(result.sources) == 2
 
     @pytest.mark.asyncio
     async def test_deduplicate_first_source_kept(self, mock_embedding_service):
@@ -192,8 +261,9 @@ class TestDeduplicate:
         result = await distiller._deduplicate(sources, threshold=0.92)
 
         # First source should be kept entirely (src_idx=0 always kept)
-        assert len(result) >= 1
-        assert "First source" in result[0].text
+        assert isinstance(result, DistillResult)
+        assert len(result.sources) >= 1
+        assert "First source" in result.sources[0].text
 
     @pytest.mark.asyncio
     async def test_deduplicate_small_chunks_dropped(self, mock_embedding_service):
@@ -223,14 +293,17 @@ class TestDeduplicate:
         result = await distiller._deduplicate(sources, threshold=0.92)
 
         # source0 keeps sentence, source1 is dropped as < 50 chars
-        assert len(result) == 1
+        assert isinstance(result, DistillResult)
+        assert len(result.sources) == 1
 
     @pytest.mark.asyncio
     async def test_deduplicate_empty_sources(self, mock_embedding_service):
-        """Returns original when sources is empty."""
+        """Returns DistillResult with empty sources when input is empty."""
         distiller = ContextDistiller(mock_embedding_service)
         result = await distiller._deduplicate([], threshold=0.92)
-        assert result == []
+        assert isinstance(result, DistillResult)
+        assert result.sources == []
+        assert result.sentence_provenance == []
 
     @pytest.mark.asyncio
     async def test_deduplicate_embedding_error_returns_original(
@@ -501,8 +574,10 @@ class TestDistill:
             distiller = ContextDistiller(mock_embedding_service)
             result = await distiller.distill("test query", sources, "NO_MATCH")
 
+            # Returns DistillResult
+            assert isinstance(result, DistillResult)
             # Should return deduped sources (both sentences are different)
-            assert len(result) >= 1
+            assert len(result.sources) >= 1
 
     @pytest.mark.asyncio
     async def test_distill_with_synthesis_enabled_no_match(
@@ -546,11 +621,13 @@ class TestDistill:
             distiller = ContextDistiller(mock_embedding_service, mock_llm_client)
             result = await distiller.distill("test query", sources, "NO_MATCH")
 
+            # Returns DistillResult
+            assert isinstance(result, DistillResult)
             # Should have called synthesis
             assert mock_llm_client.chat_completion.called
             # Synthesized source is APPENDED last (real chunks kept), not first.
-            assert result[-1].metadata.get("synthesized") is True
-            assert len(result) >= 2  # real chunk(s) preserved + synthetic appended
+            assert result.sources[-1].metadata.get("synthesized") is True
+            assert len(result.sources) >= 2  # real chunk(s) preserved + synthetic appended
 
     @pytest.mark.asyncio
     async def test_distill_confident_no_synthesis(
@@ -570,8 +647,10 @@ class TestDistill:
             mock_settings.context_distillation_dedup_threshold = 0.92
 
             distiller = ContextDistiller(mock_embedding_service, mock_llm_client)
-            await distiller.distill("test query", sources, "CONFIDENT")
+            result = await distiller.distill("test query", sources, "CONFIDENT")
 
+            # Returns DistillResult
+            assert isinstance(result, DistillResult)
             # Synthesis should NOT be called for CONFIDENT
             mock_llm_client.chat_completion.assert_not_called()
 
@@ -606,8 +685,10 @@ class TestDistill:
             mock_settings.context_distillation_dedup_threshold = 0.92
 
             distiller = ContextDistiller(mock_embedding_service, mock_llm_client)
-            await distiller.distill("test query", sources, "AMBIGUOUS")
+            result = await distiller.distill("test query", sources, "AMBIGUOUS")
 
+            # Returns DistillResult
+            assert isinstance(result, DistillResult)
             # Synthesis should NOT be called for AMBIGUOUS
             assert not mock_llm_client.chat_completion.called
 
@@ -634,8 +715,10 @@ class TestDistill:
             distiller = ContextDistiller(mock_embedding_service)
             result = await distiller.distill("test query", sources, "NO_MATCH")
 
+            # Returns DistillResult
+            assert isinstance(result, DistillResult)
             # Distiller runs dedup and returns result (flag checked by caller)
-            assert len(result) >= 1
+            assert len(result.sources) >= 1
             mock_embedding_service.embed_batch.assert_called()
 
     @pytest.mark.asyncio
@@ -657,8 +740,10 @@ class TestDistill:
 
             # No LLM client provided
             distiller = ContextDistiller(mock_embedding_service)
-            await distiller.distill("test query", sources, "NO_MATCH")
+            result = await distiller.distill("test query", sources, "NO_MATCH")
 
+            # Returns DistillResult
+            assert isinstance(result, DistillResult)
             # embed_batch should have been called for dedup
             assert mock_embedding_service.embed_batch.called
 

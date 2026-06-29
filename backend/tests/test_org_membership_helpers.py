@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from backend.tests.schema_constants import TEST_SCHEMA
 
 from app.api.deps import (
     MultipleOrgError,
@@ -12,103 +13,6 @@ from app.api.deps import (
     get_user_primary_org,
 )
 from app.models.database import _pool_cache, _pool_cache_lock
-
-# Valid SQLite schema matching production structure
-TEST_SCHEMA = """
--- Users table
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    hashed_password TEXT NOT NULL,
-    full_name TEXT DEFAULT '',
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP,
-    must_change_password INTEGER DEFAULT 0,
-    failed_attempts INTEGER DEFAULT 0,
-    locked_until TIMESTAMP
-);
-
--- Organizations table
-CREATE TABLE IF NOT EXISTS organizations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    description TEXT DEFAULT '',
-    slug TEXT UNIQUE,
-    created_by INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (created_by) REFERENCES users(id)
-);
-
--- Organization members
-CREATE TABLE IF NOT EXISTS org_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member')),
-    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE(org_id, user_id)
-);
-
--- Groups table
-CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    description TEXT DEFAULT '',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
-    UNIQUE(org_id, name)
-);
-
--- Group members
-CREATE TABLE IF NOT EXISTS group_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE(group_id, user_id)
-);
-
--- Vaults table
-CREATE TABLE IF NOT EXISTS vaults (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    description TEXT DEFAULT '',
-    owner_id INTEGER,
-    org_id INTEGER,
-    visibility TEXT DEFAULT 'private' CHECK (visibility IN ('private', 'org', 'public')),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (owner_id) REFERENCES users(id),
-    FOREIGN KEY (org_id) REFERENCES organizations(id)
-);
-
--- Vault members table
-CREATE TABLE IF NOT EXISTS vault_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vault_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    permission TEXT NOT NULL DEFAULT 'read' CHECK (permission IN ('read','write','admin')),
-    granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    granted_by INTEGER,
-    FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL,
-    UNIQUE(vault_id, user_id)
-);
-
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-CREATE INDEX IF NOT EXISTS idx_org_members_org_id ON org_members(org_id);
-CREATE INDEX IF NOT EXISTS idx_org_members_user_id ON org_members(user_id);
-"""
 
 
 @pytest.fixture(autouse=True)

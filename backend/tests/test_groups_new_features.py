@@ -17,9 +17,16 @@ from fastapi.testclient import TestClient
 
 from app.api.routes.auth import router as auth_router
 from app.api.routes.groups import router as groups_router
-from app.services.auth_service import create_access_token, hash_password
+from app.services.auth_service import (
+    compute_client_fingerprint,
+    create_access_token,
+    hash_password,
+)
 
-# Valid SQLite schema matching production structure
+# Local schema for this file: includes extra org_id column on users for
+# org-assignment tests. This is a genuine variation - the test's seed data
+# depends on users having org_id as a proper column (not added via ALTER
+# which would conflict with the seed-first ordering in setup_db).
 TEST_SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,8 +37,8 @@ CREATE TABLE IF NOT EXISTS users (
     is_active INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_login_at TIMESTAMP,
-    must_change_password INTEGER DEFAULT 0,
-    failed_attempts INTEGER DEFAULT 0,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
     locked_until TIMESTAMP,
     org_id INTEGER
 );
@@ -100,6 +107,15 @@ CREATE TABLE IF NOT EXISTS vault_group_access (
     FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL,
     UNIQUE(vault_id, group_id)
 );
+
+-- Access-token denylist (task 1.2 table)
+CREATE TABLE IF NOT EXISTS access_token_denylist (
+    jti TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_access_token_denylist_expires ON access_token_denylist(expires_at);
 """
 
 
@@ -227,17 +243,20 @@ def _create_group(org_id: int, name: str, description: str = "Test group"):
 
 def admin1_token():
     """Token for admin1 - org_id=1"""
-    return create_access_token(2, "admin1", "admin")
+    return create_access_token(2, "admin1", "admin",
+                        client_fingerprint=compute_client_fingerprint(""))
 
 
 def admin2_token():
     """Token for admin2 - org_id=2"""
-    return create_access_token(3, "admin2", "admin")
+    return create_access_token(3, "admin2", "admin",
+                        client_fingerprint=compute_client_fingerprint(""))
 
 
 def superadmin_token():
     """Token for superadmin - org_id=1"""
-    return create_access_token(1, "superadmin", "superadmin")
+    return create_access_token(1, "superadmin", "superadmin",
+                        client_fingerprint=compute_client_fingerprint(""))
 
 
 def auth_headers(token_fn):
@@ -250,7 +269,10 @@ def client():
     app = FastAPI()
     app.include_router(auth_router, prefix="/api")
     app.include_router(groups_router, prefix="/api")
-    return TestClient(app)
+    tc = TestClient(app)
+    # Override default User-Agent so fingerprint validation matches token
+    tc.headers["user-agent"] = ""
+    return tc
 
 
 # =============================================================================
@@ -537,9 +559,13 @@ class TestAutoOrgId:
 
     def test_create_group_non_admin_fails(self, client):
         """create_group requires admin role; members get 403."""
-        from app.services.auth_service import create_access_token
+        from app.services.auth_service import (
+            compute_client_fingerprint,
+            create_access_token,
+        )
 
-        token_member = create_access_token(4, "member1", "member")
+        token_member = create_access_token(4, "member1", "member",
+                                      client_fingerprint=compute_client_fingerprint(""))
 
         response = client.post(
             "/api/groups",
@@ -607,7 +633,8 @@ class TestEligibleMembers:
     def test_member_role_cannot_access(self, client):
         """Member role cannot access eligible members (403)."""
         group_id = _create_group(1, "Auth Test Group")
-        token = create_access_token(4, "user4", "member")
+        token = create_access_token(4, "user4", "member",
+                              client_fingerprint=compute_client_fingerprint(""))
 
         response = client.get(
             f"/api/groups/{group_id}/eligible-members",

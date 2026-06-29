@@ -14,6 +14,10 @@ export interface Message {
   kmsRefs?: KMSReference[];
   /** Chat mode used to generate this assistant message. */
   mode?: "instant" | "thinking";
+  /** Citation confidence scores per citation label, from the done event. */
+  citationConfidence?: Record<string, number>;
+  /** Unverifiable claims flagged by the citation validator. */
+  unverifiableClaims?: string[];
   stopped?: boolean;
   error?: string;
   created_at?: string;

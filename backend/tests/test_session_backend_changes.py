@@ -42,6 +42,7 @@ os.environ["ADMIN_SECRET_TOKEN"] = "test-admin-key"
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from backend.tests.schema_constants import TEST_SCHEMA
 
 # ============================================================================
 # Tests for _is_secure_request helper (auth.py)
@@ -347,22 +348,7 @@ class TestCreateUserEndpoint(unittest.TestCase):
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA foreign_keys = ON;")
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                hashed_password TEXT NOT NULL,
-                full_name TEXT DEFAULT '',
-                role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
-                is_active INTEGER NOT NULL DEFAULT 1,
-                must_change_password INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login_at TIMESTAMP
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+        conn.executescript(TEST_SCHEMA)
         conn.commit()
         conn.close()
 
@@ -427,6 +413,8 @@ class TestCreateUserEndpoint(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
     def tearDown(self):
         """Clean up after tests."""
@@ -448,9 +436,13 @@ class TestCreateUserEndpoint(unittest.TestCase):
 
     def get_token(self, user_id: int, username: str, role: str) -> str:
         """Generate JWT token for test user."""
-        from app.services.auth_service import create_access_token
+        from app.services.auth_service import (
+            compute_client_fingerprint,
+            create_access_token,
+        )
 
-        return create_access_token(user_id, username, role)
+        return create_access_token(user_id, username, role,
+                           client_fingerprint=compute_client_fingerprint(""))
 
     def test_create_user_success(self):
         """Admin can create a new user with valid data."""

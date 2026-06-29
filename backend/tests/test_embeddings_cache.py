@@ -3,6 +3,7 @@ Tests for embedding LRU cache implementation.
 
 Covers cache hit/miss, eviction, clear functionality, and statistics.
 """
+import json
 import os
 import sys
 
@@ -345,10 +346,13 @@ class TestEmbeddingServiceCache:
 
         # Initially empty
         stats = service.get_cache_stats()
-        assert stats['hits'] == 0
-        assert stats['misses'] == 0
-        assert stats['size'] == 0
-        assert stats['maxsize'] == 1000
+        assert stats['l1']['hits'] == 0
+        assert stats['l1']['misses'] == 0
+        assert stats['l1']['size'] == 0
+        assert stats['l1']['maxsize'] == 1000
+        assert stats['l2']['available'] is False
+        assert stats['l2']['hits'] == 0
+        assert stats['l2']['misses'] == 0
 
     async def test_cache_stats_after_operations(self):
         """Test cache stats reflect actual operations."""
@@ -366,16 +370,16 @@ class TestEmbeddingServiceCache:
             # First call - miss
             await service.embed_single("test")
             stats = service.get_cache_stats()
-            assert stats['misses'] == 1
-            assert stats['hits'] == 0
-            assert stats['size'] == 1
+            assert stats['l1']['misses'] == 1
+            assert stats['l1']['hits'] == 0
+            assert stats['l1']['size'] == 1
 
             # Second call - hit
             await service.embed_single("test")
             stats = service.get_cache_stats()
-            assert stats['misses'] == 1
-            assert stats['hits'] == 1
-            assert stats['size'] == 1
+            assert stats['l1']['misses'] == 1
+            assert stats['l1']['hits'] == 1
+            assert stats['l1']['size'] == 1
 
     async def test_embed_single_whitespace_text_raises_error(self):
         """Test that empty/whitespace text raises EmbeddingError."""
@@ -417,9 +421,9 @@ class TestEmbeddingServiceCache:
             assert mock_post.call_count == 5
 
             stats = service.get_cache_stats()
-            assert stats['hits'] == 5
-            assert stats['misses'] == 5
-            assert stats['size'] == 5
+            assert stats['l1']['hits'] == 5
+            assert stats['l1']['misses'] == 5
+            assert stats['l1']['size'] == 5
 
 
 class TestLRUCacheEdgeCases:
@@ -759,3 +763,453 @@ class TestResolvedUrlCache:
                 mock_settings.ollama_embedding_url = "http://localhost:1234/v1/embeddings"
                 assert service.provider_mode == "openai"
                 assert spy.call_count == 2
+
+
+@pytest.mark.asyncio
+class TestEmbeddingServiceRedisL2Cache:
+    """Test suite for EmbeddingService Redis L2 shared cache."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Set up test fixtures."""
+        self.mock_settings_patcher = patch('app.services.embeddings.settings')
+        self.mock_settings = self.mock_settings_patcher.start()
+
+        # Configure mock settings
+        self.mock_settings.ollama_embedding_url = "http://localhost:11434/api/embeddings"
+        self.mock_settings.embedding_model = "nomic-embed-text"
+        self.mock_settings.embedding_doc_prefix = ""
+        self.mock_settings.embedding_query_prefix = ""
+        self.mock_settings.embedding_batch_size = 512
+        self.mock_settings.embedding_batch_max_retries = 3
+        self.mock_settings.embedding_batch_min_sub_size = 1
+        self.mock_settings.chunk_size_chars = 1200
+        self.mock_settings.chunk_overlap_chars = 120
+        self.mock_settings.tri_vector_search_enabled = False
+        self.mock_settings.flag_embedding_url = None
+        self.mock_settings.redis_url = "redis://localhost:6379/0"
+        self.mock_settings.embedding_cache_ttl_seconds = 604800
+
+        yield
+
+        self.mock_settings_patcher.stop()
+
+    async def test_redis_l2_hit_backfills_l1(self):
+        """Test that a Redis L2 hit also populates the L1 LRU cache."""
+        # Mock Redis client
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        # Return a cached embedding on get (Redis hit)
+        mock_redis.get.return_value = '[0.1, 0.2, 0.3]'
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service = EmbeddingService()
+
+            assert service._redis_available is True
+            assert service._redis_client is not None
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": [0.1, 0.2, 0.3]}
+
+            # Track whether the HTTP client is called
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                # First call - Redis hit, backfills L1
+                result = await service.embed_single("test text")
+                assert result == [0.1, 0.2, 0.3]
+                # HTTP should NOT be called (served from Redis)
+                assert mock_post.call_count == 0
+                # Redis get was called
+                assert mock_redis.get.called
+                # L1 should now have the entry (backfilled from Redis hit)
+                cache_stats = service.get_cache_stats()
+                assert cache_stats['l1']['size'] >= 1
+
+    async def test_redis_l2_miss_falls_through_to_provider(self):
+        """Test that a Redis miss falls through to the embedding provider."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.get.return_value = None  # Redis miss
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service = EmbeddingService()
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": [0.5, 0.6, 0.7]}
+
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                # First call - Redis miss, call provider
+                result = await service.embed_single("miss text")
+                assert result == [0.5, 0.6, 0.7]
+                assert mock_post.call_count == 1
+
+    async def test_redis_setex_with_ttl_on_provider_hit(self):
+        """Test that after computing an embedding, it is stored in Redis with TTL."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.get.return_value = None  # Force miss to hit provider
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service = EmbeddingService()
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": [0.9, 0.8, 0.7]}
+
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                await service.embed_single("new text")
+
+                # Verify setex was called with TTL (604800 seconds = 7 days)
+                assert mock_redis.setex.called
+                call_args = mock_redis.setex.call_args
+                # setex(key, ttl, value)
+                assert call_args[0][0].startswith("emb:")
+                assert call_args[0][1] == 604800  # TTL
+                assert json.loads(call_args[0][2]) == [0.9, 0.8, 0.7]
+
+    async def test_redis_key_namespaced_with_emb_prefix(self):
+        """Test that Redis keys are prefixed with 'emb:' for namespacing."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.get.return_value = None  # Force miss to hit provider
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service = EmbeddingService()
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": [0.1, 0.2]}
+
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                await service.embed_single("namespaced test")
+
+                # Verify all Redis keys start with 'emb:' prefix
+                for call in mock_redis.method_calls:
+                    if call[0] == 'get':
+                        assert call[1][0].startswith("emb:")
+                    elif call[0] == 'setex':
+                        assert call[1][0].startswith("emb:")
+
+    async def test_redis_unavailable_service_still_works_via_lru(self):
+        """Test that when Redis is unavailable (client=None), embeddings still work via LRU + provider."""
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            # Simulate Redis connection failure at init
+            mock_redis_module.from_url.side_effect = Exception("Connection refused")
+
+            service = EmbeddingService()
+
+            # Redis should be unavailable
+            assert service._redis_client is None
+            assert service._redis_available is False
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": [0.1, 0.2, 0.3]}
+
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                # Embeddings should work fine
+                result = await service.embed_single("works without redis")
+                assert result == [0.1, 0.2, 0.3]
+
+                # Second call should hit L1 cache
+                result2 = await service.embed_single("works without redis")
+                assert result2 == [0.1, 0.2, 0.3]
+                assert mock_post.call_count == 1  # Only called once
+
+    async def test_redis_unavailable_at_runtime_still_works(self):
+        """Test that when Redis goes down at runtime, service continues via LRU + provider."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.get.return_value = '[0.1, 0.2, 0.3]'
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service = EmbeddingService()
+
+            # Simulate Redis going down at runtime
+            def redis_get_raises(*args, **kwargs):
+                raise Exception("Redis connection lost")
+
+            mock_redis.get.side_effect = redis_get_raises
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": [0.5, 0.6, 0.7]}
+
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                # Should fall through to provider when Redis get fails
+                result = await service.embed_single("runtime failure text")
+                assert result == [0.5, 0.6, 0.7]
+                assert mock_post.call_count == 1
+
+    async def test_redis_set_failure_does_not_raise(self):
+        """Test that Redis setex failure does not raise - L1 still gets the value."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.get.return_value = None  # Force provider call
+
+        def redis_setex_raises(*args, **kwargs):
+            raise Exception("Redis write error")
+
+        mock_redis.setex.side_effect = redis_setex_raises
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service = EmbeddingService()
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": [0.1, 0.2, 0.3]}
+
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                # Should NOT raise despite Redis setex failure
+                result = await service.embed_single("set failure test")
+                assert result == [0.1, 0.2, 0.3]
+                # L1 should still have the value
+                cache_stats = service.get_cache_stats()
+                assert cache_stats['l1']['size'] >= 1
+
+    async def test_redis_json_serialization_round_trip_exact_float_precision(self):
+        """Test that JSON dumps/loads preserves embedding floats exactly (FR-005 serialization invariant).
+
+        Uses a vector of floats that have known binary representation issues with
+        binary float formats, plus edge-case values, to verify the JSON round-trip
+        is exact — no precision is lost or altered.
+        """
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        # Return None to force provider path, capturing the setex call
+        mock_redis.get.return_value = None
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service = EmbeddingService()
+
+            # Vector with values known to cause floating-point representation issues
+            # and edge-case values across the representable range
+            original = [
+                0.0,
+                1.0,
+                -1.0,
+                0.1,   # 0.1 cannot be represented exactly in binary float
+                0.2,   # 0.2 same
+                0.3,   # 0.3 same
+                1.234567890123456789,
+                1e-100,
+                1e100,
+                -0.0,  # negative zero
+            ]
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": original}
+
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                await service.embed_single("precision test")
+
+                # Capture what was written to Redis
+                assert mock_redis.setex.called, "Should have written to Redis"
+                setex_call = mock_redis.setex.call_args[0]
+                redis_key, redis_ttl, redis_value = setex_call[0], setex_call[1], setex_call[2]
+
+                # Verify key format
+                assert redis_key.startswith("emb:")
+
+                # Verify TTL is the configured value
+                assert redis_ttl == 604800, "TTL should be embedding_cache_ttl_seconds (7 days)"
+
+                # Deserialize from Redis
+                loaded = json.loads(redis_value)
+
+                # Exact equality — JSON round-trip must preserve every float value
+                assert loaded == original, \
+                    f"JSON round-trip changed values: {original} vs {loaded}"
+
+    async def test_stats_include_redis_hits_and_misses(self):
+        """Test that get_cache_stats includes Redis L2 hits/misses/availability."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        # First call: miss (not in Redis), then hit after backfill
+        mock_redis.get.return_value = None
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service = EmbeddingService()
+
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": [0.1, 0.2, 0.3]}
+
+            with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_response
+
+                # Provider path
+                await service.embed_single("stats test")
+
+                stats = service.get_cache_stats()
+                assert stats['l2']['available'] is True
+                assert stats['l2']['misses'] == 1
+                assert stats['l2']['hits'] == 0
+
+    async def test_cluster_wide_sharing_write_in_one_hits_in_other(self):
+        """Test that write via service_a is a Redis hit for service_b (cluster-wide sharing).
+
+        This is the primary cluster-sharing invariant (FR-005): two EmbeddingService
+        instances sharing a Redis client must see each other's writes — a value
+        embedded via service_a must be a Redis L2 hit when service_b embeds the same text.
+        """
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        # Redis initially empty (no cached value)
+        mock_redis.get.return_value = None
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service_a = EmbeddingService()
+            service_b = EmbeddingService()
+
+            # Both must share the same Redis client
+            assert service_a._redis_client is service_b._redis_client
+
+            # Track what HTTP endpoint returns for the provider path
+            http_embedding = [0.42, 0.123, 0.999]
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.json.return_value = {"embedding": http_embedding}
+
+            # service_a posts → provider returns http_embedding → setex writes to Redis
+            with patch.object(service_a._client, 'post', new_callable=AsyncMock) as mock_post_a:
+                mock_post_a.return_value = mock_response
+
+                result_a = await service_a.embed_single("cluster sharing text")
+                assert result_a == http_embedding
+                assert mock_post_a.call_count == 1
+                # Verify setex was called (service_a wrote to Redis)
+                assert mock_redis.setex.called, "service_a should have written embedding to Redis via setex"
+                setex_key = mock_redis.setex.call_args[0][0]
+                assert setex_key.startswith("emb:")
+
+            # Now service_b embeds the SAME text — must hit Redis L2, not call provider
+            mock_redis.get.reset_mock()
+            mock_redis.setex.reset_mock()
+
+            with patch.object(service_b._client, 'post', new_callable=AsyncMock) as mock_post_b:
+                # Redis has the value from service_a's setex
+                mock_redis.get.return_value = json.dumps(http_embedding)
+
+                result_b = await service_b.embed_single("cluster sharing text")
+                assert result_b == http_embedding
+                # HTTP should NOT be called — Redis L2 hit
+                assert mock_post_b.call_count == 0, \
+                    "service_b should have hit Redis L2, not called the provider"
+                # Redis get was called (L2 lookup)
+                assert mock_redis.get.called, "service_b should have looked up the key in Redis"
+
+    async def test_shared_redis_client_across_instances(self):
+        """Test that two services sharing a Redis client see the same cache (identity check)."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+        mock_redis.get.return_value = None  # Force provider path
+
+        with patch('app.services.embeddings.redis') as mock_redis_module:
+            mock_redis_module.from_url.return_value = mock_redis
+
+            service_a = EmbeddingService()
+            service_b = EmbeddingService()
+
+            # Both should share the same Redis client (same object reference)
+            assert service_a._redis_client is service_b._redis_client
+            assert service_a._redis_client is not None
+
+
+# ─── Tests for no-Redis path (client = None) ─────────────────────────────────
+
+@pytest.mark.asyncio
+class TestEmbeddingServiceNoRedisFallback:
+    """Test that EmbeddingService works when Redis is entirely absent."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Set up test fixtures with no Redis."""
+        self.mock_settings_patcher = patch('app.services.embeddings.settings')
+        self.mock_settings = self.mock_settings_patcher.start()
+
+        # Configure mock settings with no Redis
+        self.mock_settings.ollama_embedding_url = "http://localhost:11434/api/embeddings"
+        self.mock_settings.embedding_model = "nomic-embed-text"
+        self.mock_settings.embedding_doc_prefix = ""
+        self.mock_settings.embedding_query_prefix = ""
+        self.mock_settings.embedding_batch_size = 512
+        self.mock_settings.embedding_batch_max_retries = 3
+        self.mock_settings.embedding_batch_min_sub_size = 1
+        self.mock_settings.chunk_size_chars = 1200
+        self.mock_settings.chunk_overlap_chars = 120
+        self.mock_settings.tri_vector_search_enabled = False
+        self.mock_settings.flag_embedding_url = None
+        self.mock_settings.redis_url = ""  # Empty URL means no Redis
+        self.mock_settings.embedding_cache_ttl_seconds = 604800
+
+        yield
+
+        self.mock_settings_patcher.stop()
+
+    async def test_no_redis_url_still_works_via_lru(self):
+        """Test that when redis_url is empty, service falls back to LRU only."""
+        service = EmbeddingService()
+
+        # Redis should be unavailable
+        assert service._redis_client is None
+        assert service._redis_available is False
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"embedding": [0.1, 0.2, 0.3]}
+
+        with patch.object(service._client, 'post', new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = mock_response
+
+            # Should work fine
+            result1 = await service.embed_single("lru only test")
+            assert result1 == [0.1, 0.2, 0.3]
+            assert mock_post.call_count == 1
+
+            # Second call should use L1 cache
+            result2 = await service.embed_single("lru only test")
+            assert result2 == [0.1, 0.2, 0.3]
+            assert mock_post.call_count == 1
+
+            # Stats should show L1 activity
+            stats = service.get_cache_stats()
+            assert stats['l2']['available'] is False
+            assert stats['l1']['hits'] == 1
+            assert stats['l1']['misses'] == 1

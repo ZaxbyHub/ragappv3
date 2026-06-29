@@ -1,5 +1,5 @@
 """
-Tests for async bcrypt wrapper in auth_service.
+Tests for async password wrapper in auth_service.
 
 Verifies:
 1. async_verify_password() returns True for correct password
@@ -31,6 +31,10 @@ class TestAsyncVerifyPassword(unittest.IsolatedAsyncioTestCase):
         """Set up test fixtures."""
         self.plain_password = "SecurePass123!"
         self.hashed_password = hash_password(self.plain_password)
+        # Argon2id hashes start with $argon2id$
+        assert self.hashed_password.startswith("$argon2id$"), (
+            f"Expected argon2id hash for test setup, got: {self.hashed_password[:10]}"
+        )
 
     async def test_async_verify_password_returns_true_for_correct_password(self):
         """Test that async_verify_password returns True when password matches."""

@@ -66,7 +66,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
-from app.services.auth_service import create_access_token
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
 class TestAuthIntegration(unittest.TestCase):
@@ -107,7 +107,8 @@ class TestAuthIntegration(unittest.TestCase):
 
         # Generate a valid JWT access token for the test user
         self.access_token = create_access_token(
-            user_id=self.test_user_id, username="testuser", role="admin"
+            user_id=self.test_user_id, username="testuser", role="admin",
+            client_fingerprint=compute_client_fingerprint(""),
         )
         self.auth_header = {"Authorization": f"Bearer {self.access_token}"}
 
@@ -130,6 +131,8 @@ class TestAuthIntegration(unittest.TestCase):
 
         # Create test client with dependency overrides
         self.client = TestClient(main_app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
         self.app = main_app
 
     def tearDown(self):
@@ -296,7 +299,8 @@ class TestAuthEdgeCases(unittest.TestCase):
 
         # Generate a valid JWT access token for the test user
         self.access_token = create_access_token(
-            user_id=self.test_user_id, username="testuser", role="admin"
+            user_id=self.test_user_id, username="testuser", role="admin",
+            client_fingerprint=compute_client_fingerprint(""),
         )
 
         # Create a test pool for the temporary database
@@ -318,6 +322,8 @@ class TestAuthEdgeCases(unittest.TestCase):
 
         # Create test client with dependency overrides
         self.client = TestClient(main_app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
         self.app = main_app
 
     def tearDown(self):

@@ -326,6 +326,8 @@ class DocumentResponse(BaseModel):
     processing_started_at: Optional[str] = None
     enrichment_status: Optional[str] = None
     enrichment_error: Optional[str] = None
+    enrichment_enabled: Optional[bool] = None  # Per-file override (null=inherit vault/global)
+    effective_enrichment_enabled: bool = False  # Resolved effective state
     metadata: Optional[dict] = None  # Frontend expects metadata
     tags: List[dict] = Field(default_factory=list)  # Assigned organization tags
     folder_id: Optional[int] = None  # Folder the document is filed in (null = unfiled)
@@ -397,6 +399,20 @@ class DeleteAllVaultResponse(BaseModel):
     vault_id: int
 
 
+class FileEnrichmentToggleRequest(BaseModel):
+    """Request model for toggling per-file enrichment override.
+
+    enabled: True  → file-level ON (overrides vault/global)
+    enabled: False → file-level OFF (overrides vault/global)
+    enabled: null  → clears override, falls back to vault/global
+    """
+
+    enabled: Optional[bool] = Field(
+        None,
+        description="True=enable for file, False=disable for file, null=inherit vault/global",
+    )
+
+
 def _path_is_within(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -457,6 +473,25 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     enrichment_status = row["enrichment_status"] if "enrichment_status" in keys else None
     enrichment_error = row["enrichment_error"] if "enrichment_error" in keys else None
     folder_id = row["folder_id"] if "folder_id" in keys else None
+
+    # Per-file enrichment override
+    file_enrichment_raw = row["enrichment_enabled"] if "enrichment_enabled" in keys else None
+    file_enrichment_override: Optional[bool] = None
+    if file_enrichment_raw is not None:
+        file_enrichment_override = bool(file_enrichment_raw)
+
+    # Compute effective enrichment state: file > vault > global
+    file_id = row["id"]
+    vault_id = row["vault_id"] if "vault_id" in keys else None
+    effective_enrichment = False
+    if vault_id is not None:
+        from app.services.document_processor import is_enrichment_enabled_for_file
+
+        if file_enrichment_override is not None:
+            effective_enrichment = file_enrichment_override
+        else:
+            effective_enrichment = is_enrichment_enabled_for_file(file_id, vault_id)
+
     return DocumentResponse(
         id=row["id"],
         file_name=file_name,
@@ -482,6 +517,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
         processing_started_at=processing_started_at,
         enrichment_status=enrichment_status,
         enrichment_error=enrichment_error,
+        enrichment_enabled=file_enrichment_override,
+        effective_enrichment_enabled=effective_enrichment,
         folder_id=folder_id,
         metadata={
             "status": status,
@@ -500,6 +537,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
             "processing_started_at": processing_started_at,
             "enrichment_status": enrichment_status,
             "enrichment_error": enrichment_error,
+            "enrichment_enabled": file_enrichment_override,
+            "effective_enrichment_enabled": effective_enrichment,
         },
     )
 
@@ -1057,6 +1096,78 @@ async def get_document(
         raise HTTPException(status_code=403, detail="Access denied to vault")
 
     document = _row_to_document_response(row)
+    from app.services.tag_store import TagStore
+
+    tags = await asyncio.to_thread(TagStore(conn).get_tags_for_document, file_id)
+    document.tags = [asdict(t) for t in tags]
+    return document
+
+
+@router.put("/{file_id}/enrichment-toggle", response_model=DocumentResponse)
+async def toggle_file_enrichment(
+    file_id: int,
+    request: FileEnrichmentToggleRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Set or clear the per-file enrichment override.
+
+    Requires admin permission on the vault.
+    - enabled=true  → file-level ON (overrides vault/global)
+    - enabled=false → file-level OFF (overrides vault/global)
+    - enabled=null → clears override, falls back to vault/global
+
+    Returns the updated file with effective_enrichment_enabled computed.
+    """
+    # Check file exists and get vault_id for authz
+    cursor = await asyncio.to_thread(
+        conn.execute,
+        "SELECT id, vault_id FROM files WHERE id = ?",
+        (file_id,),
+    )
+    row = await asyncio.to_thread(cursor.fetchone)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"Document with id {file_id} not found"
+        )
+
+    file_vault_id = row["vault_id"]
+
+    # Admin check on the vault
+    if not await evaluate(user, "vault", file_vault_id, "admin"):
+        raise HTTPException(status_code=403, detail="Insufficient vault permissions")
+
+    # Apply the override (NULL to clear, 1 to enable, 0 to disable)
+    if request.enabled is None:
+        new_value: Optional[int] = None
+    else:
+        new_value = 1 if request.enabled else 0
+
+    await asyncio.to_thread(
+        conn.execute,
+        "UPDATE files SET enrichment_enabled = ? WHERE id = ?",
+        (new_value, file_id),
+    )
+    await asyncio.to_thread(conn.commit)
+
+    # Fetch the updated file row with enrichment_enabled
+    cursor = await asyncio.to_thread(
+        conn.execute,
+        """
+        SELECT id, file_name, file_path, status, chunk_count, chunks_failed, file_size, vault_id,
+               created_at, processed_at, error_message, phase, phase_message,
+               progress_percent, processed_units, total_units, unit_label,
+               phase_started_at, processing_started_at, enrichment_status,
+               enrichment_error, enrichment_enabled
+        FROM files WHERE id = ?
+        """,
+        (file_id,),
+    )
+    updated_row = await asyncio.to_thread(cursor.fetchone)
+    document = _row_to_document_response(updated_row)
+
     from app.services.tag_store import TagStore
 
     tags = await asyncio.to_thread(TagStore(conn).get_tags_for_document, file_id)

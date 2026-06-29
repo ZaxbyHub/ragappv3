@@ -9,6 +9,7 @@ import { useAuthStore } from "@/stores/useAuthStore";
 import type { NavItemId } from "@/components/layout/navigationTypes";
 import { Loader2 } from "lucide-react";
 import { APP_BASENAME } from "@/lib/paths";
+import ReconnectingBanner from "@/components/ReconnectingBanner";
 
 // Toggle mock-data mode via: VITE_TEST_MODE=true npm run dev
 // Gated on import.meta.env.DEV so it is statically false (and dead-code
@@ -126,6 +127,7 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
 
 function App() {
   const initAuth = useAuthStore((state) => state.init);
+  const health = useHealthCheck({ pollInterval: 30000 });
 
   useEffect(() => {
     if (!TEST_MODE) {
@@ -135,6 +137,7 @@ function App() {
 
   return (
     <ErrorBoundary>
+      <ReconnectingBanner health={health} />
       <BrowserRouter
         basename={APP_BASENAME || undefined}
         future={{ v7_startTransition: true, v7_relativeSplatPath: true }}

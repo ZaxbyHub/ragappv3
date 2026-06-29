@@ -55,6 +55,10 @@ class ChatRequest(BaseModel):
     stream: bool = False
     vault_id: Optional[int] = None
     mode: Optional[Literal["instant", "thinking"]] = None
+    # Inline generation controls (forward-compatible v1: accepted + logged).
+    temperature: Optional[float] = None
+    retrieval_mode: Optional[str] = None
+    citation_mode: Optional[str] = None
 
 
 class UsedMemory(BaseModel):
@@ -90,6 +94,11 @@ class ChatResponse(BaseModel):
     # values in each source (polarity + thresholds). Default "distance" keeps
     # older clients on the safe path if the engine omits it.
     score_type: str = "distance"
+    # SC-015: prompt version identifier for this response
+    prompt_version: Optional[str] = Field(default=None)
+    # SC-017: A/B experiment metadata for outcome comparison
+    ab_experiment_id: Optional[int] = Field(default=None)
+    ab_variant: Optional[str] = Field(default=None)
 
 
 class ChatMessage(BaseModel):
@@ -102,6 +111,10 @@ class ChatStreamRequest(BaseModel):
     messages: List[ChatMessage]
     vault_id: Optional[int] = None
     mode: Optional[Literal["instant", "thinking"]] = None
+    # Inline generation controls (forward-compatible v1: accepted + logged).
+    temperature: Optional[float] = None
+    retrieval_mode: Optional[str] = None
+    citation_mode: Optional[str] = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -214,6 +227,9 @@ def stream_chat_response(
     mode: Optional[ChatMode] = None,
     user_id: Optional[int] = None,
     require_vault: bool = False,
+    temperature: Optional[float] = None,
+    retrieval_mode: Optional[str] = None,
+    citation_mode: Optional[str] = None,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
@@ -243,6 +259,13 @@ def stream_chat_response(
         # score polarity to interpret `score` values against, even if the
         # engine never emits a done event (e.g. early error).
         score_type = "distance"
+        # SC-015/SC-017: A/B experiment tagging for response metadata
+        ab_experiment_id: Optional[int] = None
+        ab_variant: Optional[str] = None
+        prompt_version: Optional[str] = None
+        # SC-009: citation confidence + unverifiable claims
+        citation_confidence: Optional[Dict[str, float]] = None
+        unverifiable_claims: Optional[list] = None
 
         # Resolve the effective mode the same way RAGEngine does and emit it
         # as the first SSE event so the client can show a per-message badge
@@ -262,7 +285,9 @@ def stream_chat_response(
         try:
             async for chunk in rag_engine.query(
                 message, history, stream=True, vault_id=vault_id, mode=mode,
-                require_vault=require_vault,
+                require_vault=require_vault, user_id=user_id,
+                temperature=temperature, retrieval_mode=retrieval_mode,
+                citation_mode=citation_mode,
             ):
                 chunk_type = chunk.get("type")
 
@@ -280,12 +305,23 @@ def stream_chat_response(
                     if content:
                         collected_content.append(content)
                         yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
+                elif chunk_type == "stage":
+                    # FR-015: forward pipeline stage events (Searching/Reading/Drafting)
+                    # so the frontend can show progress feedback before content arrives.
+                    yield f"data: {json.dumps({'type': 'stage', 'stage': chunk['stage']})}\n\n"
                 elif chunk_type == "done":
                     sources = chunk.get("sources", [])
                     memories_used = chunk.get("memories_used", [])
                     wiki_used = chunk.get("wiki_used", [])
                     kms_used = chunk.get("kms_used", [])
                     score_type = chunk.get("score_type", score_type)
+                    # SC-015/SC-017: extract A/B metadata from done chunk
+                    ab_experiment_id = chunk.get("ab_experiment_id")
+                    ab_variant = chunk.get("ab_variant")
+                    prompt_version = chunk.get("prompt_version")
+                    # SC-009: extract citation confidence + unverifiable claims
+                    citation_confidence = chunk.get("citation_confidence")
+                    unverifiable_claims = chunk.get("unverifiable_claims")
         except RAGEngineError as exc:
             logger.warning(
                 "RAG engine error in stream_chat_response: %s", exc
@@ -348,6 +384,8 @@ def stream_chat_response(
             repaired_content = None
 
         # Yield final done event with sources, memories, wiki, and score_type.
+        # SC-015: include prompt_version identifier in response
+        # SC-017: include ab_experiment_id and ab_variant for outcome comparison
         done_payload: Dict[str, Any] = {
             "type": "done",
             "sources": sources,
@@ -360,6 +398,16 @@ def stream_chat_response(
             done_payload["citation_validation"] = citation_validation
         if repaired_content is not None:
             done_payload["repaired_content"] = repaired_content
+        if prompt_version is not None:
+            done_payload["prompt_version"] = prompt_version
+        if ab_experiment_id is not None:
+            done_payload["ab_experiment_id"] = ab_experiment_id
+        if ab_variant is not None:
+            done_payload["ab_variant"] = ab_variant
+        if citation_confidence is not None:
+            done_payload["citation_confidence"] = citation_confidence
+        if unverifiable_claims is not None:
+            done_payload["unverifiable_claims"] = unverifiable_claims
         yield f"data: {json.dumps(done_payload)}\n\n"
 
         # Enqueue post-answer wiki compile job (non-blocking).
@@ -391,6 +439,10 @@ async def non_stream_chat_response(
     vault_id: Optional[int] = None,
     mode: Optional[ChatMode] = None,
     require_vault: bool = False,
+    user_id: Optional[int] = None,
+    temperature: Optional[float] = None,
+    retrieval_mode: Optional[str] = None,
+    citation_mode: Optional[str] = None,
 ) -> ChatResponse:
     """
     Generate a non-streaming chat response.
@@ -412,11 +464,17 @@ async def non_stream_chat_response(
     wiki_used: List[Dict[str, Any]] = []
     kms_used: List[Dict[str, Any]] = []
     score_type = "distance"
+    # SC-015/SC-017: A/B experiment tagging
+    ab_experiment_id: Optional[int] = None
+    ab_variant: Optional[str] = None
+    prompt_version: Optional[str] = None
 
     try:
         async for chunk in rag_engine.query(
             message, history, stream=False, vault_id=vault_id, mode=mode,
-            require_vault=require_vault,
+            require_vault=require_vault, user_id=user_id,
+            temperature=temperature, retrieval_mode=retrieval_mode,
+            citation_mode=citation_mode,
         ):
             chunk_type = chunk.get("type")
             logger.debug(
@@ -431,6 +489,10 @@ async def non_stream_chat_response(
                 wiki_used = chunk.get("wiki_used", [])
                 kms_used = chunk.get("kms_used", [])
                 score_type = chunk.get("score_type", score_type)
+                # SC-015/SC-017: extract A/B metadata from done chunk
+                ab_experiment_id = chunk.get("ab_experiment_id")
+                ab_variant = chunk.get("ab_variant")
+                prompt_version = chunk.get("prompt_version")
     except RAGEngineError as exc:
         logger.warning("RAG engine error in non_stream_chat_response: %s", exc)
         raise HTTPException(status_code=503, detail="Chat processing failed")
@@ -493,6 +555,9 @@ async def non_stream_chat_response(
         wiki_used=wiki_used,
         kms_used=kms_used,
         score_type=score_type,
+        prompt_version=prompt_version,
+        ab_experiment_id=ab_experiment_id,
+        ab_variant=ab_variant,
     )
 
 
@@ -553,6 +618,10 @@ async def chat(
             vault_id=body.vault_id,
             mode=effective_mode,
             require_vault=require_vault,
+            user_id=user.get("id"),
+            temperature=body.temperature,
+            retrieval_mode=body.retrieval_mode,
+            citation_mode=body.citation_mode,
         )
     except Exception:
         logger.exception("[chat] UNHANDLED EXCEPTION during chat processing")
@@ -604,6 +673,9 @@ async def chat_stream(
         mode=effective_mode,
         user_id=user.get("id"),
         require_vault=require_vault,
+        temperature=body.temperature,
+        retrieval_mode=body.retrieval_mode,
+        citation_mode=body.citation_mode,
     )
 
 

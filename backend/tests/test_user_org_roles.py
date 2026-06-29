@@ -17,24 +17,20 @@ from fastapi.testclient import TestClient
 os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-key-for-testing-only")
 os.environ.setdefault("USERS_ENABLED", "true")
 
+from backend.tests.schema_constants import TEST_SCHEMA
+
 from app.api.routes import users as users_router_module
-from app.services.auth_service import create_access_token, hash_password
+from app.services.auth_service import (
+    compute_client_fingerprint,
+    create_access_token,
+    hash_password,
+)
 
-TEST_SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    hashed_password TEXT NOT NULL,
-    full_name TEXT DEFAULT '',
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP,
-    must_change_password INTEGER NOT NULL DEFAULT 0,
-    failed_attempts INTEGER NOT NULL DEFAULT 0,
-    locked_until TIMESTAMP
-);
-
+# Local supplements for this file's schema variations:
+# 1. Simplified organizations table (no created_by/updated_at)
+# 2. Extra csrf_tokens table (not in shared schema)
+_ORGANIZATIONS_SIMPLIFIED = """
+DROP TABLE IF EXISTS organizations;
 CREATE TABLE IF NOT EXISTS organizations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -42,16 +38,8 @@ CREATE TABLE IF NOT EXISTS organizations (
     slug TEXT UNIQUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE TABLE IF NOT EXISTS org_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role TEXT NOT NULL DEFAULT 'member',
-    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(org_id, user_id)
-);
-
+"""
+_CSRF_TOKENS = """
 CREATE TABLE IF NOT EXISTS csrf_tokens (
     token TEXT PRIMARY KEY,
     user_id INTEGER,
@@ -66,8 +54,10 @@ SUPERADMIN_ID = 3
 ORG1_ID = 1
 ORG2_ID = 2
 
-admin_token = create_access_token(ADMIN_ID, "admin1", "admin")
-superadmin_token = create_access_token(SUPERADMIN_ID, "superadmin1", "superadmin")
+admin_token = create_access_token(ADMIN_ID, "admin1", "admin",
+                           client_fingerprint=compute_client_fingerprint(""))
+superadmin_token = create_access_token(SUPERADMIN_ID, "superadmin1", "superadmin",
+                                client_fingerprint=compute_client_fingerprint(""))
 
 
 def _auth(token: str) -> dict:
@@ -91,6 +81,8 @@ def setup_db(monkeypatch):
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.executescript(TEST_SCHEMA)
+    conn.executescript(_ORGANIZATIONS_SIMPLIFIED)
+    conn.executescript(_CSRF_TOKENS)
 
     pw = hash_password("Password1!")
     conn.execute(
@@ -140,8 +132,10 @@ def setup_db(monkeypatch):
     # Recreate module-level tokens using the patched key so they always match
     # the verification key regardless of which file was imported first.
     global admin_token, superadmin_token
-    admin_token = create_access_token(ADMIN_ID, "admin1", "admin")
-    superadmin_token = create_access_token(SUPERADMIN_ID, "superadmin1", "superadmin")
+    admin_token = create_access_token(ADMIN_ID, "admin1", "admin",
+                             client_fingerprint=compute_client_fingerprint(""))
+    superadmin_token = create_access_token(SUPERADMIN_ID, "superadmin1", "superadmin",
+                                  client_fingerprint=compute_client_fingerprint(""))
 
     yield db_path
 
@@ -158,7 +152,10 @@ def client():
     app = FastAPI()
     app.dependency_overrides[csrf_protect] = lambda: "test-bypass"
     app.include_router(users_router_module.router)  # router has prefix="/users" built-in
-    return TestClient(app)
+    tc = TestClient(app)
+    # Override default User-Agent so fingerprint validation matches token
+    tc.headers["user-agent"] = ""
+    return tc
 
 
 def _db_orgs(setup_db: str, user_id: int) -> dict:

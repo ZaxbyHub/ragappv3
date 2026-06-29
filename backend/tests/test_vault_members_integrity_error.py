@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from backend.tests.schema_constants import TEST_SCHEMA
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -24,120 +25,11 @@ from app.api.routes.vault_members import (
 from app.api.routes.vault_members import (
     router as vault_members_router,
 )
-from app.services.auth_service import create_access_token, hash_password
-
-# Valid SQLite schema matching test_vault_group_access_routes.py
-TEST_SCHEMA = """
--- Organizations table
-CREATE TABLE IF NOT EXISTS organizations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    description TEXT DEFAULT '',
-    slug TEXT UNIQUE,
-    created_by INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (created_by) REFERENCES users(id)
-);
-
--- Users table
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    hashed_password TEXT NOT NULL,
-    full_name TEXT DEFAULT '',
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP,
-    must_change_password INTEGER DEFAULT 0
-);
-
--- Vaults table
-CREATE TABLE IF NOT EXISTS vaults (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    description TEXT DEFAULT '',
-    owner_id INTEGER,
-    org_id INTEGER,
-    visibility TEXT DEFAULT 'private' CHECK (visibility IN ('private', 'org', 'public')),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Groups table
-CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    description TEXT DEFAULT '',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
-    UNIQUE(org_id, name)
-);
-
--- Organization members table
-CREATE TABLE IF NOT EXISTS org_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member',
-    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE(org_id, user_id)
-);
-
--- Group members table
-CREATE TABLE IF NOT EXISTS group_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE(group_id, user_id)
-);
-
--- Vault members table
-CREATE TABLE IF NOT EXISTS vault_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vault_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    permission TEXT NOT NULL DEFAULT 'read' CHECK (permission IN ('read','write','admin')),
-    granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    granted_by INTEGER,
-    FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL,
-    UNIQUE(vault_id, user_id)
-);
-
--- Vault group access table
-CREATE TABLE IF NOT EXISTS vault_group_access (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vault_id INTEGER NOT NULL,
-    group_id INTEGER NOT NULL,
-    permission TEXT NOT NULL DEFAULT 'read' CHECK (permission IN ('read','write','admin')),
-    granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    granted_by INTEGER,
-    FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
-    FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL,
-    UNIQUE(vault_id, group_id)
-);
-
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
-CREATE INDEX IF NOT EXISTS idx_vault_members_vault_id ON vault_members(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_members_user_id ON vault_members(user_id);
-CREATE INDEX IF NOT EXISTS idx_groups_org_id ON groups(org_id);
-CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON group_members(group_id);
-CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id);
-CREATE INDEX IF NOT EXISTS idx_vault_group_access_vault_id ON vault_group_access(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_group_access_group_id ON vault_group_access(group_id);
-"""
+from app.services.auth_service import (
+    compute_client_fingerprint,
+    create_access_token,
+    hash_password,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -229,11 +121,13 @@ def _get_db_conn():
 
 
 def superadmin_token():
-    return create_access_token(1, "superadmin", "superadmin")
+    return create_access_token(1, "superadmin", "superadmin",
+                            client_fingerprint=compute_client_fingerprint(""))
 
 
 def admin_token():
-    return create_access_token(2, "admin1", "admin")
+    return create_access_token(2, "admin1", "admin",
+                            client_fingerprint=compute_client_fingerprint(""))
 
 
 def auth_headers(token_fn):
@@ -249,7 +143,10 @@ def client():
     app.include_router(group_access_router, prefix="/api")
     # raise_server_exceptions=False allows exceptions in route handlers
     # to be caught by Starlette's exception middleware and returned as 500 responses.
-    return TestClient(app, raise_server_exceptions=False)
+    tc = TestClient(app, raise_server_exceptions=False)
+    # Override default User-Agent so fingerprint validation matches token
+    tc.headers["user-agent"] = ""
+    return tc
 
 
 class TestAddVaultMemberIntegrityError:

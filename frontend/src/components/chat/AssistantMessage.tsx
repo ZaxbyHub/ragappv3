@@ -149,6 +149,8 @@ export function AssistantMessage({
           isStreaming={isStreaming}
           onCitationClick={handleSourceClick}
           citedSources={citedSources}
+          citationConfidence={message.citationConfidence}
+          unverifiableClaims={message.unverifiableClaims}
         />
 
         {/* Wiki cards — compiled knowledge cited as [W#] */}

@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 import { MessageBubble } from "./MessageBubble";
 import { AssistantMessage } from "./AssistantMessage";
 import { WaitingIndicator } from "./WaitingIndicator";
+import { StageIndicator } from "./StageIndicator";
 import { Composer } from "./Composer";
 import {
   useChatStore,
@@ -140,6 +141,7 @@ interface MessageRowProps {
   activeSessionId: string | null;
   showDebug: boolean;
   highlightedId: string | null;
+  currentStage: string | null;
   onRetry: () => void;
   onEdit: (messageId: string, content: string) => void;
   onFork?: (messageId: string) => void;
@@ -155,6 +157,7 @@ const MessageRow = memo(function MessageRow({
   activeSessionId,
   showDebug,
   highlightedId,
+  currentStage,
   onRetry,
   onEdit,
   onFork,
@@ -178,7 +181,9 @@ const MessageRow = memo(function MessageRow({
     <div className={isHighlighted ? "ring-2 ring-primary/50 rounded-xl transition-all duration-500" : undefined}>
       {safeMessage.role === "assistant" ? (
         <AnimatePresence mode="wait">
-          {isAssistantStreaming && !safeMessage.content ? (
+          {isAssistantStreaming && !safeMessage.content && currentStage ? (
+            <StageIndicator key="stage" stage={currentStage as "Searching" | "Reading" | "Drafting"} />
+          ) : isAssistantStreaming && !safeMessage.content ? (
             <WaitingIndicator key="waiting" />
           ) : (
             <AssistantMessage
@@ -230,7 +235,7 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
   const activeSessionId = useChatShellStore((s) => s.activeSessionId);
 
   const { refreshHistory } = useChatHistory(vaultId);
-  const { handleSend, handleStop, sendDirect } = useSendMessage(vaultId, refreshHistory);
+  const { handleSend, handleStop, sendDirect, currentStage } = useSendMessage(vaultId, refreshHistory);
 
   const [showScrollButton, setShowScrollButton] = useState(false);
   // setIsAtBottom is retained for legacy components that read isAtBottom via
@@ -474,6 +479,7 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
                       activeSessionId={activeSessionId}
                       showDebug={showDebug}
                       highlightedId={highlightedMessageId}
+                      currentStage={currentStage}
                       onRetry={handleRetry}
                       onEdit={handleEdit}
                       onFork={isForking ? undefined : handleFork}

@@ -10,8 +10,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from app.api.deps import get_embedding_service, require_admin_role
+from app.api.deps import get_embedding_service, get_rag_engine, require_admin_role
 from app.services.embeddings import EmbeddingService
+from app.services.rag_engine import RAGEngine
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -490,3 +491,138 @@ async def ragas_evaluation(
     except Exception as e:
         logger.error("RAGAS evaluation failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Live retrieval benchmark endpoint (FR-001)
+# ---------------------------------------------------------------------------
+
+
+class LiveBenchmarkItem(BaseModel):
+    """A single benchmark query with ground-truth relevant document identifiers.
+
+    Mirrors ``eval_adapter.BenchmarkItem``.
+    """
+
+    id: str = Field(..., min_length=1, description="Stable benchmark item id")
+    query: str = Field(..., min_length=1, description="Natural-language query")
+    relevant_ids: List[str] = Field(
+        default_factory=list,
+        description="Ground-truth file_ids relevant to the query",
+    )
+
+
+class LiveEvalRequest(BaseModel):
+    """Request model for live retrieval benchmark endpoint."""
+
+    benchmark: List[LiveBenchmarkItem] = Field(
+        ...,
+        min_length=1,
+        description="Benchmark set: queries with ground-truth relevant_ids",
+    )
+    vault_id: Optional[int] = Field(
+        None, description="Vault scope for all queries (optional)"
+    )
+    top_k: Optional[int] = Field(
+        None, ge=1, description="Override recall@k / nDCG@k k value"
+    )
+
+
+class LiveEvalResponse(BaseModel):
+    """Response model for live retrieval benchmark endpoint."""
+
+    run_id: str = Field(description="Unique run identifier")
+    timestamp: str = Field(description="ISO 8601 UTC run timestamp")
+    release_id: str = Field(description="Git short commit hash or fallback")
+    top_k: int = Field(description="k used for recall@k and nDCG@k")
+    query_metrics: List[Dict[str, Any]] = Field(
+        description="Per-query metric breakdown"
+    )
+    mrr_mean: Optional[float] = Field(None, description="Mean Reciprocal Rank")
+    ndcg_mean: Optional[float] = Field(None, description="Mean nDCG@k")
+    recall_mean: Optional[float] = Field(None, description="Mean recall@k")
+
+
+@router.post("/eval/live", response_model=LiveEvalResponse)
+async def live_eval(
+    request: LiveEvalRequest,
+    rag_engine: RAGEngine = Depends(get_rag_engine),
+    user: dict = Depends(require_admin_role),
+):
+    """Run a live retrieval benchmark against the RAG pipeline (FR-001).
+
+    For each item in the supplied ``benchmark``, this endpoint:
+    1. Calls ``RAGEngine.query_retrieve_only`` to obtain the ranked list of
+       retrieved file_ids from the live vector store + reranker pipeline.
+    2. Computes MRR, nDCG@k, and recall@k against the ground-truth ``relevant_ids``.
+    3. Persists the run record (timestamp, release_id, per-query and aggregate
+       metrics) as JSONL to ``data/eval-runs/runs.jsonl``.
+
+    This bridges the offline eval harness (which consumes pre-supplied JSONL
+    contexts) with the live retrieval pipeline, enabling production retrieval
+    quality measurement without curated benchmark files.
+
+    **Access**: Admin-gated via ``require_admin_role``.
+    **Feature flag**: Requires ``settings.eval_enabled=True`` (defaults to False).
+
+    Args:
+        request: LiveEvalRequest containing the benchmark set and optional overrides.
+
+    Returns:
+        LiveEvalResponse with run metadata and computed metrics.
+
+    Raises:
+        HTTPException: 501 if eval is disabled, 500 on internal failure.
+    """
+    from app.config import settings
+    from app.services.eval_adapter import BenchmarkItem, LiveEvalAdapter
+
+    if not settings.eval_enabled:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Live evaluation endpoint is disabled. "
+                "Set EVAL_ENABLED=true to enable."
+            ),
+        )
+
+    try:
+        # Build the adapter
+        adapter = LiveEvalAdapter(top_k=request.top_k or 5)
+
+        # Convert request model to adapter types
+        benchmark_items = [
+            BenchmarkItem(id=item.id, query=item.query, relevant_ids=item.relevant_ids)
+            for item in request.benchmark
+        ]
+
+        # Run live evaluation
+        result = await adapter.run_live(
+            benchmark=benchmark_items,
+            rag_engine=rag_engine,
+            vault_id=request.vault_id,
+            top_k=request.top_k,
+        )
+
+        logger.info(
+            "Live eval run %s completed: MRR=%.3f, nDCG=%.3f, recall=%.3f",
+            result.run_id,
+            result.mrr_mean or 0.0,
+            result.ndcg_mean or 0.0,
+            result.recall_mean or 0.0,
+        )
+
+        return LiveEvalResponse(
+            run_id=result.run_id,
+            timestamp=result.timestamp,
+            release_id=result.release_id,
+            top_k=result.top_k,
+            query_metrics=[qm.__dict__ for qm in result.query_metrics],
+            mrr_mean=result.mrr_mean,
+            ndcg_mean=result.ndcg_mean,
+            recall_mean=result.recall_mean,
+        )
+
+    except Exception as e:
+        logger.error("Live eval failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Live evaluation failed: {str(e)}")

@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
@@ -26,9 +26,14 @@ from app.security import (
 from app.services.auth_service import (
     async_hash_password,
     async_verify_password,
+    compute_client_fingerprint,
     create_access_token,
     create_refresh_token,
+    decode_access_token,
+    deny_access_token,
+    password_needs_rehash,
     password_strength_check,
+    purge_expired_denied_tokens,
 )
 from app.utils.paths import csrf_cookie_path, refresh_cookie_path
 
@@ -230,13 +235,15 @@ async def register(
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
     # Create tokens for auto-login
-    access_token = create_access_token(user_id, body.username, role)
+    user_agent = request.headers.get("user-agent", "")
+    access_token = create_access_token(
+        user_id, body.username, role, client_fingerprint=compute_client_fingerprint(user_agent)
+    )
     refresh_token_raw, refresh_token_hash = create_refresh_token()
 
     # Store refresh token session
     expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
     ip_address = request.client.host if request.client else None
-    user_agent = request.headers.get("user-agent")
 
     try:
         def _register_session_db():
@@ -268,6 +275,9 @@ async def register(
         max_age=REFRESH_TOKEN_MAX_AGE_DAYS * 24 * 60 * 60,
         path=refresh_cookie_path(),
     )
+
+    csrf_manager = get_csrf_manager(request)
+    issue_csrf_token(response, csrf_manager)
 
     return {
         "access_token": access_token,
@@ -342,14 +352,24 @@ async def login(
             )
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
+    # Transparent hash upgrade: if the stored hash is a legacy scheme (bcrypt),
+    # re-hash with the current default (Argon2id) inside the session-create transaction.
+    upgrade_hash = password_needs_rehash(hashed_pw)
+    if upgrade_hash:
+        new_hashed_password = await async_hash_password(body.password)
+    else:
+        new_hashed_password = None
+
     # Create tokens
-    access_token = create_access_token(user_id, db_username, role)
+    user_agent = request.headers.get("user-agent", "")
+    access_token = create_access_token(
+        user_id, db_username, role, client_fingerprint=compute_client_fingerprint(user_agent)
+    )
     refresh_token_raw, refresh_token_hash = create_refresh_token()
 
     # Store refresh token session
     expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
     ip_address = request.client.host if request.client else None
-    user_agent = request.headers.get("user-agent")
 
     try:
         def _login_create_session():
@@ -364,10 +384,16 @@ async def login(
                         user_agent,
                     ),
                 )
-                db.execute(
-                    "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ? WHERE id = ?",
-                    (datetime.now(timezone.utc).isoformat(), user_id),
-                )
+                if new_hashed_password:
+                    db.execute(
+                        "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ?, hashed_password = ? WHERE id = ?",
+                        (datetime.now(timezone.utc).isoformat(), new_hashed_password, user_id),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = ? WHERE id = ?",
+                        (datetime.now(timezone.utc).isoformat(), user_id),
+                    )
                 db.commit()
             except Exception:
                 try:
@@ -466,7 +492,11 @@ async def refresh(
         logger.error("Session rotation failed", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
-    access_token = create_access_token(user_id, username, role)
+    # Bind new access token to same client fingerprint as the refresh request
+    user_agent = request.headers.get("user-agent", "")
+    access_token = create_access_token(
+        user_id, username, role, client_fingerprint=compute_client_fingerprint(user_agent)
+    )
 
     response.set_cookie(
         key=REFRESH_TOKEN_COOKIE_NAME,
@@ -491,11 +521,35 @@ async def refresh(
 @router.post("/logout")
 async def logout(
     response: Response,
+    authorization: Optional[str] = Header(None),
     refresh_token: Optional[str] = Cookie(None, alias=REFRESH_TOKEN_COOKIE_NAME),
     db=Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Logout and revoke refresh token."""
+    """Logout and revoke refresh token and current access token."""
+    # Deny the current access token if present (extract from Bearer token)
+    if authorization and authorization.lower().startswith("bearer "):
+        access_token_str = authorization.split(" ", 1)[1].strip()
+        if access_token_str:
+            try:
+                token_payload = decode_access_token(access_token_str)
+                jti = token_payload.get("jti")
+                user_id = int(token_payload.get("sub", 0))
+                exp = token_payload.get("exp")
+                if jti and user_id:
+                    # exp is an int Unix timestamp; store in SQLite-native format
+                    if exp:
+                        from datetime import datetime, timezone
+
+                        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        deny_access_token(db, jti, user_id, expires_at)
+                        purge_expired_denied_tokens(db)
+            except Exception:
+                # Best-effort: deny only — do not fail logout if token decode fails
+                pass
+
     if refresh_token:
         token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
         try:
@@ -683,7 +737,10 @@ async def change_password(
     invalidate_active_user_cache(user_id)
 
     # Generate new tokens
-    access_token = create_access_token(user_id, username, role)
+    user_agent = request.headers.get("user-agent", "")
+    access_token = create_access_token(
+        user_id, username, role, client_fingerprint=compute_client_fingerprint(user_agent)
+    )
     refresh_token_raw, refresh_token_hash = create_refresh_token()
 
     # Store new refresh token session
@@ -872,7 +929,11 @@ async def revoke_all_sessions(
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
     # Generate new access token
-    access_token = create_access_token(user["id"], user["username"], user["role"])
+    user_agent = request.headers.get("user-agent", "")
+    access_token = create_access_token(
+        user["id"], user["username"], user["role"],
+        client_fingerprint=compute_client_fingerprint(user_agent),
+    )
 
     # Set new refresh cookie
     response.set_cookie(

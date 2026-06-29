@@ -20,7 +20,9 @@ from app.security import get_csrf_manager  # noqa: F401
 from app.services.auth_service import (
     TokenExpiredError,
     TokenInvalidError,
+    compute_client_fingerprint,
     decode_access_token,
+    is_access_token_denied,
 )
 
 logger = logging.getLogger(__name__)
@@ -274,6 +276,39 @@ async def get_current_active_user(
 
     # Enforce token type — reject refresh tokens used as access tokens
     if payload.get("type") != "access":
+        raise HTTPException(
+            status_code=401,
+            detail="token_invalid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Denylist check: reject tokens without jti (new deployment guard) or that have been revoked
+    jti = payload.get("jti")
+    if not jti:
+        raise HTTPException(
+            status_code=401,
+            detail="token_invalid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if is_access_token_denied(db, jti):
+        raise HTTPException(
+            status_code=401,
+            detail="token_invalid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Fingerprint check: bind token to the client that issued it (fail-closed).
+    # A token without fpt is treated as legacy and rejected.
+    token_fpt = payload.get("fpt")
+    if token_fpt is None:
+        raise HTTPException(
+            status_code=401,
+            detail="token_invalid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    current_ua = request.headers.get("user-agent", "")
+    current_fpt = compute_client_fingerprint(current_ua)
+    if not secrets.compare_digest(token_fpt, current_fpt):
         raise HTTPException(
             status_code=401,
             detail="token_invalid",

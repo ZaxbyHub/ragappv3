@@ -40,6 +40,8 @@ from .document_progress import (
     set_wiki_pending,
 )
 from .embeddings import EmbeddingService
+from .image_processor import ImageProcessingResult, process_image
+from .image_search import build_searchable_text
 from .llm_client import LLMClient
 from .schema_parser import SchemaParser
 from .vector_store import VectorStore
@@ -61,6 +63,87 @@ _STAGE_TIMING_FIELDS = (
 
 def _new_stage_timings() -> dict[str, float]:
     return {field: 0.0 for field in _STAGE_TIMING_FIELDS}
+
+
+def is_enrichment_enabled_for_vault(vault_id: Optional[int]) -> bool:
+    """Return the effective enrichment setting for a vault.
+
+    Resolution order:
+    1. If vault_id is None, fall back to global settings.chunk_enrichment_enabled.
+    2. Look up vaults.enrichment_enabled for the given vault_id.
+       - NULL  → inherit global settings.chunk_enrichment_enabled
+       - 1     → True (vault-level override: ON)
+       - 0     → False (vault-level override: OFF)
+    """
+    if vault_id is None:
+        return settings.chunk_enrichment_enabled
+
+    try:
+        pool = get_pool(str(settings.sqlite_path), max_size=1)
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT enrichment_enabled FROM vaults WHERE id = ?",
+                (vault_id,),
+            ).fetchone()
+        if row is None:
+            # Vault not found — treat as global
+            return settings.chunk_enrichment_enabled
+        override = row[0]
+        if override is None:
+            return settings.chunk_enrichment_enabled
+        return bool(override)
+    except Exception:
+        # DB error — conservatively fall back to global
+        return settings.chunk_enrichment_enabled
+
+
+def is_enrichment_enabled_for_file(file_id: int, vault_id: int) -> bool:
+    """Return the effective enrichment setting for a file.
+
+    Resolution order:
+    1. Look up files.enrichment_enabled for the given file_id.
+       - 1     → True (file-level override: ON)
+       - 0     → False (file-level override: OFF)
+       - NULL  → inherit from vault (fall through to step 2)
+    2. Look up vaults.enrichment_enabled for the given vault_id
+       (via is_enrichment_enabled_for_vault), which itself falls through
+       to global settings.chunk_enrichment_enabled when vault override is NULL.
+
+    Uses a single JOIN query for efficiency: file override + vault override
+    in one round-trip.
+    """
+    try:
+        pool = get_pool(str(settings.sqlite_path), max_size=1)
+        with pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT f.enrichment_enabled AS file_override,
+                       v.enrichment_enabled AS vault_override
+                FROM files f
+                JOIN vaults v ON v.id = f.vault_id
+                WHERE f.id = ?
+                """,
+                (file_id,),
+            ).fetchone()
+        if row is None:
+            # File not found — fall back to vault resolution
+            return is_enrichment_enabled_for_vault(vault_id)
+
+        file_override = row["file_override"] if isinstance(row, sqlite3.Row) else row[0]
+        vault_override = row["vault_override"] if isinstance(row, sqlite3.Row) else row[1]
+
+        # File-level override takes precedence
+        if file_override is not None:
+            return bool(file_override)
+
+        # No file override: fall through to vault resolution
+        # Build a synthetic vault row for is_enrichment_enabled_for_vault logic
+        if vault_override is None:
+            return settings.chunk_enrichment_enabled
+        return bool(vault_override)
+    except Exception:
+        # DB error — conservatively fall back to vault resolution
+        return is_enrichment_enabled_for_vault(vault_id)
 
 
 def _add_elapsed_ms(timings: dict[str, float], field: str, started_at: float) -> None:
@@ -519,6 +602,9 @@ class DocumentProcessor:
     # File extensions that should use SpreadsheetParser
     SPREADSHEET_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 
+    # File extensions that should use image processing (OCR + metadata)
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"}
+
     def __init__(
         self,
         chunk_size_chars: int = 2000,
@@ -671,9 +757,17 @@ class DocumentProcessor:
                 ", ".join(f"chunk {i} ({size} chars)" for i, size in oversized),
             )
 
-    def _get_chunk_enrichment_service(self) -> Optional[ChunkEnrichmentService]:
-        """Lazily create a ChunkEnrichmentService when needed."""
-        if not settings.chunk_enrichment_enabled:
+    def _get_chunk_enrichment_service(
+        self, vault_id: Optional[int] = None, file_id: Optional[int] = None
+    ) -> Optional[ChunkEnrichmentService]:
+        """Lazily create a ChunkEnrichmentService when needed.
+
+        Uses the effective enrichment setting at file > vault > global priority.
+        """
+        if file_id is not None and vault_id is not None:
+            if not is_enrichment_enabled_for_file(file_id, vault_id):
+                return None
+        elif not is_enrichment_enabled_for_vault(vault_id):
             return None
         if self._llm_client is None:
             logger.warning("Chunk enrichment enabled but no LLM client available")
@@ -962,10 +1056,19 @@ class DocumentProcessor:
             if delete_by_id is not None:
                 await delete_by_id(old_id)
 
-    def should_enqueue_enrichment(self, chunks: List[ProcessedChunk]) -> bool:
-        """Return True when post-index enrichment is configured and possible."""
+    def should_enqueue_enrichment(
+        self, chunks: List[ProcessedChunk], vault_id: Optional[int] = None, file_id: Optional[int] = None
+    ) -> bool:
+        """Return True when post-index enrichment is configured and possible.
+
+        Uses the effective enrichment setting at file > vault > global priority.
+        """
+        if file_id is not None and vault_id is not None:
+            enabled = is_enrichment_enabled_for_file(file_id, vault_id)
+        else:
+            enabled = is_enrichment_enabled_for_vault(vault_id)
         return bool(
-            settings.chunk_enrichment_enabled
+            enabled
             and self._llm_client is not None
             and self.embedding_service is not None
             and self.vector_store is not None
@@ -986,7 +1089,7 @@ class DocumentProcessor:
         if not self._is_enrichment_job_current(file_id, file_hash):
             return
 
-        enrichment_service = self._get_chunk_enrichment_service()
+        enrichment_service = self._get_chunk_enrichment_service(vault_id, file_id)
         if enrichment_service is None:
             self.set_enrichment_status(file_id, "complete")
             return
@@ -1334,6 +1437,18 @@ class DocumentProcessor:
         """
         return Path(file_path).suffix.lower() in self.SPREADSHEET_EXTENSIONS
 
+    def _is_image_file(self, file_path: str) -> bool:
+        """
+        Check if a file should be processed as an image.
+
+        Args:
+            file_path: Path to the file.
+
+        Returns:
+            True if the file has an image extension.
+        """
+        return Path(file_path).suffix.lower() in self.IMAGE_EXTENSIONS
+
     async def _process_spreadsheet_file(self, file_path: str) -> List[ProcessedChunk]:
         """
         Process a spreadsheet file using SpreadsheetParser.
@@ -1407,6 +1522,79 @@ class DocumentProcessor:
             processed_chunks.append(chunk)
 
         return processed_chunks
+
+    async def _process_image_file(
+        self,
+        file_path: str,
+        file_id: Optional[int] = None,
+    ) -> Tuple[List[ProcessedChunk], str]:
+        """
+        Process an image file using image_processor + image_search.
+
+        Extracts OCR text and image metadata, builds a searchable text
+        representation, and produces a single chunk that flows through the
+        standard embedding/indexing pipeline.
+
+        Graceful degradation: if image libraries are missing or the image
+        is corrupt, logs a warning and returns an empty chunk list so the
+        file is recorded but not searchable.
+
+        Args:
+            file_path: Path to the image file.
+            file_id: Database ID of the file (used for chunk UID construction).
+
+        Returns:
+            Tuple of (list of ProcessedChunk objects, searchable document text).
+            Returns ([], "") when processing fails.
+        """
+        image_result: ImageProcessingResult = await asyncio.to_thread(
+            process_image, file_path
+        )
+
+        if not image_result.success:
+            logger.warning(
+                "Image processing failed for %s: %s. "
+                "File recorded but not searchable.",
+                file_path,
+                image_result.error,
+            )
+            return [], ""
+
+        filename = Path(file_path).name
+        searchable_text = build_searchable_text(image_result, filename)
+
+        if not searchable_text or not searchable_text.strip():
+            logger.warning(
+                "Image %s produced no searchable text. "
+                "File recorded but not searchable.",
+                file_path,
+            )
+            return [], searchable_text
+
+        # Build chunk metadata mirroring the structure used by text/spreadsheet paths
+        chunk_metadata: Dict[str, Any] = {
+            "source_type": "image",
+            "file_path": str(file_path),
+            "chunk_scale": "default",
+            "image_width": image_result.metadata.get("width"),
+            "image_height": image_result.metadata.get("height"),
+            "image_format": image_result.metadata.get("format"),
+            "image_mode": image_result.metadata.get("mode"),
+        }
+        if file_id is not None:
+            chunk_metadata["file_id"] = str(file_id)
+
+        chunk_index = 0
+        chunk_metadata["chunk_index"] = chunk_index
+        chunk_metadata["total_chunks"] = 1
+
+        chunk = ProcessedChunk(
+            text=searchable_text,
+            metadata=chunk_metadata,
+            chunk_index=chunk_index,
+        )
+
+        return [chunk], searchable_text
 
     async def _process_document_file(
         self,
@@ -1594,6 +1782,16 @@ class DocumentProcessor:
                 chunks = await self._process_spreadsheet_file(file_path)
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
                 document_text = " ".join(c.text for c in chunks)
+            elif self._is_image_file(file_path):
+                set_phase(
+                    self.pool,
+                    file_id,
+                    phase=PHASE_PARSING,
+                    message="Processing image",
+                )
+                stage_started_at = time.monotonic()
+                chunks, document_text = await self._process_image_file(file_path, file_id)
+                _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             else:
                 chunks, document_text = await self._process_document_file(
                     file_path, file_id, stage_timings
@@ -2107,6 +2305,16 @@ class DocumentProcessor:
                 chunks = await self._process_spreadsheet_file(file_path)
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
                 document_text = " ".join(c.text for c in chunks)
+            elif self._is_image_file(file_path):
+                set_phase(
+                    self.pool,
+                    file_id,
+                    phase=PHASE_PARSING,
+                    message="Processing image",
+                )
+                stage_started_at = time.monotonic()
+                chunks, document_text = await self._process_image_file(file_path, file_id)
+                _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             else:
                 chunks, document_text = await self._process_document_file(
                     file_path, file_id, stage_timings

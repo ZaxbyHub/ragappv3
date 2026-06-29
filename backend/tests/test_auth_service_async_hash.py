@@ -2,12 +2,12 @@
 Tests for async_hash_password in auth_service.
 
 Verifies:
-1. async_hash_password() returns a valid bcrypt hash
+1. async_hash_password() returns a valid argon2id hash
 2. Hash can be verified with verify_password and async_verify_password
 3. Runs on dedicated executor thread (auth-cpu prefix)
 4. Does not block the event loop — other coroutines can interleave
 5. Multiple concurrent calls do not deadlock
-6. Same password produces different hashes each time (bcrypt salting)
+6. Same password produces different hashes each time (argon2id salting)
 7. Works with special characters and unicode passwords
 8. Original hash_password() still works synchronously (backward compat)
 """
@@ -32,17 +32,17 @@ from app.services.auth_service import (
 class TestAsyncHashPassword(unittest.IsolatedAsyncioTestCase):
     """Test cases for async_hash_password function."""
 
-    async def test_async_hash_password_returns_bcrypt_hash(self):
-        """Test that async_hash_password returns a bcrypt hash string."""
+    async def test_async_hash_password_returns_argon2id_hash(self):
+        """Test that async_hash_password returns an argon2id hash string."""
         plain_password = "SecurePass123!"
         result = await async_hash_password(plain_password)
 
         # Result should be a string
         self.assertIsInstance(result, str)
-        # bcrypt hashes start with $2b$ or $2a$
+        # argon2id hashes start with $argon2id$
         self.assertTrue(
-            result.startswith("$2"),
-            f"Expected bcrypt hash starting with $2, got: {result[:10]}"
+            result.startswith("$argon2id$"),
+            f"Expected argon2id hash starting with $argon2id$, got: {result[:10]}"
         )
 
     async def test_async_hash_password_hash_can_be_verified_sync(self):
@@ -93,7 +93,7 @@ class TestAsyncHashPassword(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_async_hash_password_different_hash_each_time(self):
-        """Test that hashing same password twice produces different hashes (bcrypt salting)."""
+        """Test that hashing same password twice produces different hashes (argon2id salting)."""
         plain_password = "SamePassword123!"
         hash1 = await async_hash_password(plain_password)
         hash2 = await async_hash_password(plain_password)
@@ -115,11 +115,11 @@ class TestAsyncHashPassword(unittest.IsolatedAsyncioTestCase):
         tasks = [async_hash_password(p) for p in passwords]
         hashes = await asyncio.gather(*tasks)
 
-        # All should succeed and be valid bcrypt hashes
+        # All should succeed and be valid argon2id hashes
         self.assertEqual(len(hashes), len(passwords))
         for i, hashed in enumerate(hashes):
             self.assertIsInstance(hashed, str)
-            self.assertTrue(hashed.startswith("$2"))
+            self.assertTrue(hashed.startswith("$argon2id$"))
             self.assertTrue(verify_password(passwords[i], hashed))
 
     async def test_async_hash_password_with_special_characters(self):
@@ -146,7 +146,7 @@ class TestAsyncHashPassword(unittest.IsolatedAsyncioTestCase):
         hashed = hash_password(plain_password)
 
         self.assertIsInstance(hashed, str)
-        self.assertTrue(hashed.startswith("$2"))
+        self.assertTrue(hashed.startswith("$argon2id$"))
         self.assertTrue(verify_password(plain_password, hashed))
 
 
@@ -183,7 +183,7 @@ class TestAsyncHashPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase):
         """Other async tasks should be able to interleave during password hashing.
 
         If async_hash_password properly uses run_in_executor, other coroutines
-        should be able to run while the thread pool handles the blocking bcrypt ops.
+        should be able to run while the thread pool handles the blocking hashing ops.
         """
         plain_password = "SecurePass123!"
 
@@ -191,7 +191,7 @@ class TestAsyncHashPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase):
         task_execution_time = None
 
         async def side_task():
-            """A simple task that should run during the bcrypt operations."""
+            """A simple task that should run during the hashing operations."""
             nonlocal task_executed, task_execution_time
             start = time.perf_counter()
             # Do some async work
@@ -214,8 +214,8 @@ class TestAsyncHashPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase):
         )
 
         # Verify the side task actually ran during hashing (not after)
-        # Since bcrypt takes ~400ms and we only sleep 10ms, if task ran after,
-        # hashing_time would be ~400ms and task_execution_time would be ~400ms
+        # Since hashing takes time and we only sleep 10ms, if task ran after,
+        # hashing_time would be large and task_execution_time would also be large
         # If task interleaved, task_execution_time would be ~10ms
         self.assertLess(
             task_execution_time,
@@ -224,7 +224,7 @@ class TestAsyncHashPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_multiple_async_tasks_can_interleave_during_hashing(self):
-        """Multiple async tasks should be able to run during a long bcrypt operation."""
+        """Multiple async tasks should be able to run during a long hashing operation."""
         plain_password = "SecurePass123!"
 
         results = []
@@ -237,19 +237,19 @@ class TestAsyncHashPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase):
         # Start multiple fast tasks
         fast_tasks = [asyncio.create_task(fast_task(i)) for i in range(5)]
 
-        # Start a blocking bcrypt operation
-        bcrypt_task = asyncio.create_task(async_hash_password(plain_password))
+        # Start a blocking hashing operation
+        hash_task = asyncio.create_task(async_hash_password(plain_password))
 
         # Wait for all to complete
-        await asyncio.gather(*fast_tasks, bcrypt_task)
+        await asyncio.gather(*fast_tasks, hash_task)
 
         # All fast tasks should have completed
         self.assertEqual(sorted(results), list(range(5)))
-        self.assertIsInstance(bcrypt_task.result(), str)
-        self.assertTrue(bcrypt_task.result().startswith("$2"))
+        self.assertIsInstance(hash_task.result(), str)
+        self.assertTrue(hash_task.result().startswith("$argon2id$"))
 
     async def test_event_loop_remains_responsive_under_hash_load(self):
-        """Event loop should remain responsive even when bcrypt pool is saturated."""
+        """Event loop should remain responsive even when hash pool is saturated."""
         plain_password = "SecurePass123!"
 
         responsive = True
@@ -264,14 +264,14 @@ class TestAsyncHashPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase):
                 # If we get here, event loop is responsive
                 responsive = responsive and True
 
-        # Saturate thread pool with 4 long-running bcrypt ops
-        bcrypt_tasks = [
+        # Saturate thread pool with 4 long-running hashing ops
+        hash_tasks = [
             async_hash_password(plain_password)
             for _ in range(4)
         ]
 
         # Run liveness check alongside
-        await asyncio.gather(liveness_check(), *bcrypt_tasks)
+        await asyncio.gather(liveness_check(), *hash_tasks)
 
         # Event loop should have remained responsive
         self.assertTrue(responsive)
@@ -298,13 +298,13 @@ class TestAsyncHashPasswordThreadPoolExhaustion(unittest.IsolatedAsyncioTestCase
         # All should succeed
         self.assertEqual(len(hashes), len(passwords))
         for i, hashed in enumerate(hashes):
-            self.assertTrue(hashed.startswith("$2"))
+            self.assertTrue(hashed.startswith("$argon2id$"))
             self.assertTrue(verify_password(passwords[i], hashed))
 
         # Total time should be less than serial execution — proves the thread pool
         # is running tasks in parallel (not serializing).
-        # With 4 workers: parallel time ≈ ceil(N/4) × bcrypt_time.
-        # Allow 60s upper bound to cover slow CI environments where bcrypt may
+        # With 4 workers: parallel time ≈ ceil(N/4) × hash_time.
+        # Allow 60s upper bound to cover slow CI environments where hashing may
         # take several seconds per hash; serial execution of 20 hashes would take
         # at least 4× as long as parallel, so this still validates parallelism.
         self.assertLess(
@@ -325,7 +325,7 @@ class TestAsyncHashPasswordThreadPoolExhaustion(unittest.IsolatedAsyncioTestCase
 
         self.assertEqual(len(hashes), len(passwords))
         for i, hashed in enumerate(hashes):
-            self.assertTrue(hashed.startswith("$2"))
+            self.assertTrue(hashed.startswith("$argon2id$"))
 
     async def test_executor_healthy_after_heavy_hash_load(self):
         """Executor should remain healthy after heavy use."""
@@ -339,7 +339,7 @@ class TestAsyncHashPasswordThreadPoolExhaustion(unittest.IsolatedAsyncioTestCase
 
         # Executor should still accept new work — verify with a simple new task
         result = await async_hash_password("FinalPassword123!")
-        self.assertTrue(result.startswith("$2"))
+        self.assertTrue(result.startswith("$argon2id$"))
 
 
 class TestAsyncHashPasswordExecutorConfiguration(unittest.TestCase):

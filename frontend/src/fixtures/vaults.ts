@@ -54,6 +54,7 @@ export const mockVaults: Vault[] = import.meta.env.DEV ? [
     memory_count: 45,
     session_count: 32,
     org_id: 1,
+    effective_enrichment_enabled: false,
   },
   {
     id: 2,
@@ -65,6 +66,7 @@ export const mockVaults: Vault[] = import.meta.env.DEV ? [
     memory_count: 22,
     session_count: 18,
     org_id: 1,
+    effective_enrichment_enabled: false,
   },
   {
     id: 3,
@@ -76,6 +78,7 @@ export const mockVaults: Vault[] = import.meta.env.DEV ? [
     memory_count: 8,
     session_count: 5,
     org_id: 1,
+    effective_enrichment_enabled: false,
   },
   {
     id: 4,
@@ -87,6 +90,7 @@ export const mockVaults: Vault[] = import.meta.env.DEV ? [
     memory_count: 30,
     session_count: 12,
     org_id: 2,
+    effective_enrichment_enabled: false,
   },
   {
     id: 5,
@@ -98,6 +102,7 @@ export const mockVaults: Vault[] = import.meta.env.DEV ? [
     memory_count: 55,
     session_count: 28,
     org_id: 3,
+    effective_enrichment_enabled: false,
   },
   {
     id: 6,
@@ -109,5 +114,6 @@ export const mockVaults: Vault[] = import.meta.env.DEV ? [
     memory_count: 15,
     session_count: 9,
     org_id: 4,
+    effective_enrichment_enabled: false,
   },
 ] : [];

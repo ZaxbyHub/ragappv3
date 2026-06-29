@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.services.citation_validator import (
     parse_citations,
     repair_against_sources_and_memories,
+    score_citations,
     validate_and_repair_citations,
 )
 
@@ -153,6 +154,164 @@ class TestRepairAgainstSourcesAndMemories(unittest.TestCase):
         self.assertIn("[M1]", result.repaired_content)
         self.assertNotIn("[M2]", result.repaired_content)
         self.assertEqual(result.invalid_citations, ("M2",))
+
+
+class TestScoreCitationsConfidence(unittest.TestCase):
+    """FR-004: citation confidence scoring via lexical (Jaccard) overlap.
+
+    Jaccard = |claim_tokens ∩ source_tokens| / |claim_tokens ∪ source_tokens|
+    All expected values below are hand-computed from the token sets.
+    """
+
+    def test_high_overlap_citation_high_confidence(self):
+        # content: "The capital of France is Paris [S1]."
+        # source: "Paris is the capital of France and its largest city."
+        # claim_tokens (strip punctuation): {"the","capital","of","france","is","paris","s1"}
+        # source_tokens: {"paris","is","the","capital","of","france","and","its","largest","city"}
+        # intersection = 6, union = 11 → Jaccard = 6/11 ≈ 0.5455
+        content = "The capital of France is Paris [S1]."
+        source_text = "Paris is the capital of France and its largest city."
+        result = score_citations(content, [source_text])
+        self.assertIn("S1", result.citation_confidence)
+        self.assertAlmostEqual(result.citation_confidence["S1"], 6 / 11, places=4)
+
+    def test_low_overlap_citation_low_confidence(self):
+        # content: "The sky is green [S1]."
+        # source: "Python is a programming language developed in 1991."
+        # Python's string.punctuation strips trailing digits too:
+        # claim_tokens (strip punctuation "[]1,"): {"the","sky","is","green","s"}
+        # source_tokens (strip punctuation "-", trailing "1" from "1991"): {"python","is","a","programming","language","developed","in","199"}
+        # intersection = {"is"} → size 1, union = 12 → Jaccard = 1/12 ≈ 0.0833
+        content = "The sky is green [S1]."
+        source_text = "Python is a programming language developed in 1991."
+        result = score_citations(content, [source_text])
+        self.assertIn("S1", result.citation_confidence)
+        self.assertAlmostEqual(result.citation_confidence["S1"], 1 / 12, places=4)
+
+    def test_partial_overlap_medium_confidence(self):
+        # content: "Python is a programming language [S1]."
+        # source: "Python is a general-purpose high-level programming language."
+        # Python's string.punctuation strips hyphens:
+        # claim_tokens: {"python","is","a","programming","language","s"}
+        # source_tokens: {"python","is","a","generalpurpose","highlevel","programming","language"}
+        # intersection = 5, union = 8 → Jaccard = 5/8 = 0.625
+        content = "Python is a programming language [S1]."
+        source_text = "Python is a general-purpose high-level programming language."
+        result = score_citations(content, [source_text])
+        self.assertIn("S1", result.citation_confidence)
+        self.assertAlmostEqual(result.citation_confidence["S1"], 5 / 8, places=4)
+
+    def test_mixed_citations_individual_scores(self):
+        # S1: "Dogs are mammals [S1]." vs source_s1
+        # claim_tokens: {"dogs","are","mammals","s1"}
+        # source_tokens: {"dogs","belong","to","the","canine","family","and","are","domesticated","mammals"}
+        # intersection = {"dogs","are","mammals"} → size 3, union = 11 → Jaccard = 3/11 ≈ 0.2727
+        # S2: "Cats are also mammals [S2]." vs source_s2 ("The capital of France is Paris.")
+        # claim_tokens: {"cats","are","also","mammals","s2"}
+        # source_tokens: {"the","capital","of","france","is","paris"}
+        # intersection = ∅ → Jaccard = 0.0
+        content = "Dogs are mammals [S1]. Cats are also mammals [S2]."
+        source_s1 = "Dogs belong to the canine family and are domesticated mammals."
+        source_s2 = "The capital of France is Paris."
+        result = score_citations(content, [source_s1, source_s2])
+        self.assertIn("S1", result.citation_confidence)
+        self.assertIn("S2", result.citation_confidence)
+        self.assertAlmostEqual(result.citation_confidence["S1"], 3 / 11, places=4)
+        self.assertAlmostEqual(result.citation_confidence["S2"], 0.0, places=4)
+
+    def test_empty_content_returns_empty_confidence(self):
+        result = score_citations("", ["some text"])
+        self.assertEqual(result.citation_confidence, {})
+        self.assertEqual(result.unverifiable_claims, ())
+
+    def test_no_sources_returns_empty_confidence(self):
+        content = "Something [S1]."
+        result = score_citations(content, [])
+        self.assertEqual(result.citation_confidence, {})
+
+
+class TestUnverifiableClaims(unittest.TestCase):
+    """FR-004: unverifiable-claims list — answer sentences with no citation and low source overlap.
+
+    Sentences with no [S#] citation and Jaccard < 0.15 against all sources are flagged.
+    Expected values hand-computed: each sentence's tokens vs "python is a programming language"
+    token set {"python","is","a","programming","language"}.
+    """
+
+    def test_uncited_low_overlap_sentence_in_unverifiable(self):
+        # All four sentences score Jaccard < 0.15 against the Python source:
+        #  "The system processes input in three steps." → overlap={"in"} → 1/10=0.1 < 0.15
+        #  "First, parsing."  → overlap={"a"} → 1/7≈0.143 < 0.15
+        #  "Second, validation." → overlap=∅ → 0.0 < 0.15
+        #  "Third, transformation." → overlap=∅ → 0.0 < 0.15
+        content = (
+            "The system processes input in three steps. "
+            "First, parsing. Second, validation. Third, transformation."
+        )
+        source_texts = ["Python is a programming language."]
+        result = score_citations(content, source_texts)
+        self.assertEqual(
+            result.unverifiable_claims,
+            (
+                "The system processes input in three steps.",
+                "First, parsing.",
+                "Second, validation.",
+                "Third, transformation.",
+            ),
+        )
+
+    def test_cited_sentence_not_in_unverifiable(self):
+        # Both cited sentences score Jaccard >= 0.15 against their respective sources:
+        #  "The sky is blue [S1]" vs "The sky is blue on clear days."
+        #    → overlap={"the","sky","is","blue"} → 4/9≈0.444 ≥ 0.15
+        #  "Dogs are mammals [S2]" vs "Dogs are domesticated mammals."
+        #    → overlap={"dogs","are","mammals"} → 3/8=0.375 ≥ 0.15
+        # → unverifiable_claims must be exactly empty.
+        content = "The sky is blue [S1]. Dogs are mammals [S2]."
+        source_s1 = "The sky is blue on clear days."
+        source_s2 = "Dogs are domesticated mammals."
+        result = score_citations(content, [source_s1, source_s2])
+        self.assertEqual(result.unverifiable_claims, ())
+
+    def test_cited_high_overlap_not_in_unverifiable(self):
+        content = "Paris is the capital of France [S1]."
+        source_text = "Paris is the capital of France."
+        result = score_citations(content, [source_text])
+        self.assertEqual(result.unverifiable_claims, ())
+
+    def test_short_refusal_not_in_unverifiable(self):
+        # Short refusal-style text should NOT be flagged as unverifiable.
+        content = "I don't have enough information to answer that."
+        source_texts = ["Some unrelated document."]
+        result = score_citations(content, source_texts)
+        self.assertEqual(result.unverifiable_claims, ())
+
+    def test_no_sources_means_no_unverifiable(self):
+        # When there are no sources, we can't verify anything — but we also
+        # shouldn't return unverifiable claims (there is no evidence baseline).
+        content = "This is a factual claim without citation."
+        result = score_citations(content, [])
+        # No sources → unverifiable list should be empty
+        self.assertEqual(result.unverifiable_claims, ())
+
+
+class TestBackwardCompatibility(unittest.TestCase):
+    """ADDITIVE constraint: existing validate_and_repair_citations callers keep working."""
+
+    def test_validate_and_repair_unchanged_fields(self):
+        result = validate_and_repair_citations(
+            "Claim [S1] and another [M1].",
+            source_count=2,
+            memory_count=2,
+        )
+        # Core fields are present and correct
+        self.assertEqual(result.repaired_content, "Claim [S1] and another [M1].")
+        self.assertEqual(set(result.valid_citations), {"S1", "M1"})
+        self.assertFalse(result.invalid_stripped)
+        self.assertTrue(result.has_any_citation)
+        # New fields exist with defaults
+        self.assertEqual(result.citation_confidence, {})
+        self.assertEqual(result.unverifiable_claims, ())
 
 
 if __name__ == "__main__":

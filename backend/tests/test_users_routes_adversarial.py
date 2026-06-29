@@ -28,7 +28,13 @@ os.environ["JWT_SECRET_KEY"] = (
 )
 os.environ["USERS_ENABLED"] = "true"
 
-from app.services.auth_service import create_access_token, hash_password
+from backend.tests.schema_constants import TEST_SCHEMA
+
+from app.services.auth_service import (
+    compute_client_fingerprint,
+    create_access_token,
+    hash_password,
+)
 
 
 def setup_test_db(db_path: str) -> sqlite3.Connection:
@@ -36,29 +42,7 @@ def setup_test_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            hashed_password TEXT NOT NULL,
-            full_name TEXT DEFAULT '',
-            role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
-            is_active INTEGER NOT NULL DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login_at TIMESTAMP,
-            -- Columns added by later migrations; kept in sync with the
-            -- canonical users schema (app/models/database.py) so auth
-            -- dependencies that SELECT them (e.g. deps.get_current_user) do
-            -- not raise "no such column".
-            must_change_password INTEGER NOT NULL DEFAULT 0,
-            failed_attempts INTEGER NOT NULL DEFAULT 0,
-            locked_until TIMESTAMP
-        )
-    """)
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+    conn.executescript(TEST_SCHEMA)
 
     conn.commit()
     return conn
@@ -106,7 +90,8 @@ def create_user_with_xss_payload(
 
 def get_token(user_id: int, username: str, role: str) -> str:
     """Generate a valid JWT token for a test user."""
-    return create_access_token(user_id, username, role)
+    return create_access_token(user_id, username, role,
+                        client_fingerprint=compute_client_fingerprint(""))
 
 
 def get_expired_token(user_id: int, username: str, role: str) -> str:
@@ -215,6 +200,8 @@ class TestSQLInjection:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -350,6 +337,8 @@ class TestXSSPrevention:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -485,6 +474,8 @@ class TestMassAssignment:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -595,6 +586,8 @@ class TestNegativeAndBoundaryUserIds:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -738,6 +731,8 @@ class TestOversizedParameters:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -856,6 +851,8 @@ class TestEmptyAndMalformedBodies:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -1032,6 +1029,8 @@ class TestJWTTokenManipulation:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -1187,6 +1186,8 @@ class TestLastSuperadminRaceCondition:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -1323,6 +1324,8 @@ class TestInvalidRoleValues:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -1448,6 +1451,8 @@ class TestInvalidIsActiveValues:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 

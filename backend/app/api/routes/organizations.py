@@ -1,8 +1,11 @@
 """Organization CRUD and member management routes."""
 
 import asyncio
+import hashlib
 import re
+import secrets
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -50,6 +53,48 @@ class OrgMemberUpdateRequest(BaseModel):
         if v not in VALID_ORG_ROLES:
             raise ValueError(f"Role must be one of: {', '.join(VALID_ORG_ROLES)}")
         return v
+
+
+# Invite roles — owner cannot be invited (only added via add_org_member)
+VALID_INVITE_ROLES = ("admin", "member")
+
+
+class OrgInviteCreateRequest(BaseModel):
+    email: str = Field(..., min_length=1, max_length=255)
+    role: str
+    expires_in_days: Optional[int] = Field(default=7, ge=1, le=30)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v):
+        # Accept either a plain username (3+ non-whitespace chars without @) or a
+        # well-formed email address. This allows invites by identifier (e.g.
+        # "alice", "superadmin") as well as by email address (e.g. "a@b.com").
+        if not re.match(r"^([^\s@]{3,}|[^@\s]+@[^@\s]+\.[^@\s]+)$", v):
+            raise ValueError("Invalid identifier format")
+        return v.lower()
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v):
+        if v not in VALID_INVITE_ROLES:
+            raise ValueError(f"Role must be one of: {', '.join(VALID_INVITE_ROLES)}")
+        return v
+
+
+class OrgInviteAcceptRequest(BaseModel):
+    token: str
+
+
+def _generate_invite_token() -> tuple[str, str]:
+    """Generate a raw invite token and its sha256 hash.
+
+    Returns (raw_token, token_hash). The raw token uses an 'inv_' prefix
+    followed by 32 bytes of cryptographically secure random data.
+    """
+    raw_token = f"inv_{secrets.token_urlsafe(32)}"
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    return raw_token, token_hash
 
 
 def _generate_slug(name: str) -> str:
@@ -519,6 +564,381 @@ async def add_org_member(
         pool.release_connection(conn)
 
 
+# ---------------------------------------------------------------------------
+# Organization invite management
+# ---------------------------------------------------------------------------
+
+
+def _invite_status(invite_row: tuple) -> str:
+    """Determine invite status from a org_invites row."""
+    # row: id, org_id, email, token_hash, role, expires_at, created_at,
+    #      created_by_user_id, accepted_at, accepted_by_user_id, revoked_at
+    if invite_row[8]:  # accepted_at
+        return "accepted"
+    if invite_row[10]:  # revoked_at
+        return "revoked"
+    # Check expiry
+    expires_at = datetime.fromisoformat(invite_row[5])
+    if expires_at < datetime.now(timezone.utc):
+        return "expired"
+    return "pending"
+
+
+@router.post("/{org_id}/invites", status_code=201)
+async def create_org_invite(
+    org_id: int,
+    req: OrgInviteCreateRequest,
+    user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Create an invite for a user to join an organization (admin/owner only)."""
+    pool = get_pool(str(settings.sqlite_path))
+    conn = pool.get_connection()
+    try:
+        # Check organization exists
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM organizations WHERE id = ?",
+            (org_id,),
+        )
+        if not await asyncio.to_thread(cursor.fetchone):
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        # Check caller is admin or owner
+        if not await asyncio.to_thread(_is_org_admin_or_owner, conn, org_id, user["id"]):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient privileges. Organization admin or owner required",
+            )
+
+        # Generate token
+        raw_token, token_hash = _generate_invite_token()
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(days=req.expires_in_days)
+
+        # Insert invite
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            """INSERT INTO org_invites
+               (org_id, email, token_hash, role, expires_at, created_at, created_by_user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                org_id,
+                req.email.lower(),
+                token_hash,
+                req.role,
+                expires_at.isoformat(),
+                now.isoformat(),
+                user["id"],
+            ),
+        )
+        await asyncio.to_thread(conn.commit)
+        invite_id = cursor.lastrowid
+
+        return {
+            "invite_id": invite_id,
+            "email": req.email.lower(),
+            "role": req.role,
+            "expires_at": expires_at.isoformat(),
+            "token": raw_token,
+        }
+    finally:
+        pool.release_connection(conn)
+
+
+@router.post("/{org_id}/invites/{invite_id}/resend", status_code=201)
+async def resend_org_invite(
+    org_id: int,
+    invite_id: int,
+    user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Resend an invite with a new token (admin/owner only). Invalidates old token."""
+    pool = get_pool(str(settings.sqlite_path))
+    conn = pool.get_connection()
+    try:
+        # Check organization exists
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM organizations WHERE id = ?",
+            (org_id,),
+        )
+        if not await asyncio.to_thread(cursor.fetchone):
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        # Check caller is admin or owner
+        if not await asyncio.to_thread(_is_org_admin_or_owner, conn, org_id, user["id"]):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient privileges. Organization admin or owner required",
+            )
+
+        # Fetch existing invite
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            """SELECT id, email, role, revoked_at, accepted_at
+               FROM org_invites WHERE id = ? AND org_id = ?""",
+            (invite_id, org_id),
+        )
+        invite = await asyncio.to_thread(cursor.fetchone)
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found")
+
+        # Cannot resend accepted or revoked invites
+        if invite[3]:  # revoked_at
+            raise HTTPException(status_code=400, detail="Invite has been revoked")
+        if invite[4]:  # accepted_at
+            raise HTTPException(status_code=400, detail="Invite has already been accepted")
+
+        # Generate new token
+        raw_token, token_hash = _generate_invite_token()
+        now = datetime.now(timezone.utc)
+        # Default 7-day expiry on resend
+        expires_at = now + timedelta(days=7)
+
+        await asyncio.to_thread(
+            conn.execute,
+            """UPDATE org_invites
+               SET token_hash = ?, expires_at = ?, created_at = ?, created_by_user_id = ?
+               WHERE id = ?""",
+            (token_hash, expires_at.isoformat(), now.isoformat(), user["id"], invite_id),
+        )
+        await asyncio.to_thread(conn.commit)
+
+        return {
+            "invite_id": invite_id,
+            "email": invite[1],
+            "role": invite[2],
+            "expires_at": expires_at.isoformat(),
+            "token": raw_token,
+        }
+    finally:
+        pool.release_connection(conn)
+
+
+@router.post("/{org_id}/invites/{invite_id}/revoke")
+async def revoke_org_invite(
+    org_id: int,
+    invite_id: int,
+    user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Revoke an invite (admin/owner only). Idempotent-ish."""
+    pool = get_pool(str(settings.sqlite_path))
+    conn = pool.get_connection()
+    try:
+        # Check organization exists
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM organizations WHERE id = ?",
+            (org_id,),
+        )
+        if not await asyncio.to_thread(cursor.fetchone):
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        # Check caller is admin or owner
+        if not await asyncio.to_thread(_is_org_admin_or_owner, conn, org_id, user["id"]):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient privileges. Organization admin or owner required",
+            )
+
+        # Fetch existing invite
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id, revoked_at FROM org_invites WHERE id = ? AND org_id = ?",
+            (invite_id, org_id),
+        )
+        invite = await asyncio.to_thread(cursor.fetchone)
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found")
+
+        if invite[1]:  # already revoked
+            raise HTTPException(status_code=400, detail="Invite has already been revoked")
+
+        now = datetime.now(timezone.utc).isoformat()
+        await asyncio.to_thread(
+            conn.execute,
+            "UPDATE org_invites SET revoked_at = ? WHERE id = ?",
+            (now, invite_id),
+        )
+        await asyncio.to_thread(conn.commit)
+
+        return {"message": "Invite revoked", "invite_id": invite_id}
+    finally:
+        pool.release_connection(conn)
+
+
+@router.get("/{org_id}/invites")
+async def list_org_invites(
+    org_id: int,
+    user: dict = Depends(require_role("member")),
+):
+    """List invites for an organization (admin/owner only)."""
+    pool = get_pool(str(settings.sqlite_path))
+    conn = pool.get_connection()
+    try:
+        # Check organization exists
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM organizations WHERE id = ?",
+            (org_id,),
+        )
+        if not await asyncio.to_thread(cursor.fetchone):
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        # Check caller is admin or owner
+        if not await asyncio.to_thread(_is_org_admin_or_owner, conn, org_id, user["id"]):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient privileges. Organization admin or owner required",
+            )
+
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            """SELECT id, org_id, email, token_hash, role, expires_at, created_at,
+                      created_by_user_id, accepted_at, accepted_by_user_id, revoked_at
+               FROM org_invites WHERE org_id = ?
+               ORDER BY created_at DESC""",
+            (org_id,),
+        )
+        invites = []
+        for row in await asyncio.to_thread(cursor.fetchall):
+            invites.append(
+                {
+                    "id": row[0],
+                    "email": row[2],
+                    "role": row[4],
+                    "status": _invite_status(row),
+                    "expires_at": row[5],
+                    "created_at": row[6],
+                }
+            )
+        return {"invites": invites}
+    finally:
+        pool.release_connection(conn)
+
+
+@router.post("/invites/accept")
+async def accept_org_invite(
+    req: OrgInviteAcceptRequest,
+    user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Accept an organization invite using a token.
+
+    The authenticated user must match the invite email (prevents token theft).
+    On success, creates org_members row and marks invite as accepted.
+    """
+    token_hash = hashlib.sha256(req.token.encode()).hexdigest()
+
+    pool = get_pool(str(settings.sqlite_path))
+    conn = pool.get_connection()
+    try:
+        # Look up invite by token hash
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            """SELECT id, org_id, email, role, expires_at, revoked_at,
+                      accepted_at, accepted_by_user_id
+               FROM org_invites WHERE token_hash = ?""",
+            (token_hash,),
+        )
+        invite = await asyncio.to_thread(cursor.fetchone)
+        if not invite:
+            raise HTTPException(status_code=400, detail="Invalid or expired invite")
+
+        invite_id, org_id, invite_email, role, expires_at_str, revoked_at, accepted_at, accepted_by = invite
+
+        # Check expiry, revoked, and already-accepted — all return the same
+        # generic message to prevent token-state enumeration.
+        expires_at = datetime.fromisoformat(expires_at_str)
+        if expires_at < datetime.now(timezone.utc) or revoked_at or accepted_at:
+            raise HTTPException(status_code=400, detail="Invalid or expired invite")
+
+        # SECURITY: invite email must match authenticated user's username
+        # (users table has no email column, so we match against username;
+        # usernames are unique and case-insensitive, providing equivalent security)
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT username FROM users WHERE id = ?",
+            (user["id"],),
+        )
+        user_row = await asyncio.to_thread(cursor.fetchone)
+        if not user_row or user_row[0].lower() != invite_email.lower():
+            raise HTTPException(
+                status_code=403,
+                detail="Invite is not addressed to your account",
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Check if already a member (fast-path to avoid the atomic block for the
+        # common case; the authoritative guard is the transactional INSERT below).
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
+            (org_id, user["id"]),
+        )
+        if await asyncio.to_thread(cursor.fetchone):
+            raise HTTPException(
+                status_code=409,
+                detail="You are already a member of this organization",
+            )
+
+        # Atomic: membership INSERT + invite accepted_at UPDATE must be committed
+        # together so a concurrent double-accept cannot leave the invite unmarked.
+        # BEGIN IMMEDIATE acquires an exclusive write lock before the pre-check.
+        try:
+            await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
+            try:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+                    (org_id, user["id"], role),
+                )
+            except sqlite3.IntegrityError as e:
+                if "UNIQUE constraint failed" in str(e):
+                    # Roll back BEFORE raising so the transaction is closed before
+                    # HTTPException propagates past the outer sqlite3.Error handler.
+                    await asyncio.to_thread(conn.rollback)
+                    raise HTTPException(
+                        status_code=409,
+                        detail="You are already a member of this organization",
+                    )
+                raise
+
+            await asyncio.to_thread(
+                conn.execute,
+                """UPDATE org_invites
+                   SET accepted_at = ?, accepted_by_user_id = ?
+                   WHERE id = ?""",
+                (now, user["id"], invite_id),
+            )
+            await asyncio.to_thread(conn.commit)
+        except sqlite3.Error:
+            await asyncio.to_thread(conn.rollback)
+            raise
+
+        # Fetch membership details
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            """SELECT u.id, u.username, u.full_name, om.role, om.joined_at
+               FROM org_members om JOIN users u ON om.user_id = u.id
+               WHERE om.org_id = ? AND om.user_id = ?""",
+            (org_id, user["id"]),
+        )
+        row = await asyncio.to_thread(cursor.fetchone)
+        return {
+            "user_id": row[0],
+            "username": row[1],
+            "full_name": row[2] or "",
+            "role": row[3],
+            "joined_at": row[4],
+        }
+    finally:
+        pool.release_connection(conn)
+
+
 @router.patch("/{org_id}/members/{member_user_id}")
 async def update_org_member_role(
     org_id: int,
@@ -778,5 +1198,192 @@ async def delete_organization(
             "message": "Organization deleted",
             "org_id": org_id,
         }
+    finally:
+        pool.release_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Prompt override management (FR-007 part 2)
+# ---------------------------------------------------------------------------
+
+
+class PromptOverrideSetRequest(BaseModel):
+    """Request body for setting an org's prompt version override."""
+
+    version: str = Field(..., min_length=1, description="Prompt version to use for this org")
+
+
+class PromptOverrideResponse(BaseModel):
+    """Response containing the effective prompt version for an org."""
+
+    version: str
+    content: str
+    is_override: bool  # True if org has an override; False if using global active
+    org_id: int
+
+
+@router.put("/{org_id}/prompt-override")
+async def set_prompt_override(
+    org_id: int,
+    req: PromptOverrideSetRequest,
+    user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Set (or update) an organization's prompt version override.
+
+    Only org admins and owners may set the override. The specified version
+    must exist (404 if not). Returns the effective version (which may be
+    the global active if no override is set).
+    """
+    pool = get_pool(str(settings.sqlite_path))
+    conn = pool.get_connection()
+    try:
+        # Check org exists
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM organizations WHERE id = ?",
+            (org_id,),
+        )
+        if not await asyncio.to_thread(cursor.fetchone):
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        # Authz: caller must be org admin or owner (superadmin bypasses this check)
+        if user.get("role") != "superadmin" and not await asyncio.to_thread(
+            _is_org_admin_or_owner, conn, org_id, user["id"]
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient privileges. Organization admin or owner required",
+            )
+
+        from app.services.prompt_store import PromptVersionStore
+
+        store = PromptVersionStore(conn)
+        try:
+            await asyncio.to_thread(
+                store.set_org_override, org_id, req.version, str(user["id"])
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+        # Return the effective version
+        effective = await asyncio.to_thread(store.resolve_for_org, org_id)
+        is_override = (await asyncio.to_thread(store.get_for_org, org_id)) is not None
+
+        return PromptOverrideResponse(
+            version=effective.version,
+            content=effective.content,
+            is_override=is_override,
+            org_id=org_id,
+        )
+    finally:
+        pool.release_connection(conn)
+
+
+@router.delete("/{org_id}/prompt-override")
+async def clear_prompt_override(
+    org_id: int,
+    user: dict = Depends(require_role("member")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Clear an organization's prompt version override.
+
+    Only org admins and owners may clear the override. After clearing,
+    the org uses the global active version. Returns the global active version.
+    """
+    pool = get_pool(str(settings.sqlite_path))
+    conn = pool.get_connection()
+    try:
+        # Check org exists
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM organizations WHERE id = ?",
+            (org_id,),
+        )
+        if not await asyncio.to_thread(cursor.fetchone):
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        # Authz: caller must be org admin or owner (superadmin bypasses this check)
+        if user.get("role") != "superadmin" and not await asyncio.to_thread(
+            _is_org_admin_or_owner, conn, org_id, user["id"]
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient privileges. Organization admin or owner required",
+            )
+
+        from app.services.prompt_store import PromptVersionStore
+
+        store = PromptVersionStore(conn)
+        await asyncio.to_thread(store.clear_org_override, org_id)
+
+        # Return the effective version (now the global active)
+        effective = await asyncio.to_thread(store.resolve_for_org, org_id)
+        if effective is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No prompt version is currently active globally",
+            )
+        return PromptOverrideResponse(
+            version=effective.version,
+            content=effective.content,
+            is_override=False,
+            org_id=org_id,
+        )
+    finally:
+        pool.release_connection(conn)
+
+
+@router.get("/{org_id}/prompt-override")
+async def get_prompt_override(
+    org_id: int,
+    user: dict = Depends(require_role("member")),
+):
+    """Get the effective prompt version for an org (override or global active).
+
+    Does not require org admin/owner — any org member can read the effective version.
+    """
+    pool = get_pool(str(settings.sqlite_path))
+    conn = pool.get_connection()
+    try:
+        # Check org exists
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM organizations WHERE id = ?",
+            (org_id,),
+        )
+        if not await asyncio.to_thread(cursor.fetchone):
+            raise HTTPException(status_code=404, detail="Organization not found")
+
+        # Check user is member of org (or superadmin/admin who can see all)
+        user_role = user.get("role", "")
+        if user_role not in ("superadmin", "admin"):
+            cursor = await asyncio.to_thread(
+                conn.execute,
+                "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
+                (org_id, user["id"]),
+            )
+            if not await asyncio.to_thread(cursor.fetchone):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied: not a member of this organization",
+                )
+
+        from app.services.prompt_store import PromptVersionStore
+
+        store = PromptVersionStore(conn)
+        is_override = (await asyncio.to_thread(store.get_for_org, org_id)) is not None
+        effective = await asyncio.to_thread(store.resolve_for_org, org_id)
+        if effective is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No prompt version is currently active globally",
+            )
+        return PromptOverrideResponse(
+            version=effective.version,
+            content=effective.content,
+            is_override=is_override,
+            org_id=org_id,
+        )
     finally:
         pool.release_connection(conn)
