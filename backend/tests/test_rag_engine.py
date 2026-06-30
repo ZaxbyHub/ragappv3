@@ -151,7 +151,8 @@ class RAGEngineTests(unittest.IsolatedAsyncioTestCase):
         # Response cites [M1] so that memories_used contains the cited memory.
         engine.llm_client = cast(LLMClient, FakeLLMClient(response="Important fact [M1]"))
         results = [msg async for msg in engine.query("query", [], stream=False)]
-        self.assertEqual("content", results[0]["type"])
+        content_msgs = [r for r in results if r.get("type") == "content"]
+        self.assertEqual(1, len(content_msgs))
         done = results[-1]
         self.assertEqual("done", done["type"])
         # memories_used must contain only the cited memory as a structured dict.
@@ -171,8 +172,9 @@ class RAGEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.memory_store = cast(MemoryStore, FakeMemoryStore())
         engine.llm_client = cast(LLMClient, FakeLLMClient(response="", stream_chunks=["part1", "part2"]))
         stream = [msg async for msg in engine.query("query", [], stream=True)]
-        self.assertEqual("content", stream[0]["type"])
-        self.assertEqual("part1", stream[0]["content"])
+        content_msgs = [s for s in stream if s.get("type") == "content"]
+        self.assertEqual(2, len(content_msgs))
+        self.assertEqual("part1", content_msgs[0]["content"])
         self.assertEqual("done", stream[-1]["type"])
 
     async def test_filter_relevant_filters_scores_below_threshold(self):
@@ -280,7 +282,8 @@ class RAGEngineTests(unittest.IsolatedAsyncioTestCase):
         # Sources should be empty since all chunks were filtered
         self.assertEqual(0, len(done["sources"]))
         # The LLM response should just be "answer" - no fallback injection
-        self.assertEqual("answer", results[0]["content"])
+        content_msgs = [r for r in results if r.get("type") == "content"]
+        self.assertEqual("answer", content_msgs[0]["content"])
 
     def test_build_system_prompt_contains_knowledgevault_and_cite_sources(self):
         engine = RAGEngine()
@@ -596,6 +599,7 @@ class TestVariantFailureHandling:
             mock_settings.query_transformation_enabled = True
             mock_settings.hyde_enabled = False
             mock_settings.stepback_enabled = False
+            mock_settings.agentic_rag_enabled = False
             mock_settings.context_distillation_enabled = False
             mock_settings.context_max_tokens = 6000
 
@@ -674,6 +678,7 @@ class TestVariantFailureHandling:
             mock_settings.vector_top_k = None
             mock_settings.maintenance_mode = False
             mock_settings.retrieval_recency_weight = 0.0
+            mock_settings.agentic_rag_enabled = False
 
             # Patch the QueryTransformer to return specific variants without LLM
             async def mock_transform(query):
