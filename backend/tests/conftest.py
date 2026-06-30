@@ -219,11 +219,27 @@ def _cache_bcrypt_hash_for_test_passwords():
     # Monkey-patch pwd_context.hash (the underlying method that hash_password calls)
     _auth_module.pwd_context.hash = _fast_pwd_hash
 
+    # Also patch pwd_context.verify to avoid Argon2id verification overhead.
+    # The Argon2id migration (Phase 1) made verify ~0.5-1s per call; the existing
+    # ~3918 tests have hundreds of verify calls that collectively add 20-30+ minutes.
+    # For the common-password hash (the overwhelmingly common case), return a fast
+    # string comparison result. For any other hash, delegate to the real verify.
+    original_pwd_verify = _auth_module.pwd_context.verify
+
+    def _fast_pwd_verify(secret, hash_value, *args, **kwargs):
+        cached_hash = _bcrypt_hash_cache.get(common_password)
+        if cached_hash is not None and hash_value == cached_hash:
+            return bool(isinstance(secret, str) and secret == common_password)
+        return original_pwd_verify(secret, hash_value, *args, **kwargs)
+
+    _auth_module.pwd_context.verify = _fast_pwd_verify
+
     yield
 
-    # Restore the original on session teardown (best-effort)
+    # Restore the originals on session teardown (best-effort)
     try:
         _auth_module.pwd_context.hash = original_pwd_hash
+        _auth_module.pwd_context.verify = original_pwd_verify
     except Exception:
         pass
 
