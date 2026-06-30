@@ -12,9 +12,9 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20.19.0"
           cache: npm
@@ -64,7 +64,7 @@ jobs:
     name: Quality contracts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -79,18 +79,14 @@ jobs:
         run: python scripts/check_pr_scope_drift.py
 
   backend:
-    name: Backend (shard ${{ matrix.shard }}/4)
+    name: Backend
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
     defaults:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -104,12 +100,12 @@ jobs:
         run: |
           pip install -r requirements-ci.txt
           pip install -r requirements-dev.txt
-          pip install pytest-split pytest-xdist
+          pip install pytest-xdist
 
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Test
-        run: pytest --tb=short -v --timeout=300 -n auto tests/ --shard-id=${{ matrix.shard }} --num-shards=4
+        run: pytest --tb=short -v --timeout=300 -n auto tests/
         env:
           REDIS_URL: ""

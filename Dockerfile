@@ -1,5 +1,5 @@
 # Stage 1: Build Frontend
-FROM node:20-alpine AS frontend-builder
+FROM node:26-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -37,7 +37,7 @@ try {
 RUN npm run build
 
 # Stage 2: Backend with Unstructured dependencies
-FROM python:3.11-slim AS backend
+FROM python:3.14-slim AS backend
 
 # Install system dependencies for Unstructured
 # Note: libmagic1 needed for python-magic on Linux
