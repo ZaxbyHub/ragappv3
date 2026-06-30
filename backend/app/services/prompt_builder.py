@@ -78,6 +78,17 @@ def calculate_primary_count(total_chunks: int) -> int:
     return min(max(total_chunks - 2, 3), min(total_chunks, 5))
 
 
+def _header_escape(value: str) -> str:
+    """Escape a header field for safe interpolation outside XML wrappers.
+
+    In addition to HTML/XML escaping, normalize control characters and
+    whitespace that could break the header line or enable injection:
+    - ``\\r\\n``, ``\\n``, ``\\r`` → space (prevent line-break injection)
+    """
+    value = value.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    return _xml_escape(value)
+
+
 def format_wiki_evidence(evidence: "WikiEvidence", index: int) -> str:
     """Format a WikiEvidence item for injection into the prompt."""
     label = f"[W{index}]"
@@ -87,9 +98,15 @@ def format_wiki_evidence(evidence: "WikiEvidence", index: int) -> str:
     status = evidence.claim_status or evidence.page_status or ""
     prov = evidence.provenance_summary or ""
 
-    header = f"{label} {title} ({page_type}) | confidence: {conf} | status: {status}"
+    # SECURITY: header fields are untrusted (curator-derived or wiki-authored).
+    # Escape them so payloads like `</wiki_evidence>\n[SYSTEM] …` cannot break
+    # out of the XML wrapper or smuggle control tokens past the SECURITY BOUNDARY.
+    header = (
+        f"{label} {_header_escape(title)} ({_header_escape(page_type)}) "
+        f"| confidence: {conf} | status: {_header_escape(status)}"
+    )
     if prov:
-        header += f" | sources: {prov}"
+        header += f" | sources: {_header_escape(prov)}"
 
     body = evidence.claim_text or evidence.excerpt or ""
     return f"{header}\n<wiki_evidence>{_xml_escape(body)}</wiki_evidence>"
@@ -101,7 +118,13 @@ def format_kms_evidence(evidence: "KMSEvidence", index: int) -> str:
     title = evidence.title or ""
     status = evidence.status or ""
     source_type = evidence.source_type or ""
-    header = f"{label} {title} | status: {status} | type: {source_type}"
+    # SECURITY: header fields are untrusted. Escape them so a malicious title
+    # or status cannot break out of the <kms_evidence> wrapper.
+    header = (
+        f"{label} {_header_escape(title)} "
+        f"| status: {_header_escape(status)} "
+        f"| type: {_header_escape(source_type)}"
+    )
     body = evidence.excerpt or evidence.summary or ""
     return f"{header}\n<kms_evidence>{_xml_escape(body)}</kms_evidence>"
 
@@ -294,15 +317,21 @@ class PromptBuilderService:
         section = chunk.metadata.get("section_title") or chunk.metadata.get("heading") or ""
         label = f"[S{source_index}]"
 
-        header_parts = [f"{label} {filename}"]
+        # SECURITY: filename/section/ctx_note are untrusted (document- or
+        # LLM-derived; see chunking.py and contextual_chunking.py). They are
+        # emitted *outside* the <document> wrapper, so any tag/control-token
+        # payload would bypass the SECURITY BOUNDARY. Escape each header
+        # component before interpolation so `</document>\n[SYSTEM] …` becomes
+        # literal text rather than executable markup.
+        header_parts = [f"{label} {_header_escape(filename)}"]
         if section and section != filename:
-            header_parts.append(f"Section: {section}")
+            header_parts.append(f"Section: {_header_escape(section)}")
         header_parts.append(f"score: {chunk.score:.2f}")
         if chunk.file_id:
             header_parts.append(f"id: {chunk.file_id}")
         ctx_note = chunk.metadata.get("contextual_context", "")
         if ctx_note:
-            header_parts.append(f"context: {ctx_note[:200]}")
+            header_parts.append(f"context: {_header_escape(ctx_note[:200])}")
 
         header = " | ".join(header_parts)
 
