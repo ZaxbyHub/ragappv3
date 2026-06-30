@@ -41,11 +41,12 @@ class TestPasswordHashing:
 
     def test_hash_password_different_each_time(self):
         """Verify hashing same password twice produces different hashes."""
-        from app.services.auth_service import hash_password
+        from app.services.auth_service import pwd_context
 
         password = "samePassword"
-        hash1 = hash_password(password)
-        hash2 = hash_password(password)
+        # Bypass the conftest fast-hash cache by calling the original CryptContext directly
+        hash1 = pwd_context.using(schemes=["argon2"]).hash(password)
+        hash2 = pwd_context.using(schemes=["argon2"]).hash(password)
 
         # Hashes should be different (salt + argon2id iteration)
         assert hash1 != hash2
