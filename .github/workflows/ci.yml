@@ -76,9 +76,13 @@ jobs:
         run: python scripts/check_pr_scope_drift.py
 
   backend:
-    name: Backend
+    name: Backend (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     defaults:
       run:
         working-directory: backend
@@ -97,13 +101,12 @@ jobs:
         run: |
           pip install -r requirements-ci.txt
           pip install -r requirements-dev.txt
+          pip install pytest-split pytest-xdist
 
       - name: Lint (ruff)
         run: ruff check .
 
       - name: Test
-        run: pytest --tb=short -v --timeout=300 tests/
-
-      - name: Coverage report (informational)
-        run: pytest --cov=app --cov-report=term-missing -q --timeout=300 tests/
-        continue-on-error: true
+        run: pytest --tb=short -v --timeout=300 -n auto tests/ --shard-id=${{ matrix.shard }} --num-shards=4
+        env:
+          REDIS_URL: ""
