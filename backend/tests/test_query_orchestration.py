@@ -882,8 +882,7 @@ async def test_multi_sub_query_trace_fusion_used_true(patched_settings_fixture):
 
     assert done_msg is not None, "Expected 'done' message from query()"
 
-    trace = done_msg.get("trace", {})
-    fusion_used = trace.get("fusion_used")
+    fusion_used = done_msg.get("fusion_used")
     assert fusion_used is True, (
         f"Expected fusion_used=True for multi-sub-query plan, got {fusion_used}"
     )

@@ -618,7 +618,7 @@ class TestAccessTokenDenylist:
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
             # No jti — conditional enforcement skips denylist check
-            "fpt": _TEST_FPT_EMPTY,
+            # No fpt — conditional enforcement skips fingerprint check
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 

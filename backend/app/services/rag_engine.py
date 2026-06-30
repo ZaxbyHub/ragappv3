@@ -1456,6 +1456,7 @@ class RAGEngine:
         # so chat.py's SSE done payload carries them to the frontend.
         done_msg["citation_confidence"] = trace.citation_confidence
         done_msg["unverifiable_claims"] = list(trace.unverifiable_claims)
+        done_msg["fusion_used"] = trace.fusion_used
 
         logger.info(
             "[query] Yielding 'done': sources_count=%d, memories_used=%d",

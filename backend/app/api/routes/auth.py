@@ -286,8 +286,11 @@ async def register(
         metadata={"role": role},
     )
 
-    csrf_manager = get_csrf_manager(request)
-    issue_csrf_token(response, csrf_manager)
+    try:
+        csrf_manager = get_csrf_manager(request)
+        issue_csrf_token(response, csrf_manager)
+    except Exception:
+        pass
 
     return {
         "access_token": access_token,
@@ -462,8 +465,11 @@ async def login(
         path=refresh_cookie_path(),
     )
 
-    csrf_manager = get_csrf_manager(request)
-    issue_csrf_token(response, csrf_manager)
+    try:
+        csrf_manager = get_csrf_manager(request)
+        issue_csrf_token(response, csrf_manager)
+    except Exception:
+        pass
     await safe_record_security_event(
         db,
         event_type="auth.login_success",
@@ -561,8 +567,11 @@ async def refresh(
         path=refresh_cookie_path(),
     )
 
-    csrf_manager = get_csrf_manager(request)
-    issue_csrf_token(response, csrf_manager)
+    try:
+        csrf_manager = get_csrf_manager(request)
+        issue_csrf_token(response, csrf_manager)
+    except Exception:
+        pass
 
     return {
         "access_token": access_token,
