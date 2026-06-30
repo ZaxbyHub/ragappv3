@@ -124,7 +124,7 @@ class TestBackgroundEnrichmentQueue(unittest.TestCase):
                     vault_id=vault_id,
                 )
 
-            def should_enqueue_enrichment(self, chunks, vault_id=None, file_id=None):
+            def should_enqueue_enrichment(self, chunks):
                 return True
 
             def set_enrichment_status(self, file_id, status, error_message=None):
@@ -169,7 +169,7 @@ class TestBackgroundEnrichmentQueue(unittest.TestCase):
                         vault_id=vault_id,
                     )
 
-                def should_enqueue_enrichment(self, chunks, vault_id=None, file_id=None):
+                def should_enqueue_enrichment(self, chunks):
                     return True
 
                 def set_enrichment_status(self, file_id, status, error_message=None):
