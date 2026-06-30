@@ -15,7 +15,9 @@ from app.config import settings
 @pytest.mark.asyncio
 async def test_upload_rejects_content_length_above_100_mb(tmp_path):
     original_data_dir = settings.data_dir
+    original_max_file_size_mb = settings.max_file_size_mb
     settings.data_dir = tmp_path
+    settings.max_file_size_mb = 100
     request = SimpleNamespace(
         headers={"content-length": str((settings.max_file_size_mb * 1024 * 1024) + 1)}
     )
@@ -26,6 +28,7 @@ async def test_upload_rejects_content_length_above_100_mb(tmp_path):
             await _do_upload(request, file, settings, None, None, None, None, 1)
     finally:
         settings.data_dir = original_data_dir
+        settings.max_file_size_mb = original_max_file_size_mb
 
     assert exc_info.value.status_code == 413
     assert exc_info.value.detail == "File too large. Max size: 100 MB"

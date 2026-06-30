@@ -39,3 +39,25 @@ describe("API path configuration", () => {
     expect(loginRedirectPath()).toBe("/meridian/login");
   });
 });
+
+describe("transient retry policy", () => {
+  it("retries idempotent requests on network and gateway failures only", async () => {
+    const { isTransientRetryableRequest } = await import("./api");
+
+    expect(isTransientRetryableRequest("get", undefined, false)).toBe(true);
+    expect(isTransientRetryableRequest("GET", 503, true)).toBe(true);
+    expect(isTransientRetryableRequest("head", 504, true)).toBe(true);
+    expect(isTransientRetryableRequest("post", 503, true)).toBe(false);
+    expect(isTransientRetryableRequest("delete", undefined, false)).toBe(false);
+    expect(isTransientRetryableRequest("get", 500, true)).toBe(false);
+    expect(isTransientRetryableRequest("get", 401, true)).toBe(false);
+  });
+
+  it("caps retry backoff at the last configured delay", async () => {
+    const { transientRetryDelayMs } = await import("./api");
+
+    expect(transientRetryDelayMs(0)).toBe(300);
+    expect(transientRetryDelayMs(1)).toBe(900);
+    expect(transientRetryDelayMs(99)).toBe(900);
+  });
+});

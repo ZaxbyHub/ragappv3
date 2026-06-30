@@ -45,6 +45,10 @@ vi.mock('@/lib/api', () => ({
   changePassword: mockChangePassword,
   listOrganizations: vi.fn().mockResolvedValue([]),
   listVaults: mockListVaults,
+  listSessions: vi.fn().mockResolvedValue({ sessions: [] }),
+  revokeSession: vi.fn().mockResolvedValue(undefined),
+  revokeAllSessions: vi.fn().mockResolvedValue({ access_token: 'token', token_type: 'bearer', expires_in: 900 }),
+  setJwtAccessToken: vi.fn(),
 }));
 
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }));

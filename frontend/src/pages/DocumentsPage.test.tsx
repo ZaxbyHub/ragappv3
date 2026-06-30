@@ -164,10 +164,19 @@ vi.mock('@/components/shared/DocumentCard', () => ({
 }));
 
 vi.mock('@/components/shared/EmptyState', () => ({
-  EmptyState: ({ title, description }: { title: string; description?: string }) => (
+  EmptyState: ({
+    title,
+    description,
+    action,
+  }: {
+    title: string;
+    description?: string;
+    action?: { label: string; onClick: () => void };
+  }) => (
     <div data-testid="empty-state">
       <h2>{title}</h2>
       {description && <p>{description}</p>}
+      {action && <button onClick={action.onClick}>{action.label}</button>}
     </div>
   ),
 }));
@@ -559,6 +568,37 @@ describe('DocumentsPage - Drag to Resize Filename Column', () => {
       expect(
         screen.getByText('Create a vault or ask an admin to grant you access to start uploading documents.')
       ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Open Vaults' })).toBeInTheDocument();
+    });
+
+    it('shows read-only guidance and vault navigation for an empty read-only vault', async () => {
+      vi.mocked(useVaultStore).mockReturnValue({
+        activeVaultId: 3,
+        vaults: [{ id: 3, name: 'Read Vault', current_user_permission: 'read' }],
+      } as ReturnType<typeof useVaultStore>);
+      vi.mocked(listDocuments).mockResolvedValueOnce({ documents: [], total: 0 });
+      vi.mocked(getDocumentStats).mockResolvedValueOnce({
+        total_documents: 0,
+        total_chunks: 0,
+        total_size_bytes: 0,
+        documents_by_status: {},
+      });
+
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText('No documents yet')).toBeInTheDocument();
+      });
+      expect(
+        screen.getByText(
+          'You have read-only access to this vault. Create a vault you administer or ask an admin for write access to upload documents.'
+        )
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Open Vaults' })).toBeInTheDocument();
     });
 
     it('does not show the no-documents state for active search while stats are unavailable', async () => {

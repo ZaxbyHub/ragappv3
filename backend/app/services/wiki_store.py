@@ -990,30 +990,40 @@ class WikiStore:
     def claim_next_pending_job(self) -> Optional[WikiCompileJob]:
         """Atomically claim the oldest pending job. Returns the claimed job or None.
 
-        Uses BEGIN IMMEDIATE so concurrent callers cannot claim the same row.
+        Uses a single ``UPDATE ... RETURNING`` statement so the claim is atomic
+        without a backend-specific transaction mode such as SQLite's
+        ``BEGIN IMMEDIATE``. The query is portable across SQLite (>= 3.35) and
+        PostgreSQL: the inner ``SELECT`` pins the oldest pending row and the
+        outer ``UPDATE`` flips it to ``running`` in one atomic step, so two
+        concurrent callers can never claim the same job.
         """
         now = datetime.utcnow().isoformat()
         try:
-            self._db.execute("BEGIN IMMEDIATE")
             row = self._db.execute(
-                "SELECT * FROM wiki_compile_jobs WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+                """
+                UPDATE wiki_compile_jobs
+                SET status = 'running', started_at = ?
+                WHERE id = (
+                    SELECT id FROM wiki_compile_jobs
+                    WHERE status = 'pending'
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                )
+                RETURNING *
+                """,
+                (now,),
             ).fetchone()
-            if not row:
-                self._db.rollback()
-                return None
-            job_id = dict(row)["id"]
-            self._db.execute(
-                "UPDATE wiki_compile_jobs SET status = 'running', started_at = ? WHERE id = ?",
-                (now, job_id),
-            )
-            self._db.commit()
+            if row:
+                self._db.commit()
+                return _to_compile_job(row)
+            # No pending job matched. Python's sqlite3 opens an implicit transaction
+            # for any DML (even a 0-row UPDATE), so roll it back to leave the
+            # connection clean rather than holding an open read/write transaction.
+            self._db.rollback()
+            return None
         except Exception:
             self._db.rollback()
             raise
-        row = self._db.execute(
-            "SELECT * FROM wiki_compile_jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        return _to_compile_job(row) if row else None
 
     def complete_job(self, job_id: int, result_json: Any) -> None:
         """Mark job completed. No-op if the job was already cancelled."""
@@ -1164,7 +1174,12 @@ class WikiStore:
                 )
                 weak_count += 1
 
-        self._db.commit()
+        # NOTE: do NOT commit here. The caller controls the transaction
+        # boundary so that the stale marking can be made atomic with the
+        # subsequent DELETE of the source row (file/memory). If this method
+        # committed independently and the caller's DELETE later failed and
+        # rolled back, the claim would be marked stale while the source row
+        # still exists, leaving orphan lint findings (DD-C009 / #108).
         return {"stale": stale_count, "weak_provenance": weak_count}
 
     def mark_claims_stale_by_memory(self, memory_id: int, vault_id: int) -> dict:
@@ -1229,7 +1244,10 @@ class WikiStore:
                 )
                 weak_count += 1
 
-        self._db.commit()
+        # NOTE: do NOT commit here. See mark_claims_stale_by_file for the
+        # rationale (DD-C009 / #108). The caller controls the transaction
+        # boundary so the stale marking is atomic with the subsequent
+        # DELETE of the source memory.
         return {"stale": stale_count, "weak_provenance": weak_count}
 
     def update_lint_finding(self, finding_id: int, vault_id: int, status: str) -> Optional[WikiLintFinding]:

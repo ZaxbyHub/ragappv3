@@ -14,6 +14,15 @@ import pytest
 from backend.app.config import Settings
 
 
+def settings_without_env(**overrides):
+    return Settings(
+        _env_file=None,
+        admin_secret_token="test-admin-token",
+        jwt_secret_key="test-jwt-secret-key",
+        **overrides,
+    )
+
+
 class TestHealthCheckApiKeyDefault:
     """Tests for health_check_api_key default value."""
 
@@ -23,17 +32,17 @@ class TestHealthCheckApiKeyDefault:
         Previously defaulted to "health-api-key" which was a security bypass risk.
         Must be set via HEALTH_CHECK_API_KEY env var for any whitelist behavior.
         """
-        settings = Settings()
+        settings = settings_without_env()
         assert settings.health_check_api_key == ""
 
     def test_health_check_api_key_empty_string_type(self):
         """health_check_api_key should be a string type."""
-        settings = Settings()
+        settings = settings_without_env()
         assert isinstance(settings.health_check_api_key, str)
 
     def test_health_check_api_key_empty_string_is_falsy(self):
         """Empty string health_check_api_key is falsy (important for limiter logic)."""
-        settings = Settings()
+        settings = settings_without_env()
         assert not settings.health_check_api_key  # empty string is falsy
 
 
@@ -44,28 +53,28 @@ class TestHealthCheckApiKeyEnvOverride:
         """Custom HEALTH_CHECK_API_KEY env var value should be propagated correctly."""
         env_key = "test-secret-api-key-12345"
         with patch.dict(os.environ, {"HEALTH_CHECK_API_KEY": env_key}):
-            settings = Settings()
+            settings = settings_without_env()
             assert settings.health_check_api_key == env_key
 
     def test_health_check_api_key_env_override_with_special_chars(self):
         """Env var with special characters should be preserved."""
         env_key = "key-with-special-chars-!@#$%^&*()"
         with patch.dict(os.environ, {"HEALTH_CHECK_API_KEY": env_key}):
-            settings = Settings()
+            settings = settings_without_env()
             assert settings.health_check_api_key == env_key
 
     def test_health_check_api_key_env_override_unicode(self):
         """Env var with unicode characters should be preserved."""
         env_key = "key-中文-日本語-한국어"
         with patch.dict(os.environ, {"HEALTH_CHECK_API_KEY": env_key}):
-            settings = Settings()
+            settings = settings_without_env()
             assert settings.health_check_api_key == env_key
 
     def test_health_check_api_key_env_override_very_long(self):
         """Very long env var values should be preserved."""
         env_key = "x" * 1000
         with patch.dict(os.environ, {"HEALTH_CHECK_API_KEY": env_key}):
-            settings = Settings()
+            settings = settings_without_env()
             assert settings.health_check_api_key == env_key
 
 
@@ -86,7 +95,7 @@ class TestHealthCheckApiKeyLimiterBehavior:
         - Since key must be non-empty, empty health_check_api_key effectively disables bypass
         """
         import hmac
-        settings = Settings()  # health_check_api_key == ""
+        settings = settings_without_env()  # health_check_api_key == ""
         provided_key = "any-random-key"
 
         # Key must be truthy (non-empty)
@@ -101,7 +110,7 @@ class TestHealthCheckApiKeyLimiterBehavior:
         A provided API key should NEVER match an empty string configuration.
         """
         import hmac
-        settings = Settings()
+        settings = settings_without_env()
 
         # Various non-empty keys should not match empty string
         for key in ["", " ", "a", "health-api-key", "secret", "x" * 100]:
@@ -124,7 +133,7 @@ class TestHealthCheckApiKeyLimiterBehavior:
         """
         import hmac
 
-        settings = Settings()  # health_check_api_key == ""
+        settings = settings_without_env()  # health_check_api_key == ""
 
         # Simulate header key provided
         header_key = "some-api-key-from-header"
@@ -151,7 +160,7 @@ class TestHealthCheckApiKeyLimiterBehavior:
 
         configured_key = "my-secret-health-check-key"
         with patch.dict(os.environ, {"HEALTH_CHECK_API_KEY": configured_key}):
-            settings = Settings()
+            settings = settings_without_env()
             assert settings.health_check_api_key == configured_key
 
             # Correct key should be whitelisted

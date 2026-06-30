@@ -90,6 +90,8 @@ class ChatResponse(BaseModel):
     memories_used: List[UsedMemory] = Field(default_factory=list)
     wiki_used: List[Dict[str, Any]] = Field(default_factory=list)
     kms_used: List[Dict[str, Any]] = Field(default_factory=list)
+    answer_contract: Optional[Dict[str, Any]] = None
+    llm_metrics: Optional[Dict[str, Any]] = None
     # "distance" | "rerank" | "rrf" — tells the client how to interpret `score`
     # values in each source (polarity + thresholds). Default "distance" keeps
     # older clients on the safe path if the engine omits it.
@@ -255,6 +257,8 @@ def stream_chat_response(
         memories_used = []
         wiki_used: List[Dict[str, Any]] = []
         kms_used: List[Dict[str, Any]] = []
+        answer_contract = None
+        llm_metrics = None
         # Default to "distance" so the frontend always has a well-defined
         # score polarity to interpret `score` values against, even if the
         # engine never emits a done event (e.g. early error).
@@ -322,6 +326,8 @@ def stream_chat_response(
                     # SC-009: extract citation confidence + unverifiable claims
                     citation_confidence = chunk.get("citation_confidence")
                     unverifiable_claims = chunk.get("unverifiable_claims")
+                    answer_contract = chunk.get("answer_contract")
+                    llm_metrics = chunk.get("llm_metrics")
         except RAGEngineError as exc:
             logger.warning(
                 "RAG engine error in stream_chat_response: %s", exc
@@ -394,6 +400,10 @@ def stream_chat_response(
             "kms_used": kms_used,
             "score_type": score_type,
         }
+        if answer_contract is not None:
+            done_payload["answer_contract"] = answer_contract
+        if llm_metrics is not None:
+            done_payload["llm_metrics"] = llm_metrics
         if citation_validation is not None:
             done_payload["citation_validation"] = citation_validation
         if repaired_content is not None:
@@ -468,6 +478,8 @@ async def non_stream_chat_response(
     ab_experiment_id: Optional[int] = None
     ab_variant: Optional[str] = None
     prompt_version: Optional[str] = None
+    answer_contract = None
+    llm_metrics = None
 
     try:
         async for chunk in rag_engine.query(
@@ -493,6 +505,8 @@ async def non_stream_chat_response(
                 ab_experiment_id = chunk.get("ab_experiment_id")
                 ab_variant = chunk.get("ab_variant")
                 prompt_version = chunk.get("prompt_version")
+                answer_contract = chunk.get("answer_contract")
+                llm_metrics = chunk.get("llm_metrics")
     except RAGEngineError as exc:
         logger.warning("RAG engine error in non_stream_chat_response: %s", exc)
         raise HTTPException(status_code=503, detail="Chat processing failed")
@@ -558,6 +572,8 @@ async def non_stream_chat_response(
         prompt_version=prompt_version,
         ab_experiment_id=ab_experiment_id,
         ab_variant=ab_variant,
+        answer_contract=answer_contract,
+        llm_metrics=llm_metrics,
     )
 
 
