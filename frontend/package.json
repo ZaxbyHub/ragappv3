@@ -51,7 +51,7 @@
     "remark-math": "^6.0.0",
     "shiki": "^4.0.2",
     "sonner": "^1.4.0",
-    "tailwind-merge": "^2.2.0",
+    "tailwind-merge": "^3.6.0",
     "zustand": "^4.5.0"
   },
   "devDependencies": {
