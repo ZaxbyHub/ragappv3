@@ -3,9 +3,25 @@ import { render, screen, waitFor, act, fireEvent } from '@testing-library/react'
 import '@testing-library/jest-dom';
 import ProfilePage from '@/pages/ProfilePage';
 
+const {
+  mockListOrganizations,
+  mockListVaults,
+  mockListSessions,
+  mockRevokeSession,
+  mockRevokeAllSessions,
+  mockSetJwtAccessToken,
+} = vi.hoisted(() => ({
+  mockListOrganizations: vi.fn(),
+  mockListVaults: vi.fn(),
+  mockListSessions: vi.fn(),
+  mockRevokeSession: vi.fn(),
+  mockRevokeAllSessions: vi.fn(),
+  mockSetJwtAccessToken: vi.fn(),
+}));
+
 // Mock useAuthStore
 vi.mock('@/stores/useAuthStore', () => ({
-  useAuthStore: vi.fn((selector) => {
+  useAuthStore: Object.assign(vi.fn((selector) => {
     const mockState = {
       user: {
         id: 1,
@@ -21,7 +37,17 @@ vi.mock('@/stores/useAuthStore', () => ({
       return selector(mockState);
     }
     return mockState;
-  }),
+  }), { setState: vi.fn() }),
+}));
+
+vi.mock('@/lib/api', () => ({
+  changePassword: vi.fn().mockResolvedValue(undefined),
+  listOrganizations: mockListOrganizations,
+  listVaults: mockListVaults,
+  listSessions: mockListSessions,
+  revokeSession: mockRevokeSession,
+  revokeAllSessions: mockRevokeAllSessions,
+  setJwtAccessToken: mockSetJwtAccessToken,
 }));
 
 // Mock sonner toast
@@ -64,6 +90,36 @@ vi.mock('@/components/auth/ProtectedRoute', () => ({
 describe('ProfilePage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockListOrganizations.mockResolvedValue([]);
+    mockListVaults.mockResolvedValue({ vaults: [] });
+    mockListSessions.mockResolvedValue({
+      sessions: [
+        {
+          id: '1',
+          user_id: 1,
+          user_agent: 'Current Browser',
+          ip_address: '127.0.0.1',
+          created_at: '2026-06-27T12:00:00Z',
+          expires_at: '2026-07-27T12:00:00Z',
+          is_current: true,
+        },
+        {
+          id: '2',
+          user_id: 1,
+          user_agent: 'Old Browser',
+          ip_address: '192.0.2.10',
+          created_at: '2026-06-20T12:00:00Z',
+          expires_at: '2026-07-20T12:00:00Z',
+          is_current: false,
+        },
+      ],
+    });
+    mockRevokeSession.mockResolvedValue(undefined);
+    mockRevokeAllSessions.mockResolvedValue({
+      access_token: 'rotated-token',
+      token_type: 'bearer',
+      expires_in: 900,
+    });
   });
 
   afterEach(() => {
@@ -102,6 +158,37 @@ describe('ProfilePage', () => {
 
     expect(screen.getByRole('heading', { name: /change password/i })).toBeInTheDocument();
     expect(screen.getByText('Update your account password')).toBeInTheDocument();
+  });
+
+  it('renders active sessions and protects the current session from direct revoke', async () => {
+    await act(async () => {
+      render(<ProfilePage />);
+    });
+
+    await waitFor(() => expect(screen.getByText('Active Sessions')).toBeInTheDocument());
+    expect(screen.getByText('Current Browser')).toBeInTheDocument();
+    expect(screen.getByText('Old Browser')).toBeInTheDocument();
+    expect(screen.getByText('Current')).toBeInTheDocument();
+
+    const revokeButtons = screen.getAllByRole('button', { name: /revoke/i });
+    expect(revokeButtons[0]).toBeDisabled();
+    expect(revokeButtons[1]).not.toBeDisabled();
+  });
+
+  it('revokes another session and refreshes the session list', async () => {
+    await act(async () => {
+      render(<ProfilePage />);
+    });
+
+    await waitFor(() => expect(screen.getByText('Old Browser')).toBeInTheDocument());
+    const revokeButtons = screen.getAllByRole('button', { name: /revoke/i });
+
+    await act(async () => {
+      fireEvent.click(revokeButtons[1]);
+    });
+
+    expect(mockRevokeSession).toHaveBeenCalledWith(2);
+    expect(mockListSessions).toHaveBeenCalledTimes(2);
   });
 
   it('renders username field (disabled)', async () => {

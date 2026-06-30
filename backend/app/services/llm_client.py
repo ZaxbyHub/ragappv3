@@ -5,7 +5,8 @@ OpenAI-compatible LLM chat client using httpx.
 import json
 import logging
 import re
-from typing import AsyncGenerator, Dict, List, Optional
+import time
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
 
@@ -67,6 +68,15 @@ class LLMClient:
         assert_url_safe(base_url or settings.ollama_chat_url)
         self._circuit_breaker = create_llm_circuit_breaker(name=cb_name)
         self._client: Optional[httpx.AsyncClient] = None
+        self.last_metrics: Dict[str, Any] = {}
+
+    def _approx_tokens(self, text: str) -> int:
+        return max(1, len(text) // 4) if text else 0
+
+    def _prompt_token_estimate(self, messages: List[Dict[str, str]]) -> int:
+        return sum(
+            self._approx_tokens(str(message.get("content", ""))) for message in messages
+        )
 
     def reconfigure(
         self,
@@ -173,6 +183,7 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = 32768,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Send a chat completion request and return the full response.
@@ -199,7 +210,11 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
 
+        started_at = time.perf_counter()
+        prompt_tokens = self._prompt_token_estimate(messages)
         try:
             response = await self._circuit_breaker(client.post)(url, json=payload)
             response.raise_for_status()
@@ -214,20 +229,39 @@ class LLMClient:
             # Log connection pool metrics
             self._log_pool_stats()
 
-            return self._strip_thinking_content(content)
+            content = self._strip_thinking_content(content)
+            self.last_metrics = {
+                "provider_url": self.base_url,
+                "model": self.model,
+                "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                "prompt_tokens_estimate": prompt_tokens,
+                "completion_tokens_estimate": self._approx_tokens(content),
+                "status": "ok",
+            }
+            return content
         except CircuitBreakerError as e:
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "circuit_open"}
             raise LLMError(
                 f"LLM service is currently unavailable (circuit breaker open): {e}"
             ) from e
         except httpx.TimeoutException as e:
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "timeout"}
             raise LLMError(f"Request timed out after {self.timeout}s") from e
         except httpx.HTTPStatusError as e:
+            self.last_metrics = {
+                "provider_url": self.base_url,
+                "model": self.model,
+                "status": "http_error",
+                "status_code": e.response.status_code,
+            }
             raise LLMError(
                 f"HTTP error {e.response.status_code}: {e.response.text}"
             ) from e
         except httpx.RequestError as e:
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "request_error"}
             raise LLMError(f"Request failed: {str(e)}") from e
         except json.JSONDecodeError as e:
+            self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "invalid_json"}
             raise LLMError(f"Failed to parse response JSON: {str(e)}") from e
 
     async def chat_completion_stream(
@@ -261,6 +295,9 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        started_at = time.perf_counter()
+        prompt_tokens = self._prompt_token_estimate(messages)
+        completion_chars = 0
 
         # Check circuit breaker state before attempting stream connection.
         # Use the lock to avoid race conditions with concurrent requests.
@@ -385,6 +422,7 @@ class LLMClient:
                                     )
                                     pre_think = _buffer[: think_open_match.start()]
                                     if pre_think:
+                                        completion_chars += len(pre_think)
                                         yield pre_think
                                         _content_emitted = True
                                     _thinking_active = True
@@ -445,6 +483,7 @@ class LLMClient:
                                             _THINKING_PROCESS_MARKER
                                         )
                                         if pre_marker:
+                                            completion_chars += len(pre_marker)
                                             yield pre_marker
                                             _content_emitted = True
                                         _thinking_active = True
@@ -457,6 +496,7 @@ class LLMClient:
                                 elif _buffer:
                                     # No opening pattern and no partial-open
                                     # prefix — safe to yield.
+                                    completion_chars += len(_buffer)
                                     yield _buffer
                                     _in_prefix_region = False
                                     _buffer = ""
@@ -499,6 +539,7 @@ class LLMClient:
                                     )
                                 )
                             ):
+                                completion_chars += len(_buffer)
                                 yield _buffer
                                 _in_prefix_region = False
                                 _buffer = ""
@@ -537,6 +578,15 @@ class LLMClient:
             if stream_succeeded:
                 async with self._circuit_breaker._lock:
                     self._circuit_breaker.record_success()
+                self.last_metrics = {
+                    "provider_url": self.base_url,
+                    "model": self.model,
+                    "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    "prompt_tokens_estimate": prompt_tokens,
+                    "completion_tokens_estimate": max(1, completion_chars // 4) if completion_chars else 0,
+                    "status": "ok",
+                    "stream": True,
+                }
 
         # Log connection pool metrics after streaming completes
         self._log_pool_stats()

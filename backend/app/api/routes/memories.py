@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from typing import List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -83,11 +84,30 @@ class MemoryCreateRequest(BaseModel):
     vault_id: Optional[int] = Field(
         None, description="Optional vault ID to scope this memory"
     )
+    importance: float = Field(
+        0.5, ge=0.0, le=1.0, description="Retention importance from 0 to 1"
+    )
+    expires_at: Optional[str] = Field(
+        None, description="Optional ISO timestamp after which the memory expires"
+    )
 
     @field_validator("tags", mode="before")
     @classmethod
     def validate_tags(cls, v):
         return _normalize_tags_input(v)
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, v):
+        if not v:
+            return None
+        try:
+            parsed = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("expires_at must be an ISO timestamp") from exc
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed.isoformat()
 
 
 class MemoryUpdateRequest(BaseModel):
@@ -103,11 +123,30 @@ class MemoryUpdateRequest(BaseModel):
     source: Optional[str] = Field(
         None, max_length=500, description="Optional source reference"
     )
+    importance: Optional[float] = Field(
+        None, ge=0.0, le=1.0, description="Retention importance from 0 to 1"
+    )
+    expires_at: Optional[str] = Field(
+        None, description="Optional ISO timestamp after which the memory expires"
+    )
 
     @field_validator("tags", mode="before")
     @classmethod
     def validate_tags(cls, v):
         return _normalize_tags_input(v)
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, v):
+        if not v:
+            return None
+        try:
+            parsed = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("expires_at must be an ISO timestamp") from exc
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed.isoformat()
 
 
 class MemoryMetadata(BaseModel):
@@ -125,6 +164,8 @@ class MemoryResponse(BaseModel):
     content: str
     metadata: Optional[MemoryMetadata] = None
     score: Optional[float] = None
+    importance: float = 0.5
+    expires_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -187,6 +228,8 @@ def _memory_record_to_response(
         content=record.content,
         metadata=metadata,
         score=score,
+        importance=record.importance,
+        expires_at=record.expires_at,
         created_at=record.created_at,
         updated_at=record.updated_at,
     )
@@ -233,9 +276,10 @@ async def list_memories(
         cursor = await asyncio.to_thread(
             conn.execute,
             """
-            SELECT id, content, category, tags, source, created_at, updated_at
+            SELECT id, content, category, tags, source, importance, expires_at, created_at, updated_at
             FROM memories
-            WHERE vault_id = ? OR vault_id IS NULL
+            WHERE (vault_id = ? OR vault_id IS NULL)
+              AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
             ORDER BY created_at DESC
             """,
             (vault_id,),
@@ -251,8 +295,9 @@ async def list_memories(
         cursor = await asyncio.to_thread(
             conn.execute,
             """
-            SELECT id, content, category, tags, source, created_at, updated_at
+            SELECT id, content, category, tags, source, importance, expires_at, created_at, updated_at
             FROM memories
+            WHERE expires_at IS NULL OR datetime(expires_at) > datetime('now')
             ORDER BY created_at DESC
             """,
         )
@@ -274,8 +319,10 @@ async def list_memories(
                 id=str(row[0]),
                 content=row[1],
                 metadata=metadata,
-                created_at=row[5],
-                updated_at=row[6],
+                importance=float(row[5] or 0.5),
+                expires_at=row[6],
+                created_at=row[7],
+                updated_at=row[8],
             )
         )
 
@@ -308,6 +355,8 @@ async def create_memory(
             tags=body.tags,
             source=body.source,
             vault_id=body.vault_id,
+            importance=body.importance,
+            expires_at=body.expires_at,
         )
     except MemoryStoreError as e:
         logger.exception(
@@ -388,13 +437,19 @@ async def update_memory(
         if body.source is not None:
             update_fields.append("source = ?")
             params.append(body.source)
+        if body.importance is not None:
+            update_fields.append("importance = ?")
+            params.append(body.importance)
+        if body.expires_at is not None:
+            update_fields.append("expires_at = ?")
+            params.append(body.expires_at)
 
         if not update_fields:
             # No fields to update, just fetch and return current record
             cursor = await asyncio.to_thread(
                 conn.execute,
                 """
-                SELECT id, content, category, tags, source, created_at, updated_at
+                SELECT id, content, category, tags, source, importance, expires_at, created_at, updated_at
                 FROM memories WHERE id = ?
                 """,
                 (memory_id,),
@@ -417,8 +472,10 @@ async def update_memory(
                 id=str(row[0]),
                 content=row[1],
                 metadata=metadata,
-                created_at=row[5],
-                updated_at=row[6],
+                importance=float(row[5] or 0.5),
+                expires_at=row[6],
+                created_at=row[7],
+                updated_at=row[8],
             )
 
         # Add memory_id to params
@@ -466,7 +523,7 @@ async def update_memory(
         cursor = await asyncio.to_thread(
             conn.execute,
             """
-            SELECT id, content, category, tags, source, created_at, updated_at
+            SELECT id, content, category, tags, source, importance, expires_at, created_at, updated_at
             FROM memories WHERE id = ?
             """,
             (memory_id,),
@@ -492,8 +549,10 @@ async def update_memory(
             id=str(row[0]),
             content=row[1],
             metadata=metadata,
-            created_at=row[5],
-            updated_at=row[6],
+            importance=float(row[5] or 0.5),
+            expires_at=row[6],
+            created_at=row[7],
+            updated_at=row[8],
         )
     except (sqlite3.Error, OSError) as e:
         logger.error(f"Database error during memory update: {e}")
@@ -554,7 +613,7 @@ async def delete_memory(
     )
     await asyncio.to_thread(conn.commit)
 
-    return {"message": f"Memory {memory_id} deleted successfully"}
+    return {"message": f"Memory {memory_id} deleted successfully", "forgotten": True}
 
 
 async def _authorize_memory_search(user: dict, vault_id: Optional[int]) -> None:

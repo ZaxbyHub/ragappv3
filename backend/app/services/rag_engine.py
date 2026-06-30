@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 from app.config import settings
 from app.models.chat_mode import ChatMode
+from app.services.answer_contract import build_answer_contract
 from app.services.citation_validator import (
     parse_citations,
     parse_kms_citations,
@@ -147,6 +148,7 @@ class RAGEngine:
         # to flow through both modes.
         self._thinking_client_override = thinking_client
         self._instant_client_override = instant_client
+        self._last_llm_metrics: Dict[str, Any] = {}
         self.reranking_service = reranking_service
 
         # Log warnings for missing dependencies (indicates non-DI usage)
@@ -971,6 +973,14 @@ class RAGEngine:
             kms_candidates=kms_evidence,
             cited_kms_labels=set(cited_kms),
         )
+        done_msg["answer_contract"] = build_answer_contract(
+            full_response,
+            sources=done_msg.get("sources", []),
+            memories_used=done_msg.get("memories_used", []),
+            wiki_used=done_msg.get("wiki_used", []),
+            kms_used=done_msg.get("kms_used", []),
+        )
+        done_msg["llm_metrics"] = dict(self._last_llm_metrics or {})
         # Populate final-source labels on the trace for evaluation tooling.
         trace.final_sources = [
             s.get("source_label", "") for s in done_msg.get("sources", []) if s.get("source_label")
@@ -1449,12 +1459,31 @@ class RAGEngine:
             This prevents mid-stream exceptions from killing the SSE connection.
         """
         target = client or self.llm_client
-        try:
-            async for chunk in target.chat_completion_stream(messages, max_tokens=max_tokens):
-                yield {"type": "content", "content": chunk}
-        except LLMError as exc:
-            logger.error("[_stream_llm_response] LLMError: %s", exc)
-            yield {"type": "error", "message": str(exc), "code": "LLM_ERROR"}
+        last_error: Optional[LLMError] = None
+        for candidate in self._fallback_clients(target):
+            emitted_content = False
+            try:
+                async for chunk in candidate.chat_completion_stream(messages, max_tokens=max_tokens):
+                    emitted_content = True
+                    yield {"type": "content", "content": chunk}
+                metrics = dict(getattr(candidate, "last_metrics", {}) or {})
+                if candidate is not target:
+                    metrics["fallback_from"] = getattr(target, "base_url", None)
+                self._last_llm_metrics = metrics
+                return
+            except LLMError as exc:
+                last_error = exc
+                if emitted_content:
+                    logger.error("[_stream_llm_response] LLMError after content: %s", exc)
+                    yield {"type": "error", "message": str(exc), "code": "LLM_ERROR"}
+                    return
+                logger.warning(
+                    "[_stream_llm_response] LLMError before content from %s: %s",
+                    getattr(candidate, "base_url", "<unknown>"),
+                    exc,
+                )
+        if last_error is not None:
+            yield {"type": "error", "message": str(last_error), "code": "LLM_ERROR"}
 
     async def _get_llm_response(
         self,
@@ -1478,11 +1507,45 @@ class RAGEngine:
                 propagates failures as exceptions to the caller.
         """
         target = client or self.llm_client
-        try:
-            content = await target.chat_completion(messages, max_tokens=max_tokens)
-            yield {"type": "content", "content": content}
-        except LLMError as exc:
-            raise RAGEngineError(f"LLM chat failed: {exc}") from exc
+        last_error: Optional[LLMError] = None
+        for candidate in self._fallback_clients(target):
+            try:
+                content = await candidate.chat_completion(messages, max_tokens=max_tokens)
+                metrics = dict(getattr(candidate, "last_metrics", {}) or {})
+                if candidate is not target:
+                    metrics["fallback_from"] = getattr(target, "base_url", None)
+                    logger.warning(
+                        "LLM fallback succeeded: %s -> %s",
+                        getattr(target, "base_url", "<unknown>"),
+                        getattr(candidate, "base_url", "<unknown>"),
+                    )
+                self._last_llm_metrics = metrics
+                yield {"type": "content", "content": content}
+                return
+            except LLMError as exc:
+                last_error = exc
+                logger.warning(
+                    "LLM candidate failed: %s: %s",
+                    getattr(candidate, "base_url", "<unknown>"),
+                    exc,
+                )
+        if last_error is not None:
+            raise RAGEngineError(f"LLM chat failed: {last_error}") from last_error
+
+    def _fallback_clients(self, primary: LLMClient) -> List[LLMClient]:
+        """Return primary plus distinct fallback clients in configured mode order."""
+        candidates = [primary, self.instant_client, self.thinking_client, self.llm_client]
+        out: List[LLMClient] = []
+        seen_urls: set[str] = set()
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            url = getattr(candidate, "base_url", None) or str(id(candidate))
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            out.append(candidate)
+        return out
 
     def _build_done_message(
         self,
