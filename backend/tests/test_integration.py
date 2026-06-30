@@ -1143,10 +1143,10 @@ class TestAsyncIntegration(unittest.IsolatedAsyncioTestCase):
         async for chunk in self.rag_engine.query("test", [], stream=True):
             results.append(chunk)
 
-        # Verify content chunks come before done event
+        # Verify content chunks come before done event (stage events may precede content)
         content_types = [r["type"] for r in results]
-        self.assertEqual(content_types[0], "content")
         self.assertEqual(content_types[-1], "done")
+        self.assertIn("content", content_types)
 
         # Verify all stream chunks are present
         content_values = [
