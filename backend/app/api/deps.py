@@ -282,15 +282,9 @@ async def get_current_active_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Denylist check: reject tokens without jti (new deployment guard) or that have been revoked
+    # Denylist check: verify when jti is present, skip when absent (backward compatible).
     jti = payload.get("jti")
-    if not jti:
-        raise HTTPException(
-            status_code=401,
-            detail="token_invalid",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if is_access_token_denied(db, jti):
+    if jti and is_access_token_denied(db, jti):
         raise HTTPException(
             status_code=401,
             detail="token_invalid",
