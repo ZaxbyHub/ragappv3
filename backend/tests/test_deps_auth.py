@@ -455,7 +455,8 @@ class TestMustChangePassword:
         mock_conn, mock_cursor = mock_db
         # First call: denylist check (jti not found), Second call: user lookup
         mock_cursor.fetchone.side_effect = [
-            (42, "testuser", "Test User", "member", 1, 0),
+            None,
+            (42, "testuser", "Test User", "member", 1, 1),
         ]
 
         # Use exempt path to bypass must_change_password enforcement
@@ -623,7 +624,6 @@ class TestAccessTokenDenylist:
 
         mock_conn, mock_cursor = mock_db
         mock_cursor.fetchone.side_effect = [
-            None,
             (42, "testuser", "Test User", "member", 1, 0),
         ]
 
