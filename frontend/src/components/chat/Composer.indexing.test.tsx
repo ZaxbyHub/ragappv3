@@ -88,7 +88,7 @@ describe("Composer attachment indexing UX", () => {
       });
 
     render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
-    const textarea = screen.getByRole("combobox");
+    const textarea = screen.getByLabelText("Message input");
     const file = new File(["x"], "doc.pdf", { type: "application/pdf" });
     await act(async () => {
       pasteFile(textarea, file);
@@ -121,7 +121,7 @@ describe("Composer attachment indexing UX", () => {
     apiMock.uploadDocument.mockRejectedValue(new Error("disk full"));
 
     render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
-    const textarea = screen.getByRole("combobox");
+    const textarea = screen.getByLabelText("Message input");
     const file = new File(["x"], "bad.pdf", { type: "application/pdf" });
     await act(async () => {
       pasteFile(textarea, file);
@@ -149,7 +149,7 @@ describe("Composer attachment indexing UX", () => {
     });
 
     render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
-    const textarea = screen.getByRole("combobox");
+    const textarea = screen.getByLabelText("Message input");
     const file = new File(["x"], "broken.pdf", { type: "application/pdf" });
     await act(async () => {
       pasteFile(textarea, file);
@@ -178,7 +178,7 @@ describe("Composer attachment indexing UX", () => {
     );
 
     render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
-    const textarea = screen.getByRole("combobox");
+    const textarea = screen.getByLabelText("Message input");
     const file = new File(["x"], "slow.pdf", { type: "application/pdf" });
     await act(async () => {
       pasteFile(textarea, file);

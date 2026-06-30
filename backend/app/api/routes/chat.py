@@ -56,7 +56,7 @@ class ChatRequest(BaseModel):
     vault_id: Optional[int] = None
     mode: Optional[Literal["instant", "thinking"]] = None
     # Inline generation controls (forward-compatible v1: accepted + logged).
-    temperature: Optional[float] = None
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
     retrieval_mode: Optional[str] = None
     citation_mode: Optional[str] = None
 
@@ -112,7 +112,7 @@ class ChatStreamRequest(BaseModel):
     vault_id: Optional[int] = None
     mode: Optional[Literal["instant", "thinking"]] = None
     # Inline generation controls (forward-compatible v1: accepted + logged).
-    temperature: Optional[float] = None
+    temperature: Optional[float] = Field(default=None, ge=0, le=2)
     retrieval_mode: Optional[str] = None
     citation_mode: Optional[str] = None
 
