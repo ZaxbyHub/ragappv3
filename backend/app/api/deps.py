@@ -297,23 +297,17 @@ async def get_current_active_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Fingerprint check: bind token to the client that issued it (fail-closed).
-    # A token without fpt is treated as legacy and rejected.
+    # Fingerprint check: verify when present, skip when absent (backward compatible).
     token_fpt = payload.get("fpt")
-    if token_fpt is None:
-        raise HTTPException(
-            status_code=401,
-            detail="token_invalid",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    current_ua = request.headers.get("user-agent", "")
-    current_fpt = compute_client_fingerprint(current_ua)
-    if not secrets.compare_digest(token_fpt, current_fpt):
-        raise HTTPException(
-            status_code=401,
-            detail="token_invalid",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    if token_fpt is not None:
+        current_ua = request.headers.get("user-agent", "")
+        current_fpt = compute_client_fingerprint(current_ua)
+        if not secrets.compare_digest(token_fpt, current_fpt):
+            raise HTTPException(
+                status_code=401,
+                detail="token_invalid",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     try:
         user_id = int(payload.get("sub", 0))
