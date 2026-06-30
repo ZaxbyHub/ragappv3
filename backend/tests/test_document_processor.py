@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -159,7 +160,7 @@ CREATE TABLE posts (
         if os.path.exists(self.temp_db_path):
             os.remove(self.temp_db_path)
         if os.path.exists(self.temp_dir):
-            os.rmdir(self.temp_dir)
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _insert_indexed_file(self, file_id=77, file_hash="abcdef012345"):
         conn = sqlite3.connect(self.temp_db_path)

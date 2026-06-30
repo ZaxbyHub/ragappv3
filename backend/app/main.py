@@ -28,7 +28,9 @@ from app.api.routes.health import router as health_router
 from app.api.routes.kms import router as kms_router
 from app.api.routes.memories import router as memories_router
 from app.api.routes.organizations import router as organizations_router
+from app.api.routes.prompts import router as prompts_router
 from app.api.routes.search import router as search_router
+from app.api.routes.service_accounts import router as service_accounts_router
 from app.api.routes.settings import router as settings_router
 from app.api.routes.tags import router as tags_router
 from app.api.routes.users import router as users_router
@@ -132,6 +134,8 @@ app.include_router(wiki_router, prefix="/api")
 app.include_router(kms_router, prefix="/api")
 app.include_router(tags_router, prefix="/api")
 app.include_router(folders_router, prefix="/api")
+app.include_router(service_accounts_router, prefix="/api")
+app.include_router(prompts_router, prefix="/api")
 
 # Register exception handler for validation errors (empty filename)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)

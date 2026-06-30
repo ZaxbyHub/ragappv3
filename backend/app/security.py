@@ -1,5 +1,6 @@
 """Authentication, CSRF, and toggle utilities."""
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -298,6 +299,74 @@ def require_scope(scope: str) -> Callable:
         if scope.lower() not in [s.lower() for s in token_scopes]:
             raise HTTPException(status_code=403, detail="Missing required scope")
         return {"user_id": token}
+
+    return dependency
+
+
+def require_service_account(required_scopes: list[str]):
+    """Require a valid service-account API key with specific scopes.
+
+    Service accounts are independent of human users — they are authenticated
+    via a Bearer key that is hashed (sha256) and stored as key_hash in the
+    service_accounts table. The raw key is returned exactly once at issuance
+    and is never stored.
+
+    Authorization checks that the service account's scopes include ALL of the
+    required_scopes. Uses hash-then-lookup for key validation.
+
+    Raises:
+        401: Authorization header missing/invalid, or key not found/revoked.
+        403: Key is valid but scopes are insufficient.
+    """
+    # Import here to avoid circular import at module load time.
+    from app.config import settings
+    from app.models.database import get_pool
+
+    async def dependency(
+        authorization: str | None = Header(None),
+    ) -> dict:
+        if not authorization:
+            raise HTTPException(status_code=401, detail="Authorization header missing")
+        if not authorization.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="Invalid authorization header")
+        parts = authorization.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            raise HTTPException(status_code=401, detail="Invalid authorization header")
+        raw_key = parts[1].strip()
+
+        # Hash the raw key and look up in service_accounts.
+        # Store only the hash; the raw key is returned once at issuance.
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+        pool = get_pool(str(settings.sqlite_path))
+        conn = pool.get_connection()
+        try:
+            row = await asyncio.to_thread(
+                lambda: conn.execute(
+                    "SELECT id, name, scopes, revoked_at FROM service_accounts WHERE key_hash = ?",
+                    (key_hash,),
+                ).fetchone()
+            )
+        finally:
+            pool.release_connection(conn)
+
+        if row is None:
+            raise HTTPException(status_code=401, detail="Invalid or unknown service account key")
+        sa_id, name, scopes_str, revoked_at = row
+        if revoked_at is not None:
+            raise HTTPException(status_code=401, detail="Service account has been revoked")
+        # Parse comma-separated scopes
+        sa_scopes = [s.strip() for s in scopes_str.split(",") if s.strip()]
+        # Check all required scopes are present (case-insensitive)
+        required_lower = {s.lower() for s in required_scopes}
+        sa_scopes_lower = {s.lower() for s in sa_scopes}
+        missing = required_lower - sa_scopes_lower
+        if missing:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Insufficient service account scopes: missing {', '.join(sorted(missing))}",
+            )
+        return {"service_account_id": sa_id, "name": name, "scopes": sa_scopes}
 
     return dependency
 

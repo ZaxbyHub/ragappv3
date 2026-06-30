@@ -15,8 +15,9 @@ Design goals:
 from __future__ import annotations
 
 import re
+import string
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 # Match [S<digits>], [M<digits>], [W<digits>], and [K<digits>] anywhere in text.
 # Case-sensitive: S/M/W/K only — lowercase variants are treated as plain text.
@@ -36,6 +37,10 @@ class CitationValidationResult:
     uncited_factual_warning: bool
     invalid_wiki_citations: Tuple[str, ...] = field(default=())
     invalid_kms_citations: Tuple[str, ...] = field(default=())
+    # Per-citation confidence scores [0.0, 1.0] — populated by score_citations().
+    citation_confidence: Dict[str, float] = field(default_factory=dict)
+    # Answer sentences that have no citation AND low overlap with all sources.
+    unverifiable_claims: Tuple[str, ...] = field(default_factory=lambda: ())
 
 
 def _label_set(prefix: str, count: int) -> set[str]:
@@ -228,6 +233,221 @@ def labels_for_memories(memories: Iterable[dict]) -> List[str]:
     return out
 
 
+def _tokenize(text: str) -> Set[str]:
+    """Lowercase token set for a text: strip punctuation, split on whitespace."""
+    table = str.maketrans("", "", string.punctuation)
+    cleaned = text.translate(table).lower()
+    return set(cleaned.split())
+
+
+def _jaccard(tokens_a: Set[str], tokens_b: Set[str]) -> float:
+    """Jaccard coefficient between two token sets. Returns 0 when both are empty."""
+    if not tokens_a and not tokens_b:
+        return 0.0
+    intersection = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    return intersection / union if union else 0.0
+
+
+# -------------------------------------------------------------------------- #
+# Sentence-split helpers (mirrors context_distiller logic for consistency)
+# -------------------------------------------------------------------------- #
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split text into sentence strings, stripping leading whitespace."""
+    if not text:
+        return []
+    return [s.strip() for s in _SENTENCE_RE.split(text) if s.strip()]
+
+
+# -------------------------------------------------------------------------- #
+# Jaccard-based citation confidence
+# -------------------------------------------------------------------------- #
+
+#: Default Jaccard threshold below which an uncited sentence is "unverifiable".
+UNVERIFIABLE_THRESHOLD = 0.15
+
+
+def _sentence_overlap(claim_sentence: str, source_text: str) -> float:
+    """Jaccard token overlap between a claim sentence and a source text.
+
+    Uses the full source_text (all distilled content for that source index).
+    Optionally a caller may supply a tighter span via ``source_span`` when
+    provenance character offsets are available — but for the base case we
+    compare against the full source text so every cited sentence has at least
+    one overlapping source by construction.
+    """
+    claim_tokens = _tokenize(claim_sentence)
+    source_tokens = _tokenize(source_text)
+    return _jaccard(claim_tokens, source_tokens)
+
+
+def _best_overlap_for_claim(
+    claim_sentence: str, source_texts: Sequence[str]
+) -> float:
+    """Maximum Jaccard overlap between a claim sentence and any source text."""
+    if not source_texts:
+        return 0.0
+    return max(_sentence_overlap(claim_sentence, src) for src in source_texts)
+
+
+def _compute_citation_confidence(
+    content: str,
+    valid_citations: Sequence[str],
+    source_texts: Sequence[str],
+) -> Dict[str, float]:
+    """Compute Jaccard-based confidence per valid citation label.
+
+    Algorithm:
+      1. Split the answer content into sentences (sentence-boundary aware).
+      2. For each valid [S#] label, find the *first* sentence that contains it
+         → that is the "claim sentence" for this citation.
+      3. Look up the cited source text (sources[source_num - 1]).
+      4. Score = Jaccard(claim_sentence tokens, source_text tokens).
+
+    Returns a dict mapping label (e.g. "S1") → confidence score [0.0, 1.0].
+    """
+    if not valid_citations or not source_texts:
+        return {}
+
+    sentences = _split_sentences(content)
+    label_to_sentence: Dict[str, str] = {}
+    for sentence in sentences:
+        for match in _CITATION_RE.finditer(sentence):
+            label = f"{match.group(1)}{match.group(2)}"
+            if label not in label_to_sentence:
+                label_to_sentence[label] = sentence
+
+    confidences: Dict[str, float] = {}
+    for label in valid_citations:
+        prefix = label[0]
+        if prefix != "S":
+            continue
+        try:
+            idx = int(label[1:]) - 1
+        except ValueError:
+            continue
+        if idx < 0 or idx >= len(source_texts):
+            continue
+        claim = label_to_sentence.get(label, "")
+        if not claim:
+            continue
+        source_text = source_texts[idx]
+        confidences[label] = _sentence_overlap(claim, source_text)
+
+    return confidences
+
+
+def _find_unverifiable_claims(
+    content: str,
+    valid_citations: Sequence[str],
+    source_texts: Sequence[str],
+    threshold: float = UNVERIFIABLE_THRESHOLD,
+) -> List[str]:
+    """Return answer sentences (claims) that have no citation and low source overlap.
+
+    Unverifiable claims are factual-sounding sentences that:
+      - Have no [S#]/[M#]/[W#]/[K#] citation, AND
+      - Score below ``threshold`` Jaccard overlap against *every* retrieved source.
+
+    Returns sentences in document order (first-occurrence order).
+    """
+    if not _looks_factual(content) or not source_texts:
+        return []
+
+    cited_labels: Set[str] = set()
+    for m in _CITATION_RE.finditer(content):
+        cited_labels.add(f"{m.group(1)}{m.group(2)}")
+
+    unverifiable: List[str] = []
+    seen_uncited: Set[str] = set()
+    for sentence in _split_sentences(content):
+        if _CITATION_RE.search(sentence):
+            continue
+        if sentence in seen_uncited:
+            continue
+        seen_uncited.add(sentence)
+        best = _best_overlap_for_claim(sentence, source_texts)
+        if best < threshold:
+            unverifiable.append(sentence)
+
+    return unverifiable
+
+
+def score_citations(
+    content: str,
+    source_texts: Sequence[str],
+    sentence_provenance: Optional[Sequence[object]] = None,
+) -> CitationValidationResult:
+    """Compute citation confidence scores and unverifiable-claims list.
+
+    This is a pure, side-effect-free extension to ``validate_and_repair_citations``.
+    It adds:
+      - ``citation_confidence``: Jaccard overlap score per valid [S#] citation.
+      - ``unverifiable_claims``: answer sentences with no citation AND low overlap.
+
+    Callers that only need valid/invalid citation labels should continue calling
+    ``validate_and_repair_citations`` directly.
+
+    Args:
+        content: Complete assistant response text.
+        source_texts: Texts of the retrieved document sources, in order
+            (sources[0] → S1, sources[1] → S2, …).
+        sentence_provenance: Optional task-2.1 sentence provenance list
+            (SentenceProvenance NamedTuples). When supplied the function may use
+            provenance character offsets to narrow the source span used for
+            overlap scoring. Currently unused in v1 (reserved for future use);
+            the full source text is used for lexical overlap.
+
+    Returns:
+        A CitationValidationResult (created from a minimal valid result) that
+        carries ``citation_confidence`` and ``unverifiable_claims``. The result
+        is not repaired (repaired_content == content); use
+        ``validate_and_repair_citations`` separately when repair is also needed.
+    """
+    if not content:
+        return CitationValidationResult(
+            repaired_content="",
+            valid_citations=(),
+            invalid_citations=(),
+            invalid_stripped=False,
+            has_evidence=bool(source_texts),
+            has_any_citation=False,
+            uncited_factual_warning=False,
+            citation_confidence={},
+            unverifiable_claims=(),
+        )
+
+    valid_s = {f"S{i}" for i in range(1, len(source_texts) + 1)}
+    valid: List[str] = []
+    for m in _CITATION_RE.finditer(content):
+        label = f"{m.group(1)}{m.group(2)}"
+        if label not in valid and m.group(1) == "S" and label in valid_s:
+            valid.append(label)
+    valid_citations = tuple(dict.fromkeys(valid))
+
+    citation_confidence = _compute_citation_confidence(
+        content, valid_citations, source_texts
+    )
+    unverifiable = _find_unverifiable_claims(
+        content, valid_citations, source_texts
+    )
+
+    return CitationValidationResult(
+        repaired_content=content,
+        valid_citations=valid_citations,
+        invalid_citations=(),
+        invalid_stripped=False,
+        has_evidence=bool(source_texts),
+        has_any_citation=bool(valid_citations),
+        uncited_factual_warning=False,
+        citation_confidence=citation_confidence,
+        unverifiable_claims=tuple(unverifiable),
+    )
+
+
 def repair_against_sources_and_memories(
     content: str,
     sources: Sequence[dict],
@@ -278,4 +498,6 @@ __all__ = [
     "labels_for_sources",
     "labels_for_memories",
     "repair_against_sources_and_memories",
+    "score_citations",
+    "UNVERIFIABLE_THRESHOLD",
 ]

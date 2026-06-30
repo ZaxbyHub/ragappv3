@@ -246,6 +246,7 @@ def _query_settings(mock):
     mock.instant_skip_retrieval_evaluation = True
     mock.instant_skip_distillation_synthesis = True
     mock.instant_skip_followup_rewrite = False
+    mock.agentic_rag_enabled = False
     return mock
 
 

@@ -4,12 +4,18 @@ Dual-provider embedding client service supporting Ollama and OpenAI-compatible A
 
 import asyncio
 import hashlib
+import json
 import logging
 from collections import OrderedDict
 from typing import List, Optional
 from urllib.parse import urlparse
 
 import httpx
+
+try:
+    import redis
+except ImportError:  # pragma: no cover
+    redis = None  # type: ignore[assignment]
 
 from app.config import settings
 from app.services.circuit_breaker import CircuitBreakerError, embeddings_cb
@@ -153,6 +159,27 @@ class EmbeddingService:
         # LRU cache. Cache keys include the live model/url/prefix fingerprints,
         # so a settings change naturally invalidates cached entries.
         self._embed_cache = LRUCache(maxsize=1000)
+
+        # Redis L2 cache — shared across processes/workers.
+        # Graceful fallback: if Redis is unavailable, embeddings still work via L1 LRU + provider.
+        self._redis_client = None
+        self._redis_available = False
+        self._redis_hits = 0
+        self._redis_misses = 0
+        if settings.redis_url and redis is not None:
+            try:
+                self._redis_client = redis.from_url(settings.redis_url)
+                # Verify connectivity with a quiet ping
+                self._redis_client.ping()
+                self._redis_available = True
+                logger.info("Embedding Redis L2 cache connected: %s", settings.redis_url)
+            except Exception as e:
+                logger.warning("Embedding Redis L2 cache unavailable (will use LRU fallback): %s", e)
+                self._redis_client = None
+                self._redis_available = False
+
+        # TTL for Redis cache entries (default 7 days)
+        self._cache_ttl = getattr(settings, 'embedding_cache_ttl_seconds', 604800)
 
         # Memoized (base_url, resolved_tuple) so provider-mode detection runs
         # once per configured URL instead of on every one of the ~19 property
@@ -392,10 +419,27 @@ class EmbeddingService:
         prefix_fingerprint = hashlib.md5((prefix or "").encode("utf-8")).hexdigest()[:8]
         cache_key = f"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}"
 
-        # Check cache
+        # L1: check in-process LRU first (fastest path)
         cached = self._embed_cache.get(cache_key)
         if cached is not None:
             return cached
+
+        # L2: check Redis shared cache
+        redis_key = f"emb:{cache_key}"
+        if self._redis_client is not None:
+            try:
+                raw = self._redis_client.get(redis_key)
+                if raw is not None:
+                    embedding = json.loads(raw)
+                    self._redis_hits += 1
+                    # Backfill L1 so hot path stays fast
+                    self._embed_cache.set(cache_key, embedding)
+                    return embedding
+            except Exception as e:
+                logger.warning("Redis L2 cache get failed (will fall through to provider): %s", e)
+
+        # Provider path (cache miss on L1 and L2)
+        self._redis_misses += 1
 
         try:
             response = await embeddings_cb(self._client.post)(
@@ -420,8 +464,16 @@ class EmbeddingService:
 
             embedding = self._extract_embedding(data)
 
-            # Store in cache
+            # Store in both L1 (in-process LRU) and L2 (Redis shared cache)
             self._embed_cache.set(cache_key, embedding)
+
+            # L2: write to Redis (fire-and-forget; Redis failure must not raise)
+            if self._redis_client is not None:
+                try:
+                    redis_key = f"emb:{cache_key}"
+                    self._redis_client.setex(redis_key, self._cache_ttl, json.dumps(embedding))
+                except Exception as e:
+                    logger.warning("Redis L2 cache set failed (entry still in L1): %s", e)
 
             return embedding
 
@@ -655,10 +707,18 @@ class EmbeddingService:
         Get embedding cache statistics.
 
         Returns:
-            Dictionary with cache statistics including hits, misses,
-            hit rate percentage, current size, and max size.
+            Dictionary with cache statistics including L1 LRU hits/misses/size
+            and L2 Redis availability/hits/misses.
         """
-        return self._embed_cache.get_stats()
+        l1_stats = self._embed_cache.get_stats()
+        return {
+            "l1": l1_stats,
+            "l2": {
+                "available": self._redis_available,
+                "hits": self._redis_hits,
+                "misses": self._redis_misses,
+            },
+        }
 
     async def _embed_batch_with_retry(
         self,

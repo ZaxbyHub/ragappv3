@@ -31,7 +31,26 @@ KnowledgeVault enables you to:
 | **Role-Based Access** | Superadmin, admin, member, viewer roles with route guards |
 | **Multi-Tenancy** | Organization management with member CRUD |
 | **Setup Wizard** | One-time admin account creation on first launch |
-
+| **Citation Grounding** | Sentence-level source provenance with character offsets, surfaced per answer sentence |
+| **Shared Embedding Cache** | Redis L2 embedding cache (cluster-wide) with in-process LRU L1 fallback; configurable TTL |
+| **Citation Confidence** | Lexical-overlap confidence score per citation; unverifiable answer claims listed separately in the RAG trace |
+| **Live Retrieval Benchmark** | Admin endpoint runs MRR/nDCG/recall against the live pipeline; runs persisted for trend tracking |
+| **Query Decomposition** | Complex questions are automatically decomposed into distinct sub-queries via LLM; simple single-facet queries bypass decomposition and use standard retrieval |
+| **Sub-Query RRF Fusion** | Per-sub-query independent retrieval with Reciprocal Rank Fusion (k=60) before answer distillation; single-facet queries are unchanged |
+| **Per-Vault Enrichment Toggle** | Enable or disable enrichment per vault (file>vault>global precedence); `PUT /api/vaults/{id}/enrichment-toggle` |
+| **Per-File Enrichment Toggle** | Enable or disable enrichment per document, overriding vault and global settings; `PUT /api/documents/{id}/enrichment-toggle` |
+| **Prompt Versioning** | Versioned prompt store with admin lifecycle management (list/active/create/activate/recover); resolution order: org override > global active > built-in |
+| **Per-Org Prompt Overrides** | Organizations can override the global active prompt version; `PUT/DELETE /api/organizations/{id}/prompt-override` |
+| **A/B Prompt Variants** | Deterministic sticky user assignment to prompt A/B experiments with exposure tracking; `POST /api/prompts/ab-experiments`; chat responses tagged with prompt version and experiment metadata |
+| **Per-Pane Error Boundaries** | Each chat pane (sessions, transcript, sources) is isolated — a crash in one pane does not take down others; a retry button resets the affected pane |
+| **KaTeX + Mermaid Rendering** | Inline and block LaTeX math and Mermaid diagrams render in chat responses; Mermaid uses `securityLevel='strict'` |
+| **Inline Composer Controls** | Temperature, retrieval-mode, and citation-mode selectors inline in the composer; settings persist per session and temperature is wired to the LLM |
+| **Reconnecting Banner** | Prominent, severity-colored banner (red/amber) displayed on SSE connection loss; accessible labeling |
+| **SSE Staged Progress** | Searching/Reading/Drafting stage events arrive before answer streams begin; visible stage indicator in the UI |
+| **Citation Inspection & Confidence** | Click a citation to open a source-span popover; confidence shown as colored dots (green/amber/red); unverifiable claims listed separately in the RAG trace |
+| **Feedback-Driven Re-Ranking** | User feedback (thumbs up/down on chat messages) adjusts retrieval ranking by ±0.10 per session, personalizing results over time |
+| **Agentic RAG** | Multi-step retrieval via a tool registry and iterative planner; feature-flagged (`AGENTIC_RAG_ENABLED`), off by default |
+| **Image Ingestion** | OCR and embedding of images within documents via optional Pillow + pytesseract dependencies |
 ## Architecture
 
 ### System Overview
@@ -114,7 +133,7 @@ backend/app/
 |-----------|------------|
 | Frontend | React 18, TypeScript, Vite, shadcn/ui, Tailwind CSS |
 | Backend | Python 3.11, FastAPI, Pydantic |
-| Auth | JWT (access + httpOnly refresh cookies), bcrypt password hashing |
+| Auth | JWT (access + httpOnly refresh cookies), Argon2id password hashing, revocable access tokens, service-account API keys |
 | Vector DB | LanceDB (embedded) |
 | Memory DB | SQLite with FTS5 |
 | Document Processing | Unstructured.io |
@@ -242,6 +261,8 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `MEMORY_MUTATION_RATE_LIMIT` | `30` | Maximum memory create/update/delete requests per minute per user (0 = unlimited) |
 | `ACTIVE_USER_CACHE_TTL_SECONDS` | `30` | TTL in seconds for cached active-user lookups. Range 5–300. Lower values reduce stale-data window; higher values reduce database load on frequently-accessed endpoints. |
 | `VECTOR_SEARCH_CONCURRENCY` | `32` | Maximum concurrent vector search operations (1-64). Controls search throughput under load. |
+| `EMBEDDING_CACHE_TTL_SECONDS` | `604800` | TTL in seconds for shared Redis embedding cache entries (default 7 days). Redis is optional — falls back to in-process LRU cache when unavailable. |
+| `EVAL_ENABLED` | `false` | Enable the `/api/eval/live` live retrieval benchmark endpoint (admin-only). |
 | `SEARCH_SEMAPHORE_TIMEOUT_SECONDS` | `30.0` | Timeout in seconds for search semaphore acquisition (1.0-300.0). On timeout, `/search` and `/chat` endpoints return HTTP 503. |
 | `KMS_ENABLED` | `true` | Master switch for the KMS (Knowledge Management) subsystem |
 | `KMS_COMPILE_ON_INGEST` | `true` | Create/refresh a KMS document entry when a document finishes indexing |
@@ -437,11 +458,22 @@ curl http://localhost:9090/api/health?deep=true | jq .vector_store
 |--------|----------|-------------|
 | GET | `/api/auth/setup-status` | Check if initial admin setup is needed |
 | POST | `/api/auth/register` | Register new user, returns JWT for auto-login |
-| POST | `/api/auth/login` | Login with username/password (returns JWT) |
-| POST | `/api/auth/logout` | Logout (clears httpOnly refresh cookie) |
+| POST | `/api/auth/login` | Login with username/password (returns JWT); transparently upgrades legacy bcrypt hashes to Argon2id |
+| POST | `/api/auth/logout` | Logout (clears httpOnly refresh cookie, denylists access token) |
 | POST | `/api/auth/refresh` | Refresh access token using httpOnly cookie |
 | GET | `/api/auth/me` | Get current authenticated user profile |
 | PATCH | `/api/auth/me` | Update current user profile (name, password) |
+| POST | `/api/auth/change-password` | Change current user's password (requires fingerprint-bound access token) |
+| POST | `/api/auth/revoke-all` | Revoke all active sessions for the current user (admin+) |
+
+### Service Accounts
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/service-accounts` | Create a service account and issue a scoped API key (`sak_` prefix) |
+| GET | `/api/service-accounts` | List service accounts for the current org |
+| POST | `/api/service-accounts/{id}/rotate` | Rotate a service account's API key (old key invalidated immediately) |
+| POST | `/api/service-accounts/{id}/revoke` | Revoke a service account and invalidate its API key |
 
 ### Users (Admin)
 
@@ -462,6 +494,11 @@ curl http://localhost:9090/api/health?deep=true | jq .vector_store
 | DELETE | `/api/orgs/{id}` | Delete organization |
 | POST | `/api/orgs/{id}/members` | Add member to organization |
 | DELETE | `/api/orgs/{id}/members/{user_id}` | Remove member from organization |
+| POST | `/api/orgs/{id}/invites` | Create an organization invite (returns expiring `inv_` token) |
+| POST | `/api/orgs/{id}/invites/{invite_id}/resend` | Resend an existing invite |
+| POST | `/api/orgs/{id}/invites/{invite_id}/revoke` | Revoke an invite (invalidates token immediately) |
+| GET | `/api/orgs/{id}/invites` | List all invites for an organization |
+| POST | `/api/orgs/{id}/invites/accept` | Accept an organization invite using an `inv_` token |
 
 ### Groups
 

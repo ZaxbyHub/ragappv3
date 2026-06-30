@@ -10,135 +10,18 @@ from pathlib import Path
 
 import jwt
 import pytest
+from backend.tests.schema_constants import TEST_SCHEMA
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.routes.auth import router as auth_router
 from app.api.routes.organizations import router as organizations_router
 from app.api.routes.vault_members import router as vault_members_router
-from app.services.auth_service import create_access_token, hash_password
-
-# Valid SQLite schema (avoiding UNIQUE NOCASE syntax issue in source)
-TEST_SCHEMA = """
--- Users table
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    hashed_password TEXT NOT NULL,
-    full_name TEXT DEFAULT '',
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_login_at TIMESTAMP,
-    -- Columns added by later migrations; kept in sync with the canonical
-    -- users schema (app/models/database.py) so auth dependencies that SELECT
-    -- them (e.g. deps.get_current_user) do not raise "no such column".
-    must_change_password INTEGER NOT NULL DEFAULT 0,
-    failed_attempts INTEGER NOT NULL DEFAULT 0,
-    locked_until TIMESTAMP
-);
-
--- Organizations table
-CREATE TABLE IF NOT EXISTS organizations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    description TEXT DEFAULT '',
-    slug TEXT UNIQUE,
-    created_by INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (created_by) REFERENCES users(id)
-);
-
--- Organization members
-CREATE TABLE IF NOT EXISTS org_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member')),
-    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE(org_id, user_id)
-);
-
--- Groups table
-CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    org_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    description TEXT DEFAULT '',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
-    UNIQUE(org_id, name)
-);
-
--- Group members
-CREATE TABLE IF NOT EXISTS group_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    group_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE(group_id, user_id)
-);
-
--- Vaults table
-CREATE TABLE IF NOT EXISTS vaults (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    description TEXT DEFAULT '',
-    owner_id INTEGER,
-    org_id INTEGER,
-    visibility TEXT DEFAULT 'private' CHECK (visibility IN ('private', 'org', 'public')),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (owner_id) REFERENCES users(id),
-    FOREIGN KEY (org_id) REFERENCES organizations(id)
-);
-
--- Vault members table
-CREATE TABLE IF NOT EXISTS vault_members (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vault_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    permission TEXT NOT NULL DEFAULT 'read' CHECK (permission IN ('read','write','admin')),
-    granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    granted_by INTEGER,
-    FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL,
-    UNIQUE(vault_id, user_id)
-);
-
--- Vault group access
-CREATE TABLE IF NOT EXISTS vault_group_access (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    vault_id INTEGER NOT NULL,
-    group_id INTEGER NOT NULL,
-    permission TEXT NOT NULL DEFAULT 'read' CHECK (permission IN ('read','write','admin')),
-    granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    granted_by INTEGER,
-    FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-    FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
-    FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL,
-    UNIQUE(vault_id, group_id)
-);
-
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
-CREATE INDEX IF NOT EXISTS idx_vault_members_vault_id ON vault_members(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_members_user_id ON vault_members(user_id);
-CREATE INDEX IF NOT EXISTS idx_org_members_org_id ON org_members(org_id);
-CREATE INDEX IF NOT EXISTS idx_org_members_user_id ON org_members(user_id);
-CREATE INDEX IF NOT EXISTS idx_groups_org_id ON groups(org_id);
-CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON group_members(group_id);
-CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id);
-CREATE INDEX IF NOT EXISTS idx_vault_group_access_vault_id ON vault_group_access(vault_id);
-CREATE INDEX IF NOT EXISTS idx_vault_group_access_group_id ON vault_group_access(group_id);
-"""
+from app.services.auth_service import (
+    compute_client_fingerprint,
+    create_access_token,
+    hash_password,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -277,19 +160,23 @@ def _create_vault(name: str, owner_id: int = 1):
 
 
 def superadmin_token():
-    return create_access_token(1, "superadmin", "superadmin")
+    return create_access_token(1, "superadmin", "superadmin",
+                            client_fingerprint=compute_client_fingerprint(""))
 
 
 def admin_token():
-    return create_access_token(2, "admin1", "admin")
+    return create_access_token(2, "admin1", "admin",
+                            client_fingerprint=compute_client_fingerprint(""))
 
 
 def member_token():
-    return create_access_token(3, "member1", "member")
+    return create_access_token(3, "member1", "member",
+                            client_fingerprint=compute_client_fingerprint(""))
 
 
 def member2_token():
-    return create_access_token(4, "member2", "member")
+    return create_access_token(4, "member2", "member",
+                            client_fingerprint=compute_client_fingerprint(""))
 
 
 def expired_token():
@@ -317,7 +204,10 @@ def client():
     app.include_router(auth_router, prefix="/api")
     app.include_router(vault_members_router, prefix="/api")
     app.include_router(organizations_router, prefix="/api")
-    return TestClient(app)
+    tc = TestClient(app)
+    # Override default User-Agent so fingerprint validation matches token
+    tc.headers["user-agent"] = ""
+    return tc
 
 
 # =============================================================================

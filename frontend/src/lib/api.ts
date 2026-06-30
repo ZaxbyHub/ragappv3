@@ -778,8 +778,14 @@ export interface ChatStreamCallbacks {
    * content can be reconciled before it is persisted.
    */
   onFinalContent?: (content: string) => void;
+  /** Citation confidence scores from the done event (FR-004). */
+  onCitationConfidence?: (confidence: Record<string, number>) => void;
+  /** Unverifiable claims flagged by the citation validator from the done event (FR-004). */
+  onUnverifiableClaims?: (claims: string[]) => void;
   /** Resolved chat mode reported by the backend at the start of the stream. */
   onMode?: (mode: "instant" | "thinking") => void;
+  /** Pipeline stage event (Searching / Reading / Drafting) before content streams. */
+  onStage?: (stage: string) => void;
   onError?: (error: Error) => void;
   onComplete?: () => void;
 }
@@ -867,6 +873,8 @@ export interface Vault {
   session_count: number;
   org_id: number | null;
   current_user_permission?: "read" | "write" | "admin" | null;
+  enrichment_enabled?: boolean | null;
+  effective_enrichment_enabled: boolean;
 }
 
 export interface VaultListResponse {
@@ -957,6 +965,21 @@ export async function updateVault(id: number, request: VaultUpdateRequest): Prom
 
 export async function deleteVault(id: number): Promise<void> {
   await apiClient.delete(`/vaults/${id}`);
+}
+
+export interface VaultEnrichmentToggleRequest {
+  enabled: boolean | null;
+}
+
+export async function toggleVaultEnrichment(
+  vaultId: number,
+  request: VaultEnrichmentToggleRequest,
+): Promise<Vault> {
+  const response = await apiClient.put<Vault>(
+    `/vaults/${vaultId}/enrichment-toggle`,
+    request,
+  );
+  return response.data;
 }
 
 export async function searchMemories(
@@ -1301,6 +1324,10 @@ export async function parseSSEStream(
             callbacks.onMode?.(parsed.mode);
             continue;
           }
+          if (parsed.type === 'stage' && typeof parsed.stage === 'string') {
+            callbacks.onStage?.(parsed.stage);
+            continue;
+          }
           // Defense in depth: drop any reasoning/thinking event regardless of
           // whether it appears as ``type`` or as a content field.
           const eventType = typeof parsed.type === "string" ? parsed.type.toLowerCase() : "";
@@ -1369,6 +1396,13 @@ export async function parseSSEStream(
             // onComplete persists it (fired only when citations were stripped).
             callbacks.onFinalContent?.(parsed.repaired_content);
           }
+          // FR-004: extract citation confidence and unverifiable claims from done payload.
+          if (typeof parsed.citation_confidence === "object" && parsed.citation_confidence !== null) {
+            callbacks.onCitationConfidence?.(parsed.citation_confidence as Record<string, number>);
+          }
+          if (Array.isArray(parsed.unverifiable_claims)) {
+            callbacks.onUnverifiableClaims?.(parsed.unverifiable_claims as string[]);
+          }
           if (eventType === "done") {
             completeOnce();
             return;
@@ -1389,6 +1423,9 @@ export function chatStream(
   callbacks: ChatStreamCallbacks,
   vaultId?: number,
   mode?: 'instant' | 'thinking',
+  temperature?: number,
+  retrievalMode?: string,
+  citationMode?: string,
 ): () => void {
   const abortController = new AbortController();
   // Build the request body once and reuse for both the initial POST and
@@ -1397,6 +1434,9 @@ export function chatStream(
     messages,
     ...(vaultId != null && { vault_id: vaultId }),
     ...(mode != null && { mode }),
+    ...(temperature != null && { temperature }),
+    ...(retrievalMode != null && { retrieval_mode: retrievalMode }),
+    ...(citationMode != null && { citation_mode: citationMode }),
   });
 
   const startStream = async () => {

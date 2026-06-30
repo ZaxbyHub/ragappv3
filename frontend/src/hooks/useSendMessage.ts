@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   chatStream,
   createChatSession,
@@ -25,6 +25,8 @@ export interface UseSendMessageReturn {
   handleInputChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
   /** Send with explicit content + history — does not read or modify composer input state. */
   sendDirect: (content: string, historyMessages: Message[]) => Promise<void>;
+  /** Current pipeline stage (Searching/Reading/Drafting) before content streams, or null. */
+  currentStage: string | null;
 }
 
 export function useSendMessage(
@@ -42,6 +44,9 @@ export function useSendMessage(
     replaceMessageId,
     setStreamingMessageId,
   } = useChatStore();
+
+  // Current pipeline stage — set when backend emits a stage SSE event
+  const [currentStage, setCurrentStage] = useState<string | null>(null);
 
   // Atomic guard — prevents double-send from rapid clicks / Enter
   const sendingRef = useRef(false);
@@ -142,6 +147,7 @@ export function useSendMessage(
         chatMessages,
         {
           onMessage: (chunk) => {
+            setCurrentStage(null);
             appendToMessage(assistantMessageId, chunk);
           },
           onSources: (sources) => {
@@ -161,11 +167,21 @@ export function useSendMessage(
           onMode: (mode) => {
             updateMessage(assistantMessageId, { mode });
           },
+          onStage: (stage) => {
+            setCurrentStage(stage);
+          },
           onFinalContent: (content) => {
             // Backend stripped invalid citations: adopt the cleaned content so
             // the hallucinated [S#] chip is removed from the rendered message
             // and from what onComplete persists.
             updateMessage(assistantMessageId, { content });
+          },
+          // FR-004: capture citation confidence and unverifiable claims from done event.
+          onCitationConfidence: (confidence) => {
+            updateMessage(assistantMessageId, { citationConfidence: confidence });
+          },
+          onUnverifiableClaims: (claims) => {
+            updateMessage(assistantMessageId, { unverifiableClaims: claims });
           },
           onError: (error) => {
             console.error("Chat stream error:", error);
@@ -186,12 +202,14 @@ export function useSendMessage(
               ? "Connection lost. Check your network and try again."
               : error.message;
             updateMessage(assistantMessageId, { error: friendlyMessage });
+            setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
             setStreamingMessageId(null);
             sendingRef.current = false;
           },
           onComplete: async () => {
+            setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
             setStreamingMessageId(null);
@@ -248,6 +266,9 @@ export function useSendMessage(
         },
         activeVaultId ?? undefined,
         effectiveMode,
+        useChatModeStore.getState().temperature,
+        useChatModeStore.getState().retrievalMode,
+        useChatModeStore.getState().citationMode,
       );
 
       // Wrap the raw abort so any caller that aborts the stream — the Stop
@@ -269,6 +290,7 @@ export function useSendMessage(
       updateMessage,
       replaceMessageId,
       setStreamingMessageId,
+      setCurrentStage,
       activeVaultId,
       refreshHistory,
     ]
@@ -331,5 +353,5 @@ export function useSendMessage(
     [setInput, setInputError]
   );
 
-  return { handleSend, handleStop, handleKeyDown, handleInputChange, sendDirect };
+  return { handleSend, handleStop, handleKeyDown, handleInputChange, sendDirect, currentStage };
 }

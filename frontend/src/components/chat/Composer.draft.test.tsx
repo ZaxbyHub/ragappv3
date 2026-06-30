@@ -106,7 +106,7 @@ describe("Composer draft persistence", () => {
       mockChatState.input = "";
     });
     const { rerender } = render(<Composer onSend={onSend} onStop={vi.fn()} isStreaming={false} />);
-    const textarea = screen.getByRole("combobox");
+    const textarea = screen.getByLabelText("Message input");
 
     fireEvent.change(textarea, { target: { value: "persist me" } });
     expect(storage.get("ragapp_chat_draft_42")).toBe("persist me");
@@ -124,7 +124,7 @@ describe("Composer draft persistence", () => {
     expect(mockChatState.setInput).toHaveBeenCalledWith("stored draft");
     mockChatState.setInput.mockClear();
 
-    fireEvent.change(screen.getByRole("combobox"), { target: { value: "typed after load" } });
+    fireEvent.change(screen.getByLabelText("Message input"), { target: { value: "typed after load" } });
     rerender(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
 
     expect(mockChatState.setInput).toHaveBeenCalledTimes(1);

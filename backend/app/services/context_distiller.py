@@ -3,15 +3,52 @@
 import logging
 import math
 import re
+from dataclasses import dataclass, field
 from html import escape as _xml_escape
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class SentenceProvenance(NamedTuple):
+    """Provenance for a single kept sentence after distillation.
+
+    Attributes:
+        sentence_text: The exact text of the kept sentence.
+        source_file_id: The file_id of the RAGSource this sentence came from.
+        char_start: Character offset of the sentence start in the original source text.
+        char_end: Character offset of the sentence end in the original source text.
+        source_index: Index of the source in the original sources list (for correlation).
+    """
+
+    sentence_text: str
+    source_file_id: str
+    char_start: int
+    char_end: int
+    source_index: int
+
+
+@dataclass
+class DistillResult:
+    """Result of context distillation.
+
+    Attributes:
+        sources: Deduplicated (and optionally synthesized) RAGSource list.
+        sentence_provenance: Ordered list of SentenceProvenance for each KEPT sentence.
+            Dropped (duplicate) sentences are NOT in this list. The list is in the
+            same order as the sentences appear in the distilled sources (grouped by
+            source, in source order).
+    """
+
+    sources: "List[RAGSource]"
+    sentence_provenance: List[SentenceProvenance] = field(default_factory=list)
 
 if TYPE_CHECKING:
     from app.services.embeddings import EmbeddingService
     from app.services.llm_client import LLMClient
     from app.services.rag_engine import RAGSource
+
+SentenceSpan = tuple[int, int]  # (char_start, char_end)
 
 _SYNTHESIS_PROMPT_SYSTEM = (
     "You are a precise document analyst. Given a user query and retrieved document "
@@ -45,6 +82,48 @@ def _split_sentences(text: str) -> List[str]:
     """Split text into sentences on sentence-ending punctuation followed by whitespace."""
     parts = re.split(r"(?<=[.!?])\s+", text)
     return [p.strip() for p in parts if p.strip()]
+
+
+def _split_sentences_with_spans(
+    text: str,
+) -> List[tuple[str, SentenceSpan]]:
+    """Split text into sentences, returning each sentence with its character span.
+
+    Uses re.split (same logic as _split_sentences) but additionally uses
+    re.finditer on the same lookahead pattern to determine the exact character
+    position of each separator and therefore the correct absolute start
+    position of each resulting part.
+
+    Returns:
+        List of (sentence_text, (char_start, char_end)) tuples.
+        char_start is inclusive, char_end is exclusive — i.e.
+        ``text[char_start:char_end] == sentence_text``.
+    """
+    sep_pattern = r"(?<=[.!?])\s+"
+    parts = re.split(sep_pattern, text)
+    separators = list(re.finditer(sep_pattern, text))
+
+    result: List[tuple[str, SentenceSpan]] = []
+    pos = 0
+    for i, part in enumerate(parts):
+        stripped = part.strip()
+        if not stripped:
+            # Whitespace-only segment: advance pos by the part's length
+            # (shouldn't happen with the split pattern but handle anyway)
+            pos += len(part)
+            continue
+        # The stripped text may be offset from the start of `part` due to
+        # leading whitespace that the split pattern consumed.
+        stripped_offset = part.index(stripped)
+        char_start = pos + stripped_offset
+        char_end = char_start + len(stripped)
+        result.append((stripped, (char_start, char_end)))
+        # Advance past this part plus the following separator (if any)
+        if i < len(separators):
+            pos += len(part) + (separators[i].end() - separators[i].start())
+        else:
+            pos += len(part)
+    return result
 
 
 # Refusal / "no relevant content" detection for synthesis output.
@@ -135,7 +214,7 @@ class ContextDistiller:
         query: str,
         sources: "List[RAGSource]",
         eval_result: str = "CONFIDENT",
-    ) -> "List[RAGSource]":
+    ) -> DistillResult:
         """
         Distill sources: deduplicate sentences, optionally synthesize for weak matches.
 
@@ -144,48 +223,65 @@ class ContextDistiller:
         produces usable content, one supplementary synthesized source is
         APPENDED, so the result may contain one more source than the input.
         Fails open: embedding error returns sources unmodified.
+
+        Returns DistillResult with ``sources`` (deduplicated RAGSource list) and
+        ``sentence_provenance`` (list of SentenceProvenance for each kept sentence).
+        Synthesized sources have no per-sentence provenance.
         """
         from app.config import settings
 
         # Step 1: extractive deduplication
         try:
-            sources = await self._deduplicate(
+            result = await self._deduplicate(
                 sources, settings.context_distillation_dedup_threshold
             )
         except Exception as exc:
             logger.warning(
                 "Context distillation dedup failed, returning unmodified: %s", exc
             )
-            return sources
+            return DistillResult(sources=sources, sentence_provenance=[])
 
         # Step 2: optional LLM synthesis (only for weak matches)
         if (
             settings.context_distillation_synthesis_enabled
             and self._llm_client is not None
             and eval_result == "NO_MATCH"
-            and sources
+            and result.sources
         ):
-            sources = await self._synthesize(query, sources)
+            synthesized = await self._synthesize(query, result.sources)
+            # Synthesis appends one source; provenance is unchanged (synthetic
+            # content has no per-sentence provenance — it's generated, not retrieved).
+            return DistillResult(sources=synthesized, sentence_provenance=result.sentence_provenance)
 
-        return sources
+        return result
 
     async def _deduplicate(
         self,
         sources: "List[RAGSource]",
         threshold: float,
-    ) -> "List[RAGSource]":
-        """Remove near-duplicate sentences from lower-ranked chunks."""
-        # Collect all sentences with their source index
+    ) -> DistillResult:
+        """Remove near-duplicate sentences from lower-ranked chunks.
+
+        Returns DistillResult with the deduplicated sources and per-sentence
+        provenance (char offsets in original source text).
+
+        Note: sentence_provenance contains entries only for sources that survived
+        the < 50-char guard. Entries are grouped by source, in source order.
+        """
+        # Collect all sentences with their source index and char spans
         all_sentences: List[str] = []
+        sentence_spans: List[SentenceSpan] = []  # parallel to all_sentences
         sentence_map: List[tuple] = []  # (source_idx, sentence_pos)
+
         for src_idx, source in enumerate(sources):
-            sentences = _split_sentences(source.text)
-            for sent_pos, sent in enumerate(sentences):
+            spans_and_sents = _split_sentences_with_spans(source.text)
+            for sent_pos, (sent, span) in enumerate(spans_and_sents):
                 all_sentences.append(sent)
+                sentence_spans.append(span)
                 sentence_map.append((src_idx, sent_pos))
 
         if not all_sentences:
-            return sources
+            return DistillResult(sources=sources, sentence_provenance=[])
 
         # Embed all sentences in one batch call
         embeddings = await self._embedding_service.embed_batch(all_sentences)
@@ -213,11 +309,23 @@ class ContextDistiller:
 
         # Reconstruct sources with duplicate sentences removed
         source_sentences: List[List[str]] = [[] for _ in sources]
-        for i, (src_idx, _) in enumerate(sentence_map):
+        sentence_provenance: List[SentenceProvenance] = []
+
+        for i, (src_idx, sent_pos) in enumerate(sentence_map):
             if not is_dup[i]:
                 source_sentences[src_idx].append(all_sentences[i])
+                sentence_provenance.append(
+                    SentenceProvenance(
+                        sentence_text=all_sentences[i],
+                        source_file_id=sources[src_idx].file_id,
+                        char_start=sentence_spans[i][0],
+                        char_end=sentence_spans[i][1],
+                        source_index=src_idx,
+                    )
+                )
 
         deduped: List = []
+        surviving_indices: set = set()
         for src_idx, source in enumerate(sources):
             new_text = " ".join(source_sentences[src_idx])
             if len(new_text) < 50:
@@ -233,8 +341,14 @@ class ContextDistiller:
                     metadata=source.metadata,
                 )
             )
+            surviving_indices.add(src_idx)
 
-        return deduped
+        # Prune provenance entries whose source was dropped (no dangling references)
+        sentence_provenance = [
+            p for p in sentence_provenance if p.source_index in surviving_indices
+        ]
+
+        return DistillResult(sources=deduped, sentence_provenance=sentence_provenance)
 
     async def _synthesize(
         self,

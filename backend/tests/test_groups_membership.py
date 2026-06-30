@@ -23,7 +23,13 @@ os.environ["JWT_SECRET_KEY"] = (
 )
 os.environ["USERS_ENABLED"] = "true"
 
-from app.services.auth_service import create_access_token, hash_password
+from backend.tests.schema_constants import TEST_SCHEMA
+
+from app.services.auth_service import (
+    compute_client_fingerprint,
+    create_access_token,
+    hash_password,
+)
 
 
 def setup_test_db(db_path: str) -> sqlite3.Connection:
@@ -31,149 +37,9 @@ def setup_test_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.executescript(TEST_SCHEMA)
 
-    # Create organizations table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS organizations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            description TEXT DEFAULT '',
-            slug TEXT UNIQUE,
-            created_by INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Create users table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            hashed_password TEXT NOT NULL,
-            full_name TEXT DEFAULT '',
-            role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
-            is_active INTEGER NOT NULL DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login_at TIMESTAMP,
-            must_change_password INTEGER NOT NULL DEFAULT 0,
-            failed_attempts INTEGER NOT NULL DEFAULT 0,
-            locked_until TIMESTAMP
-        )
-    """)
-
-    # Create org_members table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS org_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            org_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner','admin','member')),
-            joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            UNIQUE(org_id, user_id)
-        )
-    """)
-
-    # Create groups table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS groups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            org_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
-            UNIQUE(org_id, name)
-        )
-    """)
-
-    # Create group_members table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS group_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            group_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            UNIQUE(group_id, user_id)
-        )
-    """)
-
-    # Create vaults table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS vaults (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            description TEXT DEFAULT '',
-            owner_id INTEGER,
-            org_id INTEGER,
-            visibility TEXT DEFAULT 'private' CHECK (visibility IN ('private', 'org', 'public')),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Create vault_group_access table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS vault_group_access (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vault_id INTEGER NOT NULL,
-            group_id INTEGER NOT NULL,
-            permission TEXT NOT NULL DEFAULT 'read' CHECK (permission IN ('read','write','admin')),
-            granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            granted_by INTEGER,
-            FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-            FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
-            FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL,
-            UNIQUE(vault_id, group_id)
-        )
-    """)
-
-    # Create vault_members table
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS vault_members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            vault_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            permission TEXT NOT NULL DEFAULT 'read' CHECK (permission IN ('read','write','admin')),
-            granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            granted_by INTEGER,
-            FOREIGN KEY (vault_id) REFERENCES vaults(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL,
-            UNIQUE(vault_id, user_id)
-        )
-    """)
-
-    # Create indexes
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_org_members_org_id ON org_members(org_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_org_members_user_id ON org_members(user_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_group_members_group_id ON group_members(group_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_vault_group_access_vault_id ON vault_group_access(vault_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_vault_members_vault_id ON vault_members(vault_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_vault_members_user_id ON vault_members(user_id)"
-    )
-
-    # Insert default vault
+    # Insert default vault (local supplement)
     conn.execute(
         "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (1, 'Default', 'Default vault')"
     )
@@ -285,7 +151,8 @@ def add_user_to_vault(
 
 def get_token(user_id: int, username: str, role: str) -> str:
     """Generate a JWT token for a test user."""
-    return create_access_token(user_id, username, role)
+    return create_access_token(user_id, username, role,
+                          client_fingerprint=compute_client_fingerprint(""))
 
 
 class TestUserGroupMembershipSetup:
@@ -392,6 +259,8 @@ class TestUserGroupMembershipSetup:
         self.original_deps_pool = original_deps_pool
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -814,6 +683,8 @@ class TestVaultGroupMembershipSetup:
         self.original_deps_pool = original_deps_pool
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 

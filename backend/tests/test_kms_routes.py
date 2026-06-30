@@ -39,7 +39,7 @@ from app.api.deps import get_db
 from app.config import settings
 from app.main import app
 from app.security import csrf_protect
-from app.services.auth_service import create_access_token
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
 class KMSFixTestBase(unittest.TestCase):
@@ -47,6 +47,8 @@ class KMSFixTestBase(unittest.TestCase):
 
     def setUp(self):
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
         self._temp_dir = tempfile.mkdtemp()
 
         self._original_jwt_secret = settings.jwt_secret_key
@@ -126,7 +128,7 @@ class KMSFixTestBase(unittest.TestCase):
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
     def _headers(self, user_id, username, role):
-        return {"Authorization": f"Bearer {create_access_token(user_id, username, role)}"}
+        return {"Authorization": f"Bearer {create_access_token(user_id, username, role, client_fingerprint=compute_client_fingerprint(''))}"}
 
     def _write_headers(self):
         return self._headers(3, "member1", "member")

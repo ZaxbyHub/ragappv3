@@ -12,8 +12,9 @@ Administrative tasks for maintaining KnowledgeVault.
 4. [Health Checks](#health-checks)
 5. [Logs](#logs)
 6. [Performance Tuning](#performance-tuning)
-7. [Security](#security)
-8. [Troubleshooting](#troubleshooting)
+7. [Evaluation](#evaluation)
+8. [Security](#security)
+9. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -479,6 +480,23 @@ Wide spreadsheets (100+ columns) are automatically split into column groups to e
 
 If you process many wide spreadsheets, monitor logs for chunk size warnings and consider adjusting `CHUNK_SIZE_CHARS` if needed.
 
+#### Shared Embedding Cache (Redis L2)
+
+KnowledgeVault uses a two-tier embedding cache to reduce redundant embedding requests across the cluster:
+
+- **L1 — In-process LRU cache:** Fastest, per-worker in-memory cache. Evicted under memory pressure.
+- **L2 — Shared Redis cache:** Cluster-wide cache backed by Redis. Reduces duplicate embedding work when multiple workers handle the same query.
+
+Redis is **already used** for query transforms and CSRF token storage — enabling the shared embedding cache introduces no new dependencies. If Redis is unavailable, the system falls back to the L1 in-process cache only. No data is lost; cache hit rate may be lower until Redis is restored.
+
+To control how long cached embeddings are stored:
+
+```bash
+EMBEDDING_CACHE_TTL_SECONDS=604800   # 7 days (default)
+```
+
+Lower values reduce Redis memory usage but increase duplicate embedding requests. Higher values improve cache hit rates for repeated queries but consume more Redis memory.
+
 ### Database Optimization
 
 **SQLite:**
@@ -524,11 +542,346 @@ ab -n 100 -c 10 http://localhost:9090/health
 
 ---
 
+## Evaluation
+
+### Live Retrieval Benchmark
+
+The `/api/eval/live` endpoint runs a retrieval-quality benchmark against the **live** RAG pipeline, computing MRR, nDCG@k, and recall@k from ground-truth query results. This bridges the offline eval harness with production retrieval quality measurement.
+
+**Access:** Admin-only (`require_admin_role`).
+**Feature flag:** Requires `EVAL_ENABLED=true` in `.env` (defaults to `false`).
+
+When disabled, the endpoint returns HTTP 501:
+```
+Set EVAL_ENABLED=true to enable.
+```
+
+**Run records** (timestamp, release ID, per-query and aggregate metrics) are persisted as JSONL to `data/eval-runs/runs.jsonl` for trend comparison across releases.
+
+**Metrics computed:**
+
+| Metric | Description |
+|--------|-------------|
+| MRR (Mean Reciprocal Rank) | Average reciprocal rank of the first relevant result |
+| nDCG@k | Normalized Discounted Cumulative Gain at k |
+| recall@k | Fraction of relevant docs retrieved in top-k results |
+
+Metrics are computed in `backend/app/services/eval_metrics.py`.
+
+---
+
+## Advanced Retrieval
+
+### Feedback-Driven Re-Ranking (FR-010)
+
+User feedback on chat messages (thumbs up/down via `PATCH /api/chat/sessions/{id}/messages/{message_id}/feedback`) is used to adjust retrieval rankings for that session.
+
+**Behavior:**
+- Feedback is stored as `"up"` or `"down"` on the message record, scoped to the current user's signal on sessions they own
+- A positive vote (`"up"`) boosts the ranking score of cited documents by **+0.10** for that session
+- A negative vote (`"down"`) penalizes the ranking score by **−0.10** for that session
+- Re-ranking is applied per-session and does not affect other users or persist across sessions
+- Admins and superadmins with write access to a session can moderate feedback on any message within it
+
+**Effect:** Over multiple turns, sessions with consistent feedback gradually surface more relevant documents and deprioritize less useful ones.
+
+### Agentic RAG (FR-008)
+
+Agentic RAG replaces the standard single-step retrieval with a multi-step iterative loop using a tool registry and an LLM-driven planner.
+
+**Feature flag — off by default:**
+```env
+AGENTIC_RAG_ENABLED=true
+```
+
+**How it works:**
+1. The planner receives the user query and decides which tools to call (e.g., `search`, `memory_lookup`, `document_retrieve`)
+2. Each tool call returns intermediate results
+3. The planner evaluates results and decides whether to call additional tools or proceed to answer distillation
+4. Iteration continues until the planner signals done or the maximum step count is reached
+
+**Tools available to the planner:**
+- Vector search (semantic similarity)
+- Memory retrieval
+- Document lookup by ID or vault
+- (Extensible via the tool registry)
+
+**Enabling:**
+```bash
+# In .env
+AGENTIC_RAG_ENABLED=true
+```
+
+Restart the container after changing the flag. When disabled (default), the standard single-step retrieval pipeline is used.
+
+### Image Ingestion (FR-009)
+
+Images embedded within supported document formats (e.g., PDF pages) are processed using OCR when optional dependencies are installed.
+
+**Requirements:**
+```bash
+# Install optional OCR dependencies
+pip install Pillow pytesseract
+
+# On Linux, also install Tesseract OCR:
+# sudo apt-get install tesseract-ocr
+
+# On macOS:
+# brew install tesseract
+
+# On Windows:
+# Download and install from https://github.com/UB-Mannheim/tesseract/wiki
+```
+
+**Behavior:**
+- When Pillow and pytesseract are importable, images within documents are extracted and passed through Tesseract OCR
+- The resulting text is chunked and embedded like any other document content
+- If the dependencies are not installed, image ingestion is silently skipped (no error; documents without images are processed normally)
+- Re-upload existing documents after installing the dependencies to index any previously skipped images
+
+**Verification:**
+```bash
+# Check that tesseract is installed and reachable
+tesseract --version
+```
+
+## Query Intelligence
+
+### Query Planner (FR-002 pt1)
+
+The query planner automatically decomposes complex, multi-facet questions into distinct sub-queries for independent retrieval, then fuses the results before answer distillation.
+
+**Behavior:**
+- **Complex queries** (multi-facet or requiring multiple pieces of information): The LLM generates 2–3 semantically distinct sub-queries covering different aspects of the original question
+- **Simple queries** (single-facet): Bypass the planner entirely and use standard single retrieval
+- The planner runs once per chat query at the start of the RAG pipeline
+
+**How it works:**
+1. User submits a chat query
+2. If the query is determined to be multi-facet, the LLM generates sub-queries
+3. Each sub-query runs independent retrieval against the vector store
+4. Results are fused using Reciprocal Rank Fusion (RRF, k=60)
+5. The fused, deduplicated result set is passed to the answer distillation step
+
+**Sub-Query RRF Fusion (FR-002 pt2):**
+- Each sub-query检索 independently retrieves its own candidate set
+- Results from all sub-queries are combined using RRF with k=60
+- RRF score = Σ 1/(k + rank) across all sub-query result lists
+- Duplicates by (file_id, text) are removed, preserving highest-ranked occurrence
+- Single-facet queries skip fusion entirely (RRF applied to single list is a no-op)
+
+### Chunk Enrichment
+
+Chunk enrichment adds metadata (title, section headers, concept tags) to document chunks during ingestion, improving retrieval precision and answer quality.
+
+**Global toggle:** `CHUNK_ENRICHMENT_ENABLED=true` in `.env` enables enrichment globally.
+
+**Per-Vault Enrichment Toggle (FR-006):**
+
+Override enrichment at the vault level. The effective enrichment state follows this precedence:
+
+```
+file override > vault override > global CHUNK_ENRICHMENT_ENABLED
+```
+
+**PUT /api/vaults/{id}/enrichment-toggle**
+
+Set or clear a vault's enrichment override.
+
+```bash
+# Enable enrichment for this vault
+curl -X PUT http://localhost:9090/api/vaults/1/enrichment-toggle \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
+
+# Disable enrichment for this vault
+curl -X PUT http://localhost:9090/api/vaults/1/enrichment-toggle \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+
+# Clear override (inherit global)
+curl -X PUT http://localhost:9090/api/vaults/1/enrichment-toggle \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": null}'
+```
+
+Response includes `enrichment_enabled` (the override value) and `effective_enrichment_enabled` (the resolved state accounting for file/vault/global precedence).
+
+Requires vault admin permission.
+
+**Per-File Enrichment Toggle (FR-006):**
+
+Override enrichment at the individual document level.
+
+**PUT /api/documents/{id}/enrichment-toggle**
+
+```bash
+# Disable enrichment for a specific file (overrides vault/global)
+curl -X PUT http://localhost:9090/api/documents/42/enrichment-toggle \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+
+# Clear override (inherit vault/global)
+curl -X PUT http://localhost:9090/api/documents/42/enrichment-toggle \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": null}'
+```
+
+Requires vault admin permission on the file's vault.
+
+---
+
+## Prompt Versioning & A/B Testing
+
+KnowledgeVault supports versioned prompts with per-organization overrides and A/B experimentation for prompt evaluation.
+
+### Prompt Versioning (FR-007 pt1)
+
+All prompt versions are stored in the `prompt_versions` table. The effective prompt for any query is resolved in this order:
+
+```
+org override > global active > built-in
+```
+
+**Admin Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/prompts` | List all prompt versions (metadata only) |
+| GET | `/api/prompts/active` | Get the currently active prompt version (includes content) |
+| POST | `/api/prompts` | Create a new prompt version |
+| POST | `/api/prompts/{version}/activate` | Activate a specific version by name |
+| GET | `/api/prompts/{version}` | Recover a prior version by name (returns full content) |
+
+**List prompt versions:**
+```bash
+curl http://localhost:9090/api/prompts \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Create a new version:**
+```bash
+curl -X POST http://localhost:9090/api/prompts \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"version": "v2", "content": "You are a helpful assistant...", "activate": true}'
+```
+
+**Activate a specific version:**
+```bash
+curl -X POST http://localhost:9090/api/prompts/v2/activate \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Recover a prior version:**
+```bash
+curl http://localhost:9090/api/prompts/v1 \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+All prompt endpoints require `admin:config` scope.
+
+### Per-Org Prompt Overrides (FR-007 pt2)
+
+Organizations can override the global active prompt version with their own version. The override applies to all queries from users belonging to that organization.
+
+**Org Override Resolution:** org override > global active > built-in
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/organizations/{id}/prompt-override` | Get effective prompt for org (any org member) |
+| PUT | `/api/organizations/{id}/prompt-override` | Set org's prompt override (org admin+) |
+| DELETE | `/api/organizations/{id}/prompt-override` | Clear org override (org admin+) |
+
+**Set an org override:**
+```bash
+curl -X PUT http://localhost:9090/api/organizations/1/prompt-override \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"version": "org-special-v1"}'
+```
+
+**Clear an org override:**
+```bash
+curl -X DELETE http://localhost:9090/api/organizations/1/prompt-override \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Get effective prompt:**
+```bash
+curl http://localhost:9090/api/organizations/1/prompt-override \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Response includes `is_override: true` if the org has an active override, or `is_override: false` if using the global active version.
+
+Requires org admin or owner for PUT/DELETE; any org member can read the effective version.
+
+### A/B Prompt Experiments (FR-007 pt3)
+
+A/B experiments compare two prompt versions (control vs. challenger) by assigning users to each variant. Assignment is deterministic and sticky — the same user always receives the same variant.
+
+**Experiment Management:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/prompts/ab-experiments` | Create a new A/B experiment |
+| GET | `/api/prompts/ab-experiments` | List all experiments with exposure counts |
+| POST | `/api/prompts/ab-experiments/{id}/end` | End an experiment and declare winner |
+
+**Create an experiment:**
+```bash
+curl -X POST http://localhost:9090/api/prompts/ab-experiments \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "helpful-vs-concise", "control_version": "v1", "challenger_version": "v2", "split_pct": 50}'
+```
+
+- `split_pct`: Percentage of users assigned to the challenger variant (default 50). Control gets the remainder.
+- Only one active experiment should exist at a time. End the current experiment before creating a new one.
+
+**List experiments:**
+```bash
+curl http://localhost:9090/api/prompts/ab-experiments \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Response includes per-variant exposure counts tracking how many users have been assigned to each arm.
+
+**End an experiment:**
+```bash
+curl -X POST http://localhost:9090/api/prompts/ab-experiments/1/end \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"winner": "challenger"}'
+```
+
+**Chat Response Metadata:**
+
+Chat responses served under an active experiment include these fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `prompt_version` | string | The prompt version actually used |
+| `ab_experiment_id` | int | The active experiment ID (if any) |
+| `ab_variant` | string | `"control"` or `"challenger"` |
+
+In streaming responses, these fields appear in the final `done` SSE event alongside sources and memories.
+
+All A/B endpoints require `admin:config` scope.
+
+---
+
 ## Security
 
 ### Authentication
 
-KnowledgeVault has built-in JWT-based authentication with role-based access control:
+KnowledgeVault has built-in JWT-based authentication with role-based access control.
 
 **User Roles:**
 - `superadmin` — Full system access, manages other admins
@@ -541,10 +894,59 @@ KnowledgeVault has built-in JWT-based authentication with role-based access cont
 - The initial admin can then invite other users via email or create accounts manually
 - JWT tokens are stored in httpOnly refresh cookies for security
 
+**Password Hashing:**
+- New passwords are hashed with **Argon2id** (memory-hard, CPU-intensive)
+- Existing **bcrypt** hashes are verified transparently and upgraded to Argon2id on next successful login — no forced password resets required
+
+**Token Revocation:**
+- Access tokens are **short-lived (15 minutes)** and can be **denylisted before expiry** (e.g., on logout)
+- All active sessions for a user can be revoked at once via `POST /api/auth/revoke-all`
+
+**Client Fingerprint Binding:**
+- Access tokens are bound to the client fingerprint (User-Agent + other signals)
+- Requests with a mismatched fingerprint are **rejected fail-closed** (HTTP 401)
+
 **Options:**
 1. **Single-Admin Mode** (`USERS_ENABLED=false`): The `ADMIN_SECRET_TOKEN` is the sole authentication mechanism — whoever possesses the token is the admin.
 
 2. **Multi-User Mode** (`USERS_ENABLED=true`): Requires `ADMIN_SECRET_TOKEN` to be set for the initial admin account, then allows user management via the UI.
+
+### Service Accounts
+
+Service accounts provide scoped, rotatable API keys for programmatic access (CI/CD, automation, server-to-server integrations).
+
+**Key Properties:**
+- API keys are prefixed `sak_` and stored as SHA-256 hashes (keys themselves are shown only once at creation)
+- Keys are scoped to specific permissions and can be rotated without disrupting other keys
+- Rotation immediately invalidates the old key — there is no grace period
+
+**Managing Service Accounts:**
+
+| Action | How |
+|--------|-----|
+| Create | `POST /api/service-accounts` — returns the raw key once; store it securely |
+| List | `GET /api/service-accounts` — shows metadata only, not keys |
+| Rotate | `POST /api/service-accounts/{id}/rotate` — issues a new key, invalidates old |
+| Revoke | `POST /api/service-accounts/{id}/revoke` — permanently invalidates the key |
+
+### Organization Invites
+
+Organization invites allow admins to invite users via a token-based flow with expiry and revocation.
+
+**Invite Properties:**
+- Tokens are prefixed `inv_` and expire after a configurable window (default 7 days)
+- Invites can be **resent** (new expiry) or **revoked** (immediate invalidation)
+- Each invite is tied to the inviting organization
+
+**Managing Invites:**
+
+| Action | How |
+|--------|-----|
+| Create | `POST /api/orgs/{id}/invites` — returns the raw `inv_` token to share |
+| List | `GET /api/orgs/{id}/invites` — shows all invites and their status |
+| Resend | `POST /api/orgs/{id}/invites/{invite_id}/resend` — resets expiry |
+| Revoke | `POST /api/orgs/{id}/invites/{invite_id}/revoke` — invalidates token |
+| Accept | `POST /api/orgs/{id}/invites/accept` — redeems the `inv_` token |
 
 ### Network Security
 
@@ -750,6 +1152,65 @@ knowledgevault.example.com {
 - [ ] Rotate `ADMIN_SECRET_TOKEN` and `JWT_SECRET_KEY` annually
 - [ ] Audit user roles (superadmin/admin/member/viewer) quarterly
 - [ ] Rotate JWT secret key when team members with admin access leave
+- [ ] Audit service account keys quarterly — revoke any unused keys and rotate annually
+- [ ] Audit org invites monthly — revoke expired or superseded invites
+
+---
+
+## Chat UX Features
+
+### Per-Pane Error Boundaries (FR-017)
+
+The chat workspace is divided into three isolated panes — Session Rail, Transcript, and Sources. Each pane runs in its own error boundary. If one pane encounters an unhandled error and crashes, the other two continue operating normally. A "Retry" button appears on the crashed pane to reset it without disrupting the rest of the session.
+
+### KaTeX + Mermaid Rendering (FR-016)
+
+Chat responses render LaTeX math (inline `$...$` and block `$$...$$`) and Mermaid diagrams directly in the message body. Mermaid diagrams are rendered with `securityLevel='strict'`, disabling scripts and external resource access.
+
+Supported KaTeX contexts:
+- **Inline math:** `$E = mc^2$`
+- **Block math:** `$$\int_0^\infty e^{-x^2} dx$$`
+
+Supported Mermaid diagram types: flowchart, sequence diagram, class diagram, state diagram, entity relationship diagram, gantt chart, pie chart, and others supported by the Mermaid `strict` mode.
+
+### Inline Composer Controls (FR-018)
+
+The message composer contains inline selectors for three per-session settings:
+
+| Control | Description | Persistence |
+|---------|-------------|-------------|
+| **Temperature** | LLM creativity/randomness slider (0–1 scale) | Per session, wired to the LLM on every request |
+| **Retrieval Mode** | Controls retrieval strategy (e.g., `thinking`, `instant`) | Per session |
+| **Citation Mode** | Toggles citation display style | Per session |
+
+Settings are stored with the session and restored when the session is reopened.
+
+### Reconnecting Banner (FR-019)
+
+When the SSE connection to the backend is lost during a streaming chat response, a prominent banner appears at the top of the chat pane:
+
+- **Red banner:** Connection dropped unexpectedly (server error, network failure)
+- **Amber banner:** Connection is being re-established (temporary outage)
+
+The banner uses accessible color coding and labeling so it remains distinguishable even for users with color vision deficiencies. When connectivity is restored, the banner dismisses automatically.
+
+### SSE Staged Progress (FR-015)
+
+Before the first token of a streaming answer arrives, the UI displays a stage indicator showing the current RAG pipeline stage:
+
+1. **Searching** — Query decomposition and vector retrieval in progress
+2. **Reading** — Retrieved chunks are being read and scored
+3. **Drafting** — Answer is being generated and streamed
+
+Stage events arrive as SSE comments or a dedicated field before the answer token stream begins. The stage indicator updates in real time as the pipeline transitions between stages.
+
+### Citation Confidence (FR-003/FR-004 Frontend)
+
+Citations in chat responses include a confidence indicator:
+
+- **Colored dots:** Green (high confidence), Amber (medium), Red (low/unverifiable)
+- **Citation popover:** Clicking a `[S#]` citation opens a popover showing the exact source span, document name, and relevance score
+- **Unverifiable claims:** When a sentence in the answer cannot be traced to a retrieved chunk, the sentence is flagged and listed separately in the RAG trace panel
 
 ---
 

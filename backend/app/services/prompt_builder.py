@@ -3,6 +3,7 @@
 Handles building system prompts, user messages, and formatting context for LLM.
 """
 
+import sqlite3
 from html import escape as _xml_escape
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -13,6 +14,9 @@ from app.services.memory_store import MemoryRecord
 if TYPE_CHECKING:
     from app.services.kms_retrieval import KMSEvidence
     from app.services.wiki_retrieval import WikiEvidence
+
+# Sentinel to distinguish "not passed" from "explicitly None"
+_UNSET = object()
 
 CITATION_INSTRUCTION = (
     "\n\nWhen answering questions based on the provided context:\n"
@@ -130,24 +134,67 @@ def format_kms_evidence(evidence: "KMSEvidence", index: int) -> str:
 
 
 class PromptBuilderService:
-    """Service for building prompts and messages for the LLM."""
+    """Service for building prompts and messages for the LLM.
+
+    Resolution order for system_prompt (highest to lowest):
+      1. Constructor ``system_prompt`` argument (explicit override, e.g. for tests)
+      2. Active prompt version in the database (via ``db`` connection)
+      3. Built-in default (backward-compatible when no active version exists)
+
+    The active DB version is resolved lazily on the first :meth:`build_messages`
+    call and cached for the lifetime of the instance.
+    """
 
     def __init__(
         self,
-        system_prompt: Optional[str] = None,
+        system_prompt: Optional[str] = _UNSET,
         max_context_chunks: Optional[int] = None,
+        db: Optional[sqlite3.Connection] = None,
     ) -> None:
         """Initialize the prompt builder service.
 
         Args:
-            system_prompt: Custom system prompt (defaults to standard KnowledgeVault prompt)
-            max_context_chunks: Maximum number of context chunks to include
+            system_prompt: Explicit system-prompt override (highest precedence).
+            max_context_chunks: Maximum number of context chunks to include.
+            db: SQLite connection for resolving the active prompt version.
+                When provided and no explicit ``system_prompt`` is given, the
+                active row in ``prompt_versions`` is used (if any).
         """
-        self.system_prompt = system_prompt or self._default_system_prompt()
+        self._explicit_prompt = system_prompt
+        self._db = db
+        self._cached_active_prompt: Optional[str] = None
         self.max_context_chunks = max_context_chunks or settings.max_context_chunks
 
+    @property
+    def system_prompt(self) -> str:
+        """Resolve and return the system prompt.
+
+        Resolution order:
+          1. Constructor ``system_prompt`` override
+          2. Active DB version (lazy, cached per-instance)
+          3. Built-in default
+        """
+        if self._explicit_prompt is not _UNSET:
+            return self._explicit_prompt  # type: ignore[return-value]
+        if self._cached_active_prompt is not None:
+            return self._cached_active_prompt
+        # Lazy resolution from DB
+        if self._db is not None:
+            try:
+                self._db.row_factory = sqlite3.Row
+                row = self._db.execute(
+                    "SELECT content FROM prompt_versions WHERE is_active = 1 LIMIT 1"
+                ).fetchone()
+                if row is not None:
+                    self._cached_active_prompt = row["content"]
+                    return self._cached_active_prompt
+            except sqlite3.OperationalError:
+                # Table may not exist yet (e.g. tests with partial schema)
+                pass
+        return self._default_system_prompt()
+
     def _default_system_prompt(self) -> str:
-        """Return the default system prompt."""
+        """Return the built-in default system prompt."""
         return (
             "You are KnowledgeVault, a highly accurate assistant that references sources "
             "when answering questions.\n\n"
@@ -174,6 +221,7 @@ class PromptBuilderService:
         relevance_hint: Optional[str] = None,
         wiki_evidence: Optional[List["WikiEvidence"]] = None,
         kms_evidence: Optional[List["KMSEvidence"]] = None,
+        system_prompt_override: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """Build the complete message list for LLM completion.
 
@@ -183,6 +231,13 @@ class PromptBuilderService:
             chunks: Retrieved document chunks
             memories: Retrieved memories
             relevance_hint: Optional hint about retrieval quality
+            wiki_evidence: Optional list of WikiEvidence items
+            kms_evidence: Optional list of KMSEvidence items
+            system_prompt_override: Per-query system prompt override.
+                When provided, prepended as a system message with highest
+                precedence (bypasses constructor override and cached DB
+                version). Used by the RAG engine to inject the org-specific
+                effective prompt version resolved at query time.
 
         Returns:
             List of message dictionaries for the LLM
@@ -210,8 +265,15 @@ class PromptBuilderService:
             if mem.content
         ]
 
+        # system_prompt_override (org-specific per-query) takes absolute
+        # precedence. Falls through to normal resolution chain otherwise.
+        effective_prompt = (
+            system_prompt_override
+            if system_prompt_override is not None
+            else self.system_prompt
+        )
         messages: List[Dict[str, str]] = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": effective_prompt},
         ]
         # Truncate history to last N messages to prevent context overflow
         max_history = 20

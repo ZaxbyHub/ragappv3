@@ -86,6 +86,20 @@ class VaultUpdateRequest(BaseModel):
         return v
 
 
+class VaultEnrichmentToggleRequest(BaseModel):
+    """Request model for toggling vault-level enrichment override.
+
+    enabled: True  → vault-level ON (overrides global)
+    enabled: False → vault-level OFF (overrides global)
+    enabled: null  → clears override, falls back to global
+    """
+
+    enabled: Optional[bool] = Field(
+        None,
+        description="True=enable for vault, False=disable for vault, null=inherit global",
+    )
+
+
 class VaultResponse(BaseModel):
     """Response model for a vault record."""
 
@@ -100,6 +114,8 @@ class VaultResponse(BaseModel):
     org_id: Optional[int] = None
     current_user_permission: Optional[str] = None
     visibility: Optional[str] = None
+    enrichment_enabled: Optional[bool] = None
+    effective_enrichment_enabled: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -113,6 +129,18 @@ class VaultListResponse(BaseModel):
 def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -> VaultResponse:
     """Map a database row to VaultResponse."""
     vault_id = row[0]
+    # Row structure: id, name, description, created_at, updated_at,
+    #               file_count, memory_count, session_count,
+    #               org_id, visibility, enrichment_enabled
+    enrichment_enabled_raw = row[10] if len(row) > 10 else None
+    enrichment_override: Optional[bool] = None
+    if enrichment_enabled_raw is not None:
+        enrichment_override = bool(enrichment_enabled_raw)
+    effective = (
+        enrichment_override
+        if enrichment_override is not None
+        else settings.chunk_enrichment_enabled
+    )
     return VaultResponse(
         id=vault_id,
         name=row[1],
@@ -124,6 +152,8 @@ def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -
         session_count=row[7] or 0,
         org_id=row[8],
         visibility=row[9] if len(row) > 9 else None,
+        enrichment_enabled=enrichment_override,
+        effective_enrichment_enabled=effective,
         current_user_permission=current_user_permission,
     )
 
@@ -134,7 +164,8 @@ _VAULT_WITH_COUNTS_SQL = """
            COUNT(DISTINCT m.id) as memory_count,
            COUNT(DISTINCT cs.id) as session_count,
            v.org_id,
-           v.visibility
+           v.visibility,
+           v.enrichment_enabled
     FROM vaults v
     LEFT JOIN files f ON f.vault_id = v.id
     LEFT JOIN memories m ON m.vault_id = v.id
@@ -609,6 +640,57 @@ async def delete_vault(
         await asyncio.to_thread(lambda: conn.rollback())
         logger.exception("Error deleting vault %d", vault_id)
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+
+
+@router.put("/vaults/{vault_id}/enrichment-toggle", response_model=VaultResponse)
+async def toggle_vault_enrichment(
+    vault_id: int,
+    request: VaultEnrichmentToggleRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """
+    Set or clear the per-vault enrichment override.
+
+    Requires admin permission on the vault.
+    - enabled=true  → vault-level ON (overrides global)
+    - enabled=false → vault-level OFF (overrides global)
+    - enabled=null → clears override, falls back to global
+
+    Returns the updated vault with effective_enrichment_enabled computed.
+    """
+    # Check vault exists
+    row = await asyncio.to_thread(
+        lambda: conn.execute(
+            "SELECT id FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone()
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"Vault with id {vault_id} not found"
+        )
+
+    # Apply the override (NULL to clear, 1 to enable, 0 to disable)
+    if request.enabled is None:
+        new_value: Optional[int] = None
+    else:
+        new_value = 1 if request.enabled else 0
+
+    await asyncio.to_thread(
+        conn.execute,
+        "UPDATE vaults SET enrichment_enabled = ? WHERE id = ?",
+        (new_value, vault_id),
+    )
+    await asyncio.to_thread(conn.commit)
+
+    # Return updated vault
+    vault = await _fetch_vault_with_counts(conn, vault_id, user)
+    if vault is None:
+        raise HTTPException(
+            status_code=404, detail=f"Vault with id {vault_id} not found"
+        )
+    return vault
 
 
 class GroupAccessItem(BaseModel):

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import sqlite3
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
@@ -14,18 +15,34 @@ from app.services.citation_validator import (
     parse_kms_citations,
     parse_wiki_citations,
     repair_against_sources_and_memories,
+    score_citations,
 )
-from app.services.context_distiller import ContextDistiller
+from app.services.context_distiller import ContextDistiller, SentenceProvenance
 from app.services.document_retrieval import DocumentRetrievalService, RAGSource
 from app.services.embeddings import EmbeddingError, EmbeddingService
+from app.services.eval_adapter import STAGE_DRAFTING, STAGE_READING, STAGE_SEARCHING
+from app.services.feedback_reranker import FeedbackReranker
 from app.services.llm_client import LLMClient, LLMError
 from app.services.memory_store import MemoryStore
 from app.services.prompt_builder import PromptBuilderService, calculate_primary_count
-from app.services.query_transformer import QueryTransformer
+from app.services.query_transformer import QueryPlanner, QueryTransformer
 from app.services.rag_trace import RAGTrace
 from app.services.retrieval_evaluator import RetrievalEvaluator
 from app.services.vector_store import SearchSemaphoreTimeoutError, VectorStore
 from app.utils.fusion import rrf_fuse
+
+# Agentic tools are imported lazily behind the agentic_rag_enabled flag
+# (rag_engine is never imported by agentic_tools at module level, so this
+# is safe from circular-import issues).
+try:
+    from app.services.agentic_planner import AgenticPlanner
+    from app.services.agentic_tools import ToolRegistry
+except ImportError:  # pragma: no cover — defensive; raised if flag enabled without wiring
+    ToolRegistry = None  # type: ignore[assignment]
+    AgenticPlanner = None  # type: ignore[assignment]
+
+# RRF constant for sub-query fusion (standard value).
+_SUB_QUERY_RRF_K = 60
 
 # Sentinel marking "no per-instance override set" for live-settings properties.
 # Used so a value of ``None`` can be an intentional override (e.g. for
@@ -137,6 +154,7 @@ class RAGEngine:
         kms_retrieval: Optional[Any] = None,
         thinking_client: Optional[LLMClient] = None,
         instant_client: Optional[LLMClient] = None,
+        db_path: Optional[str] = None,
     ) -> None:
         self.embedding_service = embedding_service or EmbeddingService()
         self.vector_store = vector_store or None
@@ -150,6 +168,9 @@ class RAGEngine:
         self._instant_client_override = instant_client
         self._last_llm_metrics: Dict[str, Any] = {}
         self.reranking_service = reranking_service
+        # db_path enables per-query org-aware prompt resolution without storing
+        # a long-lived connection on the engine (connection is acquired per-query).
+        self._db_path = db_path or str(settings.sqlite_path)
 
         # Log warnings for missing dependencies (indicates non-DI usage)
         if embedding_service is None:
@@ -210,12 +231,21 @@ class RAGEngine:
         else:
             self.prompt_builder = PromptBuilderService()
 
+        # Sentence-level provenance from the last distillation call. Task 2.3
+        # (citation confidence) and task 4.6 (UI span highlighting) consume this.
+        # Stored per-engine-instance so callers can read it after query() returns.
+        self._last_distillation_provenance: List[SentenceProvenance] = []
+
         # Query transformer instances (lazy-loaded per active LLM client) so the
         # in-process LRU cache persists across requests. Keyed by id(client),
         # mirroring ``_retrieval_evaluators`` below. A single shared instance would
         # be incorrect: QueryTransformer binds to one client and bakes that model's
         # identity into its cache keys, so Thinking/Instant must not share one.
         self._query_transformers: Dict[int, QueryTransformer] = {}
+
+        # Query planner instances (lazy-loaded per active LLM client), mirroring
+        # the per-client caching pattern used for QueryTransformer.
+        self._query_planners: Dict[int, QueryPlanner] = {}
 
         # Retrieval evaluator instances (lazy-loaded per active LLM client).
         self._retrieval_evaluators: Dict[int, RetrievalEvaluator] = {}
@@ -225,6 +255,15 @@ class RAGEngine:
 
         # KMS retrieval service (optional — injected at startup)
         self._kms_retrieval = kms_retrieval
+
+        # Feedback reranker (lazy-loaded on first use; shared across queries)
+        self._feedback_reranker: Optional[FeedbackReranker] = None
+
+    def _get_feedback_reranker(self) -> FeedbackReranker:
+        """Return the shared FeedbackReranker instance (lazy, thread-safe)."""
+        if self._feedback_reranker is None:
+            self._feedback_reranker = FeedbackReranker(db_path=self._db_path)
+        return self._feedback_reranker
 
     @property
     def thinking_client(self) -> LLMClient:
@@ -252,6 +291,168 @@ class RAGEngine:
             transformer = QueryTransformer(client)
             self._query_transformers[key] = transformer
         return transformer
+
+    def _get_query_planner(self, client: LLMClient) -> QueryPlanner:
+        """Return a per-client cached ``QueryPlanner``.
+
+        Mirrors the per-client caching pattern of :meth:`_get_query_transformer`.
+        A single shared instance is correct here because :class:`QueryPlanner`
+        does not bake model identity into its cache keys.
+        """
+        key = id(client)
+        planner = self._query_planners.get(key)
+        if planner is None:
+            planner = QueryPlanner(client)
+            self._query_planners[key] = planner
+        return planner
+
+    def _resolve_effective_prompt_sync(self, vault_id: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve the effective system-prompt content and version label for a vault's org.
+
+        Called per-query so the org-specific prompt is always current and is not
+        cached on the long-lived engine instance.
+
+        Returns:
+            Tuple of (prompt_content, prompt_version_label).
+            prompt_content is None when no org-specific override is set.
+            prompt_version_label is the version string (e.g. 'v3.5') or None.
+        """
+        if vault_id is None:
+            return None, None
+        try:
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.row_factory = sqlite3.Row
+                # Look up org_id for the vault
+                row = conn.execute(
+                    "SELECT org_id FROM vaults WHERE id = ?",
+                    (vault_id,),
+                ).fetchone()
+                if row is None or row["org_id"] is None:
+                    return None, None
+                org_id = row["org_id"]
+                # Resolve effective version via store
+                from app.services.prompt_store import PromptVersionStore
+
+                store = PromptVersionStore(conn)
+                effective = store.resolve_for_org(org_id)
+                if effective is not None:
+                    return effective.content, effective.version
+                return None, None
+            finally:
+                conn.close()
+        except Exception:
+            # Prompt resolution failures should not crash queries; fall through
+            # to normal builder resolution.
+            logger.warning(
+                "Could not resolve org-specific prompt for vault_id=%s", vault_id
+            )
+            return None, None
+
+    def _resolve_prompt_with_ab_sync(
+        self,
+        vault_id: Optional[int],
+        user_id: Optional[int],
+    ) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
+        """Resolve the effective prompt with A/B experiment layering (FR-007 part 3).
+
+        Resolution order:
+          1. 3.5 org override (if set for this vault's org)
+          2. A/B experiment override (if an active global experiment exists)
+
+        A/B layering is additional to the 3.5 org override: when an active
+        experiment exists, its assigned variant takes precedence over the 3.5
+        effective version for this query.  This lets experiments run across
+        all orgs uniformly (global experiment scope for v1 simplicity).
+
+        Exposure is recorded idempotently (INSERT OR IGNORE) so re-exposure of
+        the same subject_key to the same experiment does not double-count.
+
+        Args:
+            vault_id: Vault ID to look up org_id from (for 3.5 resolution).
+            user_id: User ID for per-user sticky A/B assignment (SC-017).
+                If None and vault_id is available, org_id is derived from
+                vault_id for an org-scoped fallback subject_key.
+
+        Returns:
+            Tuple of (prompt_content, ab_experiment_id, ab_variant, prompt_version).
+            ab_experiment_id and ab_variant are None when no active experiment
+            applies.  prompt_content may still be None (caller falls back to
+            built-in default).  prompt_version is the version label string
+            (e.g. 'v1', 'challenger', 'v3.5') or None.
+        """
+        # Step 1: 3.5 effective version (org override > global active)
+        effective_content, effective_version = self._resolve_effective_prompt_sync(vault_id)
+        prompt_version: Optional[str] = effective_version
+
+        # Step 2: Derive subject_key for A/B assignment (FR-007 part 3).
+        # Per-user sticky assignment when user_id is available (SC-017).
+        # Falls back to org-based key only when user_id is not available.
+        subject_key: Optional[str] = None
+        if user_id is not None:
+            subject_key = f"user:{user_id}"
+        # Note: org_id fallback is resolved inside the connection block below
+        # (the connection is opened once for both org lookup and A/B experiment).
+
+        # Step 3: A/B experiment — only when subject_key is available
+        ab_experiment_id: Optional[int] = None
+        ab_variant: Optional[str] = None
+        ab_content: Optional[str] = None
+
+        if subject_key is not None or vault_id is not None:
+            # Open one connection for both org_id lookup (if needed) and A/B experiment.
+            try:
+                conn = sqlite3.connect(self._db_path)
+                try:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    conn.row_factory = sqlite3.Row
+
+                    # Derive org-based subject_key if user_id was not available
+                    if subject_key is None and vault_id is not None:
+                        _row = conn.execute(
+                            "SELECT org_id FROM vaults WHERE id = ?",
+                            (vault_id,),
+                        ).fetchone()
+                        if _row is not None and _row["org_id"] is not None:
+                            subject_key = f"org:{_row['org_id']}"
+
+                    if subject_key is not None:
+                        from app.services.ab_testing import ABTestingService
+
+                        ab_service = ABTestingService(conn)
+                        active = ab_service.get_active_experiment()
+                        if active is not None:
+                            variant = ABTestingService.assign(active, subject_key)
+                            # Record exposure idempotently
+                            ab_service.record_exposure(active.id, subject_key, variant)
+                            # Pick the prompt content from the assigned variant
+                            if variant == "challenger":
+                                ab_content = active.challenger_version
+                            else:
+                                ab_content = active.control_version
+                            # ab_content is a VERSION STRING — look up its content
+                            from app.services.prompt_store import PromptVersionStore
+
+                            store = PromptVersionStore(conn)
+                            pv = store.get_version(ab_content)
+                            if pv is not None:
+                                effective_content = pv.content
+                            ab_experiment_id = active.id
+                            ab_variant = variant
+                            prompt_version = ab_content  # A/B version label
+                finally:
+                    conn.close()
+            except Exception:
+                # A/B failures should not crash queries; fall through with
+                # the 3.5 effective version and no A/B metadata.
+                logger.warning(
+                    "A/B experiment resolution failed for vault_id=%s: %s",
+                    vault_id,
+                    None,
+                )
+
+        return effective_content, ab_experiment_id, ab_variant, prompt_version
 
     # ------------------------------------------------------------------
     # Live settings properties
@@ -407,6 +608,10 @@ class RAGEngine:
         vault_id: Optional[int] = None,
         mode: Optional[ChatMode] = None,
         require_vault: bool = False,
+        user_id: Optional[int] = None,
+        temperature: Optional[float] = None,
+        retrieval_mode: Optional[str] = None,
+        citation_mode: Optional[str] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute a RAG query: embed, search, build prompt, call LLM.
 
@@ -414,6 +619,8 @@ class RAGEngine:
             require_vault: When True, raise ValueError if vault_id is None.
                 Callers that serve authenticated user contexts should set this
                 to prevent cross-vault data leakage via an unscoped query.
+            user_id: Authenticated user ID for per-user A/B subject_key derivation.
+                When provided, used as the A/B sticky subject instead of org_id.
         """
         if require_vault and vault_id is None:
             raise ValueError(
@@ -425,6 +632,51 @@ class RAGEngine:
             vault_id,
             stream,
         )
+        # v1 forward-compatible: accept retrieval_mode and citation_mode but only log them.
+        # Backend implements auto-retrieval only; non-auto values are accepted for API
+        # future-compatibility without changing behavior.
+        if retrieval_mode is not None:
+            logger.info(
+                "[query] retrieval_mode=%s — v1 forward-compatible (accepted, not implemented)",
+                retrieval_mode,
+            )
+        if citation_mode is not None:
+            logger.info(
+                "[query] citation_mode=%s — v1 forward-compatible (accepted, not implemented)",
+                citation_mode,
+            )
+
+        # ------------------------------------------------------------------
+        # FR-008: Agentic RAG — route through AgenticPlanner when enabled
+        # ------------------------------------------------------------------
+        if settings.agentic_rag_enabled:
+            logger.info("[query] Agentic RAG enabled — routing through AgenticPlanner")
+            try:
+                from app.services.agentic_tools import RetrievalTool, SynthesisTool
+
+                registry = ToolRegistry()
+                retrieval_tool = RetrievalTool(retrieval_top_k=self.retrieval_top_k, engine=self)
+                synthesis_tool = SynthesisTool(llm_client=self.llm_client)
+                registry.register(retrieval_tool)
+                registry.register(synthesis_tool)
+                planner = AgenticPlanner(registry, llm_client=self.llm_client)
+                result = await planner.plan_and_execute(user_input, vault_id=vault_id)
+                yield {"type": "content", "content": result.output}
+                yield {
+                    "type": "done",
+                    "sources": result.all_sources,
+                    "total": len(result.all_sources),
+                    "memories_used": [],
+                    "answer_source_mode": "agentic",
+                }
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[query] Agentic RAG failed (%s): %s — falling back to standard pipeline",
+                    type(exc).__name__,
+                    exc,
+                )
+                # Fall through to standard pipeline
 
         # Resolve effective mode and per-mode retrieval budget.
         from app.models.chat_mode import ChatMode  # local to avoid cycles
@@ -547,6 +799,35 @@ class RAGEngine:
                 transformed_queries = [('original', retrieval_query)]
 
         logger.debug("[query] transformed_queries=%s", transformed_queries)
+
+        # ------------------------------------------------------------------
+        # FR-002 part 1: Query planning — decompose complex questions into
+        # semantically distinct sub-queries for downstream orchestration.
+        # The plan is stored on trace.query_plan and consumed by task 3.2.
+        # ------------------------------------------------------------------
+        plan: List[str] = []  # Default: empty (used if planner is unavailable)
+        if active_client is not None:
+            try:
+                query_planner = self._get_query_planner(active_client)
+                plan = await query_planner.plan(retrieval_query)
+                trace.query_plan = plan
+                if len(plan) > 1:
+                    logger.info(
+                        "Query planner produced %d sub-queries",
+                        len(plan),
+                    )
+                    logger.debug(
+                        "Query plan: %s",
+                        plan,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Query planner failed (%s): %s, query_plan left empty",
+                    type(e).__name__,
+                    e,
+                )
+                trace.query_plan = []
+                plan = []
 
         # Embed all transformed queries concurrently
         # query_embeddings will be List[Tuple[str, List[float]]] where tuple is (variant_type, embedding)
@@ -694,6 +975,10 @@ class RAGEngine:
         # Decide whether raw document RAG is needed
         raw_rag_needed = _raw_rag_required(query_type, wiki_evidence)
 
+        # FR-015: Signal "Searching" stage to the SSE stream so the user sees
+        # feedback before the first content token arrives.
+        yield {"type": "stage", "stage": STAGE_SEARCHING}
+
         # Execute retrieval and evaluation
         fallback_reason: Optional[str] = None
         vector_results: List[Dict[str, Any]] = []
@@ -719,49 +1004,129 @@ class RAGEngine:
             "token_pack_skipped": 0,
             "token_pack_truncated": 0,
         }
-        if self.maintenance_mode:
-            fallback_reason = "RAG index is under maintenance"
-            vector_results = []
-        elif not raw_rag_needed:
-            logger.info("[query] Skipping raw RAG: wiki evidence directly answers (query_type=%s)", query_type)
-            vector_results = []
-        else:
+        # ------------------------------------------------------------------
+        # FR-002 part 2: Multi-sub-query orchestration — fan out independent
+        # retrievals for each sub-query and RRF-fuse the results before
+        # feeding the fused, deduplicated set into distillation.
+        # ------------------------------------------------------------------
+        # Flag to skip standard retrieval when multi-sub-query succeeded.
+        # Set to True when len(plan) > 1 and orchestration produces results.
+        _skip_standard_retrieval = False
+        _multi_sub_query_results: Optional[List[Dict[str, Any]]] = None
+        _multi_sub_score_type = "distance"
+        _multi_sub_relevance_hint: Optional[str] = None
+        _multi_sub_sub_queries_failed: List[str] = []
+        if len(plan) > 1:
             try:
-                vector_results, relevance_hint, eval_result, rerank_success, score_type, hybrid_status, fts_exceptions, rerank_status, variants_dropped, exact_match_promoted, token_pack_stats = await self._execute_retrieval(
-                    query_embeddings,
-                    user_input,
-                    vault_id,
+                (
+                    vector_results,
+                    fusion_applied,
+                    sub_queries_failed,
+                    score_type,
+                    relevance_hint,
+                ) = await self._orchestrate_sub_query_retrieval(
+                    plan=plan,
+                    vault_id=vault_id,
+                    user_input=user_input,
                     effective_alpha=effective_alpha,
-                    variants_dropped=variants_dropped,
-                    override_initial_top_k=effective_initial_top_k,
-                    override_reranker_top_n=effective_reranker_top_n,
+                    variants_dropped=[],
+                    effective_initial_top_k=effective_initial_top_k,
+                    effective_reranker_top_n=effective_reranker_top_n,
                     active_client=active_client,
                     mode=mode,
                 )
-                logger.info(
-                    "[query] _execute_retrieval returned: result_count=%d, first_3_distances=%s",
-                    len(vector_results),
-                    [r.get("_distance") for r in vector_results[:3]]
-                    if vector_results
-                    else "N/A",
-                )
+                _skip_standard_retrieval = True
+                _multi_sub_query_results = vector_results
+                _multi_sub_score_type = score_type
+                _multi_sub_relevance_hint = relevance_hint
+                _multi_sub_sub_queries_failed = sub_queries_failed or []
+                trace.fusion_used = fusion_applied
+                if sub_queries_failed:
+                    logger.info(
+                        "[query] %d sub-queries failed (degraded fusion): %s",
+                        len(sub_queries_failed),
+                        [sq[:40] for sq in sub_queries_failed],
+                    )
             except SearchSemaphoreTimeoutError:
                 raise
             except Exception as exc:
-                fallback_reason = str(exc)
+                logger.warning(
+                    "[query] Multi-sub-query orchestration failed (%s): %s, "
+                    "falling back to single-query retrieval",
+                    type(exc).__name__,
+                    exc,
+                )
+                _skip_standard_retrieval = False
+
+        if _skip_standard_retrieval and _multi_sub_query_results is not None:
+            # Use multi-sub-query results; skip standard retrieval.
+            trace.fused_hits = len(_multi_sub_query_results)
+            trace.fts_status = "disabled"
+            trace.fts_exceptions = 0
+            trace.rerank_status = "disabled"
+            trace.variants_dropped = list(_multi_sub_sub_queries_failed)
+            trace.exact_match_promoted = False
+            trace.token_pack_included = 0
+            trace.token_pack_skipped = 0
+            trace.token_pack_truncated = 0
+            vector_results = _multi_sub_query_results
+            score_type = _multi_sub_score_type
+            relevance_hint = _multi_sub_relevance_hint
+            eval_result = "CONFIDENT"
+            rerank_success = None
+            hybrid_status = "disabled"
+            fts_exceptions = 0
+            exact_match_promoted = False
+            token_pack_stats = {
+                "token_pack_included": 0,
+                "token_pack_skipped": 0,
+                "token_pack_truncated": 0,
+            }
+        elif not _skip_standard_retrieval:
+            # Standard single-query (or fallback) retrieval path.
+            if self.maintenance_mode:
+                fallback_reason = "RAG index is under maintenance"
                 vector_results = []
-                rerank_success = None  # Default for fallback case
-                rerank_status = "disabled"  # Default for fallback
-                score_type = "distance"  # Default for fallback
-                hybrid_status = "disabled"  # Default for fallback
-                fts_exceptions = 0  # Default for fallback
-                variants_dropped = []  # Safety net: reset on exception
-                exact_match_promoted = False  # Default for fallback
-                token_pack_stats = {
-                    "token_pack_included": 0,
-                    "token_pack_skipped": 0,
-                    "token_pack_truncated": 0,
-                }
+            elif not raw_rag_needed:
+                logger.info("[query] Skipping raw RAG: wiki evidence directly answers (query_type=%s)", query_type)
+                vector_results = []
+            else:
+                try:
+                    vector_results, relevance_hint, eval_result, rerank_success, score_type, hybrid_status, fts_exceptions, rerank_status, variants_dropped, exact_match_promoted, token_pack_stats = await self._execute_retrieval(
+                        query_embeddings,
+                        user_input,
+                        vault_id,
+                        effective_alpha=effective_alpha,
+                        variants_dropped=variants_dropped,
+                        override_initial_top_k=effective_initial_top_k,
+                        override_reranker_top_n=effective_reranker_top_n,
+                        active_client=active_client,
+                        mode=mode,
+                    )
+                    logger.info(
+                        "[query] _execute_retrieval returned: result_count=%d, first_3_distances=%s",
+                        len(vector_results),
+                        [r.get("_distance") for r in vector_results[:3]]
+                        if vector_results
+                        else "N/A",
+                    )
+                except SearchSemaphoreTimeoutError:
+                    raise
+                except Exception as exc:
+                    fallback_reason = str(exc)
+                    vector_results = []
+                    rerank_success = None  # Default for fallback case
+                    rerank_status = "disabled"  # Default for fallback
+                    score_type = "distance"  # Default for fallback
+                    hybrid_status = "disabled"  # Default for fallback
+                    fts_exceptions = 0  # Default for fallback
+                    variants_dropped = []  # Safety net: reset on exception
+                    exact_match_promoted = False  # Default for fallback
+                    token_pack_stats = {
+                        "token_pack_included": 0,
+                        "token_pack_skipped": 0,
+                        "token_pack_truncated": 0,
+                    }
 
         # Fetch indexed file IDs for atomic visibility filter (Issue #13)
         # Only chunks from fully-indexed files are returned — pending/processing files are hidden.
@@ -801,6 +1166,26 @@ class RAGEngine:
         )
         trace.filtered_hits = len(relevant_chunks)
 
+        # FR-010: feedback-driven reranking — apply historical user feedback
+        # to adjust retrieval ranking before distillation. Documents with positive
+        # net feedback receive a bounded additive bonus; negative feedback
+        # receives a bounded malus; documents with no feedback are unchanged.
+        if vault_id is not None and relevant_chunks and score_type == "rerank":
+            try:
+                fb_reranker = self._get_feedback_reranker()
+                relevant_chunks = await fb_reranker.rerank_async(relevant_chunks, vault_id)
+                logger.info(
+                    "[query] Feedback reranking applied: vault_id=%s, chunk_count=%d",
+                    vault_id,
+                    len(relevant_chunks),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Feedback reranking failed (%s): %s — continuing without adjustment",
+                    type(exc).__name__,
+                    exc,
+                )
+
         # Context distillation: deduplicate overlapping chunks and optionally synthesize
         if settings.context_distillation_enabled and relevant_chunks:
             try:
@@ -824,8 +1209,15 @@ class RAGEngine:
                     synthesis_client,
                 )
                 trace.distillation_before = len(relevant_chunks)
-                relevant_chunks = await distiller.distill(
+                distill_result = await distiller.distill(
                     user_input, relevant_chunks, eval_result
+                )
+                relevant_chunks = distill_result.sources
+                sentence_provenance = distill_result.sentence_provenance
+                self._last_distillation_provenance = sentence_provenance
+                logger.info(
+                    "[query] Context distillation: kept %d sentences with provenance",
+                    len(sentence_provenance),
                 )
                 trace.distillation_after = len(relevant_chunks)
                 logger.info(
@@ -904,19 +1296,41 @@ class RAGEngine:
         if memory_task is not None:
             memories = await memory_task
 
-        # Build messages using prompt builder service
+        # FR-015: Signal "Reading" stage — retrieval + distillation are complete;
+        # the LLM now reads the assembled context.
+        yield {"type": "stage", "stage": STAGE_READING}
+
+        # Build messages using prompt builder service.
+        # Resolve the org-specific prompt (if any) per-query so different orgs
+        # always get their own version without stale caching on the builder.
+        # FR-007 part 3: A/B experiment layering — if an active global experiment
+        # exists, its assigned variant takes precedence over the 3.5 effective version.
+        effective_prompt_override, ab_eid, ab_var, p_version = await asyncio.to_thread(
+            self._resolve_prompt_with_ab_sync, vault_id, user_id
+        )
+        if ab_eid is not None:
+            trace.ab_experiment_id = ab_eid
+            trace.ab_variant = ab_var
+        if p_version is not None:
+            trace.prompt_version = p_version
         messages = self.prompt_builder.build_messages(
             user_input, chat_history, relevant_chunks, memories, relevance_hint,
             wiki_evidence=wiki_evidence if wiki_evidence else None,
             kms_evidence=kms_evidence if kms_evidence else None,
+            system_prompt_override=effective_prompt_override,
         )
 
         # Stream or non-stream LLM response. Capture the assembled
         # content so citation labels can be parsed for the trace.
         assembled_response: List[str] = []
+
+        # FR-015: Signal "Drafting" stage — the LLM is now generating tokens.
+        yield {"type": "stage", "stage": STAGE_DRAFTING}
+
         if stream:
             async for chunk in self._stream_llm_response(
-                messages, client=active_client, max_tokens=effective_max_tokens
+                messages, client=active_client, max_tokens=effective_max_tokens,
+                temperature=temperature,
             ):
                 chunk_type = chunk.get("type", "unknown")
                 logger.debug("[query] Yielding '%s' chunk (stream)", chunk_type)
@@ -925,7 +1339,8 @@ class RAGEngine:
                 yield chunk
         else:
             async for chunk in self._get_llm_response(
-                messages, client=active_client, max_tokens=effective_max_tokens
+                messages, client=active_client, max_tokens=effective_max_tokens,
+                temperature=temperature,
             ):
                 chunk_type = chunk.get("type", "unknown")
                 logger.debug("[query] Yielding '%s' chunk (non-stream)", chunk_type)
@@ -1005,11 +1420,43 @@ class RAGEngine:
             trace.invalid_citations = []
             trace.answer_supported = None
 
+        # Citation confidence scoring and unverifiable-claims (FR-004).
+        # Build source texts from the distilled sources so we can score citation
+        # alignment with retrieved evidence. v1 uses full-source lexical overlap;
+        # provenance-narrowed scoring is reserved for a future iteration.
+        try:
+            source_texts = [
+                s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")
+                for s in done_msg.get("sources", [])
+            ]
+            confidence_result = score_citations(
+                full_response,
+                source_texts,
+                sentence_provenance=self._last_distillation_provenance,
+            )
+            trace.citation_confidence = confidence_result.citation_confidence
+            trace.unverifiable_claims = list(confidence_result.unverifiable_claims)
+        except Exception:  # pragma: no cover — defensive
+            trace.citation_confidence = {}
+            trace.unverifiable_claims = []
+
         # Always log the trace; embed in done payload only when the operator
         # opts in via ``settings.rag_trace_in_response``.
         trace.log()
         if settings.rag_trace_in_response:
             done_msg["trace"] = trace.to_dict()
+
+        # SC-015/SC-017: expose A/B experiment metadata at top level of done
+        # message so chat.py can read it regardless of rag_trace_in_response.
+        done_msg["prompt_version"] = trace.prompt_version
+        done_msg["ab_experiment_id"] = trace.ab_experiment_id
+        done_msg["ab_variant"] = trace.ab_variant
+
+        # SC-009: expose citation confidence + unverifiable claims at top level
+        # so chat.py's SSE done payload carries them to the frontend.
+        done_msg["citation_confidence"] = trace.citation_confidence
+        done_msg["unverifiable_claims"] = list(trace.unverifiable_claims)
+        done_msg["fusion_used"] = trace.fusion_used
 
         logger.info(
             "[query] Yielding 'done': sources_count=%d, memories_used=%d",
@@ -1017,6 +1464,237 @@ class RAGEngine:
             len(done_msg.get("memories_used", [])),
         )
         yield done_msg
+
+    # ------------------------------------------------------------------
+    # FR-002 part 2: Multi-sub-query orchestration + RRF fusion
+    # ------------------------------------------------------------------
+
+    async def _orchestrate_sub_query_retrieval(
+        self,
+        plan: List[str],
+        vault_id: Optional[int],
+        user_input: str,
+        effective_alpha: float,
+        variants_dropped: List[str],
+        effective_initial_top_k: int,
+        effective_reranker_top_n: int,
+        active_client: Optional[Any],
+        mode: Optional[Any],
+    ) -> Tuple[List[Dict[str, Any]], bool, List[str], str, Optional[str]]:
+        """Dispatch independent retrieval for each sub-query and fuse via RRF.
+
+        Called when ``len(plan) > 1`` after query planning (FR-002 part 1).
+        Each sub-query is embedded and retrieved independently; results are
+        fused using Reciprocal Rank Fusion (RRF, k=60) and deduplicated by
+        ``(file_id, text)`` before being returned for downstream distillation.
+
+        Args:
+            plan: List of sub-query strings from QueryPlanner.plan().
+            vault_id: Vault scope for retrieval.
+            user_input: Original user query (used as fallback if all sub-queries fail).
+            effective_alpha: Hybrid search alpha weight.
+            variants_dropped: Accumulated list of variant types that failed.
+            effective_initial_top_k: Initial retrieval top-k.
+            effective_reranker_top_n: Reranker top-n.
+            active_client: LLM client for reranking/CRAG evaluation.
+            mode: Chat mode.
+
+        Returns:
+            Tuple of (fused_vector_results, fusion_applied, failed_sub_queries,
+            score_type, relevance_hint). ``fusion_applied`` is True when RRF
+            was applied; False when falling back to single-query retrieval.
+            ``failed_sub_queries`` lists sub-query strings that failed.
+        """
+        logger.info(
+            "[_orchestrate_sub_query_retrieval] %d sub-queries to orchestrate",
+            len(plan),
+        )
+
+        # Phase 1: Embed each sub-query independently.
+        async def _embed_sub_query(sq: str) -> Tuple[str, Optional[List[float]], Optional[str]]:
+            try:
+                emb = await self.embedding_service.embed_single(sq)
+                return sq, emb, None
+            except Exception as exc:
+                logger.warning(
+                    "[_orchestrate_sub_query_retrieval] sub-query embedding failed: %s (%s)",
+                    sq[:60],
+                    exc,
+                )
+                return sq, None, str(exc)
+
+        embed_tasks = [_embed_sub_query(sq) for sq in plan]
+        embed_results = await asyncio.gather(*embed_tasks, return_exceptions=True)
+
+        # Collect successful embeddings; track failures.
+        sub_query_embeddings: List[Tuple[str, List[float]]] = []
+        failed_sub_queries: List[str] = []
+        for i, result in enumerate(embed_results):
+            if isinstance(result, BaseException):
+                sq = plan[i] if i < len(plan) else f"<sub_query_{i}>"
+                failed_sub_queries.append(sq)
+                logger.warning(
+                    "[_orchestrate_sub_query_retrieval] embed task %d (%s) raised: %s",
+                    i,
+                    sq[:60],
+                    result,
+                )
+            else:
+                sq, emb, exc = result
+                if emb is None:
+                    failed_sub_queries.append(sq)
+                    if exc:
+                        logger.warning(
+                            "[_orchestrate_sub_query_retrieval] sub-query '%s' embedding failed: %s",
+                            sq[:60],
+                            exc,
+                        )
+                else:
+                    sub_query_embeddings.append((sq, emb))
+
+        # If ALL sub-query embeddings failed, fall back to single-query retrieval.
+        if not sub_query_embeddings:
+            logger.warning(
+                "[_orchestrate_sub_query_retrieval] all sub-query embeddings failed, "
+                "falling back to single-query retrieval",
+            )
+            single_emb = await self.embedding_service.embed_single(user_input)
+            (
+                vector_results,
+                relevance_hint,
+                eval_result,
+                rerank_success,
+                score_type,
+                hybrid_status,
+                fts_exceptions,
+                rerank_status,
+                variants_dropped_out,
+                exact_match_promoted,
+                token_pack_stats,
+            ) = await self._execute_retrieval(
+                [("original", single_emb)],
+                user_input,
+                vault_id,
+                effective_alpha=effective_alpha,
+                variants_dropped=variants_dropped,
+                override_initial_top_k=effective_initial_top_k,
+                override_reranker_top_n=effective_reranker_top_n,
+                active_client=active_client,
+                mode=mode,
+            )
+            return vector_results, False, failed_sub_queries, score_type, relevance_hint
+
+        # Phase 2: Run retrieval for each sub-query independently.
+        retrieval_tasks: List[Tuple[str, asyncio.Task]] = []
+        for sq, emb in sub_query_embeddings:
+            task = asyncio.create_task(
+                self._execute_retrieval(
+                    [(sq, emb)],
+                    user_input,
+                    vault_id,
+                    effective_alpha=effective_alpha,
+                    variants_dropped=list(variants_dropped),
+                    override_initial_top_k=effective_initial_top_k,
+                    override_reranker_top_n=effective_reranker_top_n,
+                    active_client=active_client,
+                    mode=mode,
+                )
+            )
+            retrieval_tasks.append((sq, task))
+
+        gathered = await asyncio.gather(
+            *[task for _, task in retrieval_tasks], return_exceptions=True
+        )
+
+        per_sub_results: List[List[Dict[str, Any]]] = []
+        for i, result in enumerate(gathered):
+            sq = retrieval_tasks[i][0] if i < len(retrieval_tasks) else f"<sub_query_{i}>"
+            if isinstance(result, BaseException):
+                failed_sub_queries.append(sq)
+                logger.warning(
+                    "[_orchestrate_sub_query_retrieval] sub-query '%s' retrieval failed: %s",
+                    sq[:60],
+                    result,
+                )
+                per_sub_results.append([])
+            else:
+                # Unpack the 12-element tuple; vector_results is at index 0.
+                vr = result[0] if result else []
+                per_sub_results.append(vr)
+
+        successful_results = [r for r in per_sub_results if r]
+        if not successful_results:
+            logger.warning(
+                "[_orchestrate_sub_query_retrieval] all sub-query retrievals failed, "
+                "falling back to single-query retrieval",
+            )
+            single_emb = await self.embedding_service.embed_single(user_input)
+            (
+                vector_results,
+                relevance_hint,
+                eval_result,
+                rerank_success,
+                score_type,
+                hybrid_status,
+                fts_exceptions,
+                rerank_status,
+                variants_dropped_out,
+                exact_match_promoted,
+                token_pack_stats,
+            ) = await self._execute_retrieval(
+                [("original", single_emb)],
+                user_input,
+                vault_id,
+                effective_alpha=effective_alpha,
+                variants_dropped=variants_dropped,
+                override_initial_top_k=effective_initial_top_k,
+                override_reranker_top_n=effective_reranker_top_n,
+                active_client=active_client,
+                mode=mode,
+            )
+            return vector_results, False, failed_sub_queries, score_type, relevance_hint
+
+        # Phase 3: RRF fusion of per-sub-query results (k=60, uniform weights).
+        # Deduplicate by (file_id, text) after fusion.
+        fused = rrf_fuse(
+            successful_results,
+            k=_SUB_QUERY_RRF_K,
+            limit=None,
+        )
+
+        # Deduplicate by (file_id, text), preserving RRF rank order (first-seen wins).
+        seen: Set[Tuple[str, str]] = set()
+        deduped: List[Dict[str, Any]] = []
+        for record in fused:
+            key = (str(record.get("file_id", "")), record.get("text", ""))
+            if key not in seen:
+                seen.add(key)
+                deduped.append(record)
+
+        # Cap to effective_initial_top_k to match standard retrieval path sizing.
+        deduped = deduped[:effective_initial_top_k]
+
+        logger.info(
+            "[_orchestrate_sub_query_retrieval] fused %d sub-query result lists "
+            "→ %d raw fused → %d after dedup",
+            len(successful_results),
+            len(fused),
+            len(deduped),
+        )
+
+        # Extract score_type and relevance_hint from the first successful retrieval.
+        first_result = None
+        for result in gathered:
+            if not isinstance(result, BaseException) and result:
+                first_result = result
+                break
+        score_type = "distance"
+        relevance_hint: Optional[str] = None
+        if first_result is not None:
+            score_type = first_result[4] if len(first_result) > 4 else "distance"
+            relevance_hint = first_result[1] if len(first_result) > 1 else None
+
+        return deduped, True, failed_sub_queries, score_type, relevance_hint
 
     async def _execute_retrieval(
         self,
@@ -1441,6 +2119,7 @@ class RAGEngine:
         messages: List[Dict[str, str]],
         client: Optional[LLMClient] = None,
         max_tokens: int = 32768,
+        temperature: Optional[float] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stream LLM response chunks.
 
@@ -1490,6 +2169,7 @@ class RAGEngine:
         messages: List[Dict[str, str]],
         client: Optional[LLMClient] = None,
         max_tokens: int = 32768,
+        temperature: Optional[float] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Get non-streaming LLM response.
 
@@ -1953,3 +2633,133 @@ class RAGEngine:
         """Convert chunk to source metadata (backward compatibility)."""
         self._ensure_services()
         return self.document_retrieval.to_source_metadata(chunk)
+
+    # ------------------------------------------------------------------
+    # Retrieval-only query (used by LiveEvalAdapter)
+    # ------------------------------------------------------------------
+
+    async def query_retrieve_only(
+        self,
+        query: str,
+        vault_id: Optional[int] = None,
+        top_k: Optional[int] = None,
+    ) -> List[str]:
+        """Return the ordered list of retrieved file_ids for a query.
+
+        This method short-circuits the full RAG pipeline — it performs
+        embedding, vector/keyword search, fusion, reranking, and relevance
+        filtering, but skips LLM generation, citation parsing, and distillation.
+        The result is the ranked list of file_ids the live pipeline would
+        retrieve for the given query.
+
+        Used by ``LiveEvalAdapter.run_live`` to drive retrieval-quality
+        benchmarks without requiring a full end-to-end RAG run.
+
+        Args:
+            query: Natural-language query string.
+            vault_id: Optional vault scope. When None the query is unscoped.
+            top_k: Maximum number of file_ids to return. Defaults to
+                ``self.retrieval_top_k``.
+
+        Returns:
+            Ordered list of file_ids (rank 1 = most relevant per the live
+            retrieval pipeline scoring).
+        """
+        from app.services.query_transformer import is_followup_query
+
+        effective_top_k = top_k if top_k is not None else self.retrieval_top_k
+
+        # Build query embeddings (same logic as query() but simplified)
+        transformed_queries: List[Tuple[str, str]] = [("original", query)]
+
+        skip_followup_rewrite = is_followup_query(query)
+        if (
+            settings.query_transformation_enabled
+            and not skip_followup_rewrite
+        ):
+            try:
+                query_transformer = self._get_query_transformer(self.llm_client)
+                transformed_queries = await query_transformer.transform(query)
+            except Exception as e:
+                logger.warning(
+                    "Query transformation failed (%s): %s, using original query only",
+                    type(e).__name__,
+                    e,
+                )
+                transformed_queries = [("original", query)]
+
+        # Embed all transformed queries concurrently
+        async def _embed_one(vtype: str, text: str) -> List[float]:
+            if vtype == "hyde":
+                return await self.embedding_service.embed_passage(text)
+            return await self.embedding_service.embed_single(text)
+
+        embed_tasks = [_embed_one(vt, t) for vt, t in transformed_queries]
+        raw_embeddings = await asyncio.gather(*embed_tasks, return_exceptions=True)
+
+        query_embeddings: List[Tuple[str, List[float]]] = []
+        variants_dropped: List[str] = []
+
+        for (variant_type, _), result in zip(transformed_queries, raw_embeddings):
+            if isinstance(result, BaseException):
+                if variant_type == "original":
+                    raise RAGEngineError(f"Original query embedding failed: {result}") from result
+                logger.warning(
+                    "Query embedding failed for variant '%s': %s",
+                    variant_type,
+                    result,
+                )
+                variants_dropped.append(variant_type)
+            else:
+                query_embeddings.append((variant_type, result))
+
+        if not query_embeddings:
+            raise RAGEngineError("Unable to encode any query variants")
+
+        # Execute retrieval (reuse internal method)
+        effective_alpha = self.hybrid_alpha
+
+        # Fetch indexed file IDs for atomic visibility filter (Issue #13)
+        indexed_file_ids: Optional[Set[str]] = None
+        try:
+            indexed_file_ids = await asyncio.to_thread(
+                self._get_indexed_file_ids, vault_id
+            )
+        except Exception as _exc:
+            logger.warning(
+                "Failed to fetch indexed_file_ids (visibility filter disabled): %s",
+                _exc,
+            )
+
+        try:
+            vector_results, _, _, _, _, _, _, _, _, _, _ = await self._execute_retrieval(
+                query_embeddings,
+                query,
+                vault_id,
+                effective_alpha=effective_alpha,
+                variants_dropped=variants_dropped,
+            )
+        except Exception as exc:
+            logger.warning(
+                "query_retrieve_only: retrieval failed (%s), returning empty list",
+                exc,
+            )
+            return []
+
+        # Filter to indexed files only
+        if indexed_file_ids is not None:
+            vector_results = [
+                r for r in vector_results
+                if r.get("file_id") in indexed_file_ids
+            ]
+
+        # Apply relevance filter and top_k cap
+        self._sync_document_retrieval_settings()
+        relevant_chunks = await self.document_retrieval.filter_relevant(
+            vector_results,
+            reranked=False,
+            indexed_file_ids=indexed_file_ids,
+        )
+
+        # Return ordered file_ids
+        return [src.file_id for src in relevant_chunks[:effective_top_k] if src.file_id]

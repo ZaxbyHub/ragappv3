@@ -69,7 +69,7 @@ from fastapi.testclient import TestClient
 from app.api.deps import get_db, get_vector_store
 from app.config import settings
 from app.main import app
-from app.services.auth_service import create_access_token
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
 class FailOnConnection:
@@ -231,6 +231,8 @@ class TestVaultTransactionAdversarial(unittest.TestCase):
 
     def setUp(self):
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
         self._temp_dir = tempfile.mkdtemp()
 
         self._original_jwt_secret = settings.jwt_secret_key
@@ -317,7 +319,8 @@ class TestVaultTransactionAdversarial(unittest.TestCase):
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
     def _token(self, user_id, username, role):
-        return create_access_token(user_id, username, role)
+        return create_access_token(user_id, username, role,
+                                client_fingerprint=compute_client_fingerprint(""))
 
     def _auth_headers(self, token):
         return {"Authorization": f"Bearer {token}"}

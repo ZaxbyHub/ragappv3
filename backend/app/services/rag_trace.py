@@ -47,6 +47,10 @@ class RAGTrace:
     cited_sources: List[str] = field(default_factory=list)
     cited_memories: List[str] = field(default_factory=list)
     invalid_citations: List[str] = field(default_factory=list)
+    # FR-004: per-citation confidence scores (label -> Jaccard overlap [0,1])
+    citation_confidence: Dict[str, float] = field(default_factory=dict)
+    # FR-004: answer sentences with no citation and low source overlap
+    unverifiable_claims: List[str] = field(default_factory=list)
     answer_supported: Optional[bool] = None
     exact_match_promoted: bool = False
     multi_scale_used: bool = False
@@ -59,6 +63,18 @@ class RAGTrace:
     answer_source_mode: str = "documents"
     # Set when a short/referential follow-up is rewritten before retrieval.
     followup_rewrite: Optional[str] = None
+    # FR-002 part 1: LLM-generated sub-query plan from QueryPlanner.
+    # Populated by RAGEngine._run_query_plan() during query processing.
+    # Consumed by task 3.2 (orchestration/fusion). Empty list means
+    # the planner was not invoked or returned no plan.
+    query_plan: List[str] = field(default_factory=list)
+    # FR-002 part 2: Set True when sub-query RRF fusion was applied.
+    fusion_used: bool = False
+    # FR-007 part 3: A/B experiment observability.
+    ab_experiment_id: Optional[int] = None
+    ab_variant: Optional[str] = None  # 'control' | 'challenger' | None
+    # SC-015: effective prompt version label used for this query (e.g. 'v1', 'v3.5-org-override')
+    prompt_version: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -84,6 +100,8 @@ class RAGTrace:
             "cited_sources": list(self.cited_sources),
             "cited_memories": list(self.cited_memories),
             "invalid_citations": list(self.invalid_citations),
+            "citation_confidence": dict(self.citation_confidence),
+            "unverifiable_claims": list(self.unverifiable_claims),
             "answer_supported": self.answer_supported,
             "exact_match_promoted": self.exact_match_promoted,
             "multi_scale_used": self.multi_scale_used,
@@ -94,6 +112,11 @@ class RAGTrace:
             "wiki_filtered": list(self.wiki_filtered),
             "answer_source_mode": self.answer_source_mode,
             "followup_rewrite": self.followup_rewrite,
+            "query_plan": list(self.query_plan),
+            "fusion_used": self.fusion_used,
+            "ab_experiment_id": self.ab_experiment_id,
+            "ab_variant": self.ab_variant,
+            "prompt_version": self.prompt_version,
         }
 
     def log(self) -> None:

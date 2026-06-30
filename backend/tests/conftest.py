@@ -204,30 +204,33 @@ def _cache_bcrypt_hash_for_test_passwords():
     # auth_service.hash_password. The latter is bypassed by tests that do
     # `from app.services.auth_service import hash_password` at module level.
     original_pwd_hash = _auth_module.pwd_context.hash
-    common_password = "pass123"
-
-    def _get_cached_hash(password: str) -> str:
-        if password not in _bcrypt_hash_cache:
-            _bcrypt_hash_cache[password] = original_pwd_hash(password)
-        return _bcrypt_hash_cache[password]
+    original_pwd_verify = _auth_module.pwd_context.verify
+    _all_hash_cache = {}  # password -> hash (populated lazily by hash calls)
 
     def _fast_pwd_hash(secret, *args, **kwargs):
-        if isinstance(secret, str) and secret == common_password:
-            return _get_cached_hash(secret)
-        return original_pwd_hash(secret, *args, **kwargs)
+        secret_str = str(secret) if not isinstance(secret, str) else secret
+        if secret_str not in _all_hash_cache:
+            _all_hash_cache[secret_str] = original_pwd_hash(secret, *args, **kwargs)
+        return _all_hash_cache[secret_str]
 
-    # Monkey-patch pwd_context.hash (the underlying method that hash_password calls)
+    def _fast_pwd_verify(secret, hash_value, *args, **kwargs):
+        secret_str = str(secret) if not isinstance(secret, str) else secret
+        for pwd, cached_hash in _all_hash_cache.items():
+            if hash_value == cached_hash:
+                return secret_str == pwd
+        return original_pwd_verify(secret, hash_value, *args, **kwargs)
+
     _auth_module.pwd_context.hash = _fast_pwd_hash
+    _auth_module.pwd_context.verify = _fast_pwd_verify
 
     yield
 
-    # Restore the original on session teardown (best-effort)
+    # Restore the originals on session teardown (best-effort)
     try:
         _auth_module.pwd_context.hash = original_pwd_hash
+        _auth_module.pwd_context.verify = original_pwd_verify
     except Exception:
         pass
-
-
 def pytest_configure(config):
     """Called before test collection.
 

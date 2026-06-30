@@ -10,6 +10,9 @@
  * The "Test connection" button is wired to POST /settings/curator/test.
  * The local-model UX hint is rendered inline so operators know the
  * ALLOW_LOCAL_CURATOR=1 opt-in exists.
+ *
+ * When vaultId is provided, a per-vault enrichment override toggle is
+ * also shown (admin vault members only).
  */
 import { useEffect, useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -26,8 +29,11 @@ import {
 } from "@/components/ui/select";
 import { Loader2, ShieldCheck, AlertTriangle, CheckCircle2, XCircle } from "lucide-react";
 import { NumberInput } from "./NumberInput";
-import { testCuratorConnection } from "@/lib/api";
-
+import {
+  testCuratorConnection,
+  toggleVaultEnrichment,
+  getVault,
+} from "@/lib/api";
 /**
  * Tiny "always reflect the latest value" ref helper. Used by handleTest
  * so the post-await guard can compare the URL/model the test was
@@ -44,6 +50,7 @@ import type { SettingsErrors, SettingsFormData } from "@/stores/useSettingsStore
 export interface WikiCuratorSettingsProps {
   formData: SettingsFormData;
   errors: SettingsErrors;
+  vaultId?: number | null;
   onChange: <K extends keyof SettingsFormData>(
     field: K,
     value: SettingsFormData[K],
@@ -53,10 +60,71 @@ export interface WikiCuratorSettingsProps {
 export function WikiCuratorSettings({
   formData,
   errors,
+  vaultId,
   onChange,
 }: WikiCuratorSettingsProps) {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<CuratorTestResult | null>(null);
+
+  // Per-vault enrichment override state
+  const [vaultEnrichment, setVaultEnrichment] = useState<{
+    enrichment_enabled: boolean | null;
+    effective_enrichment_enabled: boolean;
+    current_user_permission?: string | null;
+  } | null>(null);
+  const [togglingEnrichment, setTogglingEnrichment] = useState(false);
+
+  // Fetch vault enrichment state when vaultId changes
+  useEffect(() => {
+    if (!vaultId) {
+      setVaultEnrichment(null);
+      return;
+    }
+    getVault(vaultId)
+      .then((vault) => {
+        setVaultEnrichment({
+          enrichment_enabled: vault.enrichment_enabled ?? null,
+          effective_enrichment_enabled: vault.effective_enrichment_enabled,
+          current_user_permission: vault.current_user_permission,
+        });
+      })
+      .catch(() => {
+        setVaultEnrichment(null);
+      });
+  }, [vaultId]);
+
+  const handleToggleEnrichment = async (checked: boolean) => {
+    if (!vaultId) return;
+    setTogglingEnrichment(true);
+    try {
+      const updated = await toggleVaultEnrichment(vaultId, {
+        enabled: checked,
+      });
+      setVaultEnrichment({
+        enrichment_enabled: updated.enrichment_enabled ?? null,
+        effective_enrichment_enabled: updated.effective_enrichment_enabled,
+        current_user_permission: updated.current_user_permission,
+      });
+    } catch {
+      // On error, refetch to restore correct state
+      if (vaultId) {
+        getVault(vaultId)
+          .then((vault) =>
+            setVaultEnrichment({
+              enrichment_enabled: vault.enrichment_enabled ?? null,
+              effective_enrichment_enabled: vault.effective_enrichment_enabled,
+              current_user_permission: vault.current_user_permission,
+            }),
+          )
+          .catch(() => setVaultEnrichment(null));
+      }
+    } finally {
+      setTogglingEnrichment(false);
+    }
+  };
+
+  const canToggleEnrichment =
+    vaultEnrichment?.current_user_permission === "admin";
 
   // Clear any stale test result when the operator toggles curator off,
   // changes the URL, or changes the model — the previous OK / error no
@@ -171,6 +239,39 @@ export function WikiCuratorSettings({
             />
             <Label htmlFor="wiki-lint-enabled" className="text-sm font-normal">Wiki lint enabled</Label>
           </div>
+          {vaultId && (
+            <div className="flex items-center gap-2 pt-2 border-t mt-3">
+              <Checkbox
+                id="vault-enrichment-enabled"
+                checked={vaultEnrichment?.effective_enrichment_enabled ?? false}
+                onCheckedChange={(v) => handleToggleEnrichment(Boolean(v))}
+                disabled={togglingEnrichment || !canToggleEnrichment}
+              />
+              <Label
+                htmlFor="vault-enrichment-enabled"
+                className="text-sm font-normal flex flex-col gap-0.5"
+              >
+                <span>Per-vault document enrichment</span>
+                {!canToggleEnrichment && vaultEnrichment && (
+                  <span className="text-xs text-muted-foreground">
+                    {vaultEnrichment.enrichment_enabled === null
+                      ? `Inherits global setting (${vaultEnrichment.effective_enrichment_enabled ? "on" : "off"})`
+                      : vaultEnrichment.enrichment_enabled
+                        ? "Vault override: on"
+                        : "Vault override: off"}
+                  </span>
+                )}
+                {canToggleEnrichment && vaultEnrichment && vaultEnrichment.enrichment_enabled === null && (
+                  <span className="text-xs text-muted-foreground">
+                    No vault override — inherits global
+                  </span>
+                )}
+              </Label>
+              {togglingEnrichment && (
+                <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />
+              )}
+            </div>
+          )}
         </CardContent>
       </Card>
 

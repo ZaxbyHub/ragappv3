@@ -349,6 +349,7 @@ function SettingsPageContent({
           <WikiCuratorSettings
             formData={formData}
             errors={errors}
+            vaultId={activeVaultId}
             onChange={(f, v) =>
               updateFormField(f, v as SettingsFormData[typeof f])
             }

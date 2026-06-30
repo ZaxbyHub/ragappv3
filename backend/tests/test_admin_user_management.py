@@ -23,7 +23,13 @@ os.environ["JWT_SECRET_KEY"] = (
 os.environ["USERS_ENABLED"] = "true"
 
 # Now safe to import app modules
-from app.services.auth_service import create_access_token, hash_password
+from backend.tests.schema_constants import TEST_SCHEMA
+
+from app.services.auth_service import (
+    compute_client_fingerprint,
+    create_access_token,
+    hash_password,
+)
 
 
 def setup_test_db(db_path: str) -> sqlite3.Connection:
@@ -31,27 +37,9 @@ def setup_test_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.executescript(TEST_SCHEMA)
 
-    # Create users table with auth extensions
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            hashed_password TEXT NOT NULL,
-            full_name TEXT DEFAULT '',
-            role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('superadmin','admin','member','viewer')),
-            is_active INTEGER NOT NULL DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_login_at TIMESTAMP,
-            must_change_password INTEGER NOT NULL DEFAULT 0,
-            failed_attempts INTEGER NOT NULL DEFAULT 0,
-            locked_until TIMESTAMP
-        )
-    """)
-
-    # Create indexes
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role)")
+    # Extra index on locked_until (local supplement)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_users_locked_until ON users(locked_until)"
     )
@@ -82,7 +70,8 @@ def create_user(
 
 def get_token(user_id: int, username: str, role: str) -> str:
     """Generate a JWT token for a test user."""
-    return create_access_token(user_id, username, role)
+    return create_access_token(user_id, username, role,
+                            client_fingerprint=compute_client_fingerprint(""))
 
 
 class TestUpdateUser:
@@ -156,6 +145,8 @@ class TestUpdateUser:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -384,6 +375,8 @@ class TestAdminResetPassword:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -458,7 +451,7 @@ class TestAdminResetPassword:
         )
         hashed = cursor.fetchone()[0]
         assert hashed != "SecretPass999"
-        assert hashed.startswith("$2b$")  # bcrypt hash prefix
+        assert hashed.startswith("$argon2id$")  # Argon2id hash prefix
 
     def test_non_admin_gets_403(self):
         """Non-admin user gets 403 Forbidden."""
@@ -610,6 +603,8 @@ class TestUpdateUserActiveStatus:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 
@@ -866,6 +861,8 @@ class TestActiveStatusWithMultipleAdmins:
         settings.jwt_secret_key = os.environ["JWT_SECRET_KEY"]
 
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
 
         yield
 

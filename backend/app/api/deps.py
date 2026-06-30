@@ -20,7 +20,9 @@ from app.security import get_csrf_manager  # noqa: F401
 from app.services.auth_service import (
     TokenExpiredError,
     TokenInvalidError,
+    compute_client_fingerprint,
     decode_access_token,
+    is_access_token_denied,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,6 +281,27 @@ async def get_current_active_user(
             detail="token_invalid",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Denylist check: verify when jti is present, skip when absent (backward compatible).
+    jti = payload.get("jti")
+    if jti and is_access_token_denied(db, jti):
+        raise HTTPException(
+            status_code=401,
+            detail="token_invalid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Fingerprint check: verify when present, skip when absent (backward compatible).
+    token_fpt = payload.get("fpt")
+    if token_fpt is not None:
+        current_ua = request.headers.get("user-agent", "")
+        current_fpt = compute_client_fingerprint(current_ua)
+        if not secrets.compare_digest(token_fpt, current_fpt):
+            raise HTTPException(
+                status_code=401,
+                detail="token_invalid",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     try:
         user_id = int(payload.get("sub", 0))

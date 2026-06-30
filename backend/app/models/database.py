@@ -27,7 +27,9 @@ CREATE TABLE IF NOT EXISTS vaults (
     org_id INTEGER,
     visibility TEXT DEFAULT 'private' CHECK (visibility IN ('private', 'org', 'public')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    enrichment_enabled INTEGER
+    -- NULL = inherit global chunk_enrichment_enabled; 1 = on; 0 = off
 );
 
 -- Files table: stores uploaded file metadata
@@ -66,6 +68,8 @@ CREATE TABLE IF NOT EXISTS files (
     enrichment_status TEXT,
     enrichment_error TEXT,
     enrichment_updated_at TIMESTAMP,
+    enrichment_enabled INTEGER,
+    -- NULL = inherit vault/global; 1 = on; 0 = off (per-file override)
     folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
     FOREIGN KEY (vault_id) REFERENCES vaults(id)
 );
@@ -281,6 +285,25 @@ CREATE TABLE IF NOT EXISTS org_members (
     UNIQUE(org_id, user_id)
 );
 
+-- Organization invites table: expiring, resendable, revocable invite tokens
+CREATE TABLE IF NOT EXISTS org_invites (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL CHECK (role IN ('admin','member')),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by_user_id INTEGER,
+    accepted_at TEXT,
+    accepted_by_user_id INTEGER,
+    revoked_at TEXT,
+    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (accepted_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_org_invites_token_hash ON org_invites(token_hash);
+
 -- Groups table: stores permission groups within organizations
 CREATE TABLE IF NOT EXISTS groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -315,6 +338,32 @@ CREATE TABLE IF NOT EXISTS user_sessions (
     user_agent TEXT,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+-- Access-token denylist: stores revoked access-token jti values so they
+-- can be rejected before their natural expiry (15-min window).
+CREATE TABLE IF NOT EXISTS access_token_denylist (
+    jti TEXT PRIMARY KEY,
+    user_id INTEGER,
+    expires_at TEXT,
+    revoked_at TEXT NOT NULL
+);
+
+-- Index on expires_at for opportunistic cleanup of expired entries
+CREATE INDEX IF NOT EXISTS idx_access_token_denylist_expires ON access_token_denylist(expires_at);
+
+-- Service accounts table: rotatable API keys for FR-014
+-- Stores sha256 hashes of raw keys (never the plaintext). Raw key returned exactly once at issuance.
+CREATE TABLE IF NOT EXISTS service_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    key_hash TEXT NOT NULL UNIQUE,
+    scopes TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_rotated_at TEXT,
+    revoked_at TEXT,
+    created_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_service_accounts_key_hash ON service_accounts(key_hash);
 
 -- Indexes for auth tables
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
@@ -741,6 +790,61 @@ CREATE INDEX IF NOT EXISTS idx_vector_delete_pending_file_id ON vector_delete_pe
 -- here. The files table's executescript path also runs against pre-existing
 -- (legacy) databases where files.folder_id may not exist yet; indexing it here
 -- would raise "no such column: folder_id" before the migration adds the column.
+
+-- ============================================================
+-- Prompt versioning (FR-007)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version TEXT NOT NULL UNIQUE,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    is_active INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_versions_is_active ON prompt_versions(is_active);
+
+-- Per-organization prompt overrides (FR-007 part 2)
+CREATE TABLE IF NOT EXISTS prompt_org_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL UNIQUE,
+    version TEXT NOT NULL,
+    set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    set_by TEXT,
+    FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_org_overrides_org_id ON prompt_org_overrides(org_id);
+
+-- A/B experiments for prompt variants (FR-007 part 3)
+CREATE TABLE IF NOT EXISTS prompt_ab_experiments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    control_version TEXT NOT NULL,
+    challenger_version TEXT NOT NULL,
+    split_pct INTEGER NOT NULL DEFAULT 50
+        CHECK (split_pct >= 0 AND split_pct <= 100),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'ended')),
+    winner TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    ended_at TEXT
+);
+
+-- Per-subject exposure log: one row per unique subject+experiment assignment.
+-- subject_key is a deterministic hash of (org_id/user_id/session) so the
+-- same subject always gets the same variant (sticky).  Uses INSERT OR IGNORE
+-- for idempotent exposure recording (same subject revisiting the same experiment
+-- does not double-count).
+CREATE TABLE IF NOT EXISTS prompt_ab_exposures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id INTEGER NOT NULL REFERENCES prompt_ab_experiments(id) ON DELETE CASCADE,
+    subject_key TEXT NOT NULL,
+    assigned_variant TEXT NOT NULL CHECK (assigned_variant IN ('control', 'challenger')),
+    exposed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(experiment_id, subject_key)
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id ON prompt_ab_exposures(experiment_id);
 """
 
 
@@ -790,6 +894,7 @@ def init_db(sqlite_path: str) -> None:
                 ("enrichment_status", "TEXT"),
                 ("enrichment_error", "TEXT"),
                 ("enrichment_updated_at", "TIMESTAMP"),
+                ("enrichment_enabled", "INTEGER"),
                 ("chunks_failed", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in existing_file_cols:
@@ -896,6 +1001,14 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_claims_unique_claim_text(sqlite_path)
     migrate_assign_orphan_users_to_default_vault(sqlite_path)
     migrate_add_wiki_lint_findings_json_check(sqlite_path)
+    migrate_add_access_token_denylist(sqlite_path)
+    migrate_add_service_accounts(sqlite_path)
+    migrate_add_org_invites(sqlite_path)
+    migrate_add_vaults_enrichment_toggle(sqlite_path)
+    migrate_add_files_enrichment_enabled(sqlite_path)
+    migrate_add_prompt_versions(sqlite_path)
+    migrate_add_prompt_org_overrides(sqlite_path)
+    migrate_add_prompt_ab_experiments(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -2109,6 +2222,46 @@ def migrate_add_files_enrichment_status(sqlite_path: str) -> None:
         conn.close()
 
 
+def migrate_add_vaults_enrichment_toggle(sqlite_path: str) -> None:
+    """Migration: add nullable enrichment_enabled column to vaults table.
+
+    Allows per-vault override of the global chunk_enrichment_enabled setting.
+    NULL = inherit global; 1 = on; 0 = off.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(vaults)").fetchall()
+        }
+        if "enrichment_enabled" not in existing_cols:
+            conn.execute("ALTER TABLE vaults ADD COLUMN enrichment_enabled INTEGER")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_files_enrichment_enabled(sqlite_path: str) -> None:
+    """Migration: add nullable enrichment_enabled column to files table.
+
+    Allows per-file override of the vault/global enrichment setting.
+    NULL = inherit vault/global; 1 = on; 0 = off.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
+        }
+        if "enrichment_enabled" not in existing_cols:
+            conn.execute("ALTER TABLE files ADD COLUMN enrichment_enabled INTEGER")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def migrate_add_chunks_failed_column(sqlite_path: str) -> None:
     """Migration: add files.chunks_failed for partial embedding failures.
 
@@ -2155,6 +2308,103 @@ def migrate_add_vector_delete_pending(sqlite_path: str) -> None:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vector_delete_pending_file_id
             ON vector_delete_pending(file_id)
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_access_token_denylist(sqlite_path: str) -> None:
+    """Migration: add access_token_denylist table for FR-011 revocable access tokens.
+
+    Stores jti values of revoked access tokens so they can be rejected before
+    their natural 15-min expiry. The expires_at column enables opportunistic
+    cleanup of expired entries without a separate scheduled job.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS access_token_denylist (
+                jti TEXT PRIMARY KEY,
+                user_id INTEGER,
+                expires_at TEXT,
+                revoked_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_access_token_denylist_expires
+            ON access_token_denylist(expires_at)
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_service_accounts(sqlite_path: str) -> None:
+    """Migration: add service_accounts table for FR-014 rotatable API keys.
+
+    Stores sha256 hashes of raw service-account keys (never the plaintext).
+    Raw key is returned exactly once at issuance/rotation and is never stored.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS service_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                key_hash TEXT NOT NULL UNIQUE,
+                scopes TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_rotated_at TEXT,
+                revoked_at TEXT,
+                created_by TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_service_accounts_key_hash
+            ON service_accounts(key_hash)
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_org_invites(sqlite_path: str) -> None:
+    """Migration: add org_invites table for FR-012 organization invite flow.
+
+    Stores sha256 hashes of raw invite tokens. Raw token is returned exactly
+    once at create/resend and is never stored. Tokens expire, can be resent
+    (new token, old invalidated), and can be revoked.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS org_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                org_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL CHECK (role IN ('admin','member')),
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by_user_id INTEGER,
+                accepted_at TEXT,
+                accepted_by_user_id INTEGER,
+                revoked_at TEXT,
+                FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE,
+                FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE SET NULL,
+                FOREIGN KEY (accepted_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_org_invites_token_hash
+            ON org_invites(token_hash)
         """)
         conn.commit()
     finally:
@@ -3119,5 +3369,116 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
         except Exception:
             pass
         raise
+    finally:
+        conn.close()
+
+
+def migrate_add_prompt_versions(sqlite_path: str) -> None:
+    """
+    Migration: Add prompt_versions table for FR-007 prompt versioning.
+
+    Idempotent — uses CREATE TABLE IF NOT EXISTS and does nothing
+    if the table already exists with the correct schema.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS prompt_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version TEXT NOT NULL UNIQUE,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                is_active INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_versions_is_active
+                ON prompt_versions(is_active);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_prompt_org_overrides(sqlite_path: str) -> None:
+    """
+    Migration: Add prompt_org_overrides table for FR-007 part 2.
+
+    Per-organization prompt override: an org can override which prompt_version
+    it uses. Non-overriding orgs keep the global active version.
+
+    Idempotent — uses CREATE TABLE IF NOT EXISTS.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS prompt_org_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                org_id INTEGER NOT NULL UNIQUE,
+                version TEXT NOT NULL,
+                set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                set_by TEXT,
+                FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_org_overrides_org_id
+                ON prompt_org_overrides(org_id);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_prompt_ab_experiments(sqlite_path: str) -> None:
+    """
+    Migration: Add prompt_ab_experiments and prompt_ab_exposures tables for FR-007 part 3.
+
+    A/B experiments allow safe rollout of new prompt versions: traffic is split
+    deterministically (sticky per subject) between a control and challenger version,
+    exposures are recorded, and an experiment can be ended by declaring a winner.
+
+    Idempotent — uses CREATE TABLE IF NOT EXISTS.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS prompt_ab_experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                control_version TEXT NOT NULL,
+                challenger_version TEXT NOT NULL,
+                split_pct INTEGER NOT NULL DEFAULT 50
+                    CHECK (split_pct >= 0 AND split_pct <= 100),
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'ended')),
+                winner TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                ended_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS prompt_ab_exposures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id INTEGER NOT NULL
+                    REFERENCES prompt_ab_experiments(id) ON DELETE CASCADE,
+                subject_key TEXT NOT NULL,
+                assigned_variant TEXT NOT NULL
+                    CHECK (assigned_variant IN ('control', 'challenger')),
+                exposed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                UNIQUE(experiment_id, subject_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id
+                ON prompt_ab_exposures(experiment_id);
+        """)
+        conn.commit()
     finally:
         conn.close()

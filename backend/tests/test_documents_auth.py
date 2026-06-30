@@ -76,7 +76,7 @@ from app.api.deps import (
 from app.api.routes.documents import _allowed_document_roots, _path_is_within
 from app.config import settings
 from app.main import app
-from app.services.auth_service import create_access_token
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
 class TestDocumentAuthBase(unittest.TestCase):
@@ -85,6 +85,8 @@ class TestDocumentAuthBase(unittest.TestCase):
     def setUp(self):
         """Set up test client with temporary database."""
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
         self._temp_dir = tempfile.mkdtemp()
 
         # Store original settings BEFORE modifying
@@ -256,23 +258,28 @@ class TestDocumentAuthBase(unittest.TestCase):
 
     def _superadmin_token(self):
         """Generate access token for superadmin user."""
-        return create_access_token(1, "superadmin", "superadmin")
+        return create_access_token(1, "superadmin", "superadmin",
+                                  client_fingerprint=compute_client_fingerprint(""))
 
     def _admin_token(self):
         """Generate access token for admin user."""
-        return create_access_token(2, "admin1", "admin")
+        return create_access_token(2, "admin1", "admin",
+                                  client_fingerprint=compute_client_fingerprint(""))
 
     def _member_token(self):
         """Generate access token for member1 user (has vault access)."""
-        return create_access_token(3, "member1", "member")
+        return create_access_token(3, "member1", "member",
+                                  client_fingerprint=compute_client_fingerprint(""))
 
     def _member_readonly_token(self):
         """Generate access token for member_readonly user."""
-        return create_access_token(4, "member_readonly", "member")
+        return create_access_token(4, "member_readonly", "member",
+                                  client_fingerprint=compute_client_fingerprint(""))
 
     def _member_no_access_token(self):
         """Generate access token for member_novault user (no vault access)."""
-        return create_access_token(5, "member_novault", "member")
+        return create_access_token(5, "member_novault", "member",
+                                  client_fingerprint=compute_client_fingerprint(""))
 
     def _auth_headers(self, token):
         """Create authorization headers with token."""

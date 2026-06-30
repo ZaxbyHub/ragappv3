@@ -2,9 +2,17 @@ import { isValidElement, memo, useMemo, useEffect, useState } from "react";
 import type { ReactNode, HTMLAttributes } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import type { Schema } from "hast-util-sanitize";
+import "katex/dist/katex.min.css";
 import { CopyButton } from "@/components/shared/CopyButton";
 import { SourceCitation } from "./SourceCitation";
+import MermaidDiagram from "./MermaidDiagram";
+import { CitationConfidence } from "./CitationConfidence";
+import { SourceSpanPopover } from "./SourceSpanPopover";
+import { AlertTriangle } from "lucide-react";
 import type { Source, UsedMemory, WikiReference, KMSReference } from "@/lib/api";
 
 // =============================================================================
@@ -348,25 +356,82 @@ function remarkCitations() {
   };
 }
 
+// MathML tag names used by KaTeX output — extend hast-util-sanitize's default
+// tagNames so rehypeSanitize does not strip the MathML tree that rehypeKatex produces.
+const MATHML_TAG_NAMES = [
+  // Layout
+  "math", "semantics", "mrow", "mfrac", "msqrt", "mroot",
+  "msup", "msub", "msubsup", "munder", "mover", "munderover",
+  "mtable", "mtr", "mtd", "mlabeledtr",
+  "mphantom", "mpadded", "mspace", "mglyph",
+  // Tokens
+  "mi", "mo", "mn", "ms", "mtext",
+  // Semantics
+  "annotation", "annotation-xml",
+  // Alignment (KaTeX emits these)
+  "maligngroup", "malignmark",
+];
+
 // Extend rehype-sanitize's default schema so our citation spans (with
-// data-citation-* attributes) survive sanitization. All other span attrs
-// remain restricted to the defaults. Bare attribute names ("attr") mean
-// "any value allowed" in hast-util-sanitize's PropertyDefinition format.
-const CITATION_SANITIZE_SCHEMA = {
+// data-citation-* attributes) and MathML tags survive sanitization. Bare
+// attribute names ("attr") mean "any value allowed" in hast-util-sanitize's
+// PropertyDefinition format.
+const CITATION_SANITIZE_SCHEMA: Schema = {
   ...defaultSchema,
+  tagNames: [
+    ...(defaultSchema.tagNames ?? []),
+    ...MATHML_TAG_NAMES,
+  ],
   attributes: {
     ...(defaultSchema.attributes ?? {}),
+    // Citation data attributes on span elements (merged — single span key)
     span: [
-      ...((defaultSchema.attributes?.span as unknown[]) ?? []),
+      ...((defaultSchema.attributes?.span as unknown as string[]) ?? []),
       "data-citation-type",
       "data-citation-label",
+      "class",
+      "style",
+      "id",
     ],
+    // KaTeX MathML elements (math, semantics, and all mrow-derived tokens)
+    math: ["class", "style", "id", "xmlns", "display", "scriptsizem", "scriptminsize", "scriptlevel"],
+    semantics: ["encoding"],
+    // Token elements
+    mi: ["class", "style", "id", "mathvariant", "mathsize"],
+    mo: ["class", "style", "id", "stretchy", "fence", "separator", "lspace", "rspace", "accent", "accentunder", "minsize", "maxsize"],
+    mn: ["class", "style", "id", "mathvariant"],
+    ms: ["class", "style", "id", "mathvariant", "lquote", "rquote"],
+    mtext: ["class", "style", "id", "mathvariant", "mathsize"],
+    // General layout
+    mrow: ["class", "style", "id"],
+    mfrac: ["class", "style", "id", "linethickness", "numalign", "denomalign", "bevelled"],
+    msqrt: ["class", "style", "id"],
+    mroot: ["class", "style", "id"],
+    msup: ["class", "style", "id"],
+    msub: ["class", "style", "id"],
+    msubsup: ["class", "style", "id"],
+    munder: ["class", "style", "id", "accentunder", "align"],
+    mover: ["class", "style", "id", "accent", "align"],
+    munderover: ["class", "style", "id", "accent", "accentunder", "align"],
+    mtable: ["class", "style", "id", "align", "columnalign", "rowalign", "columnspacing", "rowspacing", "framespacing", "equalrows", "equalcolumns", "columnwidth", "width", "height", "depth"],
+    mtr: ["class", "style", "id", "columnalign", "rowalign"],
+    mtd: ["class", "style", "id", "columnalign", "rowalign", "rowspan", "columnspan"],
+    mlabeledtr: ["class", "style", "id", "columnalign", "rowalign"],
+    mphantom: ["class", "style", "id"],
+    mpadded: ["class", "style", "id", "width", "height", "depth", "lspace", "voffset"],
+    mspace: ["class", "style", "id", "width", "height", "depth", "lspace", "voffset"],
+    mglyph: ["class", "style", "id"],
+    annotation: ["class", "style", "id", "encoding"],
+    "annotation-xml": ["class", "style", "id", "encoding"],
+    maligngroup: ["class", "style", "id"],
+    malignmark: ["class", "style", "id"],
   },
 };
 
 // Stable plugin arrays — prevent re-creating on every render
-const REMARK_PLUGINS = [remarkGfm, remarkCitations];
+const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkCitations];
 const REHYPE_PLUGINS: import("react-markdown").Options["rehypePlugins"] = [
+  rehypeKatex,
   [rehypeSanitize, CITATION_SANITIZE_SCHEMA],
 ];
 
@@ -382,6 +447,8 @@ interface MarkdownMessageProps {
   onWikiCitationClick?: (wiki: WikiReference) => void;
   onKmsCitationClick?: (kms: KMSReference) => void;
   citedSources?: Source[];
+  citationConfidence?: Record<string, number>;
+  unverifiableClaims?: string[];
 }
 
 /**
@@ -409,6 +476,8 @@ export const MarkdownMessage = memo(function MarkdownMessage({
   onWikiCitationClick,
   onKmsCitationClick,
   citedSources: externalCitedSources,
+  citationConfidence,
+  unverifiableClaims,
 }: MarkdownMessageProps) {
   const { segments, citedSources: internalCitedSources } = useMemo(
     () => parseCitationSegments(content, sources, memories, wikiRefs, kmsRefs),
@@ -529,13 +598,25 @@ export const MarkdownMessage = memo(function MarkdownMessage({
       })();
     if (source) {
       const dispIdx = citedSources.findIndex((s) => s.id === source.id);
+      const confidenceScore = citationConfidence?.[label];
       return (
-        <SourceCitation
+        <SourceSpanPopover
           source={source}
-          index={dispIdx >= 0 ? dispIdx : 0}
-          onClick={() => onCitationClick?.(source)}
-          variant="inline"
-        />
+          label={label}
+          confidence={confidenceScore}
+        >
+          <span className="inline-flex items-center align-baseline">
+            <SourceCitation
+              source={source}
+              index={dispIdx >= 0 ? dispIdx : 0}
+              onClick={() => onCitationClick?.(source)}
+              variant="inline"
+            />
+            {confidenceScore !== undefined && (
+              <CitationConfidence score={confidenceScore} className="ml-0.5" />
+            )}
+          </span>
+        </SourceSpanPopover>
       );
     }
     return <span>[{lookupName}]</span>;
@@ -550,13 +631,17 @@ export const MarkdownMessage = memo(function MarkdownMessage({
           span: (props: HTMLAttributes<HTMLSpanElement> & {
             "data-citation-type"?: string;
             "data-citation-label"?: string;
+            node?: unknown;
           }) => {
-            const citeType = props["data-citation-type"];
-            const citeLabel = props["data-citation-label"];
+            // Destructure to separate hast node from DOM props — node must NOT
+            // be spread onto the DOM span (causes node="[object Object]" attr).
+            const { node: _node, className, children, ...domProps } = props;
+            const citeType = domProps["data-citation-type"];
+            const citeLabel = domProps["data-citation-label"];
             if (citeType && citeLabel) {
               return renderCitationSpan(citeType, citeLabel);
             }
-            return <span {...props} />;
+            return <span className={className} {...domProps}>{children}</span>;
           },
           code: ({ className, children }) => (
             <code
@@ -579,6 +664,9 @@ export const MarkdownMessage = memo(function MarkdownMessage({
               ? className.replace("language-", "")
               : "";
             const codeText = codeChildrenToText(codeElement.props.children).replace(/\n$/, "");
+            if (lang === "mermaid") {
+              return <MermaidDiagram chart={codeText} />;
+            }
             return <CodeBlock language={lang} code={codeText} />;
           },
           table: ({ children }) => (
@@ -602,6 +690,24 @@ export const MarkdownMessage = memo(function MarkdownMessage({
           role="status"
           aria-label="Message streaming"
         />
+      )}
+      {unverifiableClaims && unverifiableClaims.length > 0 && (
+        <div
+          className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+          role="alert"
+        >
+          <AlertTriangle className="h-4 w-4 flex-shrink-0 text-amber-500 mt-0.5" aria-hidden />
+          <div className="flex flex-col gap-1">
+            <p className="text-xs font-semibold text-amber-600 dark:text-amber-400">
+              Unverifiable Claims
+            </p>
+            {unverifiableClaims.map((claim, i) => (
+              <p key={i} className="text-xs text-amber-600/80 dark:text-amber-400/80">
+                {claim}
+              </p>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );

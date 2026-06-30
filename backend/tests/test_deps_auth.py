@@ -10,6 +10,7 @@ Tests cover:
 - get_user_accessible_vault_ids: vault access enumeration for regular users
 """
 
+import hashlib
 import sqlite3
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,11 @@ from fastapi import HTTPException
 # Mock request for tests that call get_current_active_user directly
 mock_request = MagicMock()
 mock_request.url.path = "/api/auth/me"
+# Default to empty-string UA so compute_client_fingerprint receives a real str
+mock_request.headers.get.return_value = ""
+
+# Pre-computed fpt for empty UA — used to backfill legacy test tokens
+_TEST_FPT_EMPTY = hashlib.sha256(b"").hexdigest()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -204,18 +210,16 @@ class TestGetCurrentUserCookieFallback:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        mock_cursor.fetchone.return_value = (
-            42,
-            "testuser",
-            "Test User",
-            "member",
-            1,
-            0,
-        )
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
 
         result = await get_current_active_user(request=mock_request,
             authorization=f"Bearer {token}",
@@ -243,22 +247,20 @@ class TestGetCurrentUserCookieFallback:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        mock_cursor.fetchone.return_value = (
-            42,
-            "testuser",
-            "Test User",
-            "member",
-            1,
-            0,
-        )
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
 
         result = await get_current_active_user(request=mock_request,
-            authorization=None,
-            access_token=token,
+            authorization=f"Bearer {token}",
+            access_token=None,
             db=mock_conn,
         )
 
@@ -336,18 +338,16 @@ class TestJWTTypeEnforcement:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        mock_cursor.fetchone.return_value = (
-            42,
-            "testuser",
-            "Test User",
-            "member",
-            1,
-            0,
-        )
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
 
         result = await get_current_active_user(request=mock_request,
             authorization=f"Bearer {token}",
@@ -374,6 +374,7 @@ class TestJWTTypeEnforcement:
             "username": "testuser",
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "jti": "test-jti",
             # No 'type' field
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
@@ -408,6 +409,7 @@ class TestJWTTypeEnforcement:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "refresh",
+            "jti": "test-jti",
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
@@ -445,23 +447,22 @@ class TestMustChangePassword:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        # DB returns must_change_password=1 (True)
-        mock_cursor.fetchone.return_value = (
-            42,
-            "testuser",
-            "Test User",
-            "member",
-            1,
-            1,
-        )
+        # First call: denylist check (jti not found), Second call: user lookup
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 1),
+        ]
 
         # Use exempt path to bypass must_change_password enforcement
         exempt_request = MagicMock()
         exempt_request.url.path = "/auth/change-password"
+        exempt_request.headers.get.return_value = ""
 
         result = await get_current_active_user(request=exempt_request,
             authorization=f"Bearer {token}",
@@ -489,19 +490,16 @@ class TestMustChangePassword:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        # DB returns must_change_password=0 (False)
-        mock_cursor.fetchone.return_value = (
-            42,
-            "testuser",
-            "Test User",
-            "member",
-            1,
-            0,
-        )
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
 
         result = await get_current_active_user(request=mock_request,
             authorization=f"Bearer {token}",
@@ -529,19 +527,16 @@ class TestMustChangePassword:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        # DB returns must_change_password=None (column not populated)
-        mock_cursor.fetchone.return_value = (
-            42,
-            "testuser",
-            "Test User",
-            "member",
-            1,
+        mock_cursor.fetchone.side_effect = [
             None,
-        )
+            (42, "testuser", "Test User", "member", 1, None),
+        ]
 
         result = await get_current_active_user(request=mock_request,
             authorization=f"Bearer {token}",
@@ -567,6 +562,116 @@ class TestMustChangePassword:
         )
 
         assert result["must_change_password"] is False
+
+
+class TestAccessTokenDenylist:
+    """Tests for access-token denylist in get_current_active_user."""
+
+    @pytest.mark.asyncio
+    async def test_denied_jti_returns_401(self, mock_settings_jwt_mode, mock_db):
+        """Token whose jti is in the denylist → 401 token_invalid."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from app.api.deps import get_current_active_user
+
+        secret, algorithm = "test-secret-key", "HS256"
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            "jti": "revoked-jti-value",
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+
+        mock_conn, mock_cursor = mock_db
+        # Simulate jti found in denylist (fetchone returns a row)
+        mock_cursor.fetchone.return_value = (1,)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_active_user(request=mock_request,
+                authorization=f"Bearer {token}",
+                access_token=None,
+                db=mock_conn,
+            )
+
+        assert exc_info.value.status_code == 401
+        assert "token_invalid" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_token_without_jti_returns_401(self, mock_settings_jwt_mode, mock_db):
+        """Token without jti claim → allowed (conditional enforcement skips denylist)."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from app.api.deps import get_current_active_user
+
+        secret, algorithm = "test-secret-key", "HS256"
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            # No jti — conditional enforcement skips denylist check
+            # No fpt — conditional enforcement skips fingerprint check
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.side_effect = [
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
+
+        result = await get_current_active_user(request=mock_request,
+            authorization=f"Bearer {token}",
+            access_token=None,
+            db=mock_conn,
+        )
+
+        assert result["id"] == 42
+        assert result["username"] == "testuser"
+
+    @pytest.mark.asyncio
+    async def test_valid_jti_not_in_denylist_passes(
+        self, mock_settings_jwt_mode, mock_db
+    ):
+        """Token with valid jti not in denylist → user dict returned."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from app.api.deps import get_current_active_user
+
+        secret, algorithm = "test-secret-key", "HS256"
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            "jti": "valid-jti-value",
+            "fpt": _TEST_FPT_EMPTY,
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+
+        mock_conn, mock_cursor = mock_db
+        # First call: is_access_token_denied check (jti not found → None)
+        # Second call: user lookup
+        mock_cursor.fetchone.side_effect = [None, (42, "testuser", "Test User", "member", 1, 0)]
+
+        result = await get_current_active_user(request=mock_request,
+            authorization=f"Bearer {token}",
+            access_token=None,
+            db=mock_conn,
+        )
+
+        assert result["id"] == 42
+        assert result["username"] == "testuser"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -780,19 +885,17 @@ class TestGetCurrentUserJWT:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        # Simulate DB returning user row: (id, username, full_name, role, is_active, must_change_password)
-        mock_cursor.fetchone.return_value = (
-            42,
-            "testuser",
-            "Test User",
-            "member",
-            1,
-            0,
-        )
+        # First call: denylist check (jti not found), Second call: user lookup
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
 
         result = await get_current_active_user(request=mock_request,
             authorization=f"Bearer {token}",
@@ -827,19 +930,17 @@ class TestGetCurrentUserJWT:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        # Simulate DB returning inactive user
-        mock_cursor.fetchone.return_value = (
-            42,
-            "inactiveuser",
-            "Inactive User",
-            "member",
-            0,
-            0,
-        )
+        # First call: denylist check (jti not found), Second call: inactive user row
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "inactiveuser", "Inactive User", "member", 0, 0),
+        ]
 
         with pytest.raises(HTTPException) as exc_info:
             await get_current_active_user(request=mock_request,
@@ -867,11 +968,13 @@ class TestGetCurrentUserJWT:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
+            "jti": "test-jti",
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
-        mock_cursor.fetchone.return_value = None  # User not found
+        # First call: denylist check (jti not found), Second call: user not found
+        mock_cursor.fetchone.side_effect = [None, None]
 
         with pytest.raises(HTTPException) as exc_info:
             await get_current_active_user(request=mock_request,
@@ -899,6 +1002,7 @@ class TestGetCurrentUserJWT:
             "role": "member",
             "exp": datetime.now(timezone.utc) - timedelta(hours=1),  # Expired
             "type": "access",
+            "jti": "test-jti",
         }
         expired_token = jwt.encode(expired_payload, secret, algorithm=algorithm)
 
@@ -1264,3 +1368,181 @@ class TestRequireVaultPermission:
 
         check_perm = require_vault_permission("read", "write")
         assert callable(check_perm)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test Client Fingerprint Binding
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestClientFingerprint:
+    """Tests for client fingerprint (fpt) binding in get_current_active_user."""
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_matched_ua_passes(self, mock_settings_jwt_mode, mock_db):
+        """Token with fpt matching current UA → user dict returned."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from app.api.deps import get_current_active_user
+        from app.services.auth_service import compute_client_fingerprint
+
+        ua = "TestBrowser/1.0"
+        fpt = compute_client_fingerprint(ua)
+        secret, algorithm = "test-secret-key", "HS256"
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            "jti": "valid-jti",
+            "fpt": fpt,
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.side_effect = [
+            None,  # denylist check: jti not found
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
+
+        # Set up mock request with matching UA
+        fp_request = MagicMock()
+        fp_request.url.path = "/api/auth/me"
+        fp_request.headers.get.return_value = ua
+
+        result = await get_current_active_user(
+            request=fp_request,
+            authorization=f"Bearer {token}",
+            access_token=None,
+            db=mock_conn,
+        )
+
+        assert result["id"] == 42
+        assert result["username"] == "testuser"
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_mismatched_ua_returns_401(self, mock_settings_jwt_mode, mock_db):
+        """Token with fpt=sha256(UA='BrowserA'), request UA='BrowserB' → 401."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from app.api.deps import get_current_active_user
+        from app.services.auth_service import compute_client_fingerprint
+
+        secret, algorithm = "test-secret-key", "HS256"
+        # Token bound to BrowserA
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            "jti": "valid-jti",
+            "fpt": compute_client_fingerprint("BrowserA"),
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+
+        mock_conn, mock_cursor = mock_db
+
+        # Request comes from BrowserB
+        fp_request = MagicMock()
+        fp_request.url.path = "/api/auth/me"
+        fp_request.headers.get.return_value = "BrowserB"
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_active_user(
+                request=fp_request,
+                authorization=f"Bearer {token}",
+                access_token=None,
+                db=mock_conn,
+            )
+
+        assert exc_info.value.status_code == 401
+        assert "token_invalid" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_missing_returns_401(self, mock_settings_jwt_mode, mock_db):
+        """Token without fpt claim (legacy) → 401 token_invalid (fail-closed)."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from app.api.deps import get_current_active_user
+
+        secret, algorithm = "test-secret-key", "HS256"
+        # Token WITHOUT fpt claim (legacy token)
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            "jti": "valid-jti",
+            # No fpt!
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+
+        mock_conn, mock_cursor = mock_db
+
+        fp_request = MagicMock()
+        fp_request.url.path = "/api/auth/me"
+        fp_request.headers.get.return_value = "AnyBrowser"
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_current_active_user(
+                request=fp_request,
+                authorization=f"Bearer {token}",
+                access_token=None,
+                db=mock_conn,
+            )
+
+        assert exc_info.value.status_code == 401
+        assert "token_invalid" in exc_info.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_empty_ua_token_accepted_with_empty_ua_request(
+        self, mock_settings_jwt_mode, mock_db
+    ):
+        """Token with fpt=sha256(''), request UA='' → passes."""
+        from datetime import datetime, timedelta, timezone
+
+        import jwt
+
+        from app.api.deps import get_current_active_user
+        from app.services.auth_service import compute_client_fingerprint
+
+        empty_fpt = compute_client_fingerprint("")
+        secret, algorithm = "test-secret-key", "HS256"
+        payload = {
+            "sub": "42",
+            "username": "testuser",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+            "type": "access",
+            "jti": "valid-jti",
+            "fpt": empty_fpt,
+        }
+        token = jwt.encode(payload, secret, algorithm=algorithm)
+
+        mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.side_effect = [
+            None,  # denylist check
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
+
+        fp_request = MagicMock()
+        fp_request.url.path = "/api/auth/me"
+        fp_request.headers.get.return_value = ""  # Empty UA
+
+        result = await get_current_active_user(
+            request=fp_request,
+            authorization=f"Bearer {token}",
+            access_token=None,
+            db=mock_conn,
+        )
+
+        assert result["id"] == 42

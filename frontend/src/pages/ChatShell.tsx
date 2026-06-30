@@ -15,6 +15,8 @@ import {
   useKeyboardShortcuts,
   KeyboardShortcutsDialog,
 } from "@/components/shared/KeyboardShortcuts";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { ErrorState } from "@/components/shared/ErrorState";
 import {
   Sheet,
   SheetContent,
@@ -246,6 +248,44 @@ export default function ChatShell() {
     window.addEventListener("blur", onMouseUp);
   };
 
+  // Per-pane ErrorBoundary fallbacks — FR-017: isolate pane failures
+  // SC-046: Retry resets the ErrorBoundary state (pane remount) instead of full page reload.
+  const sessionsFallback = (reset: () => void) => (
+    <div className="flex flex-col items-center justify-center min-h-[50vh] p-8">
+      <div className="w-full max-w-md">
+        <ErrorState
+          title="Sessions error"
+          description="The sessions panel encountered a problem. Try again to restore it."
+          action={{ label: "Retry", onClick: reset }}
+        />
+      </div>
+    </div>
+  );
+
+  const transcriptFallback = (reset: () => void) => (
+    <div className="flex flex-col items-center justify-center min-h-[50vh] p-8">
+      <div className="w-full max-w-md">
+        <ErrorState
+          title="Chat area error"
+          description="The chat area encountered a problem. Try again to restore it."
+          action={{ label: "Retry", onClick: reset }}
+        />
+      </div>
+    </div>
+  );
+
+  const sourcesFallback = (reset: () => void) => (
+    <div className="flex flex-col items-center justify-center min-h-[50vh] p-8">
+      <div className="w-full max-w-md">
+        <ErrorState
+          title="Sources error"
+          description="The sources panel encountered a problem. Try again to restore it."
+          action={{ label: "Retry", onClick: reset }}
+        />
+      </div>
+    </div>
+  );
+
   return (
     <div className="flex h-full w-full overflow-hidden">
       {/* DESKTOP: Session Rail (persistent sidebar) */}
@@ -257,7 +297,9 @@ export default function ChatShell() {
         style={{ width: sessionRailOpen ? `${sessionRailWidth}px` : "0px" }}
         aria-label="Chat sessions"
       >
-        <SessionRail />
+        <ErrorBoundary fallback={sessionsFallback}>
+          <SessionRail />
+        </ErrorBoundary>
         <div
           className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/40 transition-colors"
           onMouseDown={handleSessionRailResizeStart}
@@ -275,7 +317,9 @@ export default function ChatShell() {
             <SheetDescription id="chat-sessions-desc">Navigate between chat sessions</SheetDescription>
           </SheetHeader>
           <div className="flex h-full flex-col">
-            <SessionRail />
+            <ErrorBoundary fallback={sessionsFallback}>
+              <SessionRail />
+            </ErrorBoundary>
           </div>
         </SheetContent>
       </Sheet>
@@ -309,7 +353,9 @@ export default function ChatShell() {
           </Button>
         </header>
         <div className="flex-1 overflow-hidden">
-          <TranscriptPane />
+          <ErrorBoundary fallback={transcriptFallback}>
+            <TranscriptPane />
+          </ErrorBoundary>
         </div>
         {/* MOBILE: Safe area padding for iOS */}
         <div className="md:hidden" style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }} aria-hidden="true" />
@@ -328,7 +374,9 @@ export default function ChatShell() {
           <div className="relative left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/40 transition-colors hidden lg:block" onMouseDown={handleResizeStart} role="separator" aria-label="Resize details panel" aria-orientation="vertical" />
         )}
         <div className="flex h-full flex-col p-4 bg-card/80 flex-shrink-0 w-full">
-          <RightPane />
+          <ErrorBoundary fallback={sourcesFallback}>
+            <RightPane />
+          </ErrorBoundary>
         </div>
       </aside>
 
@@ -348,7 +396,9 @@ export default function ChatShell() {
               </SheetClose>
             </div>
             <div className="flex h-full flex-col p-4 pt-12">
-              <RightPane />
+              <ErrorBoundary fallback={sourcesFallback}>
+                <RightPane />
+              </ErrorBoundary>
             </div>
           </SheetContent>
         </Sheet>

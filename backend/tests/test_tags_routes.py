@@ -30,12 +30,14 @@ from app.api.deps import get_db, get_vector_store
 from app.config import settings
 from app.main import app
 from app.security import csrf_protect
-from app.services.auth_service import create_access_token
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
 class TagsTestBase(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
+        # Override default User-Agent so fingerprint validation matches token
+        self.client.headers["user-agent"] = ""
         self._temp_dir = tempfile.mkdtemp()
 
         self._original_jwt_secret = settings.jwt_secret_key
@@ -123,7 +125,7 @@ class TagsTestBase(unittest.TestCase):
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
     def _headers(self, user_id=3, username="member1", role="member"):
-        return {"Authorization": f"Bearer {create_access_token(user_id, username, role)}"}
+        return {"Authorization": f"Bearer {create_access_token(user_id, username, role, client_fingerprint=compute_client_fingerprint(''))}"}
 
     def _seed_file(self, vault_id, file_name, file_size=10, status="indexed"):
         conn = self._connection_pool.get_connection()

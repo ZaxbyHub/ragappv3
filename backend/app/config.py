@@ -359,6 +359,10 @@ class Settings(BaseSettings):
     flag_embedding_url: str = ""
     """Deprecated: FlagEmbedding server removed. Field retained for config compatibility."""
 
+    # ── Agentic RAG configuration ────────────────────────────────────────
+    agentic_rag_enabled: bool = False
+    """Enable agentic multi-step RAG (iterative retrieval + LLM synthesis via tool registry)."""
+
     # ── Chunk enrichment / curator configuration ───────────────────────────
     chunk_enrichment_enabled: bool = False
     """Enable curator-style chunk enrichment (generates auxiliary metadata for retrieval)."""
@@ -444,6 +448,8 @@ class Settings(BaseSettings):
     """[DEPRECATED] Vector top K. Use retrieval_top_k instead."""
     maintenance_mode: bool = False
     redis_url: str = "redis://localhost:6379/0"
+    embedding_cache_ttl_seconds: int = 604800
+    """Time-to-live in seconds for cached embeddings in Redis. Default 7 days."""
     csrf_token_ttl: int = 900
     admin_rate_limit: str = "10/minute"
 

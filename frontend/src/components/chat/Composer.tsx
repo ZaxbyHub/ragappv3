@@ -22,6 +22,13 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
@@ -110,6 +117,12 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const { input, setInput, inputError, activeChatId } = useChatStore();
   const storedChatMode = useChatModeStore((s) => s.chatMode);
   const setStoredChatMode = useChatModeStore((s) => s.setChatMode);
+  const temperature = useChatModeStore((s) => s.temperature);
+  const setTemperature = useChatModeStore((s) => s.setTemperature);
+  const retrievalMode = useChatModeStore((s) => s.retrievalMode);
+  const setRetrievalMode = useChatModeStore((s) => s.setRetrievalMode);
+  const citationMode = useChatModeStore((s) => s.citationMode);
+  const setCitationMode = useChatModeStore((s) => s.setCitationMode);
   const defaultChatMode = useSettingsStore((s) => s.formData.default_chat_mode);
   const thinkingHealthy = useLlmHealthStore((s) => s.thinking);
   const instantHealthy = useLlmHealthStore((s) => s.instant);
@@ -711,58 +724,119 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
             )}
 
             {/* Mode toggle (Instant / Thinking) */}
-            <div className="flex flex-col items-end gap-0.5">
-              <div
-                role="radiogroup"
-                aria-label="Chat mode"
-                className="flex h-8 items-center rounded-sm border border-input text-xs overflow-hidden"
-              >
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={effectiveChatMode === "instant"}
-                  disabled={!instantHealthy || isStreaming}
-                  onClick={() => setStoredChatMode("instant")}
-                  title={
-                    !instantHealthy
-                      ? "Instant mode unavailable (LM Studio unreachable)"
-                      : isFallenBack && desiredChatMode === "thinking"
-                        ? "Instant — auto-selected because Thinking is unavailable"
-                        : "Instant — fast, lightweight model"
-                  }
-                  className={cn(
-                    "h-full px-3 transition-colors",
-                    effectiveChatMode === "instant"
-                      ? "bg-primary text-primary-foreground"
-                      : "text-muted-foreground hover:text-foreground hover:bg-accent",
-                    (!instantHealthy || isStreaming) && "opacity-50 cursor-not-allowed",
-                  )}
+            <div className="flex flex-col items-end gap-1">
+              <div className="flex items-center gap-1">
+                <div
+                  role="radiogroup"
+                  aria-label="Chat mode"
+                  className="flex h-8 items-center rounded-sm border border-input text-xs overflow-hidden"
                 >
-                  Instant
-                </button>
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={effectiveChatMode === "thinking"}
-                  disabled={!thinkingHealthy || isStreaming}
-                  onClick={() => setStoredChatMode("thinking")}
-                  title={
-                    !thinkingHealthy
-                      ? "Thinking mode unavailable (backend unreachable)"
-                      : isFallenBack && desiredChatMode === "instant"
-                        ? "Thinking — auto-selected because Instant is unavailable"
-                        : "Thinking — full-quality model"
-                  }
-                  className={cn(
-                    "h-full px-3 border-l border-input transition-colors",
-                    effectiveChatMode === "thinking"
-                      ? "bg-primary text-primary-foreground"
-                      : "text-muted-foreground hover:text-foreground hover:bg-accent",
-                    (!thinkingHealthy || isStreaming) && "opacity-50 cursor-not-allowed",
-                  )}
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={effectiveChatMode === "instant"}
+                    disabled={!instantHealthy || isStreaming}
+                    onClick={() => setStoredChatMode("instant")}
+                    title={
+                      !instantHealthy
+                        ? "Instant mode unavailable (LM Studio unreachable)"
+                        : isFallenBack && desiredChatMode === "thinking"
+                          ? "Instant — auto-selected because Thinking is unavailable"
+                          : "Instant — fast, lightweight model"
+                    }
+                    className={cn(
+                      "h-full px-3 transition-colors",
+                      effectiveChatMode === "instant"
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:text-foreground hover:bg-accent",
+                      (!instantHealthy || isStreaming) && "opacity-50 cursor-not-allowed",
+                    )}
+                  >
+                    Instant
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={effectiveChatMode === "thinking"}
+                    disabled={!thinkingHealthy || isStreaming}
+                    onClick={() => setStoredChatMode("thinking")}
+                    title={
+                      !thinkingHealthy
+                        ? "Thinking mode unavailable (backend unreachable)"
+                        : isFallenBack && desiredChatMode === "instant"
+                          ? "Thinking — auto-selected because Instant is unavailable"
+                          : "Thinking — full-quality model"
+                    }
+                    className={cn(
+                      "h-full px-3 border-l border-input transition-colors",
+                      effectiveChatMode === "thinking"
+                        ? "bg-primary text-primary-foreground"
+                        : "text-muted-foreground hover:text-foreground hover:bg-accent",
+                      (!thinkingHealthy || isStreaming) && "opacity-50 cursor-not-allowed",
+                    )}
+                  >
+                    Thinking
+                  </button>
+                </div>
+
+                {/* Temperature */}
+                <Select
+                  value={String(temperature)}
+                  onValueChange={(v) => setTemperature(parseFloat(v))}
+                  disabled={isStreaming}
                 >
-                  Thinking
-                </button>
+                  <SelectTrigger
+                    className="h-8 w-[70px] text-xs"
+                    aria-label="Temperature"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0].map((t) => (
+                      <SelectItem key={t} value={String(t)}>
+                        {t.toFixed(1)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                {/* Retrieval mode */}
+                <Select
+                  value={retrievalMode}
+                  onValueChange={(v) => setRetrievalMode(v as "auto" | "semantic" | "keyword")}
+                  disabled={isStreaming}
+                >
+                  <SelectTrigger
+                    className="h-8 w-[90px] text-xs"
+                    aria-label="Retrieval mode"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">Auto</SelectItem>
+                    <SelectItem value="semantic">Semantic</SelectItem>
+                    <SelectItem value="keyword">Keyword</SelectItem>
+                  </SelectContent>
+                </Select>
+
+                {/* Citation mode */}
+                <Select
+                  value={citationMode}
+                  onValueChange={(v) => setCitationMode(v as "enabled" | "disabled" | "required")}
+                  disabled={isStreaming}
+                >
+                  <SelectTrigger
+                    className="h-8 w-[95px] text-xs"
+                    aria-label="Citation mode"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="enabled">Cite: On</SelectItem>
+                    <SelectItem value="disabled">Cite: Off</SelectItem>
+                    <SelectItem value="required">Cite: Req</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
               {isFallenBack && (
                 <span
