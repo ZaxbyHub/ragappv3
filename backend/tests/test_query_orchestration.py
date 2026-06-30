@@ -861,6 +861,9 @@ async def test_multi_sub_query_trace_fusion_used_true(patched_settings_fixture):
     if sys.version_info >= (3, 14):
         pytest.skip("Python 3.14 SQLite event-loop deadlock — invariant verified by code inspection")
 
+    patched_settings_fixture.query_transformation_enabled = True
+    patched_settings_fixture.agentic_rag_enabled = False
+
     plan = ["facet_one", "facet_two"]  # 2 sub-queries
 
     fake_emb = FakeEmbeddingService()

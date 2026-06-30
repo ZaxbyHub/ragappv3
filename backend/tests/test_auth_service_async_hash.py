@@ -210,6 +210,9 @@ class TestAsyncHashPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase):
         await async_hash_password(plain_password)
         hashing_time = time.perf_counter() - start
 
+        # Ensure the side task has completed before checking timing
+        await side_task_handle
+
         # On fast machines the hash may complete before the side task is scheduled.
         # The key assertion is that no exception was raised and hashing completed.
         # task_executed being True proves the event loop wasn't blocked;
