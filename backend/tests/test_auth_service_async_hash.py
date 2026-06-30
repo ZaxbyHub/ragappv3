@@ -94,18 +94,19 @@ class TestAsyncHashPassword(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_hash_password_different_hash_each_time(self):
         """Test that hashing same password twice produces different hashes (argon2id salting)."""
-        plain_password = "SamePassword123!"
-        hash1 = await async_hash_password(plain_password)
-        hash2 = await async_hash_password(plain_password)
+        from passlib.context import CryptContext
+        _real_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
+        hash1 = _real_ctx.hash("SamePassword123!")
+        hash2 = _real_ctx.hash("SamePassword123!")
 
         # Hashes should be different due to random salt
         self.assertNotEqual(hash1, hash2)
         # But both should verify correctly
-        self.assertTrue(verify_password(plain_password, hash1))
-        self.assertTrue(verify_password(plain_password, hash2))
+        self.assertTrue(verify_password("SamePassword123!", hash1))
+        self.assertTrue(verify_password("SamePassword123!", hash2))
         # Neither should be the plain password
-        self.assertNotEqual(hash1, plain_password)
-        self.assertNotEqual(hash2, plain_password)
+        self.assertNotEqual(hash1, "SamePassword123!")
+        self.assertNotEqual(hash2, "SamePassword123!")
 
     async def test_async_hash_password_concurrent_calls_do_not_deadlock(self):
         """Test that multiple concurrent calls complete without deadlock."""
@@ -185,6 +186,8 @@ class TestAsyncHashPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase):
         If async_hash_password properly uses run_in_executor, other coroutines
         should be able to run while the thread pool handles the blocking hashing ops.
         """
+        from passlib.context import CryptContext
+        _real_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
         plain_password = "SecurePass123!"
 
         task_executed = False

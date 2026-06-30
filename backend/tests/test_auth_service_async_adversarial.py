@@ -291,8 +291,10 @@ class TestAsyncVerifyPasswordEventLoopBlocking(unittest.IsolatedAsyncioTestCase)
         If async_verify_password properly uses run_in_executor, other coroutines
         should be able to run while the thread pool handles the blocking hash ops.
         """
+        from passlib.context import CryptContext
+        _real_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
         plain_password = "SecurePass123!"
-        hashed_password = hash_password(plain_password)
+        hashed_password = _real_ctx.hash(plain_password)
 
         task_executed = False
         task_execution_time = None

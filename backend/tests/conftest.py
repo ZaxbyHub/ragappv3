@@ -205,27 +205,19 @@ def _cache_bcrypt_hash_for_test_passwords():
     # `from app.services.auth_service import hash_password` at module level.
     original_pwd_hash = _auth_module.pwd_context.hash
     original_pwd_verify = _auth_module.pwd_context.verify
-    import hashlib
-    import secrets as _secrets
-
-    _hash_to_password = {}  # hash -> password (reverse lookup for verify)
+    _all_hash_cache = {}  # password -> hash (populated lazily by hash calls)
 
     def _fast_pwd_hash(secret, *args, **kwargs):
         secret_str = str(secret) if not isinstance(secret, str) else secret
-        # Generate a unique fast hash each time (random salt + SHA-256)
-        # formatted as argon2id to pass format validation
-        salt = _secrets.token_hex(16)
-        digest = hashlib.sha256(f"{secret_str}{salt}".encode()).hexdigest()
-        fake_hash = f"$argon2id$v=19$m=19456,t=2,p=1${salt}${digest}"
-        _hash_to_password[fake_hash] = secret_str
-        return fake_hash
+        if secret_str not in _all_hash_cache:
+            _all_hash_cache[secret_str] = original_pwd_hash(secret, *args, **kwargs)
+        return _all_hash_cache[secret_str]
 
     def _fast_pwd_verify(secret, hash_value, *args, **kwargs):
         secret_str = str(secret) if not isinstance(secret, str) else secret
-        # Fast path: reverse-lookup cache
-        if hash_value in _hash_to_password:
-            return _hash_to_password[hash_value] == secret_str
-        # Fallback: real verify (for hashes created outside the cache)
+        for pwd, cached_hash in _all_hash_cache.items():
+            if hash_value == cached_hash:
+                return secret_str == pwd
         return original_pwd_verify(secret, hash_value, *args, **kwargs)
 
     _auth_module.pwd_context.hash = _fast_pwd_hash

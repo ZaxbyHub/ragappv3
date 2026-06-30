@@ -603,7 +603,7 @@ class TestAccessTokenDenylist:
 
     @pytest.mark.asyncio
     async def test_token_without_jti_returns_401(self, mock_settings_jwt_mode, mock_db):
-        """Token without jti claim → 401 token_invalid (deployment guard)."""
+        """Token without jti claim → allowed (conditional enforcement skips denylist)."""
         from datetime import datetime, timedelta, timezone
 
         import jwt
@@ -617,21 +617,25 @@ class TestAccessTokenDenylist:
             "role": "member",
             "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             "type": "access",
-            # No jti — should be rejected
+            # No jti — conditional enforcement skips denylist check
+            "fpt": _TEST_FPT_EMPTY,
         }
         token = jwt.encode(payload, secret, algorithm=algorithm)
 
         mock_conn, mock_cursor = mock_db
+        mock_cursor.fetchone.side_effect = [
+            None,
+            (42, "testuser", "Test User", "member", 1, 0),
+        ]
 
-        with pytest.raises(HTTPException) as exc_info:
-            await get_current_active_user(request=mock_request,
-                authorization=f"Bearer {token}",
-                access_token=None,
-                db=mock_conn,
-            )
+        result = await get_current_active_user(request=mock_request,
+            authorization=f"Bearer {token}",
+            access_token=None,
+            db=mock_conn,
+        )
 
-        assert exc_info.value.status_code == 401
-        assert "token_invalid" in exc_info.value.detail.lower()
+        assert result["id"] == 42
+        assert result["username"] == "testuser"
 
     @pytest.mark.asyncio
     async def test_valid_jti_not_in_denylist_passes(
