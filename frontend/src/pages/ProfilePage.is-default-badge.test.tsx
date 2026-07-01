@@ -29,22 +29,22 @@ vi.mock('@/stores/useAuthStore', () => ({
   useAuthStore: mockUseAuthStore,
 }));
 
-// Mock listVaults with is_default vaults
+// Mock listAccessibleVaults with is_default vaults
 // Define inline within the hoisted factory to avoid TDZ
-const { mockListVaults } = vi.hoisted(() => {
+const { mockListAccessibleVaults } = vi.hoisted(() => {
   const mockVaultsWithDefault = [
     { id: 1, name: 'Default Vault', description: 'The default vault', created_at: '2024-01-01', updated_at: '2024-01-01', file_count: 10, memory_count: 5, session_count: 3, org_id: 1, is_default: true },
     { id: 2, name: 'Secondary Vault', description: 'Another vault', created_at: '2024-01-01', updated_at: '2024-01-01', file_count: 5, memory_count: 2, session_count: 1, org_id: 1, is_default: false },
   ];
   return {
-    mockListVaults: vi.fn().mockResolvedValue({ vaults: mockVaultsWithDefault }),
+    mockListAccessibleVaults: vi.fn().mockResolvedValue({ vaults: mockVaultsWithDefault }),
   };
 });
 
 vi.mock('@/lib/api', () => ({
   changePassword: mockChangePassword,
   listOrganizations: vi.fn().mockResolvedValue([]),
-  listVaults: mockListVaults,
+  listAccessibleVaults: mockListAccessibleVaults,
   listSessions: vi.fn().mockResolvedValue({ sessions: [] }),
   revokeSession: vi.fn().mockResolvedValue(undefined),
   revokeAllSessions: vi.fn().mockResolvedValue({ access_token: 'token', token_type: 'bearer', expires_in: 900 }),
@@ -119,7 +119,7 @@ describe('ProfilePage Vault Access — is_default badge removal (5.5)', () => {
 
   it('does NOT render "Default" badge when all vaults have is_default=false', async () => {
     // Override the mock to return vaults without is_default
-    mockListVaults.mockResolvedValueOnce({
+    mockListAccessibleVaults.mockResolvedValueOnce({
       vaults: [
         { id: 3, name: 'Regular Vault', description: 'Not default', created_at: '2024-01-01', updated_at: '2024-01-01', file_count: 3, memory_count: 1, session_count: 0, org_id: 1, is_default: false },
       ],
@@ -163,7 +163,7 @@ describe('ProfilePage Vault Access — is_default badge removal (5.5)', () => {
   });
 
   it('renders empty vault list without Default badge', async () => {
-    mockListVaults.mockResolvedValueOnce({ vaults: [] });
+    mockListAccessibleVaults.mockResolvedValueOnce({ vaults: [] });
 
     await act(async () => {
       render(<ProfilePage />);
@@ -184,7 +184,7 @@ describe('ProfilePage Vault Access — is_default badge removal (5.5)', () => {
   });
 
   it('renders vault with is_default but no file_count without Default badge', async () => {
-    mockListVaults.mockResolvedValueOnce({
+    mockListAccessibleVaults.mockResolvedValueOnce({
       vaults: [
         { id: 4, name: 'Empty Vault', description: 'No files', created_at: '2024-01-01', updated_at: '2024-01-01', file_count: 0, memory_count: 0, session_count: 0, org_id: 1, is_default: true },
       ],

@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- **Phase 2 phase council APPROVED (2 rounds) and Final council APPROVED (5 members)**: issue #265 vault-access fixes reviewed and accepted by full council.
+
+- **Member/user vault access fixes (issue #265)**: `ProfilePage` now calls `GET /vaults/accessible` (available to all authenticated roles) instead of the admin-only `GET /vaults`, eliminating 403 errors for member/viewer users on the profile page. Vault state is now initialized on login and `init()` to validate the cached `vault_id` from localStorage against server state, preventing stale vault selections. `MemoryPage` now guards on `activeVaultId === null` and shows a user-friendly empty-state prompt instead of issuing API calls that would fail with 403 for users with no vault selected.
+
+### Added
+
 - **Prompt injection hardening Phase 1 (issue #209)**: XML special-character escaping (`html.escape`, default `quote=True`) now applied to all five untrusted-content boundary sites inside their XML wrappers: `<user_query>` (user input), `<document>` (retrieved chunks, including parent-window text), `<memory>` (memory records), `<wiki_evidence>` (compiled wiki body), and `<kms_evidence>` (KMS excerpt). All five XML special characters (`<`, `>`, `&`, `'`, `"`) are escaped. Closes CRITICAL-1, HIGH-1, HIGH-2 from issue #209 v8 review. Test suite (`test_prompt_builder_xml_escape.py`) covers 20 adversarial test methods across injection payloads, double-encoding, Unicode/CJK/emoji, 10 KB+ payloads, parent-window path, empty strings, and edge cases.
 
 - **FR-4 – CI test scope expansion (Phase 2, issue #209)**: Replaced the 8-file test allow-list in `.github/workflows/ci.yml` with `pytest --tb=short -v tests/`, expanding CI to run all 3934 backend tests including 21 scope-escalation adversarial tests, 1 prompt-injection test, 5 CSRF tests, 18 vault authorization tests, and 3 KMS authorization tests. Closes CRITICAL-2 from v8 review.
@@ -31,6 +37,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Chat query load benchmark script (Phase 4)**: `backend/scripts/benchmark_chat_queries.py` measures `POST /api/chat` latency at 5, 10, and 20 concurrent users, reporting p50/p95/p99. Uses mocked `RAGEngine` and `VectorStore` so it runs CI-stable without a live LLM. Run with `python backend/scripts/benchmark_chat_queries.py`.
 
 ### Fixed
+
+- **SCHEMA index blocking migrations on existing DBs**: Removed redundant `idx_wiki_claims_vault_normalized` index from `SCHEMA` constant in `backend/app/models/database.py`. The migration at line 2884 already creates this index after adding the `normalized_text` column, so the duplicate in `SCHEMA` caused `UNIQUE constraint failed` errors on existing databases during migration.
 
 - **Deleted documents can no longer leave chunks silently searchable (issue #219)**: when removing a document's LanceDB chunks fails during a delete, the failure is now durably recorded in a new `vector_delete_pending` table (in the same transaction as the file-row delete) and a background sweep in `BackgroundProcessor` retries the chunk delete at startup and hourly thereafter, removing the pending row only on confirmed success (capped at 10 attempts, then left for operator review). Previously the failure was only logged and the orphaned chunks stayed retrievable forever.
 - **Partial embedding failures are no longer invisible (issue #221)**: documents that index with up to 50% of their chunks dropped due to embedding failures previously showed a plain "Indexed" status with only a backend log line. The dropped-chunk count is now persisted to a new `files.chunks_failed` column, surfaced through the documents API, and rendered as an amber "Partially indexed" badge (with a failed-chunk tooltip) in the document table and cards.

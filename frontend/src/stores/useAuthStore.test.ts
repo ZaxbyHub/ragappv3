@@ -46,6 +46,18 @@ vi.mock("@/lib/api", () => ({
   },
 }));
 
+// Mock @/stores/useVaultStore
+const { mockFetchVaults } = vi.hoisted(() => ({
+  mockFetchVaults: vi.fn(),
+}));
+vi.mock("@/stores/useVaultStore", () => ({
+  useVaultStore: {
+    getState: vi.fn(() => ({
+      fetchVaults: mockFetchVaults,
+    })),
+  },
+}));
+
 // Import after mocks
 import { useAuthStore, resetInitState } from "./useAuthStore";
 import { setJwtAccessToken, getJwtAccessToken, refreshAccessToken } from "@/lib/api";
@@ -72,6 +84,8 @@ describe("useAuthStore", () => {
     mockResetCsrfToken.mockReset();
     mockEnsureCsrfToken.mockReset();
     mockEnsureCsrfToken.mockResolvedValue("mock-csrf-token");
+    mockFetchVaults.mockReset();
+    mockFetchVaults.mockResolvedValue(undefined);
 
     // Reset module-level init guard state
     resetInitState();
@@ -99,6 +113,8 @@ describe("useAuthStore", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    // Reset module-level init guard state to prevent test pollution
+    resetInitState();
   });
 
   describe("Initial State", () => {
@@ -116,7 +132,7 @@ describe("useAuthStore", () => {
   describe("login", () => {
     it("should login successfully with user in response", async () => {
       const { login } = useAuthStore.getState();
-      
+
       mockPost?.mockResolvedValueOnce({
         data: {
           access_token: "jwt123",
@@ -132,11 +148,13 @@ describe("useAuthStore", () => {
       expect(state.isAuthenticated).toBe(true);
       expect(state.authMode).toBe("jwt");
       expect(setJwtAccessToken).toHaveBeenCalledWith("jwt123");
+      // Vault state is initialized to validate cached activeVaultId
+      expect(mockFetchVaults).toHaveBeenCalledTimes(1);
     });
 
     it("should login successfully and fetch user if user not in response", async () => {
       const { login, fetchMe } = useAuthStore.getState();
-      
+
       mockPost?.mockResolvedValueOnce({
         data: {
           access_token: "jwt123",
@@ -156,21 +174,53 @@ describe("useAuthStore", () => {
       expect(state.isAuthenticated).toBe(true);
       expect(state.authMode).toBe("jwt");
       expect(setJwtAccessToken).toHaveBeenCalledWith("jwt123");
+      // Vault state is initialized to validate cached activeVaultId
+      expect(mockFetchVaults).toHaveBeenCalledTimes(1);
     });
 
     it("should throw error on login failure", async () => {
       const { login } = useAuthStore.getState();
-      
+
       mockPost?.mockRejectedValueOnce({
         response: { status: 401, data: { detail: "Invalid credentials" } },
       });
 
       await expect(login("testuser", "wrongpassword")).rejects.toThrow();
-      
+
       const state = useAuthStore.getState();
       expect(state.user).toBeNull();
       expect(state.accessToken).toBeNull();
       expect(state.isAuthenticated).toBe(false);
+    });
+
+    // Task 2.2: Verify fetchVaults is called on each login when guard is reset between calls
+    it("should call fetchVaults on each login when guard is reset between calls", async () => {
+      const { login } = useAuthStore.getState();
+
+      // First successful login — sets _vaultsInitialized = true and calls fetchVaults
+      mockPost?.mockResolvedValueOnce({
+        data: {
+          access_token: "jwt-first",
+          user: mockUser,
+        },
+      });
+
+      await login("testuser", "password123");
+
+      expect(mockFetchVaults).toHaveBeenCalledTimes(1);
+
+      // Second login after guard reset — should call fetchVaults again
+      mockPost?.mockResolvedValueOnce({
+        data: {
+          access_token: "jwt-second",
+          user: mockUser,
+        },
+      });
+
+      await login("testuser2", "password456");
+
+      // fetchVaults should be called twice (once per login)
+      expect(mockFetchVaults).toHaveBeenCalledTimes(2);
     });
 
     it("should set isLoading during login", async () => {
@@ -451,7 +501,7 @@ describe("useAuthStore", () => {
       });
 
       const { init } = useAuthStore.getState();
-      
+
       mockGet?.mockResolvedValueOnce({
         data: mockUser,
       });
@@ -462,6 +512,32 @@ describe("useAuthStore", () => {
       expect(state.authMode).toBe("jwt");
       expect(state.isAuthenticated).toBe(true);
       expect(state.user).toEqual(mockUser);
+      // Vault state is initialized to validate cached activeVaultId
+      expect(mockFetchVaults).toHaveBeenCalledTimes(1);
+    });
+
+    it("should call fetchVaults when refresh token succeeds in init", async () => {
+      useAuthStore.setState({
+        accessToken: null,
+      });
+
+      const { init } = useAuthStore.getState();
+
+      // Mock refreshAccessToken to return a new token (called by refreshToken())
+      vi.mocked(refreshAccessToken).mockResolvedValueOnce("refreshed-jwt");
+      // Mock fetchMe after refresh (GET /auth/me via authClient)
+      mockGetFn?.mockResolvedValueOnce({
+        data: mockUser,
+      });
+
+      await init();
+
+      const state = useAuthStore.getState();
+      expect(state.authMode).toBe("jwt");
+      expect(state.isAuthenticated).toBe(true);
+      expect(state.user).toEqual(mockUser);
+      // Vault state is initialized via refresh token branch
+      expect(mockFetchVaults).toHaveBeenCalledTimes(1);
     });
 
     it("should default to jwt mode after failed refresh when no token exists", async () => {

@@ -5,14 +5,14 @@ import ProfilePage from '@/pages/ProfilePage';
 
 const {
   mockListOrganizations,
-  mockListVaults,
+  mockListAccessibleVaults,
   mockListSessions,
   mockRevokeSession,
   mockRevokeAllSessions,
   mockSetJwtAccessToken,
 } = vi.hoisted(() => ({
   mockListOrganizations: vi.fn(),
-  mockListVaults: vi.fn(),
+  mockListAccessibleVaults: vi.fn(),
   mockListSessions: vi.fn(),
   mockRevokeSession: vi.fn(),
   mockRevokeAllSessions: vi.fn(),
@@ -43,7 +43,7 @@ vi.mock('@/stores/useAuthStore', () => ({
 vi.mock('@/lib/api', () => ({
   changePassword: vi.fn().mockResolvedValue(undefined),
   listOrganizations: mockListOrganizations,
-  listVaults: mockListVaults,
+  listAccessibleVaults: mockListAccessibleVaults,
   listSessions: mockListSessions,
   revokeSession: mockRevokeSession,
   revokeAllSessions: mockRevokeAllSessions,
@@ -91,7 +91,7 @@ describe('ProfilePage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockListOrganizations.mockResolvedValue([]);
-    mockListVaults.mockResolvedValue({ vaults: [] });
+    mockListAccessibleVaults.mockResolvedValue({ vaults: [] });
     mockListSessions.mockResolvedValue({
       sessions: [
         {
@@ -365,5 +365,25 @@ describe('ProfilePage', () => {
 
     const saveButton = screen.getByRole('button', { name: /save changes/i });
     expect(saveButton).toBeDisabled();
+  });
+
+  it('renders empty vault list gracefully when listAccessibleVaults rejects', async () => {
+    mockListAccessibleVaults.mockRejectedValue(new Error('Network error'));
+
+    await act(async () => {
+      render(<ProfilePage />);
+    });
+
+    // Wait for loading to finish (Promise.allSettled resolves)
+    await waitFor(() => {
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    });
+
+    // Page renders without crashing
+    expect(screen.getByText('Profile')).toBeInTheDocument();
+
+    // Vault section renders empty state due to graceful degradation
+    expect(screen.getByText('Vault Access')).toBeInTheDocument();
+    expect(screen.getByText('No vaults accessible.')).toBeInTheDocument();
   });
 });

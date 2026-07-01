@@ -27,6 +27,25 @@ import { updateMemory, promoteMemoryToWiki, getMemoryWikiStatus, type MemoryResu
 export default function MemoryPage() {
   const { activeVaultId } = useVaultStore();
 
+  if (activeVaultId === null) {
+    return (
+      <>
+        <PageTitleHeader title="Memories" />
+        <div className="p-8">
+          <EmptyState
+            icon={Brain}
+            title="Select a vault"
+            description="Choose a vault from the vault selector to view its memories."
+          />
+        </div>
+      </>
+    );
+  }
+
+  return <MemoryPageContent activeVaultId={activeVaultId} />;
+}
+
+function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
   const { memories, searchQuery, setSearchQuery, loading, handleSearch } = useMemorySearch(activeVaultId);
 
   const {
@@ -126,10 +145,6 @@ export default function MemoryPage() {
   }
 
   async function handlePromoteToWiki(memory: MemoryResult) {
-    if (!activeVaultId) {
-      toast.error("Select a vault before promoting to wiki");
-      return;
-    }
     setPromotingId(memory.id);
     try {
       const result = await promoteMemoryToWiki({

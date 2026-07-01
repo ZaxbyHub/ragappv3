@@ -5,7 +5,7 @@ import {
   changePassword,
   listOrganizations,
   listSessions,
-  listVaults,
+  listAccessibleVaults,
   revokeAllSessions,
   revokeSession,
   setJwtAccessToken,
@@ -66,7 +66,7 @@ function ProfilePageContent() {
     if (testMode) return;
     setLoadingAccess(true);
     setLoadingSessions(true);
-    Promise.allSettled([listOrganizations(), listVaults(), listSessions()]).then(([orgResult, vaultResult, sessionsResult]) => {
+    Promise.allSettled([listOrganizations(), listAccessibleVaults(), listSessions()]).then(([orgResult, vaultResult, sessionsResult]) => {
       if (orgResult.status === "fulfilled") setOrgs(orgResult.value);
       if (vaultResult.status === "fulfilled") setVaults(vaultResult.value.vaults ?? []);
       if (sessionsResult.status === "fulfilled") setSessions(sessionsResult.value.sessions ?? []);

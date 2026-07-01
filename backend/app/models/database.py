@@ -602,7 +602,6 @@ CREATE INDEX IF NOT EXISTS idx_wiki_pages_vault_type_status ON wiki_pages(vault_
 CREATE INDEX IF NOT EXISTS idx_wiki_pages_vault_slug ON wiki_pages(vault_id, slug);
 CREATE INDEX IF NOT EXISTS idx_wiki_entities_vault_name ON wiki_entities(vault_id, canonical_name);
 CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_page_status ON wiki_claims(vault_id, page_id, status);
-CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_normalized ON wiki_claims(vault_id, normalized_text);
 CREATE INDEX IF NOT EXISTS idx_wiki_claim_sources_claim_id ON wiki_claim_sources(claim_id);
 CREATE INDEX IF NOT EXISTS idx_wiki_compile_jobs_vault_status ON wiki_compile_jobs(vault_id, status);
 CREATE INDEX IF NOT EXISTS idx_wiki_lint_findings_vault_status_severity ON wiki_lint_findings(vault_id, status, severity);
