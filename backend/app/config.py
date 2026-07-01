@@ -186,6 +186,10 @@ class Settings(BaseSettings):
     this bounds the Python-side cosine work while giving semantic recall a wide pool.
     For vaults larger than this, the oldest memories fall outside the dense scan; raise
     it (at O(n) CPU cost) if a vault needs deeper recency reach."""
+    memory_eviction_interval_seconds: int = 300
+    """Interval, in seconds, between periodic background sweeps that delete expired
+    memories (rows with a past `expires_at`). Runs off the search hot path (issue #263);
+    see `MemoryStore.periodic_eviction_loop` in memory_store.py."""
     rag_trace_in_response: bool = False
     """When True, RAG queries emit a ``trace`` field in the streaming
     done event with detailed retrieval/generation observability. Default
@@ -778,6 +782,15 @@ class Settings(BaseSettings):
                 "lower values bottleneck concurrent MemoryStore retrieval"
             )
         return v
+
+    @field_validator("memory_eviction_interval_seconds", mode="after")
+    @classmethod
+    def validate_memory_eviction_interval_seconds(cls, v: int) -> int:
+        """Validate memory_eviction_interval_seconds is >= 1.
+
+        0 or negative would make the periodic eviction loop a tight/instant busy loop.
+        """
+        return cls._validate_int_range(v, 1, None, "memory_eviction_interval_seconds")
 
     @field_validator("embedding_concurrent_batches", mode="after")
     @classmethod

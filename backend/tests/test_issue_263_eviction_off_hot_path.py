@@ -6,6 +6,7 @@ background eviction loop performs cleanup correctly.
 """
 
 import asyncio
+import os
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -119,3 +120,30 @@ def test_periodic_eviction_loop_survives_errors(memory_store):
 
     # The loop must have survived the first error and called evict again.
     assert call_count["n"] >= 2
+
+
+def test_lifespan_spawns_eviction_loop_with_configured_interval():
+    """lifespan() must pass settings.memory_eviction_interval_seconds into
+    periodic_eviction_loop() rather than relying on the method's hardcoded
+    default — otherwise the setting would be dead/unwired configuration.
+
+    Reads lifespan.py's source text directly (matches this repo's existing
+    precedent, e.g. test_lifespan_model_assertion.py, for avoiding heavy
+    optional-dependency import issues in restricted CI runners) instead of
+    importing+introspecting the module.
+    """
+    lifespan_path = os.path.join(
+        os.path.dirname(__file__), "..", "app", "lifespan.py"
+    )
+    with open(lifespan_path, "r") as f:
+        source = f.read()
+
+    assert "periodic_eviction_loop(" in source, (
+        "lifespan() must spawn MemoryStore.periodic_eviction_loop via "
+        "asyncio.create_task (issue #263 — eviction must run off the search "
+        "hot path)"
+    )
+    assert "settings.memory_eviction_interval_seconds" in source, (
+        "the eviction interval must be read from settings, not hardcoded, "
+        "so memory_eviction_interval_seconds is not dead configuration"
+    )
