@@ -580,7 +580,9 @@ async def lifespan(app: FastAPI):
     # evict_expired_memories no longer runs on every search_memories call
     # (issue #263 — moves a DELETE + COMMIT off the RAG query hot path).
     memory_eviction_task = asyncio.create_task(
-        app.state.memory_store.periodic_eviction_loop()
+        app.state.memory_store.periodic_eviction_loop(
+            interval=settings.memory_eviction_interval_seconds
+        )
     )
 
     # Start LLM keep-alive tasks for both backends to prevent unload on idle.

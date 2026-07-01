@@ -234,6 +234,27 @@ class TestMemoryStore(unittest.TestCase):
                 if _cached is not None:
                     _cached.close_all()
 
+    def test_memory_eviction_interval_seconds_default_is_300(self):
+        """Test that the periodic eviction interval defaults to 300 seconds."""
+        s = Settings()
+        self.assertEqual(s.memory_eviction_interval_seconds, 300)
+
+    def test_memory_eviction_interval_seconds_rejects_zero_and_negative(self):
+        """Test that Settings rejects a non-positive eviction interval (issue #263).
+
+        0 or negative would turn the periodic eviction loop into a tight/instant
+        busy loop instead of a genuine periodic sweep.
+        """
+        with self.assertRaises(pydantic.ValidationError):
+            Settings(memory_eviction_interval_seconds=0)
+        with self.assertRaises(pydantic.ValidationError):
+            Settings(memory_eviction_interval_seconds=-1)
+
+    def test_memory_eviction_interval_seconds_accepts_custom_value(self):
+        """Test that Settings accepts a custom eviction interval."""
+        s = Settings(memory_eviction_interval_seconds=60)
+        self.assertEqual(s.memory_eviction_interval_seconds, 60)
+
 
 if __name__ == "__main__":
     unittest.main()
