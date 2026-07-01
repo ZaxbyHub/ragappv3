@@ -170,6 +170,32 @@ class MemoryStore:
         finally:
             self.pool.release_connection(conn)
 
+    async def periodic_eviction_loop(self, interval: int = 300) -> None:
+        """Run evict_expired_memories on a fixed interval.
+
+        Designed to be spawned as a background asyncio task at application
+        startup so expired-memory cleanup no longer runs on the search hot
+        path.  Catches and logs its own errors so the loop never silently
+        dies; CancelledError breaks the loop for clean shutdown.
+        """
+        logger.info("Starting periodic memory eviction task (interval: %ds)", interval)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                removed = await asyncio.to_thread(self.evict_expired_memories)
+                if removed:
+                    logger.info(
+                        "Periodic eviction removed %d expired memories", removed
+                    )
+            except asyncio.CancelledError:
+                logger.info("Periodic memory eviction task cancelled")
+                break
+            except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                logger.warning(
+                    "Periodic memory eviction failed (will retry next cycle): %s",
+                    exc,
+                )
+
     async def _embed_text(self, text: str) -> Optional[List[float]]:
         """Best-effort embed; never raises. Returns None on failure or when
         no embedding service is wired in.
@@ -596,7 +622,6 @@ class MemoryStore:
         otherwise.
         """
         # FTS results — always run.
-        self.evict_expired_memories()
         fts_records = self._fts_search(query, limit, vault_id)
 
         # Dense results — best-effort, run UNFILTERED across the vault.

@@ -88,9 +88,15 @@ def test_memory_store_filters_and_evicts_expired_memories():
             )
             store.add_memory("fresh fact about retention", importance=0.8)
 
+            # search_memories no longer evicts expired rows inline (issue
+            # #263 moved eviction to a periodic background task), but it
+            # still filters them out of results at read time.
             results = store.search_memories("retention", limit=10)
 
             assert [record.content for record in results] == ["fresh fact about retention"]
+            # Explicit eviction now removes the expired row that search
+            # left behind.
+            assert store.evict_expired_memories() == 1
             assert store.evict_expired_memories() == 0
         finally:
             pool.close_all()
