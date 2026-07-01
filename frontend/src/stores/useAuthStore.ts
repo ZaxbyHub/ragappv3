@@ -10,6 +10,7 @@ import {
   resetCsrfToken,
   attachCsrfInterceptor,
 } from "@/lib/api";
+import { useVaultStore } from "@/stores/useVaultStore";
 
 interface User {
   id: number;
@@ -72,10 +73,14 @@ const authClient = axios.create({
 let _initAttempted = false;
 let _initPromise: Promise<void> | null = null;
 
+// Guard to ensure vault state is initialized exactly once per session
+let _vaultsInitialized = false;
+
 // Reset init guard state (exported for testing)
 export const resetInitState = () => {
   _initAttempted = false;
   _initPromise = null;
+  _vaultsInitialized = false;
 };
 
 // Wire up CSRF via centralized api.ts utilities
@@ -117,6 +122,8 @@ export const useAuthStore = create<AuthState>()(
             if (state.accessToken) {
               await get().fetchMe();
               set({ authMode: "jwt", isAuthenticated: true, isLoading: false, isInitialized: true });
+              _vaultsInitialized = true;
+              await useVaultStore.getState().fetchVaults();
               return;
             }
             // No in-memory token — attempt refresh via httpOnly cookie (H-7 fix)
@@ -124,6 +131,8 @@ export const useAuthStore = create<AuthState>()(
             if (newToken) {
               await get().fetchMe();
               set({ authMode: "jwt", isAuthenticated: true, isLoading: false, isInitialized: true });
+              _vaultsInitialized = true;
+              await useVaultStore.getState().fetchVaults();
               return;
             }
           } catch {
@@ -169,6 +178,7 @@ export const useAuthStore = create<AuthState>()(
         // Reset init guard so re-login works after a failed init
         _initAttempted = false;
         _initPromise = null;
+        _vaultsInitialized = false;
 
         get()._setLoading(true);
         try {
@@ -197,6 +207,12 @@ export const useAuthStore = create<AuthState>()(
           // If user wasn't included in login response, fetch it
           if (!user) {
             await get().fetchMe();
+          }
+
+          // Initialize vault state to validate cached activeVaultId
+          if (!_vaultsInitialized) {
+            _vaultsInitialized = true;
+            await useVaultStore.getState().fetchVaults();
           }
         } finally {
           get()._setLoading(false);
@@ -256,6 +272,7 @@ export const useAuthStore = create<AuthState>()(
           // Reset init guard so re-login works after logout
           _initAttempted = false;
           _initPromise = null;
+          _vaultsInitialized = false;
         }
       },
 

@@ -33,7 +33,7 @@ vi.mock('@/stores/useAuthStore', () => ({
 vi.mock('@/lib/api', () => ({
   changePassword: mockChangePassword,
   listOrganizations: vi.fn().mockResolvedValue([]),
-  listVaults: vi.fn().mockResolvedValue({ vaults: [] }),
+  listAccessibleVaults: vi.fn().mockResolvedValue({ vaults: [] }),
   listSessions: vi.fn().mockResolvedValue({ sessions: [] }),
   revokeSession: vi.fn().mockResolvedValue(undefined),
   revokeAllSessions: vi.fn().mockResolvedValue({ access_token: 'token', token_type: 'bearer', expires_in: 900 }),
