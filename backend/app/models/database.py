@@ -3045,12 +3045,19 @@ class SQLiteConnectionPool:
                     should_create = True
 
             if should_create:
-                try:
-                    return self._create_connection()
-                except (sqlite3.Error, OSError):
-                    with self._lock:
+                # Hold the lock across the I/O call so that _created_count
+                # bookkeeping (increment + failure rollback) is atomic with
+                # respect to other callers. Without this, a transient
+                # window between the increment and the failure rollback
+                # lets concurrent get_connection() calls observe an
+                # inflated count and unnecessarily skip creation /
+                # block on the queue. See issue #262.
+                with self._lock:
+                    try:
+                        return self._create_connection()
+                    except (sqlite3.Error, OSError):
                         self._created_count -= 1
-                    raise
+                        raise
 
             # If at max capacity, block until a connection is available
             try:
