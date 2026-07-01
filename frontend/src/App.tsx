@@ -140,7 +140,6 @@ function App() {
       <ReconnectingBanner health={health} />
       <BrowserRouter
         basename={APP_BASENAME || undefined}
-        future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
       >
         <Suspense fallback={<PageLoader />}>
           <Routes>
