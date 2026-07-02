@@ -20,6 +20,11 @@ class ToggleManager:
     """Reads and writes feature toggles backed by SQLite."""
 
     CACHE_TTL = 30.0  # seconds
+    _UPSERT_SQL = (
+        "INSERT INTO admin_toggles(feature, enabled) VALUES(?, ?) "
+        "ON CONFLICT(feature) DO UPDATE SET "
+        "enabled=excluded.enabled, updated_at=CURRENT_TIMESTAMP"
+    )
 
     def __init__(self, pool: SQLiteConnectionPool) -> None:
         self.pool = pool
@@ -50,15 +55,27 @@ class ToggleManager:
     def set_toggle(self, feature: str, enabled: bool) -> None:
         conn = self.pool.get_connection()
         try:
-            conn.execute(
-                "INSERT INTO admin_toggles(feature, enabled) VALUES(?, ?) ON CONFLICT(feature) DO UPDATE SET enabled=excluded.enabled, updated_at=CURRENT_TIMESTAMP",
-                (feature, int(enabled))
-            )
+            self.set_toggle_on_connection(conn, feature, enabled)
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             self.pool.release_connection(conn)
+        self.update_cache(feature, enabled)
+
+    def set_toggle_on_connection(
+        self, conn: sqlite3.Connection, feature: str, enabled: bool
+    ) -> None:
+        """Write a toggle using the caller's transaction."""
+        conn.execute(self._UPSERT_SQL, (feature, int(enabled)))
+
+    def update_cache(self, feature: str, enabled: bool) -> None:
+        """Update the in-memory cache after a durable commit."""
         with self._lock:
-            self._cache[feature] = ToggleCacheEntry(timestamp=time.time(), enabled=enabled)
+            self._cache[feature] = ToggleCacheEntry(
+                timestamp=time.time(), enabled=enabled
+            )
 
     def clear_cache(self, feature: Optional[str] = None) -> None:
         with self._lock:

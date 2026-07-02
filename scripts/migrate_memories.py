@@ -14,7 +14,7 @@ sys.path.append(str(ROOT))
 os.environ.setdefault("DATA_DIR", str(ROOT / "data"))
 
 from backend.app.config import settings
-from backend.app.models.database import init_db, run_migrations
+from backend.app.models.database import SQLiteConnectionPool, init_db, run_migrations
 from backend.app.services.maintenance import MaintenanceService
 
 # Import optional dependencies
@@ -117,43 +117,47 @@ def migrate(rollback: bool, backup: Path | None, retention: int) -> None:
     # Initialize database schema first
     init_db(str(settings.sqlite_path))
     
-    # Initialize maintenance service
-    maintenance = MaintenanceService(str(settings.sqlite_path))
-    
-    if rollback:
-        if not backup:
-            raise SystemExit("Rollback requires --backup")
-        if not backup.exists():
-            raise SystemExit(f"Backup file not found: {backup}")
-        
-        decrypt_backup(backup)
-        print(f"Rollback completed successfully from {backup}")
-        sys.exit(0)
-
-    # Enable maintenance mode during migration
-    maintenance.set_flag(True, "migration in progress")
+    maintenance_pool = SQLiteConnectionPool(str(settings.sqlite_path), max_size=2)
     try:
-        # Create backup before migration
-        backup_dir = Path("backups")
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        
-        if HAS_BACKUP_MODULE and backup_sqlite is not None:
-            backup_path = backup_sqlite(backup_dir)  # type: ignore
-        else:
-            backup_path = backup_sqlite_fallback(backup_dir)
-        
-        print(f"Backup created: {backup_path}")
-        
-        # Run migrations
-        run_migrations(str(settings.sqlite_path))
-        print("Migrations completed successfully")
-        
-    except Exception as e:
-        print(f"Migration failed: {e}")
-        raise
+        # Initialize maintenance service
+        maintenance = MaintenanceService(maintenance_pool)
+
+        if rollback:
+            if not backup:
+                raise SystemExit("Rollback requires --backup")
+            if not backup.exists():
+                raise SystemExit(f"Backup file not found: {backup}")
+
+            decrypt_backup(backup)
+            print(f"Rollback completed successfully from {backup}")
+            return
+
+        # Enable maintenance mode during migration
+        maintenance.set_flag(True, "migration in progress")
+        try:
+            # Create backup before migration
+            backup_dir = Path("backups")
+            backup_dir.mkdir(parents=True, exist_ok=True)
+
+            if HAS_BACKUP_MODULE and backup_sqlite is not None:
+                backup_path = backup_sqlite(backup_dir)  # type: ignore
+            else:
+                backup_path = backup_sqlite_fallback(backup_dir)
+
+            print(f"Backup created: {backup_path}")
+
+            # Run migrations
+            run_migrations(str(settings.sqlite_path))
+            print("Migrations completed successfully")
+
+        except Exception as e:
+            print(f"Migration failed: {e}")
+            raise
+        finally:
+            # Always disable maintenance mode
+            maintenance.set_flag(False, "migration complete")
     finally:
-        # Always disable maintenance mode
-        maintenance.set_flag(False, "migration complete")
+        maintenance_pool.close_all()
 
 
 def main() -> None:
