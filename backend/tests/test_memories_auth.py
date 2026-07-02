@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -342,6 +342,46 @@ class TestMemoriesAuthorization(TestMemoriesAuthBase):
         )
         # Should succeed since we mocked memory_store
         self.assertEqual(response.status_code, 200)
+
+    def test_put_memories_member_without_vault_write_returns_403(self):
+        """PUT /memories/{id} by member without vault write access returns 403."""
+        conn = self._get_db_conn()
+        try:
+            cursor = conn.execute("SELECT id FROM memories WHERE vault_id = 2")
+            memory_id = cursor.fetchone()[0]
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        response = self.client.put(
+            f"/api/memories/{memory_id}",
+            json={"content": "Updated memory"},
+            headers=self._auth_headers(self._member_no_access_token()),
+        )
+
+        self.assertEqual(response.status_code, 403)
+        data = response.json()
+        self.assertIn("No write access", data.get("detail", ""))
+
+    def test_put_memories_member_with_vault_write_succeeds(self):
+        """PUT /memories/{id} by member with vault write access succeeds."""
+        self._mock_memory_store._has_embedding_columns = MagicMock(return_value=False)
+        self._mock_memory_store.embed_and_store = AsyncMock()
+        conn = self._get_db_conn()
+        try:
+            cursor = conn.execute("SELECT id FROM memories WHERE vault_id = 2")
+            memory_id = cursor.fetchone()[0]
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        response = self.client.put(
+            f"/api/memories/{memory_id}",
+            json={"content": "Updated memory"},
+            headers=self._auth_headers(self._member_token()),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["content"], "Updated memory")
 
     def test_delete_memories_member_without_vault_admin_returns_403(self):
         """DELETE /memories/{id} by member without vault admin access returns 403."""

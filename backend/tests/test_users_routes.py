@@ -11,7 +11,6 @@ These tests verify:
 """
 
 import os
-import sqlite3
 import tempfile
 
 import pytest
@@ -24,54 +23,11 @@ os.environ["JWT_SECRET_KEY"] = (
 )
 os.environ["USERS_ENABLED"] = "true"
 
-# Now safe to import app modules
-from backend.tests.schema_constants import TEST_SCHEMA
-
-from app.services.auth_service import (
-    compute_client_fingerprint,
-    create_access_token,
-    hash_password,
+from backend.tests.user_route_helpers import (
+    create_user,
+    get_token,
+    setup_test_db,
 )
-
-
-def setup_test_db(db_path: str) -> sqlite3.Connection:
-    """Set up test database with schema and initial users.
-
-    Includes all tables touched by the current user-management routes:
-    users, organizations, org_members, groups, and group_members.
-    """
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript(TEST_SCHEMA)
-
-    conn.commit()
-    return conn
-
-
-def create_user(
-    conn: sqlite3.Connection,
-    username: str,
-    password: str,
-    role: str,
-    full_name: str = "",
-    is_active: int = 1,
-) -> int:
-    """Create a test user and return its ID."""
-    hashed = hash_password(password)
-    cursor = conn.execute(
-        """INSERT INTO users (username, hashed_password, full_name, role, is_active)
-           VALUES (?, ?, ?, ?, ?)""",
-        (username, hashed, full_name, role, is_active),
-    )
-    conn.commit()
-    return cursor.lastrowid
-
-
-def get_token(user_id: int, username: str, role: str) -> str:
-    """Generate a JWT token for a test user."""
-    return create_access_token(user_id, username, role,
-                        client_fingerprint=compute_client_fingerprint(""))
 
 
 class TestUserRoutes:
@@ -1332,6 +1288,20 @@ class TestUpdateUserGroupsCallerOrgCheck(TestUserRoutes):
             "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
             (self.org_id, self.member_id, "member"),
         )
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("PF002 Other Org", "Foreign org for group scope checks"),
+        )
+        self.other_org_id = cursor.lastrowid
+        cursor = self.conn.execute(
+            "INSERT INTO groups (org_id, name, description) VALUES (?, ?, ?)",
+            (self.other_org_id, "PF002 Other Group", "Foreign group"),
+        )
+        self.other_group_id = cursor.lastrowid
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.other_org_id, self.member_id, "member"),
+        )
         self.conn.commit()
         yield
 
@@ -1370,3 +1340,109 @@ class TestUpdateUserGroupsCallerOrgCheck(TestUserRoutes):
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200
+
+    def test_admin_in_one_org_cannot_assign_group_from_other_org(self):
+        """Non-superadmin admin cannot assign groups outside caller org scope."""
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org_id, self.admin_id, "member"),
+        )
+        self.conn.commit()
+        token = get_token(self.admin_id, "admin", "admin")
+
+        response = self.client.put(
+            f"/users/{self.member_id}/groups",
+            json={"group_ids": [self.other_group_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 403
+        assert "Cannot assign" in response.json()["detail"]
+
+    def test_admin_partial_update_preserves_foreign_org_group_membership(self):
+        """Caller-scoped group updates must not delete target memberships in other orgs."""
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org_id, self.admin_id, "member"),
+        )
+        self.conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+            (self.other_group_id, self.member_id),
+        )
+        self.conn.commit()
+        token = get_token(self.admin_id, "admin", "admin")
+
+        response = self.client.put(
+            f"/users/{self.member_id}/groups",
+            json={"group_ids": [self.group_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        rows = self.conn.execute(
+            "SELECT group_id FROM group_members WHERE user_id = ?",
+            (self.member_id,),
+        ).fetchall()
+        assert {row[0] for row in rows} == {self.group_id, self.other_group_id}
+
+    def test_admin_empty_update_preserves_foreign_org_group_membership(self):
+        """Empty caller-scoped updates must not clear target memberships in other orgs."""
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org_id, self.admin_id, "member"),
+        )
+        self.conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+            (self.group_id, self.member_id),
+        )
+        self.conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?, ?)",
+            (self.other_group_id, self.member_id),
+        )
+        self.conn.commit()
+        token = get_token(self.admin_id, "admin", "admin")
+
+        response = self.client.put(
+            f"/users/{self.member_id}/groups",
+            json={"group_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        rows = self.conn.execute(
+            "SELECT group_id FROM group_members WHERE user_id = ?",
+            (self.member_id,),
+        ).fetchall()
+        assert {row[0] for row in rows} == {self.other_group_id}
+
+    def test_admin_cannot_assign_caller_org_group_when_target_not_in_group_org(self):
+        """Caller-org validation must not bypass target-user org membership validation."""
+        cursor = self.conn.execute(
+            "INSERT INTO organizations (name, description) VALUES (?, ?)",
+            ("PF002 Caller Only Org", "Caller-only org for target validation"),
+        )
+        caller_only_org_id = cursor.lastrowid
+        cursor = self.conn.execute(
+            "INSERT INTO groups (org_id, name, description) VALUES (?, ?, ?)",
+            (caller_only_org_id, "PF002 Caller Only Group", "Target is not in this org"),
+        )
+        caller_only_group_id = cursor.lastrowid
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (self.org_id, self.admin_id, "member"),
+        )
+        self.conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (caller_only_org_id, self.admin_id, "member"),
+        )
+        self.conn.commit()
+        token = get_token(self.admin_id, "admin", "admin")
+
+        response = self.client.put(
+            f"/users/{self.member_id}/groups",
+            json={"group_ids": [caller_only_group_id]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 400
+        assert "User is not a member of organization" in response.json()["detail"]

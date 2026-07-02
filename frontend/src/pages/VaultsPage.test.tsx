@@ -1,52 +1,54 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import * as fs from "fs";
 import * as path from "path";
+
+const vaultStoreMock = vi.hoisted(() => ({
+  vaults: [
+    {
+      id: 1,
+      name: "Research",
+      description: "",
+      file_count: 0,
+      memory_count: 0,
+      session_count: 0,
+      current_user_permission: "admin",
+    },
+    {
+      id: 2,
+      name: "Admin Vault",
+      description: "",
+      file_count: 0,
+      memory_count: 0,
+      session_count: 0,
+      current_user_permission: "admin",
+    },
+    {
+      id: 3,
+      name: "Write Vault",
+      description: "",
+      file_count: 0,
+      memory_count: 0,
+      session_count: 0,
+      current_user_permission: "write",
+    },
+  ],
+  loading: false,
+  fetchVaults: vi.fn(),
+  addVault: vi.fn(),
+  editVault: vi.fn(),
+  removeVault: vi.fn(),
+  activeVaultId: 2,
+  setActiveVault: vi.fn(),
+}));
 
 vi.mock("@/lib/api", () => ({
   listOrganizations: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@/stores/useVaultStore", () => ({
-  useVaultStore: vi.fn(() => ({
-    vaults: [
-      {
-        id: 1,
-        name: "Research",
-        description: "",
-        file_count: 0,
-        memory_count: 0,
-        session_count: 0,
-        current_user_permission: "admin",
-      },
-      {
-        id: 2,
-        name: "Admin Vault",
-        description: "",
-        file_count: 0,
-        memory_count: 0,
-        session_count: 0,
-        current_user_permission: "admin",
-      },
-      {
-        id: 3,
-        name: "Write Vault",
-        description: "",
-        file_count: 0,
-        memory_count: 0,
-        session_count: 0,
-        current_user_permission: "write",
-      },
-    ],
-    loading: false,
-    fetchVaults: vi.fn(),
-    addVault: vi.fn(),
-    editVault: vi.fn(),
-    removeVault: vi.fn(),
-    activeVaultId: 2,
-    setActiveVault: vi.fn(),
-  })),
+  useVaultStore: vi.fn(() => vaultStoreMock),
 }));
 
 vi.mock("sonner", () => ({
@@ -70,13 +72,15 @@ vi.mock("@/components/ui/button", () => ({
     disabled,
     title,
     onClick,
+    type,
   }: {
     children: React.ReactNode;
     disabled?: boolean;
     title?: string;
     onClick?: () => void;
+    type?: "button" | "submit" | "reset";
   }) => (
-    <button disabled={disabled} title={title} onClick={onClick}>
+    <button disabled={disabled} title={title} onClick={onClick} type={type}>
       {children}
     </button>
   ),
@@ -101,7 +105,8 @@ vi.mock("@/components/ui/skeleton", () => ({
 }));
 
 vi.mock("@/components/ui/dialog", () => ({
-  Dialog: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  Dialog: ({ children, open }: { children: React.ReactNode; open?: boolean }) =>
+    open ? <div>{children}</div> : null,
   DialogContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DialogDescription: ({ children }: { children: React.ReactNode }) => <p>{children}</p>,
   DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
@@ -191,5 +196,55 @@ describe("VaultsPage isDefaultVault removal (5.4)", () => {
     for (const button of permissionRequiredButtons) {
       expect(button).toBeDisabled();
     }
+  });
+});
+
+describe("VaultsPage dialog forms", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("submits the create dialog through its form", async () => {
+    render(<VaultsPage />);
+    await screen.findByText("Admin Vault");
+
+    fireEvent.click(screen.getByRole("button", { name: /new vault/i }));
+
+    const createNameInput = screen.getByLabelText("Vault Name");
+    const form = createNameInput.closest("form");
+    expect(form).not.toBeNull();
+
+    fireEvent.change(createNameInput, { target: { value: "New Vault" } });
+    fireEvent.submit(form!);
+
+    await waitFor(() => {
+      expect(vaultStoreMock.addVault).toHaveBeenCalledWith({
+        name: "New Vault",
+        description: "",
+        org_id: null,
+      });
+    });
+  });
+
+  it("submits the edit dialog through its form", async () => {
+    render(<VaultsPage />);
+    await screen.findByText("Admin Vault");
+
+    const editButtons = screen.getAllByTitle("Edit vault");
+    fireEvent.click(editButtons[0]);
+
+    const editNameInput = screen.getByLabelText("Vault Name");
+    const form = editNameInput.closest("form");
+    expect(form).not.toBeNull();
+
+    fireEvent.change(editNameInput, { target: { value: "Renamed Vault" } });
+    fireEvent.submit(form!);
+
+    await waitFor(() => {
+      expect(vaultStoreMock.editVault).toHaveBeenCalledWith(1, {
+        name: "Renamed Vault",
+        description: "",
+      });
+    });
   });
 });

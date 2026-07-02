@@ -28,43 +28,17 @@ os.environ["JWT_SECRET_KEY"] = (
 )
 os.environ["USERS_ENABLED"] = "true"
 
-from backend.tests.schema_constants import TEST_SCHEMA
+from backend.tests.user_route_helpers import (
+    create_user,
+    get_token,
+    setup_test_db,
+)
 
 from app.services.auth_service import (
     compute_client_fingerprint,
     create_access_token,
     hash_password,
 )
-
-
-def setup_test_db(db_path: str) -> sqlite3.Connection:
-    """Set up test database with schema and initial users."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript(TEST_SCHEMA)
-
-    conn.commit()
-    return conn
-
-
-def create_user(
-    conn: sqlite3.Connection,
-    username: str,
-    password: str,
-    role: str,
-    full_name: str = "",
-    is_active: int = 1,
-) -> int:
-    """Create a test user and return its ID."""
-    hashed = hash_password(password)
-    cursor = conn.execute(
-        """INSERT INTO users (username, hashed_password, full_name, role, is_active)
-           VALUES (?, ?, ?, ?, ?)""",
-        (username, hashed, full_name, role, is_active),
-    )
-    conn.commit()
-    return cursor.lastrowid
 
 
 def create_user_with_xss_payload(
@@ -86,12 +60,6 @@ def create_user_with_xss_payload(
     )
     conn.commit()
     return cursor.lastrowid
-
-
-def get_token(user_id: int, username: str, role: str) -> str:
-    """Generate a valid JWT token for a test user."""
-    return create_access_token(user_id, username, role,
-                        client_fingerprint=compute_client_fingerprint(""))
 
 
 def get_expired_token(user_id: int, username: str, role: str) -> str:
@@ -135,6 +103,7 @@ def get_token_with_modified_role(
         "sub": str(user_id),
         "username": username,
         "role": new_role,  # Attempting to escalate to superadmin
+        "type": "access",
         "exp": expires,
     }
     return jwt.encode(payload, secret, algorithm="HS256")
@@ -1084,12 +1053,7 @@ class TestJWTTokenManipulation:
         response = self.client.get(
             "/users/", headers={"Authorization": f"Bearer {modified_token}"}
         )
-        # The token is valid JWT-wise, but the user_id doesn't match a superadmin
-        # in the database, so either 401 (token missing type claim), 403
-        # (user not found/inactive), or 200 if role is DB-verified
-        assert response.status_code in (200, 401, 403), (
-            f"Unexpected status: {response.status_code}"
-        )
+        assert response.status_code == 403
 
     def test_tampered_token_signature(self):
         """Token with tampered signature should be rejected (401 per RFC 6750)."""

@@ -478,6 +478,51 @@ class TestUpdateOrgMemberRole:
         )
         assert response.status_code == 403
 
+    def test_org_admin_cannot_patch_member_to_owner(self, client):
+        """Org admin cannot bypass transfer-ownership by PATCH-promoting a member."""
+        org_id = _create_org("Admin Patch Owner Org", 1)
+        _add_org_member(org_id, 2, "admin")
+        _add_org_member(org_id, 3, "member")
+
+        response = client.patch(
+            f"/api/organizations/{org_id}/members/3",
+            json={"role": "owner"},
+            headers=auth_headers(admin_token),
+        )
+
+        assert response.status_code == 403
+        conn = _get_db_conn()
+        try:
+            role = conn.execute(
+                "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                (org_id, 3),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert role == "member"
+
+    def test_org_admin_cannot_patch_self_to_owner(self, client):
+        """Org admin cannot self-promote to owner through member role PATCH."""
+        org_id = _create_org("Admin Self Owner Org", 1)
+        _add_org_member(org_id, 2, "admin")
+
+        response = client.patch(
+            f"/api/organizations/{org_id}/members/2",
+            json={"role": "owner"},
+            headers=auth_headers(admin_token),
+        )
+
+        assert response.status_code == 403
+        conn = _get_db_conn()
+        try:
+            role = conn.execute(
+                "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+                (org_id, 2),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert role == "admin"
+
 
 class TestRemoveOrgMember:
     """Tests for DELETE /organizations/{org_id}/members/{member_user_id} endpoint."""

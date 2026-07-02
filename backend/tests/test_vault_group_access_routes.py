@@ -216,6 +216,27 @@ class TestListVaultGroupAccess:
         )
         assert response.status_code == 403
 
+    def test_read_permission_user_cannot_list_group_acl_metadata(self, client):
+        """Read-only vault users cannot list group ACL metadata."""
+        conn = _get_db_conn()
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (1, 3, "read", 1),
+        )
+        conn.execute(
+            "INSERT INTO vault_group_access (vault_id, group_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (1, 1, "read", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        response = client.get(
+            "/api/vaults/1/group-access", headers=auth_headers(member_token)
+        )
+
+        assert response.status_code == 403
+
 
 class TestGrantVaultGroupAccessCrossOrg:
     """Tests for cross-org validation in grant_vault_group_access."""

@@ -3,7 +3,11 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from app.api.deps import require_vault_permission
+from app.api.deps import (
+    get_current_active_user,
+    get_evaluate_policy,
+    require_vault_permission,
+)
 from app.config import settings
 from app.models.database import get_pool
 from app.security import csrf_protect
@@ -310,9 +314,9 @@ def remove_vault_member(
 
 
 @group_access_router.get("/")
-def list_vault_group_access(
+async def list_vault_group_access(
     vault_id: int,
-    current_user: dict = Depends(require_vault_permission("read")),
+    current_user: dict = Depends(get_current_active_user),
 ):
     """List all groups with access to a vault."""
     pool = get_pool(str(settings.sqlite_path))
@@ -324,6 +328,12 @@ def list_vault_group_access(
         cursor.execute("SELECT id FROM vaults WHERE id = ?", (vault_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="Vault not found")
+
+        evaluate = get_evaluate_policy(conn)
+        if not await evaluate(current_user, "vault", vault_id, "admin"):
+            raise HTTPException(
+                status_code=403, detail="Insufficient vault permissions"
+            )
 
         # Count total group access entries
         cursor.execute(

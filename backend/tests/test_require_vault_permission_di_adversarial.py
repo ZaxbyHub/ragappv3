@@ -888,16 +888,38 @@ class TestSecuritySummary:
         """
         Verify all DI refactor attack vectors are defined.
         """
-        required_tests = [
-            "test_require_vault_permission_uses_injected_db_not_standalone_pool",
-            "test_require_vault_permission_negative_vault_id_denied",
-            "test_require_vault_permission_zero_vault_id_denied",
-            "test_require_vault_permission_empty_actions_denies_all",
-            "test_require_vault_permission_none_vault_id_denies_superadmin",
-            "test_evaluate_policy_non_vault_non_group_member_denied",
-            "test_superadmin_id_zero_escalation_blocked",
-            "test_require_vault_permission_multi_action_any_match_passes",
-            "test_concurrent_vault_access_same_user_different_vaults",
-        ]
+        required_tests = {
+            "TestDIConnectionReuse": [
+                "test_require_vault_permission_uses_injected_db_not_standalone_pool",
+            ],
+            "TestMalformedVaultIdAttacks": [
+                "test_require_vault_permission_negative_vault_id_denied",
+                "test_require_vault_permission_zero_vault_id_denied",
+            ],
+            "TestEmptyActionsBypass": [
+                "test_require_vault_permission_empty_actions_denies_all",
+            ],
+            "TestNoneVaultIdPrivilegeEscalation": [
+                "test_require_vault_permission_none_vault_id_denies_superadmin",
+            ],
+            "TestResourceTypeConfusion": [
+                "test_evaluate_policy_non_vault_non_group_member_denied",
+            ],
+            "TestPrivilegeEscalation": [
+                "test_superadmin_id_zero_escalation_blocked",
+            ],
+            "TestDependencyOverrideBypass": [
+                "test_require_vault_permission_multi_action_any_match_passes",
+            ],
+            "TestConcurrentAccessAttacks": [
+                "test_concurrent_vault_access_same_user_different_vaults",
+            ],
+        }
 
-        assert len(required_tests) == 9
+        for class_name, test_names in required_tests.items():
+            test_class = globals().get(class_name)
+            assert test_class is not None, f"Missing test class {class_name}"
+            for test_name in test_names:
+                assert callable(getattr(test_class, test_name, None)), (
+                    f"Missing required test {class_name}.{test_name}"
+                )
