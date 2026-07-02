@@ -435,7 +435,7 @@ async def create_vault(
             pass
         raise HTTPException(status_code=500, detail="Failed to create vault")
 
-    if vault_id is None:
+    if vault_id is None or vault_id <= 0:
         try:
             await asyncio.to_thread(conn.rollback)
         except Exception:

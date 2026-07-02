@@ -72,6 +72,17 @@ from app.main import app
 from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
+class CursorWithLastrowid:
+    """Proxy cursor that overrides lastrowid while delegating other cursor behavior."""
+
+    def __init__(self, cursor, lastrowid):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 class FailOnConnection:
     """A connection wrapper that fails on specific SQL commands.
 
@@ -130,11 +141,7 @@ class FailOnConnection:
                 raise self._config["vault_insert_raises"]
             result = self._real_conn.execute(sql, *args, **kwargs)
             if self._config["lastrowid_override"] is not None:
-                # Temporarily override lastrowid
-                original_lastrowid = result.lastrowid
-                result.lastrowid = self._config["lastrowid_override"]
-                # Restore after call
-                result.lastrowid = original_lastrowid
+                return CursorWithLastrowid(result, self._config["lastrowid_override"])
             return result
 
         # Member INSERT failure
@@ -694,13 +701,22 @@ class TestVaultTransactionAdversarial(unittest.TestCase):
                 headers=headers,
             )
 
-            # The current code has a bug: it checks `if vault_id is None:`
-            # but 0 is not None, so the check passes and vault_id=0 is used.
-            # This should either succeed with a malformed vault or fail later.
-            self.assertIn(
-                response.status_code, [201, 500],
-                f"Expected 201 or 500 but got {response.status_code}"
-            )
+            self.assertEqual(response.status_code, 500)
+            self.assertIn(("rollback",), fail_on.call_log)
+
+            conn = sqlite3.connect(self._db_path)
+            try:
+                vault_count = conn.execute(
+                    "SELECT COUNT(*) FROM vaults WHERE name = ?",
+                    ("Test Vault",),
+                ).fetchone()[0]
+                member_count = conn.execute(
+                    "SELECT COUNT(*) FROM vault_members WHERE vault_id = 0"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(vault_count, 0)
+            self.assertEqual(member_count, 0)
         finally:
             fail_on.reset()
             self._disable_fail_on()

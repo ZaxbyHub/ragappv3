@@ -298,6 +298,29 @@ class TestUpdateVaultMember:
         )
         assert response.status_code == 404
 
+    def test_read_permission_user_cannot_update_member(self, client):
+        """User with read permission cannot update vault members (403)."""
+        conn = _get_db_conn()
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (1, 3, "read", 1),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (1, 4, "read", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        response = client.patch(
+            "/api/vaults/1/members/4",
+            json={"permission": "write"},
+            headers=auth_headers(member_token),
+        )
+
+        assert response.status_code == 403
+
 
 class TestRemoveVaultMember:
     """Tests for DELETE /vaults/{vault_id}/members/{member_user_id} endpoint."""
@@ -327,6 +350,27 @@ class TestRemoveVaultMember:
             "/api/vaults/1/members/999", headers=auth_headers(superadmin_token)
         )
         assert response.status_code == 404
+
+    def test_read_permission_user_cannot_remove_member(self, client):
+        """User with read permission cannot remove vault members (403)."""
+        conn = _get_db_conn()
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(
+            "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (1, 3, "read", 1),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission, granted_by) VALUES (?, ?, ?, ?)",
+            (1, 4, "read", 1),
+        )
+        conn.commit()
+        conn.close()
+
+        response = client.delete(
+            "/api/vaults/1/members/4", headers=auth_headers(member_token)
+        )
+
+        assert response.status_code == 403
 
     def test_self_removal_rejected(self, client):
         """Self-removal is rejected with 400."""

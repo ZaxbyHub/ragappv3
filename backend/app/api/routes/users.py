@@ -860,6 +860,7 @@ async def update_user_groups(
 
         # For non-superadmins, verify caller shares an org with target user
         # (parity with get_user_groups and update_user_organizations).
+        caller_orgs = None
         if user.get("role") != "superadmin":
             cursor = conn.execute(
                 "SELECT org_id FROM org_members WHERE user_id = ?", (user_id,)
@@ -876,11 +877,37 @@ async def update_user_groups(
                     detail="Cannot update group memberships of users outside your organization",
                 )
 
-        # If group_ids is empty, just delete all memberships and return empty list
+        # If group_ids is empty, clear only the caller-managed org scope.
         if not body.group_ids:
-            conn.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
+            if caller_orgs is None:
+                conn.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
+            else:
+                placeholders = ",".join("?" * len(caller_orgs))
+                conn.execute(
+                    f"""DELETE FROM group_members
+                        WHERE user_id = ?
+                          AND group_id IN (
+                              SELECT id FROM groups WHERE org_id IN ({placeholders})
+                          )""",
+                    (user_id, *caller_orgs),
+                )
             conn.commit()
-            return []
+            cursor = conn.execute(
+                """SELECT g.id, g.name, g.description, g.org_id
+                   FROM groups g
+                   JOIN group_members gm ON g.id = gm.group_id
+                   WHERE gm.user_id = ?""",
+                (user_id,),
+            )
+            return [
+                {
+                    "id": row[0],
+                    "name": row[1],
+                    "description": row[2] or "",
+                    "org_id": row[3],
+                }
+                for row in cursor.fetchall()
+            ]
 
         # Validate all group_ids exist and get their org_ids
         placeholders = ",".join("?" * len(body.group_ids))
@@ -896,6 +923,15 @@ async def update_user_groups(
                 status_code=400, detail=f"Groups not found: {sorted(missing_groups)}"
             )
 
+        if caller_orgs is not None:
+            requested_orgs = set(found_groups.values())
+            unauthorized = requested_orgs - caller_orgs
+            if unauthorized:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Cannot assign groups from organizations you are not a member of: {sorted(unauthorized)}",
+                )
+
         # Check user is a member of each group's organization (skip for superadmins)
         if user.get("role") != "superadmin":
             for group_id, org_id in found_groups.items():
@@ -909,8 +945,19 @@ async def update_user_groups(
                         detail=f"User is not a member of organization for group {group_id}",
                     )
 
-        # Delete existing memberships
-        cursor.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
+        # Replace only memberships in the caller-managed org scope.
+        if caller_orgs is None:
+            cursor.execute("DELETE FROM group_members WHERE user_id = ?", (user_id,))
+        else:
+            placeholders = ",".join("?" * len(caller_orgs))
+            cursor.execute(
+                f"""DELETE FROM group_members
+                    WHERE user_id = ?
+                      AND group_id IN (
+                          SELECT id FROM groups WHERE org_id IN ({placeholders})
+                      )""",
+                (user_id, *caller_orgs),
+            )
 
         # Insert new memberships
         for group_id in body.group_ids:

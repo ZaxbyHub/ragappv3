@@ -6,7 +6,7 @@ import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -569,16 +569,33 @@ async def add_org_member(
 # ---------------------------------------------------------------------------
 
 
-def _invite_status(invite_row: tuple) -> str:
+ORG_INVITE_COLUMNS = (
+    "id",
+    "org_id",
+    "email",
+    "token_hash",
+    "role",
+    "expires_at",
+    "created_at",
+    "created_by_user_id",
+    "accepted_at",
+    "accepted_by_user_id",
+    "revoked_at",
+)
+
+
+def _org_invite_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    """Convert a selected org_invites row to named fields without mutating row_factory."""
+    return dict(zip(ORG_INVITE_COLUMNS, row))
+
+
+def _invite_status(invite_row: dict[str, Any]) -> str:
     """Determine invite status from a org_invites row."""
-    # row: id, org_id, email, token_hash, role, expires_at, created_at,
-    #      created_by_user_id, accepted_at, accepted_by_user_id, revoked_at
-    if invite_row[8]:  # accepted_at
+    if invite_row["accepted_at"]:
         return "accepted"
-    if invite_row[10]:  # revoked_at
+    if invite_row["revoked_at"]:
         return "revoked"
-    # Check expiry
-    expires_at = datetime.fromisoformat(invite_row[5])
+    expires_at = datetime.fromisoformat(invite_row["expires_at"])
     if expires_at < datetime.now(timezone.utc):
         return "expired"
     return "pending"
@@ -804,14 +821,15 @@ async def list_org_invites(
         )
         invites = []
         for row in await asyncio.to_thread(cursor.fetchall):
+            invite = _org_invite_row(row)
             invites.append(
                 {
-                    "id": row[0],
-                    "email": row[2],
-                    "role": row[4],
-                    "status": _invite_status(row),
-                    "expires_at": row[5],
-                    "created_at": row[6],
+                    "id": invite["id"],
+                    "email": invite["email"],
+                    "role": invite["role"],
+                    "status": _invite_status(invite),
+                    "expires_at": invite["expires_at"],
+                    "created_at": invite["created_at"],
                 }
             )
         return {"invites": invites}
@@ -980,6 +998,11 @@ async def update_org_member_role(
             raise HTTPException(
                 status_code=403,
                 detail="Cannot change the role of the organization owner",
+            )
+        if req.role == "owner":
+            raise HTTPException(
+                status_code=403,
+                detail="Use the ownership transfer endpoint to assign the owner role",
             )
 
         # Update role

@@ -9,7 +9,6 @@ These tests verify:
 
 import os
 import shutil
-import sqlite3
 import tempfile
 
 import pytest
@@ -22,56 +21,18 @@ os.environ["JWT_SECRET_KEY"] = (
 )
 os.environ["USERS_ENABLED"] = "true"
 
-# Now safe to import app modules
-from backend.tests.schema_constants import TEST_SCHEMA
-
-from app.services.auth_service import (
-    compute_client_fingerprint,
-    create_access_token,
-    hash_password,
+from backend.tests.user_route_helpers import (
+    create_user,
+    get_token,
+)
+from backend.tests.user_route_helpers import (
+    setup_test_db as _setup_user_route_test_db,
 )
 
 
-def setup_test_db(db_path: str) -> sqlite3.Connection:
+def setup_test_db(db_path: str):
     """Set up test database with schema and initial users."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript(TEST_SCHEMA)
-
-    # Extra index on locked_until (local supplement)
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_users_locked_until ON users(locked_until)"
-    )
-
-    conn.commit()
-    return conn
-
-
-def create_user(
-    conn: sqlite3.Connection,
-    username: str,
-    password: str,
-    role: str,
-    full_name: str = "",
-    is_active: int = 1,
-    must_change_password: int = 0,
-) -> int:
-    """Create a test user and return its ID."""
-    hashed = hash_password(password)
-    cursor = conn.execute(
-        """INSERT INTO users (username, hashed_password, full_name, role, is_active, must_change_password)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (username, hashed, full_name, role, is_active, must_change_password),
-    )
-    conn.commit()
-    return cursor.lastrowid
-
-
-def get_token(user_id: int, username: str, role: str) -> str:
-    """Generate a JWT token for a test user."""
-    return create_access_token(user_id, username, role,
-                            client_fingerprint=compute_client_fingerprint(""))
+    return _setup_user_route_test_db(db_path, include_locked_until_index=True)
 
 
 class TestUpdateUser:

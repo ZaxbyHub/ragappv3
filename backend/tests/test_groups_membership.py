@@ -23,48 +23,18 @@ os.environ["JWT_SECRET_KEY"] = (
 )
 os.environ["USERS_ENABLED"] = "true"
 
-from backend.tests.schema_constants import TEST_SCHEMA
-
-from app.services.auth_service import (
-    compute_client_fingerprint,
-    create_access_token,
-    hash_password,
+from backend.tests.user_route_helpers import (
+    create_user,
+    get_token,
+)
+from backend.tests.user_route_helpers import (
+    setup_test_db as _setup_user_route_test_db,
 )
 
 
 def setup_test_db(db_path: str) -> sqlite3.Connection:
     """Set up test database with full schema including groups and vault_group_access."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.executescript(TEST_SCHEMA)
-
-    # Insert default vault (local supplement)
-    conn.execute(
-        "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (1, 'Default', 'Default vault')"
-    )
-
-    conn.commit()
-    return conn
-
-
-def create_user(
-    conn: sqlite3.Connection,
-    username: str,
-    password: str,
-    role: str,
-    full_name: str = "",
-    is_active: int = 1,
-) -> int:
-    """Create a test user and return its ID."""
-    hashed = hash_password(password)
-    cursor = conn.execute(
-        """INSERT INTO users (username, hashed_password, full_name, role, is_active)
-           VALUES (?, ?, ?, ?, ?)""",
-        (username, hashed, full_name, role, is_active),
-    )
-    conn.commit()
-    return cursor.lastrowid
+    return _setup_user_route_test_db(db_path, include_default_vault=True)
 
 
 def create_organization(conn: sqlite3.Connection, name: str, slug: str = None) -> int:
@@ -147,12 +117,6 @@ def add_user_to_vault(
         (vault_id, user_id, permission, granted_by),
     )
     conn.commit()
-
-
-def get_token(user_id: int, username: str, role: str) -> str:
-    """Generate a JWT token for a test user."""
-    return create_access_token(user_id, username, role,
-                          client_fingerprint=compute_client_fingerprint(""))
 
 
 class TestUserGroupMembershipSetup:
@@ -493,8 +457,10 @@ class TestUpdateUserGroups(TestUserGroupMembershipSetup):
         assert "Groups not found" in response.json()["detail"]
 
     def test_validates_user_is_org_member_for_each_group(self):
-        """Admin must be member of each group's org (non-superadmin)."""
-        # group3 is in org2, admin_org1 is only in org1
+        """Target user must be a member of each requested group's org."""
+        # group3 is in org2. Give the caller org2 admin rights so this test
+        # reaches the target-user org membership validation branch.
+        add_user_to_org(self.conn, self.admin_org1_id, self.org2_id, "admin")
         token = get_token(self.admin_org1_id, "admin_org1", "admin")
         response = self.client.put(
             f"/users/{self.member_org1_id}/groups",

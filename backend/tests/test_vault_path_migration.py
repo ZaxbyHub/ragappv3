@@ -327,7 +327,7 @@ class TestVaultPathMigration:
         assert (new_path / "subdir" / "file2.txt").exists()
         assert (new_path / "subdir" / "file2.txt").read_text() == "nested file"
 
-    def test_error_handling_continues_with_other_vaults(self, temp_db_and_vaults):
+    def test_error_handling_continues_with_other_vaults(self, temp_db_and_vaults, caplog):
         """
         Test that migration continues with other vaults when one fails.
         """
@@ -350,11 +350,24 @@ class TestVaultPathMigration:
         old_2.mkdir(parents=True, exist_ok=True)
         (old_2 / "file2.txt").write_text("another vault")
 
+        original_rename = Path.rename
+
+        def fail_first_vault_rename(path: Path, target: Path):
+            if path == old_1:
+                raise OSError("simulated rename failure")
+            return original_rename(path, target)
+
         # Run migration
-        with patch("app.models.database.settings") as mock_settings:
+        caplog.set_level("WARNING", logger="app.models.database")
+        with patch("app.models.database.settings") as mock_settings, patch.object(
+            Path, "rename", fail_first_vault_rename
+        ):
             mock_settings.vaults_dir = data["vaults_dir"]
             migrate_vault_paths(str(data["db_path"]))
 
-        # VERIFY: Both vaults were processed (per-vault try/except)
-        assert (data["vaults_dir"] / "1" / "file.txt").exists()
+        # VERIFY: Failed vault stayed put, the next vault still migrated, and the error was logged.
+        assert (data["vaults_dir"] / "Good_Vault" / "file.txt").exists()
+        assert not (data["vaults_dir"] / "1" / "file.txt").exists()
         assert (data["vaults_dir"] / "2" / "file2.txt").exists()
+        assert "Failed to migrate vault 'Good Vault' (ID 1)" in caplog.text
+        assert "simulated rename failure" in caplog.text
