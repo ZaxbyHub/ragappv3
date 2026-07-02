@@ -474,9 +474,12 @@ async def get_current_user_or_service_account(
 
     Raises HTTPException 401 if neither JWT nor service-account auth succeeds.
     """
-    # Path 1: Try JWT auth
+    # Path 1: Try JWT auth — respect any test dependency overrides for get_current_active_user
+    _auth_fn = request.app.dependency_overrides.get(
+        get_current_active_user, get_current_active_user
+    )
     try:
-        user = await get_current_active_user(
+        user = await _auth_fn(
             request=request,
             authorization=authorization,
             access_token=request.cookies.get("access_token"),
