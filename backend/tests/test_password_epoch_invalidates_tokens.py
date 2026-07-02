@@ -285,7 +285,10 @@ class TestPasswordEpochInvalidatesTokens(unittest.TestCase):
                 f"Precondition: token should be cached, got {me_response.status_code}"
             )
 
-        # (b) Change password — this should invalidate the cache entry
+        # (b) Change password — this should invalidate the cache entry.
+        # Wait 1 second so token_iat < password_changed_at (integer comparison).
+        import time
+        time.sleep(1)
         change_response = self.client.post(
             "/api/auth/change-password",
             headers={"Authorization": f"Bearer {token}"},
