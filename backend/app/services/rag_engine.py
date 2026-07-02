@@ -443,13 +443,13 @@ class RAGEngine:
                             prompt_version = ab_content  # A/B version label
                 finally:
                     conn.close()
-            except Exception:
+            except Exception as exc:
                 # A/B failures should not crash queries; fall through with
                 # the 3.5 effective version and no A/B metadata.
                 logger.warning(
                     "A/B experiment resolution failed for vault_id=%s: %s",
                     vault_id,
-                    None,
+                    exc,
                 )
 
         return effective_content, ab_experiment_id, ab_variant, prompt_version
