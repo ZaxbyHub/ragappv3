@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import secrets
 import sqlite3
@@ -442,7 +443,7 @@ async def get_current_active_user(
     # (real password-change events). Login rehash is NOT a password change.
     pwd_epoch = user.get("password_changed_at") or 0
     token_iat = payload.get("iat", 0) if isinstance(payload, dict) else 0
-    if pwd_epoch > 0 and float(token_iat) < pwd_epoch:
+    if pwd_epoch > 0 and token_iat < int(pwd_epoch):
         invalidate_active_user_cache(user_id)
         raise HTTPException(
             status_code=401,
@@ -475,11 +476,12 @@ async def get_current_user_or_service_account(
     Raises HTTPException 401 if neither JWT nor service-account auth succeeds.
     """
     # Path 1: Try JWT auth — respect any test dependency overrides for get_current_active_user.
-    # Test overrides are typically lambda: {dict} with no parameters, so call without kwargs
-    # when an override exists. Only pass kwargs to the real function.
+    # Test overrides are typically lambda: {dict} (returns a dict directly, no await needed).
+    # Call without kwargs when an override exists since lambdas don't accept them.
     _override = request.app.dependency_overrides.get(get_current_active_user)
     if _override is not None:
-        user = await _override()
+        _result = _override()
+        user = await _result if inspect.iscoroutine(_result) else _result
         return user
     try:
         user = await get_current_active_user(

@@ -206,7 +206,10 @@ class TestPasswordEpochInvalidatesTokens(unittest.TestCase):
                 f"Precondition: password_changed_at should be 0, got {epoch_before}"
             )
 
-        # (b) Change password at T1 — this bumps password_changed_at
+        # (b) Change password at T1 — this bumps password_changed_at.
+        # Wait 1 second so token_iat (integer seconds) < password_changed_at (integer seconds).
+        import time
+        time.sleep(1)
         change_response = self.client.post(
             "/api/auth/change-password",
             headers={"Authorization": f"Bearer {token_t0}"},
@@ -371,6 +374,9 @@ class TestPasswordEpochInvalidatesTokens(unittest.TestCase):
 
         # (c) Admin calls PATCH /users/{user_id}/password to reset the user's password
         # This should bump password_changed_at and invalidate the user's token
+        # Wait 1 second so token_iat < password_changed_at (integer comparison)
+        import time
+        time.sleep(1)
         users_app = FastAPI()
         users_app.include_router(users_router)
 
