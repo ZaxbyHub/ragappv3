@@ -716,6 +716,9 @@ class TestAuthRoutes(unittest.TestCase):
         self.assertEqual(second_login.status_code, 200)
         access_token = second_login.json()["access_token"]
 
+        # Wait 1 second so token_iat < password_changed_at (integer comparison)
+        import time
+        time.sleep(1)
         change_password_response = self.client.post(
             "/api/auth/change-password",
             json={"current_password": "Password123", "new_password": "Newpassword456"},
