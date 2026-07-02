@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- **Reverse-proxy hardening (issue #231)**: Added TrustedHostMiddleware with ALLOWED_HOSTS support to guard against HTTP Host header attacks. Fixed FORWARDED_ALLOW_IPS documentation (no longer recommends `*`). Added SSE heartbeat keepalive comment (`': heartbeat\n\n'`) during long generation gaps to prevent proxy connection timeouts. Session IP capture now uses the trust-proxy-aware `_request_ip()` helper.
 - **Phase 1 — password & session security hardening (issue #271)**: three security defects fixed:
   - **FR-001 (HIGH A1-3)**: `PATCH /auth/me` no longer accepts a `password` field. The endpoint now only allows updating `full_name`. `UpdateProfileRequest` uses `ConfigDict(extra="forbid")` to reject unexpected fields. The password-mutation branch was removed from `update_me`. The SQL builder is now static (no f-string interpolation).
   - **FR-002 (MEDIUM A1-2)**: Admin password reset (`POST /users/{id}/reset-password`) now clears `failed_attempts=0` and `locked_until=NULL` in the same UPDATE as the password change, so a locked-out user is immediately able to log in after an admin reset.

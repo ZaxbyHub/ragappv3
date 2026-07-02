@@ -1008,6 +1008,7 @@ For a subpath deployment such as `https://example.com/knowledgevault/`, configur
 | `VITE_API_URL` | Build arg (optional) | API URL override. Derived from `VITE_APP_BASENAME` when empty |
 | `BACKEND_CORS_ORIGINS` | Runtime env | Allowed CORS origins for your domain |
 | `FORWARDED_ALLOW_IPS` | Runtime env | Trusted proxy IPs for forwarded headers |
+| `ALLOWED_HOSTS` | Runtime env | Allowed Host header values for TrustedHostMiddleware |
 
 **Minimal configuration** (`.env` or environment):
 
@@ -1015,8 +1016,17 @@ For a subpath deployment such as `https://example.com/knowledgevault/`, configur
 APP_ROOT_PATH=/knowledgevault
 VITE_APP_BASENAME=/knowledgevault
 BACKEND_CORS_ORIGINS=https://example.com
-FORWARDED_ALLOW_IPS=*
+FORWARDED_ALLOW_IPS=172.16.0.0/12
 ```
+
+> **Security:** `FORWARDED_ALLOW_IPS` must be the CIDR or IP of your **trusted
+> reverse proxy** — never `*`. With `*`, uvicorn trusts `X-Forwarded-*` from any
+> peer, making `X-Forwarded-For` and `X-Forwarded-Proto` attacker-controlled. The
+> Docker bridge subnet (commonly `172.16.0.0/12`) is safe for a Docker-Compose
+> deployment where the proxy runs in a sibling container; substitute the
+> appropriate IP or CIDR for your environment (e.g. `10.0.0.5` for a host-level
+> nginx). Only use `*` inside a trusted private network where untrusted clients
+> cannot connect directly to port 9090.
 
 `VITE_API_URL` is automatically derived as `/knowledgevault/api` when left empty. To set it explicitly (e.g., for a custom API gateway), add it to your config:
 

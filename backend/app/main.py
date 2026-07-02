@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from slowapi.middleware import SlowAPIMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import FileResponse
 
 from app.api.routes.admin import router as admin_router
@@ -112,6 +113,31 @@ if "*" in settings.backend_cors_origins:
         "SECURITY WARNING: CORS origins contain wildcard ('*') with allow_credentials=True. "
         "This configuration is insecure and will be rejected by browsers. "
         "Set BACKEND_CORS_ORIGINS to specific origins (e.g., http://localhost:5173)."
+    )
+
+# Host-header validation (defense-in-depth for reverse-proxy deployments).
+# Only activated when ALLOWED_HOSTS is configured — disabled by default so
+# local dev and root deployments accessed by bare IP keep working.
+# Health check endpoints are exempted so Docker/K8s/lb probes (which send
+# Host: localhost) continue to work without needing the probe hostname in
+# ALLOWED_HOSTS.
+_HEALTH_EXEMPT_PATHS = {"/health", "/api/health"}
+
+class _TrustedHostWithHealthExempt(TrustedHostMiddleware):
+    """TrustedHostMiddleware that exempts health-check paths."""
+
+    async def dispatch(self, request, call_next):
+        path = (request.scope.get("path") or "").rstrip("/") or "/"
+        if path in _HEALTH_EXEMPT_PATHS:
+            return await call_next(request)
+        return await super().dispatch(request, call_next)
+
+if settings.allowed_hosts:
+    _hosts = list(settings.allowed_hosts)
+    app.add_middleware(_TrustedHostWithHealthExempt, allowed_hosts=_hosts)
+    logger.info(
+        "TrustedHostMiddleware enabled with allowed_hosts=%r (health endpoints exempted)",
+        settings.allowed_hosts,
     )
 
 app.include_router(health_router, prefix="/api")

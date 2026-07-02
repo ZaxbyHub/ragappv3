@@ -469,6 +469,12 @@ class Settings(BaseSettings):
     trust_proxy_headers: bool = False
     """When True, trust X-Forwarded-For for client IP (use behind trusted reverse proxy). Default False for security."""
 
+    # Host-header validation (defense-in-depth for reverse-proxy deployments).
+    # When non-empty, TrustedHostMiddleware rejects requests whose Host header
+    # is not in this list. Leave empty to disable (the default — useful for
+    # local dev and root deployments accessed by bare IP).
+    allowed_hosts: list[str] = []
+
     health_check_api_key: str = ""
     csrf_cookie_secure: bool = False
     """Set Secure flag on CSRF cookie. Default False for local development. Set to True in production with HTTPS."""
@@ -621,6 +627,28 @@ class Settings(BaseSettings):
                     raise ValueError("backend_cors_origins JSON value must be a list")
                 return parsed
             return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return v
+
+    @field_validator("allowed_hosts", mode="before")
+    @classmethod
+    def parse_allowed_hosts(cls, v):
+        """Support JSON lists and comma-separated env values for allowed hosts."""
+        if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return []
+            if value.startswith("["):
+                import json
+
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("allowed_hosts JSON value must be a list")
+                return [
+                    host.strip()
+                    for host in parsed
+                    if isinstance(host, str) and host.strip()
+                ]
+            return [host.strip() for host in value.split(",") if host.strip()]
         return v
 
     # Migration validators for backward compatibility
