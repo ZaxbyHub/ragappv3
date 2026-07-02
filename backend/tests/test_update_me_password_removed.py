@@ -74,6 +74,7 @@ class TestUpdateMePasswordRemoved(unittest.TestCase):
         run_migrations(self.db_path)
 
         # Set JWT_SECRET_KEY in environment BEFORE importing settings
+        self._original_jwt_env = os.environ.get("JWT_SECRET_KEY")
         os.environ["JWT_SECRET_KEY"] = "test-secret-key-for-testing-at-least-32-chars-long"
 
         # Store original settings
@@ -116,7 +117,10 @@ class TestUpdateMePasswordRemoved(unittest.TestCase):
     def tearDown(self):
         """Clean up after each test."""
         from app.config import settings
-        del os.environ["JWT_SECRET_KEY"]
+        if self._original_jwt_env is not None:
+            os.environ["JWT_SECRET_KEY"] = self._original_jwt_env
+        else:
+            os.environ.pop("JWT_SECRET_KEY", None)
         settings.users_enabled = self._original_users_enabled
         settings.app_root_path = self._original_app_root_path
 
