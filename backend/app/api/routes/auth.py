@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.deps import (
     assign_user_to_default_vault,
@@ -83,6 +83,7 @@ def _rotate_refresh_token_block(
     user_id: int,
     new_refresh_token_hash: str,
     new_expires_at: datetime,
+    request: Request = None,
 ) -> None:
     """Execute the exclusive-lock block for refresh token rotation.
 
@@ -108,8 +109,28 @@ def _rotate_refresh_token_block(
             (session_id, token_hash),
         )
         if not cursor.fetchone():
-            if exclusive_started:
-                db.execute("ROLLBACK")
+            # FR-003: refresh-token reuse detected — revoke entire family + emit audit event
+            try:
+                db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+                try:
+                    from app.services.security_audit import record_security_event
+                    record_security_event(
+                        db,
+                        event_type="auth.refresh_reuse_detected",
+                        target_user_id=user_id,
+                        ip_address=request.client.host if request and request.client else None,
+                        user_agent=request.headers.get("user-agent") if request else None,
+                        metadata={"session_id": session_id, "reason": "stale_token_fetchone"},
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to record refresh_reuse_detected audit event for user %s", user_id, exc_info=True,
+                    )
+                from app.api.deps import invalidate_active_user_cache
+                invalidate_active_user_cache(user_id)
+            finally:
+                if exclusive_started and db.in_transaction:
+                    db.execute("ROLLBACK")
             raise HTTPException(status_code=401, detail="Refresh token already used", headers={"WWW-Authenticate": "Bearer"})
 
         # Insert new session BEFORE deleting old — if INSERT fails, old session remains valid
@@ -126,11 +147,27 @@ def _rotate_refresh_token_block(
         db.execute("DELETE FROM user_sessions WHERE id = ?", (session_id,))
         db.execute("COMMIT")
     except sqlite3.IntegrityError:
-        if exclusive_started:
+        # FR-003: refresh-token reuse detected — revoke entire family + emit audit event
+        try:
+            db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
             try:
-                db.execute("ROLLBACK")
+                from app.services.security_audit import record_security_event
+                record_security_event(
+                    db,
+                    event_type="auth.refresh_reuse_detected",
+                    target_user_id=user_id,
+                    ip_address=request.client.host if request and request.client else None,
+                    user_agent=request.headers.get("user-agent") if request else None,
+                    metadata={"session_id": session_id, "reason": "integrity_error"},
+                )
             except Exception:
-                pass
+                logger.warning(
+                    "Failed to record refresh_reuse_detected audit event for user %s", user_id, exc_info=True,
+                )
+            from app.api.deps import invalidate_active_user_cache
+            invalidate_active_user_cache(user_id)
+        except Exception:
+            logger.warning("Failed to revoke family on refresh reuse", exc_info=True)
         raise HTTPException(status_code=401, detail="Refresh token already used", headers={"WWW-Authenticate": "Bearer"})
     except HTTPException:
         raise
@@ -171,8 +208,8 @@ class LoginRequest(BaseModel):
 
 
 class UpdateProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     full_name: Optional[str] = Field(default=None, max_length=255)
-    password: Optional[str] = Field(default=None, max_length=128)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -698,33 +735,16 @@ async def update_me(
     db=Depends(get_db),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    """Update current user profile (full_name and/or password)."""
+    """Update current user profile (full_name only)."""
     user_id = user["id"]
-    updates = []
-    params = []
 
-    if body.full_name is not None:
-        updates.append("full_name = ?")
-        params.append(body.full_name)
-
-    if body.password is not None:
-        try:
-            password_strength_check(body.password)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        hashed_pw = await async_hash_password(body.password)
-        updates.append("hashed_password = ?")
-        params.append(hashed_pw)
-
-    if not updates:
+    if body.full_name is None:
         raise HTTPException(status_code=400, detail="No fields to update")
-
-    params.append(user_id)
 
     try:
         def _update_me_db():
             try:
-                db.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", tuple(params))
+                db.execute("UPDATE users SET full_name = ? WHERE id = ?", (body.full_name, user_id))
                 db.commit()
                 return db.execute(
                     "SELECT id, username, full_name, role, is_active FROM users WHERE id = ?",
@@ -796,16 +816,18 @@ async def change_password(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Hash new password
+    # Hash new password and compute epoch for token invalidation (FR-007)
     new_hashed_pw = await async_hash_password(body.new_password)
+    new_epoch = datetime.now(timezone.utc).timestamp()
 
-    # Update password and revoke all sessions in a transaction
+    # Update password, clear must_change_password, bump password_changed_at epoch (FR-007)
+    # and revoke all sessions in a transaction
     try:
         def _change_password_db():
             try:
                 db.execute(
-                    "UPDATE users SET hashed_password = ? WHERE id = ?",
-                    (new_hashed_pw, user_id),
+                    "UPDATE users SET hashed_password = ?, must_change_password = 0, password_changed_at = ? WHERE id = ?",
+                    (new_hashed_pw, new_epoch, user_id),
                 )
                 db.execute(
                     "DELETE FROM user_sessions WHERE user_id = ?",

@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
-    get_current_active_user,
+    get_current_user_or_service_account,
     get_db,
     get_embedding_service,
     get_evaluate_policy,
@@ -108,7 +108,7 @@ def _coerce_int(value: Any) -> int | None:
 async def search(
     request: Request,
     body: SearchRequest,
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     db=Depends(get_db),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     vector_store: VectorStore = Depends(get_vector_store),
@@ -212,7 +212,7 @@ async def search(
 @router.get("/search/chunks/{chunk_id}/context", response_model=ChunkContextResponse)
 async def get_chunk_context(
     chunk_id: str,
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     db: sqlite3.Connection = Depends(get_db),
     vector_store: VectorStore = Depends(get_vector_store),
     evaluate: Callable = Depends(get_evaluate_policy),

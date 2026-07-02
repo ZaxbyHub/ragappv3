@@ -280,6 +280,22 @@ def pytest_configure(config):
         del sys.modules[key]
 
 
+# ── JWT_SECRET_KEY guard ──────────────────────────────────────────
+# Some test files (e.g. test_service_account_authenticates_to_routes)
+# may momentarily delete os.environ["JWT_SECRET_KEY"] in their
+# tearDown, which can KeyError subsequent tests in the same worker
+# that access it at module level. This autouse fixture re-establishes
+# the env var before every test function so the worker process always
+# has a valid value.
+
+
+@pytest.fixture(autouse=True)
+def _ensure_jwt_secret_key():
+    """Ensure JWT_SECRET_KEY is always set before each test."""
+    if "JWT_SECRET_KEY" not in os.environ:
+        os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
+
+
 # Also clean up diagnostic file if it was created by a previous version
 import pathlib
 

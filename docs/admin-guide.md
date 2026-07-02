@@ -901,6 +901,7 @@ KnowledgeVault has built-in JWT-based authentication with role-based access cont
 **Token Revocation:**
 - Access tokens are **short-lived (15 minutes)** and can be **denylisted before expiry** (e.g., on logout)
 - All active sessions for a user can be revoked at once via `POST /api/auth/revoke-all`
+- **Password-change token invalidation (FR-007):** Changing a user's password via `change_password` or `admin_reset_password` updates the `password_changed_at` epoch. Any access token issued before that epoch is rejected — users must re-authenticate after a password change. This is by design and ensures compromised credentials cannot be used with old tokens.
 
 **Client Fingerprint Binding:**
 - Access tokens are bound to the client fingerprint (User-Agent + other signals)
@@ -928,6 +929,21 @@ Service accounts provide scoped, rotatable API keys for programmatic access (CI/
 | List | `GET /api/service-accounts` — shows metadata only, not keys |
 | Rotate | `POST /api/service-accounts/{id}/rotate` — issues a new key, invalidates old |
 | Revoke | `POST /api/service-accounts/{id}/revoke` — permanently invalidates the key |
+
+**Route Authorization (sak_ key acceptance):**
+
+Service accounts with the `documents:read` scope can authenticate to the following read routes using a Bearer token (`Authorization: Bearer sak_<key>`). The SA key is mapped to a superadmin-equivalent principal, bypassing per-vault scoping for read operations.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/documents` | List documents |
+| GET | `/api/documents/{file_id}` | Fetch a single document |
+| GET | `/api/documents/{file_id}/status` | Get document ingest status |
+| GET | `/api/documents/{file_id}/raw` | Stream original document bytes |
+| GET | `/api/documents/stats` | Get document/chunk statistics |
+| POST | `/api/search` | Semantic search |
+| GET | `/api/search/chunks/{chunk_id}/context` | Fetch chunk context |
+| GET | `/api/tags/documents/{file_id}` | List tags for a document |
 
 ### Organization Invites
 

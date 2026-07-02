@@ -910,6 +910,7 @@ class TestGetCurrentUserJWT:
             "role": "member",
             "is_active": True,
             "must_change_password": False,
+            "password_changed_at": 0.0,
         }
 
     @pytest.mark.asyncio

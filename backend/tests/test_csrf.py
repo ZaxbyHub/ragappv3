@@ -108,12 +108,15 @@ class TestSQLiteCSRFStoreLock(unittest.TestCase):
         store._lock.release()
 
     def test_lock_is_reentrant_proof(self):
-        """
-        threading.Lock is NOT reentrant. Verify that calling lock twice from the
-        same thread would deadlock (this is expected behavior, not a bug).
-        We test that the lock actually provides mutual exclusion.
+        """threading.Lock is NOT reentrant. Verify two things:
+        1. Cross-thread mutual exclusion: 5 threads doing sequential setex/get/delete
+           complete without deadlock (lock serializes access).
+        2. Same-thread non-reentrancy: acquire(blocking=False) returns False when
+           the lock is already held on the same thread (proves Lock is not reentrant).
         """
         store = _SQLiteCSRFStore(":memory:")
+
+        # --- Section 1: Cross-thread mutual exclusion (existing) ---
         results = []
 
         def worker():
@@ -132,6 +135,20 @@ class TestSQLiteCSRFStoreLock(unittest.TestCase):
 
         # All operations completed without deadlock
         self.assertEqual(len(results), 15)  # 5 threads × 3 operations each
+
+        # --- Section 2: Same-thread non-reentrancy (NEW) ---
+        # Acquire the lock once.
+        store._lock.acquire()
+        try:
+            # Try to re-acquire from the SAME thread with blocking=False.
+            # Lock is NOT reentrant → must return False.
+            re_acquired = store._lock.acquire(blocking=False)
+            self.assertFalse(
+                re_acquired,
+                "threading.Lock is NOT reentrant: blocking=False acquire on already-held lock must return False",
+            )
+        finally:
+            store._lock.release()
 
     def test_setex_calls_cleanup_expired_under_lock(self):
         """

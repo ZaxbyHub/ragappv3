@@ -462,7 +462,7 @@ curl http://localhost:9090/api/health?deep=true | jq .vector_store
 | POST | `/api/auth/logout` | Logout (clears httpOnly refresh cookie, denylists access token) |
 | POST | `/api/auth/refresh` | Refresh access token using httpOnly cookie |
 | GET | `/api/auth/me` | Get current authenticated user profile |
-| PATCH | `/api/auth/me` | Update current user profile (name, password) |
+| PATCH | `/api/auth/me` | Update current user profile (full_name only; use POST /change-password for password) |
 | POST | `/api/auth/change-password` | Change current user's password (requires fingerprint-bound access token) |
 | POST | `/api/auth/revoke-all` | Revoke all active sessions for the current user (admin+) |
 
@@ -474,6 +474,8 @@ curl http://localhost:9090/api/health?deep=true | jq .vector_store
 | GET | `/api/service-accounts` | List service accounts for the current org |
 | POST | `/api/service-accounts/{id}/rotate` | Rotate a service account's API key (old key invalidated immediately) |
 | POST | `/api/service-accounts/{id}/revoke` | Revoke a service account and invalidate its API key |
+
+> **Note:** SA keys with `documents:read` scope authenticate to 8 read routes (list/fetch documents, document status, document raw bytes, document stats, search, chunk context, document tags) via `Authorization: Bearer sak_<key>`. The SA principal is mapped to superadmin-equivalent read access, bypassing per-vault scoping.
 
 ### Users (Admin)
 

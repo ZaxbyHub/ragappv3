@@ -326,6 +326,9 @@ class TestMustChangePasswordExemptPaths(unittest.TestCase):
         self.assertTrue(me_flagged.json()["must_change_password"])
 
         # Change password (clears the flag)
+        # Wait 1 second so the new token's iat is in a different second than password_changed_at
+        import time
+        time.sleep(1)
         cp_response = self.client.post(
             "/api/auth/change-password",
             headers={"Authorization": f"Bearer {access_token}"},

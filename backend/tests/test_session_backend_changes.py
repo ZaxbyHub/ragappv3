@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from starlette.requests import Request
 
@@ -162,14 +162,17 @@ class TestInMemoryCSRFStore(unittest.TestCase):
         """get returns None after TTL expires."""
         from app.security import _InMemoryCSRFStore
 
-        store = _InMemoryCSRFStore(ttl=1)  # 1 second TTL
-        store.setex("expiring_key", 1, "1")
+        base = 1000.0
+        with patch("app.security.time.time") as mock_time:
+            mock_time.return_value = base
+            store = _InMemoryCSRFStore(ttl=1)
+            store.setex("expiring_key", 1, "1")
 
-        # Wait for expiry
-        time.sleep(1.5)
+            # Advance time past the 1-second TTL
+            mock_time.return_value = base + 1.5
 
-        result = store.get("expiring_key")
-        self.assertIsNone(result, "get should return None after TTL expires")
+            result = store.get("expiring_key")
+            self.assertIsNone(result, "get should return None after TTL expires")
 
     def test_delete_removes_key(self):
         """delete removes the key from store."""
@@ -186,20 +189,23 @@ class TestInMemoryCSRFStore(unittest.TestCase):
         """expire extends the TTL of an existing key."""
         from app.security import _InMemoryCSRFStore
 
-        store = _InMemoryCSRFStore(ttl=1)
-        store.setex("to_extend", 1, "1")
+        base = 1000.0
+        with patch("app.security.time.time") as mock_time:
+            mock_time.return_value = base
+            store = _InMemoryCSRFStore(ttl=1)
+            store.setex("to_extend", 1, "1")
 
-        # Wait half the TTL
-        time.sleep(0.5)
+            # Advance to halfway through original TTL
+            mock_time.return_value = base + 0.5
 
-        # Extend the TTL
-        store.expire("to_extend", 2)
+            # Extend the TTL
+            store.expire("to_extend", 2)
 
-        # Wait another second (would have expired without extend)
-        time.sleep(1.0)
+            # Advance past original TTL (1.0s) but within extended TTL (2.5s)
+            mock_time.return_value = base + 1.0
 
-        result = store.get("to_extend")
-        self.assertEqual(result, "1", "key should still exist after expire extends TTL")
+            result = store.get("to_extend")
+            self.assertEqual(result, "1", "key should still exist after expire extends TTL")
 
     def test_ping_returns_true(self):
         """ping always returns True for in-memory store."""
