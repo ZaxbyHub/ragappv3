@@ -99,6 +99,7 @@ class TestSAClientAuthentication(unittest.TestCase):
     def setUp(self):
         """Set up test client with temporary database and SA fixtures."""
         # Set JWT_SECRET_KEY BEFORE importing settings
+        self._original_jwt_env = os.environ.get("JWT_SECRET_KEY")
         os.environ["JWT_SECRET_KEY"] = "test-sa-auth-regression-key-32chars!"
 
         self._temp_dir = tempfile.mkdtemp()
@@ -248,8 +249,13 @@ class TestSAClientAuthentication(unittest.TestCase):
         self._connection_pool.close_all()
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
-        # Clean up env var set in setUp
-        del os.environ["JWT_SECRET_KEY"]
+        # Restore env var to its original state so other test classes
+        # relying on module-level os.environ["JWT_SECRET_KEY"] are not
+        # poisoned by the deletion.
+        if self._original_jwt_env is not None:
+            os.environ["JWT_SECRET_KEY"] = self._original_jwt_env
+        else:
+            os.environ.pop("JWT_SECRET_KEY", None)
 
     # -------------------------------------------------------------------------
     # Test: GET /api/documents/{file_id}
