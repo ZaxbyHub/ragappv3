@@ -6,6 +6,7 @@ moving documents between folders. All endpoints enforce vault read/write
 permissions, mirroring the tag routes. Mutating endpoints are CSRF-protected.
 """
 
+import inspect
 import logging
 import sqlite3
 from dataclasses import asdict
@@ -14,7 +15,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.api.deps import evaluate_policy, get_current_active_user, get_db
+from app.api.deps import get_current_active_user, get_db, get_evaluate_policy
 from app.security import csrf_protect
 from app.services.folder_store import (
     _UNSET,
@@ -34,13 +35,21 @@ router = APIRouter(prefix="/folders", tags=["folders"])
 # ---------------------------------------------------------------------------
 
 
-async def _require_vault_read(user: dict, vault_id: int) -> None:
-    if not await evaluate_policy(user, "vault", vault_id, "read"):
+async def _require_vault_read(user: dict, vault_id: int, db: sqlite3.Connection) -> None:
+    evaluate = get_evaluate_policy(db)
+    result = evaluate(user, "vault", vault_id, "read")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
 
-async def _require_vault_write(user: dict, vault_id: int) -> None:
-    if not await evaluate_policy(user, "vault", vault_id, "write"):
+async def _require_vault_write(user: dict, vault_id: int, db: sqlite3.Connection) -> None:
+    evaluate = get_evaluate_policy(db)
+    result = evaluate(user, "vault", vault_id, "write")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
 
@@ -91,7 +100,7 @@ async def list_folders(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = FolderStore(db)
     return {"folders": [asdict(f) for f in store.list_folders(vault_id)]}
 
@@ -103,7 +112,7 @@ async def create_folder(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, request.vault_id)
+    await _require_vault_write(user, request.vault_id, db)
     store = FolderStore(db)
     try:
         folder = store.create_folder(
@@ -132,7 +141,7 @@ async def update_folder(
     vault_id = _folder_vault_id(db, folder_id)
     if vault_id is None:
         raise HTTPException(status_code=404, detail="Folder not found")
-    await _require_vault_write(user, vault_id)
+    await _require_vault_write(user, vault_id, db)
     store = FolderStore(db)
     # Only reparent when the caller actually included parent_folder_id.
     reparent = "parent_folder_id" in request.model_fields_set
@@ -168,7 +177,7 @@ async def delete_folder(
     vault_id = _folder_vault_id(db, folder_id)
     if vault_id is None:
         raise HTTPException(status_code=404, detail="Folder not found")
-    await _require_vault_write(user, vault_id)
+    await _require_vault_write(user, vault_id, db)
     store = FolderStore(db)
     store.delete_folder(folder_id, vault_id)
 
@@ -187,7 +196,7 @@ async def move_documents(
 ):
     """Move one or more documents into a folder (or to root when folder_id is
     null). Both the target folder and the files are scoped to the vault."""
-    await _require_vault_write(user, request.vault_id)
+    await _require_vault_write(user, request.vault_id, db)
     store = FolderStore(db)
     try:
         moved = store.move_documents(

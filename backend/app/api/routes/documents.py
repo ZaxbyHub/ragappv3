@@ -8,6 +8,7 @@ and managing document processing status.
 import asyncio
 import hashlib
 import hmac
+import inspect
 import logging
 import mimetypes
 import os
@@ -232,7 +233,10 @@ async def require_document_admin(
         return user
     vault_ids = await get_user_accessible_vault_ids(user, conn)
     for vault_id in vault_ids:
-        if await evaluate(user, "vault", vault_id, "admin"):
+        result = evaluate(user, "vault", vault_id, "admin")
+        if inspect.iscoroutine(result):
+            result = await result
+        if result:
             return user
     raise HTTPException(status_code=403, detail="Admin access required")
 
@@ -660,7 +664,10 @@ async def list_documents(
 
     # Check vault permissions
     if vault_id is not None:
-        if not await evaluate(user, "vault", vault_id, "read"):
+        result = evaluate(user, "vault", vault_id, "read")
+        if inspect.iscoroutine(result):
+            result = await result
+        if not result:
             raise HTTPException(status_code=403, detail="Access denied to vault")
         # Count total
         count_cursor = await asyncio.to_thread(
@@ -820,7 +827,10 @@ async def get_document_status(
     if row is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    if not await evaluate(user, "vault", row["vault_id"], "read"):
+    result = evaluate(user, "vault", row["vault_id"], "read")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
     # Derive wiki state from the latest wiki_compile_jobs row for this file.
@@ -918,7 +928,10 @@ async def get_document_raw(
         raise HTTPException(status_code=404, detail="Document not found")
 
     vault_id = row["vault_id"]
-    if not await evaluate(user, "vault", vault_id, "read"):
+    result = evaluate(user, "vault", vault_id, "read")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
     try:
@@ -995,7 +1008,10 @@ async def get_document_stats(
 
     # Check vault permissions
     if vault_id is not None:
-        if not await evaluate(user, "vault", vault_id, "read"):
+        result = evaluate(user, "vault", vault_id, "read")
+        if inspect.iscoroutine(result):
+            result = await result
+        if not result:
             raise HTTPException(status_code=403, detail="Access denied to vault")
         vault_filter_sql = "WHERE vault_id = ?"
         vault_filter_params = (vault_id,)
@@ -1092,7 +1108,10 @@ async def get_document(
         raise HTTPException(
             status_code=404, detail=f"Document with id {file_id} not found"
         )
-    if not await evaluate(user, "vault", row["vault_id"], "read"):
+    result = evaluate(user, "vault", row["vault_id"], "read")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="Access denied to vault")
 
     document = _row_to_document_response(row)
@@ -1136,7 +1155,10 @@ async def toggle_file_enrichment(
     file_vault_id = row["vault_id"]
 
     # Admin check on the vault
-    if not await evaluate(user, "vault", file_vault_id, "admin"):
+    result = evaluate(user, "vault", file_vault_id, "admin")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="Insufficient vault permissions")
 
     # Apply the override (NULL to clear, 1 to enable, 0 to disable)
@@ -1716,7 +1738,10 @@ async def delete_document(
     file_vault_id = row["vault_id"]
 
     # Check vault admin permission
-    if not await evaluate(user, "vault", file_vault_id, "admin"):
+    result = evaluate(user, "vault", file_vault_id, "admin")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="Insufficient vault permissions")
 
     try:
@@ -1795,7 +1820,10 @@ async def batch_delete_documents(
             file_name = row["file_name"]
             file_vault_id = row["vault_id"]
 
-            if not await evaluate(user, "vault", file_vault_id, "admin"):
+            result = evaluate(user, "vault", file_vault_id, "admin")
+            if inspect.iscoroutine(result):
+                result = await result
+            if not result:
                 failed_ids.append(file_id)
                 continue
 

@@ -48,6 +48,35 @@ update this doc when a convention genuinely changes.
 - **Migrations** are idempotent functions named `migrate_add_*(sqlite_path)`: open conn → check `PRAGMA table_info`/existence → `ALTER TABLE` if needed → commit. Register every new migration in `run_migrations`.
 - Multi-statement atomic writes use an explicit transaction (`BEGIN IMMEDIATE` … `commit()`/`rollback()`). Before starting one, clear any dangling implicit transaction (`if conn.in_transaction: conn.rollback()`) — a prior best-effort call may have left one open.
 
+### SSE streaming endpoints and short-lived auth deps
+
+For `StreamingResponse` endpoints (`chat_stream`, `wiki_events_stream`, future SSE routes) **do not** use `Depends(get_db)` or `Depends(get_current_active_user)` as yield-based dependencies. Yield-based deps keep the pooled connection checked out for the entire request lifetime — which is the entire stream — exhausting the connection pool (`max_size=10`) under concurrent SSE subscribers.
+
+The canonical pattern is a short-lived async dep that acquires the connection from the pool, runs auth+eval inside a `try`, and releases the connection in `finally` **before** the route returns the `StreamingResponse`. See `get_chat_stream_auth_context` (`backend/app/api/routes/chat.py`) and `get_wiki_events_auth_context` (`backend/app/api/routes/wiki.py`) for the reference implementation.
+
+```python
+async def get_stream_auth_context(
+    request: Request, body: SomeRequestModel,
+    authorization: str | None = Header(None),
+    access_token: str | None = Cookie(None),
+):
+    auth_pool = get_pool(str(settings.sqlite_path))
+    auth_conn = auth_pool.get_connection()
+    try:
+        user = await get_current_active_user(..., db=auth_conn)
+        evaluate = get_evaluate_policy(auth_conn)
+        # ... vault/admin checks ...
+        return user
+    finally:
+        auth_pool.release_connection(auth_conn)
+```
+
+The `StreamingResponse` body generator that runs AFTER this dep resolves can then safely issue new short-lived connections (e.g. via `_enqueue_wiki_compile_job(pool.connection())`) without holding a pool slot for the duration of the stream.
+
+Regression coverage: `test_chat_route_policy_di.py::TestChatStreamConnectionLifetime` patches BOTH `app.api.routes.chat.get_pool` AND `app.api.deps.get_pool` (the latter is what pre-fix code routed through via `Depends(get_evaluate_policy)`). A connection-tracker mock asserts `checked_out == 0` during the streaming body. To regression-test that the post-fix code path correctly releases the connection, also use an `app.dependency_overrides[get_stream_auth_context]` override to bypass the new dep and re-route through the real pool — that override would observe the leak.
+
+**Do not** use `Depends(get_db)` (yield-based) in any route that returns a `StreamingResponse` or similar long-lived response.
+
 ### Services
 - Service classes take a `db: sqlite3.Connection` (SQLite-backed, e.g. `TagStore(conn)`) or a `db_path: Path` (LanceDB-backed, e.g. `VectorStore`).
 - Return rows as `@dataclass` records (e.g. `MemoryRecord`); convert to dicts at the API boundary with `dataclasses.asdict`.

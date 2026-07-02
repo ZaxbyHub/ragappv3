@@ -5,18 +5,20 @@ All endpoints are vault-scoped. Access follows vault access permissions.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import sqlite3
 from dataclasses import asdict
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.api.deps import evaluate_policy, get_current_active_user, get_db
+from app.api.deps import get_current_active_user, get_db, get_evaluate_policy
 from app.config import settings
+from app.models.database import get_pool
 from app.security import csrf_protect
 from app.services.wiki_compiler import WikiCompiler
 from app.services.wiki_events import get_wiki_event_bus
@@ -61,14 +63,44 @@ def _page_dict(page) -> dict:
     return d
 
 
-async def _require_vault_read(user: dict, vault_id: int) -> None:
-    if not await evaluate_policy(user, "vault", vault_id, "read"):
+async def _require_vault_read(user: dict, vault_id: int, db: sqlite3.Connection) -> None:
+    evaluate = get_evaluate_policy(db)
+    result = evaluate(user, "vault", vault_id, "read")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
 
-async def _require_vault_write(user: dict, vault_id: int) -> None:
-    if not await evaluate_policy(user, "vault", vault_id, "write"):
+async def _require_vault_write(user: dict, vault_id: int, db: sqlite3.Connection) -> None:
+    evaluate = get_evaluate_policy(db)
+    result = evaluate(user, "vault", vault_id, "write")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No write access to this vault")
+
+
+async def get_wiki_events_auth_context(
+    request: Request,
+    vault_id: int = Query(...),
+    authorization: str | None = Header(None),
+    access_token: str | None = Cookie(None),
+) -> dict:
+    """Resolve wiki-event auth without pinning a yield DB dependency."""
+    auth_pool = get_pool(str(settings.sqlite_path))
+    auth_conn = auth_pool.get_connection()
+    try:
+        user = await get_current_active_user(
+            request,
+            authorization=authorization,
+            access_token=access_token,
+            db=auth_conn,
+        )
+        await _require_vault_read(user, vault_id, auth_conn)
+        return user
+    finally:
+        auth_pool.release_connection(auth_conn)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +195,7 @@ async def list_wiki_pages(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     pages = store.list_pages(vault_id, page_type=page_type, status=status, search=search, page=page, per_page=per_page)
     return {"pages": [_as_dict(p) for p in pages], "page": page, "per_page": per_page}
@@ -176,7 +208,7 @@ async def create_wiki_page(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, request.vault_id)
+    await _require_vault_write(user, request.vault_id, db)
     store = WikiStore(db)
     try:
         page = store.create_page(
@@ -210,7 +242,7 @@ async def get_wiki_page(
     # F-003: collapse a vault-access denial to 404 so an unauthorized caller cannot
     # distinguish "exists in another vault" (403) from "does not exist" (404).
     try:
-        await _require_vault_read(user, page.vault_id)
+        await _require_vault_read(user, page.vault_id, db)
     except HTTPException as exc:
         if exc.status_code == 403:
             raise HTTPException(status_code=404, detail="Wiki page not found")
@@ -232,7 +264,7 @@ async def update_wiki_page(
         raise HTTPException(status_code=404, detail="Wiki page not found")
     # F-003: collapse a vault-access denial to 404 (existence non-distinguishable).
     try:
-        await _require_vault_write(user, page.vault_id)
+        await _require_vault_write(user, page.vault_id, db)
     except HTTPException as exc:
         if exc.status_code == 403:
             raise HTTPException(status_code=404, detail="Wiki page not found")
@@ -269,7 +301,7 @@ async def delete_wiki_page(
         raise HTTPException(status_code=404, detail="Wiki page not found")
     # F-003: collapse a vault-access denial to 404 (existence non-distinguishable).
     try:
-        await _require_vault_write(user, page.vault_id)
+        await _require_vault_write(user, page.vault_id, db)
     except HTTPException as exc:
         if exc.status_code == 403:
             raise HTTPException(status_code=404, detail="Wiki page not found")
@@ -288,7 +320,7 @@ async def list_page_versions(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     page = store.get_page(page_id, load_relations=False)
     if not page:
@@ -311,7 +343,7 @@ async def attach_file_to_page(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, request.vault_id)
+    await _require_vault_write(user, request.vault_id, db)
     store = WikiStore(db)
     page = store.get_page(page_id, load_relations=False)
     if not page:
@@ -337,7 +369,7 @@ async def detach_file_from_page(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, vault_id)
+    await _require_vault_write(user, vault_id, db)
     store = WikiStore(db)
     removed = store.detach_file(page_id, file_id, vault_id)
     if not removed:
@@ -351,7 +383,7 @@ async def list_page_files(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     page = store.get_page(page_id, load_relations=False)
     if not page:
@@ -373,7 +405,7 @@ async def list_page_backlinks(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     page = store.get_page(page_id, load_relations=False)
     if not page:
@@ -395,7 +427,7 @@ async def list_wiki_activity(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     entries = store.list_activity(vault_id, limit=limit)
     return {"activity": [_as_dict(e) for e in entries]}
@@ -412,7 +444,7 @@ async def bulk_wiki_pages(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, request.vault_id)
+    await _require_vault_write(user, request.vault_id, db)
     store = WikiStore(db)
     if request.action == "delete":
         count = store.bulk_delete_pages(request.page_ids, request.vault_id)
@@ -439,7 +471,7 @@ async def list_wiki_entities(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     entities = store.list_entities(vault_id, search=search, limit=limit, offset=offset)
     return {"entities": [_as_dict(e) for e in entities]}
@@ -461,7 +493,7 @@ async def list_wiki_claims(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     claims = store.list_claims(
         vault_id, page_id=page_id, entity=entity, search=search, status=status,
@@ -477,7 +509,7 @@ async def create_wiki_claim(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, request.vault_id)
+    await _require_vault_write(user, request.vault_id, db)
     store = WikiStore(db)
     claim = store.create_claim(
         vault_id=request.vault_id,
@@ -507,7 +539,7 @@ async def update_wiki_claim(
     claim = store.get_claim(claim_id)
     if not claim:
         raise HTTPException(status_code=404, detail="Claim not found")
-    await _require_vault_write(user, claim.vault_id)
+    await _require_vault_write(user, claim.vault_id, db)
     updates = request.model_dump(exclude_none=True)
 
     # PR C: server-side source-quote re-verification on transitions to
@@ -611,7 +643,7 @@ async def delete_wiki_claim(
     claim = store.get_claim(claim_id)
     if not claim:
         raise HTTPException(status_code=404, detail="Claim not found")
-    await _require_vault_write(user, claim.vault_id)
+    await _require_vault_write(user, claim.vault_id, db)
     store.delete_claim(claim_id, claim.vault_id)
 
 
@@ -627,7 +659,7 @@ async def get_lint_findings(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     findings = store.list_lint_findings(vault_id, status=status, severity=severity)
     return {"findings": [_as_dict(f) for f in findings]}
@@ -640,7 +672,7 @@ async def run_wiki_lint(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, request.vault_id)
+    await _require_vault_write(user, request.vault_id, db)
     store = WikiStore(db)
     linter = WikiLinter(db, store)
     findings = linter.run_lint(request.vault_id)
@@ -658,7 +690,7 @@ async def promote_memory_to_wiki(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, request.vault_id)
+    await _require_vault_write(user, request.vault_id, db)
     store = WikiStore(db)
     compiler = WikiCompiler(db, store)
     try:
@@ -697,7 +729,7 @@ async def list_wiki_jobs(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     jobs = store.list_jobs(vault_id, status=status)
     return {"jobs": [_as_dict(j) for j in jobs]}
@@ -706,7 +738,7 @@ async def list_wiki_jobs(
 @router.get("/wiki/events")
 async def wiki_events_stream(
     vault_id: int = Query(...),
-    user: dict = Depends(get_current_active_user),
+    _user: dict = Depends(get_wiki_events_auth_context),
 ):
     """SSE stream of terminal-state wiki compile job events for a vault.
 
@@ -715,8 +747,6 @@ async def wiki_events_stream(
     the existing REST endpoints on each event. A 15-second keepalive comment
     keeps proxies and load balancers from idling the connection out.
     """
-    await _require_vault_read(user, vault_id)
-
     bus = get_wiki_event_bus()
     queue = bus.subscribe(vault_id)
 
@@ -757,7 +787,7 @@ async def search_wiki(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     results = store.search(vault_id, q, page_type=page_type, status=status, sort_by=sort_by)
     return {
@@ -779,7 +809,7 @@ async def get_wiki_job(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     job = store.get_job(job_id, vault_id)
     if not job:
@@ -795,7 +825,7 @@ async def retry_wiki_job(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, vault_id)
+    await _require_vault_write(user, vault_id, db)
     store = WikiStore(db)
     job = store.retry_job(job_id, vault_id)
     if not job:
@@ -814,7 +844,7 @@ async def cancel_wiki_job(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, vault_id)
+    await _require_vault_write(user, vault_id, db)
     store = WikiStore(db)
     cancelled = store.cancel_job(job_id, vault_id)
     if not cancelled:
@@ -838,7 +868,7 @@ async def compile_document_wiki(
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Manually enqueue a wiki ingest job for an already-indexed document."""
-    await _require_vault_write(user, vault_id)
+    await _require_vault_write(user, vault_id, db)
     db.row_factory = sqlite3.Row
     file_row = db.execute(
         "SELECT id, file_name FROM files WHERE id = ? AND vault_id = ?",
@@ -864,7 +894,7 @@ async def get_document_wiki_status(
     user: dict = Depends(get_current_active_user),
 ):
     """Return semantic wiki status, counts, linked pages/claims, and latest job for a document."""
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     db.row_factory = sqlite3.Row
     store = WikiStore(db)
 
@@ -964,7 +994,7 @@ async def get_memory_wiki_status(
     user: dict = Depends(get_current_active_user),
 ):
     """Return semantic wiki status, linked pages/claims, and latest job for a memory record."""
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     db.row_factory = sqlite3.Row
     store = WikiStore(db)
 
@@ -1034,7 +1064,7 @@ async def list_wiki_relations(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
 ):
-    await _require_vault_read(user, vault_id)
+    await _require_vault_read(user, vault_id, db)
     store = WikiStore(db)
     relations = store.list_relations(vault_id=vault_id, entity_id=entity_id)
     return {"relations": [_as_dict(r) for r in relations]}
@@ -1057,7 +1087,7 @@ async def resolve_lint_finding(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(user, vault_id)
+    await _require_vault_write(user, vault_id, db)
     store = WikiStore(db)
     try:
         finding = store.update_lint_finding(finding_id, vault_id, body.status)
@@ -1080,7 +1110,7 @@ async def recompile_vault_wiki(
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Enqueue a settings_reindex job to re-derive all stale claims in a vault."""
-    await _require_vault_write(user, vault_id)
+    await _require_vault_write(user, vault_id, db)
     store = WikiStore(db)
     job = store.create_job(
         vault_id=vault_id,

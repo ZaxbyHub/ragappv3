@@ -35,11 +35,12 @@ class TestSanitizeOnPersist(unittest.TestCase):
         )
         self.conn.commit()
 
-        # Patch evaluate_policy so the route doesn't attempt a live DB lookup.
+        # Patch get_evaluate_policy so the route doesn't attempt a live DB lookup.
         # These tests focus on sanitization behaviour, not authorization.
+        mock_evaluate = AsyncMock(return_value=True)
         self._policy_patcher = patch(
-            "app.api.routes.chat.evaluate_policy",
-            new=AsyncMock(return_value=True),
+            "app.api.routes.chat.get_evaluate_policy",
+            new=lambda conn, _ep=mock_evaluate: _ep,
         )
         self._policy_patcher.start()
 

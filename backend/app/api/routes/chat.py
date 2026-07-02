@@ -6,18 +6,18 @@ the RAG engine for context-aware responses.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import sqlite3
 from html import escape as _xml_escape
 from typing import Any, Dict, List, Literal, Optional, Set
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
-    evaluate_policy,
     get_current_active_user,
     get_db,
     get_evaluate_policy,
@@ -164,6 +164,57 @@ def _build_per_claim_sources(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Delegate to wiki_citation_helpers.build_per_claim_sources."""
     return _build_per_claim_sources_impl(answer, doc_sources, memories_as_dicts, wiki_refs)
+
+
+async def get_chat_stream_auth_context(
+    request: Request,
+    body: ChatStreamRequest,
+    authorization: str | None = Header(None),
+    access_token: str | None = Cookie(None),
+):
+    """Resolve chat-stream auth without pinning a yield DB dependency."""
+    overrides = getattr(request.app, "dependency_overrides", {})
+    user_override = overrides.get(get_current_active_user)
+    evaluate_override = overrides.get(get_evaluate_policy)
+    if user_override is not None:
+        user = user_override()
+        if inspect.isawaitable(user):
+            user = await user
+        if evaluate_override is not None:
+            evaluate = evaluate_override()
+            if inspect.isawaitable(evaluate):
+                evaluate = await evaluate
+        else:
+            async def evaluate(*_args, **_kwargs):
+                return False
+
+        if body.vault_id is not None:
+            result = evaluate(user, "vault", body.vault_id, "read")
+            if inspect.iscoroutine(result):
+                result = await result
+            if not result:
+                raise HTTPException(status_code=403, detail="No read access to this vault")
+        return user
+
+    auth_pool = get_pool(str(settings.sqlite_path))
+    auth_conn = auth_pool.get_connection()
+    try:
+        user = await get_current_active_user(
+            request,
+            authorization=authorization,
+            access_token=access_token,
+            db=auth_conn,
+        )
+        evaluate = get_evaluate_policy(auth_conn)
+        if body.vault_id is not None:
+            result = evaluate(user, "vault", body.vault_id, "read")
+            if inspect.iscoroutine(result):
+                result = await result
+            if not result:
+                raise HTTPException(status_code=403, detail="No read access to this vault")
+        return user
+    finally:
+        auth_pool.release_connection(auth_conn)
 
 
 async def _enqueue_wiki_compile_job(
@@ -614,7 +665,10 @@ async def chat(
         # Use the DI evaluate_policy variant so the permission check reuses the
         # request's pooled DB connection instead of opening a second one. This
         # halves per-request pool usage on the hot chat path (pool max_size=10).
-        if not await evaluate(user, "vault", body.vault_id, "read"):
+        result = evaluate(user, "vault", body.vault_id, "read")
+        if inspect.iscoroutine(result):
+            result = await result
+        if not result:
             raise HTTPException(status_code=403, detail="No read access to this vault")
     else:
         # vault_id=None ("All Vaults") searches across all vaults without filtering.
@@ -624,6 +678,8 @@ async def chat(
                 status_code=403,
                 detail="Searching all vaults requires admin access. Please select a specific vault.",
             )
+
+
     require_vault = user.get("role") not in ("superadmin", "admin")
     effective_mode = ChatMode(body.mode) if body.mode else None
     try:
@@ -650,8 +706,7 @@ async def chat_stream(
     request: Request,
     body: ChatStreamRequest,
     rag_engine: RAGEngine = Depends(get_rag_engine),
-    user: dict = Depends(get_current_active_user),
-    evaluate=Depends(get_evaluate_policy),
+    auth_context=Depends(get_chat_stream_auth_context),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Streaming chat endpoint that accepts a sequence of chat messages."""
@@ -664,13 +719,8 @@ async def chat_stream(
             status_code=400, detail="The last message must be from the user"
         )
 
-    if body.vault_id is not None:
-        # Use the DI evaluate_policy variant so the permission check reuses the
-        # request's pooled DB connection instead of opening a second one. This
-        # halves per-request pool usage on the hot chat path (pool max_size=10).
-        if not await evaluate(user, "vault", body.vault_id, "read"):
-            raise HTTPException(status_code=403, detail="No read access to this vault")
-    else:
+    user = auth_context
+    if body.vault_id is None:
         # vault_id=None ("All Vaults") searches across all vaults without filtering.
         # Restrict to admin/superadmin — non-admin users must specify a vault_id.
         if user.get("role") not in ("superadmin", "admin"):
@@ -678,6 +728,7 @@ async def chat_stream(
                 status_code=403,
                 detail="Searching all vaults requires admin access. Please select a specific vault.",
             )
+
     require_vault = user.get("role") not in ("superadmin", "admin")
     history = [msg.model_dump(exclude_none=True) for msg in body.messages[:-1]]
     effective_mode = ChatMode(body.mode) if body.mode else None
@@ -808,7 +859,11 @@ async def get_session(
     if session_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", session_row[1], "read"):
+    evaluate = get_evaluate_policy(conn)
+    result = evaluate(user, "vault", session_row[1], "read")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
     # Detect optional columns (older databases may lack them).
@@ -970,7 +1025,11 @@ async def create_session(
 
     Returns the created session with its ID.
     """
-    if not await evaluate_policy(user, "vault", body.vault_id, "write"):
+    evaluate = get_evaluate_policy(conn)
+    result = evaluate(user, "vault", body.vault_id, "write")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     query = "INSERT INTO chat_sessions (vault_id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
@@ -1023,7 +1082,11 @@ async def fork_session(
         raise HTTPException(status_code=404, detail="Session not found")
 
     vault_id = session_row[1]
-    if not await evaluate_policy(user, "vault", vault_id, "write"):
+    evaluate = get_evaluate_policy(conn)
+    result = evaluate(user, "vault", vault_id, "write")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     # Detect optional columns on chat_messages.
@@ -1449,7 +1512,11 @@ async def add_message(
     if session_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", session_row[2], "write"):
+    evaluate = get_evaluate_policy(conn)
+    result = evaluate(user, "vault", session_row[2], "write")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     # Check if this is the first message
@@ -1667,7 +1734,11 @@ async def set_message_feedback(
     if session_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", session_row[1], "write"):
+    evaluate = get_evaluate_policy(conn)
+    result = evaluate(user, "vault", session_row[1], "write")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     session_owner_id = session_row[2]
@@ -1744,7 +1815,11 @@ async def update_session(
     if select_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", select_row[1], "write"):
+    evaluate = get_evaluate_policy(conn)
+    result = evaluate(user, "vault", select_row[1], "write")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     # Update session
@@ -1792,7 +1867,11 @@ async def delete_session(
     if select_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", select_row[1], "write"):
+    evaluate = get_evaluate_policy(conn)
+    result = evaluate(user, "vault", select_row[1], "write")
+    if inspect.iscoroutine(result):
+        result = await result
+    if not result:
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     # Delete session (CASCADE will delete messages)

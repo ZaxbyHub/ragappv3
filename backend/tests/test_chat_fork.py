@@ -59,7 +59,7 @@ async def test_fork_response_returns_inserted_message_ids_and_created_at(
         async def allow_write(*args):
             return True
 
-        monkeypatch.setattr(chat_routes, "evaluate_policy", allow_write)
+        monkeypatch.setattr(chat_routes, "get_evaluate_policy", lambda conn, _ep=allow_write: _ep)
 
         response = await chat_routes.fork_session(
             _mock_request(),
@@ -112,7 +112,7 @@ async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
         async def allow_write(*args):
             return True
 
-        monkeypatch.setattr(chat_routes, "evaluate_policy", allow_write)
+        monkeypatch.setattr(chat_routes, "get_evaluate_policy", lambda conn, _ep=allow_write: _ep)
 
         response = await chat_routes.fork_session(
             _mock_request(),
@@ -161,7 +161,7 @@ async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path, monkeyp
         async def allow_write(*args):
             return True
 
-        monkeypatch.setattr(chat_routes, "evaluate_policy", allow_write)
+        monkeypatch.setattr(chat_routes, "get_evaluate_policy", lambda conn, _ep=allow_write: _ep)
         conn.fail_message_copy = True
         conn.fail_after_message_copies = 1
 

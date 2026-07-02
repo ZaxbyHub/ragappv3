@@ -870,18 +870,37 @@ class TestVaultScopedRoutes(unittest.TestCase):
         init_db(db_path)
         self._connection_pool = SimpleConnectionPool(db_path)
 
-        # Patch evaluate_policy in route modules that use standalone evaluate_policy
-        # (bypasses global pool and uses override DB instead)
+        # Define allow_policy BEFORE patching so we can reference it.
+        # This is an async function that returns True for any policy check.
+        async def allow_policy(user, resource_type, resource_id, action):
+            return True
+
+        # Patch get_evaluate_policy in route modules to bypass global pool and use override DB.
+        # The patch returns allow_policy directly (not an AsyncMock) so that calling
+        # evaluate(...) returns a coroutine that await correctly to True.
+        # This is needed because get_chat_stream_auth_context does a manual override lookup
+        # using the patched function as key (which differs from the original get_evaluate_policy
+        # in app.api.deps that the override was registered with), so the override isn't found
+        # and the else branch's evaluate = get_evaluate_policy(auth_conn) returns allow_policy.
         self._evaluate_policy_patches = []
         for module_name in [
             "app.api.routes.chat",
             "app.api.routes.memories",
             "app.api.routes.wiki",
         ]:
-            patcher = patch(f"{module_name}.evaluate_policy")
-            mock_ep = patcher.start()
-            mock_ep.return_value = True
+            patcher = patch(
+                f"{module_name}.get_evaluate_policy",
+                new=lambda conn, _ep=allow_policy: _ep,
+            )
+            patcher.start()
             self._evaluate_policy_patches.append(patcher)
+
+        # Also register the override with the patched function's key.
+        # get_chat_stream_auth_context does overrides.get(get_evaluate_policy) using the
+        # PATCHED function as key, but the override was registered with the ORIGINAL function
+        # key, so it always returns None. By registering with the patched key too, the lookup finds it.
+        from app.api.routes.chat import get_evaluate_policy as patched_get_ep
+        app.dependency_overrides[patched_get_ep] = lambda: allow_policy
 
         def override_get_db():
             conn = self._connection_pool.get_connection()
@@ -902,9 +921,6 @@ class TestVaultScopedRoutes(unittest.TestCase):
             "username": "test-admin",
             "role": "admin",
         }
-
-        async def allow_policy(user, resource_type, resource_id, action):
-            return True
 
         app.dependency_overrides[get_evaluate_policy] = lambda: allow_policy
         from app.security import csrf_protect
