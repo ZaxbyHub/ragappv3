@@ -101,8 +101,10 @@ afterEach(() => {
 
 ```ts
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { MyReconnectingComponent } from "./MyReconnectingComponent";
+
+const connectMock = vi.fn();
 
 describe("reconnect loop with fake timers", () => {
   afterEach(() => {
@@ -130,7 +132,7 @@ describe("reconnect loop with fake timers", () => {
 
 ```ts
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { waitFor } from "@testing-library/react";
+import { renderHook } from "@testing-library/react";
 
 it("reconnects with the refreshed token after a 401 token_expired response", async () => {
   vi.useFakeTimers();
