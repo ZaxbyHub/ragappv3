@@ -516,6 +516,49 @@ Before final output:
 - include disproved agent/tool claims,
 - keep final comments actionable.
 
+### Persisting Findings to Survive Context Compaction
+
+Long multi-file reviews generate dozens of candidates and findings. If they are
+only held in the orchestrator's conversation context, a context compaction (triggered
+at size thresholds by the platform) silently erases this detail — forcing expensive
+re-runs of explorer and reviewer lanes.
+
+**Requirement (when file writes are allowed):** After each validation phase,
+persist findings to a structured scratch artifact
+(e.g., `.swarm/evidence/review-{id}/{phase}.json`). In read-only contexts where
+file writes are not available, use the strongest non-lossy channel available
+(e.g., structured tool output that is captured and stored by the runtime), and
+state the limitation explicitly.
+
+Minimum fields schema for each persisted finding:
+
+```json
+{
+  "finding_id": "F-001",
+  "status": "PENDING | CONFIRMED | DISPROVED | PRE_EXISTING",
+  "severity": "CRITICAL | HIGH | MEDIUM | LOW",
+  "category": "correctness | security | test | docs | perf",
+  "file_line": "path/to/file.py:123",
+  "evidence": "brief summary of structural proof",
+  "next_action": "fix | investigate | ignore | escalate"
+}
+```
+
+**Checkpoint triggers:**
+| Phase | When to persist |
+|-------|-----------------|
+| Post-explorer | After collecting all base and micro-lane candidates |
+| Post-reviewer | After reviewer confirms/disproves/classifies each finding |
+| Post-critic | After critic challenges HIGH/CRITICAL findings |
+| Pre-synthesis | Before building the final grouped output |
+
+**Resume procedure:** If context is lost mid-review (e.g., after compaction or
+interruption), reload the persisted artifacts from whichever channel they were
+stored (disk, runtime capture, or structured tool output), re-verify that the
+findings match the current working-tree state, and continue from the last
+checkpoint phase.
+Do not re-dispatch explorers for already-persisted lanes unless the diff changed.
+
 ### Finding ID format
 
 ```text

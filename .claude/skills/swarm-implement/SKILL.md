@@ -65,6 +65,13 @@ Launch parallel subagents for disjoint investigation tasks such as:
 Do not use the main thread for broad repo reading if subagents can do it.
 Keep the main context focused.
 
+**Merge-base-aware scope:** When analyzing a PR branch, scope the diff to the
+correct commit range — use `git merge-base origin/master HEAD` to find the
+divergence point, then use the three-dot diff `origin/master...HEAD` to exclude
+upstream changes. Never use the full branch accumulation (`master..HEAD`) which
+includes merge artifacts from prior PRs and causes wasted exploration. Record
+the base ref, head ref, and commit range explicitly for downstream explorers.
+
 ### Phase 2 — Plan
 Create a concrete implementation plan before editing for any non-trivial task.
 The plan should include:

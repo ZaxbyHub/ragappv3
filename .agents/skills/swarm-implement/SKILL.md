@@ -66,6 +66,13 @@ Determine the exact task scope first:
 
 If the task is unclear, ask a small number of targeted questions or create a short written plan before coding.
 
+**Merge-base-aware scope:** When analyzing a PR branch, scope the diff to the
+correct commit range — use `git merge-base origin/master HEAD` to find the
+divergence point, then use the three-dot diff `origin/master...HEAD` to exclude
+upstream changes. Never use the full branch accumulation (`master..HEAD`) which
+includes merge artifacts from prior PRs and causes wasted exploration. Record
+the base ref, head ref, and commit range explicitly for downstream explorers.
+
 ### Phase 1 — Parallel exploration
 Launch parallel subagents for disjoint investigation tasks such as:
 - repository mapping for relevant subsystems

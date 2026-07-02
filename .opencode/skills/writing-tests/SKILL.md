@@ -105,6 +105,110 @@ is the canonical example.
 - Config in `frontend/vite.config.ts`; `*.test.tsx`; `src/test/setup.ts` mocks `localStorage`/`confirm`/`scrollTo`.
 - jsdom mock patterns (full snippets in `ci-compatibility-audit/references/frontend-testing-gotchas.md`): wrap `<Link>` components in `MemoryRouter`; mock `@/components/ui/select` (Radix can't open in jsdom); mock `@tanstack/react-virtual`'s `useVirtualizer` to render all rows; `vi.mock` factories can't close over outer vars (`await import("react")`).
 
+### Fake Timers & Async Loop Testing
+
+Tests for polling loops, reconnect logic, and interval-driven behavior require
+fake timers to avoid real wall-clock waits. This repo's Vitest patterns:
+
+- **Use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync()`** for async
+  loop assertions. Fake timers let you advance time deterministically without
+  waiting real seconds. Always call `vi.useRealTimers()` in `afterEach`.
+
+- **Prefer `vi.waitFor` (Vitest) over `@testing-library/react` `waitFor`** when
+  fake timers are active. RTL's `waitFor` uses real timers internally and may
+  hang or timeout when fake timers are installed. Vitest's `vi.waitFor` is
+  fake-timer-aware and integrates correctly with `vi.advanceTimersByTimeAsync`.
+
+```ts
+afterEach(() => {
+  vi.useRealTimers();
+  cleanup();
+});
+```
+
+- **Canonical pattern for testing an async reconnect loop** (e.g.,
+  WebSocket/SSE with polling backoff):
+
+```ts
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render } from "@testing-library/react";
+import { MyReconnectingComponent } from "./MyReconnectingComponent";
+
+const connectMock = vi.fn();
+
+describe("reconnect loop with fake timers", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    cleanup();
+  });
+
+  it("retries connection on failure", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(<MyReconnectingComponent />);
+
+    // Initial render triggers connection attempt
+    // Advance past the retry interval to trigger the retry
+    await vi.advanceTimersByTimeAsync(3000);
+    // Assert the retry was attempted
+    expect(connectMock).toHaveBeenCalledTimes(2);
+  });
+});
+```
+
+- **Mock sequencing for JWT refresh then reconnect:** When testing a hook or
+  component that reconnects after a 401 token_expired response, sequence the
+  fetch error, then the refresh mock, then the `getJwtAccessTokenMock` return
+  values. Canonical pattern from `useWikiEventStream.test.ts`:
+
+```ts
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { renderHook } from "@testing-library/react";
+
+it("reconnects with the refreshed token after a 401 token_expired response", async () => {
+  vi.useFakeTimers();
+  fetchMock
+    .mockResolvedValueOnce(errorResponse(401, "token_expired"))
+    .mockResolvedValue(controllableSse().response);
+  refreshAccessTokenMock.mockResolvedValue("refreshed-jwt-token");
+  getJwtAccessTokenMock
+    .mockReturnValueOnce("test-jwt-token")
+    .mockReturnValue("refreshed-jwt-token");
+
+  renderHook(() => useWikiEventStream(42, vi.fn()));
+
+  // Wait for the initial fetch and the refresh.
+  await vi.waitFor(() => expect(refreshAccessTokenMock).toHaveBeenCalledTimes(1));
+
+  // Advance past RECONNECT_BASE_MS (1000 ms) so the backoff timer fires.
+  await vi.advanceTimersByTimeAsync(1100);
+
+  // The hook returns "error" after successful refresh, which triggers reconnect.
+  await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+  // Verify the second fetch uses the refreshed token.
+  const [, init] = fetchMock.mock.calls[1];
+  expect(init.headers.Authorization).toBe("Bearer refreshed-jwt-token");
+});
+```
+
+Key points about this pattern:
+- `fetchMock` resolves the first call as 401 token_expired, the second call as success
+- `refreshAccessTokenMock.mockResolvedValue("refreshed-jwt-token")` provides the new token
+- `getJwtAccessTokenMock.mockReturnValueOnce(...).mockReturnValue(...)` sequences old→new token
+- `vi.advanceTimersByTimeAsync(1100)` triggers the reconnect backoff timer
+- The final assertion checks that the SECOND fetch used the refreshed token in the Authorization header
+
+- **`vi.useRealTimers()` gotcha:** Between the test body and `afterEach`,
+  there is a window where real `setTimeout`/`setInterval` can fire. If a
+  component started an interval with fake timers that fires during teardown,
+  wrap the interval-clearing in a try/finally or use `vi.useRealTimers()`
+  BEFORE `cleanup()` in afterEach. The recommended `afterEach` template
+  above handles this correctly by calling `vi.useRealTimers()` first.
+
+- **Do not use `vi.advanceTimersByTime` (sync)** for async code paths.
+  Always prefer the async variant `vi.advanceTimersByTimeAsync`. The sync
+  variant cannot flush microtasks (Promises) and produces false test passes.
+
 ## Source-inspection test pattern
 
 Some backend tests open Python source files as strings and regex-match for
