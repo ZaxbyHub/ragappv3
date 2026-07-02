@@ -992,6 +992,7 @@ For a subpath deployment such as `https://example.com/knowledgevault/`, configur
 | `VITE_API_URL` | Build arg (optional) | API URL override. Derived from `VITE_APP_BASENAME` when empty |
 | `BACKEND_CORS_ORIGINS` | Runtime env | Allowed CORS origins for your domain |
 | `FORWARDED_ALLOW_IPS` | Runtime env | Trusted proxy IPs for forwarded headers |
+| `ALLOWED_HOSTS` | Runtime env | Allowed Host header values for TrustedHostMiddleware |
 
 **Minimal configuration** (`.env` or environment):
 

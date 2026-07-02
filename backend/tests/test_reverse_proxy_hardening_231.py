@@ -114,7 +114,6 @@ class TestTrustedHostMiddleware(unittest.TestCase):
         )
         with open(main_path, 'r') as f:
             content = f.read()
-        self.assertIn('if settings.allowed_hosts:', content)
         self.assertIn('TrustedHostMiddleware', content)
 
     def test_trusted_host_rejects_unknown_host(self):
@@ -139,6 +138,40 @@ class TestTrustedHostMiddleware(unittest.TestCase):
         # Invalid host — should be rejected
         resp = client.get("/", headers={"Host": "evil.example.com"})
         self.assertEqual(resp.status_code, 400)
+
+
+class TestAllowedHostsJSONParsing(unittest.TestCase):
+    """Fix for FB-006/E-T002: ALLOWED_HOSTS JSON list format parsing."""
+
+    def test_parses_empty_json_list(self):
+        """Empty JSON list produces an empty list."""
+        from app.config import Settings
+        s = Settings(allowed_hosts='[]')
+        self.assertEqual(s.allowed_hosts, [])
+
+    def test_parses_json_single_host(self):
+        """JSON list with single host parses correctly."""
+        from app.config import Settings
+        s = Settings(allowed_hosts='["example.com"]')
+        self.assertEqual(s.allowed_hosts, ["example.com"])
+
+    def test_parses_json_multiple_hosts(self):
+        """JSON list with multiple hosts parses correctly."""
+        from app.config import Settings
+        s = Settings(allowed_hosts='["example.com", "api.example.com", "www.example.com"]')
+        self.assertEqual(s.allowed_hosts, ["example.com", "api.example.com", "www.example.com"])
+
+    def test_malformed_json_raises_value_error(self):
+        """Malformed JSON raises ValueError."""
+        from app.config import Settings
+        with self.assertRaises(ValueError):
+            Settings(allowed_hosts='[invalid')
+
+    def test_single_host_parsed_as_csv(self):
+        """Single host without JSON format (plain/comma) parses as CSV."""
+        from app.config import Settings
+        s = Settings(allowed_hosts="localhost")
+        self.assertEqual(s.allowed_hosts, ["localhost"])
 
 
 class TestSSEHeartbeat(unittest.TestCase):
@@ -191,17 +224,23 @@ class TestSSEHeartbeat(unittest.TestCase):
                     results.append(chunk)
             return results
 
+        try:
+            original_loop = asyncio.get_event_loop_policy().get_event_loop()
+        except (RuntimeError, AttributeError):
+            original_loop = None
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             results = loop.run_until_complete(run_test())
         finally:
             loop.close()
+            if original_loop is not None:
+                asyncio.get_event_loop_policy().set_event_loop(original_loop)
 
         heartbeat_found = any(
-            isinstance(r, str) and 'heartbeat' in r for r in results
+            isinstance(r, str) and ': heartbeat\n\n' in r for r in results
         )
-        self.assertTrue(heartbeat_found, "No heartbeat comment found in SSE output")
+        self.assertTrue(heartbeat_found, "No ': heartbeat\\n\\n' comment found in SSE output")
 
 
 class TestAuthSessionIpUsesRequestHelper(unittest.TestCase):

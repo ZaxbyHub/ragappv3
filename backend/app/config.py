@@ -643,7 +643,11 @@ class Settings(BaseSettings):
                 parsed = json.loads(value)
                 if not isinstance(parsed, list):
                     raise ValueError("allowed_hosts JSON value must be a list")
-                return [host.strip() for host in parsed if host.strip()]
+                return [
+                    host.strip()
+                    for host in parsed
+                    if isinstance(host, str) and host.strip()
+                ]
             return [host.strip() for host in value.split(",") if host.strip()]
         return v
 

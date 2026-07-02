@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- **Reverse-proxy hardening (issue #231)**: Added TrustedHostMiddleware with ALLOWED_HOSTS support to guard against HTTP Host header attacks. Fixed FORWARDED_ALLOW_IPS documentation (no longer recommends `*`). Added SSE heartbeat keepalive comment (`': heartbeat\n\n'`) during long generation gaps to prevent proxy connection timeouts. Session IP capture now uses the trust-proxy-aware `_request_ip()` helper.
+
 - **Phase 2 phase council APPROVED (2 rounds) and Final council APPROVED (5 members)**: issue #265 vault-access fixes reviewed and accepted by full council.
 
 - **Member/user vault access fixes (issue #265)**: `ProfilePage` now calls `GET /vaults/accessible` (available to all authenticated roles) instead of the admin-only `GET /vaults`, eliminating 403 errors for member/viewer users on the profile page. Vault state is now initialized on login and `init()` to validate the cached `vault_id` from localStorage against server state, preventing stale vault selections. `MemoryPage` now guards on `activeVaultId === null` and shows a user-friendly empty-state prompt instead of issuing API calls that would fail with 403 for users with no vault selected.
