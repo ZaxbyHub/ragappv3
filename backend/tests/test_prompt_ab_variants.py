@@ -13,6 +13,7 @@ import hashlib
 import os
 import sqlite3
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -141,10 +142,11 @@ class TestDeterministicAssignment:
 
     def test_different_experiments_same_subject_diff_buckets(self, ab_service, store):
         """Same subject can get different variants in different experiments."""
-        store.create_version("v1", "control content", activate=True)
-        store.create_version("v2", "challenger content")
-        exp_a = ab_service.create_experiment("exp_a", "v1", "v2", split_pct=10)
-        exp_b = ab_service.create_experiment("exp_b", "v1", "v2", split_pct=90)
+        # This test targets pure assignment math. Experiments are constructed
+        # directly because create_experiment intentionally enforces one active
+        # DB-backed experiment at a time.
+        exp_a = ABExperiment(1, "exp_a", "v1", "v2", 10, "active", None, "", None)
+        exp_b = ABExperiment(2, "exp_b", "v1", "v2", 90, "active", None, "", None)
 
         subject = "same-subject"
         var_a = ABTestingService.assign(exp_a, subject)
@@ -232,15 +234,96 @@ class TestExperimentLifecycle:
         """Duplicate experiment name raises IntegrityError."""
         store.create_version("v1", "control content", activate=True)
         store.create_version("v2", "challenger content")
-        ab_service.create_experiment("exp1", "v1", "v2")
+        exp = ab_service.create_experiment("exp1", "v1", "v2")
+        ab_service.end_experiment(exp.id, "control")
         with pytest.raises(sqlite3.IntegrityError):
             ab_service.create_experiment("exp1", "v1", "v2")
+
+    def test_create_experiment_rejects_second_active(self, ab_service, store):
+        """A second active experiment is rejected instead of silently starving."""
+        store.create_version("v1", "control content", activate=True)
+        store.create_version("v2", "challenger content")
+        first = ab_service.create_experiment("exp1", "v1", "v2")
+
+        with pytest.raises(ValueError, match="active experiment"):
+            ab_service.create_experiment("exp2", "v1", "v2")
+
+        active = ab_service.get_active_experiment()
+        assert active is not None
+        assert active.id == first.id
+
+    def test_create_experiment_rolls_back_failed_transactions(self, ab_service, store):
+        """Failed creates leave the connection usable and out of transaction."""
+        store.create_version("v1", "control content", activate=True)
+        store.create_version("v2", "challenger content")
+        first = ab_service.create_experiment("exp1", "v1", "v2")
+
+        with pytest.raises(ValueError, match="active experiment"):
+            ab_service.create_experiment("exp2", "v1", "v2")
+        assert ab_service._db.in_transaction is False
+
+        ab_service.end_experiment(first.id, "control")
+        second = ab_service.create_experiment("exp2", "v1", "v2")
+        ab_service.end_experiment(second.id, "control")
+
+        with pytest.raises(sqlite3.IntegrityError):
+            ab_service.create_experiment("exp2", "v1", "v2")
+        assert ab_service._db.in_transaction is False
+
+        third = ab_service.create_experiment("exp3", "v1", "v2")
+        assert third.name == "exp3"
+
+    def test_concurrent_create_experiment_allows_only_one_active(self):
+        """BEGIN IMMEDIATE serializes concurrent active experiment creation."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            run_migrations(path)
+
+            def create(name: str):
+                conn = sqlite3.connect(path, timeout=5.0)
+                conn.row_factory = sqlite3.Row
+                try:
+                    return ABTestingService(conn).create_experiment(
+                        name, "v1", "v2", split_pct=50
+                    )
+                finally:
+                    conn.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [
+                    executor.submit(create, "exp_a"),
+                    executor.submit(create, "exp_b"),
+                ]
+                results = []
+                errors = []
+                for future in futures:
+                    try:
+                        results.append(future.result())
+                    except ValueError as exc:
+                        errors.append(exc)
+
+            conn = sqlite3.connect(path)
+            active_count = conn.execute(
+                "SELECT COUNT(*) FROM prompt_ab_experiments WHERE status = 'active'"
+            ).fetchone()[0]
+            conn.close()
+
+            assert len(results) == 1
+            assert len(errors) == 1
+            assert "active experiment" in str(errors[0])
+            assert active_count == 1
+        finally:
+            os.unlink(path)
 
     def test_list_experiments(self, ab_service, store):
         """list_experiments returns all experiments with exposure counts."""
         store.create_version("v1", "control content", activate=True)
         store.create_version("v2", "challenger content")
         exp1 = ab_service.create_experiment("exp1", "v1", "v2", split_pct=20)
+        # The issue #273 invariant permits only one active experiment. End the
+        # first before creating another while still preserving list coverage.
+        ab_service.end_experiment(exp1.id, "control")
         exp2 = ab_service.create_experiment("exp2", "v1", "v2", split_pct=80)
 
         # Add exposures
@@ -809,6 +892,33 @@ class TestCreateExperimentEndpoint(TestABExperimentAPIFixtures):
             headers=self._admin_headers(),
         )
         assert response.status_code == 409
+
+    def test_second_active_experiment_returns_409(self, client):
+        """Creating a second active experiment returns 409."""
+        self._create_prompt_versions()
+
+        first = client.post(
+            "/api/prompts/ab-experiments",
+            json={
+                "name": "exp1",
+                "control_version": "v1-control",
+                "challenger_version": "v2-challenger",
+            },
+            headers=self._admin_headers(),
+        )
+        assert first.status_code == 201
+
+        response = client.post(
+            "/api/prompts/ab-experiments",
+            json={
+                "name": "exp2",
+                "control_version": "v1-control",
+                "challenger_version": "v2-challenger",
+            },
+            headers=self._admin_headers(),
+        )
+        assert response.status_code == 409
+        assert "active experiment" in response.json()["detail"]
 
     def test_invalid_split_pct_returns_400(self, client):
         """split_pct outside 0-100 returns 400."""

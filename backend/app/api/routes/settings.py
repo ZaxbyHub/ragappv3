@@ -435,14 +435,18 @@ _URL_FIELDS_TO_VALIDATE = {
 
 def _persist_settings(conn: sqlite3.Connection, update: SettingsUpdate) -> None:
     """Save changed settings to the settings_kv table."""
-    for field in ALLOWED_FIELDS:
-        value = getattr(update, field)
-        if value is not None:
-            conn.execute(
-                "INSERT OR REPLACE INTO settings_kv (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                (field, json.dumps(value)),
-            )
-    conn.commit()
+    try:
+        for field in ALLOWED_FIELDS:
+            value = getattr(update, field)
+            if value is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings_kv (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (field, json.dumps(value)),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _enforce_curator_required_when_enabled(update: SettingsUpdate) -> None:
@@ -494,6 +498,21 @@ def _validate_updated_urls(update: SettingsUpdate) -> None:
                 status_code=422,
                 detail=f"Unsafe {label}: {exc}",
             ) from exc
+
+
+def _validate_settings_update(update: SettingsUpdate) -> dict[str, object]:
+    """Validate a settings update and return changed values."""
+    _validate_updated_urls(update)
+    values: dict[str, object] = {}
+    for field in ALLOWED_FIELDS:
+        value = getattr(update, field)
+        if value is not None:
+            values[field] = value
+    if not values:
+        raise HTTPException(
+            status_code=400, detail="No valid fields provided for update"
+        )
+    return values
 
 
 class SettingsResponse(BaseModel):
@@ -777,24 +796,22 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
             background_processor.set_llm_client(ingestion_client)
 
 
-def _apply_settings_update(update: SettingsUpdate) -> SettingsResponse:
-    """Shared logic to apply settings update and return updated settings."""
-    # SSRF: validate updated model URLs before mutating the live settings
-    # singleton or writing settings_kv rows. EmbeddingService reads its URL live
-    # and LLM clients reconfigure after persistence, so rejected URLs must fail
-    # at this boundary to avoid partial writes.
-    _validate_updated_urls(update)
-    updated = False
-    for field in ALLOWED_FIELDS:
-        value = getattr(update, field)
-        if value is not None:
-            setattr(settings, field, value)
-            updated = True
-    if not updated:
-        raise HTTPException(
-            status_code=400, detail="No valid fields provided for update"
-        )
+def _apply_validated_settings(values: dict[str, object]) -> SettingsResponse:
+    """Apply already-validated settings to the live singleton."""
+    for field, value in values.items():
+        setattr(settings, field, value)
     return SettingsResponse.model_validate(_build_settings_dict())
+
+
+def _apply_settings_update(update: SettingsUpdate) -> SettingsResponse:
+    """Validate, apply, and return updated settings.
+
+    Route handlers persist first and call ``_apply_validated_settings`` only
+    after commit. This helper remains for direct internal tests and callers that
+    intentionally apply only to the live singleton.
+    """
+    values = _validate_settings_update(update)
+    return _apply_validated_settings(values)
 
 
 @router.get("/settings/", response_model=SettingsResponse, include_in_schema=False)
@@ -820,8 +837,9 @@ def post_settings(
 ):
     """Apply settings update and persist to database."""
     _enforce_curator_required_when_enabled(update)
-    result = _apply_settings_update(update)
+    values = _validate_settings_update(update)
     _persist_settings(conn, update)
+    _apply_validated_settings(values)
     _hot_rebind_llm_clients(request.app, update)
     # Re-derive effective_sources now that we've persisted.
     result = SettingsResponse.model_validate(
@@ -841,8 +859,9 @@ def put_settings(
 ):
     """Update settings (upserts into settings_kv)."""
     _enforce_curator_required_when_enabled(update)
-    result = _apply_settings_update(update)
+    values = _validate_settings_update(update)
     _persist_settings(conn, update)
+    _apply_validated_settings(values)
     _hot_rebind_llm_clients(request.app, update)
     result = SettingsResponse.model_validate(
         {**_build_settings_dict(), "effective_sources": _compute_effective_sources(conn)}

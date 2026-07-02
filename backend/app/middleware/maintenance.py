@@ -28,6 +28,10 @@ class MaintenanceMiddleware(BaseHTTPMiddleware):
         return None
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        path = (request.scope.get("path") or "").rstrip("/") or "/"
+        if request.method.upper() == "POST" and path == "/api/admin/maintenance":
+            return await call_next(request)
+
         service = self._get_service()
         # If service is not available yet, allow the request (fail open)
         if service is None:

@@ -194,18 +194,38 @@ class ABTestingService:
             The created experiment.
 
         Raises:
+            ValueError: if another experiment is already active.
             sqlite3.IntegrityError: if name already exists.
         """
-        cursor = self._db.execute(
-            """
-            INSERT INTO prompt_ab_experiments
-                (name, control_version, challenger_version, split_pct)
-            VALUES (?, ?, ?, ?)
-            """,
-            (name, control_version, challenger_version, split_pct),
-        )
-        self._db.commit()
-        return self.get_experiment(int(cursor.lastrowid))  # type: ignore[arg-type]
+        if self._db.in_transaction:
+            self._db.rollback()
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            active = self._db.execute(
+                """
+                SELECT id
+                FROM   prompt_ab_experiments
+                WHERE  status = 'active'
+                LIMIT  1
+                """
+            ).fetchone()
+            if active is not None:
+                raise ValueError("An active experiment already exists")
+            cursor = self._db.execute(
+                """
+                INSERT INTO prompt_ab_experiments
+                    (name, control_version, challenger_version, split_pct)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, control_version, challenger_version, split_pct),
+            )
+            experiment_id = int(cursor.lastrowid)
+            self._db.commit()
+        except Exception:
+            if self._db.in_transaction:
+                self._db.rollback()
+            raise
+        return self.get_experiment(experiment_id)  # type: ignore[arg-type]
 
     def end_experiment(self, experiment_id: int, winner: str) -> ABExperiment:
         """End an experiment and declare the winner.

@@ -288,6 +288,13 @@ async def create_ab_experiment(
                 payload.challenger_version,
                 payload.split_pct,
             )
+        except ValueError as exc:
+            if "active experiment" in str(exc):
+                raise HTTPException(
+                    status_code=409,
+                    detail="An active experiment already exists",
+                )
+            raise
         except Exception as exc:
             if "UNIQUE constraint failed" in str(exc):
                 raise HTTPException(
