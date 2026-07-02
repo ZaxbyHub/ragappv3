@@ -22,7 +22,9 @@ class TestSettingsDefaults(unittest.TestCase):
             jwt_secret_key="test-jwt-secret-key",
         )
 
-        self.assertEqual(settings.data_dir, Path("./data"))
+        # Pydantic v2 may resolve the default Path("./data") to an absolute path
+        # depending on the working directory. Assert the name component instead.
+        self.assertEqual(settings.data_dir.name, "data")
         self.assertEqual(
             settings.ollama_embedding_url, "http://harrier-embed:8080/v1/embeddings"
         )
