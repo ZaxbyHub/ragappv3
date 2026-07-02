@@ -36,7 +36,10 @@ from app.services.auth_service import (
     password_strength_check,
     purge_expired_denied_tokens,
 )
-from app.services.security_audit import safe_record_security_event
+from app.services.security_audit import (
+    _request_ip,
+    safe_record_security_event,
+)
 from app.utils.paths import csrf_cookie_path, refresh_cookie_path
 
 logger = logging.getLogger(__name__)
@@ -245,7 +248,7 @@ async def register(
 
     # Store refresh token session
     expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
-    ip_address = request.client.host if request.client else None
+    ip_address = _request_ip(request)
 
     try:
         def _register_session_db():
@@ -416,7 +419,7 @@ async def login(
 
     # Store refresh token session
     expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
-    ip_address = request.client.host if request.client else None
+    ip_address = _request_ip(request)
 
     try:
         def _login_create_session():

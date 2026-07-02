@@ -287,12 +287,33 @@ def stream_chat_response(
         yield f"data: {json.dumps({'type': 'mode', 'mode': resolved_mode.value})}\n\n"
 
         try:
-            async for chunk in rag_engine.query(
+            # Heartbeat: emit a periodic SSE comment (": heartbeat\n\n") during
+            # long generation gaps so intermediate proxies with short read
+            # timeouts (e.g. the nginx default 60s) don't drop the connection.
+            # Per the SSE spec, lines starting with ":" are comments that
+            # EventSource clients silently discard.
+            HEARTBEAT_INTERVAL = 15.0  # seconds
+
+            rag_gen = rag_engine.query(
                 message, history, stream=True, vault_id=vault_id, mode=mode,
                 require_vault=require_vault, user_id=user_id,
                 temperature=temperature, retrieval_mode=retrieval_mode,
                 citation_mode=citation_mode,
-            ):
+            )
+            rag_gen_ait = rag_gen.__aiter__()
+
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        rag_gen_ait.__anext__(), timeout=HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    # No data from the model for a full interval — send keepalive.
+                    yield ": heartbeat\n\n"
+                    continue
+                except StopAsyncIteration:
+                    break
+
                 chunk_type = chunk.get("type")
 
                 if chunk_type == "content":

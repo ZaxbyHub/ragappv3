@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from slowapi.middleware import SlowAPIMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import FileResponse
 
 from app.api.routes.admin import router as admin_router
@@ -112,6 +113,16 @@ if "*" in settings.backend_cors_origins:
         "SECURITY WARNING: CORS origins contain wildcard ('*') with allow_credentials=True. "
         "This configuration is insecure and will be rejected by browsers. "
         "Set BACKEND_CORS_ORIGINS to specific origins (e.g., http://localhost:5173)."
+    )
+
+# Host-header validation (defense-in-depth for reverse-proxy deployments).
+# Only activated when ALLOWED_HOSTS is configured — disabled by default so
+# local dev and root deployments accessed by bare IP keep working.
+if settings.allowed_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
+    logger.info(
+        "TrustedHostMiddleware enabled with allowed_hosts=%r",
+        settings.allowed_hosts,
     )
 
 app.include_router(health_router, prefix="/api")
