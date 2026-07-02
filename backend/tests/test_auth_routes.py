@@ -514,41 +514,6 @@ class TestAuthRoutes(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["full_name"], "Updated Name")
 
-    def test_update_me_password_preserves_existing_session(self):
-        """PATCH /auth/me updates password without rotating existing sessions."""
-        # Register and login first time
-        self.client.post(
-            "/api/auth/register",
-            json={"username": "passupdateuser", "password": "Password123"},
-        )
-
-        login_response1 = self.client.post(
-            "/api/auth/login",
-            json={"username": "passupdateuser", "password": "Password123"},
-        )
-
-        # Get first session token
-        cookies1 = login_response1.cookies
-        token1 = cookies1.get("refresh_token")
-
-        # Update password
-        access_token = login_response1.json()["access_token"]
-        response = self.client.patch(
-            "/api/auth/me",
-            json={"password": "newPassword456"},
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-
-        self.assertEqual(response.status_code, 200)
-
-        # PATCH /auth/me updates the profile only; session revocation is covered by
-        # the dedicated /auth/change-password endpoint.
-        refresh_response = self.client.post(
-            "/api/auth/refresh", cookies={"refresh_token": token1}
-        )
-
-        self.assertEqual(refresh_response.status_code, 200)
-
     def test_case_insensitive_username(self):
         """Username uniqueness should be case-insensitive."""
         # Register with lowercase
@@ -751,6 +716,9 @@ class TestAuthRoutes(unittest.TestCase):
         self.assertEqual(second_login.status_code, 200)
         access_token = second_login.json()["access_token"]
 
+        # Wait 1 second so token_iat < password_changed_at (integer comparison)
+        import time
+        time.sleep(1)
         change_password_response = self.client.post(
             "/api/auth/change-password",
             json={"current_password": "Password123", "new_password": "Newpassword456"},

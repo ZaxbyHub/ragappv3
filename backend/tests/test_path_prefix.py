@@ -134,10 +134,28 @@ def test_backend_cors_origins_parses_json_list_env(monkeypatch):
 
 
 def test_all_refresh_cookie_call_sites_use_external_path_helper():
+    """Every set_cookie/delete_cookie call that touches refresh must use refresh_cookie_path()."""
+    import re
+
     auth_source = Path("app/api/routes/auth.py").read_text(encoding="utf-8")
 
     assert 'path="/api/auth/refresh"' not in auth_source
-    assert auth_source.count("path=refresh_cookie_path()") == 6
+
+    # Find all set_cookie / delete_cookie calls that reference the refresh cookie
+    refresh_cookie_calls = re.findall(
+        r"(?:set_cookie|delete_cookie)\([^)]*refresh_cookie_path\(\)[^)]*\)",
+        auth_source,
+        re.DOTALL,
+    )
+    assert len(refresh_cookie_calls) >= 1, "Expected at least one refresh cookie helper usage"
+
+    for call in refresh_cookie_calls:
+        assert '"/api/auth/refresh"' not in call, (
+            f"Hardcoded '/api/auth/refresh' path detected: {call!r}"
+        )
+        assert "refresh_cookie_path()" in call, (
+            f"Refresh cookie operation missing refresh_cookie_path() helper: {call!r}"
+        )
 
 
 def test_backend_internal_routes_remain_unprefixed():

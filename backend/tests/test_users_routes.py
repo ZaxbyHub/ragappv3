@@ -1043,8 +1043,8 @@ class TestGetUserOrganizations(TestUserRoutes):
         self.conn.commit()
 
     def test_get_user_organizations_returns_orgs(self):
-        """Admin can get user's organization memberships."""
-        token = get_token(self.admin_id, "admin", "admin")
+        """Superadmin can get user's organization memberships."""
+        token = get_token(self.superadmin_id, "superadmin", "superadmin")
         response = self.client.get(
             f"/users/{self.member_id}/organizations",
             headers={"Authorization": f"Bearer {token}"},
@@ -1079,7 +1079,7 @@ class TestGetUserOrganizations(TestUserRoutes):
 
     def test_get_user_organizations_no_orgs(self):
         """User with no org memberships returns empty list."""
-        token = get_token(self.admin_id, "admin", "admin")
+        token = get_token(self.superadmin_id, "superadmin", "superadmin")
         # viewer has no org memberships
         response = self.client.get(
             f"/users/{self.viewer_id}/organizations",

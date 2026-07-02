@@ -36,6 +36,7 @@ from app.api.deps import (
     UserRole,
     get_background_processor,
     get_current_active_user,
+    get_current_user_or_service_account,
     get_db,
     get_db_pool,
     get_embedding_service,
@@ -574,7 +575,7 @@ async def list_documents(
     ),
     sort_order: str = Query("desc", description="Sort direction: asc or desc"),
     conn: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """
@@ -795,7 +796,7 @@ class DocumentStatusResponse(BaseModel):
 async def get_document_status(
     file_id: int,
     conn: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """Return the phase-aware ingest status of a single document.
@@ -899,7 +900,7 @@ async def get_document_raw(
     file_id: int,
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
     settings_dep: Settings = Depends(get_settings),
 ):
@@ -979,7 +980,7 @@ def _safe_get(row, key: str, default=None):
 async def get_document_stats(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
     conn: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """
@@ -1067,7 +1068,7 @@ async def get_document_stats(
 async def get_document(
     file_id: int,
     conn: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
     evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """Fetch a single document with its assigned tags.

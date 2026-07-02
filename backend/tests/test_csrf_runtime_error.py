@@ -5,9 +5,9 @@ and revoke_token delete().
 These tests verify that when the CSRF store's expire() or delete() methods raise
 RuntimeError("CSRF storage unavailable") (e.g., from sqlite3.Error), the
 CSRFManager methods handle it gracefully:
-- validate_token: catches RuntimeError from store.expire() at line 233, logs
+- validate_token: catches RuntimeError from store.expire() in validate_token, logs
   warning "Failed to extend CSRF token TTL", returns True
-- revoke_token: catches RuntimeError from store.delete() at line 242, logs
+- revoke_token: catches RuntimeError from store.delete() in revoke_token, logs
   warning "Failed to revoke CSRF token (storage error)", returns None
 
 Prior to the F-008 fix, only redis.RedisError, ConnectionError, and TimeoutError
@@ -32,7 +32,7 @@ class TestCSRFManagerRuntimeErrorRegressionF008(unittest.TestCase):
     def test_validate_token_catches_runtime_error_from_expire_and_returns_true(self):
         """
         validate_token calls store.expire() which raises RuntimeError.
-        F-008 fix: RuntimeError is now caught at line 233, logged at warning level,
+        F-008 fix: RuntimeError is now caught in validate_token, logged at warning level,
         and validate_token returns True (token is still considered valid).
         Prior to F-008, RuntimeError was NOT in the except clause and would
         propagate as an unhandled exception / 500 error.
@@ -81,7 +81,7 @@ class TestCSRFManagerRuntimeErrorRegressionF008(unittest.TestCase):
     def test_revoke_token_catches_runtime_error_from_delete_and_returns_none(self):
         """
         revoke_token calls store.delete() which raises RuntimeError.
-        F-008 fix: RuntimeError is now caught at line 242, logged at warning level,
+        F-008 fix: RuntimeError is now caught in revoke_token, logged at warning level,
         and revoke_token returns None. Prior to F-008, RuntimeError was NOT in the
         except clause and would propagate as an unhandled exception / 500 error.
         """

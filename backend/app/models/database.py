@@ -1008,6 +1008,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_prompt_versions(sqlite_path)
     migrate_add_prompt_org_overrides(sqlite_path)
     migrate_add_prompt_ab_experiments(sqlite_path)
+    migrate_add_password_changed_at(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -3486,5 +3487,33 @@ def migrate_add_prompt_ab_experiments(sqlite_path: str) -> None:
                 ON prompt_ab_exposures(experiment_id);
         """)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_password_changed_at(sqlite_path: str) -> None:
+    """
+    Migration: add users.password_changed_at epoch column for FR-007.
+
+    Real password-change events (change_password, admin_reset_password) bump this
+    column to datetime.now(timezone.utc).timestamp(). get_current_active_user in
+    deps.py rejects access tokens issued before this epoch.
+
+    Idempotent — uses PRAGMA table_info to check column existence first.
+    Existing rows get the default value 0 (never changed); tokens with iat > 0
+    remain valid until the user next changes their password.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        cursor = conn.execute("PRAGMA table_info(users)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if "password_changed_at" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN password_changed_at REAL NOT NULL DEFAULT 0"
+            )
+            conn.commit()
     finally:
         conn.close()

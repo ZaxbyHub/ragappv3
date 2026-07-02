@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at TIMESTAMP,
     must_change_password INTEGER NOT NULL DEFAULT 0,
     failed_attempts INTEGER NOT NULL DEFAULT 0,
-    locked_until TIMESTAMP
+    locked_until TIMESTAMP,
+    password_changed_at REAL NOT NULL DEFAULT 0
 );
 
 -- Organizations table
