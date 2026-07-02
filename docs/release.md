@@ -232,7 +232,10 @@ The maintenance flag system allows graceful degradation of service during deploy
 When maintenance mode is enabled:
 - **GET requests** continue to work normally (read-only access)
 - **POST, PUT, PATCH, DELETE requests** return HTTP 503 with "maintenance" message
-- RAG queries fallback to memory-only mode (no vector search)
+- `POST /api/admin/maintenance` remains available so administrators can disable maintenance
+
+Note: this write-blocking maintenance flag is stored in `system_flags` and is
+separate from the RAG engine's memory-only fallback setting.
 
 ### Enabling Maintenance Mode
 

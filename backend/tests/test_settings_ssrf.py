@@ -11,6 +11,7 @@ Covers:
 """
 
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -604,6 +605,118 @@ class TestChatUrlSettingsGate(unittest.TestCase):
         finally:
             live_settings.instant_chat_url = original_live
             conn.close()
+
+    def test_post_settings_persistence_failure_does_not_mutate_or_rebind(self):
+        from types import SimpleNamespace
+
+        from app.api.routes.settings import SettingsUpdate, post_settings
+        from app.config import settings as live_settings
+
+        class FailingConn:
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("settings write failed")
+
+            def commit(self):
+                raise AssertionError("commit should not be reached")
+
+            def rollback(self):
+                pass
+
+        original_top_k = live_settings.retrieval_top_k
+        original_model = live_settings.chat_model
+        fake_client = MagicMock()
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    thinking_llm_client=fake_client,
+                    instant_llm_client=None,
+                )
+            )
+        )
+        update = SettingsUpdate(
+            retrieval_top_k=original_top_k + 1,
+            chat_model="issue-273-model",
+        )
+
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                post_settings(update, request, FailingConn(), _role={}, _csrf_token="test")
+
+            self.assertEqual(live_settings.retrieval_top_k, original_top_k)
+            self.assertEqual(live_settings.chat_model, original_model)
+            fake_client.reconfigure.assert_not_called()
+        finally:
+            live_settings.retrieval_top_k = original_top_k
+            live_settings.chat_model = original_model
+
+    def test_post_settings_mid_persist_failure_rolls_back_partial_writes(self):
+        from types import SimpleNamespace
+
+        from app.api.routes.settings import SettingsUpdate, post_settings
+        from app.config import settings as live_settings
+
+        class FailingAfterFirstWrite:
+            def __init__(self):
+                self.conn = sqlite3.connect(":memory:")
+                self.conn.execute(
+                    """
+                    CREATE TABLE settings_kv (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT
+                    )
+                    """
+                )
+                self.write_count = 0
+
+            def execute(self, sql, params=()):
+                if "INSERT OR REPLACE INTO settings_kv" in sql:
+                    self.write_count += 1
+                    if self.write_count == 2:
+                        raise sqlite3.OperationalError("second write failed")
+                return self.conn.execute(sql, params)
+
+            def commit(self):
+                self.conn.commit()
+
+            def rollback(self):
+                self.conn.rollback()
+
+            def close(self):
+                self.conn.close()
+
+        original_top_k = live_settings.retrieval_top_k
+        original_model = live_settings.chat_model
+        failing_conn = FailingAfterFirstWrite()
+        fake_client = MagicMock()
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    thinking_llm_client=fake_client,
+                    instant_llm_client=None,
+                )
+            )
+        )
+        update = SettingsUpdate(
+            retrieval_top_k=original_top_k + 1,
+            chat_model="issue-273-model",
+        )
+
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                post_settings(
+                    update, request, failing_conn, _role={}, _csrf_token="test"
+                )
+
+            rows = failing_conn.conn.execute("SELECT key FROM settings_kv").fetchall()
+            self.assertEqual(rows, [])
+            self.assertEqual(live_settings.retrieval_top_k, original_top_k)
+            self.assertEqual(live_settings.chat_model, original_model)
+            fake_client.reconfigure.assert_not_called()
+        finally:
+            live_settings.retrieval_top_k = original_top_k
+            live_settings.chat_model = original_model
+            failing_conn.close()
 
 
 class TestRerankerUrlSettingsGate(unittest.TestCase):
