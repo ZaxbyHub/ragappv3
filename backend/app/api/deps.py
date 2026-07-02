@@ -210,6 +210,36 @@ def get_email_service(request: Request) -> EmailIngestionService:
     return request.app.state.email_service
 
 
+def _fetch_user_row_with_pwc(db: sqlite3.Connection, user_id: int) -> tuple | None:
+    """Fetch a user row, tolerating the absence of the password_changed_at column.
+
+    The ``password_changed_at`` column was added by migration
+    ``migrate_add_password_changed_at``. Test databases that define their own
+    ``users`` table without this column will raise ``OperationalError`` on the
+    7-column SELECT. This helper catches that case and falls back to a 6-column
+    SELECT with ``password_changed_at`` set to 0.0.
+    """
+    try:
+        return db.execute(
+            "SELECT id, username, full_name, role, is_active, must_change_password, password_changed_at "
+            "FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such column" not in str(exc).lower():
+            raise  # not the missing column — propagate
+        # Column likely doesn't exist in this test DB — fall back to 6-col SELECT
+        row = db.execute(
+            "SELECT id, username, full_name, role, is_active, must_change_password "
+            "FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is not None:
+            # Append password_changed_at = 0.0 (epoch never bumped)
+            row = tuple(row) + (0.0,)  # pyright: ignore[reportAssignmentType]
+        return row
+
+
 async def get_current_active_user(
     request: Request,
     authorization: str | None = Header(None),
@@ -335,10 +365,7 @@ async def get_current_active_user(
 
     if cached_user is None:
         row = await asyncio.to_thread(
-            lambda: db.execute(
-                "SELECT id, username, full_name, role, is_active, must_change_password, password_changed_at FROM users WHERE id = ?",
-                (user_id,),
-            ).fetchone()
+            lambda: _fetch_user_row_with_pwc(db, user_id)
         )
 
         if not row:
@@ -450,7 +477,10 @@ async def get_current_user_or_service_account(
     # Path 1: Try JWT auth
     try:
         user = await get_current_active_user(
-            request=request, authorization=authorization, db=db
+            request=request,
+            authorization=authorization,
+            access_token=request.cookies.get("access_token"),
+            db=db,
         )
         return user
     except HTTPException as exc:

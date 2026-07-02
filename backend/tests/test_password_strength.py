@@ -363,14 +363,14 @@ class TestPasswordStrengthAuthRouteIntegration(unittest.TestCase):
         )
         token = login_response.json()["access_token"]
 
-        # Try to update with weak password
+        # FR-001: PATCH /auth/me no longer accepts password field.
+        # Password field is now forbidden (extra='forbid') → 422.
         response = self.client.patch(
             "/api/auth/me",
             headers={"Authorization": f"Bearer {token}"},
             json={"password": "short"},
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("8 characters", response.json()["detail"])
+        self.assertEqual(response.status_code, 422)
 
     def test_patch_me_no_digit_returns_400(self):
         """PATCH /auth/me with password lacking digit → 400."""
@@ -385,14 +385,13 @@ class TestPasswordStrengthAuthRouteIntegration(unittest.TestCase):
         )
         token = login_response.json()["access_token"]
 
-        # Try to update with password lacking digit
+        # FR-001: PATCH /auth/me no longer accepts password field → 422.
         response = self.client.patch(
             "/api/auth/me",
             headers={"Authorization": f"Bearer {token}"},
             json={"password": "NewPassword"},
         )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("digit", response.json()["detail"])
+        self.assertEqual(response.status_code, 422)
 
     def test_patch_me_valid_password_succeeds(self):
         """PATCH /auth/me with valid password → 200."""
@@ -407,13 +406,10 @@ class TestPasswordStrengthAuthRouteIntegration(unittest.TestCase):
         )
         token = login_response.json()["access_token"]
 
-        # Update with valid password
+        # FR-001: PATCH /auth/me no longer accepts password field → 422.
         response = self.client.patch(
             "/api/auth/me",
             headers={"Authorization": f"Bearer {token}"},
             json={"password": "NewPassword123"},
         )
-        # Password update should succeed
-        self.assertEqual(response.status_code, 200)
-        data = response.json()
-        self.assertEqual(data["message"], "Profile updated successfully")
+        self.assertEqual(response.status_code, 422)
