@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import secrets
 import sqlite3
@@ -10,7 +11,7 @@ import time
 from collections.abc import Callable
 from enum import IntEnum
 from threading import Lock
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from fastapi import Cookie, Depends, Header, HTTPException, Request
 
@@ -335,7 +336,7 @@ async def get_current_active_user(
     if cached_user is None:
         row = await asyncio.to_thread(
             lambda: db.execute(
-                "SELECT id, username, full_name, role, is_active, must_change_password FROM users WHERE id = ?",
+                "SELECT id, username, full_name, role, is_active, must_change_password, password_changed_at FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
         )
@@ -356,6 +357,9 @@ async def get_current_active_user(
             "must_change_password": bool(row[5])
             if len(row) > 5 and row[5] is not None
             else False,
+            # password_changed_at may not exist on test schemas without the column;
+            # treat missing/None as 0 (epoch never bumped).
+            "password_changed_at": float(row[6]) if len(row) > 6 and row[6] is not None else 0.0,
         }
 
         if ttl > 0:
@@ -406,7 +410,91 @@ async def get_current_active_user(
                 detail="must_change_password",
             )
 
+    # FR-007: invalidate access tokens issued before the user's last password change.
+    # password_changed_at epoch is bumped by change_password and admin_reset_password
+    # (real password-change events). Login rehash is NOT a password change.
+    pwd_epoch = user.get("password_changed_at") or 0
+    token_iat = payload.get("iat", 0) if isinstance(payload, dict) else 0
+    if pwd_epoch > 0 and token_iat < int(pwd_epoch):
+        invalidate_active_user_cache(user_id)
+        raise HTTPException(
+            status_code=401,
+            detail="token_invalidated_by_password_change",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     return dict(user)
+
+
+async def get_current_user_or_service_account(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    db=Depends(get_db),
+) -> dict:
+    """Combined dependency that accepts either a JWT (human user) or a service-account Bearer key.
+
+    Tries JWT auth first via get_current_active_user. If that returns 401, falls back
+    to service-account validation. Returns a principal dict that downstream
+    evaluate() can handle.
+
+    For service-account callers, returns a mapped principal:
+      - id: f"sa:{service_account_id}"
+      - role: "superadmin" (SA tokens bypass per-vault scoping for read)
+      - is_service_account: True
+      - is_active: True
+      - scopes: list of SA scopes
+      - name: SA name
+
+    Raises HTTPException 401 if neither JWT nor service-account auth succeeds.
+    """
+    # Path 1: Try JWT auth
+    try:
+        user = await get_current_active_user(
+            request=request, authorization=authorization, db=db
+        )
+        return user
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise  # preserve 403 must_change_password, etc.
+        pass  # fall through to SA path on 401 only
+
+    # Path 2: Service-account auth
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    parts = authorization.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    raw_key = parts[1].strip()
+    if not raw_key.startswith("sak_"):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Hash the raw key and look up service_accounts
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    cursor = db.execute(
+        "SELECT id, name, scopes, revoked_at FROM service_accounts WHERE key_hash = ?",
+        (key_hash,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    sa_id, sa_name, sa_scopes_str, revoked_at = row
+    if revoked_at is not None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Check required scope
+    sa_scopes = {s.strip().lower() for s in (sa_scopes_str or "").split(",") if s.strip()}
+    if "documents:read" not in sa_scopes:
+        raise HTTPException(status_code=403, detail="Missing required scope")
+
+    return {
+        "id": f"sa:{sa_id}",
+        "role": "superadmin",
+        "is_service_account": True,
+        "is_active": True,
+        "scopes": list(sa_scopes),
+        "name": sa_name,
+        "username": f"sa:{sa_name}",
+    }
 
 
 async def get_effective_vault_permission(

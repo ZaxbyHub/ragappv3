@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -412,7 +413,11 @@ async def admin_reset_password(
             pass
 
         try:
-            db.execute("UPDATE users SET hashed_password = ?, must_change_password = 1 WHERE id = ?", (hashed_password, user_id))
+            new_epoch = datetime.now(timezone.utc).timestamp()
+            db.execute(
+                "UPDATE users SET hashed_password = ?, must_change_password = 1, failed_attempts = 0, locked_until = NULL, password_changed_at = ? WHERE id = ?",
+                (hashed_password, new_epoch, user_id),
+            )
             try:
                 db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
             except sqlite3.OperationalError as e:
@@ -636,6 +641,22 @@ async def get_user_organizations(
         cursor = await asyncio.to_thread(conn.execute, "SELECT id FROM users WHERE id = ?", (user_id,))
         if not await asyncio.to_thread(cursor.fetchone):
             raise HTTPException(status_code=404, detail="User not found")
+
+        # For non-superadmins, verify caller shares an org with target user
+        if user.get("role") != "superadmin":
+            # Get target user's orgs
+            await asyncio.to_thread(cursor.execute, "SELECT org_id FROM org_members WHERE user_id = ?", (user_id,))
+            target_orgs = {row[0] for row in await asyncio.to_thread(cursor.fetchall)}
+            # Get caller's orgs
+            caller_id = user.get("id")
+            await asyncio.to_thread(cursor.execute, "SELECT org_id FROM org_members WHERE user_id = ?", (caller_id,))
+            caller_orgs = {row[0] for row in await asyncio.to_thread(cursor.fetchall)}
+            # Check overlap
+            if not target_orgs & caller_orgs:  # intersection
+                raise HTTPException(
+                    status_code=403,
+                    detail="Cannot view organizations of users outside your organization",
+                )
 
         cursor = await asyncio.to_thread(conn.execute, """SELECT o.id, o.name, o.description, om.role, om.joined_at
                FROM org_members om JOIN organizations o ON om.org_id = o.id

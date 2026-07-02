@@ -88,7 +88,7 @@ class TestAuthHeaderInjection:
                 )
 
             # Should not accept the malformed header
-            assert exc_info.value.status_code in [401, 403]
+            assert exc_info.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_auth_header_with_control_chars(self):
@@ -106,7 +106,7 @@ class TestAuthHeaderInjection:
                     request=MagicMock(), authorization=malicious_auth, db=MagicMock()
                 )
 
-            assert exc_info.value.status_code in [401, 403]
+            assert exc_info.value.status_code == 403
 
 
 # =============================================================================

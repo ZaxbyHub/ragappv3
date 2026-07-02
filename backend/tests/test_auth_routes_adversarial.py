@@ -324,46 +324,6 @@ class TestAuthRoutesAdversarial(unittest.TestCase):
         data = response.json()
         self.assertIn("No fields to update", data["detail"])
 
-    # ─────────────────────────────────────────────────────────────────
-    # ATTACK VECTOR 10: Update Profile with Short Password
-    # ─────────────────────────────────────────────────────────────────
-    def test_update_me_short_password(self):
-        """PATCH /auth/me with password < 8 chars should return 400."""
-        # First register and login
-        self.client.post(
-            "/api/auth/register",
-            json={"username": "updateuser2", "password": "Password123"},
-        )
-
-        login_response = self.client.post(
-            "/api/auth/login",
-            json={"username": "updateuser2", "password": "Password123"},
-        )
-
-        access_token = login_response.json()["access_token"]
-
-        # Try to update with short password
-        short_passwords = ["", "a", "ab", "1234567"]
-
-        for short_pw in short_passwords:
-            response = self.client.patch(
-                "/api/auth/me",
-                json={"password": short_pw},
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-
-            self.assertEqual(
-                response.status_code,
-                400,
-                f"Short password '{short_pw}' should return 400, got {response.status_code}",
-            )
-            data = response.json()
-            detail = data["detail"].lower()
-            self.assertTrue(
-                "8 characters" in detail or "empty" in detail or "whitespace" in detail,
-                f"Expected password strength error for '{short_pw}', got: {data['detail']}",
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

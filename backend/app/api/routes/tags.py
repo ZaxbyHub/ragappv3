@@ -14,7 +14,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.api.deps import evaluate_policy, get_current_active_user, get_db
+from app.api.deps import (
+    evaluate_policy,
+    get_current_active_user,
+    get_current_user_or_service_account,
+    get_db,
+)
 from app.security import csrf_protect
 from app.services.tag_store import TagDuplicateError, TagStore
 
@@ -170,7 +175,7 @@ async def list_document_tags(
     file_id: int,
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
-    user: dict = Depends(get_current_active_user),
+    user: dict = Depends(get_current_user_or_service_account),
 ):
     await _require_vault_read(user, vault_id)
     db.row_factory = sqlite3.Row
