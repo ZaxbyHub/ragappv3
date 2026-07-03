@@ -11,8 +11,8 @@ These are source-inspection + behavioral tests that verify the INSERT statement 
 """
 
 import os
-import tempfile
 import re
+import tempfile
 
 import pytest
 from fastapi import FastAPI
@@ -213,6 +213,7 @@ class TestMustChangePasswordInCreateUserInsert:
         This prevents accidental parameterization of these security-critical flags.
         """
         import inspect
+
         from app.api.routes import users
 
         # Get the source code of the create_user function
@@ -249,6 +250,7 @@ class TestMustChangePasswordInCreateUserInsert:
         VALUES (?, ?, ?, ?, 1, 1)
         """
         import inspect
+
         from app.api.routes import users
 
         source = inspect.getsource(users.create_user)
