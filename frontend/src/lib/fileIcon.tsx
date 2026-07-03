@@ -16,24 +16,25 @@ import {
  */
 export function FileIcon({ filename, className }: { filename: string | null | undefined; className?: string }) {
   const ext = (filename ?? '').split('.').pop()?.toLowerCase() ?? '';
+  const cls = className ?? '';
 
   if (ext === 'pdf') {
-    return <FileType className={className} style={{ color: '#ef4444' }} aria-hidden="true" />;
+    return <FileType className={`${cls} text-filetype-pdf`} aria-hidden="true" />;
   }
   if (ext === 'docx' || ext === 'doc') {
-    return <FileType className={className} style={{ color: '#3b82f6' }} aria-hidden="true" />;
+    return <FileType className={`${cls} text-filetype-docx`} aria-hidden="true" />;
   }
   if (ext === 'pptx' || ext === 'ppt') {
-    return <Presentation className={className} style={{ color: '#f97316' }} aria-hidden="true" />;
+    return <Presentation className={`${cls} text-filetype-pptx`} aria-hidden="true" />;
   }
   if (ext === 'md' || ext === 'mdx') {
-    return <FileText className={className} style={{ color: '#14b8a6' }} aria-hidden="true" />;
+    return <FileText className={`${cls} text-filetype-md`} aria-hidden="true" />;
   }
   if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') {
-    return <Sheet className={className} style={{ color: '#22c55e' }} aria-hidden="true" />;
+    return <Sheet className={`${cls} text-filetype-xlsx`} aria-hidden="true" />;
   }
   if (ext === 'json') {
-    return <FileJson className={className} style={{ color: '#eab308' }} aria-hidden="true" />;
+    return <FileJson className={`${cls} text-filetype-json`} aria-hidden="true" />;
   }
   if (
     ext === 'py' ||
@@ -46,10 +47,10 @@ export function FileIcon({ filename, className }: { filename: string | null | un
     ext === 'yml' ||
     ext === 'sql'
   ) {
-    return <FileCode className={className} style={{ color: '#8b5cf6' }} aria-hidden="true" />;
+    return <FileCode className={`${cls} text-filetype-code`} aria-hidden="true" />;
   }
   if (ext === 'txt' || ext === 'log') {
-    return <FileText className={className} style={{ color: undefined }} aria-hidden="true" />;
+    return <FileText className={cls} aria-hidden="true" />;
   }
-  return <File className={className} aria-hidden="true" />;
+  return <File className={cls} aria-hidden="true" />;
 }

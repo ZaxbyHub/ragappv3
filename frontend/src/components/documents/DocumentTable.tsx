@@ -273,10 +273,10 @@ export function DocumentTable({
                         }
                         const color =
                           ws.wiki_status === "compiled"
-                            ? "text-green-600"
+                            ? "text-success"
                             : ws.wiki_status === "failed"
                               ? "text-destructive"
-                              : "text-blue-500";
+                              : "text-warning";
                         const label =
                           ws.wiki_status === "compiled"
                             ? `${ws.pages_count}p / ${ws.claims_count}c`

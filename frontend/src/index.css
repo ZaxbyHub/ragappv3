@@ -67,6 +67,15 @@
     --warning: 35 90% 33%;
     --warning-foreground: 0 0% 100%;
 
+    /* Filetype colors */
+    --filetype-pdf: 0 100% 60%;
+    --filetype-docx: 217 91% 60%;
+    --filetype-pptx: 25 95% 53%;
+    --filetype-md: 172 76% 36%;
+    --filetype-xlsx: 142 71% 45%;
+    --filetype-json: 48 96% 53%;
+    --filetype-code: 271 91% 65%;
+
     /* Radius - Material 3 style (slightly more rounded) */
     --radius: 0.75rem;
   }
@@ -109,6 +118,15 @@
     --warning: 40 70% 55%;
     --warning-foreground: 0 0% 100%;
 
+    /* Filetype colors */
+    --filetype-pdf: 0 100% 70%;
+    --filetype-docx: 217 91% 70%;
+    --filetype-pptx: 25 95% 63%;
+    --filetype-md: 172 76% 46%;
+    --filetype-xlsx: 142 71% 55%;
+    --filetype-json: 48 96% 63%;
+    --filetype-code: 271 91% 75%;
+
     /* Borders */
     --border: 195 10% 18%;
     --input: 195 10% 21%;
@@ -149,6 +167,15 @@
 
     --warning: 35 100% 24%;
     --warning-foreground: 0 0% 100%;
+
+    /* Filetype colors */
+    --filetype-pdf: 0 100% 34%;
+    --filetype-docx: 217 100% 34%;
+    --filetype-pptx: 25 100% 34%;
+    --filetype-md: 172 100% 29%;
+    --filetype-xlsx: 142 100% 29%;
+    --filetype-json: 48 100% 29%;
+    --filetype-code: 271 100% 34%;
 
     --border: 0 0% 0%;
     --input: 0 0% 0%;
@@ -364,4 +391,14 @@
     animation: none !important;
     opacity: 1 !important;
   }
+}
+
+@layer utilities {
+  .text-filetype-pdf { color: hsl(var(--filetype-pdf)); }
+  .text-filetype-docx { color: hsl(var(--filetype-docx)); }
+  .text-filetype-pptx { color: hsl(var(--filetype-pptx)); }
+  .text-filetype-md { color: hsl(var(--filetype-md)); }
+  .text-filetype-xlsx { color: hsl(var(--filetype-xlsx)); }
+  .text-filetype-json { color: hsl(var(--filetype-json)); }
+  .text-filetype-code { color: hsl(var(--filetype-code)); }
 }

@@ -3,7 +3,7 @@ import { render } from "@testing-library/react";
 import { axe } from "jest-axe";
 import { FileText } from "lucide-react";
 
-import { EmptyState } from "@/components/shared/EmptyState";
+import { EmptyState } from "@/components/EmptyState";
 
 describe("accessibility smoke gate", () => {
   it("has no axe violations for the empty-state surface", async () => {
