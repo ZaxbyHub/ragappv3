@@ -13,32 +13,31 @@ describe("FileIcon", () => {
   it("renders a red PDF icon and normalizes uppercase extensions", () => {
     const svg = renderIcon("REPORT.PDF");
 
-    expect(svg).toHaveClass("h-4", "w-4");
+    expect(svg).toHaveClass("h-4", "w-4", "text-filetype-pdf");
     expect(svg).toHaveAttribute("aria-hidden", "true");
-    expect(svg).toHaveStyle({ color: "#ef4444" });
   });
 
   it.each([
-    ["proposal.doc", "#3b82f6"],
-    ["proposal.docx", "#3b82f6"],
-    ["deck.pptx", "#f97316"],
-    ["notes.md", "#14b8a6"],
-    ["notes.mdx", "#14b8a6"],
-    ["budget.xlsx", "#22c55e"],
-    ["budget.xls", "#22c55e"],
-    ["export.csv", "#22c55e"],
-    ["data.json", "#eab308"],
-    ["script.py", "#8b5cf6"],
-    ["app.js", "#8b5cf6"],
-    ["main.ts", "#8b5cf6"],
-    ["page.html", "#8b5cf6"],
-    ["style.css", "#8b5cf6"],
-    ["config.xml", "#8b5cf6"],
-    ["conf.yaml", "#8b5cf6"],
-    ["conf.yml", "#8b5cf6"],
-    ["query.sql", "#8b5cf6"],
-  ])("renders the expected colored branch for %s", (filename, color) => {
-    expect(renderIcon(filename)).toHaveStyle({ color });
+    ["proposal.doc", "text-filetype-docx"],
+    ["proposal.docx", "text-filetype-docx"],
+    ["deck.pptx", "text-filetype-pptx"],
+    ["notes.md", "text-filetype-md"],
+    ["notes.mdx", "text-filetype-md"],
+    ["budget.xlsx", "text-filetype-xlsx"],
+    ["budget.xls", "text-filetype-xlsx"],
+    ["export.csv", "text-filetype-xlsx"],
+    ["data.json", "text-filetype-json"],
+    ["script.py", "text-filetype-code"],
+    ["app.js", "text-filetype-code"],
+    ["main.ts", "text-filetype-code"],
+    ["page.html", "text-filetype-code"],
+    ["style.css", "text-filetype-code"],
+    ["config.xml", "text-filetype-code"],
+    ["conf.yaml", "text-filetype-code"],
+    ["conf.yml", "text-filetype-code"],
+    ["query.sql", "text-filetype-code"],
+  ])("renders the expected colored branch for %s", (filename, cls) => {
+    expect(renderIcon(filename)).toHaveClass(cls);
   });
 
   it.each(["readme.txt", "server.log"])(

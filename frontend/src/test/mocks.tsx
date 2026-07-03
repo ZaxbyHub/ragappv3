@@ -109,7 +109,7 @@ vi.mock('@/components/shared/DocumentCard', () => ({
   DocumentCard: () => <div data-testid="document-card" />,
 }));
 
-vi.mock('@/components/shared/EmptyState', () => ({
+vi.mock('@/components/EmptyState', () => ({
   EmptyState: () => <div data-testid="empty-state" />,
 }));
 

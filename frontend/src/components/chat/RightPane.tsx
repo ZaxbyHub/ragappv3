@@ -21,7 +21,7 @@ import { getChunkContext, getDocumentRawBlob, type ChunkContextResponse, type So
 import { WikiCards } from "./WikiCards";
 import { KMSCards } from "./KMSCards";
 import { getRelevanceLabel, type ScoreType } from "@/lib/relevance";
-import { EmptyState } from "@/components/shared/EmptyState";
+import { EmptyState } from "@/components/EmptyState";
 
 const PdfPreview = lazy(() => import("@/components/preview/PdfPreview"));
 

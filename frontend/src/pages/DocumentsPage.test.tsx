@@ -163,7 +163,7 @@ vi.mock('@/components/shared/DocumentCard', () => ({
   ),
 }));
 
-vi.mock('@/components/shared/EmptyState', () => ({
+vi.mock('@/components/EmptyState', () => ({
   EmptyState: ({
     title,
     description,

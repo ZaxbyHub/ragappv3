@@ -35,7 +35,7 @@ import { useDebounce } from "@/hooks/useDebounce";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { useUploadStore } from "@/stores/useUploadStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
-import { EmptyState } from "@/components/shared/EmptyState";
+import { EmptyState } from "@/components/EmptyState";
 import { useBulkSelection } from "@/components/documents/useBulkSelection";
 import { useDocumentPolling } from "@/components/documents/useDocumentPolling";
 import { DocumentStatsCards } from "@/components/documents/DocumentStatsCards";
@@ -52,6 +52,7 @@ import { MoveFolderDialog } from "@/components/documents/MoveFolderDialog";
 import { MoveToFolderDialog } from "@/components/documents/MoveToFolderDialog";
 import { ConfirmDialog, type ConfirmDialogState } from "@/components/documents/ConfirmDialog";
 import { isUploadTooLarge, uploadSizeExceededMessage } from "@/lib/uploadLimits";
+import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 const FILENAME_COL_WIDTH_KEY = "ragapp_doc_table_filename_col";
 const FILENAME_COL_WIDTH_DEFAULT = 250;
@@ -558,12 +559,9 @@ export default function DocumentsPage() {
   );
 
   return (
-    <div className="space-y-6 animate-in fade-in duration-300">
+    <div className="space-y-6 animate-in fade-in duration-300 pb-12">
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Documents</h1>
-          <p className="text-muted-foreground mt-1">Manage your knowledge base documents</p>
-        </div>
+        <PageTitleHeader title="Documents" description="Manage your knowledge base documents" />
         <div className="flex items-center gap-2">
           <VaultSelector />
           <Button
