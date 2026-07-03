@@ -157,7 +157,7 @@ crontab -e
 /data/knowledgevault/
 ├── uploads/                  # [LEGACY] Flat uploads directory (deprecated, auto-migrated)
 ├── vaults/                   # Vault-specific directories
-│   ├── 1/                    # Vault 1 (default/orphan vault)
+│   ├── 1/                    # Vault 1 (first vault)
 │   │   └── uploads/          # Uploads for vault 1
 │   ├── 2/                    # Vault 2
 │   │   └── uploads/          # Uploads for vault 2
@@ -174,7 +174,7 @@ crontab -e
     └── knowledgevault.log
 ```
 
-**Note:** The system now stores uploads in vault-specific directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to the appropriate vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, it defaults to the orphan vault (vault 1).
+**Note:** The system now stores uploads in vault-specific directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to the appropriate vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
 
 ### Changing Data Location
 
@@ -891,7 +891,7 @@ KnowledgeVault has built-in JWT-based authentication with role-based access cont
 
 **Setup:**
 - When `USERS_ENABLED=True`, set `ADMIN_SECRET_TOKEN` in `.env` to create the first admin user
-- The initial admin can then invite other users via email or create accounts manually
+- The initial admin can then invite existing users via a shareable invite token or create accounts manually (no email delivery — see Organization Invites below)
 - JWT tokens are stored in httpOnly refresh cookies for security
 
 **Password Hashing:**
@@ -958,11 +958,11 @@ Organization invites allow admins to invite users via a token-based flow with ex
 
 | Action | How |
 |--------|-----|
-| Create | `POST /api/orgs/{id}/invites` — returns the raw `inv_` token to share |
-| List | `GET /api/orgs/{id}/invites` — shows all invites and their status |
-| Resend | `POST /api/orgs/{id}/invites/{invite_id}/resend` — resets expiry |
-| Revoke | `POST /api/orgs/{id}/invites/{invite_id}/revoke` — invalidates token |
-| Accept | `POST /api/orgs/{id}/invites/accept` — redeems the `inv_` token |
+| Create | `POST /api/organizations/{id}/invites` — returns the raw `inv_` token to share |
+| List | `GET /api/organizations/{id}/invites` — shows all invites and their status |
+| Resend | `POST /api/organizations/{id}/invites/{invite_id}/resend` — resets expiry |
+| Revoke | `POST /api/organizations/{id}/invites/{invite_id}/revoke` — invalidates token |
+| Accept | `POST /api/organizations/invites/accept` — redeems the `inv_` token (no `{id}`) |
 
 ### Network Security
 
@@ -1076,7 +1076,6 @@ location /knowledgevault/ {
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Prefix /knowledgevault;
     proxy_buffering off;
     proxy_cache off;
     proxy_read_timeout 3600;
