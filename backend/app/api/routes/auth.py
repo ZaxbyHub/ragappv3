@@ -228,7 +228,10 @@ async def register(
 ):
     """Register a new user. First user becomes superadmin. Issues CSRF token on success."""
     if not settings.users_enabled:
-        raise HTTPException(status_code=403, detail="Registration disabled")
+        raise HTTPException(
+            status_code=403,
+            detail="User registration is disabled in single-admin mode",
+        )
     if not body.username or len(body.username) < 3:
         raise HTTPException(
             status_code=400, detail="Username must be at least 3 characters"
