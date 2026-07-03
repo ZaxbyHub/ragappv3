@@ -136,8 +136,8 @@ async def create_user(
             )
 
         # Insert the new user and default assignments in one transaction.
-        cursor = await asyncio.to_thread(conn.execute, """INSERT INTO users (username, hashed_password, full_name, role, is_active)
-            VALUES (?, ?, ?, ?, 1)""", (body.username, hashed_password, body.full_name, body.role))
+        cursor = await asyncio.to_thread(conn.execute, """INSERT INTO users (username, hashed_password, full_name, role, is_active, must_change_password)
+            VALUES (?, ?, ?, ?, 1, 1)""", (body.username, hashed_password, body.full_name, body.role))
         user_id = cursor.lastrowid
 
         # Fetch the created user before commit so response construction remains

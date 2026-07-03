@@ -628,6 +628,22 @@ async def create_org_invite(
                 detail="Insufficient privileges. Organization admin or owner required",
             )
 
+        # Check invitee global role
+        cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT role FROM users WHERE username = ? COLLATE NOCASE",
+            (req.email.lower(),),
+        )
+        invitee_row = await asyncio.to_thread(cursor.fetchone)
+        if invitee_row:
+            from app.api.deps import UserRole
+            invitee_role = invitee_row[0]
+            if UserRole.level(invitee_role) < UserRole.level("member"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot invite user with viewer role - they cannot accept organization invites",
+                )
+
         # Generate token
         raw_token, token_hash = _generate_invite_token()
         now = datetime.now(timezone.utc)

@@ -832,6 +832,31 @@ class TestCreateUser(TestUserRoutes):
         assert response.status_code == 403
         assert "superadmin" in response.json()["detail"].lower()
 
+    def test_create_user_sets_must_change_password(self):
+        """Admin-created user has must_change_password=1 in DB and in login response."""
+        from app.security import csrf_protect
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.admin_id, "admin", "admin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "newuser",
+                "password": "SecurePass123!",
+                "full_name": "New User",
+                "role": "member",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+
+        # Verify DB has must_change_password=1
+        row = self.conn.execute(
+            "SELECT must_change_password FROM users WHERE username = ?", ("newuser",)
+        ).fetchone()
+        assert row is not None
+        assert row[0] == 1
+
     def test_create_user_duplicate_username_returns_400(self):
         """Duplicate username returns 400."""
         from app.security import csrf_protect

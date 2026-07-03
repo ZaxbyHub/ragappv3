@@ -85,7 +85,9 @@ class TestRefreshReuseRevokesFamily(unittest.TestCase):
         # Create a test pool for the temporary database
         self.test_pool = SQLiteConnectionPool(self.db_path, max_size=5)
 
+        from app.config import settings
         from app.main import app as main_app
+        settings.users_enabled = True
         from app.security import csrf_protect
 
         class TestCSRFManager:
