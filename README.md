@@ -256,8 +256,8 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `MEMORY_RRF_MIN_SCORE` | `0.005` | Minimum fused RRF score for hybrid memory retrieval. Candidates below this are discarded. |
 | `MEMORY_CONTEXT_TOP_K` | `3` | Maximum number of memories injected into each prompt after relevance filtering. |
 | `CHAT_RATE_LIMIT` | `30` | Maximum chat requests per minute per user (0 = unlimited) |
-| `SEARCH_RATE_LIMIT` | `60` | Maximum search requests per minute per user (0 = unlimited) |
-| `VAULT_CREATE_RATE_LIMIT` | `10` | Maximum vault creation requests per minute per user (0 = unlimited) |
+| `SEARCH_RATE_LIMIT` | `30` | Maximum search requests per minute per user (0 = unlimited) |
+| `VAULT_CREATE_RATE_LIMIT` | `30` | Maximum vault creation requests per minute per user (0 = unlimited) |
 | `MEMORY_MUTATION_RATE_LIMIT` | `30` | Maximum memory create/update/delete requests per minute per user (0 = unlimited) |
 | `ACTIVE_USER_CACHE_TTL_SECONDS` | `30` | TTL in seconds for cached active-user lookups. Range 5–300. Lower values reduce stale-data window; higher values reduce database load on frequently-accessed endpoints. |
 | `VECTOR_SEARCH_CONCURRENCY` | `32` | Maximum concurrent vector search operations (1-64). Controls search throughput under load. |
