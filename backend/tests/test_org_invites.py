@@ -76,6 +76,11 @@ def setup_db(monkeypatch):
         "VALUES (?, ?, ?, ?, ?, 1)",
         (4, "member2@x.com", pw, "Member Two", "member"),
     )
+    conn.execute(
+        "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+        "VALUES (?, ?, ?, ?, ?, 1)",
+        (5, "viewer1@x.com", pw, "Viewer One", "viewer"),
+    )
     conn.commit()
     conn.close()
 
@@ -167,6 +172,11 @@ def member2_token():
                         client_fingerprint=compute_client_fingerprint(""))
 
 
+def viewer_token():
+    return create_access_token(5, "viewer1@x.com", "viewer",
+                        client_fingerprint=compute_client_fingerprint(""))
+
+
 def auth_headers(token_fn):
     return {"Authorization": f"Bearer {token_fn()}"}
 
@@ -207,6 +217,46 @@ class TestCreateInvite:
         assert data["invite_id"] is not None
         assert data["token"].startswith("inv_")
         assert "expires_at" in data
+
+    def test_admin_cannot_invite_viewer_user(self, client):
+        """Admin cannot invite a viewer role user (400)."""
+        org_id = _create_org("Test Org", 2)
+
+        response = client.post(
+            f"/api/organizations/{org_id}/invites",
+            json={"email": "viewer1@x.com", "role": "member"},
+            headers=auth_headers(admin_token),
+        )
+        assert response.status_code == 400
+        assert "viewer role" in response.json()["detail"].lower()
+
+    def test_admin_can_invite_member_user(self, client):
+        """Admin can invite an existing member user (201)."""
+        org_id = _create_org("Test Org", 2)
+
+        response = client.post(
+            f"/api/organizations/{org_id}/invites",
+            json={"email": "member1@x.com", "role": "member"},
+            headers=auth_headers(admin_token),
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["email"] == "member1@x.com"
+        assert data["role"] == "member"
+
+    def test_admin_can_invite_nonexistent_user(self, client):
+        """Admin can invite a nonexistent (not-yet-registered) user (201)."""
+        org_id = _create_org("Test Org", 2)
+
+        response = client.post(
+            f"/api/organizations/{org_id}/invites",
+            json={"email": "notregistered@x.com", "role": "member"},
+            headers=auth_headers(admin_token),
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["email"] == "notregistered@x.com"
+        assert data["role"] == "member"
 
     def test_admin_creates_admin_invite(self, client):
         """Admin creates an admin invite (201)."""
