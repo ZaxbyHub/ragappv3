@@ -8,27 +8,27 @@ import { mockAdminUsers } from "@/fixtures/users";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetFooter,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Label } from "@/components/ui/label";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
-import { Skeleton } from "@/components/ui/skeleton";
+import { LoadingSpinner } from "@/components/LoadingSpinner";
+import { Pagination } from "@/components/ui/pagination";
+import {
+  Search,
+  Trash2,
+  Users,
+  Pencil,
+  KeyRound,
+  Plus,
+  Building2,
+  ChevronUp,
+  ChevronDown,
+} from "lucide-react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -38,53 +38,15 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  Search,
-  Trash2,
-  Loader2,
-  UserX,
-  Users,
-  Pencil,
-  KeyRound,
-  Plus,
-  Building2,
-  ChevronUp,
-  ChevronDown,
-} from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 
-type UserRole = "superadmin" | "admin" | "member" | "viewer";
-
-interface User {
-  id: number;
-  username: string;
-  full_name: string;
-  role: UserRole;
-  is_active: boolean;
-  created_at: string;
-}
-
-interface Group {
-  id: number;
-  name: string;
-  description: string | null;
-}
-
-interface OrgItem {
-  id: number;
-  name: string;
-  description: string;
-  role?: string;
-  joined_at?: string;
-}
+import { DeleteUserDialog } from "./AdminUsersPage/DeleteUserDialog";
+import { EditUserDialog } from "./AdminUsersPage/EditUserDialog";
+import { ResetPasswordDialog } from "./AdminUsersPage/ResetPasswordDialog";
+import { ManageGroupsSheet } from "./AdminUsersPage/ManageGroupsSheet";
+import { ManageOrgsSheet } from "./AdminUsersPage/ManageOrgsSheet";
+import { CreateUserDialog } from "./AdminUsersPage/CreateUserDialog";
+import type { User, UserRole, Group, OrgItem } from "./AdminUsersPage/types";
 
 const ROLE_OPTIONS: { value: UserRole; label: string }[] = [
   { value: "superadmin", label: "Super Admin" },
@@ -99,22 +61,23 @@ function AdminUsersPageContent() {
   const [loading, setLoading] = useState(!testMode);
   const [searchQuery, setSearchQuery] = useState("");
   const [updatingUserId, setUpdatingUserId] = useState<number | null>(null);
+  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(20);
+  const [totalCount, setTotalCount] = useState(0);
+
+  const currentUser = useAuthStore((state) => state.user);
+
+  // Delete Dialog State
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [userToDelete, setUserToDelete] = useState<User | null>(null);
 
-  // Edit User Dialog State
+  // Edit Dialog State
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [userToEdit, setUserToEdit] = useState<User | null>(null);
-  const [editFullName, setEditFullName] = useState("");
-  const [editRole, setEditRole] = useState<UserRole>("member");
-  const [isSavingEdit, setIsSavingEdit] = useState(false);
 
   // Password Reset Dialog State
   const [passwordDialogOpen, setPasswordDialogOpen] = useState(false);
   const [userToResetPassword, setUserToResetPassword] = useState<User | null>(null);
-  const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [isResettingPassword, setIsResettingPassword] = useState(false);
 
   // Manage Groups Sheet State
   const [groupsSheetOpen, setGroupsSheetOpen] = useState(false);
@@ -129,41 +92,40 @@ function AdminUsersPageContent() {
   const [orgsSheetOpen, setOrgsSheetOpen] = useState(false);
   const [userForOrgs, setUserForOrgs] = useState<User | null>(null);
   const [allOrgs, setAllOrgs] = useState<OrgItem[]>([]);
-  const [orgMemberships, setOrgMemberships] = useState<Map<number, string>>(new Map()); // org_id → role
+  const [orgMemberships, setOrgMemberships] = useState<Map<number, string>>(new Map());
   const [orgsSearchQuery, setOrgsSearchQuery] = useState("");
   const [isLoadingOrgs, setIsLoadingOrgs] = useState(false);
   const [isSavingOrgs, setIsSavingOrgs] = useState(false);
 
   // Create User Dialog State
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
-  const [createUsername, setCreateUsername] = useState("");
-  const [createFullName, setCreateFullName] = useState("");
-  const [createPassword, setCreatePassword] = useState("");
-  const [createRole, setCreateRole] = useState<UserRole>("member");
-  const [isCreatingUser, setIsCreatingUser] = useState(false);
-
-  const currentUser = useAuthStore((state) => state.user);
 
   const fetchUsers = useCallback(async () => {
     if (testMode) {
       setUsers(mockAdminUsers);
+      setTotalCount(mockAdminUsers.length);
       return;
     }
     setLoading(true);
     try {
-      const response = await apiClient.get<{ users: User[]; total: number }>("/users/");
+      const skip = (page - 1) * limit;
+      const response = await apiClient.get<{ users: User[]; total: number }>(
+        `/users/?skip=${skip}&limit=${limit}&q=${encodeURIComponent(searchQuery)}`
+      );
       setUsers(response.data.users);
+      setTotalCount(response.data.total);
     } catch (err) {
       console.error("Failed to fetch users:", err);
-      toast.error("Failed to load users");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to load users");
     } finally {
       setLoading(false);
     }
-  }, [testMode]);
+  }, [testMode, page, limit, searchQuery]);
 
   useEffect(() => {
     if (!testMode) fetchUsers();
-  }, [fetchUsers, testMode]);
+  }, [fetchUsers, testMode, page, limit]);
 
   const handleRoleChange = async (userId: number, newRole: UserRole) => {
     setUpdatingUserId(userId);
@@ -172,7 +134,8 @@ function AdminUsersPageContent() {
       setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, role: newRole } : u)));
       toast.success("Role updated successfully");
     } catch (err) {
-      toast.error("Failed to update role");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to update role");
     } finally {
       setUpdatingUserId(null);
     }
@@ -185,109 +148,90 @@ function AdminUsersPageContent() {
       setUsers((prev) => prev.map((u) => (u.id === userId ? { ...u, is_active: isActive } : u)));
       toast.success(`User ${isActive ? "activated" : "deactivated"} successfully`);
     } catch (err) {
-      toast.error("Failed to update user status");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to update user status");
     } finally {
       setUpdatingUserId(null);
     }
   };
 
-  const handleDelete = async () => {
-    if (!userToDelete) return;
+  // --- Delete User ---
+
+  const handleDeleteUser = async (user: User): Promise<void> => {
     try {
-      await apiClient.delete(`/users/${userToDelete.id}`);
-      setUsers((prev) => prev.filter((u) => u.id !== userToDelete.id));
+      await apiClient.delete(`/users/${user.id}`);
+      setUsers((prev) => prev.filter((u) => u.id !== user.id));
       toast.success("User deleted successfully");
       setDeleteDialogOpen(false);
       setUserToDelete(null);
     } catch (err) {
-      toast.error("Failed to delete user");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to delete user");
     }
   };
 
-  // Edit User Handlers
+  // --- Edit User ---
+
   const openEditDialog = (user: User) => {
     setUserToEdit(user);
-    setEditFullName(user.full_name);
-    setEditRole(user.role);
     setEditDialogOpen(true);
   };
 
   const closeEditDialog = () => {
     setEditDialogOpen(false);
     setUserToEdit(null);
-    setEditFullName("");
-    setEditRole("member");
   };
 
-  const handleSaveEdit = async () => {
-    if (!userToEdit) return;
-    setIsSavingEdit(true);
+  const handleSaveEdit = async (user: User, fullName: string, role: UserRole): Promise<void> => {
     try {
-      await apiClient.patch(`/users/${userToEdit.id}`, {
-        full_name: editFullName,
-        role: editRole,
+      await apiClient.patch(`/users/${user.id}`, {
+        full_name: fullName,
+        role: role,
       });
       setUsers((prev) =>
         prev.map((u) =>
-          u.id === userToEdit.id ? { ...u, full_name: editFullName, role: editRole } : u
+          u.id === user.id ? { ...u, full_name: fullName, role: role } : u
         )
       );
       toast.success("User updated successfully");
       closeEditDialog();
     } catch (err) {
-      toast.error("Failed to update user");
-    } finally {
-      setIsSavingEdit(false);
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to update user");
     }
   };
 
-  // Password Reset Handlers
+  // --- Password Reset ---
+
   const openPasswordDialog = (user: User) => {
     setUserToResetPassword(user);
-    setNewPassword("");
-    setConfirmPassword("");
     setPasswordDialogOpen(true);
   };
 
-  const closePasswordDialog = () => {
-    setPasswordDialogOpen(false);
-    setUserToResetPassword(null);
-    setNewPassword("");
-    setConfirmPassword("");
-  };
-
-  const handleResetPassword = async () => {
-    if (!userToResetPassword) return;
-    if (newPassword !== confirmPassword) {
-      toast.error("Passwords do not match");
-      return;
-    }
-    if (newPassword.length < 8) {
-      toast.error("Password must be at least 8 characters");
-      return;
-    }
-    setIsResettingPassword(true);
+  const handleResetPassword = async (user: User, newPassword: string): Promise<void> => {
     try {
-      await apiClient.patch(`/users/${userToResetPassword.id}/password`, {
+      await apiClient.patch(`/users/${user.id}/password`, {
         new_password: newPassword,
       });
       toast.success("Password reset successfully");
-      closePasswordDialog();
+      setPasswordDialogOpen(false);
+      setUserToResetPassword(null);
     } catch (err) {
-      toast.error("Failed to reset password");
-    } finally {
-      setIsResettingPassword(false);
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to reset password");
     }
   };
 
-  // Manage Groups Handlers
+  // --- Manage Groups ---
+
   const fetchAllGroups = async () => {
     try {
       const response = await apiClient.get<{ groups: Group[] }>("/groups");
       setAllGroups(response.data.groups);
     } catch (err) {
       console.error("Failed to fetch groups:", err);
-      toast.error("Failed to load groups");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to load groups");
     }
   };
 
@@ -297,7 +241,8 @@ function AdminUsersPageContent() {
       setSelectedGroupIds(response.data.groups.map((g) => g.id));
     } catch (err) {
       console.error("Failed to fetch user groups:", err);
-      toast.error("Failed to load user groups");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to load user groups");
     }
   };
 
@@ -324,7 +269,7 @@ function AdminUsersPageContent() {
     );
   }, []);
 
-  const handleSaveGroups = async () => {
+  const handleSaveGroups = async (): Promise<void> => {
     if (!userForGroups) return;
     setIsSavingGroups(true);
     try {
@@ -334,20 +279,23 @@ function AdminUsersPageContent() {
       toast.success("Groups updated successfully");
       closeGroupsSheet();
     } catch (err) {
-      toast.error("Failed to update groups");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to update groups");
     } finally {
       setIsSavingGroups(false);
     }
   };
 
-  // Manage Organizations Handlers
+  // --- Manage Organizations ---
+
   const fetchAllOrgs = async () => {
     try {
       const response = await apiClient.get<{ organizations: OrgItem[]; total: number }>("/organizations/");
       setAllOrgs(Array.isArray(response.data) ? response.data : response.data.organizations ?? []);
     } catch (err) {
       console.error("Failed to fetch organizations:", err);
-      toast.error("Failed to load organizations");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to load organizations");
     }
   };
 
@@ -361,7 +309,8 @@ function AdminUsersPageContent() {
       setOrgMemberships(map);
     } catch (err) {
       console.error("Failed to fetch user organizations:", err);
-      toast.error("Failed to load user organizations");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to load user organizations");
     }
   };
 
@@ -402,7 +351,7 @@ function AdminUsersPageContent() {
     });
   }, []);
 
-  const handleSaveOrgs = async () => {
+  const handleSaveOrgs = async (): Promise<void> => {
     if (!userForOrgs) return;
     setIsSavingOrgs(true);
     try {
@@ -411,78 +360,36 @@ function AdminUsersPageContent() {
       toast.success("Organizations updated successfully");
       closeOrgsSheet();
     } catch (err) {
-      toast.error("Failed to update organizations");
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to update organizations");
     } finally {
       setIsSavingOrgs(false);
     }
   };
 
-  const filteredOrgs = allOrgs.filter((org) => {
-    const searchLower = orgsSearchQuery.toLowerCase();
-    return (
-      org.name.toLowerCase().includes(searchLower) ||
-      (org.description && org.description.toLowerCase().includes(searchLower))
-    );
-  });
+  // --- Create User ---
 
-const handleCreateUser = async () => {
- if (!createUsername.trim() || createUsername.length < 3) {
- toast.error("Username must be at least 3 characters");
- return;
- }
- // Validate password
- if (createPassword.length < 8) {
- toast.error("Password must be at least 8 characters");
- return;
- }
- if (!/[A-Z]/.test(createPassword)) {
- toast.error("Password must contain at least 1 uppercase letter");
- return;
- }
- if (!/\d/.test(createPassword)) {
- toast.error("Password must contain at least 1 digit");
- return;
- }
- if (!createPassword.trim()) {
- toast.error("Password cannot be only whitespace");
- return;
- }
- setIsCreatingUser(true);
+  const handleCreateUser = async (
+    username: string,
+    fullName: string,
+    password: string,
+    role: UserRole
+  ): Promise<void> => {
     try {
       await apiClient.post("/users/", {
-        username: createUsername.trim(),
-        password: createPassword,
-        full_name: createFullName.trim(),
-        role: createRole,
+        username,
+        password,
+        full_name: fullName,
+        role,
       });
-      toast.success(`User "${createUsername.trim()}" created successfully`);
+      toast.success(`User "${username}" created successfully`);
       setCreateDialogOpen(false);
-      setCreateUsername("");
-      setCreateFullName("");
-      setCreatePassword("");
-      setCreateRole("member");
       fetchUsers();
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to create user";
-      toast.error(message);
-    } finally {
-      setIsCreatingUser(false);
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
+      toast.error(detail || "Failed to create user");
     }
   };
-
-  const filteredGroups = allGroups.filter((group) => {
-    const searchLower = groupsSearchQuery.toLowerCase();
-    return (
-      group.name.toLowerCase().includes(searchLower) ||
-      (group.description && group.description.toLowerCase().includes(searchLower))
-    );
-  });
-
-  const filteredUsers = (users ?? []).filter(
-    (u) =>
-      u.username.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      u.full_name.toLowerCase().includes(searchQuery.toLowerCase())
-  );
 
   const formatDate = (dateStr: string) => new Date(dateStr).toLocaleDateString();
   const isSuperAdmin = currentUser?.role === "superadmin";
@@ -511,7 +418,7 @@ const handleCreateUser = async () => {
           <Input
             placeholder="Search by username or name..."
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
+            onChange={(e) => { setSearchQuery(e.target.value); setPage(1); }}
             className="pl-10 w-1/2"
             aria-label="Search users"
           />
@@ -554,7 +461,7 @@ const handleCreateUser = async () => {
                     <LoadingSpinner label="Loading users…" />
                   </TableCell>
                 </TableRow>
-              ) : filteredUsers.length === 0 ? (
+              ) : users.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={6} className="p-8">
                     <EmptyState
@@ -565,7 +472,7 @@ const handleCreateUser = async () => {
                   </TableCell>
                 </TableRow>
               ) : (
-                filteredUsers.map((user) => (
+                users.map((user) => (
                   <TableRow key={user.id}>
                     <TableCell className="p-4 font-medium">{user.username}</TableCell>
                     <TableCell className="p-4">{user.full_name}</TableCell>
@@ -680,526 +587,86 @@ const handleCreateUser = async () => {
             </TableBody>
           </Table>
         </div>
+
+        {/* Pagination */}
+        <Pagination
+          page={page}
+          limit={limit}
+          total={totalCount}
+          onPageChange={setPage}
+          onLimitChange={(newLimit: number) => {
+            setLimit(newLimit);
+            setPage(1);
+          }}
+          isLoading={loading}
+        />
       </div>
 
       {/* Delete User Dialog */}
-      <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-        <DialogContent aria-labelledby="delete-title" aria-describedby="delete-desc">
-          <DialogHeader>
-            <DialogTitle id="delete-title" className="flex items-center gap-2">
-              <UserX className="w-5 h-5 text-destructive" />
-              Delete User
-            </DialogTitle>
-            <DialogDescription id="delete-desc">
-              Are you sure you want to delete <strong>{userToDelete?.username}</strong>? This action
-              cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteDialogOpen(false)}>
-              Cancel
-            </Button>
-            <Button variant="destructive" onClick={handleDelete}>
-              Delete User
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <DeleteUserDialog
+        open={deleteDialogOpen}
+        user={userToDelete}
+        onDelete={handleDeleteUser}
+        onOpenChange={setDeleteDialogOpen}
+        onClose={() => { setDeleteDialogOpen(false); setUserToDelete(null); }}
+      />
 
       {/* Edit User Dialog */}
-      <Dialog open={editDialogOpen} onOpenChange={setEditDialogOpen}>
-        <DialogContent aria-labelledby="edit-title" aria-describedby="edit-desc">
-          <DialogHeader>
-            <DialogTitle id="edit-title" className="flex items-center gap-2">
-              <Pencil className="w-5 h-5" />
-              Edit User
-            </DialogTitle>
-            <DialogDescription id="edit-desc">
-              Update user details for <strong>{userToEdit?.username}</strong>.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label htmlFor="edit-username">Username</Label>
-              <Input
-                id="edit-username"
-                value={userToEdit?.username ?? ""}
-                disabled
-                aria-readonly="true"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="edit-fullname">Full Name</Label>
-              <Input
-                id="edit-fullname"
-                value={editFullName}
-                onChange={(e) => setEditFullName(e.target.value)}
-                placeholder="Enter full name"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="edit-role">Role</Label>
-              <Select
-                value={editRole}
-                onValueChange={(v) => setEditRole(v as UserRole)}
-              >
-                <SelectTrigger id="edit-role">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {ROLE_OPTIONS.filter((r) => r.value !== "superadmin" || isSuperAdmin).map((opt) => (
-                    <SelectItem key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={closeEditDialog} disabled={isSavingEdit}>
-              Cancel
-            </Button>
-            <Button onClick={handleSaveEdit} disabled={isSavingEdit}>
-              {isSavingEdit ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                "Save Changes"
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <EditUserDialog
+        open={editDialogOpen}
+        user={userToEdit}
+        onSave={handleSaveEdit}
+        onClose={closeEditDialog}
+        isSuperAdmin={isSuperAdmin}
+      />
 
       {/* Password Reset Dialog */}
-      <Dialog open={passwordDialogOpen} onOpenChange={setPasswordDialogOpen}>
-        <DialogContent aria-labelledby="password-title" aria-describedby="password-desc">
-          <DialogHeader>
-            <DialogTitle id="password-title" className="flex items-center gap-2">
-              <KeyRound className="w-5 h-5" />
-              Reset Password
-            </DialogTitle>
-            <DialogDescription id="password-desc">
-              Set a new password for <strong>{userToResetPassword?.username}</strong>.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label htmlFor="new-password">New Password</Label>
-              <Input
-                id="new-password"
-                type="password"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="Enter new password"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="confirm-password">Confirm Password</Label>
-              <Input
-                id="confirm-password"
-                type="password"
-                value={confirmPassword}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                placeholder="Confirm new password"
-              />
-            </div>
-            <p className="text-sm text-muted-foreground">
-              User will be required to change their password on next login.
-            </p>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={closePasswordDialog} disabled={isResettingPassword}>
-              Cancel
-            </Button>
-            <Button onClick={handleResetPassword} disabled={isResettingPassword}>
-              {isResettingPassword ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Resetting...
-                </>
-              ) : (
-                "Reset Password"
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ResetPasswordDialog
+        open={passwordDialogOpen}
+        user={userToResetPassword}
+        onResetPassword={handleResetPassword}
+        onOpenChange={setPasswordDialogOpen}
+        onClose={() => { setPasswordDialogOpen(false); setUserToResetPassword(null); }}
+      />
 
       {/* Manage Groups Sheet */}
-      <Sheet open={groupsSheetOpen} onOpenChange={setGroupsSheetOpen}>
-        <SheetContent
-          className="sm:max-w-[400px] flex flex-col"
-          aria-labelledby="groups-title"
-          aria-describedby="groups-desc"
-        >
-          <SheetHeader>
-            <SheetTitle id="groups-title" className="flex items-center gap-2">
-              <Users className="h-5 w-5" aria-hidden="true" />
-              Manage Groups
-            </SheetTitle>
-            <SheetDescription id="groups-desc">
-              Manage group memberships for <strong>{userForGroups?.username}</strong>. Select groups
-              to add or remove from this user.
-            </SheetDescription>
-          </SheetHeader>
-
-          <div className="flex-1 flex flex-col py-4 min-h-0">
-            {/* Search Input */}
-            <div className="relative mb-4">
-              <Search
-                className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
-                aria-hidden="true"
-              />
-              <Input
-                placeholder="Search groups..."
-                value={groupsSearchQuery}
-                onChange={(e) => setGroupsSearchQuery(e.target.value)}
-                className="pl-10"
-                aria-label="Search groups"
-                disabled={isLoadingGroups}
-              />
-            </div>
-
-            {/* Groups List */}
-            <ScrollArea className="flex-1 -mx-6 px-6">
-              {isLoadingGroups ? (
-                <div className="space-y-3">
-                  {Array.from({ length: 5 }).map((_, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 rounded-sm border">
-                      <Skeleton className="h-4 w-4" />
-                      <div className="flex-1 space-y-2">
-                        <Skeleton className="h-4 w-32" />
-                        <Skeleton className="h-3 w-24" />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : filteredGroups.length === 0 ? (
-                <div
-                  className="text-center py-8 text-muted-foreground"
-                  role="status"
-                  aria-live="polite"
-                >
-                  {groupsSearchQuery ? "No groups match your search" : "No groups available"}
-                </div>
-              ) : (
-                <div className="space-y-2 pr-4">
-                  {filteredGroups.map((group) => (
-                    <div
-                      key={group.id}
-                      className="flex items-start space-x-3 rounded-sm border p-3 hover:bg-muted/50 transition-colors"
-                    >
-                      <Checkbox
-                        id={`group-${group.id}`}
-                        checked={selectedGroupIds.includes(group.id)}
-                        onCheckedChange={() => toggleGroup(group.id)}
-                        aria-label={`Select ${group.name}`}
-                        disabled={isSavingGroups}
-                      />
-                      <Label
-                        htmlFor={`group-${group.id}`}
-                        className="flex-1 cursor-pointer space-y-1"
-                      >
-                        <div className="font-medium">{group.name}</div>
-                        {group.description && (
-                          <div className="text-sm text-muted-foreground">{group.description}</div>
-                        )}
-                      </Label>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </ScrollArea>
-
-            {/* Selected Count */}
-            <div className="mt-4 text-sm text-muted-foreground">
-              {selectedGroupIds.length} group{selectedGroupIds.length !== 1 ? "s" : ""} selected
-            </div>
-          </div>
-
-          <SheetFooter className="flex-col gap-2 sm:flex-row border-t pt-4">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={closeGroupsSheet}
-              disabled={isSavingGroups}
-              className="w-full sm:w-auto"
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={handleSaveGroups}
-              disabled={isSavingGroups || isLoadingGroups}
-              className="w-full sm:w-auto"
-              aria-label="Save group changes"
-            >
-              {isSavingGroups ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
-                  Saving...
-                </>
-              ) : (
-                "Save Changes"
-              )}
-            </Button>
-          </SheetFooter>
-        </SheetContent>
-      </Sheet>
+      <ManageGroupsSheet
+        open={groupsSheetOpen}
+        user={userForGroups}
+        allGroups={allGroups}
+        selectedGroupIds={selectedGroupIds}
+        isLoading={isLoadingGroups}
+        isSaving={isSavingGroups}
+        searchQuery={groupsSearchQuery}
+        onSearchChange={setGroupsSearchQuery}
+        onToggleGroup={toggleGroup}
+        onSave={handleSaveGroups}
+        onClose={closeGroupsSheet}
+      />
 
       {/* Manage Organizations Sheet */}
-      <Sheet open={orgsSheetOpen} onOpenChange={setOrgsSheetOpen}>
-        <SheetContent
-          className="sm:max-w-[400px] flex flex-col"
-          aria-labelledby="orgs-title"
-          aria-describedby="orgs-desc"
-        >
-          <SheetHeader>
-            <SheetTitle id="orgs-title" className="flex items-center gap-2">
-              <Building2 className="h-5 w-5" aria-hidden="true" />
-              Manage Organizations
-            </SheetTitle>
-            <SheetDescription id="orgs-desc">
-              Manage organization memberships for <strong>{userForOrgs?.username}</strong>. Select organizations
-              to add or remove from this user.
-            </SheetDescription>
-          </SheetHeader>
-
-          <div className="flex-1 flex flex-col py-4 min-h-0">
-            <div className="relative mb-4">
-              <Search
-                className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
-                aria-hidden="true"
-              />
-              <Input
-                placeholder="Search organizations..."
-                value={orgsSearchQuery}
-                onChange={(e) => setOrgsSearchQuery(e.target.value)}
-                className="pl-10"
-                aria-label="Search organizations"
-                disabled={isLoadingOrgs}
-              />
-            </div>
-
-            <ScrollArea className="flex-1 -mx-6 px-6">
-              {isLoadingOrgs ? (
-                <div className="space-y-3">
-                  {Array.from({ length: 5 }).map((_, i) => (
-                    <div key={i} className="flex items-center gap-3 p-3 rounded-sm border">
-                      <Skeleton className="h-4 w-4" />
-                      <div className="flex-1 space-y-2">
-                        <Skeleton className="h-4 w-32" />
-                        <Skeleton className="h-3 w-24" />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : filteredOrgs.length === 0 ? (
-                <div
-                  className="text-center py-8 text-muted-foreground"
-                  role="status"
-                  aria-live="polite"
-                >
-                  {orgsSearchQuery ? "No organizations match your search" : "No organizations available"}
-                </div>
-              ) : (
-                <div className="space-y-2 pr-4">
-                  {filteredOrgs.map((org) => {
-                    const isMember = orgMemberships.has(org.id);
-                    const role = orgMemberships.get(org.id) ?? "member";
-                    return (
-                      <div
-                        key={org.id}
-                        className={`flex items-start space-x-3 rounded-sm border p-3 transition-colors ${isMember ? "border-primary/50 bg-primary/5" : "hover:bg-muted/50"}`}
-                      >
-                        <Checkbox
-                          id={`org-${org.id}`}
-                          checked={isMember}
-                          onCheckedChange={() => toggleOrg(org.id)}
-                          aria-label={`Select ${org.name}`}
-                          disabled={isSavingOrgs}
-                          className="mt-0.5"
-                        />
-                        <div className="flex-1 min-w-0">
-                          <Label htmlFor={`org-${org.id}`} className="font-medium cursor-pointer block">
-                            {org.name}
-                          </Label>
-                          {org.description && (
-                            <div className="text-sm text-muted-foreground line-clamp-1">{org.description}</div>
-                          )}
-                          <div className="mt-1.5">
-                            <Select
-                              value={role}
-                              onValueChange={(v) => setOrgRole(org.id, v)}
-                              disabled={!isMember || isSavingOrgs}
-                            >
-                              <SelectTrigger className="h-7 w-24 text-xs" aria-label={`Role in ${org.name}`}>
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                <SelectItem value="member" className="text-xs">Member</SelectItem>
-                                <SelectItem value="admin" className="text-xs">Admin</SelectItem>
-                              </SelectContent>
-                            </Select>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </ScrollArea>
-
-            <div className="mt-4 text-sm text-muted-foreground">
-              {orgMemberships.size} organization{orgMemberships.size !== 1 ? "s" : ""} selected
-            </div>
-          </div>
-
-          <SheetFooter className="flex-col gap-2 sm:flex-row border-t pt-4">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={closeOrgsSheet}
-              disabled={isSavingOrgs}
-              className="w-full sm:w-auto"
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={handleSaveOrgs}
-              disabled={isSavingOrgs || isLoadingOrgs}
-              className="w-full sm:w-auto"
-              aria-label="Save organization changes"
-            >
-              {isSavingOrgs ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
-                  Saving...
-                </>
-              ) : (
-                "Save Changes"
-              )}
-            </Button>
-          </SheetFooter>
-        </SheetContent>
-      </Sheet>
+      <ManageOrgsSheet
+        open={orgsSheetOpen}
+        user={userForOrgs}
+        allOrgs={allOrgs}
+        orgMemberships={orgMemberships}
+        isLoading={isLoadingOrgs}
+        isSaving={isSavingOrgs}
+        searchQuery={orgsSearchQuery}
+        onSearchChange={setOrgsSearchQuery}
+        onToggleOrg={toggleOrg}
+        onSetOrgRole={setOrgRole}
+        onSave={handleSaveOrgs}
+        onClose={closeOrgsSheet}
+      />
 
       {/* Create User Dialog */}
-      <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-        <DialogContent
-          className="sm:max-w-[425px]"
-          aria-labelledby="create-title"
-          aria-describedby="create-desc"
-        >
-          <DialogHeader>
-            <DialogTitle id="create-title">Create New User</DialogTitle>
-            <DialogDescription id="create-desc">
-              Add a new user to the system.
-            </DialogDescription>
-          </DialogHeader>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleCreateUser();
-            }}
-          >
-            <div className="space-y-4 py-4">
-              <div className="space-y-2">
-                <Label htmlFor="create-username">
-                  Username
-                  <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="create-username"
-                  placeholder="Enter username"
-                  value={createUsername}
-                  onChange={(e) => setCreateUsername(e.target.value)}
-                  disabled={isCreatingUser}
-                  required
-                  minLength={3}
-                  aria-describedby="username-hint"
-                />
-                <p id="username-hint" className="text-xs text-muted-foreground">
-                  Minimum 3 characters
-                </p>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="create-fullname">Full Name</Label>
-                <Input
-                  id="create-fullname"
-                  placeholder="Full name (optional)"
-                  value={createFullName}
-                  onChange={(e) => setCreateFullName(e.target.value)}
-                  disabled={isCreatingUser}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="create-password">
-                  Password
-                  <span className="text-destructive">*</span>
-                </Label>
-                <Input
-                  id="create-password"
-                  type="password"
-                  placeholder="Enter password"
-                  value={createPassword}
-                  onChange={(e) => setCreatePassword(e.target.value)}
-                  disabled={isCreatingUser}
-                  required
-                  minLength={8}
-                  aria-describedby="password-requirements"
-                />
-                <p id="password-requirements" className="text-xs text-muted-foreground">
-                  Min 8 characters, at least 1 digit and 1 uppercase letter
-                </p>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="create-role">Role</Label>
-                <Select
-                  value={createRole}
-                  onValueChange={(value) => setCreateRole(value as UserRole)}
-                  disabled={isCreatingUser}
-                >
-                  <SelectTrigger id="create-role">
-                    <SelectValue placeholder="Select a role" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {ROLE_OPTIONS.filter((r) => r.value !== "superadmin" || isSuperAdmin).map((r) => (
-                      <SelectItem key={r.value} value={r.value}>
-                        {r.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-            <DialogFooter className="flex-col gap-2 sm:flex-row">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setCreateDialogOpen(false)}
-                disabled={isCreatingUser}
-                className="w-full sm:w-auto"
-              >
-                Cancel
-              </Button>
-              <Button type="submit" disabled={isCreatingUser} className="w-full sm:w-auto">
-                {isCreatingUser ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
-                    Creating...
-                  </>
-                ) : (
-                  "Create User"
-                )}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      <CreateUserDialog
+        open={createDialogOpen}
+        onCreate={handleCreateUser}
+        onOpenChange={setCreateDialogOpen}
+        isSuperAdmin={isSuperAdmin}
+      />
     </div>
   );
 }

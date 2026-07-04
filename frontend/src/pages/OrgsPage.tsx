@@ -18,6 +18,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { RoleGuard } from "@/components/auth/RoleGuard";
 import { Building2, Plus, Trash2, Users, Vault, ChevronDown, ChevronUp, Loader2, UserPlus, UserX, Search } from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
+import { NATIVE_SELECT_CLASS_NAME } from "@/lib/utils";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
@@ -487,7 +488,7 @@ function OrgsPageContent() {
                               {member.role === "owner" ? (
                                 <Badge variant="default" className="text-xs">Owner</Badge>
                               ) : (
-                                <select value={member.role} onChange={(e) => handleRoleChange(org.id, member.user_id, e.target.value as OrgRole)} disabled={updatingMemberId === member.user_id} aria-label={`Change role for ${member.username}`} className="h-8 rounded-sm border border-input bg-background px-2 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+                                 <select value={member.role} onChange={(e) => handleRoleChange(org.id, member.user_id, e.target.value as OrgRole)} disabled={updatingMemberId === member.user_id} aria-label={`Change role for ${member.username}`} className={NATIVE_SELECT_CLASS_NAME}>
                                   {CHANGEABLE_ROLE_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
                                 </select>
                               )}

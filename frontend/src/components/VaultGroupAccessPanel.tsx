@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { NATIVE_SELECT_CLASS_NAME } from "@/lib/utils";
 import {
   Table,
   TableBody,
@@ -169,7 +170,7 @@ export function VaultGroupAccessPanel({ vaultId }: VaultGroupAccessPanelProps) {
                   <TableCell className="py-3"><div className="font-medium">{group.group_name}</div></TableCell>
                   <TableCell className="py-3 text-muted-foreground text-sm">{group.org_name}</TableCell>
                   <TableCell className="py-3">
-                    <select value={group.permission} onChange={(e) => handlePermissionChange(group.group_id, e.target.value as VaultPermission)} disabled={updatingGroupId === group.group_id} aria-label={`Change permission for ${group.group_name}`} className="h-8 rounded-sm border border-input bg-background px-2 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+                     <select value={group.permission} onChange={(e) => handlePermissionChange(group.group_id, e.target.value as VaultPermission)} disabled={updatingGroupId === group.group_id} aria-label={`Change permission for ${group.group_name}`} className={NATIVE_SELECT_CLASS_NAME}>
                       {PERMISSION_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
                     </select>
                   </TableCell>

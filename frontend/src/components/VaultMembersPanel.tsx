@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { NATIVE_SELECT_CLASS_NAME } from "@/lib/utils";
 import {
   Table,
   TableBody,
@@ -162,7 +163,7 @@ export function VaultMembersPanel({ vaultId }: VaultMembersPanelProps) {
                 <TableRow key={member.user_id}>
                   <TableCell className="py-3"><div><div className="font-medium">{member.full_name || member.username}</div><div className="text-sm text-muted-foreground">@{member.username}</div></div></TableCell>
                   <TableCell className="py-3">
-                    <select value={member.permission} onChange={(e) => handlePermissionChange(member.user_id, e.target.value as VaultPermission)} disabled={updatingMemberId === member.user_id} aria-label={`Change permission for ${member.username}`} className="h-8 rounded-sm border border-input bg-background px-2 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50">
+                     <select value={member.permission} onChange={(e) => handlePermissionChange(member.user_id, e.target.value as VaultPermission)} disabled={updatingMemberId === member.user_id} aria-label={`Change permission for ${member.username}`} className={NATIVE_SELECT_CLASS_NAME}>
                       {PERMISSION_OPTIONS.map((opt) => (<option key={opt.value} value={opt.value}>{opt.label}</option>))}
                     </select>
                   </TableCell>

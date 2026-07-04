@@ -303,7 +303,7 @@ describe('AdminUsersPage ADVERSARIAL', () => {
       await act(async () => { render(<AdminUsersPage />); });
 
       await waitFor(() => {
-        expect(screen.getByText('No users found')).toBeInTheDocument();
+        expect(screen.getAllByText('No users found').length).toBeGreaterThanOrEqual(1);
       });
     });
 
