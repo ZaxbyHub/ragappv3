@@ -516,6 +516,93 @@ data: {"type": "content", "content": "test"}
         # Code must be INTERNAL_ERROR
         self.assertEqual(error_events[0].get("code"), "INTERNAL_ERROR")
 
+    def test_stream_chat_done_event_has_citation_validation_when_invalid(self):
+        """Done event must include citation_validation and repaired_content when
+        the assembled content contains a citation that has no matching source.
+
+        The mock yields content with [S1] but the sources list has no source_label
+        key — therefore source_count=0 and valid_s={}.  The validator marks S1
+        invalid, sets invalid_stripped=True, and returns repaired_content with the
+        hallucinated [S1] marker stripped.
+        """
+        async def mock_query(*args, **kwargs):
+            yield {"type": "content", "content": "Answer based on [S1] source."}
+            yield {
+                "type": "done",
+                # No source_label key → _max_index returns 0 → valid_s is {}.
+                # [S1] in content is therefore invalid.
+                "sources": [{"file_id": "doc1.txt", "score": 0.9}],
+                "memories_used": [],
+            }
+
+        self._set_mock_rag_engine(mock_query)
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={"messages": [{"role": "user", "content": "test"}]}
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        events = self._parse_sse_events(response.text)
+        done_events = [
+            e["data"] for e in events
+            if e.get("data", {}).get("type") == "done"
+        ]
+        self.assertEqual(len(done_events), 1, "Expected exactly one done event")
+        done_event = done_events[0]
+
+        # citation_validation must be present and have S1 listed as invalid
+        self.assertIn("citation_validation", done_event)
+        cv = done_event["citation_validation"]
+        self.assertIn("S1", cv["invalid"])
+        self.assertNotIn("S1", cv["valid"])
+
+        # repaired_content must also be present (invalid citations were stripped)
+        self.assertIn("repaired_content", done_event)
+        repaired = done_event["repaired_content"]
+        self.assertIsNotNone(repaired)
+        self.assertNotIn("[S1]", repaired)
+
+    def test_stream_chat_done_event_no_citation_validation_when_valid(self):
+        """Done event must NOT include citation_validation or repaired_content when
+        all citations in the generated content match available sources.
+
+        The mock yields content with [S1] and the sources list includes a
+        source_label key with value "S1" — therefore source_count=1, [S1] is
+        valid, and no repair is needed.
+        """
+        async def mock_query(*args, **kwargs):
+            yield {"type": "content", "content": "Answer based on [S1] source."}
+            yield {
+                "type": "done",
+                "sources": [{"source_label": "S1", "file_id": "doc1.txt", "score": 0.9}],
+                "memories_used": [],
+            }
+
+        self._set_mock_rag_engine(mock_query)
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={"messages": [{"role": "user", "content": "test"}]}
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        events = self._parse_sse_events(response.text)
+        done_events = [
+            e["data"] for e in events
+            if e.get("data", {}).get("type") == "done"
+        ]
+        self.assertEqual(len(done_events), 1, "Expected exactly one done event")
+        done_event = done_events[0]
+
+        # citation_validation must NOT be present when all citations are valid
+        self.assertNotIn("citation_validation", done_event)
+
+        # repaired_content must NOT be present when no citations were repaired
+        self.assertNotIn("repaired_content", done_event)
+
 
 if __name__ == "__main__":
     unittest.main()

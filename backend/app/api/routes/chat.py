@@ -5,6 +5,8 @@ Provides streaming and non-streaming chat endpoints that leverage
 the RAG engine for context-aware responses.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -51,7 +53,7 @@ class ChatRequest(BaseModel):
     """Request model for chat endpoint."""
 
     message: str
-    history: List[Dict[str, Any]] = Field(default_factory=list)
+    history: List[ChatMessage] = Field(default_factory=list)
     stream: bool = False
     vault_id: Optional[int] = None
     mode: Optional[Literal["instant", "thinking"]] = None
@@ -173,8 +175,6 @@ async def _enqueue_wiki_compile_job(
     wiki_refs: List[Dict[str, Any]],
     doc_sources: List[Dict[str, Any]],
     memories: List[Any],
-    session_id: Optional[int] = None,
-    assistant_message_id: Optional[int] = None,
 ) -> None:
     """Enqueue a post-answer wiki compile job. Runs as a background task."""
     import datetime as _dt
@@ -193,8 +193,6 @@ async def _enqueue_wiki_compile_job(
             "assistant_answer": assistant_answer,
             "vault_id": vault_id,
             "timestamp": _dt.datetime.utcnow().isoformat(),
-            "session_id": session_id,
-            "assistant_message_id": assistant_message_id,
             "cited_wiki_labels": [r.get("wiki_label") for r in wiki_refs if r.get("wiki_label")],
             "cited_source_labels": [s.get("source_label") for s in doc_sources if s.get("source_label")],
             "cited_memory_labels": [m.get("memory_label") for m in memories_as_dicts if m.get("memory_label")],
@@ -204,7 +202,7 @@ async def _enqueue_wiki_compile_job(
             "per_claim_sources": per_claim_sources,
         }
 
-        trigger_id = f"session:{session_id}" if session_id else "session:unknown"
+        trigger_id = "query"
 
         def _create_job(conn):
             store = WikiStore(conn)
@@ -425,7 +423,11 @@ def stream_chat_response(
             done_payload["answer_contract"] = answer_contract
         if llm_metrics is not None:
             done_payload["llm_metrics"] = llm_metrics
-        if citation_validation is not None:
+        # Only emit citation_validation when there are invalid citations.
+        # When all citations are valid, the field is omitted to avoid
+        # needless payload bloat and to distinguish "no validation data"
+        # from "validation data present but empty invalid set".
+        if citation_validation is not None and citation_validation.get("invalid"):
             done_payload["citation_validation"] = citation_validation
         if repaired_content is not None:
             done_payload["repaired_content"] = repaired_content
@@ -647,10 +649,14 @@ async def chat(
             )
     require_vault = user.get("role") not in ("superadmin", "admin")
     effective_mode = ChatMode(body.mode) if body.mode else None
+    # Convert validated ChatMessage objects to plain dicts for downstream
+    # functions that expect List[Dict[str, Any]]. Mirror the streaming path
+    # (line 705) which uses model_dump(exclude_none=True).
+    history = [msg.model_dump(exclude_none=True) for msg in body.history]
     try:
         return await non_stream_chat_response(
             body.message,
-            body.history,
+            history,
             rag_engine,
             vault_id=body.vault_id,
             mode=effective_mode,
