@@ -280,6 +280,8 @@ class PromptBuilderService:
         for entry in chat_history[-max_history:]:
             safe_entry = dict(entry)
             safe_entry["content"] = _xml_escape(safe_entry.get("content") or "")
+            if safe_entry.get("role") not in {"user", "assistant"}:
+                continue
             messages.append(safe_entry)
 
         # Build structured context
