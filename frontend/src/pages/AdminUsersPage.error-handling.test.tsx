@@ -150,14 +150,18 @@ vi.mock('lucide-react', () => ({
 }));
 
 // Helper to create an axios-like error with response.data.detail
-function makeApiError(detail: string) {
-  return {
+function makeApiError(detail: string, originalError?: any) {
+  const error: any = {
     response: {
       data: {
         detail,
       },
     },
   };
+  if (originalError) {
+    error.originalError = originalError;
+  }
+  return error;
 }
 
 // Helper to make a plain error without response (network error etc)
@@ -282,10 +286,32 @@ describe('AdminUsersPage error handling', () => {
     api.default.get.mockRejectedValueOnce(makeNetworkError());
 
     await act(async () => { render(<AdminUsersPage />); });
-    
+
     const toastError = await getToastError();
     await vi.waitFor(() => expect(toastError).toHaveBeenCalled());
     expect(toastError).toHaveBeenCalledWith('Failed to load users');
+  });
+
+  it('fetchUsers: uses generic fallback when error detail is empty string', async () => {
+    const api = await import('@/lib/api');
+    api.default.get.mockRejectedValueOnce(makeApiError(''));
+
+    await act(async () => { render(<AdminUsersPage />); });
+
+    const toastError = await getToastError();
+    await vi.waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError).toHaveBeenCalledWith('Failed to load users');
+  });
+
+  it('fetchUsers: surfaces backend detail from originalError.response.data.detail when response.data.detail is empty string', async () => {
+    const api = await import('@/lib/api');
+    api.default.get.mockRejectedValueOnce(makeApiError('', { response: { data: { detail: 'Original error detail' } } }));
+
+    await act(async () => { render(<AdminUsersPage />); });
+
+    const toastError = await getToastError();
+    await vi.waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(toastError).toHaveBeenCalledWith('Original error detail');
   });
 
   // ============================================================
@@ -783,6 +809,21 @@ describe('AdminUsersPage error handling', () => {
     await vi.waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to load user groups'));
   });
 
+  it('fetchUserGroups: renders empty groups when response.data.groups is missing', async () => {
+    registerUrlResponse('/groups', { data: {} });
+    registerUrlResponse(`/users/2/groups`, { data: {} });
+
+    await act(async () => { render(<AdminUsersPage />); });
+    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+
+    const groupButton = document.querySelector('button[aria-label="Manage groups for bob"]');
+    await act(async () => {
+      fireEvent.click(groupButton!);
+    });
+
+    await vi.waitFor(() => expect(screen.getByText('No groups available')).toBeInTheDocument());
+  });
+
   // ============================================================
   // fetchAllOrgs — error in catch block at line 361
   // ============================================================
@@ -814,6 +855,20 @@ describe('AdminUsersPage error handling', () => {
 
     const toastError = await getToastError();
     await vi.waitFor(() => expect(toastError).toHaveBeenCalledWith('Failed to load organizations'));
+  });
+
+  it('fetchAllOrgs: renders empty organizations when response.data.organizations is missing', async () => {
+    registerUrlResponse('/organizations/', { data: {} });
+
+    await act(async () => { render(<AdminUsersPage />); });
+    await vi.waitFor(() => expect(screen.getByText('alice')).toBeInTheDocument());
+
+    const orgButton = document.querySelector('button[aria-label="Manage organizations for bob"]');
+    await act(async () => {
+      fireEvent.click(orgButton!);
+    });
+
+    await vi.waitFor(() => expect(screen.getByText('No organizations available')).toBeInTheDocument());
   });
 
   // ============================================================

@@ -5,6 +5,7 @@ import { useAuthStore } from "@/stores/useAuthStore";
 import apiClient from "@/lib/api";
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { mockAdminUsers } from "@/fixtures/users";
+import { useDebounce } from "@/hooks/useDebounce";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -60,6 +61,7 @@ function AdminUsersPageContent() {
   const [users, setUsers] = useState<User[]>(testMode ? mockAdminUsers : []);
   const [loading, setLoading] = useState(!testMode);
   const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearchQuery] = useDebounce(searchQuery, 300);
   const [updatingUserId, setUpdatingUserId] = useState<number | null>(null);
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(20);
@@ -110,7 +112,7 @@ function AdminUsersPageContent() {
     try {
       const skip = (page - 1) * limit;
       const response = await apiClient.get<{ users: User[]; total: number }>(
-        `/users/?skip=${skip}&limit=${limit}&q=${encodeURIComponent(searchQuery)}`
+        `/users/?skip=${skip}&limit=${limit}&q=${encodeURIComponent(debouncedSearchQuery)}`
       );
       setUsers(response.data.users);
       setTotalCount(response.data.total);
@@ -121,7 +123,7 @@ function AdminUsersPageContent() {
     } finally {
       setLoading(false);
     }
-  }, [testMode, page, limit, searchQuery]);
+  }, [testMode, page, limit, debouncedSearchQuery]);
 
   useEffect(() => {
     if (!testMode) fetchUsers();
@@ -227,7 +229,13 @@ function AdminUsersPageContent() {
   const fetchAllGroups = async () => {
     try {
       const response = await apiClient.get<{ groups: Group[] }>("/groups");
-      setAllGroups(response.data.groups);
+      setAllGroups((prev) => {
+        const next = response.data.groups ?? [];
+        if (prev.length === next.length && next.length > 0 && prev[0]?.id === next[0]?.id) {
+          return prev;
+        }
+        return next;
+      });
     } catch (err) {
       console.error("Failed to fetch groups:", err);
       const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
@@ -238,7 +246,7 @@ function AdminUsersPageContent() {
   const fetchUserGroups = async (userId: number) => {
     try {
       const response = await apiClient.get<{ groups: Group[] }>(`/users/${userId}/groups`);
-      setSelectedGroupIds(response.data.groups.map((g) => g.id));
+      setSelectedGroupIds((response.data?.groups ?? []).map((g) => g.id));
     } catch (err) {
       console.error("Failed to fetch user groups:", err);
       const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
@@ -290,8 +298,14 @@ function AdminUsersPageContent() {
 
   const fetchAllOrgs = async () => {
     try {
-      const response = await apiClient.get<{ organizations: OrgItem[]; total: number }>("/organizations/");
-      setAllOrgs(Array.isArray(response.data) ? response.data : response.data.organizations ?? []);
+      const response = await apiClient.get<{ organizations: OrgItem[]; total: number } | OrgItem[]>("/organizations/");
+      setAllOrgs((prev) => {
+        const next = Array.isArray(response.data) ? response.data : response.data?.organizations ?? [];
+        if (prev.length === next.length && prev[0]?.id === next[0]?.id) {
+          return prev;
+        }
+        return next;
+      });
     } catch (err) {
       console.error("Failed to fetch organizations:", err);
       const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail;
@@ -303,7 +317,8 @@ function AdminUsersPageContent() {
     try {
       const response = await apiClient.get<{ organizations: OrgItem[] }>(`/users/${userId}/organizations`);
       const map = new Map<number, string>();
-      for (const o of response.data.organizations) {
+      const orgs = Array.isArray(response.data) ? response.data : response.data?.organizations ?? [];
+      for (const o of orgs) {
         map.set(o.id, o.role || "member");
       }
       setOrgMemberships(map);

@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useMemo } from "react";
 import { Users, Loader2, Search } from "lucide-react";
 import {
   Sheet,
@@ -43,20 +43,13 @@ export function ManageGroupsSheet({
   onSave,
   onClose,
 }: ManageGroupsSheetProps) {
-  const toggleGroup = useCallback(
-    (groupId: number) => {
-      onToggleGroup(groupId);
-    },
-    [onToggleGroup]
-  );
-
-  const filteredGroups = allGroups.filter((group) => {
+  const filteredGroups = useMemo(() => {
     const searchLower = searchQuery.toLowerCase();
-    return (
+    return allGroups.filter((group) =>
       group.name.toLowerCase().includes(searchLower) ||
       (group.description && group.description.toLowerCase().includes(searchLower))
     );
-  });
+  }, [allGroups, searchQuery]);
 
   return (
     <Sheet open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
@@ -122,10 +115,10 @@ export function ManageGroupsSheet({
                     key={group.id}
                     className="flex items-start space-x-3 rounded-sm border p-3 hover:bg-muted/50 transition-colors"
                   >
-                    <Checkbox
+                      <Checkbox
                       id={`group-${group.id}`}
                       checked={selectedGroupIds.includes(group.id)}
-                      onCheckedChange={() => toggleGroup(group.id)}
+                      onCheckedChange={() => onToggleGroup(group.id)}
                       aria-label={`Select ${group.name}`}
                       disabled={isSaving}
                     />

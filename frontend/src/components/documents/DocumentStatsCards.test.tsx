@@ -122,7 +122,9 @@ describe("DocumentStatsCards", () => {
       };
       render(<DocumentStatsCards stats={stats} />);
       // Should fall back to 0 via `?.indexed || 0`
-      expect(screen.getByText("0")).toBeInTheDocument();
+      const indexedLabel = screen.getByText("Indexed");
+      const indexedValue = indexedLabel.closest("div")?.querySelector("h3");
+      expect(indexedValue?.textContent).toBe("0");
     });
   });
 
