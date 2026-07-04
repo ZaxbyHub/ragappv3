@@ -21,6 +21,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { NATIVE_SELECT_CLASS_NAME } from "@/lib/utils";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { useTestMode } from "@/fixtures/TestModeContext";
+import { useDebounce } from "@/hooks/useDebounce";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import {
   Table,
@@ -90,11 +91,11 @@ function OrgsPageContent() {
   const [addingMember, setAddingMember] = useState(false);
   const [selectedUser, setSelectedUser] = useState<UserResult | null>(null);
   const [userSearchQuery, setUserSearchQuery] = useState("");
+  const [debouncedUserSearchQuery] = useDebounce(userSearchQuery, 300);
   const [userSearchResults, setUserSearchResults] = useState<UserResult[]>([]);
   const [showUserDropdown, setShowUserDropdown] = useState(false);
   const [searchingUsers, setSearchingUsers] = useState(false);
   const userSearchRef = useRef<HTMLDivElement>(null);
-  const searchTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
   const [newMemberRole, setNewMemberRole] = useState<OrgRole>("member");
   const [updatingMemberId, setUpdatingMemberId] = useState<number | null>(null);
   const [removeMemberDialogOpen, setRemoveMemberDialogOpen] = useState(false);
@@ -119,13 +120,6 @@ function OrgsPageContent() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // Clean up search timeout on unmount
-  useEffect(() => {
-    return () => {
-      if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
-    };
-  }, []);
-
   // Debounced user search
   const searchUsers = useCallback(async (query: string) => {
     if (!query.trim()) {
@@ -148,9 +142,11 @@ function OrgsPageContent() {
   const handleUserSearchChange = (value: string) => {
     setUserSearchQuery(value);
     setSelectedUser(null);
-    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
-    searchTimeoutRef.current = setTimeout(() => searchUsers(value), 300);
   };
+
+  useEffect(() => {
+    searchUsers(debouncedUserSearchQuery);
+  }, [debouncedUserSearchQuery, searchUsers]);
 
   const selectUser = (user: UserResult) => {
     setSelectedUser(user);
@@ -171,7 +167,7 @@ function OrgsPageContent() {
       setOrgs(Array.isArray(response.data) ? response.data : response.data.organizations ?? []);
     } catch (err: any) {
       console.error("Failed to fetch organizations:", err);
-      toast.error(err?.response?.data?.detail || "Failed to load organizations");
+      toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to load organizations");
     } finally {
       setLoading(false);
     }
@@ -185,7 +181,7 @@ function OrgsPageContent() {
       setOrgs((prev) => prev.map((o) => o.id === orgId ? { ...o, members: response.data.members } : o));
     } catch (err: any) {
       console.error("Failed to fetch members:", err);
-      toast.error(err?.response?.data?.detail || "Failed to load members");
+      toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to load members");
     }
   }, []);
 
@@ -216,7 +212,7 @@ function OrgsPageContent() {
       setNewOrgName("");
       setNewOrgDescription("");
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || "Failed to create organization");
+      toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to create organization");
     } finally {
       setCreatingOrg(false);
     }
@@ -231,7 +227,7 @@ function OrgsPageContent() {
       setDeleteDialogOpen(false);
       setOrgToDelete(null);
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || "Failed to delete organization");
+      toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to delete organization");
     }
   };
 
@@ -250,7 +246,7 @@ function OrgsPageContent() {
       fetchOrgMembers(orgId);
       setOrgs((prev) => prev.map((o) => o.id === orgId ? { ...o, member_count: o.member_count + 1 } : o));
     } catch (err: any) {
-      const detail = err?.response?.data?.detail || "Failed to add member";
+      const detail = (err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to add member";
       toast.error(detail);
     } finally {
       setAddingMember(false);
@@ -271,7 +267,7 @@ function OrgsPageContent() {
       }));
       toast.success("Role updated successfully");
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || "Failed to update role");
+      toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to update role");
     } finally {
       setUpdatingMemberId(null);
     }
@@ -294,7 +290,7 @@ function OrgsPageContent() {
       setMemberToRemove(null);
       setOrgForMemberAction(null);
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || "Failed to remove member");
+      toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to remove member");
     }
   };
 
@@ -309,7 +305,7 @@ function OrgsPageContent() {
       setTransferTargetId(null);
       fetchOrgMembers(transferOrgId);
     } catch (err: any) {
-      toast.error(err?.response?.data?.detail || "Failed to transfer ownership");
+      toast.error((err as any)?.originalError?.response?.data?.detail || (err as any)?.response?.data?.detail || "Failed to transfer ownership");
     } finally {
       setTransferring(false);
     }

@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useMemo } from "react";
 import { Building2, Loader2, Search } from "lucide-react";
 import {
   Sheet,
@@ -52,20 +52,13 @@ export function ManageOrgsSheet({
   onSave,
   onClose,
 }: ManageOrgsSheetProps) {
-  const toggleOrg = useCallback(
-    (orgId: number) => {
-      onToggleOrg(orgId);
-    },
-    [onToggleOrg]
-  );
-
-  const filteredOrgs = allOrgs.filter((org) => {
+  const filteredOrgs = useMemo(() => {
     const searchLower = searchQuery.toLowerCase();
-    return (
+    return allOrgs.filter((org) =>
       org.name.toLowerCase().includes(searchLower) ||
       (org.description && org.description.toLowerCase().includes(searchLower))
     );
-  });
+  }, [allOrgs, searchQuery]);
 
   return (
     <Sheet open={open} onOpenChange={(isOpen) => !isOpen && onClose()}>
@@ -135,7 +128,7 @@ export function ManageOrgsSheet({
                       <Checkbox
                         id={`org-${org.id}`}
                         checked={isMember}
-                        onCheckedChange={() => toggleOrg(org.id)}
+                        onCheckedChange={() => onToggleOrg(org.id)}
                         aria-label={`Select ${org.name}`}
                         disabled={isSaving}
                         className="mt-0.5"

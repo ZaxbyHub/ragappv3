@@ -558,4 +558,27 @@ describe('AdminUsersPage pagination', () => {
       );
     });
   });
+
+  // 11. total=0 page-1 boundary: pagination disabled, page stays at 1, no users displayed
+  it('total=0 shows pagination disabled and no users displayed', async () => {
+    const api = await import('@/lib/api');
+    vi.mocked(api.default.get).mockClear();
+    vi.mocked(api.default.get).mockResolvedValue({ data: { users: [], total: 0 } });
+
+    await act(async () => { render(<AdminUsersPage />); });
+    await waitFor(() => expect(screen.getByTestId('pagination')).toBeInTheDocument());
+
+    // Pagination receives total=0
+    const calls = paginationProps.mock.calls;
+    const lastCall = calls[calls.length - 1][0];
+    expect(lastCall.total).toBe(0);
+
+    // Pagination receives page=1
+    expect(lastCall.page).toBe(1);
+
+    // No users are displayed (empty state)
+    expect(screen.queryByText('alice')).not.toBeInTheDocument();
+    expect(screen.queryByText('bob')).not.toBeInTheDocument();
+    expect(screen.queryByText('carol')).not.toBeInTheDocument();
+  });
 });
