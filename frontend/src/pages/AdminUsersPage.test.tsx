@@ -260,7 +260,8 @@ describe('AdminUsersPage', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText('No users found')).toBeInTheDocument();
+      // Table-level empty state (inside the Table)
+      expect(screen.getAllByText('No users found')[0]).toBeInTheDocument();
     });
   });
 
