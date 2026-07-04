@@ -222,6 +222,18 @@ class TestAuthRoutes(unittest.TestCase):
             },
         )
 
+    def test_register_disabled_when_users_enabled_false(self):
+        """Register endpoint should return 403 when users_enabled is False."""
+        settings.users_enabled = False
+
+        response = self.client.post(
+            "/api/auth/register",
+            json={"username": "newuser", "password": "Password123"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Registration disabled", response.json()["detail"])
+
     def test_login_success(self):
         """Register then login, verify access_token returned."""
         # First register

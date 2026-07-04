@@ -396,6 +396,9 @@ function AdminUsersPageContent() {
   const canDeleteUser = (user: User) => isSuperAdmin && user.id !== currentUser?.id;
   const canManageUser = (user: User) => user.id !== currentUser?.id;
 
+  // Defensive: guard against API returning users: null
+  const safeUsers = users ?? [];
+
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -461,7 +464,7 @@ function AdminUsersPageContent() {
                     <LoadingSpinner label="Loading users…" />
                   </TableCell>
                 </TableRow>
-              ) : users.length === 0 ? (
+              ) : safeUsers.length === 0 ? (
                 <TableRow>
                   <TableCell colSpan={6} className="p-8">
                     <EmptyState
@@ -472,7 +475,7 @@ function AdminUsersPageContent() {
                   </TableCell>
                 </TableRow>
               ) : (
-                users.map((user) => (
+                safeUsers.map((user) => (
                   <TableRow key={user.id}>
                     <TableCell className="p-4 font-medium">{user.username}</TableCell>
                     <TableCell className="p-4">{user.full_name}</TableCell>
