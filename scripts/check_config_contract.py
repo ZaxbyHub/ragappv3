@@ -88,7 +88,7 @@ def main() -> int:
     backend_config = read("backend/app/config.py")
     root_dockerfile = read("Dockerfile")
     frontend_dockerfile = read("frontend/Dockerfile")
-    frontend_api = read("frontend/src/lib/api.ts")
+    frontend_api = read("frontend/src/lib/api/core.ts")
     frontend_upload_limits = read("frontend/src/lib/uploadLimits.ts")
     frontend_paths = read("frontend/src/lib/paths.ts")
     vite_config = read("frontend/vite.config.ts")

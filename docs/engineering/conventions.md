@@ -86,14 +86,34 @@ update this doc when a convention genuinely changes.
 | `components/<feature>/` | Feature components + their local hooks (e.g. `components/documents/useDocumentPolling.ts`) |
 | `components/ui/` | shadcn/ui primitives |
 | `components/shared/` | Reusable cross-feature components (StatusBadge, EmptyState) |
-| `lib/` | `api.ts` (HTTP client), `utils.ts` (`cn()`), `formatters.ts`, `fileIcon.tsx`, `paths.ts` |
+| `lib/` | `api/` (per-domain axios modules), `utils.ts` (`cn()`), `formatters.ts`, `fileIcon.tsx`, `paths.ts` |
 | `stores/` | Zustand stores (`useAuthStore`, `useVaultStore`, `useUploadStore`, …) |
 | `hooks/` | Cross-feature custom hooks |
 
-### API client (`lib/api.ts`)
-- Single axios client, `baseURL = VITE_API_URL`. Bearer token attached via request interceptor (`setJwtAccessToken` from `useAuthStore`); CSRF token auto-attached to POST/PUT/PATCH/DELETE with 403 retry; 401 → silent refresh with backoff.
-- Prefer **options-object signatures** for functions with optional params (e.g. `listDocuments(options: ListDocumentsOptions)`), not long positional lists.
-- Export shared types/interfaces (`Document`, `Tag`, …) from `api.ts`. **IDs from the API are typed as declared there** — `Document.id` is a `string`; tag/vault ids are `number`. Match these exactly.
+### API client (`lib/api/`)
+The HTTP client is split into per-domain modules under `lib/api/`:
+- `lib/api/index.ts` — barrel re-export (`export * from "./tags"`, etc.); `export default` from `core`
+- `lib/api/core.ts` — axios client, interceptors (JWT/CSRF), shared types, utility functions, and document CRUD operations
+- `lib/api/tags.ts` — tag CRUD
+- `lib/api/folders.ts` — folder CRUD
+- `lib/api/sessions.ts` — chat streaming, SSE parsing, session CRUD
+- `lib/api/groups.ts` — group CRUD and member/vault management
+- `lib/api/users.ts` — user listing and group assignments
+- `lib/api/vault-groups.ts` — vault-group access management
+- `lib/api/wiki.ts` — wiki page and knowledge compiler operations
+- `lib/api/kms.ts` — knowledge management entry operations
+- `lib/api/health.ts` — health check functions
+- `lib/api/settings.ts` — server settings CRUD
+- `lib/api/vaults.ts` — vault CRUD
+- `lib/api/organizations.ts` — organization listing
+- `lib/api/memories.ts` — memory CRUD
+- `lib/api/auth-sessions.ts` — auth session management (list, revoke, change password)
+
+The axios client (`apiClient`) is in `core.ts` with `baseURL = VITE_API_URL`. Bearer token attached via request interceptor (`setJwtAccessToken` from `useAuthStore`); CSRF token auto-attached to POST/PUT/PATCH/DELETE with 403 retry; 401 → silent refresh with backoff.
+
+Prefer **options-object signatures** for functions with optional params (e.g. `listDocuments(options: ListDocumentsOptions)`), not long positional lists.
+
+Export shared types/interfaces (`Document`, `Tag`, `Vault`, `ChatSession`, etc.) from `lib/api/core.ts` (re-exported from `index.ts`). **IDs from the API are typed as declared there** — `Document.id` is a `string`; tag/vault ids are `number`. Match these exactly.
 
 ### Components, state, routing
 - Pages compose **local hooks + feature components** (the DocumentsPage pattern: `useDocumentPolling`/`useBulkSelection` + `<DocumentTable/>`/`<TagFilter/>`). Keep pages as slim orchestrators.
