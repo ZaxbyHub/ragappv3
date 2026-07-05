@@ -635,7 +635,7 @@ async def create_org_invite(
         invitee_cursor = await asyncio.to_thread(
             conn.execute,
             "SELECT role FROM users WHERE username = ? COLLATE NOCASE",
-            (req.email,),
+            (req.email.lower(),),
         )
         invitee_row = await asyncio.to_thread(invitee_cursor.fetchone)
         if invitee_row:

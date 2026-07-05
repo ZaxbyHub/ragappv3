@@ -228,7 +228,7 @@ class TestCreateInvite:
             headers=auth_headers(admin_token),
         )
         assert response.status_code == 400
-        assert "viewer role" in response.json()["detail"].lower()
+        assert "global role below member" in response.json()["detail"].lower()
 
     def test_admin_can_invite_member_user(self, client):
         """Admin can invite an existing member user (201)."""

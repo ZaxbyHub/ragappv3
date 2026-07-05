@@ -1,11 +1,13 @@
 """Regression tests for issue #300: Onboarding hardening.
 
-Covers three independent fixes:
+Covers the changes in this PR:
 1. POST /api/auth/register rejects with 403 when users_enabled=False (auth.py).
-2. POST /api/users/ create_user sets must_change_password=1 (users.py).
-3. POST /api/organizations/{org_id}/invites rejects viewers at creation time
+2. POST /api/organizations/{org_id}/invites rejects viewers at creation time
    with a clear 400 instead of creating a permanently dead-end invite
    (organizations.py).
+
+Note: The must_change_password=1 fix in users.py was delivered separately
+by PR #316 and is not part of this PR.
 """
 
 import os

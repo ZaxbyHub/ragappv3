@@ -222,7 +222,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_username_too_short_when_users_disabled(self):
         """1-char username with users_enabled=False should still 403."""
@@ -234,7 +234,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_exactly_3_chars_username_when_users_disabled(self):
         """Exactly 3-char username (boundary) with users_enabled=False should still 403."""
@@ -246,7 +246,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_missing_username_when_users_disabled(self):
         """Missing username field → Pydantic validation 422 BEFORE guard (correct behavior)."""
@@ -335,7 +335,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
                 403,
                 f"SQL injection '{payload[:20]}...' should be rejected with 403, got {response.status_code}",
             )
-            self.assertEqual(response.json()["detail"], "Registration disabled")
+            self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_path_traversal_in_username_when_users_disabled(self):
         """Path traversal in username with users_enabled=False should still 403."""
@@ -416,7 +416,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_zero_width_chars_in_username_when_users_disabled(self):
         """Zero-width characters in username with users_enabled=False should still 403."""
@@ -430,7 +430,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_emoji_in_username_when_users_disabled(self):
         """Emoji in username with users_enabled=False should still 403."""
@@ -467,7 +467,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_auth_bypass_via_x_original_url_when_disabled(self):
         """X-Original-URL cannot enable registration when users_enabled=False."""
@@ -480,7 +480,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_auth_bypass_via_x_http_method_override_when_disabled(self):
         """X-HTTP-Method-Override cannot enable registration when users_enabled=False."""
@@ -579,7 +579,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_exactly_max_length_password_when_disabled(self):
         """Password exactly at max_length (128) with users_enabled=False should 403."""
@@ -592,7 +592,7 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_whitespace_only_username_when_disabled(self):
         """Whitespace-only username with users_enabled=False should still 403."""
