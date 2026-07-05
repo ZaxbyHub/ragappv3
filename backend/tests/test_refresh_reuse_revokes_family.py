@@ -111,6 +111,12 @@ class TestRefreshReuseRevokesFamily(unittest.TestCase):
 
         self.app = main_app
 
+        # Ensure users_enabled is True for this test class, regardless of
+        # the settings singleton state inherited from other test modules.
+        from app.config import settings
+        self._original_users_enabled = settings.users_enabled
+        settings.users_enabled = True
+
     def tearDown(self):
         """Clean up after each test."""
         # Clear dependency overrides
@@ -118,6 +124,10 @@ class TestRefreshReuseRevokesFamily(unittest.TestCase):
 
         # Close the test pool
         self.test_pool.close_all()
+
+        # Restore users_enabled setting
+        from app.config import settings
+        settings.users_enabled = self._original_users_enabled
 
         # Clean up temp directory
         import shutil
