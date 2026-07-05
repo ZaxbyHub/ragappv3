@@ -132,6 +132,7 @@ class TestSupersedesColumnCache(unittest.IsolatedAsyncioTestCase):
 
         # Reset the mock to track new calls
         mock_conn.execute.reset_mock()
+        mock_conn.execute.side_effect = [mock_cursor_query]
 
         # Second call - should use cache, not call PRAGMA again
         await engine._check_supersession(sources)
