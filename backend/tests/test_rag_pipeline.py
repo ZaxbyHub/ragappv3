@@ -50,6 +50,7 @@ except ImportError:
 
 from app.services.rag_engine import RAGEngine
 from app.services.reranking import RerankingService
+from app.utils.fusion import rrf_fuse
 
 
 class FakeEmbeddingService:
@@ -447,74 +448,87 @@ class TestHybridSearch(unittest.TestCase):
         """Test Reciprocal Rank Fusion (RRF) combines dense and FTS results."""
         # Simulate dense search results (with _distance)
         dense_results = [
-            {"text": "Dense result 1", "_distance": 0.1, "file_id": "d1"},
-            {"text": "Dense result 2", "_distance": 0.2, "file_id": "d2"},
-            {"text": "Dense result 3", "_distance": 0.3, "file_id": "d3"},
+            {"id": "d1", "text": "Dense result 1", "_distance": 0.1, "file_id": "d1"},
+            {"id": "d2", "text": "Dense result 2", "_distance": 0.2, "file_id": "d2"},
+            {"id": "d3", "text": "Dense result 3", "_distance": 0.3, "file_id": "d3"},
         ]
 
         # Simulate FTS results (with score)
         fts_results = [
-            {"text": "FTS result 1", "score": 0.9, "file_id": "f1"},
-            {"text": "Dense result 1", "_distance": 0.1, "file_id": "d1"},  # Overlap!
-            {"text": "FTS result 2", "score": 0.8, "file_id": "f2"},
+            {"id": "f1", "text": "FTS result 1", "score": 0.9, "file_id": "f1"},
+            {"id": "d1", "text": "Dense result 1", "_distance": 0.1, "file_id": "d1"},  # Overlap via id
+            {"id": "f2", "text": "FTS result 2", "score": 0.8, "file_id": "f2"},
         ]
 
-        # RRF fusion: score = 1/(rank_dense + 1) + 1/(rank_fts + 1)
-        # d1: 1/(0+1) + 1/(1+1) = 1.5
-        # f1: 1/(3+1) + 1/(0+1) = 1.25
-        # d2: 1/(1+1) + 1/(3+1) = 1.0
-        # f2: 1/(3+1) + 1/(2+1) = 0.583
-        # d3: 1/(2+1) + 0 = 0.333
+        # Call the real rrf_fuse function
+        fused = rrf_fuse([dense_results, fts_results], k=60, limit=10)
 
-        # Create hybrid results with both score types
-        hybrid_results = []
-        seen_ids = set()
+        # Verify we have 5 results: d1 (overlap, deduplicated), d2, d3, f1, f2
+        self.assertEqual(len(fused), 5)
 
-        # Add dense results first
-        for i, r in enumerate(dense_results):
-            hybrid_results.append(r.copy())
-            seen_ids.add(r["file_id"])
+        # Verify d1 appears (overlap case)
+        ids = [r["id"] for r in fused]
+        self.assertIn("d1", ids)
 
-        # Add FTS results that aren't already in
-        for r in fts_results:
-            if r["file_id"] not in seen_ids:
-                hybrid_results.append(r.copy())
-                seen_ids.add(r["file_id"])
+        # Verify ordering: fused results sorted by _rrf_score descending
+        scores = [r["_rrf_score"] for r in fused]
+        self.assertEqual(scores, sorted(scores, reverse=True))
 
-        # Verify we have combined results
-        self.assertEqual(len(hybrid_results), 5)  # d1, d2, d3, f1, f2
+        # d1: rank_dense=0, rank_fts=1 → 1/(60+0+1) + 1/(60+1+1) ≈ 0.01639 + 0.01613
+        # f1: rank_dense=3, rank_fts=0 → 1/(60+3+1) + 1/(60+0+1) ≈ 0.01563 + 0.01639
+        # d2: rank_dense=1, rank_fts=3 → 1/(60+1+1) + 1/(60+3+1) ≈ 0.01613 + 0.01563
+        # d3: rank_dense=2, rank_fts=None → 1/(60+2+1) = 0.01587
+        d1_score = next(r["_rrf_score"] for r in fused if r["id"] == "d1")
+        self.assertGreater(d1_score, 0.0)
 
     def test_rrf_fusion_with_overlapping_results(self):
         """Test RRF handles overlapping results from dense and FTS."""
-        # Both search methods return the same top result
+        # Both search methods return the same top result (identified by id)
         dense_results = [
-            {"text": "Best match", "_distance": 0.05, "file_id": "same"},
+            {"id": "same", "text": "Best match", "_distance": 0.05, "file_id": "same"},
         ]
 
         fts_results = [
-            {"text": "Best match", "score": 0.95, "file_id": "same"},
+            {"id": "same", "text": "Best match", "score": 0.95, "file_id": "same"},
         ]
 
-        # RRF score for overlapping result:
-        # rank_dense=0, rank_fts=0
-        # score = 1/(0+1) + 1/(0+1) = 2.0
+        fused = rrf_fuse([dense_results, fts_results], k=60, limit=10)
 
-        self.assertEqual(len(dense_results), 1)
-        self.assertEqual(len(fts_results), 1)
-        self.assertEqual(dense_results[0]["file_id"], fts_results[0]["file_id"])
+        # Should have 1 result (deduplicated)
+        self.assertEqual(len(fused), 1)
+        self.assertEqual(fused[0]["id"], "same")
+
+        # RRF score: rank_dense=0, rank_fts=0 → 1/(60+0+1) + 1/(60+0+1) = 2/(61)
+        expected_score = 2.0 / 61.0
+        self.assertAlmostEqual(fused[0]["_rrf_score"], expected_score, places=5)
 
     def test_rrf_fusion_no_overlap(self):
         """Test RRF when dense and FTS results don't overlap."""
         dense_results = [
-            {"text": "Dense only", "_distance": 0.1, "file_id": "dense_only"},
+            {"id": "dense_only", "text": "Dense only", "_distance": 0.1, "file_id": "dense_only"},
         ]
 
         fts_results = [
-            {"text": "FTS only", "score": 0.9, "file_id": "fts_only"},
+            {"id": "fts_only", "text": "FTS only", "score": 0.9, "file_id": "fts_only"},
         ]
 
-        # No overlap - each result gets only one component of RRF
-        self.assertNotEqual(dense_results[0]["file_id"], fts_results[0]["file_id"])
+        fused = rrf_fuse([dense_results, fts_results], k=60, limit=10)
+
+        # Both results should appear (no deduplication needed)
+        self.assertEqual(len(fused), 2)
+
+        ids = {r["id"] for r in fused}
+        self.assertIn("dense_only", ids)
+        self.assertIn("fts_only", ids)
+
+        # Each gets score from only one list:
+        # dense_only: rank=0 → 1/(60+0+1) = 1/61
+        # fts_only: rank=0 → 1/(60+0+1) = 1/61
+        # Both should have the same score since each appears in only one list at rank 0
+        dense_score = next(r["_rrf_score"] for r in fused if r["id"] == "dense_only")
+        fts_score = next(r["_rrf_score"] for r in fused if r["id"] == "fts_only")
+        self.assertAlmostEqual(dense_score, fts_score, places=5)
+        self.assertAlmostEqual(dense_score, 1.0 / 61.0, places=5)
 
 
 class TestRAGEnginePipeline(unittest.IsolatedAsyncioTestCase):

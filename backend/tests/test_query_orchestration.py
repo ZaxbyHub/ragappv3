@@ -433,7 +433,7 @@ async def test_multi_sub_query_orchestration_runs_per_sub_query(patched_settings
     fake_vs.reset()
 
     # Directly call _orchestrate_sub_query_retrieval to bypass DB access
-    vector_results, fusion_applied, failed, score_type, rel_hint = (
+    vector_results, fusion_applied, failed, score_type, rel_hint, rerank_success, hybrid_status, rerank_status = (
         await engine._orchestrate_sub_query_retrieval(
             plan=plan,
             vault_id=1,
@@ -469,7 +469,7 @@ async def test_multi_sub_query_fusion_used_flag_true(patched_settings_fixture):
 
     engine = _make_engine(fake_emb, fake_vs, fake_llm, fake_mem)
 
-    vector_results, fusion_applied, failed, score_type, rel_hint = (
+    vector_results, fusion_applied, failed, score_type, rel_hint, rerank_success, hybrid_status, rerank_status = (
         await engine._orchestrate_sub_query_retrieval(
             plan=plan,
             vault_id=1,
@@ -517,7 +517,7 @@ async def test_single_sub_query_orchestration_fusion_used_false(patched_settings
     # results). The fusion_applied flag in the return value will be True.
     # But when called through query(), len(plan) > 1 is False so the standard
     # single-query path is used with fusion_used=False in the trace.
-    vector_results, fusion_applied, failed, score_type, rel_hint = (
+    vector_results, fusion_applied, failed, score_type, rel_hint, rerank_success, hybrid_status, rerank_status = (
         await engine._orchestrate_sub_query_retrieval(
             plan=plan,  # Single item
             vault_id=1,
@@ -566,7 +566,7 @@ async def test_failing_sub_query_degraded_fusion(patched_settings_fixture):
 
     engine = _make_engine(fake_emb, fake_vs, fake_llm, fake_mem)
 
-    vector_results, fusion_applied, failed, score_type, rel_hint = (
+    vector_results, fusion_applied, failed, score_type, rel_hint, rerank_success, hybrid_status, rerank_status = (
         await engine._orchestrate_sub_query_retrieval(
             plan=plan,
             vault_id=1,
@@ -613,7 +613,7 @@ async def test_all_sub_queries_fail_falls_back_to_single_query(patched_settings_
 
     engine = _make_engine(fake_emb, fake_vs, fake_llm, fake_mem)
 
-    vector_results, fusion_applied, failed, score_type, rel_hint = (
+    vector_results, fusion_applied, failed, score_type, rel_hint, rerank_success, hybrid_status, rerank_status = (
         await engine._orchestrate_sub_query_retrieval(
             plan=plan,
             vault_id=1,
@@ -697,7 +697,7 @@ async def test_multi_sub_query_rrf_fused_order_matches_hand_computed(patched_set
     engine = _make_engine(fake_emb, fake_vs, fake_llm, fake_mem)
     fake_vs.reset()
 
-    vector_results, fusion_applied, failed, score_type, rel_hint = (
+    vector_results, fusion_applied, failed, score_type, rel_hint, rerank_success, hybrid_status, rerank_status = (
         await engine._orchestrate_sub_query_retrieval(
             plan=plan,
             vault_id=1,
@@ -813,7 +813,7 @@ async def test_failing_sub_query_records_failed_list(patched_settings_fixture):
 
     engine = _make_engine(fake_emb, fake_vs, fake_llm, fake_mem)
 
-    vector_results, fusion_applied, failed, score_type, rel_hint = (
+    vector_results, fusion_applied, failed, score_type, rel_hint, rerank_success, hybrid_status, rerank_status = (
         await engine._orchestrate_sub_query_retrieval(
             plan=plan,
             vault_id=1,
@@ -912,7 +912,7 @@ async def test_orchestration_fused_result_capped_at_retrieval_top_k(patched_sett
     engine.retrieval_top_k = 10
     fake_vs.reset()
 
-    vector_results, fusion_applied, failed, score_type, rel_hint = (
+    vector_results, fusion_applied, failed, score_type, rel_hint, rerank_success, hybrid_status, rerank_status = (
         await engine._orchestrate_sub_query_retrieval(
             plan=plan,
             vault_id=1,

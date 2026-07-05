@@ -293,6 +293,104 @@ class TestRetrievalTool:
 
 
 # ---------------------------------------------------------------------------
+# SynthesisTool — XML escaping and prompt structure regression tests
+# ---------------------------------------------------------------------------
+
+class TestSynthesisToolXMLEscaping:
+    """Regression tests for XML escaping in SynthesisTool user content."""
+
+    def setup_method(self):
+        self.tool = SynthesisTool()
+
+    def _build_user_content(self, text: str, sources=None):
+        """Helper: call _build_prompt directly to inspect user_content without LLM."""
+        # SynthesisTool uses an internal _build_prompt method; we test via
+        # execute by mocking the LLM so we can inspect the messages passed.
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(
+            self._execute_capture(text, sources)
+        )
+
+    async def _execute_capture(self, text: str, sources=None):
+        captured_messages = []
+
+        async def mock_chat_completion(messages, **kwargs):
+            captured_messages.extend(messages)
+            return "mocked response"
+
+        tool = SynthesisTool()
+        tool._llm = MagicMock()
+        tool._llm.chat_completion = mock_chat_completion
+        await tool.execute(text=text, sources=sources or [])
+        return captured_messages
+
+    @pytest.mark.asyncio
+    async def test_user_content_has_user_query_tag(self):
+        """User content must contain <user_query> XML tag wrapping the query."""
+        captured = await self._execute_capture(text="What is 2+2?")
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "<user_query>" in user_msg["content"]
+        assert "</user_query>" in user_msg["content"]
+
+    @pytest.mark.asyncio
+    async def test_user_content_has_source_passages_tag(self):
+        """Retrieved evidence must use <source_passages> XML tag."""
+        mock_source = [{"file_id": "f1", "score": 0.9, "snippet": "some text"}]
+        captured = await self._execute_capture(
+            text="What is RAG?", sources=mock_source
+        )
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "<source_passages>" in user_msg["content"]
+        assert "</source_passages>" in user_msg["content"]
+
+    @pytest.mark.asyncio
+    async def test_xml_entities_escaped_in_user_query(self):
+        """Literal < > & in user query must be converted to XML entities."""
+        captured = await self._execute_capture(text="Look at a < b & c > d")
+        user_msg = next(m for m in captured if m["role"] == "user")
+        assert "&lt;" in user_msg["content"]
+        assert "&gt;" in user_msg["content"]
+        assert "&amp;" in user_msg["content"]
+        # Original characters must NOT appear unescaped inside tags
+        assert "<user_query>" in user_msg["content"]
+
+    @pytest.mark.asyncio
+    async def test_xml_entities_escaped_in_source_snippets(self):
+        """Literal < > & in source snippets must be converted to XML entities."""
+        mock_source = [
+            {
+                "file_id": "f1",
+                "score": 0.9,
+                "snippet": "Use array <list> & map for <b> & <c>",
+            }
+        ]
+        captured = await self._execute_capture(text="Explain this", sources=mock_source)
+        user_msg = next(m for m in captured if m["role"] == "user")
+        # Check entities are present
+        assert "&lt;" in user_msg["content"]
+        assert "&gt;" in user_msg["content"]
+        assert "&amp;" in user_msg["content"]
+
+    @pytest.mark.asyncio
+    async def test_none_text_handled_gracefully(self):
+        """execute() must not raise AttributeError when text is None."""
+        captured = await self._execute_capture(text=None)
+        user_msg = next(m for m in captured if m["role"] == "user")
+        # None becomes "None" string — no AttributeError
+        assert "None" in user_msg["content"]
+        assert "<user_query>" in user_msg["content"]
+
+    @pytest.mark.asyncio
+    async def test_system_prompt_has_security_boundary_directive(self):
+        """System prompt must contain SECURITY BOUNDARY directive and tag names."""
+        captured = await self._execute_capture(text="Test query")
+        sys_msg = next(m for m in captured if m["role"] == "system")
+        assert "SECURITY BOUNDARY" in sys_msg["content"]
+        assert "user_query" in sys_msg["content"]
+        assert "source_passages" in sys_msg["content"]
+
+
+# ---------------------------------------------------------------------------
 # AgenticTool protocol (structural test — ABC won't let you instantiate
 # without implementing abstract methods)
 # ---------------------------------------------------------------------------

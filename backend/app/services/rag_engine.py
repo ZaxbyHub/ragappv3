@@ -171,6 +171,8 @@ class RAGEngine:
         # db_path enables per-query org-aware prompt resolution without storing
         # a long-lived connection on the engine (connection is acquired per-query).
         self._db_path = db_path or str(settings.sqlite_path)
+        # Cache for supersedes_file_id column existence to avoid repeated PRAGMA probes
+        self._supersedes_column_exists: Optional[bool] = None
 
         # Log warnings for missing dependencies (indicates non-DI usage)
         if embedding_service is None:
@@ -648,6 +650,14 @@ class RAGEngine:
 
         # ------------------------------------------------------------------
         # FR-008: Agentic RAG — route through AgenticPlanner when enabled
+        #
+        # NOTE: When agentic_rag_enabled is True, this branch yields a
+        # simplified response directly from AgenticPlanner and returns
+        # early (line 672). The early return skips:
+        #   - answer_contract enforcement (no structured JSON contract)
+        #   - citation repair (no citation normalization/repair pass)
+        #   - full trace assembly (no extended trace logged to evidence)
+        # Use the standard pipeline below for those features.
         # ------------------------------------------------------------------
         if settings.agentic_rag_enabled:
             logger.info("[query] Agentic RAG enabled — routing through AgenticPlanner")
@@ -1016,6 +1026,9 @@ class RAGEngine:
         _multi_sub_score_type = "distance"
         _multi_sub_relevance_hint: Optional[str] = None
         _multi_sub_sub_queries_failed: List[str] = []
+        _multi_sub_rerank_success: Optional[bool] = None
+        _multi_sub_hybrid_status: str = "disabled"
+        _multi_sub_rerank_status: str = "disabled"
         if len(plan) > 1:
             try:
                 (
@@ -1024,6 +1037,9 @@ class RAGEngine:
                     sub_queries_failed,
                     score_type,
                     relevance_hint,
+                    rerank_success,
+                    hybrid_status,
+                    rerank_status,
                 ) = await self._orchestrate_sub_query_retrieval(
                     plan=plan,
                     vault_id=vault_id,
@@ -1040,6 +1056,9 @@ class RAGEngine:
                 _multi_sub_score_type = score_type
                 _multi_sub_relevance_hint = relevance_hint
                 _multi_sub_sub_queries_failed = sub_queries_failed or []
+                _multi_sub_rerank_success = rerank_success
+                _multi_sub_hybrid_status = hybrid_status
+                _multi_sub_rerank_status = rerank_status
                 trace.fusion_used = fusion_applied
                 if sub_queries_failed:
                     logger.info(
@@ -1063,7 +1082,7 @@ class RAGEngine:
             trace.fused_hits = len(_multi_sub_query_results)
             trace.fts_status = "disabled"
             trace.fts_exceptions = 0
-            trace.rerank_status = "disabled"
+            trace.rerank_status = _multi_sub_rerank_status
             trace.variants_dropped = list(_multi_sub_sub_queries_failed)
             trace.exact_match_promoted = False
             trace.token_pack_included = 0
@@ -1072,9 +1091,12 @@ class RAGEngine:
             vector_results = _multi_sub_query_results
             score_type = _multi_sub_score_type
             relevance_hint = _multi_sub_relevance_hint
+            # Multi-sub-query fusion is treated as CONFIDENT by design: RRF fusion
+            # already combines evidence from multiple query angles, so NO_MATCH
+            # synthesis is not expected for decomposed queries.
             eval_result = "CONFIDENT"
-            rerank_success = None
-            hybrid_status = "disabled"
+            rerank_success = _multi_sub_rerank_success
+            hybrid_status = _multi_sub_hybrid_status
             fts_exceptions = 0
             exact_match_promoted = False
             token_pack_stats = {
@@ -1480,7 +1502,7 @@ class RAGEngine:
         effective_reranker_top_n: int,
         active_client: Optional[Any],
         mode: Optional[Any],
-    ) -> Tuple[List[Dict[str, Any]], bool, List[str], str, Optional[str]]:
+    ) -> Tuple[List[Dict[str, Any]], bool, List[str], str, Optional[str], Optional[bool], str, str]:
         """Dispatch independent retrieval for each sub-query and fuse via RRF.
 
         Called when ``len(plan) > 1`` after query planning (FR-002 part 1).
@@ -1501,9 +1523,14 @@ class RAGEngine:
 
         Returns:
             Tuple of (fused_vector_results, fusion_applied, failed_sub_queries,
-            score_type, relevance_hint). ``fusion_applied`` is True when RRF
-            was applied; False when falling back to single-query retrieval.
+            score_type, relevance_hint, rerank_success, hybrid_status,
+            rerank_status). ``fusion_applied`` is True when RRF was applied;
+            False when falling back to single-query retrieval.
             ``failed_sub_queries`` lists sub-query strings that failed.
+            ``rerank_success`` is True if any sub-query had rerank_success=True.
+            ``hybrid_status`` is the most-enabled hybrid status across sub-queries.
+            ``rerank_status`` is "ok" if any sub-query had "ok", else "fallback"
+            if any had "fallback", else "disabled".
         """
         logger.info(
             "[_orchestrate_sub_query_retrieval] %d sub-queries to orchestrate",
@@ -1582,7 +1609,7 @@ class RAGEngine:
                 active_client=active_client,
                 mode=mode,
             )
-            return vector_results, False, failed_sub_queries, score_type, relevance_hint
+            return vector_results, False, failed_sub_queries, score_type, relevance_hint, rerank_success, hybrid_status, rerank_status
 
         # Phase 2: Run retrieval for each sub-query independently.
         retrieval_tasks: List[Tuple[str, asyncio.Task]] = []
@@ -1598,6 +1625,7 @@ class RAGEngine:
                     override_reranker_top_n=effective_reranker_top_n,
                     active_client=active_client,
                     mode=mode,
+                    skip_evaluation=True,
                 )
             )
             retrieval_tasks.append((sq, task))
@@ -1652,7 +1680,7 @@ class RAGEngine:
                 active_client=active_client,
                 mode=mode,
             )
-            return vector_results, False, failed_sub_queries, score_type, relevance_hint
+            return vector_results, False, failed_sub_queries, score_type, relevance_hint, rerank_success, hybrid_status, rerank_status
 
         # Phase 3: RRF fusion of per-sub-query results (k=60, uniform weights).
         # Deduplicate by (file_id, text) after fusion.
@@ -1694,7 +1722,34 @@ class RAGEngine:
             score_type = first_result[4] if len(first_result) > 4 else "distance"
             relevance_hint = first_result[1] if len(first_result) > 1 else None
 
-        return deduped, True, failed_sub_queries, score_type, relevance_hint
+        # Aggregate rerank_success, hybrid_status, and rerank_status from sub-queries.
+        # rerank_success: True if ANY sub-query had rerank_success=True (index 3).
+        # hybrid_status: most "enabled" value across sub-queries (index 5).
+        # rerank_status: "ok" if any sub-query had "ok", else "fallback", else "disabled".
+        agg_rerank_success: Optional[bool] = None
+        agg_hybrid_status: str = "disabled"
+        agg_rerank_status: str = "disabled"
+        for result in gathered:
+            if isinstance(result, BaseException) or not result:
+                continue
+            # index 3: rerank_success
+            rs = result[3] if len(result) > 3 else None
+            if rs is True:
+                agg_rerank_success = True
+            # index 5: hybrid_status
+            hs = result[5] if len(result) > 5 else "disabled"
+            if hs == "both" and agg_hybrid_status != "both":
+                agg_hybrid_status = "both"
+            elif hs == "dense_only" and agg_hybrid_status == "disabled":
+                agg_hybrid_status = "dense_only"
+            # index 7: rerank_status
+            rrs = result[7] if len(result) > 7 else "disabled"
+            if rrs == "ok":
+                agg_rerank_status = "ok"
+            elif rrs == "fallback" and agg_rerank_status == "disabled":
+                agg_rerank_status = "fallback"
+
+        return deduped, True, failed_sub_queries, score_type, relevance_hint, agg_rerank_success, agg_hybrid_status, agg_rerank_status
 
     async def _execute_retrieval(
         self,
@@ -1707,6 +1762,7 @@ class RAGEngine:
         override_reranker_top_n: Optional[int] = None,
         active_client: Optional[LLMClient] = None,
         mode: Optional["ChatMode"] = None,
+        skip_evaluation: bool = False,
     ) -> tuple[List[Dict[str, Any]], Optional[str], str, Optional[bool], str, str, int, str, List[str], bool, Dict[str, int]]:
         """Execute vector search and retrieval evaluation.
 
@@ -2053,6 +2109,7 @@ class RAGEngine:
                     settings.retrieval_evaluation_enabled
                     and active_client is not None
                     and not skip_retrieval_evaluation
+                    and not skip_evaluation
                 ):
                     try:
                         evaluator_key = id(active_client)
@@ -2490,19 +2547,36 @@ class RAGEngine:
         file_ids = list({src.file_id for src in sources if src.file_id})
         if not file_ids:
             return None
+
+        # Use cached column existence check to avoid repeated PRAGMA probes
+        if self._supersedes_column_exists is None:
+
+            def _probe() -> bool:
+                pool = _get_pool()
+                with pool.connection() as conn:
+                    cursor = conn.execute("PRAGMA table_info(files)")
+                    columns = {row[1] for row in cursor.fetchall()}
+                    return "supersedes_file_id" in columns
+
+            try:
+                self._supersedes_column_exists = await asyncio.to_thread(_probe)
+            except Exception as exc:
+                logger.warning(
+                    "Supersession probe failed (suppressed): %s", exc
+                )
+                self._supersedes_column_exists = False
+
+        if not self._supersedes_column_exists:
+            logger.debug(
+                "Supersession check skipped: supersedes_file_id column not in files table"
+            )
+            return None
+
         try:
 
             def _query() -> list:
                 pool = _get_pool()
                 with pool.connection() as conn:
-                    # Check if supersedes_file_id column exists in files table
-                    cursor = conn.execute("PRAGMA table_info(files)")
-                    columns = {row[1] for row in cursor.fetchall()}
-                    if "supersedes_file_id" not in columns:
-                        logger.debug(
-                            "Supersession check skipped: supersedes_file_id column not in files table"
-                        )
-                        return []
 
                     placeholders = ",".join("?" * len(file_ids))
                     sql = (
