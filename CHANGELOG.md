@@ -94,6 +94,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Configuration and installation docs now align with the current Harrier TEI embedding service, 9090 backend port, 3000 frontend dev port, and thinking/instant model defaults.
 - Docker Compose defaults now match runtime retrieval defaults: `PARENT_RETRIEVAL_ENABLED=true` and `PER_DOC_CHUNK_CAP=5`.
 - Docker Compose and `.env.example` CORS defaults now preserve both Vite dev (`http://localhost:5173`) and frontend dev (`http://localhost:3000`) origins.
+- **Frontend API client refactored into per-domain modules (issue #295)**: monolithic `frontend/src/lib/api.ts` (2372 lines) split into 15 per-domain modules under `frontend/src/lib/api/`: `core.ts` (shared axios client, interceptors, types, document CRUD), `tags.ts`, `folders.ts`, `sessions.ts` (SSE streaming + chat sessions), `groups.ts`, `users.ts`, `vault-groups.ts`, `wiki.ts`, `kms.ts`, `health.ts`, `settings.ts`, `vaults.ts`, `organizations.ts`, `memories.ts`, `auth-sessions.ts`. Barrel `index.ts` re-exports all modules, preserving the `@/lib/api` import path and `export default apiClient` contract. All ~85 exports preserved; no behavioral changes.
 
 ### Fixed
 
