@@ -3,8 +3,7 @@
 This module provides the :class:`AgenticPlanner` which wraps a
 :class:`~app.services.agentic_tools.ToolRegistry` and alternates between
 retrieval rounds and LLM-guided reasoning, bounded by ``max_rounds``.
-It is fully self-contained and does **not** import from or wire into
-``RAGEngine.query``.
+It is wired into ``RAGEngine.query`` behind ``settings.agentic_rag_enabled``.
 """
 
 from __future__ import annotations
