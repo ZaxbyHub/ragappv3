@@ -17,6 +17,7 @@ The authoritative testing policy and conventions live in
 ## Policy (summary)
 
 - New behavior ships with tests. For a bug fix, add a failing reproduction test, then make it pass.
+- **Feature gate / optional dependency removal:** when removing a gate, scan for old assertions. See `docs/engineering/testing.md` → "Feature gate / optional dependency removal checklist".
 - Assert real behavior: backend → status **+** body **+** DB state change; frontend → callback args / DOM, not just "it rendered".
 - Cover negative paths (403/422, cross-vault isolation, cascade deletes, error branches). Security-sensitive code has `*_adversarial` companion tests.
 - No test theater — a test must exercise what its name claims. See "Test must exercise what its name claims" below.

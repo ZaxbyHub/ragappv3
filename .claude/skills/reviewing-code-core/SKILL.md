@@ -56,6 +56,7 @@ Check for:
 - tests that assert existence instead of behavior
 - comments, release notes, or docstrings that overstate what exists
 - polished scaffolding around missing behavior
+- for renamed routes, paths, or public models, confirm the consumer coupling surface: router import only (compatible) vs. model/path import (breaking)
 
 ### Phase 4 — Run AI-slop checks
 Check for:
