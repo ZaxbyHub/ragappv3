@@ -67,6 +67,24 @@ Canonical examples: `frontend/src/tests/documents-organization.test.tsx`, `front
 
 ---
 
+### Feature gate / optional dependency removal checklist
+
+When you remove or change a feature gate, optional dependency, or
+install-presence check, scan all test files for assertions that codify the
+old gate behavior:
+
+- `grep -rl "<gate-symbol>" backend/tests/` — e.g. `ragas`, the feature-flag name
+- `grep -rl "<endpoint-path>" backend/tests/` — e.g. `/eval/ragas`
+- `grep -rl "<feature-flag-env>" backend/tests/` — e.g. `EVAL_ENABLED`
+
+Update or remove tests that assert the removed gate; add tests that verify
+the new behavior.
+
+**Canonical anti-pattern:** `backend/tests/test_eval_feature_gate.py` asserted
+`import ragas` behavior that was removed in issue #283.
+
+---
+
 ## 4. What CI runs vs. what you should run
 
 CI (`.github/workflows/ci.yml`) runs the full suite:

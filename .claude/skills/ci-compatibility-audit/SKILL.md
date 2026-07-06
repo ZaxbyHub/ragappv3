@@ -124,6 +124,23 @@ Then run the full suite before pushing.
   `Select`, virtualized lists): see `references/frontend-testing-gotchas.md`
   for the repo's established mock patterns before improvising.
 
+### Cross-platform evidence-write fallback
+
+Some automated QA gates write evidence to `.swarm/evidence/`; on Windows these
+writes can fail with "parent directory already contains a .swarm/ folder" or
+similar path errors. When this happens, the local run is not a valid CI signal;
+do not treat the gate failure as a code defect.
+
+Fallback protocol:
+1. Run `ruff check .` (backend) or `npm run lint` (frontend) manually.
+2. Run the targeted pytest / vitest commands manually.
+3. If those pass, the code is likely CI-compatible; note the evidence-write
+   failure in the PR description or a comment.
+
+Keep using path-safe operations (e.g., `pathlib.Path`) in any code you write;
+this guidance is about handling pre-existing tooling path issues, not excusing
+sloppy paths.
+
 ## Output
 
 Classify each risk as:

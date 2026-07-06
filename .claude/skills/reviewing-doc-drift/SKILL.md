@@ -26,5 +26,6 @@ Detect claimed features that are not actually shipped, and shipped behavior that
 - security claims map to enforced checks where the privileged action executes
 - compatibility claims map to actual platform-safe behavior
 - breaking changes have migration notes or equivalent guidance
+- for renamed public paths/routes, verify consumers import the router object rather than individual Pydantic models, hardcoded path strings, or named response-model classes; renaming a path is safe when only the mounted router is imported, but breaking if models or paths are imported directly
 - release/changelog scope matches actual changed behavior
 - examples would work if followed literally
