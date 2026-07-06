@@ -232,7 +232,7 @@ class TestAuthRoutes(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertIn("Registration disabled", response.json()["detail"])
+        self.assertIn("User registration is disabled in single-admin mode", response.json()["detail"])
 
     def test_login_success(self):
         """Register then login, verify access_token returned."""

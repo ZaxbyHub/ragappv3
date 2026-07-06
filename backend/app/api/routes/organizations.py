@@ -11,7 +11,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from app.api.deps import require_role
+from app.api.deps import UserRole, require_role
 from app.config import settings
 from app.models.database import get_pool
 from app.security import csrf_protect
@@ -628,20 +628,22 @@ async def create_org_invite(
                 detail="Insufficient privileges. Organization admin or owner required",
             )
 
-        # Check invitee global role
-        cursor = await asyncio.to_thread(
+        # Fail closed: if the invitee exists with a global role below member,
+        # they can never accept the invite (accept_org_invite requires
+        # require_role("member")), so reject at creation time with a clear
+        # message instead of creating a permanently dead-end invite.
+        invitee_cursor = await asyncio.to_thread(
             conn.execute,
             "SELECT role FROM users WHERE username = ? COLLATE NOCASE",
             (req.email.lower(),),
         )
-        invitee_row = await asyncio.to_thread(cursor.fetchone)
+        invitee_row = await asyncio.to_thread(invitee_cursor.fetchone)
         if invitee_row:
-            from app.api.deps import UserRole
-            invitee_role = invitee_row[0]
-            if UserRole.level(invitee_role) < UserRole.level("member"):
+            invitee_level = UserRole.level(invitee_row[0])
+            if invitee_level < UserRole.MEMBER.value:
                 raise HTTPException(
                     status_code=400,
-                    detail="Cannot invite user with viewer role - they cannot accept organization invites",
+                    detail="Cannot invite a user with a global role below member",
                 )
 
         # Generate token

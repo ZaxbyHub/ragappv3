@@ -2,7 +2,7 @@
 Verification tests for the /register endpoint users_enabled guard.
 
 Covers:
-- 403 + "Registration disabled" when users_enabled=False
+- 403 + "User registration is disabled in single-admin mode" when users_enabled=False
 - Happy-path registration when users_enabled=True
 - users_enabled guard fires before other validation (username/password)
 - setup-status reflects users_enabled=False correctly
@@ -129,11 +129,11 @@ class TestRegisterUsersEnabledGuard(unittest.TestCase):
             pass
 
     # -------------------------------------------------------------------------
-    # users_enabled=False → 403 "Registration disabled"
+        # users_enabled=False → 403 "User registration is disabled in single-admin mode"
     # -------------------------------------------------------------------------
 
     def test_register_returns_403_when_users_enabled_false(self):
-        """POST /auth/register with users_enabled=False → 403 + detail 'Registration disabled'."""
+        """POST /auth/register with users_enabled=False → 403 + detail 'User registration is disabled in single-admin mode'."""
         settings.users_enabled = False
 
         response = self.client.post(
@@ -142,7 +142,7 @@ class TestRegisterUsersEnabledGuard(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_register_users_enabled_false_does_not_create_user(self):
         """When users_enabled=False, no user record should be created."""
@@ -174,7 +174,7 @@ class TestRegisterUsersEnabledGuard(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     # -------------------------------------------------------------------------
     # users_enabled=True → registration proceeds normally
@@ -284,7 +284,7 @@ class TestRegisterUsersEnabledGuard(unittest.TestCase):
 
         # Would be 400 "Username must be at least 3 characters" if guard didn't fire first
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_users_enabled_guard_precedes_password_validation(self):
         """users_enabled=False check runs before password strength check."""
@@ -297,7 +297,7 @@ class TestRegisterUsersEnabledGuard(unittest.TestCase):
 
         # Would be 400 if guard didn't short-circuit
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
     def test_users_enabled_guard_precedes_username_uniqueness_check(self):
         """users_enabled=False check runs before duplicate-username check."""
@@ -317,7 +317,7 @@ class TestRegisterUsersEnabledGuard(unittest.TestCase):
 
         # Would be 409 "Username already exists" if guard didn't fire first
         self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["detail"], "Registration disabled")
+        self.assertEqual(response.json()["detail"], "User registration is disabled in single-admin mode")
 
 
 if __name__ == "__main__":
