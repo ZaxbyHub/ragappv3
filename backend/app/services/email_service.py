@@ -105,6 +105,7 @@ class EmailIngestionService:
         """Callback invoked when the polling task finishes — logs unhandled exceptions."""
         if task.cancelled():
             logger.info("Email polling task was cancelled")
+            self._running = False
             return
         exc = task.exception()
         if exc is not None:
@@ -115,12 +116,16 @@ class EmailIngestionService:
             )
             self._running = False
 
-    def stop_polling(self) -> None:
+    async def stop_polling(self) -> None:
         """
         Stop the email ingestion service gracefully.
 
-        Signals the service to shut down. The actual stop is handled
-        asynchronously in the polling loop.
+        Signals the service to shut down and waits for the polling task
+        to complete. If the task does not stop within the timeout, it
+        is cancelled. This mirrors the FileWatcher.stop() pattern so
+        that callers (e.g. lifespan shutdown) can be certain the poller
+        is no longer active before tearing down shared resources (pool,
+        background_processor). The timeout is bounded at 5.0 seconds.
         """
         if not self._running:
             logger.warning("Email ingestion service is not running")
@@ -128,6 +133,24 @@ class EmailIngestionService:
 
         logger.info("Stopping email ingestion service...")
         self._stop_event.set()
+
+        if self._polling_task is not None:
+            try:
+                await asyncio.wait_for(self._polling_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Email polling task did not stop gracefully, cancelling..."
+                )
+                self._polling_task.cancel()
+                try:
+                    await self._polling_task
+                except asyncio.CancelledError:
+                    pass
+            except asyncio.CancelledError:
+                # Propagation from an outer cancellation — let it through.
+                raise
+
+        logger.info("Email ingestion service stopped")
 
     def is_healthy(self) -> bool:
         """
@@ -370,6 +393,25 @@ class EmailIngestionService:
                 logger.warning(
                     f"Email UID {uid} too large ({size_mb:.2f}MB > {max_mb:.2f}MB), skipping"
                 )
+                # Mark the oversized email as \Seen so it is excluded from
+                # subsequent UNSEEN searches. The normal processing path gets
+                # an implicit \Seen from the (RFC822) body fetch (RFC 3501),
+                # but we return before that fetch, so we must set the flag
+                # explicitly here -- otherwise the poller re-selects and
+                # re-skips this email on every cycle indefinitely.
+                for attempt in range(3):
+                    try:
+                        await imap_client.store(uid, '+FLAGS', '\\Seen')
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            continue
+                        logger.warning(
+                            f"Failed to mark oversized email UID {self._sanitize_log_value(uid)} as Seen: {e}"
+                        )
+                        raise OSError(
+                            f"Failed to mark oversized email UID {uid} as Seen after retries"
+                        ) from e
                 return
 
         # Fetch email content

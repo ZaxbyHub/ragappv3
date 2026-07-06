@@ -98,6 +98,7 @@ class FakeIMAPClient:
         self.fetched_uids = []
         self.logged_out = False
         self.emails = {}  # uid -> email data
+        self.stored_flags = {}  # uid -> list of store calls
 
     async def wait_hello_from_server(self):
         return 'OK'
@@ -118,13 +119,18 @@ class FakeIMAPClient:
         if uid in self.emails:
             email_data = self.emails[uid]
             if 'RFC822.SIZE' in parts:
-                len(email_data['content'])
-                return ('OK', [(b'1 (RFC822.SIZE {size})',)])
+                size = len(email_data['content'])
+                return ('OK', [(f'{uid} (RFC822.SIZE {size})'.encode(),)])
             elif 'RFC822' in parts:
                 # Real aioimaplib returns: [(b'uid (RFC822 {size})', b'...email content...')]
                 # where data[0][0] is the response string and data[0][1] is the email bytes
                 return ('OK', [(b'1 (RFC822)', email_data['content'])])
         return ('OK', [])
+
+    async def store(self, uid, *args):
+        """Record a STORE command (e.g. +FLAGS \\Seen) for test assertions."""
+        self.stored_flags.setdefault(uid, []).append(args)
+        return ('OK', None)
 
     async def logout(self):
         self.logged_out = True
@@ -676,7 +682,7 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(self.service._polling_task)
 
             # Stop the service
-            self.service.stop_polling()
+            await self.service.stop_polling()
             # Wait a bit for stop to propagate
             await asyncio.sleep(0.1)
 
@@ -695,7 +701,7 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first_task, second_task)
 
             # Stop the service
-            self.service.stop_polling()
+            await self.service.stop_polling()
             await asyncio.sleep(0.1)
 
     async def test_start_polling_when_disabled(self):
@@ -714,7 +720,7 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_stop_polling_when_not_running(self):
         """Test stop_polling handles not running gracefully."""
         # Should not raise exception
-        self.service.stop_polling()
+        await self.service.stop_polling()
         self.assertFalse(self.service._running)
 
     async def test_stop_polling_sets_stop_event(self):
@@ -725,7 +731,7 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
             await self.service.start_polling()
             self.assertFalse(self.service._stop_event.is_set())
 
-            self.service.stop_polling()
+            await self.service.stop_polling()
             self.assertTrue(self.service._stop_event.is_set())
 
             # Wait a bit for stop to propagate
@@ -837,6 +843,146 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
 
             # Check nothing was enqueued
             self.assertEqual(len(self.background_processor.enqueued), 0)
+
+    async def test_oversized_email_marked_seen(self):
+        """Regression for issue #280 A9-5: oversized email must be marked
+        \\Seen so it is excluded from subsequent UNSEEN searches.
+
+        Before the fix, _process_email returned early after the RFC822.SIZE
+        fetch without setting \\Seen. Since the SIZE fetch does not set the
+        flag (RFC 3501), the poller re-selected and re-skipped the same
+        oversized email on every cycle indefinitely.
+        """
+        from app.services.email_service import MAX_EMAIL_SIZE
+
+        fake_imap = FakeIMAPClient()
+
+        # Build an email whose raw bytes exceed MAX_EMAIL_SIZE
+        large_content = b'x' * (MAX_EMAIL_SIZE + 1024)
+        msg = EmailMessage()
+        msg['Subject'] = 'Big Doc [Vault1]'
+        msg['From'] = 'sender@example.com'
+        msg.set_content('body')
+        msg.add_attachment(
+            large_content,
+            maintype='application',
+            subtype='pdf',
+            filename='huge.pdf',
+        )
+
+        fake_imap.emails = {'1': {'content': msg.as_bytes()}}
+
+        with patch('app.services.email_service.aioimaplib.IMAP4_SSL', return_value=fake_imap):
+            await self.service._process_email(fake_imap, '1')
+
+            # Nothing should have been enqueued
+            self.assertEqual(len(self.background_processor.enqueued), 0)
+
+            # The oversized email MUST have been marked \\Seen
+            self.assertIn('1', fake_imap.stored_flags,
+                          "Oversized email was not marked \\Seen — "
+                          "it will be re-polled indefinitely")
+            store_args = fake_imap.stored_flags['1'][0]
+            self.assertIn('\\Seen', store_args)
+
+    async def test_stop_polling_awaits_task_completion(self):
+        """Regression for issue #280 E2-1: stop_polling must await the
+        polling task (or cancel it on timeout) before returning.
+
+        Before the fix, stop_polling was synchronous and only set the stop
+        event. The polling task could still be mid-poll when the caller
+        proceeded to tear down shared resources (pool, background_processor).
+        """
+        fake_imap = FakeIMAPClient()
+
+        with patch('app.services.email_service.aioimaplib.IMAP4_SSL', return_value=fake_imap):
+            await self.service.start_polling()
+            self.assertTrue(self.service._running)
+            task = self.service._polling_task
+            self.assertIsNotNone(task)
+
+            await self.service.stop_polling()
+
+            # After stop_polling returns, the polling task MUST be done
+            self.assertTrue(task.done(),
+                            "stop_polling returned before the polling task finished")
+            self.assertFalse(self.service._running)
+
+    async def test_oversized_email_store_failure_is_handled(self):
+        """Regression for issue #280 follow-up: if marking an oversized
+        email as \\Seen fails after retries, _process_email must raise
+        OSError so _poll_once can log the failure and continue without
+        getting stuck on the same message.
+        """
+        from app.services.email_service import MAX_EMAIL_SIZE
+
+        fake_imap = FakeIMAPClient()
+        call_count = 0
+
+        async def failing_store(uid, *args):
+            nonlocal call_count
+            call_count += 1
+            raise OSError("IMAP store failed")
+
+        fake_imap.store = failing_store
+
+        large_content = b'x' * (MAX_EMAIL_SIZE + 1024)
+        msg = EmailMessage()
+        msg['Subject'] = 'Big Doc [Vault1]'
+        msg['From'] = 'sender@example.com'
+        msg.set_content('body')
+        msg.add_attachment(
+            large_content,
+            maintype='application',
+            subtype='pdf',
+            filename='huge.pdf',
+        )
+
+        fake_imap.emails = {'1': {'content': msg.as_bytes()}}
+
+        with patch('app.services.email_service.aioimaplib.IMAP4_SSL', return_value=fake_imap):
+            with self.assertRaises(OSError) as ctx:
+                await self.service._process_email(fake_imap, '1')
+
+            self.assertIn("Failed to mark oversized email UID 1 as Seen", str(ctx.exception))
+
+            # store() should have been attempted 3 times
+            self.assertEqual(call_count, 3)
+
+            # Nothing should have been enqueued
+            self.assertEqual(len(self.background_processor.enqueued), 0)
+
+    async def test_stop_polling_timeout_cancels_task(self):
+        """Regression for issue #280 E2-1 follow-up: if the polling task
+        does not stop within the 5s timeout, stop_polling must cancel it
+        and await its completion.
+        """
+        fake_imap = FakeIMAPClient()
+
+        async def hang_forever():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+
+        with patch('app.services.email_service.aioimaplib.IMAP4_SSL', return_value=fake_imap):
+            await self.service.start_polling()
+            self.assertTrue(self.service._running)
+            task = self.service._polling_task
+            self.assertIsNotNone(task)
+
+            # Replace the polling task with one that hangs forever
+            task.cancel()
+            await asyncio.sleep(0)
+            self.service._polling_task = asyncio.create_task(hang_forever())
+            self.service._polling_task.add_done_callback(self.service._on_polling_task_done)
+
+            await self.service.stop_polling()
+
+            # After stop_polling returns, the polling task MUST be done
+            self.assertTrue(self.service._polling_task.done(),
+                            "stop_polling did not cancel/complete the polling task")
+            self.assertFalse(self.service._running)
 
     async def test_process_email_multiple_attachments(self):
         """Test processing email with multiple attachments."""
