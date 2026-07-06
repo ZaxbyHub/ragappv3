@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { useShallow } from "zustand/shallow";
 import type { Source, UsedMemory, WikiReference, KMSReference } from "@/lib/api";
 
 export interface Message {
@@ -244,8 +245,10 @@ export const useMessageIds = () => useChatStore((s) => s.messageIds);
 /** Subscribe to a single message by ID — streaming rows only re-render for their own message. */
 export const useMessage = (id: string) => useChatStore((s) => s.messagesById[id]);
 /** Legacy: full messages array. Triggers re-render when any message changes. */
+// NOTE: In zustand 5, the equalityFn argument to useStore is silently ignored.
+// useShallow (which uses a ref cache inside the selector) replaces the broken shallow+arg pattern.
 export const useChatMessages = () =>
-  useChatStore((s) => s.messageIds.map((id) => s.messagesById[id]));
+  useChatStore(useShallow((s) => s.messageIds.map((id) => s.messagesById[id])));
 export const useChatInput = () => useChatStore((s) => s.input);
 export const useChatIsStreaming = () => useChatStore((s) => s.isStreaming);
 export const useChatInputError = () => useChatStore((s) => s.inputError);
@@ -273,48 +276,56 @@ export const useStreamingMessageContentLength = (): number =>
  * ends or sources change — never on every token chunk.
  */
 export const useLastCompletedAssistantSources = (): Source[] | undefined =>
-  useChatStore((s) => {
-    const streamingId = s.streamingMessageId;
-    for (let i = s.messageIds.length - 1; i >= 0; i--) {
-      const id = s.messageIds[i];
-      if (id === streamingId) continue;
-      const msg = s.messagesById[id];
-      if (msg?.role === "assistant" && msg.sources) return msg.sources;
-    }
-    return undefined;
-  });
+  useChatStore(
+    useShallow((s) => {
+      const streamingId = s.streamingMessageId;
+      for (let i = s.messageIds.length - 1; i >= 0; i--) {
+        const id = s.messageIds[i];
+        if (id === streamingId) continue;
+        const msg = s.messagesById[id];
+        if (msg?.role === "assistant" && msg.sources) return msg.sources;
+      }
+      return undefined;
+    })
+  );
 
 /**
  * Selector returning the wiki refs of the most recent *completed* assistant
  * message. Mirrors useLastCompletedAssistantSources pattern.
  */
 export const useLastCompletedAssistantWikiRefs = (): WikiReference[] | undefined =>
-  useChatStore((s) => {
-    const streamingId = s.streamingMessageId;
-    for (let i = s.messageIds.length - 1; i >= 0; i--) {
-      const id = s.messageIds[i];
-      if (id === streamingId) continue;
-      const msg = s.messagesById[id];
-      if (msg?.role === "assistant" && msg.wikiRefs && msg.wikiRefs.length > 0) return msg.wikiRefs;
-    }
-    return undefined;
-  });
+  useChatStore(
+    useShallow((s) => {
+      const streamingId = s.streamingMessageId;
+      for (let i = s.messageIds.length - 1; i >= 0; i--) {
+        const id = s.messageIds[i];
+        if (id === streamingId) continue;
+        const msg = s.messagesById[id];
+        if (msg?.role === "assistant" && msg.wikiRefs && msg.wikiRefs.length > 0)
+          return msg.wikiRefs;
+      }
+      return undefined;
+    })
+  );
 
 /**
  * Selector returning the KMS refs of the most recent *completed* assistant
  * message. Mirrors useLastCompletedAssistantWikiRefs.
  */
 export const useLastCompletedAssistantKmsRefs = (): KMSReference[] | undefined =>
-  useChatStore((s) => {
-    const streamingId = s.streamingMessageId;
-    for (let i = s.messageIds.length - 1; i >= 0; i--) {
-      const id = s.messageIds[i];
-      if (id === streamingId) continue;
-      const msg = s.messagesById[id];
-      if (msg?.role === "assistant" && msg.kmsRefs && msg.kmsRefs.length > 0) return msg.kmsRefs;
-    }
-    return undefined;
-  });
+  useChatStore(
+    useShallow((s) => {
+      const streamingId = s.streamingMessageId;
+      for (let i = s.messageIds.length - 1; i >= 0; i--) {
+        const id = s.messageIds[i];
+        if (id === streamingId) continue;
+        const msg = s.messagesById[id];
+        if (msg?.role === "assistant" && msg.kmsRefs && msg.kmsRefs.length > 0)
+          return msg.kmsRefs;
+      }
+      return undefined;
+    })
+  );
 
 /** Last user message's content (the active query). */
 export const useLastUserContent = (): string =>
@@ -333,15 +344,17 @@ export const useLastUserContent = (): string =>
  * sources, not the latest message's.
  */
 export const useSourcesForSourceId = (sourceId?: string): Source[] | undefined =>
-  useChatStore((s) => {
-    if (!sourceId) return undefined;
-    for (let i = 0; i < s.messageIds.length; i++) {
-      const msg = s.messagesById[s.messageIds[i]];
-      const found = msg?.sources?.some((src) => src.id === sourceId);
-      if (found) return msg!.sources;
-    }
-    return undefined;
-  });
+  useChatStore(
+    useShallow((s) => {
+      if (!sourceId) return undefined;
+      for (let i = 0; i < s.messageIds.length; i++) {
+        const msg = s.messagesById[s.messageIds[i]];
+        const found = msg?.sources?.some((src) => src.id === sourceId);
+        if (found) return msg!.sources;
+      }
+      return undefined;
+    })
+  );
 
 /**
  * Returns a JSON-encoded array of every completed (non-streaming)
