@@ -226,7 +226,7 @@ describe("CSRF Exports from @/lib/api", () => {
       mockCookies = "X-CSRF-Token=test-token";
       const { attachCsrfInterceptor } = await import("@/lib/api");
 
-      let capturedConfig: Record<string, unknown> | null = null;
+      const capturedConfig: Record<string, unknown> | null;
       const mockInstance = {
         interceptors: {
           request: {
