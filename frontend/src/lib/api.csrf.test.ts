@@ -226,7 +226,6 @@ describe("CSRF Exports from @/lib/api", () => {
       mockCookies = "X-CSRF-Token=test-token";
       const { attachCsrfInterceptor } = await import("@/lib/api");
 
-      let capturedConfig: Record<string, unknown> | null = null;
       const mockInstance = {
         interceptors: {
           request: {
@@ -245,7 +244,7 @@ describe("CSRF Exports from @/lib/api", () => {
       const interceptorFn = (requestUse as any).mock.calls[0][0];
 
       const config = { method: "post", headers: {} };
-      capturedConfig = await interceptorFn(config);
+      const capturedConfig = await interceptorFn(config);
 
       expect(capturedConfig.headers["X-CSRF-Token"]).toBe("test-token");
     });
