@@ -1,10 +1,10 @@
 # docs: capture zustand 5 useShallow and vite/vitest lockfile conventions
 
 ## What changed
-Added a "State selectors and zustand upgrades" section to `docs/engineering/conventions.md` documenting two hard-won lessons from the Phase 5 dependabot cleanup:
+Added a "State selectors and zustand upgrades" section to `docs/engineering/conventions.md` documenting three hard-won lessons from the Phase 5 dependabot cleanup:
 
 - Zustand 5 silently ignores the `equalityFn` second argument to `useStore`; array/object selectors must use `useStore(useShallow(selector))` from `zustand/shallow` to avoid React "Maximum update depth exceeded" loops.
-- Dependency lockfiles must be regenerated with the CI Node/npm version (Node 20/npm 10); newer npm versions generate lockfile metadata that older CI npm rejects.
+- Dependency lockfiles must be regenerated with the same Node release as CI (Node 20.19.0) so the bundled npm version matches CI; newer npm versions generate lockfile metadata that older CI npm rejects.
 - Vitest 4.x requires Vite >= 6; keep the top-level `vite` dependency aligned with the `vitest` range.
 
 ## Why

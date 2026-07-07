@@ -122,8 +122,8 @@ Export shared types/interfaces (`Document`, `Tag`, `Vault`, `ChatSession`, etc.)
 - Styling: Tailwind classes + `cn()` from `lib/utils.ts`; use `formatFileSize`/`formatDate` from `lib/formatters.ts`.
 
 ### State selectors and zustand upgrades
-- Array/object selectors must be stable across renders. In **zustand 5** the `equalityFn` second argument to `useStore(selector, equalityFn)` is silently ignored; use `useStore(useShallow(selector))` from `zustand/shallow` instead. Add a regression test that fails when the broken pattern is present.
-- Verify dependency lockfiles with the CI Node/npm version (Node 20/npm 10). Lockfiles produced by newer npm may be rejected by CI's older npm.
+- Array/object selectors must be stable across renders. In **zustand 5** the `equalityFn` second argument to `useStore(selector, equalityFn)` is silently ignored; use `useStore(useShallow(selector))` from `zustand/shallow` instead. Existing selectors in `frontend/src/stores/` use `useShallow` to avoid unstable references.
+- CI pins Node 20.19.0; regenerate lockfiles with the same Node release so the bundled npm version matches CI. Lockfiles produced by newer npm may be rejected by CI's older npm.
 - Vitest 4.x requires Vite >= 6; keep the top-level `vite` dependency aligned with the `vitest` range.
 
 ### TypeScript & lint
