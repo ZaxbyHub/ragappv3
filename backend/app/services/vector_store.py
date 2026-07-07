@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Literal, Optional, cast
 import lancedb
 import numpy as np
 import pyarrow as pa
+from lancedb.expr import col, lit
 from lancedb.index import FTS, IvfPq
 
 from app.config import settings
@@ -49,18 +50,23 @@ def _lance_escape(value) -> str:
         LanceDB's ``.where()`` method accepts only a string expression, not
         parameter-bound values. Vault IDs are interpolated into filter strings
         like ``f"vault_id = '{safe_vault_id}'"`` at multiple call sites in this
-        module (search, FTS search, delete). Without escaping, a crafted
+        module (search, dense search, delete). Without escaping, a crafted
         vault_id value containing a single quote could break out of the string
         literal and inject arbitrary filter predicates.
 
         This function mitigates that risk by doubling all single quotes,
         following the SQL-standard escaping convention. While LanceDB exposes
-        Expr-based filtering via ``where_expr()``, the ``.where()`` method used
+        Expr-based filtering via ``col()``/``lit()``, the ``.where()`` method used
         throughout this module accepts only string expressions, so string-level
         escaping is the required defense for this call pattern.
 
-    See also: ``_search_single_scale()`` (lines ~811, ~850), ``search()``
-    (lines ~1080, ~1110), ``delete_by_vault()`` (line ~1338) for call sites.
+        FTS search paths have been migrated to use Expr API (``col("vault_id").eq(lit(vault_id))``)
+        at ``_search_single_scale()`` (~line 897) and ``search()`` (~line 1160). Dense arms
+        retain string interpolation as a fallback since ``.where()`` requires a single string
+        predicate and cannot mix Expr objects with user-provided filter strings.
+
+    See also: ``_search_single_scale()`` (dense arm ~line 857), ``search()`` (dense arm ~line 1131),
+    ``delete_by_vault()`` (line ~1385) for remaining call sites.
     """
     return str(value).replace("'", "''")
 
@@ -852,6 +858,9 @@ class VectorStore:
         scale_filter = f"chunk_scale = '{safe_scale}'"
 
         # Combine with vault filter if present
+        # Dense arm fallback: LanceDB's .where() requires a single string predicate;
+        # there is no parameter-binding API for the dense path. The vault_id is
+        # already a string column so integer behaviour is unaffected.
         if vault_id is not None:
             safe_vault_id = _lance_escape(vault_id)
             vault_filter = f"vault_id = '{safe_vault_id}'"
@@ -892,8 +901,10 @@ class VectorStore:
                 fts_query = await self.table.search(query_text, query_type="fts")
                 fts_filter_parts = [scale_filter]
                 if vault_id:
-                    safe_vault_id = _lance_escape(vault_id)
-                    fts_filter_parts.append(f"vault_id = '{safe_vault_id}'")
+                    # Use Expr API for type-safe vault_id filtering instead of
+                    # string interpolation. lit() handles type conversion safely.
+                    # .to_sql() is required before joining with string parts below.
+                    fts_filter_parts.append(col("vault_id").eq(lit(vault_id)).to_sql())
                 if filter_expr:
                     fts_filter_parts.append(f"({filter_expr})")
                 fts_combined_filter = " AND ".join(f"({f})" for f in fts_filter_parts)
@@ -1119,6 +1130,9 @@ class VectorStore:
 
             # Apply vault filter if specified (pure string building — cheap, done
             # once and shared by the dense arm).
+            # Dense arm fallback: LanceDB's .where() requires a single string predicate;
+            # parameter binding is not available for the dense path. The vault_id is
+            # already a string column so integer behaviour is unaffected.
             _filter_expr = filter_expr
             if vault_id is not None:
                 safe_vault_id = _lance_escape(vault_id)
@@ -1151,9 +1165,18 @@ class VectorStore:
                 try:
                     fts_query = await self.table.search(query_text, query_type="fts")
                     if vault_id:
-                        safe_vault_id = _lance_escape(vault_id)
-                        fts_query = fts_query.where(f"vault_id = '{safe_vault_id}'")
-                    if filter_expr:
+                        # Use Expr API for type-safe vault_id filtering instead of
+                        # string interpolation. lit() handles type conversion safely.
+                        # Fallback to string interpolation when filter_expr is also
+                        # present (requires string concatenation).
+                        if filter_expr:
+                            vault_id_filter = col("vault_id").eq(lit(vault_id)).to_sql()
+                            fts_query = fts_query.where(
+                                f"({vault_id_filter}) AND ({filter_expr})"
+                            )
+                        else:
+                            fts_query = fts_query.where(col("vault_id").eq(lit(vault_id)))
+                    elif filter_expr:
                         fts_query = fts_query.where(filter_expr)
                     results = await fts_query.limit(fetch_k).to_list()
                     if results:
