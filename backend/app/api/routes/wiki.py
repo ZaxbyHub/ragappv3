@@ -662,7 +662,14 @@ async def promote_memory_to_wiki(
     store = WikiStore(db)
     compiler = WikiCompiler(db, store)
     try:
-        result = compiler.promote_memory(
+        # Run the synchronous compiler off the event loop. promote_memory does
+        # sync entity extraction + DB writes and, when the curator is enabled,
+        # blocks up to wiki_llm_curator_timeout_sec via the curator offload
+        # executor (issue #276 A6-2). Thread-safe: the request-scoped db
+        # connection is opened with check_same_thread=False and the pool hands
+        # out exclusive connections, matching the to_thread pattern at 531/552.
+        result = await asyncio.to_thread(
+            compiler.promote_memory,
             memory_id=request.memory_id,
             vault_id=request.vault_id,
             page_type=request.page_type,

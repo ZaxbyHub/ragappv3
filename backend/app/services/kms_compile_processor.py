@@ -37,6 +37,10 @@ class KMSCompileProcessor:
         self._pool = pool
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # Strong references to detached background tasks (e.g. delayed
+        # auto-retry resets) so CPython does not garbage-collect them
+        # mid-flight (issue #276 E2-3, mirrors the wiki processor).
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         if self._running:
@@ -54,6 +58,18 @@ class KMSCompileProcessor:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        # Cancel any in-flight detached reset tasks so they do not outlive the
+        # processor (issue #276 E2-3).
+        for bg in list(self._bg_tasks):
+            bg.cancel()
+        for bg in list(self._bg_tasks):
+            try:
+                await bg
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self._bg_tasks.clear()
         logger.info("KMSCompileProcessor stopped")
 
     # ------------------------------------------------------------------
@@ -105,8 +121,14 @@ class KMSCompileProcessor:
                                 "KMSCompileProcessor: job id=%d will auto-retry (%d/%d) in %.0fs",
                                 job.id, new_retry_count, MAX_RETRIES, backoff,
                             )
-                            await asyncio.sleep(backoff)
-                            await asyncio.to_thread(self._reset_job_to_pending, job.id)
+                            # Detach the backoff+reset so the single poll loop
+                            # can keep claiming other pending jobs instead of
+                            # head-of-line blocking them for the full backoff
+                            # (issue #276 E2-3). The task is retained in
+                            # self._bg_tasks so it is not GC'd mid-flight; the
+                            # A6-1 status guard makes a cancel-during-delay a
+                            # safe no-op.
+                            self._spawn_delayed_reset(job.id, backoff)
                         else:
                             logger.error(
                                 "KMSCompileProcessor: job id=%d permanently failed after %d retries",
@@ -150,6 +172,32 @@ class KMSCompileProcessor:
 
         with self._pool.connection() as conn:
             KMSStore(conn).reset_job_to_pending(job_id)
+
+    def _spawn_delayed_reset(self, job_id: int, backoff: float) -> None:
+        """Schedule a delayed reset of a failed job as a detached background task.
+
+        Keeps a strong reference in ``self._bg_tasks`` so the task is not
+        garbage-collected mid-flight, and so ``stop()`` can cancel it cleanly
+        (issue #276 E2-3). The poll loop returns immediately after spawning so
+        it can keep claiming other pending jobs during the backoff window.
+        """
+        task = asyncio.create_task(self._delayed_reset(job_id, backoff))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _delayed_reset(self, job_id: int, backoff: float) -> None:
+        """Sleep the backoff, then reset the failed job to pending for auto-retry."""
+        try:
+            await asyncio.sleep(backoff)
+            await asyncio.to_thread(self._reset_job_to_pending, job_id)
+        except asyncio.CancelledError:
+            # Processor is shutting down; abandon the reset.
+            raise
+        except Exception as exc:  # noqa: BLE001 — detached task must not propagate
+            logger.error(
+                "KMSCompileProcessor: delayed reset of job id=%d failed: %s",
+                job_id, exc,
+            )
 
     def _dispatch(self, job) -> dict:
         """Dispatch a job to the appropriate handler. Runs in a thread."""
