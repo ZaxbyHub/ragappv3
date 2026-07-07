@@ -606,7 +606,7 @@ async def lifespan(app: FastAPI):
     # Shutdown: Cancel keepalive, stop file watcher, and close services
     # Stop email ingestion service
     if app.state.email_service:
-        app.state.email_service.stop_polling()
+        await app.state.email_service.stop_polling()
     for kt in (keepalive_task_thinking, keepalive_task_instant):
         if kt:
             kt.cancel()
