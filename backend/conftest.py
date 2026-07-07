@@ -10,14 +10,36 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Stub problematic optional dependencies BEFORE any test imports
 # This must happen before pytest collection to prevent import errors
 
-# Stub lancedb (imports lancedb.index.IvfPq, FTS)
+# Stub lancedb (imports lancedb.index.IvfPq, FTS, lancedb.expr.col/lit)
 _lancedb = types.ModuleType("lancedb")
 _lancedb.index = types.ModuleType("lancedb.index")
 # Add fake IvfPq, FTS classes to prevent import errors
 _lancedb.index.IvfPq = type("IvfPq", (), {})
 _lancedb.index.FTS = type("FTS", (), {})
+_lancedb.expr = types.ModuleType("lancedb.expr")
+# Minimal col/lit stubs so vector_store.py can import them for tests
+class _ExprStub:
+    def __init__(self, sql):
+        self._sql = sql
+    def eq(self, other):
+        if isinstance(other, _ExprStub):
+            return _ExprStub(f"{self._sql} = {other._sql}")
+        return _ExprStub(f"{self._sql} = {other!r}")
+    def to_sql(self):
+        return self._sql
+    def __and__(self, other):
+        if isinstance(other, _ExprStub):
+            return _ExprStub(f"({self._sql}) AND ({other._sql})")
+        return _ExprStub(f"({self._sql}) AND ({other})")
+    def __rand__(self, other):
+        if isinstance(other, _ExprStub):
+            return _ExprStub(f"({other._sql}) AND ({self._sql})")
+        return _ExprStub(f"({other}) AND ({self._sql})")
+_lancedb.expr.col = lambda name: _ExprStub(name)
+_lancedb.expr.lit = lambda value: _ExprStub(repr(value))
 sys.modules["lancedb"] = _lancedb
 sys.modules["lancedb.index"] = _lancedb.index
+sys.modules["lancedb.expr"] = _lancedb.expr
 
 # Stub pyarrow only when the real package is unavailable. Replacing a real
 # pyarrow install with an attribute-less stub breaks `import pandas`, because

@@ -5,8 +5,11 @@ Tests SSE format, content accumulation, and done event structure.
 """
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
 
 # Add parent directory to path for imports
@@ -51,9 +54,14 @@ except ImportError:
     sys.modules['unstructured.documents'] = _unstructured.documents
     sys.modules['unstructured.documents.elements'] = _unstructured.documents.elements
 
+from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
+from app.api.deps import get_current_active_user, get_db, get_rag_engine
+from app.config import settings
 from app.main import app
+from app.models.database import init_db, run_migrations
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
 class TestChatStreaming(unittest.TestCase):
@@ -602,6 +610,130 @@ data: {"type": "content", "content": "test"}
 
         # repaired_content must NOT be present when no citations were repaired
         self.assertNotIn("repaired_content", done_event)
+
+    def test_stream_non_vault_member_returns_403(self):
+        """A non-vault-member user must receive 403 when streaming to a vault,
+        and the response body must NOT reveal whether the vault exists.
+        """
+        # Store original settings so they can be restored
+        original_jwt_secret = settings.jwt_secret_key
+        original_users_enabled = settings.users_enabled
+        original_data_dir = settings.data_dir
+
+        try:
+            # Create isolated temp directory and database for this test
+            temp_dir = tempfile.mkdtemp()
+            db_path = str(Path(temp_dir) / "test_vault_isolation.db")
+            settings.data_dir = Path(temp_dir)
+            settings.jwt_secret_key = "test-secret-key-for-testing-at-least-32-chars-long"
+            settings.users_enabled = True
+
+            # Clear pool cache before creating new database
+            from app.models.database import _pool_cache, _pool_cache_lock
+
+            with _pool_cache_lock:
+                for path, pool in list(_pool_cache.items()):
+                    pool.close_all()
+                _pool_cache.clear()
+
+            # Initialize database and run migrations
+            init_db(db_path)
+            run_migrations(db_path)
+            connection_pool = SimpleConnectionPool(db_path)
+
+            # Seed test data: one non-admin, non-vault-member user and one vault
+            conn = connection_pool.get_connection()
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+                # Non-admin, non-vault-member user
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, role, is_active) "
+                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    (1, "nonmember", "unused-hash", "Non Member", "member"),
+                )
+                # A vault that the user is NOT a member of
+                conn.execute(
+                    "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (?, ?, ?)",
+                    (1, "Secret Vault", "Private vault with no members"),
+                )
+                # Deliberately NOT inserting vault_members row for user 1 / vault 1
+                conn.commit()
+            finally:
+                connection_pool.release_connection(conn)
+
+            # Build override for get_db that uses the test pool
+            def override_get_db():
+                conn = connection_pool.get_connection()
+                try:
+                    yield conn
+                finally:
+                    connection_pool.release_connection(conn)
+
+            # Mock RAG engine to avoid LLM calls (permission check fires before engine is invoked)
+            mock_engine = MagicMock()
+
+            async def mock_query(*args, **kwargs):
+                yield {"type": "done", "sources": [], "memories_used": []}
+
+            mock_engine.query = mock_query
+
+            # Override dependencies
+            app.dependency_overrides[get_db] = override_get_db
+            app.dependency_overrides[get_rag_engine] = lambda: mock_engine
+
+            # Override get_current_active_user to return the non-member user dict.
+            # We supply the user dict directly rather than going through JWT decode,
+            # so we use a dict that matches the shape returned by get_current_active_user.
+            non_member_user = {
+                "id": 1,
+                "username": "nonmember",
+                "email": "",
+                "role": "member",
+            }
+            app.dependency_overrides[get_current_active_user] = lambda: non_member_user
+
+            # POST to /api/chat/stream with a vault_id the user is not a member of
+            response = self.client.post(
+                "/api/chat/stream",
+                json={
+                    "messages": [{"role": "user", "content": "test"}],
+                    "vault_id": 1,
+                },
+            )
+
+            # Assert 403 Forbidden
+            self.assertEqual(
+                response.status_code,
+                403,
+                f"Expected 403 but got {response.status_code}: {response.text}",
+            )
+
+            # Assert response body does NOT leak vault existence information
+            body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            detail = body.get("detail", "")
+
+            # The generic message must be present
+            self.assertEqual(detail, "No read access to this vault")
+
+            # Must not echo vault name or a vault identifier in any field
+            self.assertNotIn("Secret Vault", detail)
+            self.assertNotIn("vault_id", detail.lower())
+            # Also check the full response body for any vault-identifying info
+            self.assertNotIn("1", response.text)
+        finally:
+            # Clean up overrides
+            app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(get_rag_engine, None)
+            app.dependency_overrides.pop(get_current_active_user, None)
+
+            # Restore settings
+            settings.jwt_secret_key = original_jwt_secret
+            settings.users_enabled = original_users_enabled
+            settings.data_dir = original_data_dir
+
+            # Close pool and remove temp directory
+            connection_pool.close_all()
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

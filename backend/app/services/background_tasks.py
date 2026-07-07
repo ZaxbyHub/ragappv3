@@ -123,7 +123,18 @@ class TaskItem:
 
 @dataclass
 class EnrichmentTaskItem:
-    """Post-index enrichment task for an already indexed file."""
+    """Post-index enrichment task for an already indexed file.
+
+    Attributes:
+        file_id: Database ID of the file.
+        file_path: Path to the indexed file.
+        vault_id: Vault the file belongs to.
+        file_hash: SHA-256 hash of the file content.
+        chunks: List of chunk dictionaries produced during indexing.
+        document_text: Full text of the document for enrichment.
+        attempt: Current retry attempt count (0 = first attempt).
+            Incremented on each retry; compared against ``max_retries``.
+    """
 
     file_id: int
     file_path: str
@@ -131,6 +142,7 @@ class EnrichmentTaskItem:
     file_hash: str
     chunks: list
     document_text: str
+    attempt: int = 0
 
 
 class BackgroundProcessor:
@@ -139,15 +151,20 @@ class BackgroundProcessor:
 
     Manages a worker loop that processes files using DocumentProcessor with
     retry logic (max 3 attempts). Failed tasks are requeued with exponential
-    backoff delay. Provides graceful shutdown via asyncio.Event.
+    backoff delay. A separate enrichment worker retries failed enrichment jobs
+    up to max_retries times with the same exponential backoff, and skips
+    requeue when shutdown is in progress. Provides graceful shutdown via
+    asyncio.Event.
 
     Attributes:
         max_retries: Maximum number of retry attempts per task
         retry_delay: Base delay in seconds between retries (doubles each attempt)
         queue: asyncio.Queue holding TaskItem objects
+        enrichment_queue: asyncio.Queue holding EnrichmentTaskItem objects
         shutdown_event: asyncio.Event for graceful shutdown
         processor: DocumentProcessor instance for file processing
         _worker_tasks: List of worker task references
+        _enrichment_worker_task: Enrichment worker task reference
         _running: Boolean indicating if processor is active
     """
 
@@ -670,6 +687,48 @@ class BackgroundProcessor:
                 )
             except Exception:
                 logger.exception("Enrichment job failed for file_id=%s", item.file_id)
+                if self.shutdown_event.is_set():
+                    logger.warning(
+                        "Enrichment failed for file_id=%s during shutdown, not requeuing",
+                        item.file_id,
+                    )
+                    continue
+                if item.attempt < self.max_retries:
+                    delay = self.retry_delay * (2 ** item.attempt)
+                    logger.warning(
+                        "Enrichment failed for file_id=%s, retrying in %ss "
+                        "(attempt %s/%s)",
+                        item.file_id,
+                        delay,
+                        item.attempt + 1,
+                        self.max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    # Re-check shutdown after backoff; stop() may have been
+                    # called while we were sleeping.
+                    if self.shutdown_event.is_set():
+                        logger.warning(
+                            "Enrichment retry for file_id=%s skipped after backoff "
+                            "because shutdown is in progress",
+                            item.file_id,
+                        )
+                        continue
+                    new_item = EnrichmentTaskItem(
+                        file_id=item.file_id,
+                        file_path=item.file_path,
+                        vault_id=item.vault_id,
+                        file_hash=item.file_hash,
+                        chunks=item.chunks,
+                        document_text=item.document_text,
+                        attempt=item.attempt + 1,
+                    )
+                    await self.enrichment_queue.put(new_item)
+                else:
+                    logger.error(
+                        "Enrichment permanently failed for file_id=%s after %s attempts",
+                        item.file_id,
+                        self.max_retries,
+                    )
             finally:
                 self.enrichment_queue.task_done()
 
@@ -727,6 +786,7 @@ class BackgroundProcessor:
                         file_hash=result.file_hash,
                         chunks=result.chunks,
                         document_text=result.document_text,
+                        attempt=0,
                     )
                 )
             logger.info(f"Successfully processed: {task.file_path}")
