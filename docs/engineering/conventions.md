@@ -121,6 +121,11 @@ Export shared types/interfaces (`Document`, `Tag`, `Vault`, `ChatSession`, etc.)
 - Routes are lazy (`lazy(() => import(...))`) under `<Suspense>`, wrapped in `ProtectedRoute` + `MainAppShell` in `App.tsx`.
 - Styling: Tailwind classes + `cn()` from `lib/utils.ts`; use `formatFileSize`/`formatDate` from `lib/formatters.ts`.
 
+### State selectors and zustand upgrades
+- Array/object selectors must be stable across renders. In **zustand 5** the `equalityFn` second argument to `useStore(selector, equalityFn)` is silently ignored; use `useStore(useShallow(selector))` from `zustand/shallow` instead. Add a regression test that fails when the broken pattern is present.
+- Verify dependency lockfiles with the CI Node/npm version (Node 20/npm 10). Lockfiles produced by newer npm may be rejected by CI's older npm.
+- Vitest 4.x requires Vite >= 6; keep the top-level `vite` dependency aligned with the `vitest` range.
+
 ### TypeScript & lint
 - `tsconfig` is `strict` with `noUnusedLocals`/`noUnusedParameters`. Use `import type` for type-only imports.
 - Lint is **zero-warning**: `eslint src --max-warnings 0`. `react-hooks/exhaustive-deps` is enforced.
