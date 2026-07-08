@@ -488,9 +488,9 @@ async def ragas_evaluation(
             metrics=metrics, evaluation_time_ms=evaluation_time_ms, details=details
         )
 
-    except Exception as e:
-        logger.error("RAGAS evaluation failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
+    except Exception:
+        logger.exception("RAGAS evaluation failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +623,6 @@ async def live_eval(
             recall_mean=result.recall_mean,
         )
 
-    except Exception as e:
-        logger.error("Live eval failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Live evaluation failed: {str(e)}")
+    except Exception:
+        logger.exception("Live eval failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
