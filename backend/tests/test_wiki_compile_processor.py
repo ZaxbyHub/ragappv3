@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -175,7 +176,6 @@ class TestCompileIngestJob(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-        import os
         try:
             os.unlink(self._tmpfile.name)
         except OSError:
@@ -242,16 +242,29 @@ class TestCompileIngestJob(unittest.TestCase):
         self.assertGreater(len(result["claims"]), 0)
 
     def test_does_not_open_raw_file_bytes(self):
-        # /dev/zero is not a regular file and has no .txt extension; the compiler
-        # must skip cleanly without raising or hanging.
-        self.conn.execute(
-            "UPDATE files SET file_path = '/dev/zero' WHERE id = 1"
-        )
-        self.conn.commit()
-        result = self.compiler.compile_ingest_job(
-            vault_id=1, input_json={"file_id": 1}  # no text → skip
-        )
-        self.assertTrue(result.get("skipped"))
+        # A real binary file (no .txt extension) containing non-UTF-8 bytes.
+        # Because the path does not end in .txt the plain-text fallback is
+        # skipped; the compiler attempts a raw read and must still skip
+        # cleanly without raising or hanging.
+        tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
+        try:
+            tmp.write(b"\x00\x01\x02\x03\xff\xfe\xfd\xfc")
+            tmp.close()
+            self.conn.execute(
+                "UPDATE files SET file_path = ?, file_name = ? WHERE id = 1",
+                (tmp.name, "raw.bin"),
+            )
+            self.conn.commit()
+            result = self.compiler.compile_ingest_job(
+                vault_id=1, input_json={"file_id": 1}  # no text → skip
+            )
+            self.assertTrue(result.get("skipped"))
+        finally:
+            import os as _os
+            try:
+                _os.unlink(tmp.name)
+            except OSError:
+                pass
 
     def test_creates_page_even_when_extraction_is_empty(self):
         # Prose with no acronyms and no ALL-CAPS-org role claims must still
@@ -1294,7 +1307,6 @@ class TestIngestJobReParseFromFilePath(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-        import os
         try:
             os.unlink(self._tmpfile.name)
         except OSError:
@@ -1791,3 +1803,271 @@ class TestWikiFirstRetrievalGate(unittest.TestCase):
         )
         result = _raw_rag_required("entity_lookup", [evidence])
         self.assertTrue(result, "Stale freshness must require raw RAG")
+
+
+# ---------------------------------------------------------------------------
+# Issue #276 regression tests: A6-1 (reset guard), A6-4 (reindex dedup),
+# E2-3 (non-blocking detached reset + GC-safe task retention).
+# ---------------------------------------------------------------------------
+
+class TestWikiResetJobToPendingGuard(unittest.TestCase):
+    """A6-1: reset_job_to_pending must be guarded by status='failed' so the
+    auto-retry path cannot resurrect a job the user cancelled during the
+    processor's backoff window. Applies symmetrically to wiki_store and
+    kms_store."""
+
+    def setUp(self):
+        from app.models.database import run_migrations
+
+        self._td = tempfile.mkdtemp()
+        db_path = str(Path(self._td) / "test.db")
+        run_migrations(db_path)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'T')")
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    def _job_row_status(self, table: str, job_id: int) -> str:
+        row = self.conn.execute(
+            f"SELECT status FROM {table} WHERE id = ?", (job_id,)
+        ).fetchone()
+        return dict(row)["status"]
+
+    def test_wiki_reset_does_not_resurrect_cancelled_job(self):
+        from app.services.wiki_store import WikiStore
+
+        store = WikiStore(self.conn)
+        job = store.create_job(vault_id=1, trigger_type="manual")
+        # Simulate the race: fail_job, then user retry (failed->pending), then
+        # cancel (pending->cancelled), THEN the delayed reset fires.
+        store.fail_job(job.id, "boom")
+        store.retry_job(job.id, vault_id=1)            # -> pending
+        self.assertTrue(store.cancel_job(job.id, vault_id=1))  # -> cancelled
+        store.reset_job_to_pending(job.id)             # the delayed auto-retry
+        self.assertEqual(
+            self._job_row_status("wiki_compile_jobs", job.id),
+            "cancelled",
+            "reset_job_to_pending must not resurrect a cancelled job (A6-1)",
+        )
+
+    def test_wiki_reset_still_works_on_failed_job(self):
+        from app.services.wiki_store import WikiStore
+
+        store = WikiStore(self.conn)
+        job = store.create_job(vault_id=1, trigger_type="manual")
+        store.fail_job(job.id, "boom")
+        store.reset_job_to_pending(job.id)
+        self.assertEqual(
+            self._job_row_status("wiki_compile_jobs", job.id),
+            "pending",
+            "the intended auto-retry path (status='failed') must still reset",
+        )
+
+    def test_kms_reset_does_not_resurrect_cancelled_job(self):
+        from app.services.kms_store import KMSStore
+
+        store = KMSStore(self.conn)
+        store.create_job(vault_id=1, trigger_type="ingest")
+        job_id = self.conn.execute(
+            "SELECT id FROM kms_compile_jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        jid = dict(job_id)["id"]
+        store.fail_job(jid, "boom")
+        store.retry_job(jid, vault_id=1)
+        self.assertTrue(store.cancel_job(jid, vault_id=1))
+        store.reset_job_to_pending(jid)
+        self.assertEqual(
+            self._job_row_status("kms_compile_jobs", jid),
+            "cancelled",
+            "KMS reset_job_to_pending must not resurrect a cancelled job (A6-1)",
+        )
+
+
+class TestReindexMemoryDedup(unittest.TestCase):
+    """A6-4: _handle_reindex must promote each distinct memory_id only once,
+    even when the same memory backs multiple superseded claims."""
+
+    def setUp(self):
+        from app.models.database import run_migrations
+        from app.services.wiki_compiler import WikiCompiler
+        from app.services.wiki_store import WikiStore
+
+        self._td = tempfile.mkdtemp()
+        db_path = str(Path(self._td) / "test.db")
+        run_migrations(db_path)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'T')")
+        self.conn.commit()
+        self.store = WikiStore(self.conn)
+        self.compiler = WikiCompiler(self.conn, self.store)
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    def test_reindex_promotes_each_memory_once(self):
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+
+        # Seed a page so promote_memory has something to attach to.
+        page = self.store.create_page(
+            vault_id=1, slug="p1", title="P1", page_type="entity",
+            markdown="# P1", created_by=1,
+        )
+        # Two superseded claims sharing the SAME memory_id source.
+        self.store.create_claim(
+            vault_id=1, page_id=page.id, claim_text="claim one", status="superseded",
+            source_type="memory",
+            sources=[{"source_kind": "memory", "memory_id": 777}],
+        )
+        self.store.create_claim(
+            vault_id=1, page_id=page.id, claim_text="claim two", status="superseded",
+            source_type="memory",
+            sources=[{"source_kind": "memory", "memory_id": 777}],
+        )
+        job = SimpleNamespace(vault_id=1, trigger_type="settings_reindex")
+        calls: list[int] = []
+        with patch.object(
+            self.compiler, "promote_memory", side_effect=lambda **kw: calls.append(kw["memory_id"]) or {"page": page, "claims": [], "entities": []}
+        ) as mock_promote:
+            result = WikiCompileProcessor._handle_reindex(
+                job, self.store, self.compiler, {}
+            )
+        # The same memory_id (777) is referenced twice but must be promoted once.
+        self.assertEqual(mock_promote.call_count, 1, "memory_id must be deduped (A6-4)")
+        self.assertEqual(calls, [777])
+        self.assertEqual(result["reprocessed"], 1)
+        self.assertEqual(result["stale_count"], 2)
+
+
+class TestPollLoopNonBlockingBackoff(unittest.IsolatedAsyncioTestCase):
+    """E2-3: a failed job's backoff must run as a DETACHED task so the poll
+    loop keeps claiming other pending jobs; the task must be retained in
+    _bg_tasks (GC-safe) and is safe to cancel on shutdown."""
+
+    async def asyncSetUp(self):
+        from app.models.database import SQLiteConnectionPool, run_migrations
+
+        self._td = tempfile.mkdtemp()
+        db_path = str(Path(self._td) / "test.db")
+        run_migrations(db_path)
+        self.pool = SQLiteConnectionPool(db_path, max_size=3)
+        with self.pool.connection() as conn:
+            conn.row_factory = None
+            conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'T')")
+            conn.commit()
+
+    async def asyncTearDown(self):
+        self.pool.close_all()
+        import shutil
+        shutil.rmtree(self._td, ignore_errors=True)
+
+    async def test_failed_job_reset_runs_detached_and_loop_continues(self):
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+        from app.services.wiki_store import WikiStore
+
+        # Seed a job that will fail, then claim it directly through the processor
+        # by simulating the failure path.
+        with self.pool.connection() as conn:
+            conn.row_factory = sqlite3.Row
+            job = WikiStore(conn).create_job(vault_id=1, trigger_type="manual")
+            job_id = job.id
+
+        proc = WikiCompileProcessor(self.pool)
+        proc._running = True
+        # Drive the failure path: fail the job, then spawn the delayed reset
+        # with a tiny backoff. The poll loop must NOT be blocked (it returns
+        # immediately from _spawn_delayed_reset).
+        new_retry_count = await asyncio.to_thread(proc._fail_job, job_id, "test failure")
+        backoff = 0.05  # keep the test fast
+        proc._spawn_delayed_reset(job_id, backoff)
+        # The spawn must have retained the task (GC-safe, critic B2).
+        self.assertEqual(len(proc._bg_tasks), 1, "_bg_tasks must retain the detached task")
+
+        # The task must complete (it was not GC'd mid-flight).
+        await asyncio.sleep(0.3)
+        self.assertEqual(len(proc._bg_tasks), 0, "task must self-remove via done-callback after completion")
+
+        # And the job must have been reset to pending.
+        with self.pool.connection() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT status FROM wiki_compile_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        self.assertEqual(dict(row)["status"], "pending")
+        proc._running = False
+
+    async def test_poll_loop_claims_second_job_during_failed_job_backoff(self):
+        """E2-3: the poll loop must keep claiming other pending jobs while a failed
+        job sits in its detached backoff/reset window."""
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+        from app.services.wiki_store import WikiStore
+
+        with self.pool.connection() as conn:
+            conn.row_factory = sqlite3.Row
+            store = WikiStore(conn)
+            # Job 1: non-existent memory → _dispatch raises ValueError → fail → detached reset.
+            job1 = store.create_job(vault_id=1, trigger_type="memory", input_json={"memory_id": 99999})
+            # Job 2: query with no answer → completes quickly.
+            job2 = store.create_job(vault_id=1, trigger_type="query", input_json={})
+
+        proc = WikiCompileProcessor(self.pool)
+        await proc.start()
+        try:
+            # Wait for job2 to complete (fast path, no backoff).
+            for _ in range(50):  # 5 s total
+                await asyncio.sleep(0.1)
+                with self.pool.connection() as conn:
+                    conn.row_factory = sqlite3.Row
+                    row2 = conn.execute(
+                        "SELECT status FROM wiki_compile_jobs WHERE id = ?", (job2.id,)
+                    ).fetchone()
+                if dict(row2)["status"] == "completed":
+                    break
+            self.assertEqual(
+                dict(row2)["status"], "completed",
+                "Job 2 must complete while job 1 is in backoff",
+            )
+
+            # Wait for job 1's detached reset to fire (backoff=2 s).
+            for _ in range(50):  # 5 s total
+                await asyncio.sleep(0.1)
+                with self.pool.connection() as conn:
+                    conn.row_factory = sqlite3.Row
+                    row1 = conn.execute(
+                        "SELECT status FROM wiki_compile_jobs WHERE id = ?", (job1.id,)
+                    ).fetchone()
+                if dict(row1)["status"] == "pending":
+                    break
+            self.assertEqual(
+                dict(row1)["status"], "pending",
+                "Job 1 must return to 'pending' after its detached reset fires",
+            )
+        finally:
+            await proc.stop()
+
+    async def test_stop_cancels_in_flight_bg_tasks(self):
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+        from app.services.wiki_store import WikiStore
+
+        with self.pool.connection() as conn:
+            conn.row_factory = sqlite3.Row
+            job = WikiStore(conn).create_job(vault_id=1, trigger_type="manual")
+            job_id = job.id
+
+        proc = WikiCompileProcessor(self.pool)
+        proc._running = True
+        proc._fail_job(job_id, "test failure")
+        # Long backoff so the task is still pending when stop() runs.
+        proc._spawn_delayed_reset(job_id, backoff=10.0)
+        self.assertEqual(len(proc._bg_tasks), 1)
+        await proc.stop()
+        self.assertEqual(
+            len(proc._bg_tasks), 0, "stop() must cancel and clear in-flight bg tasks (E2-3)"
+        )

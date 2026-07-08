@@ -757,5 +757,199 @@ class TestEntityMismatchFilterExpandedMatch(unittest.TestCase):
         )
 
 
+class TestWikiRetrievalEntityAndRelationPipeline(unittest.TestCase):
+    """End-to-end coverage for the previously-untested retrieval phases
+    (issue #99): entity exact match (canonical + alias), relation lookup with
+    predicate scoring, exact-entity page evidence, batched claim provenance
+    (issue #276 E1-3), and the multi-candidate ranking/sort.
+
+    Also serves as the regression for issue #276 A6-3 (claim-status predicate):
+    a 'superseded' claim must never reach the result list.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from queue import Empty, Queue
+
+        from app.models.database import init_db, run_migrations
+
+        self._tmp = tempfile.mkdtemp()
+        db = str(Path(self._tmp) / "app.db")
+        init_db(db)
+        run_migrations(db)
+
+        class _Pool:
+            def __init__(self, path):
+                self._path = path
+                self._q = Queue(maxsize=5)
+
+            def get_connection(self):
+                try:
+                    return self._q.get_nowait()
+                except Empty:
+                    c = sqlite3.connect(self._path, check_same_thread=False)
+                    c.row_factory = sqlite3.Row
+                    return c
+
+            def release_connection(self, c):
+                try:
+                    self._q.put_nowait(c)
+                except Exception:
+                    c.close()
+
+            def close_all(self):
+                while True:
+                    try:
+                        self._q.get_nowait().close()
+                    except Empty:
+                        break
+
+        self._pool = _Pool(db)
+        self.service = WikiRetrievalService(pool=self._pool)
+
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("INSERT OR REPLACE INTO vaults (id, name) VALUES (1, 'V1')")
+            # A page that the entity points at (exact-entity page evidence path).
+            conn.execute(
+                "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, markdown, "
+                "summary, status, confidence) VALUES "
+                "(1, 1, 'afomis', 'AFOMIS', 'entity', '# AFOMIS', "
+                "'Armed Forces Operations', 'verified', 0.9)"
+            )
+            # Entity with an alias and a linked page. The alias is an ALL-CAPS
+            # token so extract_query_intent surfaces it as an entity candidate
+            # (the extractor only treats ALL-CAPS 2+ char tokens as candidates),
+            # which is what exercises the json_each alias-lookup branch.
+            conn.execute(
+                "INSERT INTO wiki_entities (id, vault_id, canonical_name, entity_type, "
+                "aliases_json, page_id) VALUES "
+                "(1, 1, 'AFOMIS', 'organization', '[\"AFO\"]', 1)"
+            )
+            # An active claim backing a relation. The predicate is 'director'
+            # (a member of _PREDICATE_TERMS) so a query containing 'director'
+            # exercises the +0.1 boost branch of predicate scoring.
+            conn.execute(
+                "INSERT INTO wiki_claims (id, vault_id, page_id, claim_text, subject, "
+                "predicate, object, claim_type, source_type, status, confidence) VALUES "
+                "(10, 1, 1, 'AFOMIS has a director.', 'AFOMIS', 'director', "
+                "'operations', 'fact', 'document', 'active', 0.85)"
+            )
+            # A superseded claim about the same entity — must be EXCLUDED (A6-3).
+            conn.execute(
+                "INSERT INTO wiki_claims (id, vault_id, page_id, claim_text, subject, "
+                "predicate, object, claim_type, source_type, status, confidence) VALUES "
+                "(11, 1, 1, 'AFOMIS was disbanded.', 'AFOMIS', 'status', 'disbanded', "
+                "'fact', 'document', 'superseded', 0.5)"
+            )
+            # Relation: AFOMIS -director-> operations, backed by the active claim.
+            conn.execute(
+                "INSERT INTO wiki_relations (id, vault_id, subject_entity_id, predicate, "
+                "object_text, claim_id, confidence) VALUES "
+                "(1, 1, 1, 'director', 'operations', 10, 0.9)"
+            )
+            # Provenance sources for the active claim (E1-3 batch path).
+            conn.execute(
+                "INSERT INTO wiki_claim_sources (claim_id, source_kind, file_id) VALUES "
+                "(10, 'document', 7)"
+            )
+            conn.execute(
+                "INSERT INTO wiki_claim_sources (claim_id, source_kind, memory_id) VALUES "
+                "(10, 'memory', 42)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        import shutil
+        self._pool.close_all()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_entity_exact_match_canonical_resolves_and_returns_relation(self):
+        """Phase 1 canonical-name match feeds Phase 2 relation lookup."""
+        results = self.service.retrieve("AFOMIS", vault_id=1)
+        # The active claim (10) should appear via the relation path.
+        claim_ids = {r.claim_id for r in results}
+        self.assertIn(10, claim_ids, "canonical entity match must surface the active relation claim")
+        # The superseded claim (11) must NEVER appear (A6-3 regression).
+        self.assertNotIn(11, claim_ids, "superseded claim must be excluded by status predicate")
+
+    def test_entity_exact_match_alias_resolves(self):
+        """Phase 1 alias lookup via json_each resolves the entity from its alias.
+
+        Uses the ALL-CAPS alias 'AFO' so extract_query_intent surfaces it as an
+        entity candidate; the canonical-name branch won't match 'AFO', so the
+        only way the entity resolves is via the json_each(alias) lookup.
+        """
+        results = self.service.retrieve("AFO", vault_id=1)
+        claim_ids = {r.claim_id for r in results}
+        self.assertIn(
+            10, claim_ids,
+            "alias lookup must resolve the entity and surface its relation claim",
+        )
+
+    def test_relation_lookup_predicate_match_boosts_score(self):
+        """Phase 2 predicate scoring: a matching predicate adds +0.1 and records matched_predicate."""
+        results = self.service.retrieve("AFOMIS director", vault_id=1)
+        rel = next((r for r in results if r.claim_id == 10), None)
+        self.assertIsNotNone(rel, "relation claim must be returned")
+        self.assertEqual(rel.score_type, "relation")
+        self.assertEqual(rel.matched_predicate, "director")
+        # base 0.85 + 0.1 boost
+        self.assertAlmostEqual(rel.score, 0.95, places=5)
+
+    def test_relation_lookup_predicate_miss_penalizes_score(self):
+        """Phase 2 predicate scoring: a query predicate that does not match the
+        relation's predicate subtracts 0.15. 'chief' is in _PREDICATE_TERMS but
+        the relation predicate is 'director', so it counts as a miss."""
+        results = self.service.retrieve("AFOMIS chief", vault_id=1)
+        rel = next((r for r in results if r.claim_id == 10), None)
+        self.assertIsNotNone(rel, "relation claim must be returned even when predicate misses")
+        self.assertIsNone(rel.matched_predicate)
+        # base 0.85 - 0.15 penalty
+        self.assertAlmostEqual(rel.score, 0.70, places=5)
+
+    def test_get_page_evidence_for_matched_entity(self):
+        """The exact-entity page branch produces page evidence with score_type='exact_entity'."""
+        results = self.service.retrieve("AFOMIS", vault_id=1)
+        page_ev = [r for r in results if r.page_id == 1 and r.claim_id is None]
+        self.assertTrue(
+            any(r.score_type == "exact_entity" for r in page_ev),
+            "matched entity with page_id must yield exact_entity page evidence",
+        )
+
+    def test_claim_provenance_batched_populates_source_count(self):
+        """E1-3 batched provenance: source_count and provenance_summary are populated."""
+        results = self.service.retrieve("AFOMIS director", vault_id=1)
+        rel = next((r for r in results if r.claim_id == 10), None)
+        self.assertIsNotNone(rel)
+        # Two sources: one document, one memory.
+        self.assertEqual(rel.source_count, 2)
+        self.assertIn("doc", rel.provenance_summary)
+        self.assertIn("memory", rel.provenance_summary)
+
+    def test_ranking_relation_predicate_ranks_before_exact_entity(self):
+        """Ranking/sort (lines 335-340): relation+predicate match outranks exact_entity."""
+        # Query 'AFOMIS director' produces BOTH a relation claim (predicate match)
+        # and the exact-entity page evidence. The relation must sort first.
+        results = self.service.retrieve("AFOMIS director", vault_id=1)
+        self.assertGreaterEqual(len(results), 2)
+        top = results[0]
+        self.assertEqual(top.score_type, "relation")
+        self.assertEqual(top.matched_predicate, "director")
+
+    def test_superseded_claim_excluded_from_fts_search(self):
+        """A6-3 regression: a superseded claim must not surface via FTS even when
+        its text matches the query."""
+        results = self.service.retrieve("disbanded", vault_id=1)
+        claim_ids = {r.claim_id for r in results}
+        self.assertNotIn(
+            11, claim_ids,
+            "superseded claim must be filtered out of FTS claim search by status predicate",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

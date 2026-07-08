@@ -100,8 +100,26 @@ export default function WikiPage() {
   async function handleSave(data: Parameters<typeof createPage>[0] | Parameters<typeof editPage>[1]) {
     if (!activeVaultId) return;
     if (editingPage) {
-      await editPage(editingPage.id, data as Parameters<typeof editPage>[1]);
-      toast.success("Page updated");
+      // DD-C020 optimistic locking (issue #276 1X-1): send the version we
+      // loaded so the backend (wiki.py:246/252) can reject with HTTP 409 if
+      // another edit landed first. apiClient does not retry 409.
+      try {
+        await editPage(editingPage.id, {
+          ...(data as Parameters<typeof editPage>[1]),
+          expected_version: editingPage.version,
+        });
+        toast.success("Page updated");
+      } catch (err: unknown) {
+        const status = (err as { response?: { status?: number } } | undefined)?.response?.status
+          ?? (err as { status?: number } | undefined)?.status;
+        if (status === 409) {
+          toast.error("This page was edited by someone else. Refresh and try again.");
+          await fetchPages();
+        } else {
+          throw err;
+        }
+        return;
+      }
     } else {
       const createData = data as Parameters<typeof createPage>[0];
       await createPage({ ...createData, vault_id: activeVaultId });

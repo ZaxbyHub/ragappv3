@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import React from "react";
+import { toast } from "sonner";
 
 // ---------------------------------------------------------------------------
 // Mock API module — must be declared before any component imports
@@ -65,7 +66,17 @@ vi.mock("@/components/ui/tabs", async () => {
 
 // Mock child wiki page components to isolate the parent
 vi.mock("@/pages/WikiPageList", () => ({
-  WikiPageList: () => <div data-testid="wiki-page-list">Page List</div>,
+  WikiPageList: ({ onSelect }: { onSelect?: (pageId: number) => void }) => (
+    <div data-testid="wiki-page-list">
+      Page List
+      <button
+        data-testid="select-page-btn"
+        onClick={() => onSelect?.(1)}
+      >
+        Select Page
+      </button>
+    </div>
+  ),
   PAGE_TYPES: [
     { value: "", label: "All" },
     { value: "overview", label: "Overview" },
@@ -74,12 +85,50 @@ vi.mock("@/pages/WikiPageList", () => ({
 }));
 
 vi.mock("@/pages/WikiPageDetail", () => ({
-  WikiPageDetail: () => <div data-testid="wiki-page-detail">Page Detail</div>,
+  WikiPageDetail: ({ onEdit }: { onEdit?: () => void }) => (
+    <div data-testid="wiki-page-detail">
+      Page Detail
+      <button data-testid="edit-page-btn" onClick={onEdit}>
+        Edit
+      </button>
+    </div>
+  ),
 }));
 
 vi.mock("@/pages/WikiEditDialog", () => ({
-  WikiEditDialog: ({ open }: { open: boolean }) =>
-    open ? <div data-testid="wiki-edit-dialog">Edit Dialog</div> : null,
+  WikiEditDialog: ({
+    open,
+    onSave,
+    page,
+  }: {
+    open: boolean;
+    onSave?: (data: {
+      title: string;
+      page_type: string;
+      markdown: string;
+      summary: string;
+      status: string;
+      confidence: number;
+    }) => Promise<void>;
+    page?: object | null;
+  }) =>
+    open ? (
+      <div data-testid="wiki-edit-dialog">
+        Edit Dialog
+        <button
+          data-testid="save-dialog-btn"
+          onClick={() =>
+            onSave?.(
+              page
+                ? { title: (page as { title: string }).title, page_type: (page as { page_type: string }).page_type, markdown: (page as { markdown: string }).markdown, summary: (page as { summary: string }).summary, status: (page as { status: string }).status, confidence: (page as { confidence: number }).confidence }
+                : { title: "New", page_type: "entity", markdown: "md", summary: "", status: "draft", confidence: 0 }
+            )
+          }
+        >
+          Save
+        </button>
+      </div>
+    ) : null,
 }));
 
 vi.mock("@/pages/WikiLintPanel", () => ({
@@ -94,7 +143,7 @@ vi.mock("@/pages/WikiLintPanel", () => ({
 // Now import components after mocks are in place
 // ---------------------------------------------------------------------------
 import WikiPage from "./WikiPage";
-import { listWikiPages, listWikiLintFindings, runWikiLint } from "@/lib/api";
+import { listWikiPages, listWikiLintFindings, runWikiLint, updateWikiPage } from "@/lib/api";
 
 // WikiPage opens an authenticated wiki-events fetch stream on mount
 // (useWikiEventStream). Stub fetch with an open (never-resolving) stream so
@@ -325,6 +374,81 @@ describe("WikiPage", () => {
           search: undefined,
         });
       });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // DD-C020 optimistic-locking 409 conflict flow (issue #276 1X-1)
+  // ---------------------------------------------------------------------------
+  it("shows conflict toast and refetches pages when save returns 409", async () => {
+    const { getWikiPage } = await import("@/lib/api");
+
+    // Mock updateWikiPage to reject with a 409 conflict error
+    (updateWikiPage as ReturnType<typeof vi.fn>).mockRejectedValue({
+      response: { status: 409 },
+    });
+
+    // Mock getWikiPage to return a page so selectedPage is set
+    (getWikiPage as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 1,
+      vault_id: 1,
+      slug: "test-page",
+      title: "Test Page",
+      page_type: "entity",
+      markdown: "# Test",
+      summary: "A test page",
+      status: "draft",
+      confidence: 0,
+      version: 1,
+      created_by: null,
+      created_at: "2024-01-01T00:00:00Z",
+      updated_at: "2024-01-01T00:00:00Z",
+      last_compiled_at: null,
+      claims: [],
+      entities: [],
+      lint_findings: [],
+    });
+
+    render(<WikiPage />);
+
+    // Select a page via the mocked WikiPageList
+    await act(async () => {
+      screen.getByTestId("select-page-btn").click();
+    });
+
+    // Wait for WikiPageDetail to appear (page loaded)
+    await waitFor(() => {
+      expect(screen.getByTestId("wiki-page-detail")).toBeInTheDocument();
+    });
+
+    // Click the Edit button in the mocked WikiPageDetail
+    await act(async () => {
+      screen.getByTestId("edit-page-btn").click();
+    });
+
+    // Wait for the edit dialog to appear
+    await waitFor(() => {
+      expect(screen.getByTestId("wiki-edit-dialog")).toBeInTheDocument();
+    });
+
+    // Clear listWikiPages mock call count before triggering save
+    (listWikiPages as ReturnType<typeof vi.fn>).mockClear();
+
+    // Click the Save button in the mocked dialog
+    await act(async () => {
+      screen.getByTestId("save-dialog-btn").click();
+    });
+
+    // Assert: toast.error called with the exact conflict message
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(
+        "This page was edited by someone else. Refresh and try again."
+      );
+    });
+
+    // Assert: listWikiPages was called (refetch after conflict)
+    await waitFor(() => {
+      expect(listWikiPages).toHaveBeenCalled();
     });
   });
 });

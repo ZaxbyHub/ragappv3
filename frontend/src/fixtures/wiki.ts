@@ -218,6 +218,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 1,
     vault_id: 1,
+    version: 1,
     slug: "platform-overview",
     title: "Platform Overview",
     page_type: "overview",
@@ -236,6 +237,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 2,
     vault_id: 1,
+    version: 1,
     slug: "api-authentication",
     title: "API Authentication",
     page_type: "procedure",
@@ -254,6 +256,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 3,
     vault_id: 1,
+    version: 1,
     slug: "security-audit-2023",
     title: "Security Audit 2023",
     page_type: "contradiction",
@@ -272,6 +275,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 4,
     vault_id: 1,
+    version: 1,
     slug: "deployment-guide",
     title: "Deployment Guide",
     page_type: "procedure",
@@ -290,6 +294,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 5,
     vault_id: 1,
+    version: 1,
     slug: "chunking-strategy",
     title: "Chunking Strategy",
     page_type: "system",
@@ -308,6 +313,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 6,
     vault_id: 1,
+    version: 1,
     slug: "rate-limiting",
     title: "Rate Limiting",
     page_type: "system",
@@ -326,6 +332,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 7,
     vault_id: 1,
+    version: 1,
     slug: "encryption-at-rest",
     title: "Encryption at Rest",
     page_type: "procedure",
@@ -344,6 +351,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 8,
     vault_id: 1,
+    version: 1,
     slug: "user-management",
     title: "User Management",
     page_type: "entity",
@@ -362,6 +370,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 9,
     vault_id: 1,
+    version: 1,
     slug: "open-questions-q2",
     title: "Open Questions Q2",
     page_type: "open_question",
@@ -380,6 +389,7 @@ export const mockWikiPages: WikiPage[] = import.meta.env.DEV ? [
   {
     id: 10,
     vault_id: 1,
+    version: 1,
     slug: "data-retention",
     title: "Data Retention Policy",
     page_type: "procedure",

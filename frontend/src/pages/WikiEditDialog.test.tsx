@@ -196,6 +196,7 @@ describe("WikiEditDialog", () => {
       summary: "sum",
       status: "draft",
       confidence: 0.5,
+      version: 1,
       created_by: null,
       created_at: "",
       updated_at: "",

@@ -281,8 +281,15 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
             chunk_index=0,
         )
 
-    async def test_process_existing_file_respects_gating(self):
-        """process_existing_file must gate wiki job creation the same way as process_file."""
+    async def _run_process_existing_file(self, mock_settings):
+        """Run process_existing_file with the given settings and the standard
+        mock stack. Returns the (mock_set_wiki_pending, mock_wiki_store) so each
+        test can assert against them.
+
+        Mirrors ``_run_process_file`` in the sibling ``process_file`` test
+        class so the two paths are exercised with identical mock plumbing
+        (issue #276 C3-4 test-parity gap).
+        """
         from app.services.document_processor import DocumentProcessor
 
         pool = MagicMock()
@@ -307,9 +314,6 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
 
         chunk = self._make_chunk()
 
-        # Test with wiki_enabled=False
-        mock_settings = _make_mock_settings(wiki_enabled=False, wiki_compile_on_ingest=True)
-
         with patch("app.services.document_processor.settings", mock_settings), \
             patch.object(processor, "_update_status"), \
             patch.object(processor, "_validate_chunk_sizes"), \
@@ -325,16 +329,61 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
             patch("app.services.document_processor.set_phase"), \
             patch("app.services.document_processor.clear_progress"), \
             patch("app.services.document_processor.compute_parent_windows"), \
-            patch("app.services.document_processor.set_wiki_pending"), \
+            patch("app.services.document_processor.set_wiki_pending") as mock_set_wiki_pending, \
             patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls:
             mock_wiki_store = MagicMock()
             mock_wiki_store.create_job.return_value = None
             mock_wiki_store_cls.return_value = mock_wiki_store
 
-            await processor.process_existing_file(file_id=789, file_path=self.txt_file_path, vault_id=1)
+            await processor.process_existing_file(
+                file_id=789, file_path=self.txt_file_path, vault_id=1
+            )
 
-            # create_job should NOT have been called because wiki_enabled=False
-            mock_wiki_store.create_job.assert_not_called()
+            return mock_set_wiki_pending, mock_wiki_store
+
+    async def test_process_existing_file_respects_gating(self):
+        """process_existing_file must NOT create a wiki job when wiki_enabled=False."""
+        mock_settings = _make_mock_settings(wiki_enabled=False, wiki_compile_on_ingest=True)
+
+        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(mock_settings)
+
+        # create_job should NOT have been called because wiki_enabled=False
+        mock_wiki_store.create_job.assert_not_called()
+
+    async def test_process_existing_file_skips_when_compile_on_ingest_false(self):
+        """process_existing_file must NOT create a wiki job when wiki_compile_on_ingest=False.
+
+        Closes the test-parity gap with ``process_file`` flagged in issue #276
+        (C3-4): the negative-on-compile-flag case was previously untested for
+        ``process_existing_file``.
+        """
+        mock_settings = _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=False)
+
+        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(mock_settings)
+
+        # create_job should NOT have been called because wiki_compile_on_ingest=False
+        mock_wiki_store.create_job.assert_not_called()
+
+    async def test_process_existing_file_enqueues_when_both_flags_true(self):
+        """process_existing_file MUST create a wiki job when both flags are True.
+
+        Closes the test-parity gap with ``process_file`` flagged in issue #276
+        (C3-4): the positive case was previously untested for
+        ``process_existing_file``, so a regression that broke only this path's
+        enqueue would have shipped green.
+        """
+        mock_settings = _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=True)
+
+        _mock_set_wiki_pending, mock_wiki_store = await self._run_process_existing_file(mock_settings)
+
+        # create_job SHOULD have been called once with the file's file_id (789)
+        mock_wiki_store.create_job.assert_called_once()
+        mock_wiki_store.create_job.assert_called_with(
+            vault_id=1,
+            trigger_type="ingest",
+            trigger_id="file:789",
+            input_json={"file_id": 789, "vault_id": 1},
+        )
 
 
 if __name__ == '__main__':

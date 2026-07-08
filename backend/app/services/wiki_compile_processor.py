@@ -34,6 +34,11 @@ class WikiCompileProcessor:
         self._pool = pool
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # Strong references to detached background tasks (e.g. delayed
+        # auto-retry resets) so CPython does not garbage-collect them
+        # mid-flight (issue #276 E2-3). Tasks remove themselves on completion
+        # via a done-callback.
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         if self._running:
@@ -51,6 +56,18 @@ class WikiCompileProcessor:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        # Cancel any in-flight detached reset tasks so they do not outlive the
+        # processor (issue #276 E2-3).
+        for bg in list(self._bg_tasks):
+            bg.cancel()
+        for bg in list(self._bg_tasks):
+            try:
+                await bg
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self._bg_tasks.clear()
         logger.info("WikiCompileProcessor stopped")
 
     # ------------------------------------------------------------------
@@ -103,8 +120,14 @@ class WikiCompileProcessor:
                                 "WikiCompileProcessor: job id=%d will auto-retry (%d/%d) in %.0fs",
                                 job.id, new_retry_count, MAX_RETRIES, backoff,
                             )
-                            await asyncio.sleep(backoff)
-                            await self._reset_job_to_pending_with_retry(job.id)
+                            # Detach the backoff+reset so the single poll loop
+                            # can keep claiming other pending jobs instead of
+                            # head-of-line blocking them for the full backoff
+                            # (issue #276 E2-3). The task is retained in
+                            # self._bg_tasks so it is not GC'd mid-flight; the
+                            # A6-1 status guard makes a cancel-during-delay a
+                            # safe no-op.
+                            self._spawn_delayed_reset(job.id, backoff)
                         else:
                             logger.error(
                                 "WikiCompileProcessor: job id=%d permanently failed after %d retries",
@@ -181,6 +204,32 @@ class WikiCompileProcessor:
                     await asyncio.sleep(delay)
         assert last_exc is not None
         raise last_exc
+
+    def _spawn_delayed_reset(self, job_id: int, backoff: float) -> None:
+        """Schedule a delayed reset of a failed job as a detached background task.
+
+        Keeps a strong reference in ``self._bg_tasks`` so the task is not
+        garbage-collected mid-flight, and so ``stop()`` can cancel it cleanly
+        (issue #276 E2-3). The poll loop returns immediately after spawning so
+        it can keep claiming other pending jobs during the backoff window.
+        """
+        task = asyncio.create_task(self._delayed_reset(job_id, backoff))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _delayed_reset(self, job_id: int, backoff: float) -> None:
+        """Sleep the backoff, then reset the failed job to pending for auto-retry."""
+        try:
+            await asyncio.sleep(backoff)
+            await self._reset_job_to_pending_with_retry(job_id)
+        except asyncio.CancelledError:
+            # Processor is shutting down; abandon the reset.
+            raise
+        except Exception as exc:  # noqa: BLE001 — detached task must not propagate
+            logger.error(
+                "WikiCompileProcessor: delayed reset of job id=%d failed: %s",
+                job_id, exc,
+            )
 
     def _publish_event(self, job, event_type: str, *, result: Optional[dict] = None, error: Optional[str] = None) -> None:
         """Fan out a terminal-state event to SSE subscribers for the vault.
@@ -269,18 +318,27 @@ class WikiCompileProcessor:
             return compiler.promote_memory(memory_id=memory_id, vault_id=vault_id)
 
         stale_claims = store.list_claims(vault_id=vault_id, status="superseded")
-        reprocessed = 0
+        # Dedup memory_id across claims/sources: a single memory commonly
+        # promotes into multiple claims, so re-promoting each occurrence would
+        # fire redundant promote_memory (and LLM curator) calls and inflate the
+        # reprocessed counter (issue #276 A6-4). reprocessed counts distinct
+        # memories promoted.
+        seen_memory_ids: set[int] = set()
         for claim in stale_claims:
             for src in claim.sources or []:
-                if src.source_kind == "memory" and src.memory_id:
-                    try:
-                        compiler.promote_memory(memory_id=src.memory_id, vault_id=vault_id)
-                        reprocessed += 1
-                    except Exception as exc:
-                        logger.warning(
-                            "WikiCompileProcessor reindex: promote_memory(%d) failed: %s",
-                            src.memory_id,
-                            exc,
-                        )
+                if src.source_kind == "memory" and src.memory_id and src.memory_id not in seen_memory_ids:
+                    seen_memory_ids.add(src.memory_id)
+
+        reprocessed = 0
+        for memory_id in seen_memory_ids:
+            try:
+                compiler.promote_memory(memory_id=memory_id, vault_id=vault_id)
+                reprocessed += 1
+            except Exception as exc:
+                logger.warning(
+                    "WikiCompileProcessor reindex: promote_memory(%d) failed: %s",
+                    memory_id,
+                    exc,
+                )
 
         return {"reprocessed": reprocessed, "stale_count": len(stale_claims)}

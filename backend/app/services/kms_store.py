@@ -439,9 +439,17 @@ class KMSStore:
         return dict(row)["retry_count"] if row else 0
 
     def reset_job_to_pending(self, job_id: int) -> None:
-        """Reset a failed job back to pending for auto-retry by the processor."""
+        """Reset a failed job back to pending for auto-retry by the processor.
+
+        Guarded by ``status = 'failed'`` so the auto-retry path cannot clobber a
+        job that has since been retried-then-cancelled by the user during the
+        processor's backoff window (issue #276 A6-1, mirrors the wiki_store
+        fix). The processor only calls this immediately after ``fail_job`` set
+        status='failed', so the guard is a no-op on the intended path.
+        """
         self._db.execute(
-            "UPDATE kms_compile_jobs SET status = 'pending', started_at = NULL, completed_at = NULL WHERE id = ?",
+            "UPDATE kms_compile_jobs SET status = 'pending', started_at = NULL, completed_at = NULL "
+            "WHERE id = ? AND status = 'failed'",
             (job_id,),
         )
         self._db.commit()

@@ -399,11 +399,14 @@ class WikiRetrievalService:
                LEFT JOIN wiki_claims c ON r.claim_id = c.id
                LEFT JOIN wiki_pages p ON c.page_id = p.id
                WHERE r.vault_id = ? AND r.subject_entity_id = ?
+               AND (c.status IS NULL OR c.status = 'active')
                ORDER BY r.confidence DESC""",
             (vault_id, entity.id),
         ).fetchall()
 
         results = []
+        claim_ids = [d_claim_id for row in rows if (d_claim_id := dict(row).get("claim_id"))]
+        provenance_by_claim = self._claim_provenance_for(conn, claim_ids)
         for row in rows:
             d = dict(row)
             predicate = (d.get("predicate") or "").lower()
@@ -421,7 +424,7 @@ class WikiRetrievalService:
             else:
                 score = base_score
 
-            source_count, provenance = self._claim_provenance(conn, d.get("claim_id"))
+            source_count, provenance = provenance_by_claim.get(d.get("claim_id"), (0, ""))
             freshness = d.get("last_compiled_at")
 
             ev = WikiEvidence(
@@ -497,6 +500,7 @@ class WikiRetrievalService:
                    JOIN wiki_claims c ON wiki_claims_fts.rowid = c.id
                    LEFT JOIN wiki_pages p ON c.page_id = p.id
                    WHERE wiki_claims_fts MATCH ? AND c.vault_id = ?
+                   AND (c.status IS NULL OR c.status = 'active')
                    ORDER BY rank
                    LIMIT 10""",
                 (normalized_query, vault_id),
@@ -506,9 +510,10 @@ class WikiRetrievalService:
             return []
 
         results = []
+        provenance_by_claim = self._claim_provenance_for(conn, [dict(r)["id"] for r in rows])
         for i, row in enumerate(rows):
             d = dict(row)
-            source_count, provenance = self._claim_provenance(conn, d["id"])
+            source_count, provenance = provenance_by_claim.get(d["id"], (0, ""))
             results.append(WikiEvidence(
                 label_placeholder="W?",
                 page_id=d.get("page_id") or 0,
@@ -573,20 +578,44 @@ class WikiRetrievalService:
             ))
         return results
 
-    def _claim_provenance(
-        self, conn: sqlite3.Connection, claim_id: Optional[int]
-    ) -> tuple[int, str]:
-        """Return (source_count, provenance_summary) for a claim."""
-        if not claim_id:
-            return 0, ""
+    def _claim_provenance_for(
+        self, conn: sqlite3.Connection, claim_ids: list[int]
+    ) -> dict[int, tuple[int, str]]:
+        """Batched provenance lookup (issue #276 E1-3).
+
+        Issues a single ``WHERE claim_id IN (...)`` query and groups results in
+        Python, replacing the per-row single-row query that fired
+        O(relation_rows + fts_claim_rows) times per retrieval.
+        Returns ``{claim_id: (source_count, provenance_summary)}``.
+        """
+        if not claim_ids:
+            return {}
+        placeholders = ",".join("?" for _ in claim_ids)
         try:
             rows = conn.execute(
-                "SELECT source_kind FROM wiki_claim_sources WHERE claim_id = ?",
-                (claim_id,),
+                f"SELECT claim_id, source_kind FROM wiki_claim_sources "
+                f"WHERE claim_id IN ({placeholders})",
+                tuple(claim_ids),
             ).fetchall()
-            if not rows:
-                return 0, ""
-            kinds = [r[0] for r in rows]
+        except Exception as exc:
+            logger.warning(
+                "_claim_provenance_for: failed for %d claim(s): %s",
+                len(claim_ids),
+                exc,
+            )
+            return {cid: (0, "") for cid in claim_ids}
+
+        grouped: dict[int, list[str]] = {}
+        for r in rows:
+            claim_id, source_kind = r[0], r[1]
+            grouped.setdefault(claim_id, []).append(source_kind)
+
+        result: dict[int, tuple[int, str]] = {}
+        for cid in claim_ids:
+            kinds = grouped.get(cid)
+            if not kinds:
+                result[cid] = (0, "")
+                continue
             summary_parts = []
             doc_count = kinds.count("document")
             mem_count = kinds.count("memory")
@@ -594,9 +623,8 @@ class WikiRetrievalService:
                 summary_parts.append(f"{doc_count} doc{'s' if doc_count > 1 else ''}")
             if mem_count:
                 summary_parts.append(f"{mem_count} memory")
-            return len(rows), ", ".join(summary_parts) or "manual"
-        except Exception:
-            return 0, ""
+            result[cid] = (len(kinds), ", ".join(summary_parts) or "manual")
+        return result
 
 
 # ---------------------------------------------------------------------------

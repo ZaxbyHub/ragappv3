@@ -71,6 +71,11 @@ export interface WikiPage {
   summary: string;
   status: "draft" | "verified" | "stale" | "needs_review" | "archived";
   confidence: number;
+  // DD-C020 optimistic-locking version (issue #276 1X-1). The backend
+  // returns this on every WikiPage response (wiki.py:255) and rejects
+  // conflicting updates with HTTP 409 when the client sends a stale
+  // expected_version.
+  version: number;
   created_by: number | null;
   created_at: string;
   updated_at: string;
@@ -211,6 +216,10 @@ export async function updateWikiPage(pageId: number, data: {
   summary?: string;
   status?: string;
   confidence?: number;
+  // DD-C020 optimistic-locking guard (issue #276 1X-1). When set, the backend
+  // (wiki.py:99/246) compares this to the stored version and rejects the
+  // update with HTTP 409 if they differ. Omit to skip the conflict check.
+  expected_version?: number;
 }): Promise<WikiPage> {
   const response = await apiClient.put<WikiPage>(`/wiki/pages/${pageId}`, data);
   return response.data;
