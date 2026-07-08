@@ -42,7 +42,7 @@ skill_origin: generated
 
 ## Forbidden Shortcuts
 
-- Change dependency versions that cause typecheck or build to fail.
+- Claim a task or phase is complete before all required QA gate artifacts are present.
 - Fail a verification gate on pre-existing lint issues not introduced by the current phase.
 
 ## Delegation Template
