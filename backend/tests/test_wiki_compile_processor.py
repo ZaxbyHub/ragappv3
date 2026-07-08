@@ -176,7 +176,6 @@ class TestCompileIngestJob(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-        import os
         try:
             os.unlink(self._tmpfile.name)
         except OSError:
@@ -1308,7 +1307,6 @@ class TestIngestJobReParseFromFilePath(unittest.TestCase):
 
     def tearDown(self):
         self.conn.close()
-        import os
         try:
             os.unlink(self._tmpfile.name)
         except OSError:
