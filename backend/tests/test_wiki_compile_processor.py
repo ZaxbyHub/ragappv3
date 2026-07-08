@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -242,16 +243,29 @@ class TestCompileIngestJob(unittest.TestCase):
         self.assertGreater(len(result["claims"]), 0)
 
     def test_does_not_open_raw_file_bytes(self):
-        # /dev/zero is not a regular file and has no .txt extension; the compiler
-        # must skip cleanly without raising or hanging.
-        self.conn.execute(
-            "UPDATE files SET file_path = '/dev/zero' WHERE id = 1"
-        )
-        self.conn.commit()
-        result = self.compiler.compile_ingest_job(
-            vault_id=1, input_json={"file_id": 1}  # no text → skip
-        )
-        self.assertTrue(result.get("skipped"))
+        # A real binary file (no .txt extension) containing non-UTF-8 bytes.
+        # Because the path does not end in .txt the plain-text fallback is
+        # skipped; the compiler attempts a raw read and must still skip
+        # cleanly without raising or hanging.
+        tmp = tempfile.NamedTemporaryFile(suffix=".bin", delete=False)
+        try:
+            tmp.write(b"\x00\x01\x02\x03\xff\xfe\xfd\xfc")
+            tmp.close()
+            self.conn.execute(
+                "UPDATE files SET file_path = ?, file_name = ? WHERE id = 1",
+                (tmp.name, "raw.bin"),
+            )
+            self.conn.commit()
+            result = self.compiler.compile_ingest_job(
+                vault_id=1, input_json={"file_id": 1}  # no text → skip
+            )
+            self.assertTrue(result.get("skipped"))
+        finally:
+            import os as _os
+            try:
+                _os.unlink(tmp.name)
+            except OSError:
+                pass
 
     def test_creates_page_even_when_extraction_is_empty(self):
         # Prose with no acronyms and no ALL-CAPS-org role claims must still
@@ -1990,6 +2004,55 @@ class TestPollLoopNonBlockingBackoff(unittest.IsolatedAsyncioTestCase):
             ).fetchone()
         self.assertEqual(dict(row)["status"], "pending")
         proc._running = False
+
+    async def test_poll_loop_claims_second_job_during_failed_job_backoff(self):
+        """E2-3: the poll loop must keep claiming other pending jobs while a failed
+        job sits in its detached backoff/reset window."""
+        from app.services.wiki_compile_processor import WikiCompileProcessor
+        from app.services.wiki_store import WikiStore
+
+        with self.pool.connection() as conn:
+            conn.row_factory = sqlite3.Row
+            store = WikiStore(conn)
+            # Job 1: non-existent memory → _dispatch raises ValueError → fail → detached reset.
+            job1 = store.create_job(vault_id=1, trigger_type="memory", input_json={"memory_id": 99999})
+            # Job 2: query with no answer → completes quickly.
+            job2 = store.create_job(vault_id=1, trigger_type="query", input_json={})
+
+        proc = WikiCompileProcessor(self.pool)
+        await proc.start()
+        try:
+            # Wait for job2 to complete (fast path, no backoff).
+            for _ in range(50):  # 5 s total
+                await asyncio.sleep(0.1)
+                with self.pool.connection() as conn:
+                    conn.row_factory = sqlite3.Row
+                    row2 = conn.execute(
+                        "SELECT status FROM wiki_compile_jobs WHERE id = ?", (job2.id,)
+                    ).fetchone()
+                if dict(row2)["status"] == "completed":
+                    break
+            self.assertEqual(
+                dict(row2)["status"], "completed",
+                "Job 2 must complete while job 1 is in backoff",
+            )
+
+            # Wait for job 1's detached reset to fire (backoff=2 s).
+            for _ in range(50):  # 5 s total
+                await asyncio.sleep(0.1)
+                with self.pool.connection() as conn:
+                    conn.row_factory = sqlite3.Row
+                    row1 = conn.execute(
+                        "SELECT status FROM wiki_compile_jobs WHERE id = ?", (job1.id,)
+                    ).fetchone()
+                if dict(row1)["status"] == "pending":
+                    break
+            self.assertEqual(
+                dict(row1)["status"], "pending",
+                "Job 1 must return to 'pending' after its detached reset fires",
+            )
+        finally:
+            await proc.stop()
 
     async def test_stop_cancels_in_flight_bg_tasks(self):
         from app.services.wiki_compile_processor import WikiCompileProcessor

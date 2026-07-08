@@ -597,7 +597,12 @@ class WikiRetrievalService:
                 f"WHERE claim_id IN ({placeholders})",
                 tuple(claim_ids),
             ).fetchall()
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "_claim_provenance_for: failed for %d claim(s): %s",
+                len(claim_ids),
+                exc,
+            )
             return {cid: (0, "") for cid in claim_ids}
 
         grouped: dict[int, list[str]] = {}
