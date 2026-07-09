@@ -19,7 +19,7 @@ class StructuredAnswer(BaseModel):
     abstained: bool = False
 
 
-_CITATION_RE = re.compile(r"\[(S\d+|M\d+|W\d+|KMS\d+)\]")
+_CITATION_RE = re.compile(r"\[(S\d+|M\d+|W\d+|K\d+)\]")
 
 
 def build_answer_contract(
@@ -32,8 +32,8 @@ def build_answer_contract(
 ) -> Dict[str, Any]:
     source_labels = {s.get("source_label") for s in sources}
     memory_labels = {m.get("memory_label") for m in memories_used}
-    wiki_labels = {w.get("label_placeholder") for w in wiki_used}
-    kms_labels = {k.get("label_placeholder") for k in kms_used}
+    wiki_labels = {w.get("wiki_label") for w in wiki_used}
+    kms_labels = {k.get("kms_label") for k in kms_used}
     citations: List[AnswerCitation] = []
     for label in dict.fromkeys(_CITATION_RE.findall(content)):
         if label in source_labels:
