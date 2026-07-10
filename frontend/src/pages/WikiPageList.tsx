@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
+import { toast } from "sonner";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { EmptyState } from "@/components/EmptyState";
 import { FileText, Trash2, RefreshCw } from "lucide-react";
@@ -22,10 +24,10 @@ export const PAGE_TYPES = [
 
 const STATUS_COLORS: Record<string, string> = {
   draft: "bg-muted text-muted-foreground",
-  verified: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200",
-  stale: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200",
-  needs_review: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
-  archived: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
+  verified: "bg-success/10 text-success",
+  stale: "bg-warning/10 text-warning",
+  needs_review: "bg-primary/10 text-primary",
+  archived: "bg-destructive/10 text-destructive",
 };
 
 interface WikiPageListProps {
@@ -46,13 +48,6 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh }: W
     setSelectedIds([]);
   }, [pages]);
 
-  function toggleSelect(pageId: number, e: React.MouseEvent) {
-    e.stopPropagation();
-    setSelectedIds((prev) =>
-      prev.includes(pageId) ? prev.filter((id) => id !== pageId) : [...prev, pageId]
-    );
-  }
-
   function toggleSelectAll() {
     if (selectedIds.length === pages.length) {
       setSelectedIds([]);
@@ -69,8 +64,10 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh }: W
       await bulkWikiPageAction(vaultId, selectedIds, "delete");
       setSelectedIds([]);
       onRefresh?.();
-    } catch {
-      // error handled by api interceptor
+    } catch (err) {
+      // The api interceptor normalizes but does NOT render a toast — surface
+      // the failure to the user so a failed bulk-delete is not silent (UI-INT-3).
+      toast.error(err instanceof Error ? err.message : "Failed to delete pages");
     } finally {
       setBulkLoading(false);
     }
@@ -83,8 +80,8 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh }: W
       await bulkWikiPageAction(vaultId, selectedIds, "update", { status });
       setSelectedIds([]);
       onRefresh?.();
-    } catch {
-      // error handled by api interceptor
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to update page status");
     } finally {
       setBulkLoading(false);
     }
@@ -145,11 +142,10 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh }: W
       )}
       {!loading && pages.length > 0 && (
         <div className="flex items-center gap-2 px-1 mb-1">
-          <input
-            type="checkbox"
+          <Checkbox
             checked={selectedIds.length === pages.length && pages.length > 0}
-            onChange={toggleSelectAll}
-            className="h-3.5 w-3.5 rounded border-border"
+            onCheckedChange={toggleSelectAll}
+            className="h-3.5 w-3.5"
             aria-label="Select all pages"
           />
           <span className="text-xs text-muted-foreground">Select all</span>
@@ -166,12 +162,19 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh }: W
         >
           <CardContent className="py-3 px-4">
             <div className="flex items-start gap-2">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={selectedIds.includes(page.id)}
-                onClick={(e) => toggleSelect(page.id, e)}
-                onChange={() => {}}
-                className="h-3.5 w-3.5 mt-1 rounded border-border shrink-0"
+                onCheckedChange={(checked) => {
+                  // Stop propagation so the click does not also trigger the
+                  // row's onClick (which would open the page).
+                  if (!checked) {
+                    setSelectedIds((prev) => prev.filter((id) => id !== page.id));
+                  } else {
+                    setSelectedIds((prev) => [...prev, page.id]);
+                  }
+                }}
+                onClick={(e) => e.stopPropagation()}
+                className="h-3.5 w-3.5 mt-1 shrink-0"
                 aria-label={`Select ${page.title}`}
               />
               <div className="flex items-start justify-between gap-2 flex-1 min-w-0">

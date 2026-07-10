@@ -316,7 +316,7 @@ export function WikiCuratorSettings({
               aria-invalid={errors.wiki_llm_curator_url ? true : undefined}
             />
             {errors.wiki_llm_curator_url && (
-              <p className="text-xs text-destructive">
+              <p role="alert" className="text-xs text-destructive">
                 {errors.wiki_llm_curator_url}
               </p>
             )}
@@ -344,7 +344,7 @@ export function WikiCuratorSettings({
               aria-invalid={errors.wiki_llm_curator_model ? true : undefined}
             />
             {errors.wiki_llm_curator_model && (
-              <p className="text-xs text-destructive">
+              <p role="alert" className="text-xs text-destructive">
                 {errors.wiki_llm_curator_model}
               </p>
             )}

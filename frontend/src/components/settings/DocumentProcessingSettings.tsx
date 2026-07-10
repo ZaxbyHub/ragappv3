@@ -35,7 +35,7 @@ export function DocumentProcessingSettings({
             className={errors.chunk_size_chars ? "border-destructive" : ""}
           />
           {errors.chunk_size_chars && (
-            <p className="text-xs text-destructive">{errors.chunk_size_chars}</p>
+            <p role="alert" className="text-xs text-destructive">{errors.chunk_size_chars}</p>
           )}
           <p className="text-xs text-muted-foreground">
             Number of characters per document chunk
@@ -55,7 +55,7 @@ export function DocumentProcessingSettings({
             className={errors.chunk_overlap_chars ? "border-destructive" : ""}
           />
           {errors.chunk_overlap_chars && (
-            <p className="text-xs text-destructive">{errors.chunk_overlap_chars}</p>
+            <p role="alert" className="text-xs text-destructive">{errors.chunk_overlap_chars}</p>
           )}
           <p className="text-xs text-muted-foreground">
             Number of overlapping characters between chunks (must be less than chunk size)
@@ -75,7 +75,7 @@ export function DocumentProcessingSettings({
             className={errors.retrieval_top_k ? "border-destructive" : ""}
           />
           {errors.retrieval_top_k && (
-            <p className="text-xs text-destructive">{errors.retrieval_top_k}</p>
+            <p role="alert" className="text-xs text-destructive">{errors.retrieval_top_k}</p>
           )}
           <p className="text-xs text-muted-foreground">
             Maximum number of chunks to retrieve and include in context
@@ -112,7 +112,7 @@ export function DocumentProcessingSettings({
               className={errors.auto_scan_interval_minutes ? "border-destructive" : ""}
             />
             {errors.auto_scan_interval_minutes && (
-              <p className="text-xs text-destructive">{errors.auto_scan_interval_minutes}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.auto_scan_interval_minutes}</p>
             )}
             <p className="text-xs text-muted-foreground">
               How often to scan for new documents (in minutes)
