@@ -1,5 +1,8 @@
 # Stage 1: Build Frontend
-FROM node:26-alpine AS frontend-builder
+# Pinned to node 20.19 to match CI (ci.yml node-version "20.19.0") so a green
+# CI run proves the shipped image builds (B6-2, #289). node:26 diverged from CI
+# and could build/run differently than what CI validated.
+FROM node:20.19-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -37,7 +40,9 @@ try {
 RUN npm run build
 
 # Stage 2: Backend with Unstructured dependencies
-FROM python:3.14-slim AS backend
+# Pinned to python 3.11 to match CI (ci.yml python-version "3.11") so a green
+# CI run proves the shipped image builds and runs (B6-2, #289).
+FROM python:3.11-slim AS backend
 
 # Install system dependencies for Unstructured
 # Note: libmagic1 needed for python-magic on Linux
