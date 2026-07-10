@@ -144,10 +144,12 @@ class VectorStore:
         Returns:
             First 16 characters of the SHA-256 hex digest of
             ``settings.embedding_doc_prefix + '|' + settings.embedding_query_prefix``.
-            None values are coerced to empty string.
+            Falsy values (including ``None``) are treated as empty strings, and
+            truthy non-string values are coerced via ``str()`` so the function is
+            safe under partially-mocked settings.
         """
-        doc_prefix = settings.embedding_doc_prefix or ""
-        query_prefix = settings.embedding_query_prefix or ""
+        doc_prefix = str(settings.embedding_doc_prefix or "")
+        query_prefix = str(settings.embedding_query_prefix or "")
         combined = (doc_prefix + "|" + query_prefix).encode()
         return hashlib.sha256(combined).hexdigest()[:16]
 

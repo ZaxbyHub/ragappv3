@@ -18,7 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -27,13 +27,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # lancedb is a required dependency for these tests - import it early before any stub is installed
 import lancedb  # noqa: E402
-
-try:
-    import pyarrow
-except ImportError:
-    import types
-
-    sys.modules["pyarrow"] = types.ModuleType("pyarrow")
 
 try:
     from unstructured.partition.auto import partition
@@ -79,6 +72,7 @@ from app.config import settings
 from app.main import app
 from app.security import csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
+from app.services.vector_store import VectorStore
 
 
 class TestEmbeddingModelVersioningBase(unittest.TestCase):
@@ -844,6 +838,83 @@ class TestReindexJobCompletionOrdering(TestEmbeddingModelVersioningBase):
             self.assertIsNotNone(completed_at)
         finally:
             self._connection_pool.release_connection(conn)
+
+
+class TestComputeEmbeddingPrefixHash(unittest.TestCase):
+    """Tests for _compute_embedding_prefix_hash."""
+
+    def test_returns_16_char_hex_hash(self):
+        """Verify it returns a 16-character hex string for normal string prefixes."""
+        vs = VectorStore(db_path=Path("/tmp/test_lancedb"))
+
+        # With default (empty) prefixes the hash should be deterministic
+        result = vs._compute_embedding_prefix_hash()
+        self.assertIsInstance(result, str)
+        self.assertEqual(len(result), 16)
+        # Must be valid hexadecimal
+        int(result, 16)  # raises ValueError if not hex
+        self.assertEqual(result, vs._compute_embedding_prefix_hash())  # idempotent
+
+    def test_non_empty_string_prefixes_change_hash(self):
+        """Verify that explicit non-empty string prefixes produce a different hash
+        from the empty-string baseline."""
+        vs = VectorStore(db_path=Path("/tmp/test_lancedb"))
+
+        # Empty-string baseline
+        orig_doc = settings.embedding_doc_prefix
+        orig_query = settings.embedding_query_prefix
+        try:
+            settings.embedding_doc_prefix = ""
+            settings.embedding_query_prefix = ""
+            baseline = vs._compute_embedding_prefix_hash()
+
+            # Non-empty prefixes should produce a different hash
+            settings.embedding_doc_prefix = "doc_prefix"
+            settings.embedding_query_prefix = "query_prefix"
+            result = vs._compute_embedding_prefix_hash()
+            self.assertNotEqual(result, baseline)
+            self.assertIsInstance(result, str)
+            self.assertEqual(len(result), 16)
+            int(result, 16)  # must be valid hex
+        finally:
+            settings.embedding_doc_prefix = orig_doc
+            settings.embedding_query_prefix = orig_query
+
+    def test_treats_none_as_empty_string(self):
+        """Verify that when settings.embedding_doc_prefix and settings.embedding_query_prefix
+        are None, the result is the same as empty strings."""
+        vs = VectorStore(db_path=Path("/tmp/test_lancedb"))
+
+        # Capture baseline with empty strings
+        orig_doc = settings.embedding_doc_prefix
+        orig_query = settings.embedding_query_prefix
+        try:
+            settings.embedding_doc_prefix = ""
+            settings.embedding_query_prefix = ""
+            baseline = vs._compute_embedding_prefix_hash()
+
+            # Set to None and verify same result
+            settings.embedding_doc_prefix = None
+            settings.embedding_query_prefix = None
+            result = vs._compute_embedding_prefix_hash()
+            self.assertEqual(result, baseline)
+        finally:
+            settings.embedding_doc_prefix = orig_doc
+            settings.embedding_query_prefix = orig_query
+
+    def test_handles_mocked_settings_without_exploding(self):
+        """Patch app.services.vector_store.settings with a MagicMock that does NOT have
+        embedding_doc_prefix or embedding_query_prefix set, and verify the function
+        returns a 16-character hex string (does not raise)."""
+        vs = VectorStore(db_path=Path("/tmp/test_lancedb"))
+
+        with patch("app.services.vector_store.settings") as mock_settings:
+            mock_settings.embedding_doc_prefix = MagicMock()
+            mock_settings.embedding_query_prefix = MagicMock()
+            result = vs._compute_embedding_prefix_hash()
+            self.assertIsInstance(result, str)
+            self.assertEqual(len(result), 16)
+            int(result, 16)  # must be valid hex
 
 
 if __name__ == "__main__":
