@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from app.config import settings
+from app.services.store_utils import DualPoolMixin
 
 logger = logging.getLogger(__name__)
 
@@ -81,27 +82,17 @@ class KMSEvidence:
         }
 
 
-class KMSRetrievalService:
+class KMSRetrievalService(DualPoolMixin):
     """Retrieves KMS evidence for RAG queries.
 
     Takes a connection pool. Supports both pool interfaces in this codebase:
     the production ``SQLiteConnectionPool`` (``get_connection``/
-    ``release_connection``) and the lightweight test pools (``get``/``put``).
+    ``release_connection``) and the lightweight test pools (``get``/``put``)
+    via the shared :class:`DualPoolMixin` (F3-4).
     """
 
     def __init__(self, pool: Any) -> None:
         self._pool = pool
-
-    def _acquire(self) -> sqlite3.Connection:
-        if hasattr(self._pool, "get_connection"):
-            return self._pool.get_connection()
-        return self._pool.get()
-
-    def _release(self, conn: sqlite3.Connection) -> None:
-        if hasattr(self._pool, "release_connection"):
-            self._pool.release_connection(conn)
-        else:
-            self._pool.put(conn)
 
     def retrieve(self, query: str, vault_id: Optional[int]) -> List[KMSEvidence]:
         """Return ranked KMSEvidence for the query.

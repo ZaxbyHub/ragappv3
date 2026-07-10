@@ -189,8 +189,12 @@ class FileWatcher:
             finally:
                 self.pool.release_connection(conn)
         except Exception as e:
+            # Re-raise so scan_once treats a per-directory DB-query failure as
+            # a counted/reported error (caught at the scan_once level, matching
+            # the sibling scanning-error branch) rather than returning the same
+            # empty set() as a legitimate "no new files" scan (RES-4).
             logger.error(f"Error querying database: {e}")
-            return set()
+            raise
 
         # Find new files (on disk but not in DB)
         new_files: Set[Path] = set()

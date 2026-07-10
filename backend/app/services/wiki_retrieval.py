@@ -23,6 +23,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+from app.services.store_utils import DualPoolMixin
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -181,12 +183,14 @@ def extract_query_intent(query: str) -> tuple[list[str], list[str]]:
 # WikiRetrievalService
 # ---------------------------------------------------------------------------
 
-class WikiRetrievalService:
+class WikiRetrievalService(DualPoolMixin):
     """Retrieves wiki evidence for RAG queries.
 
     Takes a connection pool (or a raw sqlite3.Connection for testing).
     For production use, pass the app's db_pool; the retrieve() method
     borrows a connection, runs queries, and returns the connection.
+
+    Pool acquire/release is provided by the shared :class:`DualPoolMixin` (F3-4).
     """
 
     def __init__(
@@ -207,20 +211,6 @@ class WikiRetrievalService:
                 settings.wiki_fts_page_search_max_candidates
             )
         self._fts_page_search_max_candidates = max(0, fts_page_search_max_candidates)
-
-    def _acquire(self) -> sqlite3.Connection:
-        # Support both the production SQLiteConnectionPool
-        # (get_connection/release_connection) and lightweight test pools
-        # (get/put).
-        if hasattr(self._pool, "get_connection"):
-            return self._pool.get_connection()
-        return self._pool.get()
-
-    def _release(self, conn: sqlite3.Connection) -> None:
-        if hasattr(self._pool, "release_connection"):
-            self._pool.release_connection(conn)
-        else:
-            self._pool.put(conn)
 
     def retrieve(self, query: str, vault_id: Optional[int]) -> List[WikiEvidence]:
         """Return ranked WikiEvidence for the query.

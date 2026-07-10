@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
+from app.services.store_utils import cosine_similarity as _cosine_similarity_shared
+
 if TYPE_CHECKING:
     from unstructured.documents.elements import Element
 
@@ -374,24 +376,14 @@ class EmbeddingSemanticChunker:
         return sentences
 
     def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
+        """Calculate cosine similarity between two vectors.
+
+        Delegates to the shared helper (F3-5). NOTE: the previous inline copy
+        had no length guard and silently truncated to the shorter vector via
+        zip(); the shared helper returns 0.0 on length mismatch, fixing that
+        divergence.
         """
-        Calculate cosine similarity between two vectors.
-
-        Args:
-            vec1: First vector
-            vec2: Second vector
-
-        Returns:
-            Cosine similarity value between -1 and 1
-        """
-        dot_product = sum(a * b for a, b in zip(vec1, vec2))
-        norm1 = math.sqrt(sum(a * a for a in vec1))
-        norm2 = math.sqrt(sum(b * b for b in vec2))
-
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-
-        return dot_product / (norm1 * norm2)
+        return _cosine_similarity_shared(vec1, vec2)
 
     def _calculate_breakpoints(self, similarities: List[float]) -> List[int]:
         """

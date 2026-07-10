@@ -1,11 +1,12 @@
 """Context distillation: sentence-level deduplication and optional LLM synthesis."""
 
 import logging
-import math
 import re
 from dataclasses import dataclass, field
 from html import escape as _xml_escape
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
+
+from app.services.store_utils import cosine_similarity as _cosine_similarity_shared
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +71,13 @@ _SYNTHESIS_PROMPT_USER = (
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(x * x for x in b))
-    if mag_a == 0.0 or mag_b == 0.0:
-        return 0.0
-    return dot / (mag_a * mag_b)
+    """Cosine similarity. Delegates to the shared helper (F3-5).
+
+    NOTE: the previous inline copy had no length guard and silently truncated
+    to the shorter vector via zip(); the shared helper returns 0.0 on length
+    mismatch, fixing that divergence.
+    """
+    return _cosine_similarity_shared(a, b)
 
 
 def _split_sentences(text: str) -> List[str]:

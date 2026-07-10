@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+from app.services.store_utils import vault_file_ids as _vault_file_ids_shared
+
 # Sentinel distinguishing "parent not provided" from "parent explicitly set to
 # NULL (move to root)" in update_folder.
 _UNSET: Any = object()
@@ -124,15 +126,12 @@ class FolderStore:
         return result
 
     def _vault_file_ids(self, vault_id: int, file_ids: list[int]) -> list[int]:
-        """Return the subset of file_ids that belong to vault_id."""
-        if not file_ids:
-            return []
-        placeholders = ",".join("?" * len(file_ids))
-        rows = self._db.execute(
-            f"SELECT id FROM files WHERE vault_id = ? AND id IN ({placeholders})",
-            (vault_id, *file_ids),
-        ).fetchall()
-        return [r["id"] for r in rows]
+        """Return the subset of file_ids that belong to vault_id.
+
+        Delegates to the shared helper (store_utils.vault_file_ids) so the
+        implementation is not duplicated across FolderStore/TagStore (F3-3).
+        """
+        return _vault_file_ids_shared(self._db, vault_id, file_ids)
 
     # -----------------------------------------------------------------------
     # Folder CRUD

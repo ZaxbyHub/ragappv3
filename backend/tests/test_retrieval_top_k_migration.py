@@ -6,6 +6,13 @@ This test file verifies:
 3. RAG engine integration with retrieval_top_k
 """
 
+import os
+
+# The async RAG-engine test constructs real EmbeddingService/VectorStore
+# instances, whose SSRF guards validate the configured local model URLs.
+# Allow local service endpoints for this module's construction paths.
+os.environ.setdefault("ALLOW_LOCAL_SERVICES", "1")
+
 import asyncio
 import os
 import sys
@@ -133,23 +140,40 @@ class TestRAGEngineRetrievalTopK(unittest.TestCase):
 class TestRAGEngineAsyncBehavior:
     """Async tests for RAG engine behavior."""
 
-    async def test_rag_engine_search_memories_called_with_retrieval_top_k(self):
-        """Test that search_memories is called with correct retrieval_top_k limit."""
-        from unittest.mock import patch
+    async def test_rag_engine_search_memories_uses_memory_retrieval_top_k(self):
+        """RAGEngine.query passes settings.memory_retrieval_top_k (NOT
+        retrieval_top_k) as the limit to MemoryStore.search_memories.
 
-        # Mock settings
-        with patch("app.services.rag_engine.settings") as mock_settings:
-            mock_settings.retrieval_top_k = 15
-            mock_settings.query_transformation_enabled = False
-            mock_settings.tri_vector_search_enabled = False
-            mock_settings.maintenance_mode = False
-            mock_settings.context_max_tokens = 6000
-            mock_settings.retrieval_evaluation_enabled = False
+        Replaces the prior tautological test (C2-4) which only asserted
+        ``mock_settings.retrieval_top_k == 15`` after setting it to 15 and
+        never referenced search_memories. Driving the full streaming query()
+        generator requires heavy mocking of the embedding/LLM/vector stack
+        (the query path embeds the query before reaching memory retrieval),
+        so this uses the repo's established source-inspection pattern to
+        assert the production code reads the correct settings field. A
+        regression that swapped ``memory_retrieval_top_k`` for
+        ``retrieval_top_k`` would fail this test.
+        """
+        import os
 
-            # Mock actual retrieval_top_k value passed
-            with patch("app.config.settings.retrieval_top_k", 15):
-                # Verify the retrieval_top_k value is correctly configured
-                assert mock_settings.retrieval_top_k == 15
+        source_path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "services", "rag_engine.py"
+        )
+        source = open(source_path, encoding="utf-8").read()
+
+        # The memory-retrieval branch must pass memory_retrieval_top_k.
+        assert "settings.memory_retrieval_top_k" in source
+        # Locate the search_memories call and confirm it is bounded by
+        # memory_retrieval_top_k, not retrieval_top_k.
+        idx = source.find("self.memory_store.search_memories")
+        assert idx != -1, "search_memories call not found in rag_engine.py"
+        # The limit is on the following lines (within the asyncio.to_thread call).
+        window = source[idx : idx + 200]
+        assert "memory_retrieval_top_k" in window
+        # Must NOT use the bare retrieval_top_k field (settings.retrieval_top_k).
+        # Note: "memory_retrieval_top_k" contains "retrieval_top_k" as a
+        # substring, so check for the settings-qualified bare field instead.
+        assert "settings.retrieval_top_k" not in window
 
 
 class TestRetrievalTopKValueMigration(unittest.TestCase):
