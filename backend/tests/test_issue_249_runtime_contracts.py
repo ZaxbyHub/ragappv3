@@ -146,6 +146,25 @@ def test_answer_contract_preserves_answer_and_typed_citations():
     assert contract["abstained"] is False
 
 
+def test_answer_contract_includes_wiki_and_kms_citations():
+    """Regression for issue #284: wiki/KMS citations were silently dropped
+    due to (1) regex matching [KMS#] instead of real [K#] labels, and
+    (2) label sets built from nonexistent 'label_placeholder' key instead
+    of 'wiki_label'/'kms_label'."""
+    contract = build_answer_contract(
+        "Wiki says [W1] and KMS says [K1].",
+        sources=[],
+        memories_used=[],
+        wiki_used=[{"wiki_label": "W1"}],
+        kms_used=[{"kms_label": "K1"}],
+    )
+
+    assert contract["citations"] == [
+        {"label": "W1", "evidence_type": "wiki"},
+        {"label": "K1", "evidence_type": "kms"},
+    ]
+
+
 class DummyLLMClient:
     def __init__(self, name, *, fail=False, content=""):
         self.base_url = name

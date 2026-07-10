@@ -22,15 +22,48 @@ SCRUB_FIELDS = {
     "api_key",
     "authorization",
     "secret",
+    "password",
+    "access_token",
+    "refresh_token",
+    "csrf_token",
+    "cookie",
+    "bearer",
 }
 
 logger = logging.getLogger("http")
 
 
 def _scrub_value(value: str) -> str:
+    """Redact a value if it contains any sensitive keyword.
+
+    Used by :func:`_sanitize_query` for URL query-param *names* (e.g.
+    ``?api_key=...``). Not used for free-text log message bodies.
+    """
     if not value:
         return value
     return "[redacted]" if any(field in value.lower() for field in SCRUB_FIELDS) else value
+
+
+class SensitiveFieldFilter(logging.Filter):
+    """Redact sensitive record *attributes* by name.
+
+    Scrubs the VALUE of any log-record attribute whose NAME is in
+    :data:`SCRUB_FIELDS` (e.g. ``record.user_input``, ``record.api_key``),
+    replacing it with ``[redacted]``. This is attribute-name-based, NOT
+    free-text message matching, so a log line whose message merely contains
+    the word "user_input" is left untouched while an ``extra={"user_input":
+    ...}`` record is scrubbed. This honors the documented field-level
+    redaction contract without over-redacting legitimate log messages.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        for field in SCRUB_FIELDS:
+            if hasattr(record, field):
+                try:
+                    setattr(record, field, "[redacted]")
+                except Exception:  # pragma: no cover — defensive
+                    pass
+        return True
 
 
 def _sanitize_query(query: str) -> str:

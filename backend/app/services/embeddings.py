@@ -6,8 +6,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections import OrderedDict
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -150,15 +151,32 @@ class EmbeddingService:
         # endpoint changes.
         # follow_redirects=False so a 30x from the embedding host cannot bypass
         # the SSRF guard by redirecting to a private/internal address.
+        # SSRFSafeTransport re-validates the resolved IP at request time to close
+        # the DNS-rebinding TOCTOU gap the startup-only guard leaves open.
+        # httpx ignores the `limits=` kwarg on AsyncClient whenever a custom
+        # `transport=` is supplied, so `limits` must be forwarded into the
+        # wrapped transport explicitly or connection-pool sizing silently
+        # reverts to httpx's defaults.
+        from app.services.ssrf_transport import SSRFSafeTransport
+
         self._client = httpx.AsyncClient(
             timeout=self.timeout,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             follow_redirects=False,
+            transport=SSRFSafeTransport(
+                transport=httpx.AsyncHTTPTransport(
+                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+                )
+            ),
         )
 
         # LRU cache. Cache keys include the live model/url/prefix fingerprints,
         # so a settings change naturally invalidates cached entries.
         self._embed_cache = LRUCache(maxsize=1000)
+
+        # Last embedding-API call metrics (analogous to LLMClient.last_metrics).
+        # Populated on every provider-path call (success or failure); None until
+        # the first call. Exposed for operators/diagnostics (E3-6).
+        self.last_metrics: Optional[Dict[str, Any]] = None
 
         # Redis L2 cache — shared across processes/workers.
         # Graceful fallback: if Redis is unavailable, embeddings still work via L1 LRU + provider.
@@ -441,6 +459,7 @@ class EmbeddingService:
         # Provider path (cache miss on L1 and L2)
         self._redis_misses += 1
 
+        _embed_started = time.perf_counter()
         try:
             response = await embeddings_cb(self._client.post)(
                 self.embeddings_url, json=self._build_payload(text_to_embed)
@@ -464,6 +483,13 @@ class EmbeddingService:
 
             embedding = self._extract_embedding(data)
 
+            self.last_metrics = {
+                "provider_url": self.embeddings_url,
+                "mode": self.provider_mode,
+                "latency_ms": round((time.perf_counter() - _embed_started) * 1000, 2),
+                "status": "ok",
+            }
+
             # Store in both L1 (in-process LRU) and L2 (Redis shared cache)
             self._embed_cache.set(cache_key, embedding)
 
@@ -478,11 +504,40 @@ class EmbeddingService:
             return embedding
 
         except CircuitBreakerError as e:
-            raise EmbeddingError(f"Embedding service circuit breaker is open: {e}")
-        except httpx.TimeoutException:
-            raise EmbeddingError("Embedding request timed out")
-        except httpx.HTTPError:
-            raise EmbeddingError("Embedding HTTP error occurred")
+            logger.warning(
+                "Embedding request failed (mode=%s): circuit breaker open: %s",
+                self.provider_mode,
+                e,
+            )
+            self.last_metrics = {
+                "provider_url": self.embeddings_url,
+                "mode": self.provider_mode,
+                "latency_ms": round((time.perf_counter() - _embed_started) * 1000, 2),
+                "status": "circuit_open",
+            }
+            raise EmbeddingError(f"Embedding service circuit breaker is open: {e}") from e
+        except httpx.TimeoutException as e:
+            logger.warning(
+                "Embedding request timed out (mode=%s): %s", self.provider_mode, e
+            )
+            self.last_metrics = {
+                "provider_url": self.embeddings_url,
+                "mode": self.provider_mode,
+                "latency_ms": round((time.perf_counter() - _embed_started) * 1000, 2),
+                "status": "timeout",
+            }
+            raise EmbeddingError("Embedding request timed out") from e
+        except httpx.HTTPError as e:
+            logger.warning(
+                "Embedding HTTP error (mode=%s): %s", self.provider_mode, e
+            )
+            self.last_metrics = {
+                "provider_url": self.embeddings_url,
+                "mode": self.provider_mode,
+                "latency_ms": round((time.perf_counter() - _embed_started) * 1000, 2),
+                "status": "http_error",
+            }
+            raise EmbeddingError("Embedding HTTP error occurred") from e
 
     async def embed_single(self, text: str) -> List[float]:
         """
@@ -681,6 +736,10 @@ class EmbeddingService:
         """Log connection pool and cache statistics for monitoring."""
         try:
             pool = getattr(client, "_transport", None)
+            # SSRFSafeTransport wraps the real httpx.AsyncHTTPTransport as
+            # `_transport`, not `_pool` — unwrap it before looking for `_pool`.
+            if pool is not None and not hasattr(pool, "_pool"):
+                pool = getattr(pool, "_transport", None)
             if pool and hasattr(pool, "_pool"):
                 pool_obj = pool._pool
                 connections = getattr(pool_obj, "_num_connections", 0)

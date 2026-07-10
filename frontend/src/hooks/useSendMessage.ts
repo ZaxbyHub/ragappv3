@@ -132,6 +132,14 @@ export function useSendMessage(
       let streamedWikiRefs: WikiReference[] = [];
       // Accumulate KMS refs from the SSE stream so they can be persisted with the message.
       let streamedKmsRefs: KMSReference[] = [];
+      // Mirror of the coalesced hook's accumulated content, updated
+      // synchronously alongside append(). useCoalescedAppend's flush()
+      // writes to React state, and the store sync happens in a useEffect —
+      // both deferred to the next render. onComplete/onError need the FULL
+      // content immediately (to persist to the backend or update the store
+      // without waiting a render), so they read this synchronous mirror
+      // instead of relying on the effect having already run.
+      let streamedContent = "";
 
       // Resolve effective chat mode using the same logic as the Composer
       // toggle so the highlighted mode and the sent payload never diverge.
@@ -161,6 +169,14 @@ export function useSendMessage(
         {
           onMessage: (chunk) => {
             setCurrentStage(null);
+            // Coalesce SSE appends behind requestAnimationFrame (UI-PERF-2):
+            // without this, every token chunk updates the store, re-renders
+            // MarkdownMessage, and re-runs the full remark/rehype parse of
+            // the entire accumulated content (O(n²) in message length).
+            // useCoalescedAppend batches appends to once per frame (with a
+            // timer fallback), bounding reparse frequency independent of
+            // token rate while preserving live citation rendering.
+            streamedContent += chunk;
             append(chunk);
           },
           onSources: (sources) => {
@@ -186,7 +202,18 @@ export function useSendMessage(
           onFinalContent: (content) => {
             // Backend stripped invalid citations: adopt the cleaned content so
             // the hallucinated [S#] chip is removed from the rendered message
-            // and from what onComplete persists.
+            // and from what onComplete persists. The replace SUPERSEDES all
+            // buffered streaming tokens, so cancel any pending coalesced flush
+            // and clear its buffer — otherwise the pending flush would later
+            // fire (its `content` state still holding the stale, citation-dirty
+            // accumulated text) and the sync-effect below would overwrite this
+            // cleaned content with it, re-injecting the stripped citations and
+            // duplicating text. Nulling the ref also stops that same effect
+            // from firing again for this message once reset() clears content
+            // back to "".
+            reset();
+            assistantMessageIdRef.current = null;
+            streamedContent = content;
             updateMessage(assistantMessageId, { content });
           },
           // FR-004: capture citation confidence and unverifiable claims from done event.
@@ -197,7 +224,18 @@ export function useSendMessage(
             updateMessage(assistantMessageId, { unverifiableClaims: claims });
           },
           onError: (error) => {
+            // Flush any buffered streaming content before reading store state
+            // (UI-PERF-2): rAF-batched appends may not have fired yet, so
+            // synchronously drain the buffer to avoid losing the partial tail.
+            // flush() only updates the hook's own React state — the sync to
+            // the store happens in a useEffect on the next render, which is
+            // too late for the synchronous updateMessage below. Write the
+            // synchronous streamedContent mirror directly instead (skipped
+            // if onFinalContent already finalized this message).
             flush();
+            if (assistantMessageIdRef.current !== null) {
+              updateMessage(assistantMessageId, { content: streamedContent });
+            }
             console.error("Chat stream error:", error);
             const isAbort =
               error.name === "AbortError" || /aborted|abort/i.test(error.message);
@@ -223,7 +261,19 @@ export function useSendMessage(
             sendingRef.current = false;
           },
           onComplete: async () => {
+            // Flush any buffered streaming content before reading store state
+            // (UI-PERF-2): rAF-batched appends may not have fired yet when the
+            // stream completes, so synchronously drain the buffer to avoid
+            // persisting truncated content (the tail would be lost otherwise).
+            // flush() only updates the hook's own React state — the sync to
+            // the store happens in a useEffect on the next render, which is
+            // too late for the synchronous store read a few lines below.
+            // Write the synchronous streamedContent mirror directly instead
+            // (skipped if onFinalContent already finalized this message).
             flush();
+            if (assistantMessageIdRef.current !== null) {
+              updateMessage(assistantMessageId, { content: streamedContent });
+            }
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);

@@ -191,8 +191,14 @@ def _cache_bcrypt_hash_for_test_passwords():
     name.
 
     The cache is lazy: the first test that needs 'pass123' triggers the real
-    bcrypt call, subsequent tests get the cached value. Tests that use other
-    passwords (rare) are unaffected.
+    bcrypt call, subsequent tests get the cached value.
+
+    IMPORTANT: the cache is deliberately scoped to ONLY the documented common
+    password 'pass123'. Every other password is hashed/verified through the
+    real CryptContext so (a) fresh-salt-per-hash is exercised for non-fixture
+    passwords and (b) a real regression in the Argon2/bcrypt verify path is
+    not short-circuited. Tests that use other passwords are unaffected and
+    go through the real implementation.
     """
     # Lazy import — auth_service may not be available during early collection
     try:
@@ -200,24 +206,34 @@ def _cache_bcrypt_hash_for_test_passwords():
     except ImportError:
         return  # app.services.auth_service not importable; skip this fixture
 
+    # The single password whose hash we memoize for suite speed.
+    _CACHED_PASSWORD = "pass123"
+
     # Patch pwd_context.hash (the underlying method that hash_password calls), NOT
     # auth_service.hash_password. The latter is bypassed by tests that do
     # `from app.services.auth_service import hash_password` at module level.
     original_pwd_hash = _auth_module.pwd_context.hash
     original_pwd_verify = _auth_module.pwd_context.verify
-    _all_hash_cache = {}  # password -> hash (populated lazily by hash calls)
+    _cached_hash: dict = {}  # only ever holds the _CACHED_PASSWORD entry
 
     def _fast_pwd_hash(secret, *args, **kwargs):
         secret_str = str(secret) if not isinstance(secret, str) else secret
-        if secret_str not in _all_hash_cache:
-            _all_hash_cache[secret_str] = original_pwd_hash(secret, *args, **kwargs)
-        return _all_hash_cache[secret_str]
+        # Only memoize the documented common password; everything else goes
+        # through the real (fresh-salt) implementation.
+        if secret_str != _CACHED_PASSWORD:
+            return original_pwd_hash(secret, *args, **kwargs)
+        if secret_str not in _cached_hash:
+            _cached_hash[secret_str] = original_pwd_hash(secret, *args, **kwargs)
+        return _cached_hash[secret_str]
 
     def _fast_pwd_verify(secret, hash_value, *args, **kwargs):
         secret_str = str(secret) if not isinstance(secret, str) else secret
-        for pwd, cached_hash in _all_hash_cache.items():
-            if hash_value == cached_hash:
-                return secret_str == pwd
+        # Only short-circuit for the single memoized password; this is a
+        # legitimate cache hit (the hash already matched), not a bypass, and
+        # it never fires for any other password.
+        cached_hash = _cached_hash.get(_CACHED_PASSWORD)
+        if cached_hash is not None and hash_value == cached_hash:
+            return secret_str == _CACHED_PASSWORD
         return original_pwd_verify(secret, hash_value, *args, **kwargs)
 
     _auth_module.pwd_context.hash = _fast_pwd_hash

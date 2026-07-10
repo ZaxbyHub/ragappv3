@@ -7,16 +7,16 @@ import type { WikiLintFinding } from "@/lib/api";
 
 const SEVERITY_COLORS: Record<string, string> = {
   low: "border-l-muted bg-muted/20",
-  medium: "border-l-yellow-400 bg-yellow-50 dark:bg-yellow-950",
-  high: "border-l-orange-400 bg-orange-50 dark:bg-orange-950",
-  critical: "border-l-red-500 bg-red-50 dark:bg-red-950",
+  medium: "border-l-warning bg-warning/5",
+  high: "border-l-warning bg-warning/5",
+  critical: "border-l-destructive bg-destructive/5",
 };
 
 const SEVERITY_TEXT: Record<string, string> = {
   low: "text-muted-foreground",
-  medium: "text-yellow-700 dark:text-yellow-300",
-  high: "text-orange-700 dark:text-orange-300",
-  critical: "text-red-700 dark:text-red-300",
+  medium: "text-warning",
+  high: "text-warning",
+  critical: "text-destructive",
 };
 
 interface WikiLintPanelProps {

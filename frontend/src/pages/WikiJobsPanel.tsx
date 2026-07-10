@@ -21,9 +21,9 @@ import {
 
 const STATUS_COLORS: Record<WikiCompileJob["status"], string> = {
   pending: "bg-muted text-muted-foreground",
-  running: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
-  completed: "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300",
-  failed: "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300",
+  running: "bg-primary/10 text-primary",
+  completed: "bg-success/10 text-success",
+  failed: "bg-destructive/10 text-destructive",
   cancelled: "bg-muted text-muted-foreground line-through",
 };
 

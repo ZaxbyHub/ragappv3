@@ -61,6 +61,17 @@ def _get_pool():
 logger = logging.getLogger(__name__)
 
 
+# Approximate chars-per-token ratio used by the token-budget packer
+# (_pack_context_by_token_budget) to estimate chunk sizes without a tokenizer.
+# Centralized so the estimate can be tuned in one place (QUAL-2).
+_CHARS_PER_TOKEN_ESTIMATE = 3.5
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate the token count of ``text`` from its length (QUAL-2)."""
+    return max(1, int(len(text) / _CHARS_PER_TOKEN_ESTIMATE))
+
+
 class RAGEngineError(Exception):
     """Raised when the RAG engine cannot complete a query."""
 
@@ -1091,10 +1102,45 @@ class RAGEngine:
             vector_results = _multi_sub_query_results
             score_type = _multi_sub_score_type
             relevance_hint = _multi_sub_relevance_hint
-            # Multi-sub-query fusion is treated as CONFIDENT by design: RRF fusion
-            # already combines evidence from multiple query angles, so NO_MATCH
-            # synthesis is not expected for decomposed queries.
+            # Run the retrieval evaluator on the fused/deduped set so a real
+            # eval_result is computed (A7-3). Previously this was hardcoded to
+            # "CONFIDENT", which meant NO_MATCH distillation synthesis could
+            # never fire for decomposed multi-facet queries even when the fused
+            # evidence was genuinely irrelevant. Default to CONFIDENT on
+            # evaluator outage (fail-open, matching the single-query path).
             eval_result = "CONFIDENT"
+            if (
+                settings.retrieval_evaluation_enabled
+                and active_client is not None
+                and vector_results
+            ):
+                try:
+                    evaluator_key = id(active_client)
+                    if evaluator_key not in self._retrieval_evaluators:
+                        self._retrieval_evaluators[evaluator_key] = RetrievalEvaluator(
+                            active_client
+                        )
+                    _fusion_evaluator = self._retrieval_evaluators[evaluator_key]
+                    eval_result = await _fusion_evaluator.evaluate(
+                        user_input, vector_results
+                    )
+                    if eval_result == "NO_MATCH":
+                        relevance_hint = "Note: The retrieved documents may not be directly relevant to your query."
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "Multi-sub-query fusion evaluation: NO_MATCH for query (len=%d)",
+                                len(user_input),
+                            )
+                    elif eval_result == "AMBIGUOUS" and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "Multi-sub-query fusion evaluation: AMBIGUOUS for query (len=%d)",
+                            len(user_input),
+                        )
+                except Exception as _fusion_eval_exc:
+                    logger.warning(
+                        "Multi-sub-query fusion evaluation failed (defaulting to CONFIDENT): %s",
+                        _fusion_eval_exc,
+                    )
             rerank_success = _multi_sub_rerank_success
             hybrid_status = _multi_sub_hybrid_status
             fts_exceptions = 0
@@ -2489,7 +2535,7 @@ class RAGEngine:
             packed, token_count = [], 0
             for chunk in chunks:
                 # ~3.5 chars/token for English; overestimates to prevent overflow
-                chunk_tokens = max(1, int(len(chunk.text) / 3.5))
+                chunk_tokens = _estimate_tokens(chunk.text)
                 if token_count + chunk_tokens > max_tokens and packed:
                     break
                 packed.append(chunk)
@@ -2513,7 +2559,7 @@ class RAGEngine:
         # Phase 1: reserved top-N — always include, even if over budget.
         # Track when a reserved chunk pushes past the remaining budget.
         for chunk in reserved_chunks:
-            chunk_tokens = max(1, int(len(chunk.text) / 3.5))
+            chunk_tokens = _estimate_tokens(chunk.text)
             if token_count + chunk_tokens > max_tokens and packed:
                 # Over budget for this reserved slot — include anyway, mark truncated.
                 # (The LLM context window provides the final safety net.)
@@ -2524,7 +2570,7 @@ class RAGEngine:
         # Phase 2: best-fit for rank 4+ — skip overflows but keep evaluating.
         skipped = 0
         for chunk in remaining_chunks:
-            chunk_tokens = max(1, int(len(chunk.text) / 3.5))
+            chunk_tokens = _estimate_tokens(chunk.text)
             if token_count + chunk_tokens <= max_tokens:
                 packed.append(chunk)
                 token_count += chunk_tokens

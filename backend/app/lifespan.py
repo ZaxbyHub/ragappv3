@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.config import settings
+from app.middleware.logging import SensitiveFieldFilter
 from app.models.database import get_pool, run_migrations
 from app.security import CSRFManager
 from app.services.background_tasks import get_background_processor
@@ -31,12 +32,14 @@ from app.services.rag_engine import RAGEngine
 from app.services.reranking import RerankingService
 from app.services.secret_manager import SecretManager
 from app.services.ssrf import URLBlocked, assert_url_safe
+from app.services.ssrf_transport import SSRFSafeTransport
 from app.services.toggle_manager import ToggleManager
 from app.services.vector_store import VectorStore, VectorStoreError
 from app.services.wiki_compile_processor import WikiCompileProcessor
 from app.services.wiki_retrieval import WikiRetrievalService
+from app.utils.request_context import JsonFormatter, RequestIdFilter
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  # noqa: E402
 
 
 def select_ingestion_llm_client(app: FastAPI, mode: str):
@@ -61,19 +64,44 @@ async def _llm_keepalive_task(llm_client: LLMClient, interval: int = 30):
     """
     logger.info("Starting LLM keep-alive task (interval: %ds)", interval)
 
+    # Track consecutive failures so a sustained outage is distinguishable
+    # from a transient model-unload. DEBUG per-ping stays for noise control,
+    # but after _KEEPALIVE_WARN_THRESHOLD consecutive failures we escalate to
+    # WARNING so operators get an alarm for a persistent LLM outage instead
+    # of seeing only DEBUG lines that look identical to a healthy transient.
+    _KEEPALIVE_WARN_THRESHOLD = 3
+    consecutive_failures = 0
+
     while True:
         try:
             await asyncio.sleep(interval)
             # Send a simple completion to keep model loaded
             messages = [{"role": "user", "content": "ping"}]
             await llm_client.chat_completion(messages, max_tokens=1)
+            if consecutive_failures:
+                logger.info(
+                    "LLM keep-alive recovered after %d consecutive failure(s)",
+                    consecutive_failures,
+                )
+            consecutive_failures = 0
             logger.debug("LLM keep-alive ping sent successfully")
         except asyncio.CancelledError:
             logger.info("LLM keep-alive task cancelled")
             break
         except Exception as e:
-            # Log but don't crash - model might just be unloaded
-            logger.debug("LLM keep-alive ping failed (model may be unloaded): %s", e)
+            consecutive_failures += 1
+            if consecutive_failures >= _KEEPALIVE_WARN_THRESHOLD:
+                # Sustained outage — escalate so it is not buried at DEBUG.
+                logger.warning(
+                    "LLM keep-alive ping failed (%d consecutive): %s",
+                    consecutive_failures,
+                    e,
+                )
+            else:
+                # Transient — model might just be unloaded. Keep noise low.
+                logger.debug(
+                    "LLM keep-alive ping failed (model may be unloaded): %s", e
+                )
 
 
 def _validate_setting_value(key: str, value) -> bool:
@@ -222,8 +250,12 @@ async def _validate_tei_embedding_model(embedding_service) -> None:
 
         # follow_redirects=False so a 30x from the embedding host cannot bypass
         # the SSRF guard by redirecting to a private/internal address.
+        # SSRFSafeTransport re-validates the resolved IP at request time to close
+        # the DNS-rebinding TOCTOU gap the startup-only guard leaves open.
         async with httpx.AsyncClient(
-            timeout=10.0, follow_redirects=False
+            timeout=10.0,
+            follow_redirects=False,
+            transport=SSRFSafeTransport(),
         ) as client:
             # TEI exposes /info at the server root, not under the embeddings
             # route. Strip the resolved embeddings endpoint suffix (native
@@ -288,10 +320,30 @@ async def lifespan(app: FastAPI):
     )
     if not _root_logger.handlers:
         _handler = logging.StreamHandler()
-        _handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-        )
+        # Structured JSON output so the extra={} fields supplied by the HTTP
+        # middleware (request_id, method, path, status_code, duration_ms, …)
+        # and the request_id stamped by RequestIdFilter are actually emitted,
+        # instead of being dropped by a plain-text formatter.
+        _handler.setFormatter(JsonFormatter())
+        # Stamp request_id on every record (from the contextvar) and redact
+        # sensitive record attributes by name (user_input/api_key/…).
+        _handler.addFilter(RequestIdFilter())
+        _handler.addFilter(SensitiveFieldFilter())
         _root_logger.addHandler(_handler)
+    else:
+        # A handler already exists (e.g. uvicorn installed its own, or a
+        # custom log config was supplied). Attach the request_id and
+        # sensitive-field filters so those concerns apply uniformly across
+        # whatever formatter the existing handler uses. We deliberately do
+        # NOT replace the existing formatter here — clobbering uvicorn's (or
+        # a deployment's) formatter would silently change its log shape.
+        # Operators who want JSON output everywhere can configure a JSON
+        # formatter in their logging config directly.
+        for _existing in _root_logger.handlers:
+            if RequestIdFilter not in {type(f) for f in _existing.filters}:
+                _existing.addFilter(RequestIdFilter())
+            if SensitiveFieldFilter not in {type(f) for f in _existing.filters}:
+                _existing.addFilter(SensitiveFieldFilter())
 
     # Startup: Initialize database and services
     try:
@@ -582,7 +634,10 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("Memory embedding backfill startup task failed: %s", exc)
 
-    asyncio.create_task(_run_memory_backfill())
+    # Hold a reference and cancel on shutdown so the backfill task is not
+    # orphaned at process exit (mirrors memory_eviction_task below).
+    memory_backfill_task = asyncio.create_task(_run_memory_backfill())
+
 
     # Start periodic memory eviction as a background task so
     # evict_expired_memories no longer runs on every search_memories call
@@ -627,6 +682,13 @@ async def lifespan(app: FastAPI):
         memory_eviction_task.cancel()
         try:
             await memory_eviction_task
+        except asyncio.CancelledError:
+            pass
+    # Cancel the one-shot memory embedding backfill task if still running.
+    if memory_backfill_task and not memory_backfill_task.done():
+        memory_backfill_task.cancel()
+        try:
+            await memory_backfill_task
         except asyncio.CancelledError:
             pass
     if app.state.file_watcher:

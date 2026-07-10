@@ -59,26 +59,43 @@ def test_search_memories_still_filters_expired_rows_at_read_time(memory_store):
 
 def test_periodic_eviction_loop_removes_expired_rows(memory_store):
     """The periodic_eviction_loop coroutine should evict expired memories
-    when it wakes up."""
+    when it wakes up.
+
+    Uses an asyncio.Event signal set after each eviction cycle (C4-5) instead
+    of a fixed wall-clock sleep, so the assertion is deterministic and not a
+    race against interval + to_thread latency under CI contention.
+    """
     memory_store.add_memory(
         "ephemeral secret",
         expires_at="2000-01-01T00:00:00",
     )
     memory_store.add_memory("permanent record")
 
-    # Drive one iteration of the loop with a tiny interval.  We cancel
-    # after the first eviction cycle completes.
-    async def _drive():
-        task = asyncio.create_task(
-            memory_store.periodic_eviction_loop(interval=0.05)
-        )
-        # Give the loop time to run at least one eviction cycle.
-        await asyncio.sleep(0.15)
-        task.cancel()
+    original_evict = memory_store.evict_expired_memories
+    evicted = asyncio.Event()
+
+    def _signaling_evict():
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            return original_evict()
+        finally:
+            # Signal from inside the running loop's event loop.
+            try:
+                evicted.set()
+            except Exception:
+                pass
+
+    async def _drive():
+        with mock.patch.object(memory_store, "evict_expired_memories", side_effect=_signaling_evict):
+            task = asyncio.create_task(
+                memory_store.periodic_eviction_loop(interval=0.05)
+            )
+            # Wait deterministically for the first eviction cycle.
+            await asyncio.wait_for(evicted.wait(), timeout=5.0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     asyncio.run(_drive())
 
@@ -93,22 +110,36 @@ def test_periodic_eviction_loop_removes_expired_rows(memory_store):
 
 def test_periodic_eviction_loop_survives_errors(memory_store):
     """A single failed eviction must not kill the loop — it should log
-    and retry on the next cycle."""
+    and retry on the next cycle.
+
+    Uses an asyncio.Event signal set after each eviction attempt (C4-5) so the
+    test waits deterministically for N cycles instead of racing fixed sleeps.
+    """
     call_count = {"n": 0}
+    attempts = asyncio.Event()
 
     original = memory_store.evict_expired_memories
 
     def flaky_evict():
         call_count["n"] += 1
-        if call_count["n"] == 1:
-            raise RuntimeError("transient db lock")
-        return original()
+        try:
+            if call_count["n"] == 1:
+                raise RuntimeError("transient db lock")
+            return original()
+        finally:
+            try:
+                attempts.set()
+            except Exception:
+                pass
 
     async def _drive():
         task = asyncio.create_task(
             memory_store.periodic_eviction_loop(interval=0.01)
         )
-        await asyncio.sleep(0.05)
+        # Wait until at least 2 eviction attempts have occurred.
+        while call_count["n"] < 2:
+            attempts.clear()
+            await asyncio.wait_for(attempts.wait(), timeout=5.0)
         task.cancel()
         try:
             await task

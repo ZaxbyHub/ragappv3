@@ -304,29 +304,40 @@ class TestDenseSearchOrderBy(unittest.TestCase):
                 candidate_ids=None,
             )
 
-            if len(results) >= 2:
-                # First result should have >= score than second (descending)
-                self.assertGreaterEqual(
-                    results[0].score, results[1].score
-                )
+            # Assert the expected result-set size UNCONDITIONALLY first (C3-3):
+            # the prior `if len(results) >= 2` guard let a regression that
+            # narrowed the result set pass vacuously by skipping the assertion.
+            self.assertGreaterEqual(len(results), 2)
+            # First result should have >= score than second (descending)
+            self.assertGreaterEqual(
+                results[0].score, results[1].score
+            )
         finally:
             store.pool.close_all()
             os.remove(path)
 
     def test_dense_search_id_desc_bias_with_no_fts_order(self):
         """SQL ORDER BY id DESC biases toward most recent candidates when
-        no FTS ordering applies (candidate_ids provided but no similarity tie)."""
+        two candidates share the SAME similarity score (a genuine tie).
+
+        Both memories embed to the same concept dimension so their cosine
+        similarity to the query is identical; the tie is broken by id DESC
+        (rec2 first). This makes the ordering assertion meaningful and
+        non-vacuous (C3-3: the prior `if len(results) == 2` guard let this
+        pass vacuously when the unrelated-query fixture returned 0 results).
+        """
         embedder = _StubEmbedder()
         store, path = _make_store(embedding_service=embedder)
         try:
-            rec1 = store.add_memory("alpha", vault_id=1)
-            rec2 = store.add_memory("beta", vault_id=1)
+            # Two memories sharing the "meeting" concept → tied similarity.
+            rec1 = store.add_memory("meeting notes alpha", vault_id=1)
+            rec2 = store.add_memory("meeting notes beta", vault_id=1)
 
-            _embed_memory_sync(store, rec1.id, "alpha")
-            _embed_memory_sync(store, rec2.id, "beta")
+            _embed_memory_sync(store, rec1.id, "meeting notes alpha")
+            _embed_memory_sync(store, rec2.id, "meeting notes beta")
 
-            # Use candidate_ids to control ordering
-            query_emb = embedder._vector_from("completely unrelated query")
+            # Query matches the shared concept → identical positive similarity.
+            query_emb = embedder._vector_from("meeting")
             results = store._dense_search(
                 query_embedding=query_emb,
                 limit=5,
@@ -334,11 +345,10 @@ class TestDenseSearchOrderBy(unittest.TestCase):
                 candidate_ids=[rec1.id, rec2.id],
             )
 
-            # When there's no FTS ordering and similarity scores are very low/zero,
-            # the SQL ORDER BY id DESC would put rec2 first (higher id)
-            if len(results) == 2:
-                # Higher ID (rec2) should come first due to id DESC ordering
-                self.assertEqual(results[0].id, rec2.id)
+            # Assert the expected result-set size UNCONDITIONALLY first (C3-3).
+            self.assertEqual(len(results), 2)
+            # Tied scores are broken by id DESC → rec2 (higher id) first.
+            self.assertEqual(results[0].id, rec2.id)
         finally:
             store.pool.close_all()
             os.remove(path)

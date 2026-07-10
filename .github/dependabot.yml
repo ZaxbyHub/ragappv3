@@ -15,6 +15,13 @@ updates:
           - "minor"
           - "patch"
 
+  # Embedding-server sidecar Python dependencies (B6-3: previously uncovered).
+  - package-ecosystem: "pip"
+    directory: "/backend/embedding_server"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
   # Frontend npm dependencies
   - package-ecosystem: "npm"
     directory: "/frontend"
@@ -34,6 +41,11 @@ updates:
       interval: "weekly"
   - package-ecosystem: "docker"
     directory: "/frontend"
+    schedule:
+      interval: "weekly"
+  # Embedding-server sidecar Dockerfile (B6-3: previously uncovered).
+  - package-ecosystem: "docker"
+    directory: "/backend/embedding_server"
     schedule:
       interval: "weekly"
 

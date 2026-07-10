@@ -119,8 +119,14 @@ class CuratorClient:
         }
 
         async def _do_post() -> dict:
+            # SSRFSafeTransport re-validates the resolved IP at request time to
+            # close the DNS-rebinding TOCTOU gap the per-call guard leaves open.
+            from app.services.ssrf_transport import SSRFSafeTransport
+
             async with httpx.AsyncClient(
-                timeout=self.timeout, follow_redirects=False
+                timeout=self.timeout,
+                follow_redirects=False,
+                transport=SSRFSafeTransport(),
             ) as client:
                 resp = await client.post(self.endpoint, json=payload)
             if resp.status_code >= 300:

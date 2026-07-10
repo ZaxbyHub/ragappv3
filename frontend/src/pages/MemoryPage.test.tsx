@@ -56,6 +56,7 @@ vi.mock('@/lib/api', () => ({
   updateMemory: mockUpdateMemory,
   promoteMemoryToWiki: mockPromoteMemoryToWiki,
   getMemoryWikiStatus: mockGetMemoryWikiStatus,
+  batchMemoryWikiStatus: vi.fn().mockResolvedValue({}),
 }));
 
 // Mock sonner toast

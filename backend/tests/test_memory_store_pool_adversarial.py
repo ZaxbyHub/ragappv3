@@ -132,33 +132,54 @@ class TestSQLiteConnectionPoolBoundaryConditions(unittest.TestCase):
         """Pool with max_size=0 deadlocks: _created_count < max_size is always False,
         and the blocking get() times out waiting on an empty unbounded queue.
 
-        Confirmed: raises RuntimeError after 3 × 5s = 15s.
-        This is an exploitable resource-exhaustion pre-condition — a caller that
-        passes max_size=0 from config will hang for 15s then raise.
+        Confirmed: raises RuntimeError after 3 attempts. The internal per-attempt
+        Queue.get timeout (5s) is patched to raise Empty immediately so this
+        proves the deadlock behavior in <1s instead of 15s (C3-2).
         """
+        import queue as _queue
+        from unittest.mock import patch
+
         from app.models.database import SQLiteConnectionPool
 
         pool = SQLiteConnectionPool(str(self.db_path), max_size=0)
         self.assertEqual(pool.max_size, 0)
         self.assertEqual(pool._pool.maxsize, 0)  # Queue is unbounded
 
-        # get_connection() has no timeout kwarg; the internal timeout is 5s per attempt
-        # After 3 attempts (15s total), it raises RuntimeError
-        with self.assertRaises(RuntimeError) as ctx:
-            pool.get_connection()
+        # Patch the blocking get to raise Empty immediately so the loop
+        # exhausts max_wait_attempts without burning real wall-clock time.
+        real_get = _queue.Queue.get
+
+        def _instant_empty(self, *a, **kw):
+            raise _queue.Empty
+
+        with patch.object(_queue.Queue, "get", _instant_empty):
+            with self.assertRaises(RuntimeError) as ctx:
+                pool.get_connection()
         self.assertIn("Could not obtain", str(ctx.exception))
+        # Sanity: the real get signature is unchanged (patch only affected this test).
+        _ = real_get
 
         pool.close_all()
 
     def test_pool_max_size_negative_deadlocks_on_get_connection(self):
-        """Pool with max_size=-1 deadlocks for the same reason."""
+        """Pool with max_size=-1 deadlocks for the same reason.
+
+        Queue.get timeout patched to raise Empty immediately (C3-2).
+        """
+        import queue as _queue
+        from unittest.mock import patch
+
         from app.models.database import SQLiteConnectionPool
 
         pool = SQLiteConnectionPool(str(self.db_path), max_size=-1)
         self.assertEqual(pool.max_size, -1)
 
-        with self.assertRaises(RuntimeError) as ctx:
-            pool.get_connection()
+        def _instant_empty(self, *a, **kw):
+            raise _queue.Empty
+
+        with patch.object(_queue.Queue, "get", _instant_empty):
+            with self.assertRaises(RuntimeError) as ctx:
+                pool.get_connection()
         self.assertIn("Could not obtain", str(ctx.exception))
 
         pool.close_all()
@@ -247,15 +268,25 @@ class TestMemoryStorePoolIntegration(unittest.TestCase):
             os.rmdir(self.temp_dir)
 
     def test_memory_store_with_zero_pool_size_deadlocks(self):
-        """MemoryStore created with pool max_size=0 (via config injection) deadlocks."""
+        """MemoryStore created with pool max_size=0 (via config injection) deadlocks.
+
+        Queue.get timeout patched to raise Empty immediately (C3-2).
+        """
+        import queue as _queue
+        from unittest.mock import patch
+
         from app.models.database import SQLiteConnectionPool
         from app.services.memory_store import MemoryStore
 
         pool = SQLiteConnectionPool(str(self.db_path), max_size=0)
         store = MemoryStore(pool=pool)
 
-        with self.assertRaises(RuntimeError) as ctx:
-            store.add_memory("test memory")
+        def _instant_empty(self, *a, **kw):
+            raise _queue.Empty
+
+        with patch.object(_queue.Queue, "get", _instant_empty):
+            with self.assertRaises(RuntimeError) as ctx:
+                store.add_memory("test memory")
         self.assertIn("Could not obtain", str(ctx.exception))
 
         pool.close_all()

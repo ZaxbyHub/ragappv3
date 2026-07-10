@@ -46,11 +46,12 @@ export function RAGSettings({
                 step={0.01}
                 value={formData.max_distance_threshold}
                 onChange={(e) => onChange("max_distance_threshold", e.target.value)}
+                aria-label="Max Distance Threshold"
                 className="flex-1"
               />
             </div>
             {errors.max_distance_threshold && (
-              <p className="text-xs text-destructive">{errors.max_distance_threshold}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.max_distance_threshold}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Maximum distance (1-0) for chunks to be included in context (lower = more strict)
@@ -70,7 +71,7 @@ export function RAGSettings({
               className={errors.retrieval_window ? "border-destructive" : ""}
             />
             {errors.retrieval_window && (
-              <p className="text-xs text-destructive">{errors.retrieval_window}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.retrieval_window}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Number of adjacent chunks to include (0-3)
@@ -94,7 +95,7 @@ export function RAGSettings({
               </SelectContent>
             </Select>
             {errors.vector_metric && (
-              <p className="text-xs text-destructive">{errors.vector_metric}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.vector_metric}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Distance metric used for vector similarity search
@@ -116,7 +117,7 @@ export function RAGSettings({
               className={errors.embedding_batch_size ? "border-destructive" : ""}
             />
             {errors.embedding_batch_size && (
-              <p className="text-xs text-destructive">{errors.embedding_batch_size}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.embedding_batch_size}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Number of chunks to embed per API request. Higher values = better GPU utilization.
@@ -142,7 +143,7 @@ export function RAGSettings({
               placeholder="Passage: "
             />
             {errors.embedding_doc_prefix && (
-              <p className="text-xs text-destructive">{errors.embedding_doc_prefix}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.embedding_doc_prefix}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Prefix added to document chunks before embedding (default: &quot;Passage: &quot;)
@@ -160,7 +161,7 @@ export function RAGSettings({
               placeholder="Query: "
             />
             {errors.embedding_query_prefix && (
-              <p className="text-xs text-destructive">{errors.embedding_query_prefix}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.embedding_query_prefix}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Prefix added to queries before embedding (default: &quot;Query: &quot;)

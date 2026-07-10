@@ -98,10 +98,11 @@ describe("FR-019: ReconnectingBanner", () => {
   it("displays amber/chat-down variant when only chat is unavailable", () => {
     render(<ReconnectingBanner health={chatDownHealth()} />);
     const banner = screen.getByRole("alert");
-    // Amber/yellow background for non-severe (chat only) — no destructive red class
+    // Warning-token background for non-severe (chat only) — no destructive red
+    // class. Tokenized in UI-VIS-4 (#294) so the banner adapts to dark/high-contrast themes.
     expect(banner).not.toHaveClass("bg-destructive/95");
-    expect(banner).toHaveClass("bg-yellow-500/95");
-    expect(banner).toHaveClass("text-yellow-950");
+    expect(banner).toHaveClass("bg-warning/95");
+    expect(banner).toHaveClass("text-warning-foreground");
   });
 
   it("displays red/severe variant when backend is down", () => {

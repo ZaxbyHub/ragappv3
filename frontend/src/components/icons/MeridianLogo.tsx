@@ -12,6 +12,8 @@ export function MeridianLogo({ className, size = 200 }: MeridianLogoProps) {
       fill="none"
       xmlns="http://www.w3.org/2000/svg"
       className={className}
+      aria-hidden="true"
+      focusable="false"
     >
       <defs>
         {/* Left outer face — pink → purple */}

@@ -1,7 +1,15 @@
 """
 Evaluation API routes for RAG pipeline metrics.
 
-Provides endpoints for evaluating RAG pipeline performance using RAGAS metrics.
+NOTE: the ``/eval/ragas`` route computes **lexical-overlap approximation**
+metrics (bigram/trigram overlap, keyword overlap, query/ground-truth word-set
+overlap, optional embedding cosine), NOT metrics from the ``ragas`` library.
+The route and model names retain the ``RAGAS`` prefix for API stability, but
+the values are approximations intended for quick local sanity-checks of RAG
+output, not the rigorous reference-based metrics the upstream ``ragas``
+package provides. ``ragas`` is intentionally NOT a runtime dependency (it is
+absent from all requirements files); the endpoint is gated solely on
+``settings.eval_enabled``.
 """
 
 import logging
@@ -19,7 +27,11 @@ logger = logging.getLogger(__name__)
 
 
 class RAGASEvaluationRequest(BaseModel):
-    """Request model for RAGAS evaluation endpoint."""
+    """Request model for the lexical-overlap evaluation endpoint.
+
+    Despite the legacy ``RAGAS`` prefix (kept for API stability), the metrics
+    computed here are lexical-overlap approximations, not upstream-ragas values.
+    """
 
     query: str = Field(..., min_length=1, description="User query to evaluate")
     answer: str = Field(..., description="Generated answer to evaluate")
@@ -32,7 +44,12 @@ class RAGASEvaluationRequest(BaseModel):
 
 
 class RAGASMetrics(BaseModel):
-    """RAGAS evaluation metrics."""
+    """Lexical-overlap approximation metrics (NOT upstream ragas values).
+
+    The ``RAGAS`` name is retained for API stability; each field below is a
+    hand-rolled heuristic (n-gram/keyword/word-set overlap, or embedding
+    cosine for ``answer_similarity``). See ``eval.py`` module docstring.
+    """
 
     faithfulness: float = Field(
         0.0, ge=0.0, le=1.0, description="Answer grounded in context"
@@ -53,7 +70,10 @@ class RAGASMetrics(BaseModel):
 
 
 class RAGASEvaluationResponse(BaseModel):
-    """Response model for RAGAS evaluation endpoint."""
+    """Response model for the lexical-overlap evaluation endpoint.
+
+    Note: ``metrics`` are lexical-overlap approximations, not upstream ragas.
+    """
 
     metrics: RAGASMetrics
     evaluation_time_ms: int
@@ -400,15 +420,20 @@ async def ragas_evaluation(
     user: dict = Depends(require_admin_role),
 ):
     """
-    Evaluate RAG pipeline using RAGAS metrics.
+    Evaluate RAG pipeline output with lexical-overlap approximation metrics.
 
-    Calculates:
-    - Faithfulness: How well the answer is grounded in retrieved contexts
-    - Answer Relevancy: How relevant the answer is to the query
-    - Context Precision: Proportion of retrieved contexts that are relevant
-    - Context Recall: Coverage of ground truth in retrieved contexts
-    - Context Relevancy: Average relevance of contexts to query
-    - Answer Similarity: Semantic similarity to ground truth (if provided)
+    NOTE: despite the legacy route path (``/eval/ragas``) and the ``RAGAS``
+    model names, these are **hand-rolled lexical heuristics**, NOT metrics
+    computed by the upstream ``ragas`` library (which is not a dependency).
+    They are intended for quick local sanity-checks, not rigorous evaluation.
+
+    Calculates (all lexical-overlap approximations unless noted):
+    - Faithfulness: answer-sentence n-gram overlap with retrieved contexts
+    - Answer Relevancy: keyword overlap between query and answer
+    - Context Precision: query/contexts word-set overlap
+    - Context Recall: ground-truth/contexts word-set overlap
+    - Context Relevancy: average query/contexts word-set overlap
+    - Answer Similarity: embedding cosine to ground truth (if provided)
 
     Args:
         request: RAGASEvaluationRequest containing query, answer, contexts
@@ -424,16 +449,14 @@ async def ragas_evaluation(
     if not settings.eval_enabled:
         raise HTTPException(
             status_code=501,
-            detail="RAGAS evaluation endpoint is disabled. Set EVAL_ENABLED=true to enable.",
+            detail="Evaluation endpoint is disabled. Set EVAL_ENABLED=true to enable.",
         )
 
-    try:
-        import ragas  # noqa: F401
-    except ImportError:
-        raise HTTPException(
-            status_code=501,
-            detail="RAGAS evaluation endpoint requires the 'ragas' library. Install with: pip install ragas",
-        )
+    # NOTE: the `ragas` library is intentionally NOT imported here. The route
+    # previously gated on `import ragas` purely as an install-presence check,
+    # but ragas was never called and is absent from all requirements files.
+    # The metrics above are lexical-overlap heuristics; the gate is solely
+    # `eval_enabled` (see module docstring).
 
     import time
 

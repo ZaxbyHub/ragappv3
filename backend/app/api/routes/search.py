@@ -6,6 +6,7 @@ Provides endpoints for searching document chunks using vector similarity.
 
 import asyncio
 import json
+import logging
 import sqlite3
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,7 @@ from app.services.vector_store import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 class SearchRequest(BaseModel):
@@ -200,15 +202,17 @@ async def search(
     except SearchSemaphoreTimeoutError:
         raise HTTPException(status_code=503, detail="Search temporarily unavailable")
     except EmbeddingError as e:
-        raise HTTPException(
-            status_code=500, detail=f"Embedding service error: {str(e)}"
-        )
+        # Log the underlying error server-side; return a generic message so
+        # internal exception text is not echoed to the caller.
+        logger.error("Search embedding error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Embedding service error")
     except VectorStoreError as e:
-        raise HTTPException(status_code=500, detail=f"Vector store error: {str(e)}")
+        logger.error("Search vector store error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Vector store error")
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Search operation failed: {str(e)}"
-        )
+        # Catch-all: never echo raw internal exception text into the response.
+        logger.error("Search operation failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal error during search")
 
 
 @router.get("/search/chunks/{chunk_id}/context", response_model=ChunkContextResponse)

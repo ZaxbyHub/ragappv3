@@ -73,14 +73,33 @@ class TestEmbeddingServiceClientAttribute:
 
 
 class TestEmbeddingServiceConnectionLimits:
-    """Tests verifying correct connection pool limits are configured."""
+    """Tests verifying correct connection pool limits are configured.
+
+    EmbeddingService wires an SSRFSafeTransport into httpx.AsyncClient(...)
+    for request-time SSRF re-validation. httpx ignores the AsyncClient-level
+    `limits=` kwarg whenever a custom `transport=` is supplied, so `limits`
+    must be forwarded into the *wrapped* httpx.AsyncHTTPTransport instead —
+    these tests inspect the transport passed to AsyncClient, not a bare
+    `limits=` kwarg on AsyncClient itself (asserting the latter would pass
+    even when the real connection pool silently reverts to httpx's defaults,
+    which is exactly the regression this test previously missed).
+    """
+
+    def _get_transport_pool(self, mock_client_class):
+        call_kwargs = mock_client_class.call_args[1]
+        assert 'transport' in call_kwargs, "AsyncClient should be called with a transport"
+        transport = call_kwargs['transport']
+        # SSRFSafeTransport wraps the real httpx.AsyncHTTPTransport as
+        # `_transport`, which itself exposes the connection pool as `_pool`.
+        inner_transport = transport._transport
+        assert isinstance(inner_transport, httpx.AsyncHTTPTransport), \
+            f"wrapped transport should be httpx.AsyncHTTPTransport, got {type(inner_transport)}"
+        return inner_transport._pool
 
     def test_client_created_with_limits(self, mock_settings):
-        """The _client should be created with httpx.Limits."""
-        # Save reference to real httpx classes before patching
+        """The wrapped transport's pool should be configured with httpx.Limits."""
         real_async_client = httpx.AsyncClient
 
-        # Patch httpx.AsyncClient to capture the limits parameter
         with patch('app.services.embeddings.httpx.AsyncClient') as mock_client_class:
             mock_client_instance = MagicMock(spec=real_async_client)
             mock_client_instance.is_closed = False
@@ -89,19 +108,12 @@ class TestEmbeddingServiceConnectionLimits:
 
             EmbeddingService()
 
-            # Verify AsyncClient was called
             mock_client_class.assert_called_once()
-
-            # Get the call kwargs
-            call_kwargs = mock_client_class.call_args[1]
-
-            # Verify limits was passed
-            assert 'limits' in call_kwargs, "AsyncClient should be called with limits parameter"
-            assert isinstance(call_kwargs['limits'], httpx.Limits), \
-                f"limits should be httpx.Limits, got {type(call_kwargs['limits'])}"
+            pool = self._get_transport_pool(mock_client_class)
+            assert pool is not None, "wrapped transport should have a connection pool"
 
     def test_max_connections_is_20(self, mock_settings):
-        """The _client should be created with max_connections=20."""
+        """The wrapped transport's pool should be created with max_connections=20."""
         real_async_client = httpx.AsyncClient
 
         with patch('app.services.embeddings.httpx.AsyncClient') as mock_client_class:
@@ -112,15 +124,12 @@ class TestEmbeddingServiceConnectionLimits:
 
             EmbeddingService()
 
-            # Get the call kwargs
-            call_kwargs = mock_client_class.call_args[1]
-
-            # Verify max_connections
-            assert call_kwargs['limits'].max_connections == 20, \
-                f"max_connections should be 20, got {call_kwargs['limits'].max_connections}"
+            pool = self._get_transport_pool(mock_client_class)
+            assert pool._max_connections == 20, \
+                f"max_connections should be 20, got {pool._max_connections}"
 
     def test_max_keepalive_connections_is_10(self, mock_settings):
-        """The _client should be created with max_keepalive_connections=10."""
+        """The wrapped transport's pool should be created with max_keepalive_connections=10."""
         real_async_client = httpx.AsyncClient
 
         with patch('app.services.embeddings.httpx.AsyncClient') as mock_client_class:
@@ -131,12 +140,9 @@ class TestEmbeddingServiceConnectionLimits:
 
             EmbeddingService()
 
-            # Get the call kwargs
-            call_kwargs = mock_client_class.call_args[1]
-
-            # Verify max_keepalive_connections
-            assert call_kwargs['limits'].max_keepalive_connections == 10, \
-                f"max_keepalive_connections should be 10, got {call_kwargs['limits'].max_keepalive_connections}"
+            pool = self._get_transport_pool(mock_client_class)
+            assert pool._max_keepalive_connections == 10, \
+                f"max_keepalive_connections should be 10, got {pool._max_keepalive_connections}"
 
 
 class TestEmbeddingServiceCloseMethod:

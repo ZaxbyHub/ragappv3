@@ -147,7 +147,7 @@ export default function KMSDetailPage() {
               {editing ? (
                 <Input value={title} onChange={(e) => setTitle(e.target.value)} className="text-lg font-semibold" />
               ) : (
-                <h2 className="text-lg font-semibold">{entry.title}</h2>
+                <h1 className="text-lg font-semibold">{entry.title}</h1>
               )}
               <p className="text-xs text-muted-foreground">{entry.slug}</p>
             </div>

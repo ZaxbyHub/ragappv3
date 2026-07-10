@@ -59,8 +59,14 @@ class ModelChecker:
 
         # follow_redirects=False so a 30x from a model host cannot bypass the
         # SSRF guard by redirecting to a private/internal address.
+        # SSRFSafeTransport re-validates the resolved IP at request time to close
+        # the DNS-rebinding TOCTOU gap the startup-only guard leaves open.
+        from app.services.ssrf_transport import SSRFSafeTransport
+
         async with httpx.AsyncClient(
-            timeout=self.timeout, follow_redirects=False
+            timeout=self.timeout,
+            follow_redirects=False,
+            transport=SSRFSafeTransport(),
         ) as client:
             # Check embedding model
             result['embedding_model'] = await self._check_model_availability(

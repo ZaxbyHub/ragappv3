@@ -17,7 +17,11 @@ import { MeridianLogo } from "@/components/icons/MeridianLogo";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { LockPasswordIcon, Login01Icon, User02Icon, ViewOffSlashIcon, ViewIcon } from "@hugeicons/core-free-icons";
 
-const TEST_MODE = import.meta.env.VITE_TEST_MODE === "true";
+// Gate the demo-credential bypass on import.meta.env.DEV so it is
+// dead-code-eliminated in production builds (B7-1, #290) — matching App.tsx.
+// Without the DEV gate, an operator setting VITE_TEST_MODE=true at production
+// build time would ship a live client-side login bypass.
+const TEST_MODE = import.meta.env.DEV && import.meta.env.VITE_TEST_MODE === "true";
 const DEMO_USERNAME = import.meta.env.VITE_DEMO_USERNAME || "demo";
 const DEMO_PASSWORD = import.meta.env.VITE_DEMO_PASSWORD || "demo123";
 

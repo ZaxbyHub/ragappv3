@@ -1238,4 +1238,40 @@ describe("TranscriptPane ADVERSARIAL TESTS", () => {
       expect(screen.getByLabelText(/Active vault/)).toBeInTheDocument();
     });
   });
+
+  describe("Type confusion attacks", () => {
+    // Regression coverage for scenarios previously covered by the deleted
+    // TranscriptPane.{,adversarial.}virtualization.test.tsx files (removed
+    // because they mocked an unused @tanstack/react-virtual module — but
+    // these specific role/content type-confusion cases are not tied to the
+    // virtualizer and were otherwise left untested). MessageBubble renders
+    // `message.content` directly in JSX, so a non-string content value can
+    // throw React's "Objects are not valid as a React child" error.
+    it("should handle message with number role instead of string", async () => {
+      const messages = [{ id: "msg-1", role: 123 as any, content: "Number role" }];
+      setMockChatState({ messages, input: "", isStreaming: false, inputError: null });
+
+      expect(() => {
+        render(<TranscriptPane />);
+      }).not.toThrow();
+    });
+
+    it("should handle message with array content instead of string", async () => {
+      const messages = [{ id: "msg-1", role: "assistant", content: ["array", "content"] as any }];
+      setMockChatState({ messages, input: "", isStreaming: false, inputError: null });
+
+      expect(() => {
+        render(<TranscriptPane />);
+      }).not.toThrow();
+    });
+
+    it("should handle message with plain-object content instead of string", async () => {
+      const messages = [{ id: "msg-1", role: "assistant", content: { nested: "object" } as any }];
+      setMockChatState({ messages, input: "", isStreaming: false, inputError: null });
+
+      expect(() => {
+        render(<TranscriptPane />);
+      }).not.toThrow();
+    });
+  });
 });

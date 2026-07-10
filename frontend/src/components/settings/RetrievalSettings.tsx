@@ -53,7 +53,7 @@ export function RetrievalSettings({
               className={errors.reranker_url ? "border-destructive" : ""}
             />
             {errors.reranker_url && (
-              <p className="text-xs text-destructive">{errors.reranker_url}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.reranker_url}</p>
             )}
             <p className="text-xs text-muted-foreground">
               URL to the reranking service (leave empty to use local reranker)
@@ -72,7 +72,7 @@ export function RetrievalSettings({
               className={errors.reranker_model ? "border-destructive" : ""}
             />
             {errors.reranker_model && (
-              <p className="text-xs text-destructive">{errors.reranker_model}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.reranker_model}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Model name for the reranking service
@@ -92,7 +92,7 @@ export function RetrievalSettings({
               className={errors.initial_retrieval_top_k ? "border-destructive" : ""}
             />
             {errors.initial_retrieval_top_k && (
-              <p className="text-xs text-destructive">{errors.initial_retrieval_top_k}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.initial_retrieval_top_k}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Number of initial documents to retrieve before reranking (5-100)
@@ -112,7 +112,7 @@ export function RetrievalSettings({
               className={errors.reranker_top_n ? "border-destructive" : ""}
             />
             {errors.reranker_top_n && (
-              <p className="text-xs text-destructive">{errors.reranker_top_n}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.reranker_top_n}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Number of top documents to keep after reranking (1-20)
@@ -170,7 +170,7 @@ export function RetrievalSettings({
               />
             </div>
             {errors.hybrid_alpha && (
-              <p className="text-xs text-destructive">{errors.hybrid_alpha}</p>
+              <p role="alert" className="text-xs text-destructive">{errors.hybrid_alpha}</p>
             )}
             <p className="text-xs text-muted-foreground">
               Weight for vector search vs keyword search (0 = keyword only, 1 = vector only)

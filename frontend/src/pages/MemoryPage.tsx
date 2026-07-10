@@ -22,7 +22,7 @@ import { VaultSelector } from "@/components/vault/VaultSelector";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { useMemorySearch } from "@/hooks/useMemorySearch";
 import { useMemoryCrud, getCategoryFromMetadata, getTagsFromMetadata, getSourceFromMetadata, MAX_MEMORY_CONTENT_LENGTH } from "@/hooks/useMemoryCrud";
-import { updateMemory, promoteMemoryToWiki, getMemoryWikiStatus, type MemoryResult, type MemoryWikiStatus } from "@/lib/api";
+import { updateMemory, promoteMemoryToWiki, batchMemoryWikiStatus, type MemoryResult, type MemoryWikiStatus } from "@/lib/api";
 
 export default function MemoryPage() {
   const { activeVaultId } = useVaultStore();
@@ -81,17 +81,15 @@ function MemoryPageContent({ activeVaultId }: { activeVaultId: number }) {
 
   const fetchWikiStatuses = useCallback(async (mems: MemoryResult[]) => {
     if (!activeVaultId || !mems.length) return;
-    const results = await Promise.allSettled(
-      mems.map((m) => getMemoryWikiStatus(parseInt(m.id, 10), activeVaultId))
-    );
-    setWikiStatusMap((prev) => {
-      const next = { ...prev };
-      mems.forEach((m, i) => {
-        const r = results[i];
-        if (r.status === "fulfilled") next[m.id] = r.value;
-      });
-      return next;
-    });
+    // Batch the wiki-status lookup into a single request (UI-PERF-4) instead
+    // of fanning out one HTTP request per memory.
+    try {
+      const ids = mems.map((m) => parseInt(m.id, 10)).filter((n) => !Number.isNaN(n));
+      const statuses = await batchMemoryWikiStatus(ids, activeVaultId);
+      setWikiStatusMap((prev) => ({ ...prev, ...statuses }));
+    } catch {
+      // Non-fatal: wiki status chips simply stay empty on failure.
+    }
   }, [activeVaultId]);
 
   useEffect(() => {

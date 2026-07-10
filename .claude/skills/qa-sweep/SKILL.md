@@ -41,6 +41,8 @@ Spawn a SECOND independent agent to verify original planned work vs. delivered w
 
 If sub-agents are not authorized, run this as a separate local fallback completeness pass before reporting completion.
 
+- **Regression-test baseline verification:** For every new regression test, identify the **pre-fix commit or baseline hash** (issue body, plan acceptance criteria, or "fails on commit X" line). Run the test against that baseline to confirm it fails, then run it against the fix branch to confirm it passes. Use `HEAD~1` ONLY when the fix is a single commit immediately before the test; in multi-commit or merge-batch fixes, prefer the documented pre-fix SHA. A regression test that does not fail under the documented pre-fix baseline is not a regression guard — it is theater.
+
 ### Stop Condition
 Do NOT stop until ≥95% confident that:
 - All issues, related issues, and edge cases are covered
