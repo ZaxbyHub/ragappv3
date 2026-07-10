@@ -17,7 +17,10 @@ import { MeridianLogo } from "@/components/icons/MeridianLogo";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { LockPasswordIcon, Login01Icon, User02Icon, ViewOffSlashIcon, ViewIcon } from "@hugeicons/core-free-icons";
 
-const TEST_MODE = import.meta.env.VITE_TEST_MODE === "true";
+// Gated on import.meta.env.DEV so it is statically false (and dead-code
+// eliminated) in any production build — the demo auth bypass can never ship
+// in `vite build` output regardless of VITE_TEST_MODE. Mirrors App.tsx.
+const TEST_MODE = import.meta.env.DEV && import.meta.env.VITE_TEST_MODE === "true";
 const DEMO_USERNAME = import.meta.env.VITE_DEMO_USERNAME || "demo";
 const DEMO_PASSWORD = import.meta.env.VITE_DEMO_PASSWORD || "demo123";
 
