@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -62,6 +64,8 @@ from app.config import settings
 from app.main import app
 from app.models.database import init_db, run_migrations
 from app.services.auth_service import compute_client_fingerprint, create_access_token
+
+pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
 
 class TestChatStreaming(unittest.TestCase):

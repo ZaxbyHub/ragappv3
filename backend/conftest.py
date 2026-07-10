@@ -12,8 +12,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Stub problematic optional dependencies BEFORE any test imports
 # This must happen before pytest collection to prevent import errors
 
-# Stub lancedb only when the real package is unavailable. CI installs the real
-# lancedb via requirements-ci.txt, so only use the stub locally.
+# Stub lancedb only when the real package is unavailable. lancedb is excluded
+# from CI requirements (requirements-ci.txt); this stub only activates when the
+# real lancedb package is unavailable (e.g., local dev without lancedb installed).
 try:
     import lancedb  # noqa: F401
 except ImportError:
@@ -105,11 +106,50 @@ except ImportError:
     class _PyArrowStubMeta(type):
         def __instancecheck__(cls, instance):
             return False
+
+    class _PyArrowType:
+        def __init__(self, name, value_type=None, list_size=None):
+            self.name = name
+            self.value_type = value_type
+            self.list_size = list_size
+
+    class _PyArrowField:
+        def __init__(self, name, type_, nullable=True):
+            self.name = name
+            self.type = type_
+            self.nullable = nullable
+
+    class _PyArrowSchema:
+        def __init__(self, fields, metadata=None):
+            self._fields = list(fields)
+            self.metadata = metadata or {}
+
+        def __len__(self):
+            return len(self._fields)
+
+        def field(self, i_or_name):
+            if isinstance(i_or_name, str):
+                for f in self._fields:
+                    if f.name == i_or_name:
+                        return f
+                raise KeyError(i_or_name)
+            return self._fields[i_or_name]
+
+        def names(self):
+            return [f.name for f in self._fields]
+
     _pa_stub_cls = _PyArrowStubMeta("_PyArrowStub", (), {})
     _pa_stub = types.ModuleType("pyarrow")
     _pa_stub.__version__ = "0.0.0"
     _pa_stub.Array = _pa_stub_cls
     _pa_stub.ChunkedArray = _pa_stub_cls
+    _pa_stub.schema = lambda fields, metadata=None: _PyArrowSchema(fields, metadata)
+    _pa_stub.field = lambda name, type_, nullable=True: _PyArrowField(name, type_, nullable)
+    _pa_stub.string = lambda: _PyArrowType("string")
+    _pa_stub.int32 = lambda: _PyArrowType("int32")
+    _pa_stub.float32 = lambda: _PyArrowType("float32")
+    _pa_stub.list_ = lambda value_type, list_size=None: _PyArrowType("list", value_type, list_size)
+    _pa_stub.binary = lambda: _PyArrowType("binary")
     sys.modules["pyarrow"] = _pa_stub
 
 # Stub numpy when not installed. vector_store.py imports numpy at the top level;
@@ -163,11 +203,11 @@ sys.modules["unstructured.file_utils"] = _unstructured.file_utils
 sys.modules["unstructured.file_utils.filetype"] = _unstructured.file_utils.filetype
 
 
-# Autouse fixture: provides a ready vector_store on app.state for every test.
+# Opt-in fixture: provides a ready vector_store on app.state.
 # Tests that explicitly set app.state.vector_store are unaffected because this
 # fixture only runs when the attribute is absent.
-@pytest.fixture(autouse=True)
-def ensure_ready_vector_store():
+@pytest.fixture
+def ready_vector_store():
     from unittest.mock import MagicMock
 
     from app.main import app
@@ -185,3 +225,5 @@ def ensure_ready_vector_store():
             delattr(app.state, "vector_store")
         if hasattr(app.state, "_vector_store_fixture_set"):
             delattr(app.state, "_vector_store_fixture_set")
+
+

@@ -63,7 +63,11 @@ except ImportError:
 from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
+import pytest
+
 from app.api.deps import get_llm_health_checker, get_model_checker
+
+pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
 # Create a temporary database for testing
 TEST_DB_PATH = None
