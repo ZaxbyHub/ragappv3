@@ -22,6 +22,12 @@ SCRUB_FIELDS = {
     "api_key",
     "authorization",
     "secret",
+    "password",
+    "access_token",
+    "refresh_token",
+    "csrf_token",
+    "cookie",
+    "bearer",
 }
 
 logger = logging.getLogger("http")

@@ -123,14 +123,20 @@ class LLMClient:
         headers = {"Connection": "keep-alive", "Keep-Alive": "timeout=300, max=1000"}
         # SSRFSafeTransport re-validates the resolved IP at request time to
         # close the DNS-rebinding TOCTOU gap the startup-only guard leaves
-        # open, while preserving TLS SNI/cert validation.
+        # open, while preserving TLS SNI/cert validation. httpx ignores the
+        # `limits=` kwarg on AsyncClient whenever a custom `transport=` is
+        # supplied, so `limits` must be forwarded into the wrapped transport
+        # explicitly or connection-pool sizing silently reverts to httpx's
+        # defaults.
         from app.services.ssrf_transport import SSRFSafeTransport
 
         self._client = httpx.AsyncClient(
             timeout=self.timeout,
-            limits=limits,
             headers=headers,
-            transport=SSRFSafeTransport(),
+            follow_redirects=False,
+            transport=SSRFSafeTransport(
+                transport=httpx.AsyncHTTPTransport(limits=limits)
+            ),
         )
 
     async def __aenter__(self):
@@ -156,6 +162,10 @@ class LLMClient:
             if client is None:
                 return
             pool = getattr(client, "_transport", None)
+            # SSRFSafeTransport wraps the real httpx.AsyncHTTPTransport as
+            # `_transport`, not `_pool` — unwrap it before looking for `_pool`.
+            if pool is not None and not hasattr(pool, "_pool"):
+                pool = getattr(pool, "_transport", None)
             if pool and hasattr(pool, "_pool"):
                 pool_obj = pool._pool
                 connections = getattr(pool_obj, "_num_connections", 0)

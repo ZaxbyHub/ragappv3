@@ -55,9 +55,12 @@ class TestLLMClientPoolConfig:
             await client.start()
 
             try:
-                # Access the internal pool's connection limits
+                # Access the internal pool's connection limits. `_transport`
+                # is now SSRFSafeTransport, which wraps the real
+                # httpx.AsyncHTTPTransport as `_transport` (not `_pool`) —
+                # unwrap it to reach the actual connection pool.
                 assert client._client is not None
-                pool = client._client._transport._pool
+                pool = client._client._transport._transport._pool
                 assert pool._max_connections == settings.llm_max_connections
                 assert pool._max_keepalive_connections == settings.llm_max_keepalive_connections
             finally:
@@ -83,8 +86,10 @@ class TestLLMClientPoolConfig:
                 await client.start()
 
                 try:
+                    # See comment in test_start_uses_settings_values above —
+                    # `_transport` is SSRFSafeTransport, unwrap to the real pool.
                     assert client._client is not None
-                    pool = client._client._transport._pool
+                    pool = client._client._transport._transport._pool
                     assert pool._max_connections == custom_max_conn
                     assert pool._max_keepalive_connections == custom_keepalive
                 finally:

@@ -153,13 +153,20 @@ class EmbeddingService:
         # the SSRF guard by redirecting to a private/internal address.
         # SSRFSafeTransport re-validates the resolved IP at request time to close
         # the DNS-rebinding TOCTOU gap the startup-only guard leaves open.
+        # httpx ignores the `limits=` kwarg on AsyncClient whenever a custom
+        # `transport=` is supplied, so `limits` must be forwarded into the
+        # wrapped transport explicitly or connection-pool sizing silently
+        # reverts to httpx's defaults.
         from app.services.ssrf_transport import SSRFSafeTransport
 
         self._client = httpx.AsyncClient(
             timeout=self.timeout,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
             follow_redirects=False,
-            transport=SSRFSafeTransport(),
+            transport=SSRFSafeTransport(
+                transport=httpx.AsyncHTTPTransport(
+                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+                )
+            ),
         )
 
         # LRU cache. Cache keys include the live model/url/prefix fingerprints,
@@ -729,6 +736,10 @@ class EmbeddingService:
         """Log connection pool and cache statistics for monitoring."""
         try:
             pool = getattr(client, "_transport", None)
+            # SSRFSafeTransport wraps the real httpx.AsyncHTTPTransport as
+            # `_transport`, not `_pool` — unwrap it before looking for `_pool`.
+            if pool is not None and not hasattr(pool, "_pool"):
+                pool = getattr(pool, "_transport", None)
             if pool and hasattr(pool, "_pool"):
                 pool_obj = pool._pool
                 connections = getattr(pool_obj, "_num_connections", 0)

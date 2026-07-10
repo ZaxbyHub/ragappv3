@@ -264,6 +264,41 @@ class TestVectorStoreModelIdValidation(unittest.IsolatedAsyncioTestCase):
         result = await vs.validate_schema("any-model", 128)
         self.assertNotIn("reindex", str(result))
 
+    async def test_validate_schema_warns_when_existing_table_has_no_stored_hash(self):
+        """A table that predates the F2-2 check (stored_metadata present but
+        with no embedding_prefix_hash key — the real shape of a table
+        upgraded from before this validation existed) cannot be verified
+        against the current embedding model. This must not silently pass
+        with zero signal to the operator; it must log a loud warning."""
+        from app.services.vector_store import VectorStore
+
+        vs = VectorStore.__new__(VectorStore)
+        vs.table = MagicMock()
+        mock_field = MagicMock()
+        mock_field.type.list_size = 128
+        mock_schema = MagicMock()
+        mock_schema.field.return_value = mock_field
+        mock_schema.metadata = None
+        vs.table.schema = AsyncMock(return_value=mock_schema)
+
+        # Metadata exists (table has been through validate_schema before)
+        # but has no embedding_prefix_hash — the exact shape produced by a
+        # table that was created before the F2-2 hash was introduced.
+        async def _fake_get_stored_metadata():
+            return {"embedding_model_id": "old-model"}
+
+        vs.get_stored_metadata = _fake_get_stored_metadata
+        vs.db = MagicMock()
+        vs.db.table_names = AsyncMock(return_value=["chunks"])
+
+        with self.assertLogs("app.services.vector_store", level="WARNING") as cm:
+            await vs.validate_schema("new-model", 128)
+
+        self.assertTrue(
+            any("embedding_prefix_hash" in msg for msg in cm.output),
+            f"expected a warning about the missing stored hash, got: {cm.output}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

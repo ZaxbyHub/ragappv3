@@ -37,4 +37,29 @@ describe("ChatShell VaultSelector (structural inspection)", () => {
     expect(vaultIndex).toBeGreaterThan(titleIndex);
     expect(vaultIndex).toBeLessThan(downloadIndex);
   });
+
+  it("keeps the session-rail and details-panel toggles at the outer edges of the header", () => {
+    // Regression guard: the header's relative element order must remain
+    // PanelLeft < title < VaultSelector < Download < PanelRight. A reorder
+    // of the sidebar-toggle icons around VaultSelector/export would not be
+    // caught by the "between title and export button" check above alone.
+    const headerSectionMatch = chatShellContent.match(
+      /<header[^>]*>[\s\S]*?<\/header>/
+    );
+    expect(headerSectionMatch).not.toBeNull();
+    const headerContent = headerSectionMatch![0];
+
+    const panelLeftIndex = headerContent.indexOf("<PanelLeft");
+    const titleIndex = headerContent.indexOf("activeSessionTitle");
+    const vaultIndex = headerContent.indexOf("<VaultSelector");
+    const downloadIndex = headerContent.indexOf("<Download");
+    const panelRightIndex = headerContent.indexOf("<PanelRight");
+
+    expect(panelLeftIndex).toBeGreaterThan(-1);
+    expect(panelRightIndex).toBeGreaterThan(-1);
+    expect(panelLeftIndex).toBeLessThan(titleIndex);
+    expect(titleIndex).toBeLessThan(vaultIndex);
+    expect(vaultIndex).toBeLessThan(downloadIndex);
+    expect(downloadIndex).toBeLessThan(panelRightIndex);
+  });
 });

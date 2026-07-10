@@ -29,6 +29,7 @@ httpx version.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 from typing import Optional
@@ -41,6 +42,10 @@ from app.services.ssrf import (
     _is_blocked_address,
     _local_services_opt_in_enabled,
 )
+
+# Bounds the request-time re-resolution below so a hanging/slow resolver
+# cannot stall the caller indefinitely (see asyncio.to_thread usage below).
+_DNS_REVALIDATION_TIMEOUT_SECONDS = 5.0
 
 
 def _resolve_host_ips(host: str, port: int) -> list[str]:
@@ -58,6 +63,13 @@ class SSRFSafeTransport(httpx.AsyncBaseTransport):
     Pass an instance to ``httpx.AsyncClient(transport=SSRFSafeTransport())``.
     Honors the same ``ALLOW_LOCAL_SERVICES`` opt-in as the guard so local-dev
     configurations are not broken.
+
+    To preserve caller-configured connection-pool ``limits`` (or any other
+    ``httpx.AsyncHTTPTransport`` option), construct the wrapped transport
+    yourself and pass it in — ``httpx.AsyncClient(limits=...)`` does NOT
+    apply ``limits`` when a custom ``transport=`` is supplied, so it must be
+    forwarded explicitly:
+    ``SSRFSafeTransport(transport=httpx.AsyncHTTPTransport(limits=limits))``.
     """
 
     def __init__(self, transport: Optional[httpx.AsyncHTTPTransport] = None):
@@ -65,6 +77,15 @@ class SSRFSafeTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         parsed = urlparse(str(request.url))
+        # Defense-in-depth: mirror assert_url_safe's scheme/credential checks
+        # here too, so this transport is safe even if a future caller wires
+        # it up without an upstream assert_url_safe() call.
+        if parsed.scheme not in ("http", "https"):
+            raise URLBlocked(
+                f"URL scheme must be http or https (got {parsed.scheme!r})."
+            )
+        if parsed.username or parsed.password:
+            raise URLBlocked("URL must not embed credentials (user:pass@host).")
         host = parsed.hostname
         if host:
             # Literal-IP hosts short-circuit DNS.
@@ -72,7 +93,23 @@ class SSRFSafeTransport(httpx.AsyncBaseTransport):
                 ipaddress.ip_address(host)
                 candidates = [host]
             except ValueError:
-                candidates = _resolve_host_ips(host, parsed.port or 80)
+                # Offload the blocking getaddrinfo() call so a slow/hanging
+                # resolver cannot stall the whole event loop (matches the
+                # asyncio.to_thread pattern used for assert_url_safe elsewhere
+                # in this codebase, e.g. reranking.py / model_checker.py).
+                try:
+                    candidates = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _resolve_host_ips, host, parsed.port or 80
+                        ),
+                        timeout=_DNS_REVALIDATION_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # Fail-closed to match the no-candidates case below.
+                    raise URLBlocked(
+                        f"URL host {host!r} did not resolve at request time "
+                        f"within {_DNS_REVALIDATION_TIMEOUT_SECONDS}s."
+                    ) from None
             # Fail-closed to match the startup guard (ssrf.py raises URLBlocked
             # when getaddrinfo returns nothing) — an attacker who can force a
             # transient DNS failure at re-validation must not slip past.

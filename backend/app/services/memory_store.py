@@ -310,7 +310,7 @@ class MemoryStore:
             # the embedding batch limit; return_exceptions preserves per-memory
             # error handling.
             sem = asyncio.Semaphore(
-                max(1, getattr(settings, "embed_concurrent_batches", 4))
+                max(1, getattr(settings, "embedding_concurrent_batches", 4))
             )
 
             async def _embed_one(mid: int, text: str) -> bool:

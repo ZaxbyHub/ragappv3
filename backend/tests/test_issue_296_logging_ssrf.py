@@ -115,6 +115,26 @@ class TestSensitiveFieldFilter(unittest.TestCase):
         self.filt.filter(rec)
         self.assertEqual(rec.getMessage(), "the field user_input should be validated")
 
+    def test_scrubs_password_and_token_family_attributes(self):
+        # SCRUB_FIELDS originally omitted several common secret-bearing
+        # names; a caller doing logger.info(..., extra={"password": ...})
+        # would leak it unredacted.
+        rec = self._make_record(
+            password="hunter2",
+            access_token="at-123",
+            refresh_token="rt-456",
+            csrf_token="csrf-789",
+            cookie="session=abc",
+            bearer="Bearer xyz",
+        )
+        self.filt.filter(rec)
+        self.assertEqual(rec.password, "[redacted]")
+        self.assertEqual(rec.access_token, "[redacted]")
+        self.assertEqual(rec.refresh_token, "[redacted]")
+        self.assertEqual(rec.csrf_token, "[redacted]")
+        self.assertEqual(rec.cookie, "[redacted]")
+        self.assertEqual(rec.bearer, "[redacted]")
+
 
 class TestJsonFormatterAndRequestId(unittest.TestCase):
     """E3-2 / E3-4: JSON output carries request_id and extras."""

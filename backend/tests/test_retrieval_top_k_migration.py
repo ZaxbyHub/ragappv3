@@ -6,13 +6,6 @@ This test file verifies:
 3. RAG engine integration with retrieval_top_k
 """
 
-import os
-
-# The async RAG-engine test constructs real EmbeddingService/VectorStore
-# instances, whose SSRF guards validate the configured local model URLs.
-# Allow local service endpoints for this module's construction paths.
-os.environ.setdefault("ALLOW_LOCAL_SERVICES", "1")
-
 import asyncio
 import os
 import sys

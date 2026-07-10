@@ -20,7 +20,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -77,31 +77,66 @@ class TestMemoryStoreAddMemoryRetryUnit(unittest.TestCase):
                 def release_connection(self, c):
                     c.close()
 
-            store = MemoryStore(pool=_FixedPool(tmp.name))
+            # Wrap the real sqlite3.Connection so the post-commit SELECT-back
+            # (add_memory's second `conn.execute(...)` call) raises, while
+            # the INSERT (inside the retried `_insert_and_commit`) succeeds
+            # normally on the same connection.
+            class _SelectFailsAfterInsertConn:
+                def __init__(self, real_conn):
+                    self._real = real_conn
+                    self.execute_calls = []
 
-            # Patch the inner retried function to record how many times the
-            # INSERT runs. We simulate a SELECT-back failure on the first
-            # add_memory by making the connection's execute raise on a SELECT
-            # after commit — but the simplest deterministic proof: call
-            # add_memory twice with the same content and confirm the retry
-            # decorator's @with_retry on the INSERT unit is isolated. Instead,
-            # assert the source structure: the SELECT-back is NOT inside the
-            # @with_retry-decorated function.
-            source = open(
-                os.path.join(os.path.dirname(__file__), "..", "app", "services", "memory_store.py"),
-                encoding="utf-8",
-            ).read()
-            # The add_memory method itself is NOT decorated with @with_retry
-            # (the inner _insert_and_commit is). Locate add_memory def.
-            idx = source.find("def add_memory(")
-            self.assertGreater(idx, -1)
-            # The decorator line immediately before add_memory must NOT be
-            # @with_retry (it was pre-fix).
-            pre = source.rfind("\n", 0, idx - 1)
-            preceding_line = source[pre:idx].strip()
-            self.assertNotIn("@with_retry", preceding_line)
-            # The inner retried helper exists.
-            self.assertIn("def _insert_and_commit(conn):", source)
+                def execute(self, sql, params=()):
+                    self.execute_calls.append(sql)
+                    if sql.strip().upper().startswith("SELECT"):
+                        raise _sqlite.OperationalError(
+                            "simulated SELECT-back failure"
+                        )
+                    return self._real.execute(sql, params)
+
+                def commit(self):
+                    self._real.commit()
+
+                def close(self):
+                    self._real.close()
+
+            wrapped = _SelectFailsAfterInsertConn(_sqlite.connect(tmp.name))
+
+            class _FixedPoolWithWrappedConn:
+                def get_connection(self):
+                    return wrapped
+
+                def release_connection(self, c):
+                    pass  # wrapped connection is closed explicitly below
+
+            store = MemoryStore(pool=_FixedPoolWithWrappedConn())
+
+            with self.assertRaises(_sqlite.OperationalError):
+                store.add_memory(content="hello world")
+            wrapped.close()
+
+            # The SELECT-back's failure must NOT have caused the INSERT to
+            # be re-run: exactly one row should exist, and the INSERT sql
+            # must have executed exactly once (not retried/duplicated).
+            insert_calls = [s for s in wrapped.execute_calls if s.strip().upper().startswith("INSERT")]
+            self.assertEqual(
+                len(insert_calls), 1,
+                "INSERT ran more than once — the SELECT-back failure must not "
+                "re-trigger the retried INSERT unit (A5-1)",
+            )
+
+            verify_conn = _sqlite.connect(tmp.name)
+            try:
+                count = verify_conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE content = ?", ("hello world",)
+                ).fetchone()[0]
+            finally:
+                verify_conn.close()
+            self.assertEqual(
+                count, 1,
+                "expected exactly one persisted row; a duplicate-insert "
+                "regression would leave 2+",
+            )
         finally:
             os.unlink(tmp.name)
 
@@ -321,6 +356,42 @@ class TestBatchMemoryWikiStatusBody(unittest.TestCase):
         self.assertIn("memory_ids", window)
         # Must NOT use Query for memory_ids.
         self.assertNotIn("memory_ids: List[int] = Query", window)
+
+
+class TestBackfillConcurrencySetting(unittest.IsolatedAsyncioTestCase):
+    """backfill_missing_embeddings must bound its concurrency Semaphore with
+    settings.embedding_concurrent_batches (NOT the non-existent
+    embed_concurrent_batches — a typo that made the knob permanently inert,
+    always falling back to the hardcoded default of 4)."""
+
+    async def test_semaphore_uses_configured_embedding_concurrent_batches(self):
+        from app.services.memory_store import MemoryStore
+
+        store = MemoryStore.__new__(MemoryStore)
+        store.embedding_service = MagicMock()
+        store.embed_and_store = AsyncMock(return_value=None)
+        store._has_embedding_columns = MagicMock(return_value=True)
+
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [(1, "a"), (2, "b")]
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value = mock_cursor
+        store.pool = MagicMock()
+        store.pool.get_connection.return_value = mock_conn
+
+        mock_settings = MagicMock()
+        mock_settings.embedding_model = "test-model"
+        mock_settings.embedding_concurrent_batches = 2
+
+        with patch("app.services.memory_store.settings", mock_settings), \
+             patch("app.services.memory_store.asyncio.Semaphore") as mock_sem:
+            mock_sem.return_value = MagicMock()
+            mock_sem.return_value.__aenter__ = AsyncMock(return_value=None)
+            mock_sem.return_value.__aexit__ = AsyncMock(return_value=None)
+
+            await store.backfill_missing_embeddings()
+
+        mock_sem.assert_called_once_with(2)
 
 
 if __name__ == "__main__":

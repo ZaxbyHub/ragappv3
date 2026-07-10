@@ -2212,6 +2212,23 @@ class VectorStore:
                 )
                 logger.error(error_msg)
                 raise VectorStoreValidationError(error_msg)
+            elif not stored_hash:
+                # Table predates the F2-2 model-identity check (its metadata
+                # was never baked in — LanceDB only accepts schema metadata
+                # at create_table time, so an existing table opened via
+                # open_table() never gets it). This guard therefore cannot
+                # detect a same-dimension model swap on this table; warn
+                # loudly so an operator changing embedding_model on an
+                # existing deployment knows to reindex manually.
+                logger.warning(
+                    "Vector table 'chunks' has no stored embedding_prefix_hash "
+                    "(created before model-identity validation was added). "
+                    "The model-mismatch guard cannot verify this table was "
+                    "built with the currently configured embedding model "
+                    f"({embedding_model_id!r}); if the embedding model was "
+                    "changed, reindex manually to avoid semantically "
+                    "incompatible search results."
+                )
 
         metadata_to_store = {
             "embedding_model_id": embedding_model_id,

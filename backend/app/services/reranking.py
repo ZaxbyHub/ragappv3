@@ -217,6 +217,7 @@ class RerankingService:
 
             self._http_client = httpx.AsyncClient(
                 timeout=settings.reranker_timeout_seconds,
+                follow_redirects=False,
                 transport=SSRFSafeTransport(),
             )
         try:
