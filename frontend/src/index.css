@@ -9,11 +9,9 @@
  *   Monochromatic Luxury Theme - Restrained Teal
  */
 
-/* Google Fonts — preloaded via <link> in index.html for non-blocking load */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Commissioner:wght@100..900&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Electrolize&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Spline+Sans:wght@300..700&display=swap');
+/* Google Fonts are loaded via the non-blocking <link> in index.html
+   (including Inter, the body font). The previous CSS @import block was
+   render-blocking and duplicated 3 of the 4 families — removed (UI-PERF-5). */
 
 @tailwind base;
 @tailwind components;
@@ -43,7 +41,10 @@
     
     /* Muted - Very subtle teal-gray */
     --muted: 195 10% 94%;
-    --muted-foreground: 195 10% 45%;
+    /* Darkened from 45% → 40% lightness so the token clears WCAG 1.4.3 AA
+       (4.5:1) on --background/--card in light theme (UI-A11Y-1, #294).
+       Was a marginal 4.284:1 failure at 45%. */
+    --muted-foreground: 195 10% 40%;
     
     /* Accent - Light grey with barely perceptible blue tint */
     --accent: 195 42% 86%;

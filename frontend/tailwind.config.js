@@ -20,9 +20,11 @@ export default {
        */
       fontFamily: {
         sans: ['Spline Sans', 'system-ui', 'sans-serif'],
-        serif: ['Source Serif 4', 'Georgia', 'serif'],
-        display: ['Source Serif 4', 'Georgia', 'serif'],
-        body: ['Spline Sans', 'system-ui', 'sans-serif'],
+      },
+      // Named micro-text token for the de-facto text-[10px] scale used ~49x
+      // across the app (UI-VIS-6, #291). Centralizes the smallest text size.
+      fontSize: {
+        '2xs': ['0.625rem', { lineHeight: '0.9rem' }],
       },
       colors: {
         border: "hsl(var(--border))",

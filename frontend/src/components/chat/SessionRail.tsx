@@ -207,7 +207,7 @@ export function ChatSearchInput({
             <Button
               variant="ghost"
               size="icon"
-              className="h-5 w-5"
+              className="h-6 w-6"
               onClick={handleClear}
               aria-label="Clear search"
             >
@@ -323,7 +323,7 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
       >
         <div className="flex flex-col items-start gap-2">
           <div className="flex items-center justify-between gap-2">
-            <HugeiconsIcon icon={Message01Icon} strokeWidth={1.2} size={16} color={isActive ? "text-accent-foreground" : "text-muted-foreground"} aria-hidden="true" />
+            <HugeiconsIcon icon={Message01Icon} strokeWidth={1.2} size={16} className={isActive ? "text-accent-foreground" : "text-muted-foreground"} aria-hidden="true" />
 
             <div className="w-full">
               {isEditing ? (
@@ -908,8 +908,8 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
         <div className="flex flex-col items-center justify-center py-8 text-center flex-1">
           <AlertCircle className="w-10 h-10 mb-3 text-destructive" aria-hidden="true" />
           <p className="text-sm text-muted-foreground">Failed to load sessions</p>
-          <p className="text-xs text-muted-foreground/70 mt-1">{error}</p>
-          <p className="text-xs text-muted-foreground/60 mt-2 max-w-[200px]">
+          <p className="text-xs text-muted-foreground mt-1">{error}</p>
+          <p className="text-xs text-muted-foreground mt-2 max-w-[200px]">
             Check your network connection, then retry. If this persists, the
             chat service may be temporarily unavailable.
           </p>
@@ -942,7 +942,7 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
           <p className="text-sm text-muted-foreground">No sessions yet</p>
           {hasIndexedDocs ? (
             <>
-              <p className="text-xs text-muted-foreground/70 mt-1">
+              <p className="text-xs text-muted-foreground mt-1">
                 Start a new chat to begin a conversation
               </p>
               <Button variant="outline" className="mt-4" onClick={handleNewChat}>
@@ -952,7 +952,7 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
             </>
           ) : (
             <>
-              <p className="text-xs text-muted-foreground/70 mt-1 max-w-[220px]">
+              <p className="text-xs text-muted-foreground mt-1 max-w-[220px]">
                 Upload documents first so the assistant has something to ground
                 its answers in.
               </p>
@@ -965,7 +965,7 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
               </Button>
               <button
                 onClick={handleNewChat}
-                className="mt-3 text-xs text-muted-foreground/70 underline hover:text-muted-foreground"
+                className="mt-3 text-xs text-muted-foreground underline hover:text-muted-foreground"
               >
                 Start a new chat anyway
               </button>
@@ -1007,7 +1007,7 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
           <div className="flex flex-col items-center justify-center py-8 text-center">
             <Search className="w-10 h-10 text-muted-foreground mb-3" aria-hidden="true" />
             <p className="text-sm text-muted-foreground">No sessions found</p>
-            <p className="text-xs text-muted-foreground/70 mt-1">
+            <p className="text-xs text-muted-foreground mt-1">
               Try adjusting your search
             </p>
             <Button

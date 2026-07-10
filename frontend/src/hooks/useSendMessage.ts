@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   chatStream,
   createChatSession,
@@ -50,6 +50,20 @@ export function useSendMessage(
 
   // Atomic guard — prevents double-send from rapid clicks / Enter
   const sendingRef = useRef(false);
+  // UI-PERF-2: rAF batching for streaming appends.
+  const streamingBufferRef = useRef("");
+  const streamingRafRef = useRef<number | null>(null);
+
+  // Cancel any pending rAF flush on unmount so we don't update state after teardown.
+  useEffect(() => {
+    return () => {
+      if (streamingRafRef.current !== null) {
+        cancelAnimationFrame(streamingRafRef.current);
+        streamingRafRef.current = null;
+      }
+      streamingBufferRef.current = "";
+    };
+  }, []);
 
   /**
    * Core send primitive. Accepts content and a history snapshot directly so
@@ -148,7 +162,24 @@ export function useSendMessage(
         {
           onMessage: (chunk) => {
             setCurrentStage(null);
-            appendToMessage(assistantMessageId, chunk);
+            // Coalesce SSE appends behind requestAnimationFrame (UI-PERF-2):
+            // without this, every token chunk updates the store, re-renders
+            // MarkdownMessage, and re-runs the full remark/rehype parse of
+            // the entire accumulated content (O(n²) in message length). The
+            // rAF batches appends to once per frame, bounding reparse
+            // frequency independent of token rate while preserving live
+            // citation rendering (the full ReactMarkdown pipeline still runs).
+            streamingBufferRef.current += chunk;
+            if (streamingRafRef.current === null) {
+              streamingRafRef.current = requestAnimationFrame(() => {
+                streamingRafRef.current = null;
+                const buffered = streamingBufferRef.current;
+                if (buffered) {
+                  streamingBufferRef.current = "";
+                  appendToMessage(assistantMessageId, buffered);
+                }
+              });
+            }
           },
           onSources: (sources) => {
             updateMessage(assistantMessageId, { sources });
@@ -173,7 +204,16 @@ export function useSendMessage(
           onFinalContent: (content) => {
             // Backend stripped invalid citations: adopt the cleaned content so
             // the hallucinated [S#] chip is removed from the rendered message
-            // and from what onComplete persists.
+            // and from what onComplete persists. The replace SUPERSEDES all
+            // buffered streaming tokens, so cancel any pending rAF and clear
+            // the buffer — otherwise onComplete's flush would append the stale
+            // (citation-dirty) buffered tokens back on top of the cleaned
+            // content, re-injecting the stripped citations and duplicating text.
+            if (streamingRafRef.current !== null) {
+              cancelAnimationFrame(streamingRafRef.current);
+              streamingRafRef.current = null;
+            }
+            streamingBufferRef.current = "";
             updateMessage(assistantMessageId, { content });
           },
           // FR-004: capture citation confidence and unverifiable claims from done event.
@@ -184,6 +224,18 @@ export function useSendMessage(
             updateMessage(assistantMessageId, { unverifiableClaims: claims });
           },
           onError: (error) => {
+            // Flush any buffered streaming content before reading store state
+            // (UI-PERF-2): rAF-batched appends may not have fired yet, so
+            // synchronously drain the buffer to avoid losing the partial tail.
+            if (streamingRafRef.current !== null) {
+              cancelAnimationFrame(streamingRafRef.current);
+              streamingRafRef.current = null;
+            }
+            const buffered = streamingBufferRef.current;
+            if (buffered) {
+              streamingBufferRef.current = "";
+              appendToMessage(assistantMessageId, buffered);
+            }
             console.error("Chat stream error:", error);
             const isAbort =
               error.name === "AbortError" || /aborted|abort/i.test(error.message);
@@ -209,6 +261,19 @@ export function useSendMessage(
             sendingRef.current = false;
           },
           onComplete: async () => {
+            // Flush any buffered streaming content before reading store state
+            // (UI-PERF-2): rAF-batched appends may not have fired yet when the
+            // stream completes, so synchronously drain the buffer to avoid
+            // persisting truncated content (the tail would be lost otherwise).
+            if (streamingRafRef.current !== null) {
+              cancelAnimationFrame(streamingRafRef.current);
+              streamingRafRef.current = null;
+            }
+            const buffered = streamingBufferRef.current;
+            if (buffered) {
+              streamingBufferRef.current = "";
+              appendToMessage(assistantMessageId, buffered);
+            }
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);

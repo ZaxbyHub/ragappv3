@@ -183,9 +183,9 @@ export default function DocumentDetailPage() {
               <ArrowLeft className="w-4 h-4" />
             </Button>
             <FileIcon filename={doc.filename} className="w-5 h-5 flex-shrink-0" />
-            <h2 className="text-lg font-semibold truncate" title={doc.filename}>
+            <h1 className="text-lg font-semibold truncate" title={doc.filename}>
               {doc.filename}
-            </h2>
+            </h1>
           </div>
           <Button variant="outline" size="sm" onClick={handleDownload}>
             <Download className="w-4 h-4 mr-1" />

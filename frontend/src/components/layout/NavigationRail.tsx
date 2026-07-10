@@ -82,15 +82,20 @@ function StatusIndicator({ isUp, label, loading, isExpanded }: { isUp: boolean; 
           "rounded-full flex-shrink-0 size-3",
           loading ? "bg-warning animate-pulse" : isUp ? "bg-success" : "bg-destructive"
         )}
+        // Non-color cue + accessible name on the dot itself so collapsed-rail
+        // status is not conveyed by color alone (UI-A11Y-6, #294).
+        role="img"
+        aria-label={`${label}: ${loading ? "checking" : isUp ? "online" : "offline"}`}
+        title={`${label}: ${loading ? "checking" : isUp ? "online" : "offline"}`}
       />
       {isExpanded && (
-        <>
-          <span className="text-[11px] text-muted-foreground truncate whitespace-nowrap">
-            {loading ? "Checking" : label}
-          </span>
-          <span className="sr-only">{label}: {isUp ? "online" : "offline"}</span>
-        </>
+        <span className="text-[11px] text-muted-foreground truncate whitespace-nowrap">
+          {loading ? "Checking" : label}
+        </span>
       )}
+      {/* Always announced (even when collapsed) so screen readers convey status
+          via text, not color. Previously gated behind {isExpanded}. */}
+      <span className="sr-only">{label}: {loading ? "checking" : isUp ? "online" : "offline"}</span>
     </div>
   );
 }

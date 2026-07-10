@@ -26,6 +26,9 @@ type StreamHandlers = {
   onWiki: (wikiRefs: unknown[]) => void;
   onKMS: (kmsRefs: unknown[]) => void;
   onMode: (mode: string) => void;
+  onFinalContent?: (content: string) => void;
+  onCitationConfidence?: (confidence: unknown) => void;
+  onUnverifiableClaims?: (claims: unknown[]) => void;
   onError: (error: Error) => void;
   onComplete: () => Promise<void> | void;
 };
@@ -102,6 +105,68 @@ describe("useSendMessage", () => {
       role: "user",
       content: "What changed?",
     });
+  });
+
+  it("persists the FULL streamed assistant content (rAF batching must flush before persist — UI-PERF-2)", async () => {
+    // The default chatStream mock calls onMessage("hello") then immediately
+    // onComplete(). With rAF batching, the buffered "hello" must be flushed
+    // synchronously in onComplete before the store content is persisted,
+    // otherwise the assistant message is saved truncated.
+    const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ input: "hi" });
+
+    const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+    await act(async () => {
+      await result.current.handleSend();
+    });
+
+    await waitFor(() => {
+      expect(refreshHistory).toHaveBeenCalledWith(true);
+    });
+
+    // The assistant addChatMessage call must carry the streamed content.
+    const assistantCall = apiMocks.addChatMessage.mock.calls.find(
+      (c) => c[1].role === "assistant",
+    );
+    expect(assistantCall).toBeDefined();
+    expect((assistantCall![1] as { content: string }).content).toContain("hello");
+  });
+
+  it("onFinalContent replaces streamed content without re-injecting stripped citations (UI-PERF-2 + rAF buffer)", async () => {
+    // Regression for the rAF-batching interaction with citation-stripping:
+    // stream a citation-dirty token, then fire onFinalContent (cleaned) and
+    // onComplete back-to-back (the SSE done-event ordering). The persisted
+    // assistant content must equal the REPAIRED text — no duplicated body,
+    // no re-injected [S5] citation.
+    apiMocks.chatStream.mockImplementation((_messages: unknown, handlers: StreamHandlers) => {
+      // Buffer a citation-dirty token (rAF has not flushed).
+      handlers.onMessage("The answer is 42 [S5]");
+      // done event carries repaired_content (citation stripped).
+      handlers.onFinalContent?.("The answer is 42");
+      void handlers.onComplete();
+      return vi.fn();
+    });
+
+    const refreshHistory = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ input: "what is the answer" });
+
+    const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+    await act(async () => {
+      await result.current.handleSend();
+    });
+    await waitFor(() => {
+      expect(refreshHistory).toHaveBeenCalled();
+    });
+
+    const assistantCall = apiMocks.addChatMessage.mock.calls.find(
+      (c) => c[1].role === "assistant",
+    );
+    expect(assistantCall).toBeDefined();
+    const persisted = (assistantCall![1] as { content: string }).content;
+    // Must equal the repaired content exactly (no duplication, no [S5]).
+    expect(persisted).toBe("The answer is 42");
+    expect(persisted).not.toContain("[S5]");
   });
 
   it("force-refreshes history and the session rail after an existing session is persisted", async () => {

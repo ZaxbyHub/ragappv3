@@ -327,6 +327,9 @@ export default function ChatShell() {
       {/* MAIN TRANSCRIPT AREA */}
       <main className="flex flex-1 flex-col min-w-0 bg-background">
         <header className="flex h-14 items-center gap-2 border-b border-border px-4">
+          {/* Page-level heading landmark (sr-only) so screen-reader heading
+              navigation has an h1 on this route (UI-HIER-1, #291). */}
+          <h1 className="sr-only">Chat</h1>
           {/* Session rail toggle — visible on all screen sizes */}
           <Button variant="ghost" size="icon" onClick={handleToggleSessionRail}
             aria-label={isMobile ? (mobileSheetOpen ? "Hide sessions" : "Show sessions") : (sessionRailOpen ? "Hide sessions" : "Show sessions")}
