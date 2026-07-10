@@ -219,6 +219,23 @@ class VectorStore:
         self._embedding_dim = embedding_dim
         table_just_created = False
 
+        # Persist the embedding model identity into the table schema metadata at
+        # creation so validate_schema() can detect a same-dimension-but-different-
+        # model reindex need (F2-2). LanceDB cannot update metadata on an existing
+        # table, so this only applies to freshly-created tables — but it gives the
+        # validate_schema model-id comparison a source of truth for new tables.
+        import hashlib as _hashlib
+
+        _creation_model_id = str(settings.embedding_model or "")
+        _creation_prefix_hash = _hashlib.sha256(
+            _creation_model_id.encode("utf-8")
+        ).hexdigest()[:16]
+        _schema_metadata = {
+            b"embedding_model_id": _creation_model_id.encode("utf-8"),
+            b"embedding_dim": str(embedding_dim).encode("utf-8"),
+            b"embedding_prefix_hash": _creation_prefix_hash.encode("utf-8"),
+        }
+
         # Define schema for chunks table
         schema = pa.schema(
             [
@@ -242,7 +259,8 @@ class VectorStore:
                 pa.field("parent_window_end", pa.int32(), nullable=True),
                 pa.field("chunk_position", pa.int32(), nullable=True),
                 ("embedding", pa.list_(pa.float32(), embedding_dim)),
-            ]
+            ],
+            metadata=_schema_metadata,
         )
 
         # Create or open table with error handling
@@ -2175,6 +2193,25 @@ class VectorStore:
         prefix_hash = hashlib.sha256(embedding_model_id.encode("utf-8")).hexdigest()[
             :16
         ]
+
+        # Validate model identity, not just dimension (F2-2): if the table was
+        # created with a different embedding model (different prefix hash), the
+        # stored vectors are semantically incompatible with the current model
+        # even if the dimension coincidentally matches — searches will return
+        # garbage. Persist the hash at table creation (init_table) so this
+        # comparison has a source of truth (LanceDB cannot update metadata on
+        # an existing table, hence the log-only write below).
+        if stored_metadata:
+            stored_hash = stored_metadata.get("embedding_prefix_hash")
+            stored_model = stored_metadata.get("embedding_model_id")
+            if stored_hash and stored_hash != prefix_hash:
+                error_msg = (
+                    f"Embedding model changed from {stored_model!r} to "
+                    f"{embedding_model_id!r} (prefix hash {stored_hash} -> "
+                    f"{prefix_hash}); reindex required even though dimensions match."
+                )
+                logger.error(error_msg)
+                raise VectorStoreValidationError(error_msg)
 
         metadata_to_store = {
             "embedding_model_id": embedding_model_id,
