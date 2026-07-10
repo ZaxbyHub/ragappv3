@@ -1,0 +1,37 @@
+name: Generate lockfiles (tmp)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: claude/issue-220-222-224
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-tools
+        run: pip install pip-tools
+
+      - name: Generate production lockfile
+        working-directory: backend
+        run: |
+          python3.11 -m piptools compile --generate-hashes --no-header --allow-unsafe requirements.txt --output-file requirements-lock.txt
+
+      - name: Generate CI lockfile
+        working-directory: backend
+        run: |
+          python3.11 -m piptools compile --generate-hashes --no-header --allow-unsafe requirements-ci.txt --output-file requirements-lock-ci.txt
+
+      - name: Upload lockfiles
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockfiles
+          path: |
+            backend/requirements-lock.txt
+            backend/requirements-lock-ci.txt
