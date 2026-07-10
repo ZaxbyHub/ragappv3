@@ -161,6 +161,25 @@ def get_vector_store(request: Request) -> VectorStore:
     return request.app.state.vector_store
 
 
+def require_model_ready(vector_store: VectorStore = Depends(get_vector_store)) -> VectorStore:
+    """Return the vector store only if it is initialized and ready.
+
+    Raises HTTPException 503 if the vector store is None (not initialized) or
+    if its _ready flag is False (embedding model mismatch — reindex required).
+    """
+    if vector_store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Vector store is not initialized.",
+        )
+    if getattr(vector_store, '_ready', True) is False:
+        raise HTTPException(
+            status_code=503,
+            detail="Embedding model mismatch — admin reindex required",
+        )
+    return vector_store
+
+
 def get_memory_store(request: Request) -> MemoryStore:
     """Return the memory store from app state."""
     return request.app.state.memory_store

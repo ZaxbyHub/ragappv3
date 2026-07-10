@@ -37,6 +37,50 @@ class _ExprStub:
         return _ExprStub(f"({other}) AND ({self._sql})")
 _lancedb.expr.col = lambda name: _ExprStub(name)
 _lancedb.expr.lit = lambda value: _ExprStub(repr(value))
+
+# Minimal connect/create_table stub for tests that use the real LanceDB API
+class _StubTable:
+    """Stub for a LanceDB table."""
+
+    def __init__(self, name, schema=None):
+        self.name = name
+        self._schema = schema
+
+    async def schema(self):
+        return self._schema
+
+    def __repr__(self):
+        return f"<_StubTable {self.name}>"
+
+
+class _StubDB:
+    """Stub for a LanceDB connection (returned by lancedb.connect)."""
+
+    def __init__(self, uri):
+        self.uri = uri
+        self._tables = {}
+
+    async def table_names(self):
+        return list(self._tables.keys())
+
+    def create_table(self, name, schema=None, exist_ok=False):
+        """Synchronous create_table (matches real LanceDB API)."""
+        table = _StubTable(name, schema)
+        self._tables[name] = table
+        return table
+
+    async def open_table(self, name):
+        return self._tables.get(name, _StubTable(name))
+
+    def __repr__(self):
+        return f"<_StubDB {self.uri}>"
+
+
+def _stub_connect(uri):
+    return _StubDB(uri)
+
+
+_lancedb.connect = _stub_connect
 sys.modules["lancedb"] = _lancedb
 sys.modules["lancedb.index"] = _lancedb.index
 sys.modules["lancedb.expr"] = _lancedb.expr

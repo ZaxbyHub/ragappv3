@@ -19,6 +19,7 @@ from app.api.deps import (
     get_current_active_user,
     get_db,
     get_memory_store,
+    require_model_ready,
 )
 from app.config import settings
 from app.limiter import limiter
@@ -640,6 +641,7 @@ async def search_memories(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
     memory_store: MemoryStore = Depends(get_memory_store),
     user: dict = Depends(get_current_active_user),
+    _: None = Depends(require_model_ready),
 ):
     """
     Search memories using full-text search.
@@ -661,6 +663,7 @@ async def search_memories_post(
     memory_store: MemoryStore = Depends(get_memory_store),
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
+    _: None = Depends(require_model_ready),
 ):
     """Search memories via POST (request body).
 

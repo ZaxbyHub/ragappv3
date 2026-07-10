@@ -3,8 +3,10 @@ LanceDB vector store service for semantic search.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -116,6 +118,7 @@ class VectorStore:
         self.table: Optional[lancedb.table.AsyncTable] = None
         self._embedding_dim: Optional[int] = None
         self._fts_exceptions: int = 0
+        self._ready: bool = True
         # Track the row count at last IVF_PQ build to detect post-delete churn (Issue #13)
         self._last_index_build_row_count: int = 0
         self._index_mutation_generation: int = 0
@@ -134,6 +137,119 @@ class VectorStore:
         if self._search_semaphore is None:
             self._search_semaphore = asyncio.Semaphore(_get_vector_search_concurrency())
         return self._search_semaphore
+
+    def _compute_embedding_prefix_hash(self) -> str:
+        """Compute a 16-char hex hash from the concatenation of doc and query prefix strings.
+
+        Returns:
+            First 16 characters of the SHA-256 hex digest of
+            ``settings.embedding_doc_prefix + '|' + settings.embedding_query_prefix``.
+            None values are coerced to empty string.
+        """
+        doc_prefix = settings.embedding_doc_prefix or ""
+        query_prefix = settings.embedding_query_prefix or ""
+        combined = (doc_prefix + "|" + query_prefix).encode()
+        return hashlib.sha256(combined).hexdigest()[:16]
+
+    async def record_embedding_metadata(
+        self, embedding_dim: int, raise_on_error: bool = False
+    ) -> None:
+        """Persist embedding model metadata to the SQLite settings_kv table.
+
+        Stores three keys: embedding_model_id, embedding_dim, embedding_prefix_hash.
+        Uses INSERT OR REPLACE so repeated calls are idempotent.
+
+        Args:
+            embedding_dim: The embedding vector dimension.
+            raise_on_error: When True, re-raise sqlite3.Error instead of logging
+                it as non-fatal. When False (default), errors are logged and
+                swallowed so startup/validate_schema paths are unaffected.
+        """
+        def _write() -> None:
+            conn = sqlite3.connect(str(settings.sqlite_path))
+            try:
+                cursor = conn.cursor()
+                keys_values = [
+                    ("embedding_model_id", settings.embedding_model or ""),
+                    ("embedding_dim", str(embedding_dim)),
+                    ("embedding_prefix_hash", self._compute_embedding_prefix_hash()),
+                ]
+                for key, value in keys_values:
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO settings_kv (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                        (key, value),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+        try:
+            await asyncio.to_thread(_write)
+            logger.info(
+                "Embedding metadata persisted: model=%s dim=%d hash=%s",
+                settings.embedding_model,
+                embedding_dim,
+                self._compute_embedding_prefix_hash(),
+            )
+        except sqlite3.Error as e:
+            if raise_on_error:
+                raise
+            logger.warning("Failed to persist embedding metadata to settings_kv (non-fatal): %s", e)
+
+    async def get_embedding_metadata(self) -> dict:
+        """Retrieve embedding model metadata from the SQLite settings_kv table.
+
+        Returns:
+            Dict with keys: embedding_model_id (str | None), embedding_dim (int | None),
+            embedding_prefix_hash (str | None).
+        """
+        def _read() -> list:
+            conn = sqlite3.connect(str(settings.sqlite_path))
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT key, value FROM settings_kv WHERE key IN (?, ?, ?)",
+                    ("embedding_model_id", "embedding_dim", "embedding_prefix_hash"),
+                )
+                return cursor.fetchall()
+            finally:
+                conn.close()
+
+        try:
+            rows = await asyncio.to_thread(_read)
+        except sqlite3.Error as e:
+            logger.warning("Failed to read embedding metadata from settings_kv (non-fatal): %s", e)
+            return {
+                "embedding_model_id": None,
+                "embedding_dim": None,
+                "embedding_prefix_hash": None,
+            }
+
+        result: dict = {
+            "embedding_model_id": None,
+            "embedding_dim": None,
+            "embedding_prefix_hash": None,
+        }
+        for key, value in rows:
+            if key == "embedding_model_id":
+                result["embedding_model_id"] = value
+            elif key == "embedding_dim":
+                try:
+                    result["embedding_dim"] = int(value)
+                except (ValueError, TypeError):
+                    result["embedding_dim"] = None
+            elif key == "embedding_prefix_hash":
+                result["embedding_prefix_hash"] = value
+        return result
+
+    async def mark_ready(self, ready: bool = True) -> None:
+        """Set the vector store ready flag.
+
+        Args:
+            ready: True if the vector store is ready for queries, False otherwise.
+        """
+        self._ready = ready
+        logger.debug("VectorStore readiness set to %s", ready)
 
     @asynccontextmanager
     async def _acquire_write_lock(self):
@@ -304,6 +420,10 @@ class VectorStore:
             raise VectorStoreConnectionError(
                 f"Failed to initialize 'chunks' table: {e}"
             ) from e
+
+        # Persist embedding metadata to settings_kv on new table creation
+        if table_just_created:
+            await self.record_embedding_metadata(embedding_dim)
 
         # Defer vector index creation until sufficient rows (FR-013)
         if table_just_created:
@@ -2136,17 +2256,18 @@ class VectorStore:
         """
         Validate that the table schema matches the current embedding configuration.
 
+        Compares the stored embedding model identity from the SQLite settings_kv sidecar
+        against the configured model and sets vector_store._ready = False on mismatch.
+
         Args:
             embedding_model_id: The embedding model identifier
             embedding_dim: The expected embedding dimension
 
         Returns:
-            Dictionary with validation results
-
-        Raises:
-            VectorStoreValidationError: If embedding dimension mismatch is detected
+            Dictionary with validation results including ready flag, stored/expected metadata,
+            mismatch flag, mismatch details, and actual dimension.
         """
-        # Generate a probe embedding for "dimension_probe" text
+        # Generate a probe embedding for "dimension_probe" text (kept for diagnostic purposes)
         probe_text = "dimension_probe"
         try:
             probe_embedding = self._generate_probe_embedding(probe_text, embedding_dim)
@@ -2154,87 +2275,156 @@ class VectorStore:
             logger.warning(f"Failed to generate probe embedding: {e}")
             probe_embedding = None
 
-        # Get expected dimension from the provided parameter
-        expected_dim = embedding_dim
-
         # Check if table exists
-        table_exists = False
-        if self.db is not None:
-            try:
-                table_names = await self.db.table_names()
-                table_exists = "chunks" in table_names
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(f"Failed to check table existence: {e}")
+        if self.db is None:
+            self._ready = True
+            logger.debug("validate_schema: db is None, marking ready=True")
+            return {
+                "table_exists": False,
+                "ready": True,
+                "stored_metadata": None,
+                "expected_metadata": None,
+                "mismatch": False,
+                "mismatch_details": [],
+                "actual_dim": None,
+                "probe_embedding_generated": probe_embedding is not None,
+            }
 
-        stored_metadata = None
-        if table_exists:
-            try:
-                if self.table is None:
-                    self.table = await self.db.open_table("chunks")
+        try:
+            table_names = await self.db.table_names()
+            table_exists = "chunks" in table_names
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning(f"Failed to check table existence: {e}")
+            self._ready = True
+            return {
+                "table_exists": False,
+                "ready": True,
+                "stored_metadata": None,
+                "expected_metadata": None,
+                "mismatch": False,
+                "mismatch_details": [],
+                "actual_dim": None,
+                "probe_embedding_generated": probe_embedding is not None,
+            }
 
-                # Get schema and compare vector dimension
-                schema = await self.table.schema()
-                embedding_field = schema.field("embedding")
-                actual_dim = None
-                if hasattr(embedding_field.type, "list_size"):
-                    actual_dim = embedding_field.type.list_size
+        if not table_exists:
+            self._ready = True
+            logger.debug("validate_schema: chunks table does not exist, marking ready=True")
+            return {
+                "table_exists": False,
+                "ready": True,
+                "stored_metadata": None,
+                "expected_metadata": None,
+                "mismatch": False,
+                "mismatch_details": [],
+                "actual_dim": None,
+                "probe_embedding_generated": probe_embedding is not None,
+            }
 
-                if actual_dim is not None and actual_dim != expected_dim:
-                    error_msg = f"Embedding dimension changed from {actual_dim} to {expected_dim}; reindex required."
-                    logger.error(error_msg)
-                    raise VectorStoreValidationError(error_msg)
+        # Table exists - open it and read schema
+        if self.table is None:
+            self.table = await self.db.open_table("chunks")
 
-                # Get stored metadata
-                stored_metadata = await self.get_stored_metadata()
+        # Get schema and extract actual embedding dimension
+        actual_dim: Optional[int] = None
+        try:
+            schema = await self.table.schema()
+            embedding_field = schema.field("embedding")
+            if hasattr(embedding_field.type, "list_size"):
+                actual_dim = embedding_field.type.list_size
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as e:
+            logger.warning(f"Failed to read embedding dimension from table schema: {e}")
 
-            except VectorStoreValidationError:
-                raise
-            except (AttributeError, KeyError, IndexError, TypeError, ValueError) as e:
-                logger.warning(f"Failed to validate schema: {e}")
+        # Read stored model identity from sidecar
+        stored_metadata = await self.get_embedding_metadata()
 
-        # Prepare metadata to store
-        import hashlib
-
-        prefix_hash = hashlib.sha256(embedding_model_id.encode("utf-8")).hexdigest()[
-            :16
-        ]
-
-        metadata_to_store = {
+        # Build expected metadata
+        expected_metadata = {
             "embedding_model_id": embedding_model_id,
-            "embedding_dim": str(expected_dim),
-            "embedding_prefix_hash": prefix_hash,
+            "embedding_dim": embedding_dim,
+            "embedding_prefix_hash": self._compute_embedding_prefix_hash(),
         }
 
-        # Update table metadata if table exists
-        if table_exists and self.table is not None:
-            try:
-                # Get existing metadata
-                schema = await self.table.schema()
-                current_metadata = dict(schema.metadata) if schema.metadata else {}
+        # Check if sidecar has a stored identifier
+        has_stored_identifier = (
+            stored_metadata.get("embedding_model_id") is not None
+            and stored_metadata.get("embedding_model_id") != ""
+        )
 
-                # Update with our metadata
-                for key, value in metadata_to_store.items():
-                    if isinstance(value, str):
-                        current_metadata[key.encode("utf-8")] = value.encode("utf-8")
-                    else:
-                        current_metadata[key.encode("utf-8")] = str(value).encode(
-                            "utf-8"
-                        )
+        if not has_stored_identifier:
+            self._ready = False
+            logger.warning(
+                "No stored embedding model identifier found in settings_kv; "
+                "vector store marked not ready. Reindex required."
+            )
+            return {
+                "table_exists": True,
+                "ready": False,
+                "stored_metadata": stored_metadata,
+                "expected_metadata": expected_metadata,
+                "mismatch": True,
+                "mismatch_details": ["no_stored_identifier"],
+                "actual_dim": actual_dim,
+                "probe_embedding_generated": probe_embedding is not None,
+            }
 
-                # Note: LanceDB doesn't support direct metadata update on existing table
-                # We'll log the metadata that should be stored for future reference
-                logger.info(f"Table metadata to store/update: {metadata_to_store}")
+        # Compare all three components
+        mismatch_details: List[str] = []
 
-            except (AttributeError, KeyError, TypeError, ValueError) as e:
-                logger.warning(f"Failed to update table metadata: {e}")
+        # Compare embedding_model_id
+        stored_model_id = stored_metadata.get("embedding_model_id")
+        if stored_model_id != embedding_model_id:
+            mismatch_details.append("embedding_model_id")
 
+        # Compare embedding_dim (treat None stored_dim as mismatch; compare as strings)
+        stored_dim = stored_metadata.get("embedding_dim")
+        if stored_dim is None:
+            mismatch_details.append("embedding_dim")
+        elif str(stored_dim) != str(embedding_dim):
+            mismatch_details.append("embedding_dim")
+
+        # Compare embedding_prefix_hash
+        stored_hash = stored_metadata.get("embedding_prefix_hash")
+        expected_hash = expected_metadata["embedding_prefix_hash"]
+        if stored_hash != expected_hash:
+            mismatch_details.append("embedding_prefix_hash")
+
+        if mismatch_details:
+            self._ready = False
+            logger.warning(
+                "Embedding model identity mismatch detected; vector store marked not ready. "
+                "Mismatched fields: %s. Stored: %s, Expected: %s",
+                mismatch_details,
+                stored_metadata,
+                expected_metadata,
+            )
+            return {
+                "table_exists": True,
+                "ready": False,
+                "stored_metadata": stored_metadata,
+                "expected_metadata": expected_metadata,
+                "mismatch": True,
+                "mismatch_details": mismatch_details,
+                "actual_dim": actual_dim,
+                "probe_embedding_generated": probe_embedding is not None,
+            }
+
+        # Everything matches
+        self._ready = True
+        logger.info(
+            "Vector store embedding model identity matches configured model (model=%s dim=%d).",
+            embedding_model_id,
+            embedding_dim,
+        )
         return {
-            "table_exists": table_exists,
-            "expected_dim": expected_dim,
-            "actual_dim": expected_dim if table_exists else None,
+            "table_exists": True,
+            "ready": True,
             "stored_metadata": stored_metadata,
+            "expected_metadata": expected_metadata,
+            "mismatch": False,
+            "mismatch_details": [],
+            "actual_dim": actual_dim,
             "probe_embedding_generated": probe_embedding is not None,
-            "metadata_to_store": metadata_to_store,
         }
 
     def _generate_probe_embedding(self, text: str, dim: int) -> List[float]:

@@ -15,7 +15,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.api.deps import evaluate_policy, get_current_active_user, get_db
+from app.api.deps import (
+    evaluate_policy,
+    get_current_active_user,
+    get_db,
+    require_model_ready,
+)
 from app.config import settings
 from app.security import csrf_protect
 from app.services.wiki_compiler import WikiCompiler
@@ -763,6 +768,7 @@ async def search_wiki(
     sort_by: Optional[str] = Query(None, description="Sort pages by: title, updated_at, confidence"),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    _: None = Depends(require_model_ready),
 ):
     await _require_vault_read(user, vault_id)
     store = WikiStore(db)

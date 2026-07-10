@@ -728,6 +728,23 @@ CREATE INDEX IF NOT EXISTS idx_kms_entries_vault_slug ON kms_entries(vault_id, s
 CREATE INDEX IF NOT EXISTS idx_kms_entries_file_id ON kms_entries(file_id);
 CREATE INDEX IF NOT EXISTS idx_kms_compile_jobs_vault_status ON kms_compile_jobs(vault_id, status);
 
+CREATE TABLE IF NOT EXISTS document_reindex_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vault_id INTEGER,
+    trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK (trigger_type IN ('manual','api','settings_reindex')),
+    trigger_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','cancelled')),
+    error TEXT,
+    result_json TEXT DEFAULT '{}',
+    input_json TEXT DEFAULT '{}',
+    retry_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_reindex_jobs_vault_status ON document_reindex_jobs(vault_id, status);
+
 -- ============================================================
 -- Document organization tags (user-curated, vault-scoped)
 -- ============================================================
@@ -981,6 +998,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_jobs_retry_count(sqlite_path)
     migrate_add_kms_tables(sqlite_path)
     migrate_add_kms_refs(sqlite_path)
+    migrate_add_document_reindex_jobs(sqlite_path)
     migrate_add_tags_tables(sqlite_path)
     migrate_add_folders(sqlite_path)
     migrate_add_files_parsed_text(sqlite_path)
@@ -1827,6 +1845,42 @@ def migrate_add_kms_tables(sqlite_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_kms_entries_vault_slug ON kms_entries(vault_id, slug);
             CREATE INDEX IF NOT EXISTS idx_kms_entries_file_id ON kms_entries(file_id);
             CREATE INDEX IF NOT EXISTS idx_kms_compile_jobs_vault_status ON kms_compile_jobs(vault_id, status);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_document_reindex_jobs(sqlite_path: str) -> None:
+    """
+    Migration: Add document_reindex_jobs table for existing databases.
+
+    Idempotent — safe to run multiple times. Table and index use
+    IF NOT EXISTS guards.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS document_reindex_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER,
+                trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK (trigger_type IN ('manual','api','settings_reindex')),
+                trigger_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','cancelled')),
+                error TEXT,
+                result_json TEXT DEFAULT '{}',
+                input_json TEXT DEFAULT '{}',
+                retry_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_document_reindex_jobs_vault_status ON document_reindex_jobs(vault_id, status);
         """)
         conn.commit()
     finally:

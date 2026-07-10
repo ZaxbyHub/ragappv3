@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   chatStream,
   createChatSession,
@@ -15,6 +15,7 @@ import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import { computeEffectiveChatMode } from "@/lib/chatMode";
 import type { UsedMemory } from "@/lib/api";
+import useCoalescedAppend from "./useCoalescedAppend";
 
 export const MAX_INPUT_LENGTH = 2000;
 
@@ -39,7 +40,6 @@ export function useSendMessage(
     setAbortFn,
     setInputError,
     addMessage,
-    appendToMessage,
     updateMessage,
     replaceMessageId,
     setStreamingMessageId,
@@ -50,6 +50,13 @@ export function useSendMessage(
 
   // Atomic guard — prevents double-send from rapid clicks / Enter
   const sendingRef = useRef(false);
+
+  // Coalescing hook for streaming content chunks — reduces store write frequency
+  const { append, flush, reset, content } = useCoalescedAppend();
+
+  // Ref to track the current streaming assistant message ID so the useEffect
+  // can update it even after the closure that created it has returned.
+  const assistantMessageIdRef = useRef<string | null>(null);
 
   /**
    * Core send primitive. Accepts content and a history snapshot directly so
@@ -143,12 +150,18 @@ export function useSendMessage(
       // below overwrites this if the server applied a fallback.
       updateMessage(assistantMessageId, { mode: effectiveMode });
 
+      // Reset coalescing buffer and track the assistant message ID for the stream.
+      // The useEffect syncs coalesced content → store via updateMessage.
+      reset();
+      flush();
+      assistantMessageIdRef.current = assistantMessageId;
+
       const abort = chatStream(
         chatMessages,
         {
           onMessage: (chunk) => {
             setCurrentStage(null);
-            appendToMessage(assistantMessageId, chunk);
+            append(chunk);
           },
           onSources: (sources) => {
             updateMessage(assistantMessageId, { sources });
@@ -184,6 +197,7 @@ export function useSendMessage(
             updateMessage(assistantMessageId, { unverifiableClaims: claims });
           },
           onError: (error) => {
+            flush();
             console.error("Chat stream error:", error);
             const isAbort =
               error.name === "AbortError" || /aborted|abort/i.test(error.message);
@@ -209,6 +223,7 @@ export function useSendMessage(
             sendingRef.current = false;
           },
           onComplete: async () => {
+            flush();
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
@@ -286,11 +301,13 @@ export function useSendMessage(
       setAbortFn,
       setInputError,
       addMessage,
-      appendToMessage,
       updateMessage,
       replaceMessageId,
       setStreamingMessageId,
       setCurrentStage,
+      append,
+      flush,
+      reset,
       activeVaultId,
       refreshHistory,
     ]
@@ -352,6 +369,16 @@ export function useSendMessage(
     },
     [setInput, setInputError]
   );
+
+  // Sync coalesced streaming content to the chat store.
+  // The coalescing hook batches rapid SSE chunks; this effect writes the
+  // accumulated content to the store via updateMessage (not appendToMessage)
+  // to avoid double-appending the accumulated content.
+  useEffect(() => {
+    const messageId = assistantMessageIdRef.current;
+    if (messageId === null) return;
+    updateMessage(messageId, { content });
+  }, [content, updateMessage]);
 
   return { handleSend, handleStop, handleKeyDown, handleInputChange, sendDirect, currentStage };
 }

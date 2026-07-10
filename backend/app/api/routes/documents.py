@@ -8,6 +8,7 @@ and managing document processing status.
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import mimetypes
 import os
@@ -398,6 +399,37 @@ class DeleteAllVaultResponse(BaseModel):
 
     deleted_count: int
     vault_id: int
+
+
+class ReindexRequest(BaseModel):
+    """Request model for triggering a document reindex job."""
+
+    vault_id: Optional[int] = None
+
+
+class ReindexResponse(BaseModel):
+    """Response model for a reindex job creation."""
+
+    job_id: int
+    status: str
+    vault_id: Optional[int] = None
+
+
+class ReindexJobStatusResponse(BaseModel):
+    """Response model for reindex job status."""
+
+    id: int
+    vault_id: Optional[int] = None
+    trigger_type: Optional[str] = None
+    trigger_id: Optional[str] = None
+    status: str
+    error: Optional[str] = None
+    result_json: Optional[str] = None
+    input_json: Optional[str] = None
+    retry_count: int = 0
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
 
 
 class FileEnrichmentToggleRequest(BaseModel):
@@ -1540,6 +1572,66 @@ async def scan_directories(
         logger.exception("Error during directory scan")
         raise HTTPException(status_code=500, detail=f"Scan failed: {e}")
     # Note: No finally block to stop processor - it runs continuously
+
+
+@router.post("/reindex", response_model=ReindexResponse)
+@limiter.limit(settings.admin_rate_limit)
+async def reindex_documents(
+    request: Request,
+    payload: ReindexRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(require_admin_role),
+    csrf_token: str = Depends(csrf_protect),
+    background_processor: BackgroundProcessor = Depends(get_background_processor),
+) -> ReindexResponse:
+    """Trigger a reindex job for documents, optionally scoped to a vault.
+
+    Creates a reindex job in the document_reindex_jobs table and returns
+    immediately with the job_id and status.
+    """
+    vault_id = payload.vault_id
+
+    def _create_job() -> int:
+        cur = conn.execute(
+            "INSERT INTO document_reindex_jobs (vault_id, trigger_type, trigger_id, status, input_json) VALUES (?, ?, ?, ?, ?)",
+            (vault_id, "api", str(user.get("id", "")), "pending", json.dumps({"vault_id": vault_id})),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    try:
+        job_id = await asyncio.to_thread(_create_job)
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create reindex job: {exc}")
+
+    if not background_processor.is_running:
+        await background_processor.start()
+    await background_processor.enqueue_reindex(job_id)
+
+    return ReindexResponse(job_id=job_id, status="pending", vault_id=vault_id)
+
+
+@router.get("/reindex/jobs/{job_id}", response_model=ReindexJobStatusResponse)
+async def get_reindex_job_status(
+    job_id: int,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(require_admin_role),
+) -> ReindexJobStatusResponse:
+    """Return the full status of a reindex job by ID."""
+
+    def _fetch_job():
+        row = conn.execute(
+            "SELECT id, vault_id, trigger_type, trigger_id, status, error, result_json, input_json, retry_count, created_at, started_at, completed_at FROM document_reindex_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        return row
+
+    row = await asyncio.to_thread(_fetch_job)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Reindex job not found")
+
+    row_dict = dict(row)
+    return ReindexJobStatusResponse(**row_dict)
 
 
 def _unlink_document_file(stored_path: str, vault_id: int) -> None:

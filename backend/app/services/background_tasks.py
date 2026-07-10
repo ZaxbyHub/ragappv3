@@ -6,6 +6,7 @@ documents with retry logic and graceful shutdown.
 """
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -145,6 +146,17 @@ class EnrichmentTaskItem:
     attempt: int = 0
 
 
+@dataclass
+class ReindexTaskItem:
+    """Reindex job task item.
+
+    Attributes:
+        job_id: Database ID of the reindex job.
+    """
+
+    job_id: int
+
+
 class BackgroundProcessor:
     """
     Background task processor using asyncio.Queue for document ingestion.
@@ -198,6 +210,7 @@ class BackgroundProcessor:
         self.retry_delay = retry_delay
         self.queue: asyncio.Queue[TaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
         self.enrichment_queue: asyncio.Queue[EnrichmentTaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
+        self.reindex_queue: asyncio.Queue[ReindexTaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
         self.shutdown_event = asyncio.Event()
         self.processor = DocumentProcessor(
             chunk_size_chars=chunk_size_chars,
@@ -210,6 +223,7 @@ class BackgroundProcessor:
         self._worker_tasks: List[asyncio.Task] = []
         self._enrichment_worker_task: Optional[asyncio.Task] = None
         self._vector_delete_sweep_task: Optional[asyncio.Task] = None
+        self._reindex_worker_task: Optional[asyncio.Task] = None
         self._running = False
         self.maintenance_service = maintenance_service
         self._write_semaphore: Optional[asyncio.Semaphore] = None
@@ -265,6 +279,7 @@ class BackgroundProcessor:
         self._enrichment_worker_task = asyncio.create_task(
             self._enrichment_worker_loop(), name="enrichment-worker"
         )
+        self._reindex_worker_task = asyncio.create_task(self._reindex_worker_loop(), name="reindex-worker")
 
         # Step 3: NOW run recovery. Workers are ready to consume.
         await self._recover_stranded_pending_rows()
@@ -579,6 +594,9 @@ class BackgroundProcessor:
         if self._vector_delete_sweep_task:
             self._vector_delete_sweep_task.cancel()
             await asyncio.gather(self._vector_delete_sweep_task, return_exceptions=True)
+        if self._reindex_worker_task:
+            self._reindex_worker_task.cancel()
+            await asyncio.gather(self._reindex_worker_task, return_exceptions=True)
 
         # Phase 3: Flush optimize on VectorStore if available
         if hasattr(self.processor, 'vector_store') and self.processor.vector_store is not None:
@@ -639,6 +657,11 @@ class BackgroundProcessor:
         """Add a post-index enrichment job to the enrichment queue."""
         await self.enrichment_queue.put(item)
         logger.debug("Enqueued enrichment for file_id=%s", item.file_id)
+
+    async def enqueue_reindex(self, job_id: int) -> None:
+        """Add a reindex job to the reindex queue."""
+        await self.reindex_queue.put(ReindexTaskItem(job_id=job_id))
+        logger.debug("Enqueued reindex job: %s", job_id)
 
     async def _worker_loop(self) -> None:
         """
@@ -731,6 +754,195 @@ class BackgroundProcessor:
                     )
             finally:
                 self.enrichment_queue.task_done()
+
+    async def _reindex_worker_loop(self) -> None:
+        """Process reindex jobs from the reindex queue."""
+        while True:
+            if self.shutdown_event.is_set() and self.reindex_queue.empty():
+                break
+            try:
+                item = await asyncio.wait_for(self.reindex_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                await self._process_reindex_job(item.job_id)
+            finally:
+                self.reindex_queue.task_done()
+
+    async def _process_reindex_job(self, job_id: int) -> None:
+        """Process a reindex job: re-embed all stored documents with the current model.
+
+        Steps:
+        1. Mark job as 'running'.
+        2. Read vault_id / input_json from the job row.
+        3. Select files with status IN ('indexed', 'error'), optionally filtered by vault_id.
+        4. Group by vault_id and iterate in sorted order.
+        5. For each file call process_existing_file (current model), counting successes/failures.
+        6. On any file failure: continue to next file (partial-failure strategy).
+        7. Mark job 'completed' on full success, 'failed' if any file failed.
+        8. Leave settings_kv and vector_store._ready unchanged (Task 1.7).
+        """
+        logger.info("Starting reindex job %d", job_id)
+        if self.processor is None or self.processor.pool is None:
+            logger.warning("Processor or pool unavailable for reindex job %d; skipping.", job_id)
+            return
+
+        try:
+            # Step 1: Mark as running (only pending jobs can transition)
+            with self.processor.pool.connection() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE document_reindex_jobs
+                    SET status = 'running', started_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = 'pending'
+                    """,
+                    (job_id,),
+                )
+                conn.commit()
+                if cursor.rowcount == 0:
+                    logger.warning("Reindex job %d not found or not in pending state; skipping.", job_id)
+                    return
+            logger.info("Reindex job %d status updated to running.", job_id)
+
+            # Step 2: Read vault_id and input_json from the job row
+            with self.processor.pool.connection() as conn:
+                row = conn.execute(
+                    "SELECT vault_id, input_json FROM document_reindex_jobs WHERE id = ? AND status = 'running'",
+                    (job_id,),
+                ).fetchone()
+                if not row:
+                    logger.warning("Reindex job %d not found or not running; skipping.", job_id)
+                    return
+                vault_id = row["vault_id"] if hasattr(row, "keys") else row[0]
+
+            # Step 3: Select files to reindex
+            with self.processor.pool.connection() as conn:
+                if vault_id is not None:
+                    rows = conn.execute(
+                        "SELECT id, file_path, vault_id FROM files WHERE vault_id = ? AND status IN ('indexed', 'error')",
+                        (vault_id,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, file_path, vault_id FROM files WHERE status IN ('indexed', 'error')",
+                    ).fetchall()
+
+            # Step 4: Group by vault_id
+            vaults_files: dict[int, list[tuple[int, str, int]]] = {}
+            for row in rows:
+                fid = row["id"] if hasattr(row, "keys") else row[0]
+                fpath = row["file_path"] if hasattr(row, "keys") else row[1]
+                vid = row["vault_id"] if hasattr(row, "keys") else row[2]
+                vaults_files.setdefault(vid, []).append((fid, fpath, vid))
+
+            # Step 5: Initialize counters
+            total_files = 0
+            processed_files = 0
+            failed_files = 0
+            failed_details: list[str] = []
+
+            for vault_id_sorted in sorted(vaults_files.keys()):
+                file_list = vaults_files[vault_id_sorted]
+                for file_id, file_path, vault_id_file in file_list:
+                    total_files += 1
+                    logger.info("Re-embedding file_id=%d in vault_id=%d", file_id, vault_id_file)
+                    try:
+                        await self.processor.process_existing_file(file_id, file_path, vault_id_file)
+                        processed_files += 1
+                    except (
+                        DocumentProcessingError,
+                        FileNotFoundError,
+                        OSError,
+                        RuntimeError,
+                        Exception,
+                    ) as exc:
+                        logger.exception(
+                            "Re-embed failed for file_id=%d in vault_id=%d: %s",
+                            file_id,
+                            vault_id_file,
+                            exc,
+                        )
+                        failed_files += 1
+                        failed_details.append(f"file_id={file_id}: {exc}")
+                        continue
+
+            # Step 6: Determine final job status and result
+            if total_files == 0:
+                result = {"processed": 0, "failed": 0}
+                with self.processor.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE document_reindex_jobs SET status = 'completed', result_json = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (json.dumps(result), job_id),
+                    )
+                    conn.commit()
+                logger.info("Reindex job %d completed (no files to reindex).", job_id)
+            elif failed_files > 0:
+                result = {"processed": processed_files, "failed": failed_files, "details": failed_details[:10]}
+                with self.processor.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE document_reindex_jobs SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (json.dumps(result), job_id),
+                    )
+                    conn.commit()
+                logger.error(
+                    "Reindex job %d failed for %d/%d files; stored model identity left unchanged.",
+                    job_id,
+                    failed_files,
+                    total_files,
+                )
+            else:
+                # Step 7a: Update stored model identity and readiness BEFORE marking completed.
+                # If this fails, mark the job as failed so the app is not left in a mismatched
+                # state on restart (metadata not persisted but job reported as completed).
+                try:
+                    vector_store = self.processor.vector_store
+                    if vector_store is not None:
+                        await vector_store.record_embedding_metadata(settings.embedding_dim, raise_on_error=True)
+                        await vector_store.mark_ready(True)
+                        logger.info(
+                            "Vector store model identity updated and marked ready after reindex job %d.",
+                            job_id,
+                        )
+                    else:
+                        logger.warning("Vector store unavailable; cannot update model identity after reindex job %d.", job_id)
+                except Exception as exc:
+                    logger.exception("Failed to update vector store model identity after reindex job %d", job_id)
+                    try:
+                        with self.processor.pool.connection() as conn:
+                            conn.execute(
+                                "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
+                                (datetime.now(UTC).isoformat(), str(exc), job_id),
+                            )
+                            conn.commit()
+                    except Exception:
+                        logger.warning("Failed to update reindex job %d status to failed", job_id)
+                    return
+
+                # Step 7b: Only mark completed after metadata and readiness updates succeeded.
+                result = {"processed": processed_files, "failed": 0}
+                with self.processor.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE document_reindex_jobs SET status = 'completed', result_json = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (json.dumps(result), job_id),
+                    )
+                    conn.commit()
+                logger.info(
+                    "Reindex job %d completed successfully for %d files.",
+                    job_id,
+                    processed_files,
+                )
+
+        except Exception as exc:
+            logger.exception("Error processing reindex job %d", job_id)
+            try:
+                with self.processor.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
+                        (datetime.now(UTC).isoformat(), str(exc), job_id),
+                    )
+                    conn.commit()
+            except Exception:
+                logger.warning("Failed to update reindex job %d status to failed", job_id)
 
     async def _process_task_wrapper(self, task: TaskItem) -> None:
         """
