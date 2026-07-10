@@ -25,3 +25,5 @@ argon2-cffi>=21.3.0
 rapidfuzz>=3.0.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
+lancedb>=0.34.0
+pyarrow>=14.0.0
