@@ -6,4 +6,4 @@ transformers==5.13.0
 tokenizers==0.23.1
 sentencepiece==0.2.1
 FlagEmbedding==1.4.0
-numpy==1.26.4
+numpy==2.5.1
