@@ -95,62 +95,68 @@ except ImportError:
     sys.modules["lancedb.index"] = _lancedb.index
     sys.modules["lancedb.expr"] = _lancedb.expr
 
-# Stub pyarrow only when the real package is unavailable. Replacing a real
-# pyarrow install with an attribute-less stub breaks `import pandas`, because
-# pandas.compat.pyarrow reads `pyarrow.__version__` during its own import.
-# pandas._libs.lib also sets PYARROW_INSTALLED=True and caches pa=this stub,
-# so pa.Array must exist as a class whose isinstance() always returns False.
-try:
-    import pyarrow  # noqa: F401
-except ImportError:
-    class _PyArrowStubMeta(type):
-        def __instancecheck__(cls, instance):
-            return False
+# Stub pyarrow to a rich, test-safe implementation. CI installs the real package,
+# but many test files fall back to an attribute-less `types.ModuleType("pyarrow")`
+# when pyarrow is unavailable, which overrides any real/stub pyarrow already in
+# `sys.modules` and breaks tests that call `pa.schema(...)` or use pa type helpers.
+# Always installing this expanded stub (with explicit schema/type helpers and a
+# `__getattr__` fallback) keeps the test environment consistent in both local and
+# CI runs.
+class _PyArrowStubMeta(type):
+    def __instancecheck__(cls, instance):
+        return False
 
-    class _PyArrowType:
-        def __init__(self, name, value_type=None, list_size=None):
-            self.name = name
-            self.value_type = value_type
-            self.list_size = list_size
+class _PyArrowType:
+    def __init__(self, name, value_type=None, list_size=None):
+        self.name = name
+        self.value_type = value_type
+        self.list_size = list_size
 
-    class _PyArrowField:
-        def __init__(self, name, type_, nullable=True):
-            self.name = name
-            self.type = type_
-            self.nullable = nullable
+class _PyArrowField:
+    def __init__(self, name, type_, nullable=True):
+        self.name = name
+        self.type = type_
+        self.nullable = nullable
 
-    class _PyArrowSchema:
-        def __init__(self, fields, metadata=None):
-            self._fields = list(fields)
-            self.metadata = metadata or {}
+class _PyArrowSchema:
+    def __init__(self, fields, metadata=None):
+        self._fields = list(fields)
+        self.metadata = metadata or {}
 
-        def __len__(self):
-            return len(self._fields)
+    def __len__(self):
+        return len(self._fields)
 
-        def field(self, i_or_name):
-            if isinstance(i_or_name, str):
-                for f in self._fields:
-                    if f.name == i_or_name:
-                        return f
-                raise KeyError(i_or_name)
-            return self._fields[i_or_name]
+    def field(self, i_or_name):
+        if isinstance(i_or_name, str):
+            for f in self._fields:
+                if f.name == i_or_name:
+                    return f
+            raise KeyError(i_or_name)
+        return self._fields[i_or_name]
 
-        def names(self):
-            return [f.name for f in self._fields]
+    def names(self):
+        return [f.name for f in self._fields]
 
-    _pa_stub_cls = _PyArrowStubMeta("_PyArrowStub", (), {})
-    _pa_stub = types.ModuleType("pyarrow")
-    _pa_stub.__version__ = "0.0.0"
-    _pa_stub.Array = _pa_stub_cls
-    _pa_stub.ChunkedArray = _pa_stub_cls
-    _pa_stub.schema = lambda fields, metadata=None: _PyArrowSchema(fields, metadata)
-    _pa_stub.field = lambda name, type_, nullable=True: _PyArrowField(name, type_, nullable)
-    _pa_stub.string = lambda: _PyArrowType("string")
-    _pa_stub.int32 = lambda: _PyArrowType("int32")
-    _pa_stub.float32 = lambda: _PyArrowType("float32")
-    _pa_stub.list_ = lambda value_type, list_size=None: _PyArrowType("list", value_type, list_size)
-    _pa_stub.binary = lambda: _PyArrowType("binary")
-    sys.modules["pyarrow"] = _pa_stub
+class _PyArrowModule(types.ModuleType):
+    def __init__(self, name):
+        super().__init__(name)
+        self.__version__ = "0.0.0"
+        self._stub_cls = _PyArrowStubMeta("_PyArrowStub", (), {})
+        self.Array = self._stub_cls
+        self.ChunkedArray = self._stub_cls
+        self.schema = lambda fields, metadata=None: _PyArrowSchema(fields, metadata)
+        self.field = lambda name, type_, nullable=True: _PyArrowField(name, type_, nullable)
+        self.string = lambda: _PyArrowType("string")
+        self.int32 = lambda: _PyArrowType("int32")
+        self.float32 = lambda: _PyArrowType("float32")
+        self.list_ = lambda value_type, list_size=None: _PyArrowType("list", value_type, list_size)
+        self.binary = lambda: _PyArrowType("binary")
+
+    def __getattr__(self, name):
+        return self._stub_cls
+
+_pa_stub = _PyArrowModule("pyarrow")
+sys.modules["pyarrow"] = _pa_stub
 
 # Stub numpy when not installed. vector_store.py imports numpy at the top level;
 # tests that only exercise pure-Python logic (e.g. RAGEngine._raw_rag_required)
