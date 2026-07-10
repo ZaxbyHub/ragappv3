@@ -1,6 +1,8 @@
 # Runtime deps for CI — excludes packages stubbed by conftest.py
-# (lancedb, pyarrow, unstructured[all-docs] are stubbed at test time and
-#  excluded here to avoid multi-GB installs and system-library requirements)
+# (lancedb and unstructured[all-docs] are stubbed at test time and
+#  excluded here to avoid multi-GB installs and system-library requirements).
+# pyarrow is installed for real because the stubs are insufficient for
+# schema-dependent tests.
 fastapi>=0.139.0
 uvicorn[standard]>=0.50.0
 python-multipart>=0.0.32
@@ -25,5 +27,4 @@ argon2-cffi>=21.3.0
 rapidfuzz>=3.0.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
-lancedb>=0.34.0
 pyarrow>=14.0.0
