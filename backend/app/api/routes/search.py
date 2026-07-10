@@ -20,6 +20,7 @@ from app.api.deps import (
     get_embedding_service,
     get_evaluate_policy,
     get_vector_store,
+    require_model_ready,
 )
 from app.config import settings
 from app.limiter import limiter
@@ -115,6 +116,7 @@ async def search(
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     vector_store: VectorStore = Depends(get_vector_store),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _=Depends(require_model_ready),
 ):
     """
     Semantic search endpoint for document chunks.
@@ -220,6 +222,7 @@ async def get_chunk_context(
     db: sqlite3.Connection = Depends(get_db),
     vector_store: VectorStore = Depends(get_vector_store),
     evaluate: Callable = Depends(get_evaluate_policy),
+    _=Depends(require_model_ready),
 ):
     """
     Fetch a retrieved chunk plus stored parent-window context for lazy previews.

@@ -30,6 +30,9 @@ def _make_client(*, allow: bool, mock_user: dict = None) -> tuple[TestClient, Ma
     app = FastAPI()
     app.include_router(router, prefix="/api")
 
+    app.state.vector_store = MagicMock()
+    app.state.vector_store._ready = True
+
     if mock_user is None:
         mock_user = {"id": 1, "username": "testuser", "role": "member"}
     app.dependency_overrides[get_current_active_user] = lambda: mock_user

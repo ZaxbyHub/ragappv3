@@ -14,7 +14,12 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.api.deps import evaluate_policy, get_current_active_user, get_db
+from app.api.deps import (
+    evaluate_policy,
+    get_current_active_user,
+    get_db,
+    require_model_ready,
+)
 from app.config import settings
 from app.security import csrf_protect
 from app.services.kms_store import KMSStore
@@ -220,6 +225,7 @@ async def search_kms(
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     _: None = Depends(require_kms_enabled),
+    _model_ready: None = Depends(require_model_ready),
 ):
     await _require_vault_read(user, vault_id)
     store = KMSStore(db)

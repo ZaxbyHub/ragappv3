@@ -35,7 +35,10 @@ sys.modules["unstructured"] = _unstructured_stub
 sys.modules["unstructured.partition"] = _unstructured_stub.partition
 sys.modules["unstructured.partition.auto"] = _unstructured_stub.partition.auto
 
+import pytest
 from fastapi.testclient import TestClient
+
+pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
 
 @dataclass

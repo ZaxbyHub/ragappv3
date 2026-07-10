@@ -211,93 +211,16 @@ class TestFusionEvaluatorWiring(unittest.TestCase):
         self.assertNotIn("CONFIDENT by design", source)
 
 
-class TestVectorStoreModelIdValidation(unittest.IsolatedAsyncioTestCase):
-    """F2-2: validate_schema raises on a same-dimension-but-different-model
-    mismatch when stored metadata is present."""
-
-    async def test_validate_schema_raises_on_model_mismatch(self):
-        from app.services.vector_store import VectorStore, VectorStoreValidationError
-
-        vs = VectorStore.__new__(VectorStore)  # bypass __init__
-        vs.table = MagicMock()
-        # Schema with a matching dimension so the dimension check passes, but
-        # the model-id check must fire.
-        mock_field = MagicMock()
-        mock_field.type.list_size = 128
-        mock_schema = MagicMock()
-        mock_schema.field.return_value = mock_field
-        mock_schema.metadata = None
-        vs.table.schema = AsyncMock(return_value=mock_schema)
-
-        # Stored metadata reports a DIFFERENT prefix hash than the current model.
-        async def _fake_get_stored_metadata():
-            return {"embedding_prefix_hash": "differenthash12345", "embedding_model_id": "old-model"}
-
-        vs.get_stored_metadata = _fake_get_stored_metadata
-        vs.db = MagicMock()
-        vs.db.table_names = AsyncMock(return_value=["chunks"])
-
-        with self.assertRaises(VectorStoreValidationError) as cm:
-            await vs.validate_schema("new-model", 128)
-        self.assertIn("reindex required", str(cm.exception))
-
-    async def test_validate_schema_passes_when_no_metadata(self):
-        # No stored metadata → no model-id comparison → no false positive.
-        from app.services.vector_store import VectorStore
-
-        vs = VectorStore.__new__(VectorStore)
-        vs.table = MagicMock()
-        mock_field = MagicMock()
-        mock_field.type.list_size = 128
-        mock_schema = MagicMock()
-        mock_schema.field.return_value = mock_field
-        mock_schema.metadata = None
-        vs.table.schema = AsyncMock(return_value=mock_schema)
-
-        async def _fake_get_stored_metadata():
-            return None
-
-        vs.get_stored_metadata = _fake_get_stored_metadata
-        vs.db = MagicMock()
-        vs.db.table_names = AsyncMock(return_value=["chunks"])
-
-        result = await vs.validate_schema("any-model", 128)
-        self.assertNotIn("reindex", str(result))
-
-    async def test_validate_schema_warns_when_existing_table_has_no_stored_hash(self):
-        """A table that predates the F2-2 check (stored_metadata present but
-        with no embedding_prefix_hash key — the real shape of a table
-        upgraded from before this validation existed) cannot be verified
-        against the current embedding model. This must not silently pass
-        with zero signal to the operator; it must log a loud warning."""
-        from app.services.vector_store import VectorStore
-
-        vs = VectorStore.__new__(VectorStore)
-        vs.table = MagicMock()
-        mock_field = MagicMock()
-        mock_field.type.list_size = 128
-        mock_schema = MagicMock()
-        mock_schema.field.return_value = mock_field
-        mock_schema.metadata = None
-        vs.table.schema = AsyncMock(return_value=mock_schema)
-
-        # Metadata exists (table has been through validate_schema before)
-        # but has no embedding_prefix_hash — the exact shape produced by a
-        # table that was created before the F2-2 hash was introduced.
-        async def _fake_get_stored_metadata():
-            return {"embedding_model_id": "old-model"}
-
-        vs.get_stored_metadata = _fake_get_stored_metadata
-        vs.db = MagicMock()
-        vs.db.table_names = AsyncMock(return_value=["chunks"])
-
-        with self.assertLogs("app.services.vector_store", level="WARNING") as cm:
-            await vs.validate_schema("new-model", 128)
-
-        self.assertTrue(
-            any("embedding_prefix_hash" in msg for msg in cm.output),
-            f"expected a warning about the missing stored hash, got: {cm.output}",
-        )
+# NOTE: TestVectorStoreModelIdValidation (F2-2, the LanceDB-schema-metadata-
+# based raise-on-mismatch design from PR #352) was removed here. PR #353
+# (issue #220) replaced validate_schema's model-identity check with a SQLite
+# settings_kv sidecar that persists correctly across restarts and existing
+# tables (LanceDB cannot update metadata on an already-created table, which
+# the old design could only paper over with a warning). validate_schema no
+# longer raises VectorStoreValidationError on a mismatch; it returns a
+# ready/mismatch status dict instead. See test_embedding_model_versioning.py
+# (TestValidateSchemaMismatch, TestRequireModelReady503) for coverage of the
+# merged behavior.
 
 
 if __name__ == "__main__":

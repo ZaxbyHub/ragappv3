@@ -19,7 +19,7 @@ class AsyncMock(MagicMock):
 
 
 # =============================================================================
-# Group 1: TestAsyncHasParentWindow [2.1] — async has_parent_window_text_sample
+# Group 1: TestAsyncHasParentWindow [2.1] â€” async has_parent_window_text_sample
 # =============================================================================
 
 class TestAsyncHasParentWindow:
@@ -118,7 +118,7 @@ class TestAsyncHasParentWindow:
 
 
 # =============================================================================
-# Group 2: TestLifespanStartup [2.2] — lifespan await fixes
+# Group 2: TestLifespanStartup [2.2] â€” lifespan await fixes
 # =============================================================================
 
 class TestLifespanStartup:
@@ -179,7 +179,7 @@ class TestLifespanStartup:
 
 
 # =============================================================================
-# Group 3: TestStrandedProcessingRecovery [2.3] — row recovery
+# Group 3: TestStrandedProcessingRecovery [2.3] â€” row recovery
 # =============================================================================
 
 class TestStrandedProcessingRecovery:
@@ -243,7 +243,7 @@ class TestStrandedProcessingRecovery:
 
 
 # =============================================================================
-# Group 4: TestValidateSchemaAsync — validate_schema async behavior
+# Group 4: TestValidateSchemaAsync â€” validate_schema async behavior
 # =============================================================================
 
 class TestValidateSchemaAsync:
@@ -260,9 +260,9 @@ class TestValidateSchemaAsync:
         assert inspect.iscoroutinefunction(vs.validate_schema)
 
     @pytest.mark.asyncio
-    async def test_validate_schema_dimension_mismatch_raises(self):
-        """validate_schema raises VectorStoreValidationError on dimension mismatch."""
-        from app.services.vector_store import VectorStore, VectorStoreValidationError
+    async def test_validate_schema_dimension_mismatch_detected(self):
+        """validate_schema returns mismatch=True and ready=False on dimension mismatch."""
+        from app.services.vector_store import VectorStore
 
         vs = VectorStore()
         vs.db = AsyncMock()
@@ -272,16 +272,20 @@ class TestValidateSchemaAsync:
             field=MagicMock(return_value=MagicMock(type=MagicMock(list_size=512)))  # Stored dim
         ))
 
-        with patch.object(vs, 'get_stored_metadata', new_callable=AsyncMock, return_value=None):
+        with patch.object(vs, 'get_embedding_metadata', new_callable=AsyncMock, return_value={
+            "embedding_model_id": "test-model",
+            "embedding_dim": 512,
+        }):
             with patch.object(vs, '_generate_probe_embedding', return_value=[0.0] * 1024):
-                with pytest.raises(VectorStoreValidationError) as exc_info:
-                    await vs.validate_schema("test-model", 1024)  # Expected dim
+                result = await vs.validate_schema("test-model", 1024)  # Expected dim
 
-                assert "Embedding dimension changed" in str(exc_info.value)
+        assert result["mismatch"] is True
+        assert "embedding_dim" in result["mismatch_details"]
+        assert result["ready"] is False
 
 
 # =============================================================================
-# Group 5: TestProcessorStartStop — processor lifecycle
+# Group 5: TestProcessorStartStop â€” processor lifecycle
 # =============================================================================
 
 class TestProcessorStartStop:

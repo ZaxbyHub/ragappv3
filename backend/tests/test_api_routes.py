@@ -60,10 +60,13 @@ except ImportError:
     sys.modules["unstructured.documents"] = _unstructured.documents
     sys.modules["unstructured.documents.elements"] = _unstructured.documents.elements
 
+import pytest
 from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_llm_health_checker, get_model_checker
+
+pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
 # Create a temporary database for testing
 TEST_DB_PATH = None

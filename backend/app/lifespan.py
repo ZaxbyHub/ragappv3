@@ -448,15 +448,23 @@ async def lifespan(app: FastAPI):
             embedding_model_id, embedding_dim
         )
         logger.info(f"Vector store schema validation completed: {validation_result}")
+        if not app.state.vector_store._ready:
+            logger.warning("=" * 60)
+            logger.warning("VECTOR STORE MODEL MISMATCH")
+            logger.warning("=" * 60)
+            logger.warning("The configured embedding model does not match the identity stored for the existing index.")
+            logger.warning("Vector-query endpoints will return HTTP 503 until a reindex is completed.")
+            if validation_result and isinstance(validation_result, dict):
+                logger.warning("Validation result: %s", validation_result)
+            logger.warning("=" * 60)
     except VectorStoreError as e:
         logger.error("=" * 60)
         logger.error("VECTOR STORE SCHEMA VALIDATION FAILED")
         logger.error("=" * 60)
-        logger.error(f"Error: {e}")
-        logger.error("The embedding dimension has changed. A full reindex is required.")
-        logger.error("Please run the reindex process or delete the LanceDB database.")
+        logger.error("Error: %s", e)
+        logger.error("Vector store validation encountered an unexpected error.")
         logger.error("=" * 60)
-        # Continue startup but warn that reindex is needed
+        # Continue startup; the vector store will remain unavailable for vector queries.
     # Parent-window retrieval startup check: if the operator has enabled
     # parent_retrieval but the on-disk chunks were ingested before the
     # parent_window_text was being persisted, the feature degrades to

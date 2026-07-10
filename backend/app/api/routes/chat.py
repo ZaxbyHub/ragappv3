@@ -25,6 +25,7 @@ from app.api.deps import (
     get_evaluate_policy,
     get_rag_engine,
     get_user_accessible_vault_ids,
+    require_model_ready,
 )
 from app.config import settings
 from app.limiter import limiter
@@ -609,6 +610,7 @@ async def chat(
     user: dict = Depends(get_current_active_user),
     evaluate=Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
+    _=Depends(require_model_ready),
 ):
     """
     Chat endpoint for RAG-based conversational interface.
@@ -680,6 +682,7 @@ async def chat_stream(
     user: dict = Depends(get_current_active_user),
     evaluate=Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
+    _=Depends(require_model_ready),
 ):
     """Streaming chat endpoint that accepts a sequence of chat messages."""
     if not body.messages:

@@ -17,9 +17,12 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
 from test_kms_routes import KMSFixTestBase
 
 from app.services.kms_store import KMSStore
+
+pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
 
 class KMSCrudBase(KMSFixTestBase):

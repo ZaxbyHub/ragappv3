@@ -33,6 +33,7 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
         "worker-0",
         "worker-1",
         "enrichment-worker",
+        "reindex-worker",
         "vector-delete-sweep",
     ]
 

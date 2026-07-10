@@ -14,6 +14,8 @@ import sys
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 try:
@@ -71,6 +73,8 @@ from app.api.routes.chat import (
     stream_chat_response,
 )
 from app.main import app
+
+pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
 
 class TestRequireVaultWiring(unittest.TestCase):
