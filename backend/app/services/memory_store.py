@@ -21,14 +21,16 @@ persisted and indexed lexically. A later background pass (or a fresh
 import asyncio
 import json
 import logging
-import math
 import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
+import numpy as np
+
 from app.config import settings
 from app.models.database import SQLiteConnectionPool
+from app.services.store_utils import cosine_similarity as _cosine_similarity_shared
 from app.utils.fusion import rrf_fuse
 from app.utils.retry import with_retry
 
@@ -73,21 +75,32 @@ class MemoryRecord:
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     """Cosine similarity between two equal-length float vectors.
 
-    Returns 0.0 for length mismatch or zero vectors so callers don't have
-    to special-case those edge conditions.
+    Delegates to the shared helper (store_utils.cosine_similarity) so the
+    implementation is not duplicated across memory_store/context_distiller/
+    chunking (F3-5).
     """
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return dot / (math.sqrt(na) * math.sqrt(nb))
+    return _cosine_similarity_shared(a, b)
+
+
+def _numpy_cosine_to_rows(query_vec: "np.ndarray", mat: "np.ndarray") -> "np.ndarray":
+    """Vectorized cosine similarity of ``query_vec`` against each row of ``mat``.
+
+    ``mat`` is assumed homogeneous (the caller drops dimension-mismatched rows
+    before assembling it), since np.asarray(..., dtype=float64) raises on a
+    ragged list. Zero-norm rows yield 0.0 (matching the shared scalar helper's
+    zero-vector guard).
+    """
+    if mat.ndim != 2 or mat.shape[0] == 0:
+        return np.zeros(mat.shape[0] if mat.ndim == 2 else 0)
+    query_norm = np.linalg.norm(query_vec)
+    row_norms = np.linalg.norm(mat, axis=1)
+    if query_norm == 0.0:
+        return np.zeros(mat.shape[0])
+    # Avoid division by zero for zero-norm rows.
+    safe_norms = np.where(row_norms == 0.0, 1.0, row_norms)
+    sims = (mat @ query_vec) / (safe_norms * query_norm)
+    sims[row_norms == 0.0] = 0.0
+    return sims
 
 
 class MemoryStore:
@@ -291,13 +304,30 @@ class MemoryStore:
 
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
-            for memory_id, content in batch:
-                try:
-                    await self.embed_and_store(memory_id, content)
-                    summary["processed"] += 1
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Backfill failed for memory %d: %s", memory_id, exc)
+            # Gather embed_and_store coroutines concurrently within each batch
+            # (E2-4): the previous sequential await issued one embedding HTTP
+            # round-trip at a time. Bound concurrency with a Semaphore reusing
+            # the embedding batch limit; return_exceptions preserves per-memory
+            # error handling.
+            sem = asyncio.Semaphore(
+                max(1, getattr(settings, "embedding_concurrent_batches", 4))
+            )
+
+            async def _embed_one(mid: int, text: str) -> bool:
+                async with sem:
+                    await self.embed_and_store(mid, text)
+                    return True
+
+            results = await asyncio.gather(
+                *(_embed_one(memory_id, content) for memory_id, content in batch),
+                return_exceptions=True,
+            )
+            for (memory_id, _content), res in zip(batch, results):
+                if isinstance(res, Exception):
+                    logger.warning("Backfill failed for memory %d: %s", memory_id, res)
                     summary["failed"] += 1
+                else:
+                    summary["processed"] += 1
 
             logger.info(
                 "Memory embedding backfill progress: %d/%d done",
@@ -314,7 +344,6 @@ class MemoryStore:
         )
         return summary
 
-    @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
     def add_memory(
         self,
         content: str,
@@ -332,14 +361,23 @@ class MemoryStore:
         INSERT INTO memories (content, category, tags, source, vault_id, importance, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """
-        conn = self.pool.get_connection()
-        try:
+
+        @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
+        def _insert_and_commit(conn):
             cursor = conn.execute(
                 sql,
                 (content, category, tags, source, vault_id, importance, expires_at),
             )
             conn.commit()
-            memory_id = cursor.lastrowid
+            return cursor.lastrowid
+
+        conn = self.pool.get_connection()
+        try:
+            # Only the INSERT+commit is retried (A5-1): the post-commit
+            # SELECT-back below is NOT inside @with_retry, so a sqlite3.Error
+            # on the read cannot re-run the already-committed INSERT and
+            # create a duplicate row + FTS entry.
+            memory_id = _insert_and_commit(conn)
             if memory_id is None:
                 raise MemoryStoreError("Failed to insert memory")
             # Fetch created_at, updated_at, and vault_id for the inserted row
@@ -576,34 +614,56 @@ class MemoryStore:
         finally:
             self.pool.release_connection(conn)
 
-        scored: List[MemoryRecord] = []
+        # Vectorize the cosine scan with numpy (E1-2): the previous per-row
+        # pure-Python scalar loop over up to memory_dense_max_candidates rows
+        # ran on every RAG query. Parse vectors, drop malformed/missing ones,
+        # then compute all similarities in a single matrix operation.
+        min_sim = settings.memory_dense_min_similarity if settings.memory_relevance_filter_enabled else 0.0
+        _expected_dim = len(query_embedding)
+        candidate_rows = []
+        candidate_vecs = []
         for row in rows:
             try:
                 vec = json.loads(row[10]) if row[10] else None
             except (TypeError, json.JSONDecodeError):
                 vec = None
-            if not isinstance(vec, list):
+            if not isinstance(vec, list) or not vec:
                 continue
-            sim = _cosine_similarity(query_embedding, vec)
-            min_sim = settings.memory_dense_min_similarity if settings.memory_relevance_filter_enabled else 0.0
-            if sim <= min_sim:
+            # Drop dimension-mismatched vectors BEFORE assembling the matrix:
+            # np.asarray(..., dtype=float64) would raise on a ragged list, and
+            # a length-mismatched vector yields 0.0 similarity anyway (strict
+            # length guard). Filtering here keeps the batch homogeneous and
+            # restores the pre-vectorization graceful handling of a stale/odd
+            # row (e.g. after an embedding-model migration).
+            if len(vec) != _expected_dim:
                 continue
-            scored.append(
-                MemoryRecord(
-                    id=row[0],
-                    content=row[1],
-                    category=row[2],
-                    tags=row[3],
-                    source=row[4],
-                    vault_id=row[5],
-                    importance=float(row[6] or 0.5),
-                    expires_at=row[7],
-                    created_at=row[8],
-                    updated_at=row[9],
-                    score=sim,
-                    score_type="dense",
+            candidate_rows.append(row)
+            candidate_vecs.append(vec)
+
+        scored: List[MemoryRecord] = []
+        if candidate_rows:
+            query_vec = np.asarray(query_embedding, dtype=np.float64)
+            mat = np.asarray(candidate_vecs, dtype=np.float64)
+            sims = _numpy_cosine_to_rows(query_vec, mat)
+            for row, sim in zip(candidate_rows, sims):
+                if sim <= min_sim:
+                    continue
+                scored.append(
+                    MemoryRecord(
+                        id=row[0],
+                        content=row[1],
+                        category=row[2],
+                        tags=row[3],
+                        source=row[4],
+                        vault_id=row[5],
+                        importance=float(row[6] or 0.5),
+                        expires_at=row[7],
+                        created_at=row[8],
+                        updated_at=row[9],
+                        score=float(sim),
+                        score_type="dense",
+                    )
                 )
-            )
         scored.sort(key=lambda r: (r.score or 0.0), reverse=True)
         return scored[:limit]
 
@@ -695,10 +755,25 @@ class MemoryStore:
         if not text or not text.strip():
             return None
 
-        # Heuristic: if the message is clearly *quoting* or *describing*
-        # external content that contains a "note that" prefix, suppress
-        # capture. We require both a quote-guard hit AND a colon/quote
-        # nearby to keep the guard tight.
+        # Heuristic quote-guard (A5-2): suppress capture when the text is
+        # *quoting* or *describing* external content that contains a memory
+        # directive. Two signals:
+        #   (a) Quotation punctuation near a quote-guard phrase
+        #       (colon/quote chars) — the original guard, kept.
+        #   (b) An attribution-verb-+"that" construction immediately preceding
+        #       the directive (e.g. "the report notes that, remember to…",
+        #       "the document says that note that…"). This is the specific
+        #       quoting-content signal the comma-attribution gap missed,
+        #       without the over-suppression that adding bare "," would cause.
+        # "According to my calendar, remember to call mom" is intentionally NOT
+        # suppressed: "according to" without a following "that"-clause is the
+        # user's own justification, not a quotation of external content.
+        _ATTRIBUTION_PRECEDE_WINDOW = 80
+        _ATTRIBUTION_THAT_RE = re.compile(
+            r"\b(?:notes?|says|said|wrote|reads?|states?|mentions?)\s+that\b",
+            re.IGNORECASE,
+        )
+
         guard_match = self._QUOTE_GUARD_RE.search(text)
         if guard_match:
             window = text[max(0, guard_match.start() - 8) : guard_match.end() + 60]
@@ -716,8 +791,15 @@ class MemoryStore:
                 memory_content = memory_content.strip("\"'“”‘’ \t\n")
                 memory_content = memory_content.rstrip(".!?,;:")
                 memory_content = memory_content.strip()
-                if memory_content:
-                    return memory_content
+                if not memory_content:
+                    continue
+                # Attribution-verb-+"that" preceding the directive within a
+                # bounded window ⇒ the directive is embedded in described
+                # external content, not a user directive.
+                window_before = text[max(0, match.start() - _ATTRIBUTION_PRECEDE_WINDOW) : match.start()]
+                if _ATTRIBUTION_THAT_RE.search(window_before):
+                    return None
+                return memory_content
         return None
 
 

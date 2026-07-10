@@ -9,9 +9,9 @@ import json
 import logging
 import sqlite3
 from dataclasses import asdict
-from typing import Optional
+from typing import Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -974,15 +974,20 @@ async def get_memory_wiki_status(
     await _require_vault_read(user, vault_id)
     db.row_factory = sqlite3.Row
     store = WikiStore(db)
+    return _memory_wiki_status_payload(db, store, memory_id, vault_id)
 
+
+def _memory_wiki_status_payload(db: sqlite3.Connection, store: "WikiStore", memory_id: int, vault_id: int) -> dict:
+    """Compute the wiki-status payload for a single memory.
+
+    Extracted so the batch endpoint can reuse it without re-resolving
+    auth/store per memory (UI-PERF-4: collapse the N+1 fan-out).
+    """
     # Collect memory jobs (trigger_id filtered + bounded in SQL — F-012).
-    # trigger_type can be either "memory" or "manual", so keep that check in Python
-    # over the already-bounded result set.
     jobs = store.list_jobs(vault_id, trigger_id=f"memory:{memory_id}", limit=50)
     mem_jobs = [j for j in jobs if j.trigger_type in ("memory", "manual")]
     latest_job = mem_jobs[0] if mem_jobs else None
 
-    # Claims sourced from this memory
     claims_rows = db.execute(
         """SELECT wc.id, wc.status, wc.page_id, wc.claim_text
            FROM wiki_claims wc
@@ -995,7 +1000,6 @@ async def get_memory_wiki_status(
     active_claims = sum(1 for c in claims_data if c["status"] == "active")
     stale_claims = sum(1 for c in claims_data if c["status"] == "superseded")
 
-    # Linked pages
     page_ids = {c["page_id"] for c in claims_data if c["page_id"]}
     linked_pages = []
     for pid in page_ids:
@@ -1006,7 +1010,6 @@ async def get_memory_wiki_status(
         if row:
             linked_pages.append(dict(row))
 
-    # Semantic status
     if latest_job and latest_job.status == "running":
         wiki_status = "promoting"
     elif stale_claims > 0 and active_claims == 0:
@@ -1028,6 +1031,34 @@ async def get_memory_wiki_status(
         "latest_job": _as_dict(latest_job) if latest_job else None,
         "job_count": len(mem_jobs),
     }
+
+
+@router.post("/wiki/memories/batch-status")
+async def batch_memory_wiki_status(
+    vault_id: int = Query(...),
+    body: Dict[str, List[int]] = Body(default_factory=lambda: {"memory_ids": []}),
+    _csrf_token: str = Depends(csrf_protect),
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+):
+    """Return wiki-status payloads for many memories in one request.
+
+    Collapses the per-memory N+1 fan-out from MemoryPage into a single
+    request (UI-PERF-4). Memory ids are read from the JSON request body
+    (``{"memory_ids": [1, 2, …]}``) rather than a repeated query param, so
+    the array survives axios's default serialization. Returns
+    ``{ "statuses": { "<memory_id>": <payload> } }``.
+    """
+    await _require_vault_read(user, vault_id)
+    db.row_factory = sqlite3.Row
+    store = WikiStore(db)
+    memory_ids = body.get("memory_ids") or []
+    # Cap the batch size to avoid an unbounded request.
+    bounded = memory_ids[:200]
+    result: dict[str, dict] = {}
+    for mid in bounded:
+        result[str(mid)] = _memory_wiki_status_payload(db, store, mid, vault_id)
+    return {"statuses": result}
 
 
 # ---------------------------------------------------------------------------

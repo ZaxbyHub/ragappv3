@@ -10,6 +10,7 @@ from app.api.deps import get_csrf_manager, get_current_active_user, get_db, requ
 from app.config import settings
 from app.security import CSRFManager, csrf_protect, issue_csrf_token
 from app.services.ssrf import URLBlocked, assert_url_safe
+from app.services.ssrf_transport import SSRFSafeTransport
 
 router = APIRouter()
 
@@ -888,7 +889,11 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
     if settings.reranker_url:
         targets["reranker"] = settings.reranker_url
 
-    async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+    async with httpx.AsyncClient(
+        timeout=5.0,
+        follow_redirects=False,
+        transport=SSRFSafeTransport(),
+    ) as client:
         results = {}
         for name, url in targets.items():
             try:
@@ -1010,7 +1015,11 @@ async def test_curator_connection(
 
     started = _time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            transport=SSRFSafeTransport(),
+        ) as client:
             resp = await client.post(endpoint, json=payload)
         latency_ms = int((_time.monotonic() - started) * 1000)
         if resp.status_code >= 300:

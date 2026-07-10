@@ -30,7 +30,7 @@ function ReconnectingBanner({ health }: { health: HealthStatus }) {
         "transition-colors duration-200",
         isSevere
           ? "bg-destructive/95 text-destructive-foreground"
-          : "bg-yellow-500/95 text-yellow-950"
+          : "bg-warning/95 text-warning-foreground"
       )}
     >
       {isSevere ? (

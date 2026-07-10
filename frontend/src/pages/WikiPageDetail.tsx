@@ -16,9 +16,9 @@ interface WikiPageDetailProps {
 
 const SEVERITY_COLORS: Record<string, string> = {
   low: "bg-muted text-muted-foreground",
-  medium: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200",
-  high: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200",
-  critical: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
+  medium: "bg-warning/10 text-warning",
+  high: "bg-warning/10 text-warning",
+  critical: "bg-destructive/10 text-destructive",
 };
 
 function ClaimRow({ claim }: { claim: WikiClaim }) {
@@ -266,7 +266,7 @@ export function WikiPageDetail({ page, onBack, onEdit, onDelete }: WikiPageDetai
               <ArrowLeft className="w-4 h-4" />
             </Button>
             <div>
-              <h2 className="text-lg font-semibold">{page.title}</h2>
+              <h1 className="text-lg font-semibold">{page.title}</h1>
               <p className="text-xs text-muted-foreground">{page.slug}</p>
             </div>
           </div>

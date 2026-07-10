@@ -343,6 +343,26 @@ export async function getMemoryWikiStatus(memoryId: number, vaultId: number): Pr
   return response.data;
 }
 
+/**
+ * Fetch wiki status for many memories in a single request (UI-PERF-4:
+ * collapses the per-memory N+1 fan-out from MemoryPage into one call).
+ * Returns a map keyed by memory id (as a string).
+ */
+export async function batchMemoryWikiStatus(
+  memoryIds: number[],
+  vaultId: number,
+): Promise<Record<string, MemoryWikiStatus>> {
+  if (!memoryIds.length) return {};
+  // Send memory_ids in the JSON body (not query params) so the array survives
+  // axios's default serialization intact (UI-PERF-4).
+  const response = await apiClient.post<{ statuses: Record<string, MemoryWikiStatus> }>(
+    `/wiki/memories/batch-status`,
+    { memory_ids: memoryIds },
+    { params: { vault_id: vaultId } },
+  );
+  return response.data.statuses;
+}
+
 // Version history
 export async function getWikiPageVersions(pageId: number, vaultId: number) {
   const response = await apiClient.get(`/wiki/pages/${pageId}/versions`, { params: { vault_id: vaultId } });

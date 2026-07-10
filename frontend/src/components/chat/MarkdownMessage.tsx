@@ -479,9 +479,17 @@ export const MarkdownMessage = memo(function MarkdownMessage({
   citationConfidence,
   unverifiableClaims,
 }: MarkdownMessageProps) {
+  // Skip the full parseCitationSegments scan when the caller already supplies
+  // citedSources (the AssistantMessage production path, which runs the
+  // identical call on identical inputs and passes the result here). This
+  // eliminates one redundant end-to-end regex scan per assistant-message
+  // render — including every streamed token (PERF-4, #291).
   const { segments, citedSources: internalCitedSources } = useMemo(
-    () => parseCitationSegments(content, sources, memories, wikiRefs, kmsRefs),
-    [content, sources, memories, wikiRefs, kmsRefs]
+    () =>
+      externalCitedSources !== undefined
+        ? { segments: [], citedSources: externalCitedSources }
+        : parseCitationSegments(content, sources, memories, wikiRefs, kmsRefs),
+    [content, sources, memories, wikiRefs, kmsRefs, externalCitedSources],
   );
 
   const citedSources = externalCitedSources ?? internalCitedSources;

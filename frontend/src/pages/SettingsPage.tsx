@@ -44,7 +44,6 @@ import { handleSettingsInputChange } from "@/components/settings/handleInputChan
 import { ConnectionStatusBadges } from "@/components/shared/ConnectionStatusBadges";
 import type { HealthStatus } from "@/types/health";
 import { useHealthCheck } from "@/hooks/useHealthCheck";
-import { ConnectionSettings } from "@/components/settings/ConnectionSettings";
 import { DocumentProcessingSettings } from "@/components/settings/DocumentProcessingSettings";
 import { RAGSettings } from "@/components/settings/RAGSettings";
 import { RetrievalSettings } from "@/components/settings/RetrievalSettings";
@@ -406,9 +405,6 @@ function SettingsPageWithStatus({ health }: { health: HealthStatus }) {
       setIsTestingConnections(false);
     }
   };
-
-  // Hide the unused-warning for dropped ConnectionSettings consumer.
-  void ConnectionSettings;
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
