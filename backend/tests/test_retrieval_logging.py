@@ -21,10 +21,6 @@ _lancedb.index = _lancedb_index
 sys.modules["lancedb"] = _lancedb
 sys.modules["lancedb.index"] = _lancedb_index
 
-# Stub pyarrow
-_pyarrow = types.ModuleType("pyarrow")
-sys.modules["pyarrow"] = _pyarrow
-
 # Stub unstructured
 _unstructured = types.ModuleType("unstructured")
 _unstructured.partition = types.ModuleType("unstructured.partition")
