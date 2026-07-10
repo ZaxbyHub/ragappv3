@@ -67,10 +67,10 @@ None.
   `.opencode/skills/` directory is the opencode-swarm plugin's
   internal area — the plugin skips it when injecting skills for
   Claude Code or Codex sessions, so editing it would deepen drift
-  without serving the target runners. A separate Option 2 plan at
-  `.swarm/plans/option-2-skill-organization.md` formalizes the fix
-  via a frontmatter `audience:` tag, after which this caveat is
-  resolved.
+  without serving the target runners. A separate Option 2 architecture (frontmatter `audience:` tag,
+  documented in the swarm-pr-review notes) formalizes the fix once
+  the opencode-swarm plugin's loader gains an `audience`-aware
+  filter. Until then, this caveat stands.
 - **spec.md FR-001..FR-006 deferred.** The broader "Skill and
   Knowledge Recommendations Implementation" spec contains code-level
   items (TaskItem.attempt default, shutdown guard, retry-disciplines
