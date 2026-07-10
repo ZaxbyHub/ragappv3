@@ -66,6 +66,16 @@ async def health_check(
         "services": {"backend": True, "embeddings": None, "chat": None, "vector_store": None},
     }
 
+    # Expose the ingestion/enrichment backlog depth so operators can observe a
+    # stuck BackgroundProcessor without tailing logs (the queue_size property
+    # was previously defined but never consumed by any application code).
+    bg_processor = getattr(request.app.state, "background_processor", None)
+    if bg_processor is not None:
+        try:
+            result["ingestion_queue_size"] = bg_processor.queue_size
+        except Exception as exc:
+            logger.debug("ingestion queue_size probe failed: %s", exc)
+
     if deep:
         llm_status = await llm_checker.check_all()
         try:

@@ -121,8 +121,16 @@ class LLMClient:
         )
         # Add keep-alive headers to prevent LM Studio from unloading
         headers = {"Connection": "keep-alive", "Keep-Alive": "timeout=300, max=1000"}
+        # SSRFSafeTransport re-validates the resolved IP at request time to
+        # close the DNS-rebinding TOCTOU gap the startup-only guard leaves
+        # open, while preserving TLS SNI/cert validation.
+        from app.services.ssrf_transport import SSRFSafeTransport
+
         self._client = httpx.AsyncClient(
-            timeout=self.timeout, limits=limits, headers=headers
+            timeout=self.timeout,
+            limits=limits,
+            headers=headers,
+            transport=SSRFSafeTransport(),
         )
 
     async def __aenter__(self):
@@ -587,6 +595,25 @@ class LLMClient:
                     "status": "ok",
                     "stream": True,
                 }
+            else:
+                # Streaming failed — record a failure metric so the done
+                # payload's llm_metrics does not report a stale/ok value for
+                # a failed turn (mirrors the non-streaming per-error
+                # branches above and in chat_completion). If the SSE-fallback
+                # path already set a more specific status (timeout/http_error/
+                # request_error/circuit_open via chat_completion), preserve it
+                # rather than overwriting with the generic "error".
+                _existing_status = (self.last_metrics or {}).get("status", "ok")
+                if _existing_status == "ok":
+                    self.last_metrics = {
+                        "provider_url": self.base_url,
+                        "model": self.model,
+                        "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                        "prompt_tokens_estimate": prompt_tokens,
+                        "completion_tokens_estimate": max(1, completion_chars // 4) if completion_chars else 0,
+                        "status": "error",
+                        "stream": True,
+                    }
 
         # Log connection pool metrics after streaming completes
         self._log_pool_stats()

@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Zero-byte files created by unquoted pip-redirect mishaps (e.g. `pip install
+# foo>=0.9.0` parsed as a redirect creating an empty "=0.9.0" file). Guard so
+# they are not re-committed (B6-5, #289).
+=[0-9]*
 .Python
 env/
 venv/
@@ -80,3 +85,4 @@ tmp/
 
 # SQLite files created by tests with MagicMock paths
 backend/<MagicMock*
+.zcode/

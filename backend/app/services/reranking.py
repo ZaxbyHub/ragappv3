@@ -94,6 +94,14 @@ class RerankingService:
         )
         self._top_n_override = None if top_n is self._UNSET else top_n
         self._http_client: Optional[httpx.AsyncClient] = None
+        # NOTE: startup URL validation is intentionally NOT performed here, even
+        # though EmbeddingService/LLMClient validate at construction. Unlike
+        # those, RerankingService resolves its URL lazily (the _UNSET sentinel
+        # reads live from settings on every call so admins can change it without
+        # restarting), and per-call assert_url_safe in _rerank_via_endpoint is
+        # the correct validation point. Validating at construction would both
+        # break the deferred-resolution design and reject test fixtures that use
+        # non-resolvable hostnames (e.g. 'reranker.local').
 
     @property
     def reranker_url(self) -> str:
@@ -147,8 +155,32 @@ class RerankingService:
                 scored = await self._rerank_via_endpoint(query, texts, n)
             else:
                 scored = await self._rerank_local(query, texts, n)
+        except CircuitBreakerError as e:
+            # Expected self-healing condition (reranker circuit open) — log at
+            # WARNING with backend context so it's distinguishable from a
+            # code-level parse bug or a network timeout.
+            logger.warning(
+                "Reranker circuit open (backend=%s), returning original order: %s",
+                self.reranker_url or "local",
+                e,
+            )
+            return (chunks[:n], False)
+        except httpx.HTTPError as e:
+            # Network/timeout/HTTP errors — WARNING with backend context.
+            logger.warning(
+                "Reranker HTTP error (backend=%s), returning original order: %s",
+                self.reranker_url or "local",
+                e,
+            )
+            return (chunks[:n], False)
         except Exception as e:
-            logger.error(f"Reranking failed, returning original order: {e}")
+            # Genuinely unexpected (e.g. a response-parsing bug) — ERROR with
+            # a full stack trace for triage.
+            logger.error(
+                "Reranking failed unexpectedly, returning original order: %s",
+                e,
+                exc_info=True,
+            )
             return (chunks[:n], False)
 
         # Attach score and return top_n
@@ -179,8 +211,13 @@ class RerankingService:
         }
         await asyncio.to_thread(assert_url_safe, self.reranker_url)
         if self._http_client is None:
+            # SSRFSafeTransport re-validates the resolved IP at request time to
+            # close the DNS-rebinding TOCTOU gap the per-call guard leaves open.
+            from app.services.ssrf_transport import SSRFSafeTransport
+
             self._http_client = httpx.AsyncClient(
-                timeout=settings.reranker_timeout_seconds
+                timeout=settings.reranker_timeout_seconds,
+                transport=SSRFSafeTransport(),
             )
         try:
             response = await reranking_cb(self._http_client.post)(url, json=payload)
