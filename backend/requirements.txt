@@ -23,6 +23,6 @@ PyJWT>=2.13.0
 passlib[bcrypt,argon2]>=1.7.4
 bcrypt<6.0.0
 argon2-cffi>=21.3.0
-rapidfuzz>=3.0.0
+rapidfuzz>=3.14.5
 Pillow>=10.0.0
 pytesseract>=0.3.10
