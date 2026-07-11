@@ -112,6 +112,6 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest --tb=short -v --timeout=300 -n auto tests/
+        run: pytest --tb=short -v --timeout=300 -n auto --cov --cov-report=term-missing tests/
         env:
           REDIS_URL: ""

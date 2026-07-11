@@ -213,6 +213,7 @@ class TestFileWatcherRaisesOnDbError(unittest.TestCase):
     """RES-4: _find_new_files re-raises on DB-query failure (no silent empty set)."""
 
     def test_db_error_propagates(self):
+        import tempfile
         from pathlib import Path
 
         from app.services.file_watcher import FileWatcher
@@ -222,8 +223,20 @@ class TestFileWatcherRaisesOnDbError(unittest.TestCase):
         # Simulate a DB-query failure.
         fw.pool.get_connection.side_effect = RuntimeError("pool exhausted")
 
-        with self.assertRaises(RuntimeError):
-            fw._find_new_files(Path("/tmp"))
+        # Use a private empty temp directory instead of the shared /tmp. Under
+        # pytest-xdist (-n auto) the shared /tmp contains files that other
+        # workers create and delete concurrently, and _find_new_files' rglob +
+        # is_file() walk races against those deletions (FileNotFoundError before
+        # the mocked pool side_effect ever fires). An empty private dir makes the
+        # walk a no-op so execution reaches the DB-query path deterministically.
+        scan_dir = Path(tempfile.mkdtemp(prefix="fw_test_"))
+        try:
+            with self.assertRaises(RuntimeError):
+                fw._find_new_files(scan_dir)
+        finally:
+            import shutil
+
+            shutil.rmtree(scan_dir, ignore_errors=True)
 
 
 class TestDualPoolMixinShared(unittest.TestCase):

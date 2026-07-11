@@ -408,5 +408,67 @@ class TestIsBlockedAddressShared(unittest.TestCase):
         self.assertTrue(_is_blocked_address("not-an-ip-at-all"))
 
 
+# ---------------------------------------------------------------------------
+# Parity: curator guard must agree with the general guard on identical inputs
+# (guards against drift now that curator_ssrf delegates to the shared core).
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorGeneralGuardParity(unittest.TestCase):
+    """assert_curator_url_safe and assert_url_safe must make the same decision
+    on the same input, differing only in exception type and opt-in env var."""
+
+    PARITY_INPUTS = [
+        "file:///etc/passwd",
+        "data:text/plain,hi",
+        "ftp://example.com/x",
+        "http://user:pass@example.com/",
+        "",
+        "   ",
+        "http://",
+        "https://example.com/path",  # public, both allow
+    ]
+
+    def _general_decision(self, url):
+        try:
+            assert_url_safe(url)
+            return "allow"
+        except URLBlocked:
+            return "block"
+
+    def _curator_decision(self, url):
+        try:
+            assert_curator_url_safe(url)
+            return "allow"
+        except CuratorURLBlocked:
+            return "block"
+
+    def test_parity_no_opt_in(self):
+        """Without any local opt-in, both guards agree on each input."""
+        with patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "", "ALLOW_LOCAL_CURATOR": ""}, clear=False):
+            for url in self.PARITY_INPUTS:
+                with self.subTest(url=url):
+                    self.assertEqual(
+                        self._general_decision(url),
+                        self._curator_decision(url),
+                        f"guards disagree on {url!r}",
+                    )
+
+    def test_loopback_blocked_by_both(self):
+        """127.0.0.1 is blocked by both guards when their opt-ins are unset."""
+        with patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "", "ALLOW_LOCAL_CURATOR": ""}, clear=False):
+            self.assertEqual(self._general_decision("http://127.0.0.1:9/"), "block")
+            self.assertEqual(self._curator_decision("http://127.0.0.1:9/"), "block")
+
+    def test_opt_ins_independent(self):
+        """ALLOW_LOCAL_SERVICES must not unlock the curator guard and vice versa."""
+        with patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1", "ALLOW_LOCAL_CURATOR": ""}, clear=False):
+            self.assertEqual(self._general_decision("http://127.0.0.1:9/"), "allow")
+            self.assertEqual(self._curator_decision("http://127.0.0.1:9/"), "block")
+        with patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "", "ALLOW_LOCAL_CURATOR": "1"}, clear=False):
+            self.assertEqual(self._general_decision("http://127.0.0.1:9/"), "block")
+            self.assertEqual(self._curator_decision("http://127.0.0.1:9/"), "allow")
+
+
 if __name__ == "__main__":
     unittest.main()

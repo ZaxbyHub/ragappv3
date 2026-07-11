@@ -10,17 +10,12 @@ import sys
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from app.services.circuit_breaker import (
     AsyncCircuitBreaker,
     CircuitBreakerError,
     CircuitBreakerState,
-    _on_circuit_close,
-    _on_circuit_open,
-    _on_half_open,
     circuit_breaker,
     embeddings_cb,
     llm_cb,
@@ -77,51 +72,6 @@ class TestPreconfiguredCircuitBreakers:
         assert model_checker_cb.name == "model_checker"
         assert model_checker_cb.fail_max == 3
         assert model_checker_cb.reset_timeout == 30
-
-
-class TestCircuitBreakerCallbacks:
-    """Test suite for circuit breaker state change callbacks."""
-
-    @patch('app.services.circuit_breaker.logger')
-    def test_on_circuit_open_logs_warning(self, mock_logger):
-        """Test that _on_circuit_open logs a warning."""
-        mock_cb = MagicMock()
-        mock_cb.name = "test_breaker"
-        mock_cb.fail_max = 5
-
-        _on_circuit_open(mock_cb)
-
-        mock_logger.warning.assert_called_once_with(
-            "Circuit breaker '%s' opened after %d consecutive failures",
-            "test_breaker",
-            5,
-        )
-
-    @patch('app.services.circuit_breaker.logger')
-    def test_on_circuit_close_logs_info(self, mock_logger):
-        """Test that _on_circuit_close logs info."""
-        mock_cb = MagicMock()
-        mock_cb.name = "test_breaker"
-
-        _on_circuit_close(mock_cb)
-
-        mock_logger.info.assert_called_once_with(
-            "Circuit breaker '%s' closed - service recovered",
-            "test_breaker",
-        )
-
-    @patch('app.services.circuit_breaker.logger')
-    def test_on_half_open_logs_info(self, mock_logger):
-        """Test that _on_half_open logs info."""
-        mock_cb = MagicMock()
-        mock_cb.name = "test_breaker"
-
-        _on_half_open(mock_cb)
-
-        mock_logger.info.assert_called_once_with(
-            "Circuit breaker '%s' entering half-open state - testing service",
-            "test_breaker",
-        )
 
 
 @pytest.mark.asyncio

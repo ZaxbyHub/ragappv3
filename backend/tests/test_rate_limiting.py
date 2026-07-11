@@ -844,5 +844,97 @@ class TestTrustProxyHeaders(unittest.TestCase):
         self.assertEqual(client_ip, "10.0.0.5")
 
 
+class TestRuntimeRateLimitEnforcement(unittest.TestCase):
+    """Runtime verification that the slowapi limiter actually blocks after N hits.
+
+    Complements the source-scanning classes above: instead of asserting the
+    decorator text is present, this hits a real (low) limit via the actual
+    WhitelistLimiter and confirms a RateLimitExceeded is raised on the N+1th
+    call. This catches a misconfigured-but-syntactically-present decorator
+    (e.g. wrong key_func, disabled storage) that source scans cannot detect.
+    """
+
+    @staticmethod
+    def _make_request(lim, extra_headers=None):
+        """Build a real Starlette Request wired with the slowapi state the
+        SlowAPIMiddleware normally sets (request.app.state.limiter plus the
+        rate-limit view state). slowapi requires a genuine Request instance."""
+        from types import SimpleNamespace
+
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+
+        app = Starlette()
+        app.state.limiter = lim
+        headers = extra_headers or {}
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [
+                (k.lower().encode("latin-1"), v.encode("latin-1"))
+                for k, v in headers.items()
+            ],
+            "query_string": b"",
+            "client": ("testclient", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "root_path": "",
+            "app": app,
+        }
+        req = Request(scope)
+        # The middleware normally initializes these on request.state before the
+        # decorated handler reads them.
+        req.state.view_rate_limit = SimpleNamespace()
+        return req
+
+    def test_limiter_blocks_after_limit_exceeded(self):
+        """A real endpoint under a 2/minute limit must raise on the 3rd hit."""
+        from slowapi.errors import RateLimitExceeded
+
+        from app.limiter import WhitelistLimiter
+
+        # Fresh limiter with a tiny limit so the test is fast and deterministic.
+        # key_func tolerates being called with or without the request arg
+        # (slowapi calls it both ways depending on the code path).
+        def key_func(_request=None):
+            return "testclient"
+
+        lim = WhitelistLimiter(key_func=key_func, storage_uri="memory://")
+
+        @lim.limit("2/minute")
+        def handler(request):
+            return "ok"
+
+        # First two calls are within the limit.
+        self.assertEqual(handler(self._make_request(lim)), "ok")
+        self.assertEqual(handler(self._make_request(lim)), "ok")
+        # Third call must be rejected.
+        with self.assertRaises(RateLimitExceeded):
+            handler(self._make_request(lim))
+
+    def test_whitelist_bypasses_limit_at_runtime(self):
+        """A whitelisted request (valid X-API-Key) must not count against limits."""
+        from app.limiter import WhitelistLimiter
+
+        api_key = "super-secret-health-check-key"
+
+        def key_func(_request=None):
+            return "testclient"
+
+        with patch("app.limiter.settings") as mock_settings:
+            mock_settings.health_check_api_key = api_key
+            lim = WhitelistLimiter(key_func=key_func, storage_uri="memory://")
+
+            @lim.limit("1/minute")
+            def handler(request):
+                return "ok"
+
+            # Whitelisted requests should never hit the limit, no matter the count.
+            for _ in range(5):
+                req = self._make_request(lim, {"X-API-Key": api_key})
+                self.assertEqual(handler(req), "ok")
+
+
 if __name__ == "__main__":
     unittest.main()
