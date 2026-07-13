@@ -11,13 +11,14 @@ Verifies that:
 import sqlite3
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from backend.tests.schema_constants import TEST_SCHEMA
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.api.deps import get_db
 from app.api.routes.auth import router as auth_router
 from app.api.routes.vault_members import (
     group_access_router,
@@ -134,6 +135,54 @@ def auth_headers(token_fn):
     return {"Authorization": f"Bearer {token_fn()}"}
 
 
+def _mock_db_conn(exc, auth_user_row=None):
+    """Build a mock DB connection whose cursor.execute() raises ``exc``.
+
+    Used to override ``get_db`` so route handlers receive a failing connection
+    via DI (replacing the legacy get_pool patch). The connection's top-level
+    ``execute()`` (used by get_current_active_user's auth queries) returns
+    None for the denylist check and ``auth_user_row`` for the user lookup so
+    auth still resolves; the handler's own cursor-based queries raise ``exc``.
+    """
+    mock_conn = MagicMock()
+
+    # Top-level execute() is used by auth: first the denylist check
+    # (is_access_token_denied -> fetchone() must be None so the token is NOT
+    # denied), then _fetch_user_row_with_pwc (fetchone() returns the user).
+    auth_cursor = MagicMock()
+    auth_cursor.fetchone.side_effect = [None, auth_user_row, auth_user_row]
+    mock_conn.execute.return_value = auth_cursor
+
+    # Handler cursor (conn.cursor().execute()) raises the injected exception.
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = exc
+    mock_conn.cursor.return_value = mock_cursor
+    mock_conn.commit.return_value = None
+    mock_conn.rollback.return_value = None
+    return mock_conn
+
+
+def _client_with_failing_db(client, exc):
+    """Override ``get_db`` on ``client``'s app to yield a failing mock.
+
+    The mock connection's cursor.execute() raises ``exc``. Routes now receive
+    their connection via ``Depends(get_db)`` instead of calling ``get_pool()``
+    directly, so we override the DI dependency rather than patching get_pool.
+
+    Auth (get_current_active_user) also resolves through ``Depends(get_db)``,
+    so the mock connection's top-level ``execute()`` returns the seeded
+    superadmin user row, letting auth succeed while the handler's own cursor-
+    based queries raise ``exc``. This preserves the original test intent:
+    only the route handler's DB operation fails, auth resolves normally.
+    """
+    # The superadmin row matches _fetch_user_row_with_pwc's 7-column shape.
+    auth_user_row = (1, "superadmin", "Super Admin", "superadmin", 1, 0, 0.0)
+    client.app.dependency_overrides[get_db] = lambda: _mock_db_conn(
+        exc, auth_user_row=auth_user_row
+    )
+    return client
+
+
 @pytest.fixture
 def client():
     """Create test client with routers."""
@@ -182,32 +231,19 @@ class TestAddVaultMemberIntegrityError:
         The exception must be raised INSIDE the try block so it is not caught
         by the `except sqlite3.IntegrityError` handler in the route.
         """
-        with patch("app.api.routes.vault_members.get_pool") as mock_get_pool:
-            # Create a mock connection whose cursor.execute() raises the error.
-            # This ensures the exception occurs inside the try block.
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_cursor.execute.side_effect = sqlite3.OperationalError(
-                "database is locked"
-            )
-            mock_conn.cursor.return_value = mock_cursor
-            mock_conn.commit.return_value = None
-
-            mock_pool = MagicMock()
-            mock_pool.get_connection.return_value = mock_conn
-            mock_pool.release_connection.return_value = None
-            mock_get_pool.return_value = mock_pool
-
-            response = client.post(
-                "/api/vaults/1/members",
-                json={"member_user_id": 3, "permission": "read"},
-                headers=auth_headers(superadmin_token),
-            )
-            # Connection error is NOT IntegrityError -> should be 500 Internal Server Error
-            assert response.status_code == 500, (
-                f"Expected 500 for non-IntegrityError, got {response.status_code}. "
-                "Non-IntegrityError exceptions must not be caught as 409."
-            )
+        failing_client = _client_with_failing_db(
+            client=client, exc=sqlite3.OperationalError("database is locked")
+        )
+        response = failing_client.post(
+            "/api/vaults/1/members",
+            json={"member_user_id": 3, "permission": "read"},
+            headers=auth_headers(superadmin_token),
+        )
+        # Connection error is NOT IntegrityError -> should be 500 Internal Server Error
+        assert response.status_code == 500, (
+            f"Expected 500 for non-IntegrityError, got {response.status_code}. "
+            "Non-IntegrityError exceptions must not be caught as 409."
+        )
 
     def test_returns_500_on_foreign_key_error_not_409(self, client):
         """Returns 500 (not 409) when FK constraint fails but is NOT IntegrityError.
@@ -215,29 +251,16 @@ class TestAddVaultMemberIntegrityError:
         Note: FK violations ARE IntegrityError in SQLite, but we test with a
         generic Exception to ensure only sqlite3.IntegrityError is caught.
         """
-        with patch("app.api.routes.vault_members.get_pool") as mock_get_pool:
-            # Create a mock connection whose cursor.execute() raises the error.
-            # This ensures the exception occurs inside the try block.
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_cursor.execute.side_effect = RuntimeError(
-                "unexpected error during transaction"
-            )
-            mock_conn.cursor.return_value = mock_cursor
-            mock_conn.commit.return_value = None
-
-            mock_pool = MagicMock()
-            mock_pool.get_connection.return_value = mock_conn
-            mock_pool.release_connection.return_value = None
-            mock_get_pool.return_value = mock_pool
-
-            response = client.post(
-                "/api/vaults/1/members",
-                json={"member_user_id": 3, "permission": "read"},
-                headers=auth_headers(superadmin_token),
-            )
-            # RuntimeError is not IntegrityError -> should be 500
-            assert response.status_code == 500
+        failing_client = _client_with_failing_db(
+            client=client, exc=RuntimeError("unexpected error during transaction")
+        )
+        response = failing_client.post(
+            "/api/vaults/1/members",
+            json={"member_user_id": 3, "permission": "read"},
+            headers=auth_headers(superadmin_token),
+        )
+        # RuntimeError is not IntegrityError -> should be 500
+        assert response.status_code == 500
 
 
 class TestGrantVaultGroupAccessIntegrityError:
@@ -273,59 +296,35 @@ class TestGrantVaultGroupAccessIntegrityError:
         The exception must be raised INSIDE the try block so it is not caught
         by the `except sqlite3.IntegrityError` handler in the route.
         """
-        with patch("app.api.routes.vault_members.get_pool") as mock_get_pool:
-            # Create a mock connection whose cursor.execute() raises the error.
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_cursor.execute.side_effect = sqlite3.OperationalError(
-                "database is locked"
-            )
-            mock_conn.cursor.return_value = mock_cursor
-            mock_conn.commit.return_value = None
-
-            mock_pool = MagicMock()
-            mock_pool.get_connection.return_value = mock_conn
-            mock_pool.release_connection.return_value = None
-            mock_get_pool.return_value = mock_pool
-
-            response = client.post(
-                "/api/vaults/1/group-access",
-                json={"group_id": 1, "permission": "read"},
-                headers=auth_headers(superadmin_token),
-            )
-            # Connection error is NOT IntegrityError -> should be 500
-            assert response.status_code == 500, (
-                f"Expected 500 for non-IntegrityError, got {response.status_code}. "
-                "Non-IntegrityError exceptions must not be caught as 409."
-            )
+        failing_client = _client_with_failing_db(
+            client=client, exc=sqlite3.OperationalError("database is locked")
+        )
+        response = failing_client.post(
+            "/api/vaults/1/group-access",
+            json={"group_id": 1, "permission": "read"},
+            headers=auth_headers(superadmin_token),
+        )
+        # Connection error is NOT IntegrityError -> should be 500
+        assert response.status_code == 500, (
+            f"Expected 500 for non-IntegrityError, got {response.status_code}. "
+            "Non-IntegrityError exceptions must not be caught as 409."
+        )
 
     def test_returns_500_on_generic_exception_not_409(self, client):
         """Returns 500 (not 409) when a generic Exception occurs.
 
         The code must only catch sqlite3.IntegrityError, not broad Exception.
         """
-        with patch("app.api.routes.vault_members.get_pool") as mock_get_pool:
-            # Create a mock connection whose cursor.execute() raises the error.
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_cursor.execute.side_effect = RuntimeError(
-                "unexpected error during transaction"
-            )
-            mock_conn.cursor.return_value = mock_cursor
-            mock_conn.commit.return_value = None
-
-            mock_pool = MagicMock()
-            mock_pool.get_connection.return_value = mock_conn
-            mock_pool.release_connection.return_value = None
-            mock_get_pool.return_value = mock_pool
-
-            response = client.post(
-                "/api/vaults/1/group-access",
-                json={"group_id": 1, "permission": "read"},
-                headers=auth_headers(superadmin_token),
-            )
-            # RuntimeError is not IntegrityError -> should be 500
-            assert response.status_code == 500
+        failing_client = _client_with_failing_db(
+            client=client, exc=RuntimeError("unexpected error during transaction")
+        )
+        response = failing_client.post(
+            "/api/vaults/1/group-access",
+            json={"group_id": 1, "permission": "read"},
+            headers=auth_headers(superadmin_token),
+        )
+        # RuntimeError is not IntegrityError -> should be 500
+        assert response.status_code == 500
 
 
 class TestUpdateRemoveOperationsReraiseExceptions:
@@ -347,27 +346,16 @@ class TestUpdateRemoveOperationsReraiseExceptions:
         conn.commit()
         conn.close()
 
-        with patch("app.api.routes.vault_members.get_pool") as mock_get_pool:
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_cursor.execute.side_effect = sqlite3.OperationalError(
-                "database is locked"
-            )
-            mock_conn.cursor.return_value = mock_cursor
-            mock_conn.commit.return_value = None
-
-            mock_pool = MagicMock()
-            mock_pool.get_connection.return_value = mock_conn
-            mock_pool.release_connection.return_value = None
-            mock_get_pool.return_value = mock_pool
-
-            response = client.patch(
-                "/api/vaults/1/members/3",
-                json={"permission": "write"},
-                headers=auth_headers(superadmin_token),
-            )
-            # Connection error should propagate as 500
-            assert response.status_code == 500
+        failing_client = _client_with_failing_db(
+            client=client, exc=sqlite3.OperationalError("database is locked")
+        )
+        response = failing_client.patch(
+            "/api/vaults/1/members/3",
+            json={"permission": "write"},
+            headers=auth_headers(superadmin_token),
+        )
+        # Connection error should propagate as 500
+        assert response.status_code == 500
 
     def test_remove_vault_member_reraises_connection_error(self, client):
         """Remove operation re-raises connection errors as 500."""
@@ -381,26 +369,15 @@ class TestUpdateRemoveOperationsReraiseExceptions:
         conn.commit()
         conn.close()
 
-        with patch("app.api.routes.vault_members.get_pool") as mock_get_pool:
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_cursor.execute.side_effect = sqlite3.OperationalError(
-                "database is locked"
-            )
-            mock_conn.cursor.return_value = mock_cursor
-            mock_conn.commit.return_value = None
-
-            mock_pool = MagicMock()
-            mock_pool.get_connection.return_value = mock_conn
-            mock_pool.release_connection.return_value = None
-            mock_get_pool.return_value = mock_pool
-
-            response = client.delete(
-                "/api/vaults/1/members/3",
-                headers=auth_headers(superadmin_token),
-            )
-            # Connection error should propagate as 500
-            assert response.status_code == 500
+        failing_client = _client_with_failing_db(
+            client=client, exc=sqlite3.OperationalError("database is locked")
+        )
+        response = failing_client.delete(
+            "/api/vaults/1/members/3",
+            headers=auth_headers(superadmin_token),
+        )
+        # Connection error should propagate as 500
+        assert response.status_code == 500
 
     def test_update_vault_group_access_reraises_connection_error(self, client):
         """Update group access operation re-raises connection errors as 500."""
@@ -414,27 +391,16 @@ class TestUpdateRemoveOperationsReraiseExceptions:
         conn.commit()
         conn.close()
 
-        with patch("app.api.routes.vault_members.get_pool") as mock_get_pool:
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_cursor.execute.side_effect = sqlite3.OperationalError(
-                "database is locked"
-            )
-            mock_conn.cursor.return_value = mock_cursor
-            mock_conn.commit.return_value = None
-
-            mock_pool = MagicMock()
-            mock_pool.get_connection.return_value = mock_conn
-            mock_pool.release_connection.return_value = None
-            mock_get_pool.return_value = mock_pool
-
-            response = client.patch(
-                "/api/vaults/1/group-access/1",
-                json={"permission": "write"},
-                headers=auth_headers(superadmin_token),
-            )
-            # Connection error should propagate as 500
-            assert response.status_code == 500
+        failing_client = _client_with_failing_db(
+            client=client, exc=sqlite3.OperationalError("database is locked")
+        )
+        response = failing_client.patch(
+            "/api/vaults/1/group-access/1",
+            json={"permission": "write"},
+            headers=auth_headers(superadmin_token),
+        )
+        # Connection error should propagate as 500
+        assert response.status_code == 500
 
     def test_revoke_vault_group_access_reraises_connection_error(self, client):
         """Revoke group access operation re-raises connection errors as 500."""
@@ -448,23 +414,12 @@ class TestUpdateRemoveOperationsReraiseExceptions:
         conn.commit()
         conn.close()
 
-        with patch("app.api.routes.vault_members.get_pool") as mock_get_pool:
-            mock_conn = MagicMock()
-            mock_cursor = MagicMock()
-            mock_cursor.execute.side_effect = sqlite3.OperationalError(
-                "database is locked"
-            )
-            mock_conn.cursor.return_value = mock_cursor
-            mock_conn.commit.return_value = None
-
-            mock_pool = MagicMock()
-            mock_pool.get_connection.return_value = mock_conn
-            mock_pool.release_connection.return_value = None
-            mock_get_pool.return_value = mock_pool
-
-            response = client.delete(
-                "/api/vaults/1/group-access/1",
-                headers=auth_headers(superadmin_token),
-            )
-            # Connection error should propagate as 500
-            assert response.status_code == 500
+        failing_client = _client_with_failing_db(
+            client=client, exc=sqlite3.OperationalError("database is locked")
+        )
+        response = failing_client.delete(
+            "/api/vaults/1/group-access/1",
+            headers=auth_headers(superadmin_token),
+        )
+        # Connection error should propagate as 500
+        assert response.status_code == 500
