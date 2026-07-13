@@ -23,3 +23,21 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
+
+# Coverage gating (H4). Scoped to the SSRF guard modules — these are small,
+# fully exercised in CI, and the security-critical surface this issue's SSRF
+# work touches. A blanket app/ gate would be cargo-cult here because heavy-dep
+# modules (vector_store, document_processor) are stubbed in CI and measure as
+# uncoverable, which would trap future PRs through no fault of the author.
+# app.security is excluded because it is large (303 stmts) and only partially
+# exercised by any given test file; its coverage is tracked by the broader
+# suite over time. See issue #152.
+[tool.coverage.run]
+source = ["app.services.ssrf", "app.services.curator_ssrf"]
+branch = false
+
+[tool.coverage.report]
+# ssrf.py + curator_ssrf.py baseline measured at ~96%. Set at 90 to leave
+# headroom while still catching real regressions in the SSRF guards.
+fail_under = 90
+show_missing = true

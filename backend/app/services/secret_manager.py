@@ -1,7 +1,16 @@
 """Simple secret manager helper."""
 
+import logging
 import os
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Below this length an HMAC key is considered weak. We only warn (not raise) so
+# existing deployments with short-but-set keys are not broken; operators should
+# rotate to a >=32-byte key. 32 bytes = 256 bits, the recommended floor for a
+# keyed hash (HMAC-SHA256).
+_HMAC_KEY_MIN_BYTES = 32
 
 
 class SecretManagerError(RuntimeError):
@@ -23,6 +32,16 @@ class SecretManager:
         if not key:
             raise SecretManagerError(
                 f"HMAC key for version '{version}' is not configured"
+            )
+        if len(key) < _HMAC_KEY_MIN_BYTES:
+            # Non-breaking: warn only. Existing deployments may use short keys;
+            # raising would break them. Operators should rotate to >=32 bytes.
+            logger.warning(
+                "AUDIT_HMAC_KEY for version '%s' is %d bytes; >=%d bytes is "
+                "recommended for HMAC-SHA256. Please rotate to a stronger key.",
+                version,
+                len(key),
+                _HMAC_KEY_MIN_BYTES,
             )
         return key.encode("utf-8"), version
 

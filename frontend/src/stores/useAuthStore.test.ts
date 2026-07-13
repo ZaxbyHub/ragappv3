@@ -701,6 +701,68 @@ describe("useAuthStore", () => {
     });
   });
 
+  describe("localStorage persistence (TEST-FE-001)", () => {
+    // The store uses zustand persist() with name "auth-storage" and partializes
+    // only { user, authMode, needsSetup } — accessToken is deliberately NOT
+    // persisted (H-11 XSS-risk fix). The persist middleware captures its
+    // storage at module-load time, so these tests verify the persistence
+    // contract via the store's persist options (name + partialize) directly,
+    // which is the exact surface that decides what reaches localStorage.
+
+    it("persist store name is 'auth-storage'", () => {
+      // zustand exposes persist config on the store under the persist key.
+      const persistApi: any = (useAuthStore as any).persist;
+      expect(persistApi).toBeDefined();
+      // The options carry the storage name.
+      const options = persistApi?.getOptions?.() ?? persistApi?.options;
+      expect(options?.name).toBe("auth-storage");
+    });
+
+    it("partialize persists only user, authMode, needsSetup", () => {
+      const persistApi: any = (useAuthStore as any).persist;
+      const options = persistApi?.getOptions?.() ?? persistApi?.options;
+      const partialize = options?.partialize;
+      expect(typeof partialize).toBe("function");
+
+      const fullState = {
+        user: mockUser,
+        authMode: "jwt",
+        needsSetup: false,
+        accessToken: "secret-jwt-should-not-persist",
+        isAuthenticated: true,
+        isLoading: false,
+        isInitialized: true,
+      };
+      const persisted = partialize(fullState);
+
+      // Must include the three persisted fields.
+      expect(persisted).toEqual({
+        user: mockUser,
+        authMode: "jwt",
+        needsSetup: false,
+      });
+      // Must NOT include accessToken or any other runtime-only field.
+      expect(persisted).not.toHaveProperty("accessToken");
+      expect(persisted).not.toHaveProperty("isAuthenticated");
+    });
+
+    it("partialize never includes accessToken regardless of store state", () => {
+      const persistApi: any = (useAuthStore as any).persist;
+      const options = persistApi?.getOptions?.() ?? persistApi?.options;
+      const partialize = options?.partialize;
+
+      // Even when accessToken is set, it must not appear in persisted output.
+      const persisted = partialize({
+        ...useAuthStore.getState(),
+        accessToken: "super-secret-jwt",
+      });
+      expect(persisted).not.toHaveProperty("accessToken");
+      // A token present in the live state must never reach the partialized blob.
+      const serialized = JSON.stringify(persisted);
+      expect(serialized).not.toContain("super-secret-jwt");
+    });
+  });
+
   describe("setAuthMode", () => {
     it("should set authMode to jwt", () => {
       const { setAuthMode } = useAuthStore.getState();

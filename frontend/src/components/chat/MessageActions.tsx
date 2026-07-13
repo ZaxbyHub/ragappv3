@@ -20,6 +20,13 @@ import { updateMessageFeedback } from "@/lib/api";
 // CopyButton with toast feedback
 // =============================================================================
 
+// WCAG 2.5.5 / 2.5.8 touch-target size: the visible button is h-9 w-9 (36px)
+// and an absolutely-positioned ::before extends the clickable area to ≥44px on
+// both axes without enlarging the visual glyph, keeping the dense action row
+// compact while meeting the minimum target size. (UI-D3-01)
+const TOUCH_TARGET_44 =
+  "relative h-9 w-9 active:scale-95 before:absolute before:left-1/2 before:top-1/2 before:h-11 before:w-11 before:-translate-x-1/2 before:-translate-y-1/2 before:content-['']";
+
 interface CopyActionProps {
   content: string;
   /** If true, strip [S1] / [Source:…] markers before copying */
@@ -64,7 +71,7 @@ function CopyAction({ content, stripCitations = false, onCopy }: CopyActionProps
         <Button
           variant="ghost"
           size="icon"
-          className="h-7 w-7 active:scale-95"
+          className={TOUCH_TARGET_44}
           onClick={handleCopy}
           aria-label={state === "copied" ? "Copied to clipboard" : state === "error" ? "Copy failed" : "Copy message"}
         >
@@ -172,7 +179,7 @@ function FeedbackActions({
             variant="ghost"
             size="icon"
             className={cn(
-              "h-7 w-7 transition-all duration-150 active:scale-95",
+              "transition-all duration-150 " + TOUCH_TARGET_44,
               current === "up" && "bg-accent text-accent-foreground scale-105"
             )}
             onClick={() => handleFeedback("up")}
@@ -191,7 +198,7 @@ function FeedbackActions({
             variant="ghost"
             size="icon"
             className={cn(
-              "h-7 w-7 transition-all duration-150 active:scale-95",
+              "transition-all duration-150 " + TOUCH_TARGET_44,
               current === "down" && "bg-accent text-accent-foreground scale-105"
             )}
             onClick={() => handleFeedback("down")}
@@ -251,7 +258,7 @@ export function AssistantMessageActions({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-7 w-7 active:scale-95"
+                className={TOUCH_TARGET_44}
                 onClick={onRetry}
                 aria-label="Retry"
               >
@@ -268,7 +275,7 @@ export function AssistantMessageActions({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-7 w-7 active:scale-95"
+                className={TOUCH_TARGET_44}
                 onClick={onFork}
                 aria-label="Branch conversation from here"
               >
@@ -285,7 +292,7 @@ export function AssistantMessageActions({
               <Button
                 variant="ghost"
                 size="icon"
-                className={cn("h-7 w-7 active:scale-95", isDebugActive && "bg-accent text-accent-foreground")}
+                className={cn(TOUCH_TARGET_44, isDebugActive && "bg-accent text-accent-foreground")}
                 onClick={onDebugToggle}
                 aria-label="Toggle debug info"
               >
@@ -336,7 +343,7 @@ export function UserMessageActions({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-7 w-7 active:scale-95"
+                className={TOUCH_TARGET_44}
                 onClick={onEdit}
                 disabled={isEditDisabled}
                 aria-label="Edit message"
@@ -354,7 +361,7 @@ export function UserMessageActions({
               <Button
                 variant="ghost"
                 size="icon"
-                className="h-7 w-7 active:scale-95"
+                className={TOUCH_TARGET_44}
                 onClick={onFork}
                 aria-label="Branch conversation from here"
               >

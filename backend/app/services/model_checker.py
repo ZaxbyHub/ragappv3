@@ -16,6 +16,29 @@ class ModelCheckerError(Exception):
     pass
 
 
+def _model_check_error(timeout: float, exc: BaseException) -> Dict[str, Any]:
+    """Map a model-probe exception to the standard unavailable-result dict.
+
+    Shared by all three model-check methods so the error-handling tail stays
+    identical (TimeoutException / HTTPStatusError / RequestError /
+    ValueError|TypeError|RuntimeError).
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return {'available': False, 'error': f"Request timed out after {timeout}s"}
+    if isinstance(exc, httpx.HTTPStatusError):
+        return {
+            'available': False,
+            'error': f"HTTP error {exc.response.status_code}: {exc.response.text}",
+        }
+    if isinstance(exc, httpx.RequestError):
+        return {'available': False, 'error': f"Request failed: {str(exc)}"}
+    if isinstance(exc, (ValueError, TypeError, RuntimeError)):
+        return {'available': False, 'error': f"Unexpected error: {str(exc)}"}
+    # Should not reach here for the documented exception set; re-raise to avoid
+    # silently swallowing an unexpected error type.
+    raise exc
+
+
 class ModelChecker:
     """Checks availability of embedding and chat models via Ollama or OpenAI-compatible APIs."""
 
@@ -214,26 +237,8 @@ class ModelChecker:
                 'error': f"Model '{model_name}' not found. Available models: {', '.join(available_model_names) or 'none'}"
             }
 
-        except httpx.TimeoutException:
-            return {
-                'available': False,
-                'error': f"Request timed out after {self.timeout}s"
-            }
-        except httpx.HTTPStatusError as e:
-            return {
-                'available': False,
-                'error': f"HTTP error {e.response.status_code}: {e.response.text}"
-            }
-        except httpx.RequestError as e:
-            return {
-                'available': False,
-                'error': f"Request failed: {str(e)}"
-            }
-        except (ValueError, TypeError, RuntimeError) as e:
-            return {
-                'available': False,
-                'error': f"Unexpected error: {str(e)}"
-            }
+        except Exception as e:
+            return _model_check_error(self.timeout, e)
 
     async def _check_tei_model(
         self,
@@ -282,26 +287,8 @@ class ModelChecker:
                 )
             }
 
-        except httpx.TimeoutException:
-            return {
-                'available': False,
-                'error': f"Request timed out after {self.timeout}s"
-            }
-        except httpx.HTTPStatusError as e:
-            return {
-                'available': False,
-                'error': f"HTTP error {e.response.status_code}: {e.response.text}"
-            }
-        except httpx.RequestError as e:
-            return {
-                'available': False,
-                'error': f"Request failed: {str(e)}"
-            }
-        except (ValueError, TypeError, RuntimeError) as e:
-            return {
-                'available': False,
-                'error': f"Unexpected error: {str(e)}"
-            }
+        except Exception as e:
+            return _model_check_error(self.timeout, e)
 
     @model_checker_cb
     async def _check_openai_compatible_model(
@@ -357,23 +344,5 @@ class ModelChecker:
                 'available': False,
                 'error': f"Circuit breaker open: {str(e)}"
             }
-        except httpx.TimeoutException:
-            return {
-                'available': False,
-                'error': f"Request timed out after {self.timeout}s"
-            }
-        except httpx.HTTPStatusError as e:
-            return {
-                'available': False,
-                'error': f"HTTP error {e.response.status_code}: {e.response.text}"
-            }
-        except httpx.RequestError as e:
-            return {
-                'available': False,
-                'error': f"Request failed: {str(e)}"
-            }
-        except (ValueError, TypeError, RuntimeError) as e:
-            return {
-                'available': False,
-                'error': f"Unexpected error: {str(e)}"
-            }
+        except Exception as e:
+            return _model_check_error(self.timeout, e)

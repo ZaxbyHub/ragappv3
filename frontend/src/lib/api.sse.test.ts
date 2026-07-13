@@ -200,3 +200,113 @@ describe("parseSSEStream - regression: backend done completes once (F-001)", () 
     expect(completeCalls).toBe(1);
   });
 });
+
+// Build a reader from raw string chunks (NOT JSON.stringify'd). Used to feed
+// malformed SSE data the makeReader() helper cannot express.
+function makeRawReader(chunks: string[]): ReadableStreamDefaultReader<Uint8Array> {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk));
+      }
+      controller.close();
+    },
+  });
+  return stream.getReader();
+}
+
+describe("parseSSEStream - malformed input handling (TEST-FE-003)", () => {
+  // The parser is expected to drop a malformed (non-JSON) data chunk and keep
+  // streaming rather than throwing or aborting the connection. See
+  // sessions.ts parseSSEStream's bare-catch around JSON.parse.
+
+  it("drops a non-JSON data chunk and continues streaming valid events", async () => {
+    const contents: string[] = [];
+    let completed = false;
+    const errors: string[] = [];
+
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: (c) => contents.push(c),
+      onComplete: () => {
+        completed = true;
+      },
+      onError: (e) => errors.push(e.message),
+    };
+
+    // A garbage data frame, then a valid content event, then [DONE].
+    await parseSSEStream(
+      makeRawReader([
+        "data: this is not json\n\n",
+        `data: ${JSON.stringify({ type: "content", content: "after-garbage" })}\n\n`,
+        "data: [DONE]\n\n",
+      ]),
+      callbacks
+    );
+
+    // The valid event after the garbage must still be delivered.
+    expect(contents).toContain("after-garbage");
+    // The stream must complete normally (not abort on the bad chunk).
+    expect(completed).toBe(true);
+    // The malformed chunk must not surface as a user-visible error.
+    expect(errors).toEqual([]);
+  });
+
+  it("drops a data chunk with the wrong JSON shape but keeps well-formed ones", async () => {
+    const contents: string[] = [];
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: (c) => contents.push(c),
+      onComplete: () => {},
+    };
+
+    await parseSSEStream(
+      makeRawReader([
+        `data: ${JSON.stringify({ unrelated: "shape" })}\n\n`,
+        `data: ${JSON.stringify({ type: "content", content: "good" })}\n\n`,
+        "data: [DONE]\n\n",
+      ]),
+      callbacks
+    );
+
+    expect(contents).toEqual(["good"]);
+  });
+
+  it("completes when a malformed chunk precedes the [DONE] marker", async () => {
+    let completed = false;
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: () => {},
+      onComplete: () => {
+        completed = true;
+      },
+    };
+
+    await parseSSEStream(
+      makeRawReader(["data: {broken\n\n", "data: [DONE]\n\n"]),
+      callbacks
+    );
+
+    expect(completed).toBe(true);
+  });
+
+  it("handles an event split across multiple stream chunks", async () => {
+    const contents: string[] = [];
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: (c) => contents.push(c),
+      onComplete: () => {},
+    };
+
+    const eventJson = JSON.stringify({ type: "content", content: "split-ok" });
+    // The same logical SSE frame arrives in two byte chunks: "data: <partial>"
+    // then "<rest>\n\n" — the parser must buffer across reads and reassemble.
+    await parseSSEStream(
+      makeRawReader([
+        `data: ${eventJson.slice(0, 10)}`,
+        `${eventJson.slice(10)}\n\n`,
+        "data: [DONE]\n\n",
+      ]),
+      callbacks
+    );
+
+    expect(contents).toEqual(["split-ok"]);
+  });
+});

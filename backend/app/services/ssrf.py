@@ -71,25 +71,55 @@ def assert_url_safe(url: str) -> None:
     The caller is expected to also pass ``follow_redirects=False`` to its
     HTTP client so a 30x to a private host can't bypass the guard.
     """
+    _check_url(
+        url,
+        blocked_exc=URLBlocked,
+        opt_in_enabled=_local_services_opt_in_enabled,
+        opt_in_hint=_LOCAL_SERVICES_HINT,
+        label="URL",
+    )
+
+
+def _check_url(
+    url: str,
+    blocked_exc,
+    opt_in_enabled,
+    opt_in_hint: str,
+    label: str = "URL",
+) -> None:
+    """Shared SSRF validation core used by assert_url_safe and curator_ssrf.
+
+    Parameters:
+      - blocked_exc: exception class to raise on rejection (must accept a str).
+      - opt_in_enabled: zero-arg callable evaluated at call time (NOT module
+        load) so tests can flip the env var; must return True when local
+        destinations are allowed.
+      - opt_in_hint: hint string appended to the private-address message.
+      - label: noun used in the empty/scheme/credentials/hostname messages
+        (e.g. "URL" or "Curator URL").
+
+    Kept network-aware (DNS resolution) and identical in semantics across all
+    callers so the curator SSRF guard cannot drift from the general one.
+    """
     if not url or not url.strip():
-        raise URLBlocked("URL is empty.")
+        raise blocked_exc(f"{label} is empty.")
 
     try:
         parsed = urlparse(url.strip())
         parsed_port = parsed.port
     except ValueError as exc:
-        raise URLBlocked(f"URL is malformed: {exc}") from exc
+        raise blocked_exc(f"{label} is malformed: {exc}") from exc
     if parsed.scheme not in ("http", "https"):
-        raise URLBlocked(
-            f"URL scheme must be http or https (got {parsed.scheme!r})."
+        raise blocked_exc(
+            f"{label} scheme must be http or https (got {parsed.scheme!r})."
         )
     if parsed.username or parsed.password:
-        raise URLBlocked(
-            "URL must not embed credentials (user:pass@host)."
+        raise blocked_exc(
+            f"{label} must not embed credentials (user:pass@host)."
         )
     host = parsed.hostname
     if not host:
-        raise URLBlocked("URL has no hostname.")
+        raise blocked_exc(f"{label} has no hostname.")
 
     # Hostname literal IPs short-circuit DNS.
     try:
@@ -99,18 +129,18 @@ def assert_url_safe(url: str) -> None:
         try:
             infos = socket.getaddrinfo(host, parsed_port or 80, type=socket.SOCK_STREAM)
         except OSError as e:
-            raise URLBlocked(
-                f"URL host {host!r} did not resolve: {e}"
+            raise blocked_exc(
+                f"{label} host {host!r} did not resolve: {e}"
             ) from e
         candidates = sorted({info[4][0] for info in infos})
         if not candidates:
-            raise URLBlocked(f"URL host {host!r} resolved to nothing.")
+            raise blocked_exc(f"{label} host {host!r} resolved to nothing.")
 
     blocked = [ip for ip in candidates if _is_blocked_address(ip)]
-    if blocked and not _local_services_opt_in_enabled():
+    if blocked and not opt_in_enabled():
         # Don't echo the resolved IPs back — saying "private/loopback"
         # is enough for the operator and avoids leaking internal DNS.
-        raise URLBlocked(
-            f"URL host {host!r} resolves to a private / loopback / "
-            f"link-local address. {_LOCAL_SERVICES_HINT}"
+        raise blocked_exc(
+            f"{label} host {host!r} resolves to a private / loopback / "
+            f"link-local address. {opt_in_hint}"
         )

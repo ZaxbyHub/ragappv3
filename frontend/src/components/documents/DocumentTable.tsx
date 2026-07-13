@@ -102,7 +102,12 @@ export function DocumentTable({
     <Card className="hidden sm:block">
       <CardContent className="p-0">
         <div ref={tableScrollRef} className="overflow-auto" style={{ maxHeight: "70vh" }}>
-          <table className="w-full" style={{ tableLayout: "fixed" }}>
+          <table
+            className="w-full"
+            style={{ tableLayout: "fixed" }}
+            aria-rowcount={documents.length + 1}
+            aria-colcount={10}
+          >
             <caption className="sr-only">Documents List</caption>
             <thead style={{ position: "sticky", top: 0, zIndex: 10 }}>
               <tr role="row" className="border-b bg-muted" style={{ display: "flex" }}>
@@ -184,6 +189,7 @@ export function DocumentTable({
                   <tr
                     key={docId}
                     role="row"
+                    aria-rowindex={virtualItem.index + 2}
                     data-index={virtualItem.index}
                     ref={tableVirtualizer.measureElement}
                     style={{

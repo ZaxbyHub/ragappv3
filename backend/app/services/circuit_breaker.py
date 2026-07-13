@@ -281,29 +281,3 @@ model_checker_cb = AsyncCircuitBreaker(
     reset_timeout=30,
     name="model_checker",
 )
-
-
-# Keep these for backward compatibility with existing code
-def _on_circuit_open(cb: Any) -> None:
-    """Callback invoked when a circuit breaker opens."""
-    logger.warning(
-        "Circuit breaker '%s' opened after %d consecutive failures",
-        cb.name if hasattr(cb, 'name') else 'unknown',
-        cb.fail_max if hasattr(cb, 'fail_max') else 0,
-    )
-
-
-def _on_circuit_close(cb: Any) -> None:
-    """Callback invoked when a circuit breaker closes."""
-    logger.info(
-        "Circuit breaker '%s' closed - service recovered",
-        cb.name if hasattr(cb, 'name') else 'unknown',
-    )
-
-
-def _on_half_open(cb: Any) -> None:
-    """Callback invoked when a circuit breaker enters half-open state."""
-    logger.info(
-        "Circuit breaker '%s' entering half-open state - testing service",
-        cb.name if hasattr(cb, 'name') else 'unknown',
-    )
