@@ -35,13 +35,18 @@ class TestSanitizeOnPersist(unittest.TestCase):
         )
         self.conn.commit()
 
-        # Patch evaluate_policy so the route doesn't attempt a live DB lookup.
+        # Patch get_evaluate_policy so the route doesn't attempt a live DB lookup.
         # These tests focus on sanitization behaviour, not authorization.
         self._policy_patcher = patch(
-            "app.api.routes.chat.evaluate_policy",
-            new=AsyncMock(return_value=True),
+            "app.api.deps.get_evaluate_policy",
+            new=lambda db: AsyncMock(return_value=True),
         )
         self._policy_patcher.start()
+
+        async def allow_write(*args, **kwargs):
+            return True
+
+        self._allow_write = allow_write
 
         self.mock_request = MagicMock(spec=Request)
         self.mock_request.client.host = "127.0.0.1"
@@ -73,6 +78,7 @@ class TestSanitizeOnPersist(unittest.TestCase):
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,
+                evaluate=self._allow_write,
             )
         )
 
@@ -101,6 +107,7 @@ class TestSanitizeOnPersist(unittest.TestCase):
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,
+                evaluate=self._allow_write,
             )
         )
         # User content is preserved verbatim.
@@ -137,6 +144,7 @@ class TestSanitizeOnPersist(unittest.TestCase):
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,
+                evaluate=self._allow_write,
             )
         )
         self.assertIsNotNone(result.get("memories"))

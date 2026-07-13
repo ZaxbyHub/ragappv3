@@ -9,15 +9,15 @@ import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.api.deps import (
-    evaluate_policy,
     get_current_active_user,
     get_db,
+    get_evaluate_policy,
     get_memory_store,
     require_model_ready,
 )
@@ -258,6 +258,7 @@ async def list_memories(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """
     List all memories.
@@ -271,7 +272,7 @@ async def list_memories(
       Non-admin callers should specify vault_id explicitly.
     """
     if vault_id is not None:
-        if not await evaluate_policy(user, "vault", vault_id, "read"):
+        if not await evaluate(user, "vault", vault_id, "read"):
             raise HTTPException(status_code=403, detail="No read access to this vault")
         # Include global memories (vault_id IS NULL) alongside vault-scoped memories
         cursor = await asyncio.to_thread(
@@ -339,6 +340,8 @@ async def create_memory(
     memory_store: MemoryStore = Depends(get_memory_store),
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
+    conn: sqlite3.Connection = Depends(get_db),
+    evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """
     Create a new memory.
@@ -346,7 +349,7 @@ async def create_memory(
     Uses MemoryStore.add_memory to add a new memory to the database.
     """
     if body.vault_id is not None:
-        if not await evaluate_policy(user, "vault", body.vault_id, "write"):
+        if not await evaluate(user, "vault", body.vault_id, "write"):
             raise HTTPException(status_code=403, detail="No write access to this vault")
     try:
         record = await asyncio.to_thread(
@@ -390,6 +393,7 @@ async def update_memory(
     user: dict = Depends(get_current_active_user),
     memory_store: MemoryStore = Depends(get_memory_store),
     _csrf_token: str = Depends(csrf_protect),
+    evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """
     Update an existing memory.
@@ -411,7 +415,7 @@ async def update_memory(
         # Check vault write permission
         memory_vault_id = row[1]
         if memory_vault_id is not None:
-            if not await evaluate_policy(user, "vault", memory_vault_id, "write"):
+            if not await evaluate(user, "vault", memory_vault_id, "write"):
                 raise HTTPException(
                     status_code=403, detail="No write access to this vault"
                 )
@@ -569,6 +573,7 @@ async def delete_memory(
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
+    evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """
     Delete a memory.
@@ -589,7 +594,7 @@ async def delete_memory(
     # Check vault admin permission
     memory_vault_id = row[1]
     if memory_vault_id is not None:
-        if not await evaluate_policy(user, "vault", memory_vault_id, "admin"):
+        if not await evaluate(user, "vault", memory_vault_id, "admin"):
             raise HTTPException(status_code=403, detail="No admin access to this vault")
 
     # Mark wiki claims stale before removing the memory record.
@@ -617,14 +622,17 @@ async def delete_memory(
     return {"message": f"Memory {memory_id} deleted successfully", "forgotten": True}
 
 
-async def _authorize_memory_search(user: dict, vault_id: Optional[int]) -> None:
+async def _authorize_memory_search(
+    user: dict, vault_id: Optional[int], db: sqlite3.Connection
+) -> None:
     """Enforce vault read access for memory search/list operations.
 
     - vault_id=N → require read access on vault N.
     - vault_id=None → admin/superadmin only (broad search across all vaults).
     """
+    evaluate = get_evaluate_policy(db)
     if vault_id is not None:
-        if not await evaluate_policy(user, "vault", vault_id, "read"):
+        if not await evaluate(user, "vault", vault_id, "read"):
             raise HTTPException(status_code=403, detail="No read access to this vault")
     else:
         if user.get("role") not in ("superadmin", "admin"):
@@ -639,6 +647,7 @@ async def search_memories(
     query: str = Query(..., min_length=1, description="Search query string"),
     limit: int = Query(5, ge=1, le=100, description="Maximum number of results"),
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
+    conn: sqlite3.Connection = Depends(get_db),
     memory_store: MemoryStore = Depends(get_memory_store),
     user: dict = Depends(get_current_active_user),
     _: None = Depends(require_model_ready),
@@ -652,7 +661,7 @@ async def search_memories(
     Authorization: requires vault read access when vault_id is provided;
     admin/superadmin only when vault_id is omitted (cross-vault search).
     """
-    await _authorize_memory_search(user, vault_id)
+    await _authorize_memory_search(user, vault_id, conn)
     results = await _perform_memory_search(memory_store, query, limit, vault_id)
     return MemorySearchResponse(results=results, total=len(results))
 
@@ -664,13 +673,14 @@ async def search_memories_post(
     user: dict = Depends(get_current_active_user),
     _csrf_token: str = Depends(csrf_protect),
     _: None = Depends(require_model_ready),
+    conn: sqlite3.Connection = Depends(get_db),
 ):
     """Search memories via POST (request body).
 
     Authorization: requires vault read access when vault_id is provided;
     admin/superadmin only when vault_id is omitted (cross-vault search).
     """
-    await _authorize_memory_search(user, request.vault_id)
+    await _authorize_memory_search(user, request.vault_id, conn)
     # Handle empty or whitespace-only queries gracefully
     if not request.query or not request.query.strip():
         return MemorySearchResponse(results=[], total=0)
