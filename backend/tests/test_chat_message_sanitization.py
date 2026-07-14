@@ -6,7 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from starlette.requests import Request
 
@@ -35,19 +35,17 @@ class TestSanitizeOnPersist(unittest.TestCase):
         )
         self.conn.commit()
 
-        # Patch evaluate_policy so the route doesn't attempt a live DB lookup.
-        # These tests focus on sanitization behaviour, not authorization.
-        self._policy_patcher = patch(
-            "app.api.routes.chat.evaluate_policy",
-            new=AsyncMock(return_value=True),
-        )
-        self._policy_patcher.start()
+        # These tests focus on sanitization behaviour, not authorization. The
+        # route's policy check is satisfied by passing an allow-all evaluate
+        # callable directly (the route now takes evaluate via DI, so direct
+        # calls receive it as a parameter rather than via module patching).
+        self._allow_evaluate = AsyncMock(return_value=True)
 
         self.mock_request = MagicMock(spec=Request)
         self.mock_request.client.host = "127.0.0.1"
 
     def tearDown(self):
-        self._policy_patcher.stop()
+        pass
         try:
             self.conn.close()
         finally:
@@ -73,6 +71,7 @@ class TestSanitizeOnPersist(unittest.TestCase):
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,
+                evaluate=self._allow_evaluate,
             )
         )
 
@@ -101,6 +100,7 @@ class TestSanitizeOnPersist(unittest.TestCase):
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,
+                evaluate=self._allow_evaluate,
             )
         )
         # User content is preserved verbatim.
@@ -137,6 +137,7 @@ class TestSanitizeOnPersist(unittest.TestCase):
                 conn=self.conn,
                 user={"id": 1, "username": "u", "role": "admin"},
                 rag_engine=None,
+                evaluate=self._allow_evaluate,
             )
         )
         self.assertIsNotNone(result.get("memories"))

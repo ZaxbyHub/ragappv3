@@ -12,14 +12,13 @@ import json
 import logging
 import sqlite3
 from html import escape as _xml_escape
-from typing import Any, Dict, List, Literal, Optional, Set
+from typing import Any, Callable, Dict, List, Literal, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
-    evaluate_policy,
     get_current_active_user,
     get_db,
     get_evaluate_policy,
@@ -823,6 +822,7 @@ async def get_session(
     session_id: int,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """
     Get a specific chat session with all its messages.
@@ -838,7 +838,7 @@ async def get_session(
     if session_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", session_row[1], "read"):
+    if not await evaluate(user, "vault", session_row[1], "read"):
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
     # Detect optional columns (older databases may lack them).
@@ -993,6 +993,7 @@ async def create_session(
     body: CreateSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """
@@ -1000,7 +1001,7 @@ async def create_session(
 
     Returns the created session with its ID.
     """
-    if not await evaluate_policy(user, "vault", body.vault_id, "write"):
+    if not await evaluate(user, "vault", body.vault_id, "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     query = "INSERT INTO chat_sessions (vault_id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
@@ -1034,6 +1035,7 @@ async def fork_session(
     body: ForkSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """
@@ -1053,7 +1055,7 @@ async def fork_session(
         raise HTTPException(status_code=404, detail="Session not found")
 
     vault_id = session_row[1]
-    if not await evaluate_policy(user, "vault", vault_id, "write"):
+    if not await evaluate(user, "vault", vault_id, "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     # Detect optional columns on chat_messages.
@@ -1461,6 +1463,7 @@ async def add_message(
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
     rag_engine: Optional[RAGEngine] = Depends(get_rag_engine),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """
@@ -1479,7 +1482,7 @@ async def add_message(
     if session_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", session_row[2], "write"):
+    if not await evaluate(user, "vault", session_row[2], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     # Check if this is the first message
@@ -1670,6 +1673,7 @@ async def set_message_feedback(
     body: FeedbackRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """
@@ -1697,7 +1701,7 @@ async def set_message_feedback(
     if session_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", session_row[1], "write"):
+    if not await evaluate(user, "vault", session_row[1], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     session_owner_id = session_row[2]
@@ -1759,6 +1763,7 @@ async def update_session(
     body: UpdateSessionRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """
@@ -1774,7 +1779,7 @@ async def update_session(
     if select_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", select_row[1], "write"):
+    if not await evaluate(user, "vault", select_row[1], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     # Update session
@@ -1806,6 +1811,7 @@ async def delete_session(
     session_id: int,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """
@@ -1822,7 +1828,7 @@ async def delete_session(
     if select_row is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if not await evaluate_policy(user, "vault", select_row[1], "write"):
+    if not await evaluate(user, "vault", select_row[1], "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
     # Delete session (CASCADE will delete messages)

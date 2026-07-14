@@ -36,7 +36,7 @@ class FailingMessageCopyConnection(sqlite3.Connection):
 
 @pytest.mark.asyncio
 async def test_fork_response_returns_inserted_message_ids_and_created_at(
-    tmp_path, monkeypatch
+    tmp_path,
 ):
     db_path = tmp_path / "fork-success.db"
     init_db(str(db_path))
@@ -59,14 +59,13 @@ async def test_fork_response_returns_inserted_message_ids_and_created_at(
         async def allow_write(*args):
             return True
 
-        monkeypatch.setattr(chat_routes, "evaluate_policy", allow_write)
-
         response = await chat_routes.fork_session(
             _mock_request(),
             source_session_id,
             chat_routes.ForkSessionRequest(message_index=1),
             conn,
             {"id": 1},
+            evaluate=allow_write,
         )
 
         assert response["forked_from_session_id"] == source_session_id
@@ -83,7 +82,7 @@ async def test_fork_response_returns_inserted_message_ids_and_created_at(
 
 @pytest.mark.asyncio
 async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
-    tmp_path, monkeypatch
+    tmp_path,
 ):
     db_path = tmp_path / "fork-wiki-refs.db"
     init_db(str(db_path))
@@ -112,14 +111,13 @@ async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
         async def allow_write(*args):
             return True
 
-        monkeypatch.setattr(chat_routes, "evaluate_policy", allow_write)
-
         response = await chat_routes.fork_session(
             _mock_request(),
             source_session_id,
             chat_routes.ForkSessionRequest(message_index=0),
             conn,
             {"id": 1},
+            evaluate=allow_write,
         )
 
         forked_session_id = response["id"]
@@ -135,7 +133,7 @@ async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
 
 
 @pytest.mark.asyncio
-async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path, monkeypatch):
+async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path):
     db_path = tmp_path / "fork-atomicity.db"
     init_db(str(db_path))
     conn = sqlite3.connect(
@@ -161,7 +159,6 @@ async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path, monkeyp
         async def allow_write(*args):
             return True
 
-        monkeypatch.setattr(chat_routes, "evaluate_policy", allow_write)
         conn.fail_message_copy = True
         conn.fail_after_message_copies = 1
 
@@ -172,6 +169,7 @@ async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path, monkeyp
                 chat_routes.ForkSessionRequest(message_index=1),
                 conn,
                 {"id": 1},
+                evaluate=allow_write,
             )
 
         branch_count = conn.execute(
