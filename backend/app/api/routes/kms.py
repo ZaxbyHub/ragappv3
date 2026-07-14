@@ -9,7 +9,7 @@ endpoints follow vault access permissions, mirroring the wiki routes.
 import logging
 import sqlite3
 from dataclasses import asdict
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -53,14 +53,12 @@ def _entry_dict(entry) -> dict:
     return d
 
 
-async def _require_vault_read(db: sqlite3.Connection, user: dict, vault_id: int) -> None:
-    evaluate = get_evaluate_policy(db)
+async def _require_vault_read(evaluate: Callable, user: dict, vault_id: int) -> None:
     if not await evaluate(user, "vault", vault_id, "read"):
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
 
-async def _require_vault_write(db: sqlite3.Connection, user: dict, vault_id: int) -> None:
-    evaluate = get_evaluate_policy(db)
+async def _require_vault_write(evaluate: Callable, user: dict, vault_id: int) -> None:
     if not await evaluate(user, "vault", vault_id, "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
@@ -115,9 +113,10 @@ async def list_kms_entries(
     per_page: int = Query(50, ge=1, le=200),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
 ):
-    await _require_vault_read(db, user, vault_id)
+    await _require_vault_read(evaluate, user, vault_id)
     store = KMSStore(db)
     entries = store.list_entries(
         vault_id, status=status, tag=tag, search=search, page=page, per_page=per_page
@@ -136,10 +135,11 @@ async def create_kms_entry(
     request: KMSEntryCreateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(db, user, request.vault_id)
+    await _require_vault_write(evaluate, user, request.vault_id)
     _validate_status(request.status)
     store = KMSStore(db)
     try:
@@ -165,13 +165,14 @@ async def get_kms_entry(
     entry_id: int,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
 ):
     store = KMSStore(db)
     entry = store.get_entry(entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail="KMS entry not found")
-    await _require_vault_read(db, user, entry.vault_id)
+    await _require_vault_read(evaluate, user, entry.vault_id)
     return _entry_dict(entry)
 
 
@@ -181,6 +182,7 @@ async def update_kms_entry(
     request: KMSEntryUpdateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
     _csrf_token: str = Depends(csrf_protect),
 ):
@@ -188,7 +190,7 @@ async def update_kms_entry(
     entry = store.get_entry(entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail="KMS entry not found")
-    await _require_vault_write(db, user, entry.vault_id)
+    await _require_vault_write(evaluate, user, entry.vault_id)
     _validate_status(request.status)
     updates = request.model_dump(exclude_none=True)
     updated = store.update_entry(entry_id, entry.vault_id, **updates)
@@ -202,6 +204,7 @@ async def delete_kms_entry(
     entry_id: int,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
     _csrf_token: str = Depends(csrf_protect),
 ):
@@ -209,7 +212,7 @@ async def delete_kms_entry(
     entry = store.get_entry(entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail="KMS entry not found")
-    await _require_vault_write(db, user, entry.vault_id)
+    await _require_vault_write(evaluate, user, entry.vault_id)
     store.delete_entry(entry_id, entry.vault_id)
 
 
@@ -226,10 +229,11 @@ async def search_kms(
     per_page: int = Query(50, ge=1, le=200),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
     _model_ready: None = Depends(require_model_ready),
 ):
-    await _require_vault_read(db, user, vault_id)
+    await _require_vault_read(evaluate, user, vault_id)
     store = KMSStore(db)
     entries = store.list_entries(vault_id, search=q, page=page, per_page=per_page)
     total = store.count_entries(vault_id, search=q)
@@ -253,11 +257,12 @@ async def compile_document_kms(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Enqueue a KMS ingest job for an already-indexed document."""
-    await _require_vault_write(db, user, vault_id)
+    await _require_vault_write(evaluate, user, vault_id)
     db.row_factory = sqlite3.Row
     file_row = db.execute(
         "SELECT id FROM files WHERE id = ? AND vault_id = ?",
@@ -282,11 +287,12 @@ async def recompile_vault_kms(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Enqueue a settings_reindex job to recompile all document entries in a vault."""
-    await _require_vault_write(db, user, vault_id)
+    await _require_vault_write(evaluate, user, vault_id)
     store = KMSStore(db)
     job = store.create_job(
         vault_id=vault_id,
@@ -308,9 +314,10 @@ async def list_kms_jobs(
     status: Optional[str] = Query(None),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
 ):
-    await _require_vault_read(db, user, vault_id)
+    await _require_vault_read(evaluate, user, vault_id)
     store = KMSStore(db)
     jobs = store.list_jobs(vault_id, status=status)
     return {"jobs": [asdict(j) for j in jobs]}
@@ -322,9 +329,10 @@ async def get_kms_job(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
 ):
-    await _require_vault_read(db, user, vault_id)
+    await _require_vault_read(evaluate, user, vault_id)
     store = KMSStore(db)
     job = store.get_job(job_id, vault_id)
     if not job:

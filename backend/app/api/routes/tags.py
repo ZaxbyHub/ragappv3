@@ -9,7 +9,7 @@ Mutating endpoints are CSRF-protected.
 import logging
 import sqlite3
 from dataclasses import asdict
-from typing import Optional
+from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -33,14 +33,12 @@ router = APIRouter(prefix="/tags", tags=["tags"])
 # ---------------------------------------------------------------------------
 
 
-async def _require_vault_read(db: sqlite3.Connection, user: dict, vault_id: int) -> None:
-    evaluate = get_evaluate_policy(db)
+async def _require_vault_read(evaluate: Callable, user: dict, vault_id: int) -> None:
     if not await evaluate(user, "vault", vault_id, "read"):
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
 
-async def _require_vault_write(db: sqlite3.Connection, user: dict, vault_id: int) -> None:
-    evaluate = get_evaluate_policy(db)
+async def _require_vault_write(evaluate: Callable, user: dict, vault_id: int) -> None:
     if not await evaluate(user, "vault", vault_id, "write"):
         raise HTTPException(status_code=403, detail="No write access to this vault")
 
@@ -88,8 +86,9 @@ async def list_tags(
     vault_id: int = Query(..., description="Vault ID"),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
 ):
-    await _require_vault_read(db, user, vault_id)
+    await _require_vault_read(evaluate, user, vault_id)
     store = TagStore(db)
     return {"tags": [asdict(t) for t in store.list_tags(vault_id)]}
 
@@ -99,9 +98,10 @@ async def create_tag(
     request: TagCreateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(db, user, request.vault_id)
+    await _require_vault_write(evaluate, user, request.vault_id)
     store = TagStore(db)
     try:
         tag = store.create_tag(request.vault_id, request.name, request.color)
@@ -118,12 +118,13 @@ async def update_tag(
     request: TagUpdateRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     vault_id = _tag_vault_id(db, tag_id)
     if vault_id is None:
         raise HTTPException(status_code=404, detail="Tag not found")
-    await _require_vault_write(db, user, vault_id)
+    await _require_vault_write(evaluate, user, vault_id)
     store = TagStore(db)
     try:
         updated = store.update_tag(
@@ -143,12 +144,13 @@ async def delete_tag(
     tag_id: int,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     vault_id = _tag_vault_id(db, tag_id)
     if vault_id is None:
         raise HTTPException(status_code=404, detail="Tag not found")
-    await _require_vault_write(db, user, vault_id)
+    await _require_vault_write(evaluate, user, vault_id)
     store = TagStore(db)
     store.delete_tag(tag_id, vault_id)
 
@@ -163,10 +165,11 @@ async def assign_tags(
     request: TagAssignRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Bulk-assign one or more tags to one or more documents in a vault."""
-    await _require_vault_write(db, user, request.vault_id)
+    await _require_vault_write(evaluate, user, request.vault_id)
     store = TagStore(db)
     created = store.assign_tags(request.vault_id, request.file_ids, request.tag_ids)
     return {"assigned": created}
@@ -178,8 +181,9 @@ async def list_document_tags(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_user_or_service_account),
+    evaluate: Callable = Depends(get_evaluate_policy),
 ):
-    await _require_vault_read(db, user, vault_id)
+    await _require_vault_read(evaluate, user, vault_id)
     db.row_factory = sqlite3.Row
     row = db.execute(
         "SELECT id FROM files WHERE id = ? AND vault_id = ?", (file_id, vault_id)
@@ -196,10 +200,11 @@ async def set_document_tags(
     request: DocumentTagsSetRequest,
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Replace the full tag set for a single document."""
-    await _require_vault_write(db, user, request.vault_id)
+    await _require_vault_write(evaluate, user, request.vault_id)
     db.row_factory = sqlite3.Row
     row = db.execute(
         "SELECT id FROM files WHERE id = ? AND vault_id = ?",
@@ -219,8 +224,9 @@ async def unassign_tag(
     vault_id: int = Query(...),
     db: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ):
-    await _require_vault_write(db, user, vault_id)
+    await _require_vault_write(evaluate, user, vault_id)
     store = TagStore(db)
     store.unassign_tag(vault_id, file_id, tag_id)

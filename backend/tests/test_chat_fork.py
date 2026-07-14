@@ -36,7 +36,7 @@ class FailingMessageCopyConnection(sqlite3.Connection):
 
 @pytest.mark.asyncio
 async def test_fork_response_returns_inserted_message_ids_and_created_at(
-    tmp_path, monkeypatch
+    tmp_path,
 ):
     db_path = tmp_path / "fork-success.db"
     init_db(str(db_path))
@@ -82,7 +82,7 @@ async def test_fork_response_returns_inserted_message_ids_and_created_at(
 
 @pytest.mark.asyncio
 async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
-    tmp_path, monkeypatch
+    tmp_path,
 ):
     db_path = tmp_path / "fork-wiki-refs.db"
     init_db(str(db_path))
@@ -133,7 +133,7 @@ async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
 
 
 @pytest.mark.asyncio
-async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path, monkeypatch):
+async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path):
     db_path = tmp_path / "fork-atomicity.db"
     init_db(str(db_path))
     conn = sqlite3.connect(

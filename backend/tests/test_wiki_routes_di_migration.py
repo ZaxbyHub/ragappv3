@@ -304,52 +304,50 @@ class TestWikiEventsStreamDI(WikiDITestBase):
 
 class TestRequireVaultHelpersDI(WikiDITestBase):
     """
-    Verify the helpers receive the injected db, NOT a fresh connection.
+    Verify the helpers receive the injected evaluate callable, NOT a fresh connection.
 
-    The key security property: _require_vault_read and _require_vault_write
-    must call get_evaluate_policy(db) — not evaluate_policy() which would
-    open a standalone pool connection.
+    The key security property: endpoints receive evaluate: Callable from
+    Depends(get_evaluate_policy) and pass it to _require_vault_read/_require_vault_write,
+    which call evaluate() directly — no new pool connection is opened.
     """
 
-    def test_require_vault_read_called_with_injected_db(self):
+    def test_require_vault_read_called_with_evaluate(self):
         """
-        Capture the db object passed to _require_vault_read and verify
-        it is the same connection object from our pool override.
+        Capture the evaluate callable passed to _require_vault_read and verify
+        it is a Callable (not a db connection).
         """
-        captured_db = []
+        captured_evaluate = []
 
         original_require_vault_read = __import__(
             "app.api.routes.wiki",
             fromlist=["_require_vault_read"]
         )._require_vault_read
 
-        async def patched_require_vault_read(db, user, vault_id):
-            captured_db.append(db)
-            # Fall through to the real implementation.
-            return await original_require_vault_read(db, user, vault_id)
+        async def patched_require_vault_read(evaluate, user, vault_id):
+            captured_evaluate.append(evaluate)
+            return await original_require_vault_read(evaluate, user, vault_id)
 
         with patch("app.api.routes.wiki._require_vault_read", patched_require_vault_read):
             resp = self.client.get("/api/wiki/pages", params={"vault_id": 1})
             self.assertEqual(resp.status_code, 200, resp.text)
 
-        self.assertEqual(len(captured_db), 1, "Must capture exactly one db call")
-        # The captured db must be a sqlite3.Connection (our pool returns Row-wrapped connections).
-        self.assertIsInstance(captured_db[0], sqlite3.Connection)
+        self.assertEqual(len(captured_evaluate), 1, "Must capture exactly one evaluate call")
+        self.assertTrue(callable(captured_evaluate[0]), "evaluate must be a Callable")
 
-    def test_require_vault_write_called_with_injected_db(self):
+    def test_require_vault_write_called_with_evaluate(self):
         """
-        Capture the db object passed to _require_vault_write.
+        Capture the evaluate callable passed to _require_vault_write.
         """
-        captured_db = []
+        captured_evaluate = []
 
         original_require_vault_write = __import__(
             "app.api.routes.wiki",
             fromlist=["_require_vault_write"]
         )._require_vault_write
 
-        async def patched_require_vault_write(db, user, vault_id):
-            captured_db.append(db)
-            return await original_require_vault_write(db, user, vault_id)
+        async def patched_require_vault_write(evaluate, user, vault_id):
+            captured_evaluate.append(evaluate)
+            return await original_require_vault_write(evaluate, user, vault_id)
 
         with patch("app.api.routes.wiki._require_vault_write", patched_require_vault_write):
             resp = self.client.post(
@@ -358,32 +356,8 @@ class TestRequireVaultHelpersDI(WikiDITestBase):
             )
             self.assertEqual(resp.status_code, 201, resp.text)
 
-        self.assertEqual(len(captured_db), 1)
-        self.assertIsInstance(captured_db[0], sqlite3.Connection)
-
-    def test_get_evaluate_policy_called_with_injected_db(self):
-        """
-        Verify that inside _require_vault_read, get_evaluate_policy is called
-        with the SAME db object that was injected, not a fresh connection.
-        """
-        call_records = []
-
-        original_get_evaluate_policy = __import__(
-            "app.api.deps", fromlist=["get_evaluate_policy"]
-        ).get_evaluate_policy
-
-        def patched_get_evaluate_policy(db):
-            call_records.append(("get_evaluate_policy", db))
-            return original_get_evaluate_policy(db)
-
-        with patch("app.api.routes.wiki.get_evaluate_policy", patched_get_evaluate_policy):
-            resp = self.client.get("/api/wiki/pages", params={"vault_id": 1})
-            self.assertEqual(resp.status_code, 200, resp.text)
-
-        self.assertEqual(len(call_records), 1)
-        method_name, passed_db = call_records[0]
-        self.assertEqual(method_name, "get_evaluate_policy")
-        self.assertIsInstance(passed_db, sqlite3.Connection)
+        self.assertEqual(len(captured_evaluate), 1)
+        self.assertTrue(callable(captured_evaluate[0]), "evaluate must be a Callable")
 
 
 # ---------------------------------------------------------------------------
@@ -398,8 +372,11 @@ class TestWikiPermissionsAfterMigration(WikiDITestBase):
     def test_no_read_access_returns_403(self):
         """
         A user with no vault membership gets 403 on wiki read endpoints.
-        We use a non-superadmin mock to verify policy is consulted.
+        We use a non-superadmin mock and verify the real policy is consulted.
         """
+        # Remove the get_evaluate_policy override so real policy is used.
+        app.dependency_overrides.pop(get_evaluate_policy, None)
+
         # Override with a non-privileged user.
         app.dependency_overrides[get_current_active_user] = lambda: {
             "id": 99,
@@ -418,6 +395,9 @@ class TestWikiPermissionsAfterMigration(WikiDITestBase):
         """
         A user without write permission gets 403 when creating wiki content.
         """
+        # Remove the get_evaluate_policy override so real policy is used.
+        app.dependency_overrides.pop(get_evaluate_policy, None)
+
         app.dependency_overrides[get_current_active_user] = lambda: {
             "id": 99,
             "username": "stranger",

@@ -398,6 +398,7 @@ class TestPreMigrationConcurrentVaultRequests(BaseConcurrentVaultRequestsTest):
         self._patch = None
         super().tearDown()
 
+    @unittest.skip("Obsolete after DI migration: patch no longer affects code path (FastAPI DI resolves get_evaluate_policy from deps, not route module)")
     async def test_pre_migration_behaviour_causes_pool_exhaustion(self):
         """Phase A: pre-migration behaviour (second-connection-per-evaluate)
         oversubscribes the size-10 pool with 10 concurrent requests, causing

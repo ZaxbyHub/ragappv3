@@ -185,23 +185,21 @@ class TestTagsEvaluateDI(unittest.IsolatedAsyncioTestCase):
         self._tags_module = tags_module
         self._mock_db = MagicMock()
 
-    async def test_require_vault_read_forwards_db_to_get_evaluate_policy(self):
-        """get_evaluate_policy is called with the same db that the endpoint received."""
+    async def test_require_vault_read_forwards_evaluate_to_policy(self):
+        """_require_vault_read forwards the evaluate callable to the policy."""
         user = {"id": 3, "role": "member"}
         mock_evaluate = AsyncMock(return_value=True)
 
-        with patch.object(self._tags_module, "get_evaluate_policy", return_value=mock_evaluate):
-            await self._tags_module._require_vault_read(self._mock_db, user, vault_id=2)
+        await self._tags_module._require_vault_read(mock_evaluate, user, vault_id=2)
 
         mock_evaluate.assert_called_once_with(user, "vault", 2, "read")
 
-    async def test_require_vault_write_forwards_db_to_get_evaluate_policy(self):
-        """get_evaluate_policy is called with the same db that the endpoint received."""
+    async def test_require_vault_write_forwards_evaluate_to_policy(self):
+        """_require_vault_write forwards the evaluate callable to the policy."""
         user = {"id": 3, "role": "member"}
         mock_evaluate = AsyncMock(return_value=True)
 
-        with patch.object(self._tags_module, "get_evaluate_policy", return_value=mock_evaluate):
-            await self._tags_module._require_vault_write(self._mock_db, user, vault_id=2)
+        await self._tags_module._require_vault_write(mock_evaluate, user, vault_id=2)
 
         mock_evaluate.assert_called_once_with(user, "vault", 2, "write")
 
@@ -212,9 +210,8 @@ class TestTagsEvaluateDI(unittest.IsolatedAsyncioTestCase):
         false_evaluate = AsyncMock(return_value=False)
         user = {"id": 3, "role": "member"}
 
-        with patch.object(self._tags_module, "get_evaluate_policy", return_value=false_evaluate):
-            with self.assertRaises(HTTPException) as ctx:
-                await self._tags_module._require_vault_read(self._mock_db, user, vault_id=99)
+        with self.assertRaises(HTTPException) as ctx:
+            await self._tags_module._require_vault_read(false_evaluate, user, vault_id=99)
 
         self.assertEqual(ctx.exception.status_code, 403)
         self.assertIn("read access", ctx.exception.detail)
@@ -226,9 +223,8 @@ class TestTagsEvaluateDI(unittest.IsolatedAsyncioTestCase):
         false_evaluate = AsyncMock(return_value=False)
         user = {"id": 3, "role": "member"}
 
-        with patch.object(self._tags_module, "get_evaluate_policy", return_value=false_evaluate):
-            with self.assertRaises(HTTPException) as ctx:
-                await self._tags_module._require_vault_write(self._mock_db, user, vault_id=99)
+        with self.assertRaises(HTTPException) as ctx:
+            await self._tags_module._require_vault_write(false_evaluate, user, vault_id=99)
 
         self.assertEqual(ctx.exception.status_code, 403)
         self.assertIn("write access", ctx.exception.detail)

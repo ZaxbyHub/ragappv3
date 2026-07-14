@@ -88,9 +88,7 @@ class TestGetSessionPolicyDI:
         resp = client.get("/api/chat/sessions/1")
         # Should not be 403 "No read access" — may be 404 or any other code
         # but the evaluate path is confirmed reachable
-        assert not (
-            resp.status_code == 403 and "No read access" in resp.text
-        ), "evaluate=True should not produce a permission-denied 403"
+        assert resp.status_code != 403, f"evaluate=True should not produce 403, got {resp.status_code}: {resp.text}"
 
 
 class TestCreateSessionPolicyDI:
@@ -111,9 +109,7 @@ class TestCreateSessionPolicyDI:
         client = TestClient(app)
 
         resp = client.post("/api/chat/sessions", json={"vault_id": 3})
-        assert not (
-            resp.status_code == 403 and "write access" in resp.text
-        ), "evaluate=True should not produce a permission-denied 403"
+        assert resp.status_code != 403, f"evaluate=True should not produce 403, got {resp.status_code}: {resp.text}"
 
 
 class TestForkSessionPolicyDI:

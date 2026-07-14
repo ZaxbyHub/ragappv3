@@ -191,42 +191,32 @@ class TestEvaluateDIWiring(unittest.TestCase):
 
     def test_search_memories_calls_authorize_memory_search(self):
         """GET /api/memories/search calls _authorize_memory_search with vault_id."""
-        # search_memories has no evaluate Depends; _authorize_memory_search
-        # calls get_evaluate_policy(db) directly — patch at module level.
-        import app.api.routes.memories as mr
-
+        # search_memories uses evaluate: Callable = Depends(get_evaluate_policy)
+        # and passes it to _authorize_memory_search(evaluate, user, vault_id).
         calls = []
-        original = mr.get_evaluate_policy
 
-        def tracking_factory(db):
-            async def tracking(*args):
-                calls.append(args)
-                return True
-            return tracking
+        async def tracking(*args):
+            calls.append(args)
+            return True
 
-        mr.get_evaluate_policy = tracking_factory
+        app.dependency_overrides[self._get_evaluate_policy] = lambda: tracking
 
         try:
             resp = self.client.get("/api/memories/search?query=test&vault_id=5")
             self.assertEqual(resp.status_code, 200, resp.text)
             self.assertIn(("vault", 5, "read"), [(c[1], c[2], c[3]) for c in calls])
         finally:
-            mr.get_evaluate_policy = original
+            app.dependency_overrides.pop(self._get_evaluate_policy, None)
 
     def test_search_memories_post_calls_authorize_memory_search(self):
         """POST /api/memories/search calls _authorize_memory_search with vault_id."""
-        import app.api.routes.memories as mr
-
         calls = []
-        original = mr.get_evaluate_policy
 
-        def tracking_factory(db):
-            async def tracking(*args):
-                calls.append(args)
-                return True
-            return tracking
+        async def tracking(*args):
+            calls.append(args)
+            return True
 
-        mr.get_evaluate_policy = tracking_factory
+        app.dependency_overrides[self._get_evaluate_policy] = lambda: tracking
 
         try:
             resp = self.client.post("/api/memories/search",
@@ -234,7 +224,7 @@ class TestEvaluateDIWiring(unittest.TestCase):
             self.assertEqual(resp.status_code, 200, resp.text)
             self.assertIn(("vault", 11, "read"), [(c[1], c[2], c[3]) for c in calls])
         finally:
-            mr.get_evaluate_policy = original
+            app.dependency_overrides.pop(self._get_evaluate_policy, None)
 
     def test_search_memories_crossvault_admin_bypass(self):
         """GET /api/memories/search without vault_id bypasses vault check for admin."""
@@ -316,34 +306,6 @@ class TestAuthorizeMemorySearchDBConnection(unittest.TestCase):
         self._pool.close_all()
         import shutil
         shutil.rmtree(self._temp_dir, ignore_errors=True)
-
-    def test_authorize_memory_search_uses_injected_db(self):
-        """
-        _authorize_memory_search(user, vault_id, conn) calls get_evaluate_policy(db)
-        where db is the connection from Depends(get_db).
-        """
-        import app.api.routes.memories as mr
-
-        db_paths = []
-        original = mr.get_evaluate_policy
-
-        def capturing_factory(db):
-            # Verify the passed db belongs to the test pool (touches test db file)
-            db_paths.append(db.execute("SELECT 'injected_db'").fetchone()[0])
-            async def ok(*args):
-                return True
-            return ok
-
-        mr.get_evaluate_policy = capturing_factory
-
-        try:
-            resp = self.client.get("/api/memories/search?query=test&vault_id=1")
-            self.assertEqual(resp.status_code, 200, resp.text)
-            self.assertEqual(db_paths, ["injected_db"],
-                "get_evaluate_policy(db) should receive the injected test db connection")
-        finally:
-            mr.get_evaluate_policy = original
-
 
 # ---------------------------------------------------------------------------
 # Test: Vault permission enforcement — 403 when evaluate denies
