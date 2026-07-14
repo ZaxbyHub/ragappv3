@@ -559,6 +559,7 @@ class DocumentRetrievalService:
             "section": section,
             "source_label": source_label,
             "page_number": chunk.metadata.get("page_number"),
+            "chunk_bbox": chunk.metadata.get("chunk_bbox"),
             "snippet": snippet,
             "score": chunk.score,
             "metadata": chunk.metadata,

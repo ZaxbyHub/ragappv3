@@ -74,6 +74,22 @@ CREATE TABLE IF NOT EXISTS files (
     FOREIGN KEY (vault_id) REFERENCES vaults(id)
 );
 
+-- Per-chunk failure records for partial-embedding retry (Issue #396).
+-- Unlike files.chunks_failed (an aggregate counter), this table stores the
+-- identity + rebuild metadata of each chunk that failed to embed so a
+-- chunk-scoped retry can re-embed only the failures without re-parsing.
+CREATE TABLE IF NOT EXISTS failed_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    chunk_metadata TEXT NOT NULL,  -- JSON: raw_text, parent_window_*, chunk_position, page_number, chunk_bbox, chunk_scale, chunk_uid, parent_window_text
+    error_reason TEXT,
+    attempts INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_failed_chunks_file_id ON failed_chunks(file_id);
+
 -- Full-text search index for document list metadata search
 CREATE VIRTUAL TABLE IF NOT EXISTS files_search_fts USING fts5(
     file_name,
@@ -1005,6 +1021,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_files_processing_progress(sqlite_path)
     migrate_add_files_enrichment_status(sqlite_path)
     migrate_add_chunks_failed_column(sqlite_path)
+    migrate_add_failed_chunks_table(sqlite_path)
     migrate_add_vector_delete_pending(sqlite_path)
     migrate_add_security_audit_log(sqlite_path)
     migrate_add_files_search_fts(sqlite_path)
@@ -2363,6 +2380,46 @@ def migrate_add_vector_delete_pending(sqlite_path: str) -> None:
             CREATE INDEX IF NOT EXISTS idx_vector_delete_pending_file_id
             ON vector_delete_pending(file_id)
         """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_failed_chunks_table(sqlite_path: str) -> None:
+    """Migration: add failed_chunks table for chunk-scoped retry (Issue #396).
+
+    Stores per-chunk identity + rebuild metadata for chunks that failed to
+    embed, so ``DocumentProcessor.retry_failed_chunks`` can re-embed only the
+    failures without re-parsing the source file. ``files.chunks_failed`` (added
+    by migrate_add_chunks_failed_column) remains the aggregate counter; this
+    table is the durable identity store.
+
+    CASCADE on files.id delete keeps the table clean when a document is removed.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS failed_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                chunk_metadata TEXT NOT NULL,
+                error_reason TEXT,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_failed_chunks_file_id
+            ON failed_chunks(file_id)
+            """
+        )
         conn.commit()
     finally:
         conn.close()

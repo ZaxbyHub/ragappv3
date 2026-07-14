@@ -338,6 +338,91 @@ async def retry_document(
         raise HTTPException(status_code=500, detail=f"Retry failed: {exc}")
 
 
+@router.post("/{file_id}/retry-chunks")
+@limiter.limit(settings.admin_rate_limit)
+async def retry_failed_chunks(
+    file_id: int,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(require_admin_role),
+    csrf_token: str = Depends(csrf_protect),
+    vector_store: VectorStore = Depends(get_vector_store),
+    embedding_service: EmbeddingService = Depends(get_embedding_service),
+    db_pool: SQLiteConnectionPool = Depends(get_db_pool),
+    secret_manager: SecretManager = Depends(get_secret_manager),
+    current_user: dict | None = Depends(_optional_current_user),
+) -> dict:
+    """Re-embed and re-index only the chunks that failed during ingest (Issue #396).
+
+    Unlike the whole-document retry above, this targets only the chunks recorded
+    in ``failed_chunks`` for a file whose status is ``indexed`` (partial-failure
+    case). Returns 409 when the file is not in a retryable state.
+    """
+    # Verify the file exists and is retryable before constructing the processor.
+    cursor = await asyncio.to_thread(
+        conn.execute,
+        "SELECT status FROM files WHERE id = ?",
+        (file_id,),
+    )
+    file_row = await asyncio.to_thread(cursor.fetchone)
+    if file_row is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    processor = DocumentProcessor(
+        chunk_size_chars=settings.chunk_size_chars,
+        chunk_overlap_chars=settings.chunk_overlap_chars,
+        vector_store=vector_store,
+        embedding_service=embedding_service,
+        pool=db_pool,
+    )
+
+    user_id = (
+        str(current_user["id"])
+        if current_user and current_user.get("id")
+        else user.get("id", "unknown")
+    )
+    try:
+        result = await processor.retry_failed_chunks(file_id)
+    except ValueError as exc:
+        # Not retryable (status != 'indexed' or file missing) → 409.
+        await asyncio.to_thread(
+            _record_document_action,
+            file_id,
+            "retry-chunks",
+            "rejected",
+            user_id,
+            secret_manager,
+            conn,
+        )
+        await asyncio.to_thread(conn.commit)
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Error retrying failed chunks for document %d", file_id)
+        await asyncio.to_thread(
+            _record_document_action,
+            file_id,
+            "retry-chunks",
+            "error",
+            user_id,
+            secret_manager,
+            conn,
+        )
+        await asyncio.to_thread(conn.commit)
+        raise HTTPException(status_code=500, detail=f"Retry-chunks failed: {exc}")
+
+    await asyncio.to_thread(
+        _record_document_action,
+        file_id,
+        "retry-chunks",
+        "ok",
+        user_id,
+        secret_manager,
+        conn,
+    )
+    await asyncio.to_thread(conn.commit)
+    return {"file_id": file_id, **result}
+
+
 class DocumentResponse(BaseModel):
     """Response model for a document record - frontend compatible."""
 
@@ -349,6 +434,8 @@ class DocumentResponse(BaseModel):
     status: str
     chunk_count: int
     chunks_failed: int = 0  # Chunks dropped due to embedding failures (Issue #221)
+    failed_chunks: int = 0  # Count of failed chunks eligible for retry (Issue #396)
+    failed_chunk_ids: List[int] = Field(default_factory=list)  # Chunk indices (Issue #396)
     size: Optional[int] = None  # Frontend expects size
     created_at: Optional[str]
     processed_at: Optional[str]
@@ -526,6 +613,28 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     file_name = row["file_name"]
     chunk_count = row["chunk_count"] or 0
     chunks_failed = (row["chunks_failed"] if "chunks_failed" in keys else 0) or 0
+    failed_chunks_count = (
+        row["failed_chunks"] if "failed_chunks" in keys else None
+    )
+    failed_chunk_ids_raw = (
+        row["failed_chunk_ids"] if "failed_chunk_ids" in keys else None
+    )
+    # Parse failed_chunk_ids: may come from json_group_array (JSON string like
+    # "[0,3]" or sqlite json_group_array output "[0,3]"), or be None.
+    failed_chunk_ids: List[int] = []
+    if failed_chunk_ids_raw is not None:
+        try:
+            import json as _json
+
+            parsed = _json.loads(failed_chunk_ids_raw)
+            if isinstance(parsed, list):
+                failed_chunk_ids = [int(x) for x in parsed]
+        except (ValueError, TypeError):
+            failed_chunk_ids = []
+    # Fallback: count derived from ids list when the correlated subquery wasn't
+    # included in the SELECT.
+    if failed_chunks_count is None:
+        failed_chunks_count = len(failed_chunk_ids)
     status = row["status"]
     error_message = row["error_message"] if "error_message" in keys else None
     phase = row["phase"] if "phase" in keys else None
@@ -569,6 +678,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
         status=status,
         chunk_count=chunk_count,
         chunks_failed=chunks_failed,
+        failed_chunks=failed_chunks_count,
+        failed_chunk_ids=failed_chunk_ids,
         size=row["file_size"]
         if "file_size" in row.keys() and row["file_size"] is not None
         else None,
@@ -593,6 +704,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
             "chunk_count": chunk_count,
             "chunks": chunk_count,  # Backward compatibility
             "chunks_failed": chunks_failed,
+            "failed_chunks": failed_chunks_count,
+            "failed_chunk_ids": failed_chunk_ids,
             # Keep progress fields mirrored for legacy metadata-based clients.
             "error_message": error_message,
             "phase": phase,
@@ -745,7 +858,10 @@ async def list_documents(
                    created_at, processed_at, error_message, phase, phase_message,
                    progress_percent, processed_units, total_units, unit_label,
                    phase_started_at, processing_started_at, enrichment_status,
-                   enrichment_error, vault_id, folder_id
+                   enrichment_error, vault_id, folder_id,
+                   (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
+                   (SELECT COALESCE(json_group_array(chunk_index), '[]')
+                    FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
             FROM files
             WHERE vault_id = ?{_extra_clause()}
             {order_clause}
@@ -775,7 +891,10 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error, vault_id, folder_id
+                       enrichment_error, vault_id, folder_id,
+                       (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
+                       (SELECT COALESCE(json_group_array(chunk_index), '[]')
+                        FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
                 FROM files
                 WHERE vault_id IN ({placeholders}){_extra_clause()}
                 {order_clause}
@@ -799,7 +918,10 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error, vault_id, folder_id
+                       enrichment_error, vault_id, folder_id,
+                       (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
+                       (SELECT COALESCE(json_group_array(chunk_index), '[]')
+                        FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
                 FROM files{base_where}
                 {order_clause}
                 LIMIT ? OFFSET ?
@@ -839,6 +961,9 @@ class DocumentStatusResponse(BaseModel):
     filename: str
     status: str
     chunk_count: int
+    chunks_failed: int = 0  # Aggregate counter (Issue #221)
+    failed_chunks: int = 0  # Count eligible for chunk-scoped retry (Issue #396)
+    failed_chunk_ids: List[int] = Field(default_factory=list)  # Chunk indices (Issue #396)
     error_message: Optional[str] = None
     processed_at: Optional[str] = None
     # Phase-aware progress
@@ -875,7 +1000,8 @@ async def get_document_status(
     cursor = await asyncio.to_thread(
         conn.execute,
         """
-        SELECT id, vault_id, file_name, status, chunk_count, error_message,
+        SELECT id, vault_id, file_name, status, chunk_count, chunks_failed,
+               error_message,
                processed_at, phase, phase_message, progress_percent,
                processed_units, total_units, unit_label, phase_started_at,
                processing_started_at, wiki_pending, enrichment_status,
@@ -938,11 +1064,28 @@ async def get_document_status(
         except (ValueError, TypeError):
             elapsed_seconds = None
 
+    # Failed-chunk accounting for chunk-scoped retry (Issue #396).
+    failed_chunk_ids: List[int] = []
+    try:
+        fc_cursor = await asyncio.to_thread(
+            conn.execute,
+            "SELECT chunk_index FROM failed_chunks WHERE file_id = ? ORDER BY chunk_index",
+            (file_id,),
+        )
+        fc_rows = await asyncio.to_thread(fc_cursor.fetchall)
+        failed_chunk_ids = [int(r["chunk_index"]) for r in fc_rows]
+    except sqlite3.Error:
+        # failed_chunks table may not exist on very old test fixtures.
+        pass
+
     return DocumentStatusResponse(
         id=row["id"],
         filename=row["file_name"],
         status=row["status"],
         chunk_count=row["chunk_count"] or 0,
+        chunks_failed=row["chunks_failed"] or 0,
+        failed_chunks=len(failed_chunk_ids),
+        failed_chunk_ids=failed_chunk_ids,
         error_message=_safe_get(row, "error_message"),
         processed_at=_safe_get(row, "processed_at"),
         phase=_safe_get(row, "phase"),
@@ -1041,6 +1184,178 @@ def _safe_get(row, key: str, default=None):
         return row[key]  # tuple/dict
     except (KeyError, IndexError, TypeError):
         return default
+
+
+class DocumentSearchResult(BaseModel):
+    """A single ranked document-search hit (Issue #396)."""
+
+    id: int
+    file_name: str
+    vault_id: int
+    status: str
+    score: float  # Normalized bm25 relevance (lower bm25 = better; negated for display)
+    excerpt: str  # Matched snippet with <mark> highlights (or fallback window)
+    match_type: str  # "body" | "metadata" | "filename"
+
+
+class DocumentSearchResponse(BaseModel):
+    """Ranked document-search response with excerpts (Issue #396)."""
+
+    results: List[DocumentSearchResult]
+    total: int
+    query: str
+
+
+@router.get("/search", response_model=DocumentSearchResponse)
+async def search_documents(
+    q: str = Query(..., min_length=1, max_length=200, description="Search query"),
+    vault_id: Optional[int] = Query(None, description="Restrict to a vault"),
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_user_or_service_account),
+    evaluate: Callable = Depends(get_evaluate_policy),
+):
+    """Ranked document search returning matching excerpts (Issue #396).
+
+    Ranks by ``bm25()`` over ``files_content_fts`` (document body) and
+    ``files_search_fts`` (metadata), with a filename LIKE fallback. Returns one
+    row per document (de-duplicated in SQL before pagination) with a highlighted
+    excerpt. Authz mirrors ``GET /documents``: vault read check when
+    ``vault_id`` is given, accessible-vault filter for non-admins without one.
+    """
+    query_text = q.strip()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Query must not be empty")
+
+    fts_query = _build_files_fts_query(query_text)
+    if not fts_query:
+        raise HTTPException(status_code=400, detail="Query has no searchable tokens")
+    like_query = f"%{query_text.lower()}%"
+
+    # Resolve the vault scope (mirrors list_documents).
+    accessible_vaults: Optional[List[int]] = None
+    if vault_id is not None:
+        if not await evaluate(user, "vault", vault_id, "read"):
+            raise HTTPException(status_code=403, detail="Access denied to vault")
+        scope_vaults: List[int] = [vault_id]
+    else:
+        if user.get("role") not in ("admin", "superadmin"):
+            accessible_vaults = await get_user_accessible_vault_ids(user, conn)
+            if not accessible_vaults:
+                return DocumentSearchResponse(results=[], total=0, query=q)
+            scope_vaults = accessible_vaults
+        else:
+            scope_vaults = []  # admin: no vault restriction
+
+    if scope_vaults:
+        placeholders = ",".join("?" * len(scope_vaults))
+        vault_clause_body = f"f.vault_id IN ({placeholders})"
+        vault_clause_meta = vault_clause_body
+        vault_clause_name = vault_clause_body
+        vault_params = list(scope_vaults)
+    else:
+        vault_clause_body = "1=1"
+        vault_clause_meta = "1=1"
+        vault_clause_name = "1=1"
+        vault_params = []
+
+    # CTE + ROW_NUMBER dedup: keep one row per doc (body > metadata > filename).
+    # bm25() returns negative values (more negative = better); ORDER BY rank ASC.
+    ranked_sql = f"""
+    WITH raw_matches AS (
+        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+               bm25(files_content_fts) AS rank,
+               highlight(files_content_fts, 0, '<mark>', '</mark>') AS excerpt_raw,
+               1 AS type_priority
+        FROM files_content_fts
+        JOIN files f ON f.id = files_content_fts.rowid
+        WHERE files_content_fts MATCH ?
+          AND {vault_clause_body}
+        UNION ALL
+        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+               bm25(files_search_fts) AS rank,
+               highlight(files_search_fts, 0, '<mark>', '</mark>') AS excerpt_raw,
+               2 AS type_priority
+        FROM files_search_fts
+        JOIN files f ON f.id = files_search_fts.rowid
+        WHERE files_search_fts MATCH ?
+          AND {vault_clause_meta}
+        UNION ALL
+        SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
+               0.0 AS rank, NULL AS excerpt_raw,
+               3 AS type_priority
+        FROM files f
+        WHERE LOWER(f.file_name) LIKE ?
+          AND {vault_clause_name}
+    ),
+    ranked AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY type_priority ASC, rank ASC) AS rn
+        FROM raw_matches
+    )
+    SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority
+    FROM ranked WHERE rn = 1
+    ORDER BY type_priority ASC, rank ASC
+    LIMIT ? OFFSET ?
+    """
+
+    count_sql = f"""
+    WITH raw_matches AS (
+        SELECT f.id FROM files_content_fts
+        JOIN files f ON f.id = files_content_fts.rowid
+        WHERE files_content_fts MATCH ? AND {vault_clause_body}
+        UNION
+        SELECT f.id FROM files_search_fts
+        JOIN files f ON f.id = files_search_fts.rowid
+        WHERE files_search_fts MATCH ? AND {vault_clause_meta}
+        UNION
+        SELECT f.id FROM files f
+        WHERE LOWER(f.file_name) LIKE ? AND {vault_clause_name}
+    )
+    SELECT COUNT(*) AS total FROM raw_matches
+    """
+
+    base_params = [fts_query, *vault_params, fts_query, *vault_params, like_query, *vault_params]
+    cursor = await asyncio.to_thread(
+        conn.execute,
+        ranked_sql,
+        [*base_params, limit, offset],
+    )
+    rows = await asyncio.to_thread(cursor.fetchall)
+
+    count_cursor = await asyncio.to_thread(
+        conn.execute, count_sql, base_params
+    )
+    total = (await asyncio.to_thread(count_cursor.fetchone))[0]
+
+    results: List[DocumentSearchResult] = []
+    for row in rows:
+        match_type = {1: "body", 2: "metadata", 3: "filename"}.get(
+            int(row["type_priority"]), "body"
+        )
+        excerpt_raw = row["excerpt_raw"]
+        # Excerpt finalization: FTS highlight → parsed_text window → filename.
+        if isinstance(excerpt_raw, str) and excerpt_raw.strip():
+            excerpt = excerpt_raw[:300]
+        elif row["parsed_text"]:
+            excerpt = str(row["parsed_text"])[:200]
+        else:
+            excerpt = row["file_name"]
+        # Normalize score: negate bm25 so higher = better for display.
+        score = -float(row["rank"]) if row["rank"] is not None else 0.0
+        results.append(
+            DocumentSearchResult(
+                id=int(row["id"]),
+                file_name=row["file_name"],
+                vault_id=int(row["vault_id"]),
+                status=row["status"],
+                score=score,
+                excerpt=excerpt,
+                match_type=match_type,
+            )
+        )
+
+    return DocumentSearchResponse(results=results, total=int(total), query=q)
 
 
 @router.get("/stats", response_model=DocumentStatsResponse)
@@ -1150,7 +1465,10 @@ async def get_document(
                created_at, processed_at, error_message, phase, phase_message,
                progress_percent, processed_units, total_units, unit_label,
                phase_started_at, processing_started_at, enrichment_status,
-               enrichment_error
+               enrichment_error,
+               (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
+               (SELECT COALESCE(json_group_array(chunk_index), '[]')
+                FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
         FROM files WHERE id = ?
         """,
         (file_id,),
