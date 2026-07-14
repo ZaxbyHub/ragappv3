@@ -341,6 +341,7 @@ async def create_memory(
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
+    conn: sqlite3.Connection = Depends(get_db),
 ):
     """
     Create a new memory.
@@ -645,6 +646,7 @@ async def search_memories(
     query: str = Query(..., min_length=1, description="Search query string"),
     limit: int = Query(5, ge=1, le=100, description="Maximum number of results"),
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
+    conn: sqlite3.Connection = Depends(get_db),
     memory_store: MemoryStore = Depends(get_memory_store),
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
@@ -672,6 +674,7 @@ async def search_memories_post(
     evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
     _: None = Depends(require_model_ready),
+    conn: sqlite3.Connection = Depends(get_db),
 ):
     """Search memories via POST (request body).
 

@@ -679,7 +679,7 @@ async def chat_stream(
     body: ChatStreamRequest,
     rag_engine: RAGEngine = Depends(get_rag_engine),
     user: dict = Depends(get_current_active_user),
-    evaluate=Depends(get_evaluate_policy),
+    evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
     _=Depends(require_model_ready),
 ):
@@ -694,9 +694,6 @@ async def chat_stream(
         )
 
     if body.vault_id is not None:
-        # Use the DI evaluate_policy variant so the permission check reuses the
-        # request's pooled DB connection instead of opening a second one. This
-        # halves per-request pool usage on the hot chat path (pool max_size=10).
         if not await evaluate(user, "vault", body.vault_id, "read"):
             raise HTTPException(status_code=403, detail="No read access to this vault")
     else:
@@ -1462,8 +1459,8 @@ async def add_message(
     body: AddMessageRequest,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(get_current_active_user),
-    rag_engine: Optional[RAGEngine] = Depends(get_rag_engine),
     evaluate: Callable = Depends(get_evaluate_policy),
+    rag_engine: Optional[RAGEngine] = Depends(get_rag_engine),
     _csrf_token: str = Depends(csrf_protect),
 ):
     """

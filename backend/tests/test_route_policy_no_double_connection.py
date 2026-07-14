@@ -223,30 +223,21 @@ def test_denied_route_returns_403_without_standalone_pool(db_path):
 
 
 # ---------------------------------------------------------------------------
-# Carve-out: wiki_events_stream (SSE endpoint) intentionally retains the
-# standalone evaluate_policy for its pre-stream permission check. This test
-# LOCKS IN that design decision: if someone later routes it through
-# Depends(get_evaluate_policy) without thinking through the SSE connection
-# lifecycle, this test will flag the change for review.
-#
-# See the wiki_events_stream docstring for the full rationale.
+# SSE endpoint: wiki_events_stream was migrated to DI evaluate_policy as part
+# of the S-003 fix. The pre-stream permission check uses the injected
+# ``evaluate`` callable from ``Depends(get_evaluate_policy)``.
 # ---------------------------------------------------------------------------
 
 
-def test_wiki_events_stream_uses_standalone_evaluate_policy_by_design(db_path):
-    """wiki_events_stream intentionally keeps the standalone evaluate_policy.
+def test_wiki_events_stream_uses_di_evaluate_policy(db_path):
+    """wiki_events_stream uses the DI evaluate_policy (migrated from standalone).
 
-    This is the documented exception to the S-003 migration. The endpoint's
-    permission check runs BEFORE the indefinite SSE loop; using the standalone
-    makes the check a short-lived transient connection rather than wiring
-    another Depends(get_db)-backed dependency into the stream. This test
-    asserts the standalone IS used (get_pool IS called) so that any future
-    change to this endpoint's permission path is a deliberate, reviewed
-    decision — not an accidental regression or silent fix.
+    The endpoint's pre-stream permission check uses the injected ``evaluate``
+    callable from ``Depends(get_evaluate_policy)``, consistent with the S-003
+    migration. This test verifies both that get_pool is NOT called (no
+    standalone evaluate_policy) AND that the DI evaluate callable IS invoked
+    with the correct arguments.
     """
-    client = _make_client(db_path, allow=True, router=wiki.router, prefix="/api")
-    # The SSE endpoint streams indefinitely; override the event bus so the
-    # stream closes after the pre-stream check so TestClient returns.
     import asyncio
 
     closed = asyncio.Event()
@@ -269,25 +260,53 @@ def test_wiki_events_stream_uses_standalone_evaluate_policy_by_design(db_path):
         def unsubscribe(self, _vault_id, _queue):
             closed.set()
 
+    # Track DI evaluate invocations
+    evaluate_calls = []
+
+    async def _tracking_evaluate(*args, **kwargs):
+        evaluate_calls.append((args, kwargs))
+        return True
+
+    app = FastAPI()
+    app.include_router(wiki.router, prefix="/api")
+    app.state.vector_store = None
+    app.dependency_overrides[get_current_active_user] = lambda: {
+        "id": 1,
+        "username": "admin",
+        "role": "superadmin",
+        "is_active": True,
+        "must_change_password": False,
+    }
+    app.dependency_overrides[get_evaluate_policy] = lambda: _tracking_evaluate
+
+    def _get_db():
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    app.dependency_overrides[get_db] = _get_db
+
+    client = TestClient(app)
+
     with patch("app.api.routes.wiki.get_wiki_event_bus", return_value=_ImmediateCloseBus()):
         with patch("app.api.deps.get_pool") as mock_get_pool:
-            # Allow the standalone evaluate_policy to succeed (superadmin).
-            with patch("app.api.deps._evaluate_policy", return_value=True):
-                try:
-                    client.get("/api/wiki/events", params={"vault_id": 1})
-                except Exception:
-                    # The stream may raise on close; we only care about the
-                    # pre-stream check having run.
-                    pass
-    # The standalone evaluate_policy path MUST have called get_pool. If this
-    # assertion fails, someone changed wiki_events_stream's permission path —
-    # review whether the SSE connection lifecycle is still acceptable.
-    assert mock_get_pool.call_count >= 1, (
-        "wiki_events_stream is the documented S-003 carve-out: its pre-stream "
-        "permission check should use the standalone evaluate_policy (which "
-        "calls get_pool). If you migrated it to Depends(get_evaluate_policy), "
-        "update this test AND the wiki_events_stream docstring to reflect "
-        "the new design."
+            try:
+                client.get("/api/wiki/events", params={"vault_id": 1})
+            except Exception:
+                pass
+
+    # DI evaluate must have been called with the vault read check
+    assert len(evaluate_calls) >= 1, (
+        "wiki_events_stream must invoke the DI evaluate callable for its "
+        "pre-stream permission check."
+    )
+    # get_pool must NOT have been called (no standalone evaluate_policy)
+    assert mock_get_pool.call_count == 0, (
+        "wiki_events_stream must use DI get_evaluate_policy, not standalone "
+        "evaluate_policy. The S-003 migration moved this endpoint to DI."
     )
 
 

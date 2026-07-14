@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -51,8 +51,6 @@ except ImportError:
     sys.modules['unstructured.chunking.title'] = _unstructured.chunking.title
     sys.modules['unstructured.documents'] = _unstructured.documents
     sys.modules['unstructured.documents.elements'] = _unstructured.documents.elements
-
-from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 

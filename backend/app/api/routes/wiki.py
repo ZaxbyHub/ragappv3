@@ -16,7 +16,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
-    evaluate_policy,
     get_current_active_user,
     get_db,
     get_evaluate_policy,
@@ -741,6 +740,7 @@ async def list_wiki_jobs(
 async def wiki_events_stream(
     vault_id: int = Query(...),
     user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """SSE stream of terminal-state wiki compile job events for a vault.
 
@@ -756,21 +756,10 @@ async def wiki_events_stream(
     separate concern from issue #205 (S-003 double-connection) and is tracked
     under issue #301 (SSE connection pinning).
 
-    The pre-stream permission check uses the transient standalone
-    ``evaluate_policy`` rather than ``Depends(get_evaluate_policy)``. Adding
-    a second ``Depends(get_db)``-backed dependency here would not change the
-    held-connection count (FastAPI caches ``Depends(get_db)`` per request, so
-    it would reuse the connection auth already checked out), but it WOULD
-    remove the only regression guard against a future change that introduces
-    a genuinely separate checkout path. Keeping the transient standalone call
-    makes the permission check short-lived and explicit: it opens a separate
-    connection, evaluates, and releases it immediately, before streaming.
-    The net effect during the pre-stream check is two transient connections
-    (one from auth, one from evaluate_policy); after the check, only the auth
-    connection remains pinned for the stream. This is the same shape as the
-    pre-fix code and is not a regression introduced by the S-003 migration.
+    The pre-stream permission check uses the injected ``evaluate`` callable
+    from ``Depends(get_evaluate_policy)``.
     """
-    if not await evaluate_policy(user, "vault", vault_id, "read"):
+    if not await evaluate(user, "vault", vault_id, "read"):
         raise HTTPException(status_code=403, detail="No read access to this vault")
 
     bus = get_wiki_event_bus()
@@ -1031,16 +1020,66 @@ async def get_memory_wiki_status(
     await _require_vault_read(evaluate, user, vault_id)
     db.row_factory = sqlite3.Row
     store = WikiStore(db)
-    return _memory_wiki_status_payload(db, store, memory_id, vault_id)
 
-
-def _memory_wiki_status_payload(db: sqlite3.Connection, store: "WikiStore", memory_id: int, vault_id: int) -> dict:
-    """Compute the wiki-status payload for a single memory.
-
-    Extracted so the batch endpoint can reuse it without re-resolving
-    auth/store per memory (UI-PERF-4: collapse the N+1 fan-out).
-    """
     # Collect memory jobs (trigger_id filtered + bounded in SQL — F-012).
+    # trigger_type can be either "memory" or "manual", so keep that check in Python
+    # over the already-bounded result set.
+    jobs = store.list_jobs(vault_id, trigger_id=f"memory:{memory_id}", limit=50)
+    mem_jobs = [j for j in jobs if j.trigger_type in ("memory", "manual")]
+    latest_job = mem_jobs[0] if mem_jobs else None
+
+    # Claims sourced from this memory
+    claims_rows = db.execute(
+        """SELECT wc.id, wc.status, wc.page_id, wc.claim_text
+           FROM wiki_claims wc
+           JOIN wiki_claim_sources wcs ON wcs.claim_id = wc.id
+           WHERE wcs.memory_id = ? AND wc.vault_id = ?""",
+        (memory_id, vault_id),
+    ).fetchall()
+
+    claims_data = [dict(r) for r in claims_rows]
+    active_claims = sum(1 for c in claims_data if c["status"] == "active")
+    stale_claims = sum(1 for c in claims_data if c["status"] == "superseded")
+
+    # Linked pages
+    page_ids = {c["page_id"] for c in claims_data if c["page_id"]}
+    linked_pages = []
+    for pid in page_ids:
+        row = db.execute(
+            "SELECT id, slug, title, page_type, status FROM wiki_pages WHERE id = ? AND vault_id = ?",
+            (pid, vault_id),
+        ).fetchone()
+        if row:
+            linked_pages.append(dict(row))
+
+    # Semantic status
+    if latest_job and latest_job.status == "running":
+        wiki_status = "promoting"
+    elif stale_claims > 0 and active_claims == 0:
+        wiki_status = "stale"
+    elif active_claims > 0:
+        wiki_status = "promoted"
+    elif len(claims_data) > 0:
+        wiki_status = "promoted"
+    else:
+        wiki_status = "not_promoted"
+
+    return {
+        "memory_id": memory_id,
+        "wiki_status": wiki_status,
+        "claims_count": len(claims_data),
+        "active_claims": active_claims,
+        "stale_claims": stale_claims,
+        "linked_pages": linked_pages,
+        "latest_job": _as_dict(latest_job) if latest_job else None,
+        "job_count": len(mem_jobs),
+    }
+
+
+def _memory_wiki_status_payload(
+    db: sqlite3.Connection, store: WikiStore, memory_id: int, vault_id: int
+) -> dict:
+    """Return the wiki-status payload for a single memory (helper for batch)."""
     jobs = store.list_jobs(vault_id, trigger_id=f"memory:{memory_id}", limit=50)
     mem_jobs = [j for j in jobs if j.trigger_type in ("memory", "manual")]
     latest_job = mem_jobs[0] if mem_jobs else None
