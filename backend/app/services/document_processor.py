@@ -1313,9 +1313,10 @@ class DocumentProcessor:
                 )
             conn.execute(
                 "UPDATE files SET chunks_failed = "
-                "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?) "
+                "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
+                "chunk_count = chunk_count + ? "
                 "WHERE id = ?",
-                (file_id, file_id),
+                (file_id, len(records), file_id),
             )
             conn.commit()
         except sqlite3.Error:
@@ -2281,6 +2282,31 @@ class DocumentProcessor:
                         chunks_failed_count = len(failed_chunk_indices)
 
                         if failure_pct > 50:
+                            # The file is about to land in status='error', which
+                            # the chunk-scoped retry endpoint rejects (409). The
+                            # failed_chunks rows persisted above are therefore
+                            # unreachable for chunk retry and would desync from
+                            # files.chunks_failed (which stays 0 on the error
+                            # path). Clear them so the only recovery is the
+                            # whole-document retry, which re-ingests from scratch.
+                            try:
+                                _abort_conn = self.pool.get_connection()
+                                try:
+                                    _abort_conn.execute(
+                                        "DELETE FROM failed_chunks WHERE file_id = ?",
+                                        (file_id,),
+                                    )
+                                    _abort_conn.commit()
+                                finally:
+                                    self.pool.release_connection(_abort_conn)
+                            except sqlite3.Error:
+                                logger.warning(
+                                    "Could not clear failed_chunks rows before "
+                                    ">50%% abort for file %d; rows will be cleared "
+                                    "on next re-ingest.",
+                                    file_id,
+                                    exc_info=True,
+                                )
                             raise DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
                                 "Aborting document ingest." % (len(failed_chunk_indices), original_chunk_count, failure_pct),
@@ -2797,6 +2823,31 @@ class DocumentProcessor:
                         chunks_failed_count = len(failed_chunk_indices)
 
                         if failure_pct > 50:
+                            # The file is about to land in status='error', which
+                            # the chunk-scoped retry endpoint rejects (409). The
+                            # failed_chunks rows persisted above are therefore
+                            # unreachable for chunk retry and would desync from
+                            # files.chunks_failed (which stays 0 on the error
+                            # path). Clear them so the only recovery is the
+                            # whole-document retry, which re-ingests from scratch.
+                            try:
+                                _abort_conn = self.pool.get_connection()
+                                try:
+                                    _abort_conn.execute(
+                                        "DELETE FROM failed_chunks WHERE file_id = ?",
+                                        (file_id,),
+                                    )
+                                    _abort_conn.commit()
+                                finally:
+                                    self.pool.release_connection(_abort_conn)
+                            except sqlite3.Error:
+                                logger.warning(
+                                    "Could not clear failed_chunks rows before "
+                                    ">50%% abort for file %d; rows will be cleared "
+                                    "on next re-ingest.",
+                                    file_id,
+                                    exc_info=True,
+                                )
                             raise DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
                                 "Aborting document ingest." % (len(failed_chunk_indices), original_chunk_count, failure_pct),

@@ -10,12 +10,14 @@ from test_documents_auth import TestDocumentAuthBase
 class TestDocumentsSearchRanked(TestDocumentAuthBase):
     """GET /documents/search returns ranked docs with excerpts."""
 
-    def _seed_doc(self, file_id, vault_id, file_name, parsed_text, status="indexed"):
+    def _seed_doc(self, file_id, vault_id, file_name, parsed_text, status="indexed",
+                  email_subject=None, email_sender=None):
         conn = self._connection_pool.get_connection()
         try:
             conn.execute(
                 "INSERT INTO files (id, file_name, file_path, file_size, status, "
-                "chunk_count, vault_id, parsed_text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "chunk_count, vault_id, parsed_text, email_subject, email_sender) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     file_id,
                     file_name,
@@ -25,6 +27,8 @@ class TestDocumentsSearchRanked(TestDocumentAuthBase):
                     1,
                     vault_id,
                     parsed_text,
+                    email_subject,
+                    email_sender,
                 ),
             )
             conn.commit()
@@ -156,6 +160,41 @@ class TestDocumentsSearchRanked(TestDocumentAuthBase):
         ids2 = {r["id"] for r in page2["results"]}
         self.assertEqual(len(page2["results"]), 2)
         self.assertEqual(ids1.isdisjoint(ids2), True, "pages must not overlap")
+
+    def test_metadata_match_highlights_matched_column_not_filename(self):
+        """[NF2] A match in email_subject must produce an excerpt from that
+        column (with <mark>), not the filename."""
+        # Unique token in email_subject; absent from filename + body.
+        self._seed_doc(
+            230, 2, "plain_report.txt", "Unrelated body content without the token.",
+            email_subject="Q3 zorbulator revenue review",
+        )
+        token = self._member_token()
+        resp = self.client.get(
+            "/api/documents/search?q=zorbulator&vault_id=2",
+            headers=self._auth_headers(token),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["total"], 1)
+        result = data["results"][0]
+        self.assertEqual(result["match_type"], "metadata")
+        # The excerpt must come from the matched metadata column and contain
+        # the highlight marker, NOT be the bare filename.
+        self.assertIn("<mark>zorbulator</mark>", result["excerpt"])
+
+    def test_fts_special_chars_hyphen_does_not_error(self):
+        """[PRR-019] Hyphens in the query are normalized by _build_files_fts_query
+        (FTS5 treats them as column-filter prefix otherwise → OperationalError).
+        The search must not 500."""
+        self._seed_doc(231, 2, "hyphen-test.pdf", "model-x specification details")
+        token = self._member_token()
+        resp = self.client.get(
+            "/api/documents/search?q=model-x&vault_id=2",
+            headers=self._auth_headers(token),
+        )
+        self.assertIn(resp.status_code, (200,))
+        self.assertEqual(resp.json()["total"], 1)
 
     def test_empty_query_rejected(self):
         token = self._member_token()

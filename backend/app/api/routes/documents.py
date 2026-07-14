@@ -345,6 +345,7 @@ async def retry_failed_chunks(
     request: Request,
     conn: sqlite3.Connection = Depends(get_db),
     user: dict = Depends(require_admin_role),
+    evaluate: Callable = Depends(get_evaluate_policy),
     csrf_token: str = Depends(csrf_protect),
     vector_store: VectorStore = Depends(get_vector_store),
     embedding_service: EmbeddingService = Depends(get_embedding_service),
@@ -358,15 +359,23 @@ async def retry_failed_chunks(
     in ``failed_chunks`` for a file whose status is ``indexed`` (partial-failure
     case). Returns 409 when the file is not in a retryable state.
     """
-    # Verify the file exists and is retryable before constructing the processor.
+    # Verify the file exists and retryable; fetch vault_id for the per-file
+    # admin authz check. require_admin_role is only a coarse pre-filter
+    # ("admin of any vault") — a scoped vault admin must still be admin of the
+    # vault that owns this file, matching toggle_file_enrichment / delete_document.
     cursor = await asyncio.to_thread(
         conn.execute,
-        "SELECT status FROM files WHERE id = ?",
+        "SELECT status, vault_id FROM files WHERE id = ?",
         (file_id,),
     )
     file_row = await asyncio.to_thread(cursor.fetchone)
     if file_row is None:
         raise HTTPException(status_code=404, detail="Document not found")
+
+    if not await evaluate(user, "vault", file_row["vault_id"], "admin"):
+        raise HTTPException(
+            status_code=403, detail="Insufficient vault permissions"
+        )
 
     processor = DocumentProcessor(
         chunk_size_chars=settings.chunk_size_chars,
@@ -1262,6 +1271,9 @@ async def search_documents(
 
     # CTE + ROW_NUMBER dedup: keep one row per doc (body > metadata > filename).
     # bm25() returns negative values (more negative = better); ORDER BY rank ASC.
+    # A single statement computes both the page and the total over the
+    # de-duplicated set: a full-count CTE (no LIMIT) is joined to the paginated
+    # page, so the non-sargable filename LIKE runs once, not twice (NF3).
     ranked_sql = f"""
     WITH raw_matches AS (
         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
@@ -1275,7 +1287,14 @@ async def search_documents(
         UNION ALL
         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
                bm25(files_search_fts) AS rank,
-               highlight(files_search_fts, 0, '<mark>', '</mark>') AS excerpt_raw,
+               COALESCE(
+                   NULLIF(highlight(files_search_fts, 4, '<mark>', '</mark>'), ''),
+                   NULLIF(highlight(files_search_fts, 5, '<mark>', '</mark>'), ''),
+                   NULLIF(highlight(files_search_fts, 1, '<mark>', '</mark>'), ''),
+                   NULLIF(highlight(files_search_fts, 3, '<mark>', '</mark>'), ''),
+                   NULLIF(highlight(files_search_fts, 6, '<mark>', '</mark>'), ''),
+                   highlight(files_search_fts, 0, '<mark>', '</mark>')
+               ) AS excerpt_raw,
                2 AS type_priority
         FROM files_search_fts
         JOIN files f ON f.id = files_search_fts.rowid
@@ -1290,29 +1309,22 @@ async def search_documents(
           AND {vault_clause_name}
     ),
     ranked AS (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY type_priority ASC, rank ASC) AS rn
+        SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority,
+               ROW_NUMBER() OVER (PARTITION BY id ORDER BY type_priority ASC, rank ASC) AS rn
         FROM raw_matches
+    ),
+    deduped AS (
+        SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority
+        FROM ranked WHERE rn = 1
+    ),
+    full_count AS (
+        SELECT COUNT(*) AS n FROM deduped
     )
-    SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority
-    FROM ranked WHERE rn = 1
-    ORDER BY type_priority ASC, rank ASC
+    SELECT d.id, d.file_name, d.vault_id, d.status, d.rank, d.excerpt_raw,
+           d.parsed_text, d.type_priority, fc.n AS total_count
+    FROM deduped d, full_count fc
+    ORDER BY d.type_priority ASC, d.rank ASC
     LIMIT ? OFFSET ?
-    """
-
-    count_sql = f"""
-    WITH raw_matches AS (
-        SELECT f.id FROM files_content_fts
-        JOIN files f ON f.id = files_content_fts.rowid
-        WHERE files_content_fts MATCH ? AND {vault_clause_body}
-        UNION
-        SELECT f.id FROM files_search_fts
-        JOIN files f ON f.id = files_search_fts.rowid
-        WHERE files_search_fts MATCH ? AND {vault_clause_meta}
-        UNION
-        SELECT f.id FROM files f
-        WHERE LOWER(f.file_name) LIKE ? AND {vault_clause_name}
-    )
-    SELECT COUNT(*) AS total FROM raw_matches
     """
 
     base_params = [fts_query, *vault_params, fts_query, *vault_params, like_query, *vault_params]
@@ -1323,10 +1335,33 @@ async def search_documents(
     )
     rows = await asyncio.to_thread(cursor.fetchall)
 
-    count_cursor = await asyncio.to_thread(
-        conn.execute, count_sql, base_params
-    )
-    total = (await asyncio.to_thread(count_cursor.fetchone))[0]
+    # total_count comes from the cross-joined full_count CTE; it is identical
+    # on every row, so read it from the first row (or 0 when the page is empty
+    # but matches exist — handle the empty-page case below).
+    total = int(rows[0]["total_count"]) if rows else 0
+    if total == 0 and offset > 0:
+        # Page beyond the result set: re-derive total without pagination so the
+        # caller still gets an accurate count (the LIMIT returned nothing but
+        # matches exist). Single cheap count over the deduped CTE.
+        count_only_sql = f"""
+        WITH raw_matches AS (
+            SELECT f.id FROM files_content_fts
+            JOIN files f ON f.id = files_content_fts.rowid
+            WHERE files_content_fts MATCH ? AND {vault_clause_body}
+            UNION
+            SELECT f.id FROM files_search_fts
+            JOIN files f ON f.id = files_search_fts.rowid
+            WHERE files_search_fts MATCH ? AND {vault_clause_meta}
+            UNION
+            SELECT f.id FROM files f
+            WHERE LOWER(f.file_name) LIKE ? AND {vault_clause_name}
+        )
+        SELECT COUNT(*) FROM raw_matches
+        """
+        count_cursor = await asyncio.to_thread(
+            conn.execute, count_only_sql, base_params
+        )
+        total = int((await asyncio.to_thread(count_cursor.fetchone))[0])
 
     results: List[DocumentSearchResult] = []
     for row in rows:

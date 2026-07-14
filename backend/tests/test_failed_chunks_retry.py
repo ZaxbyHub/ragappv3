@@ -165,6 +165,46 @@ class TestFailedChunksRetry(unittest.TestCase):
                 "VALUES (?, ?, ?, ?)",
                 (self.vault_id, self.member_id, "read", "2026-01-01"),
             )
+            # admin_user (role=admin) gets an explicit admin entry on vault A so
+            # the per-file vault-admin check (evaluate ... "admin") passes. The
+            # role=admin baseline alone only grants write, not admin.
+            conn.execute(
+                "INSERT INTO vault_members (vault_id, user_id, permission, granted_at) "
+                "VALUES (?, ?, ?, ?)",
+                (self.vault_id, self.admin_id, "admin", "2026-01-01"),
+            )
+            # A second vault (B) and a vault admin of B only — used to prove the
+            # cross-vault admin check on retry-chunks (NF1): admin-of-B must NOT
+            # be able to retry chunks of a file in vault A (self.vault_id).
+            conn.execute(
+                "INSERT INTO vaults (name, description, visibility, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("VB", "v", "private", "2026-01-01", "2026-01-01"),
+            )
+            self.vault_b_id = conn.execute(
+                "SELECT id FROM vaults WHERE name='VB'"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO users (username, hashed_password, full_name, role, is_active, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "vault_b_admin",
+                    "pw",
+                    "Vault B Admin",
+                    "admin",  # role=admin: passes require_admin_role pre-filter;
+                    #   per-vault gate must still deny (no admin perm on vault A)
+                    1,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            self.vault_b_admin_id = conn.execute(
+                "SELECT id FROM users WHERE username='vault_b_admin'"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO vault_members (vault_id, user_id, permission, granted_at) "
+                "VALUES (?, ?, ?, ?)",
+                (self.vault_b_id, self.vault_b_admin_id, "admin", "2026-01-01"),
+            )
             # An indexed file with chunks_failed=2.
             conn.execute(
                 "INSERT INTO files (id, file_name, file_path, file_size, status, chunk_count, "
@@ -258,7 +298,8 @@ class TestFailedChunksRetry(unittest.TestCase):
         self.assertEqual(len(vs.added_records), 2)
         rebuilt_ids = {r["id"] for r in vs.added_records}
         self.assertEqual(rebuilt_ids, expected_ids)
-        # failed_chunks rows deleted; chunks_failed decremented to 0.
+        # failed_chunks rows deleted; chunks_failed decremented to 0;
+        # chunk_count incremented by the 2 re-indexed chunks (PRR-003).
         conn = self.pool.get_connection()
         try:
             remaining = conn.execute(
@@ -269,6 +310,10 @@ class TestFailedChunksRetry(unittest.TestCase):
                 "SELECT chunks_failed FROM files WHERE id = 70"
             ).fetchone()[0]
             self.assertEqual(cf, 0)
+            cc = conn.execute(
+                "SELECT chunk_count FROM files WHERE id = 70"
+            ).fetchone()[0]
+            self.assertEqual(cc, 5)  # was 3, +2 retried
         finally:
             self.pool.release_connection(conn)
 
@@ -473,6 +518,22 @@ class TestFailedChunksRetry(unittest.TestCase):
         }
         return jwt.encode(payload, settings.jwt_secret_key, algorithm="HS256")
 
+    def _vault_b_admin_token(self):
+        """Token for a user who is admin of vault B but NOT vault A.
+
+        role=admin is deliberate: it clears the coarse require_admin_role
+        pre-filter so the request reaches the per-file vault-admin gate —
+        which is the actual threat model the test must exercise.
+        """
+        payload = {
+            "sub": str(self.vault_b_admin_id),
+            "username": "vault_b_admin",
+            "role": "admin",  # passes pre-filter; per-vault check must still deny
+            "exp": datetime.now(timezone.utc).timestamp() + 3600,
+            "type": "access",
+        }
+        return jwt.encode(payload, settings.jwt_secret_key, algorithm="HS256")
+
     def test_endpoint_admin_retry_succeeds(self):
         self._seed_failed_chunks()
         emb = _FakeEmbeddingService()
@@ -486,6 +547,27 @@ class TestFailedChunksRetry(unittest.TestCase):
             self.assertEqual(resp.status_code, 200, resp.text)
             data = resp.json()
             self.assertEqual(data["succeeded"], 2)
+        finally:
+            main_app.dependency_overrides.clear()
+
+    def test_endpoint_cross_vault_admin_forbidden(self):
+        """[NF1] A vault admin of vault B cannot retry chunks of a file in
+        vault A — require_admin_role is only a coarse pre-filter; the handler
+        must enforce per-file vault-admin authz."""
+        self._seed_failed_chunks()  # file 70 is in vault A (self.vault_id)
+        emb = _FakeEmbeddingService()
+        vs = _FakeVectorStore()
+        client, main_app = self._setup_client(emb, vs)
+        try:
+            resp = client.post(
+                "/api/documents/70/retry-chunks",
+                headers={
+                    "Authorization": f"Bearer {self._vault_b_admin_token()}"
+                },
+            )
+            self.assertEqual(resp.status_code, 403, resp.text)
+            # No LanceDB write should have occurred.
+            self.assertEqual(len(vs.added_records), 0)
         finally:
             main_app.dependency_overrides.clear()
 

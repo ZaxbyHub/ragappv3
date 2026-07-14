@@ -255,6 +255,42 @@ class TestChunkContextWindow(unittest.TestCase):
         # Only index 4 exists after 2 (index 3 is gone).
         self.assertEqual(data["after"], ["g text 4"])
 
+    def test_before_exceeds_center_at_index_zero(self):
+        """[PRR-020] context_before larger than the center chunk_index (here 0)
+        yields a negative lower BETWEEN bound — must not error, and must return
+        only existing neighbors (the single 'after' chunk)."""
+        conn = self.test_pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO files (id, file_name, file_path, file_size, status, chunk_count, vault_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (52, "edge.md", "/uploads/edge.md", 100, "indexed", 3, self.vault_id),
+            )
+            conn.commit()
+        finally:
+            self.test_pool.release_connection(conn)
+        self.fake_vector_store.chunk_records = [
+            {
+                "id": f"52_{i}",
+                "text": f"e text {i}",
+                "file_id": "52",
+                "vault_id": str(self.vault_id),
+                "chunk_index": i,
+                "metadata": json.dumps({"raw_text": f"e text {i}"}),
+            }
+            for i in range(3)
+        ]
+        # Center on index 0; ask for 5 before (negative lo) and 1 after.
+        resp = self.client.get(
+            "/api/search/chunks/52_0/context?context_before=5&context_after=1",
+            headers={"Authorization": f"Bearer {self._token()}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        self.assertEqual(data["before"], [])  # nothing before index 0
+        self.assertEqual(data["after"], ["e text 1"])
+        self.assertEqual(data["matched_text"], "e text 0")
+
     def test_inaccessible_vault_returns_404(self):
         """Chunk in a vault the user cannot read → 404 (not 403)."""
         conn = self.test_pool.get_connection()
