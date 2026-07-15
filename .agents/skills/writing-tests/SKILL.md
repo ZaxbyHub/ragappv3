@@ -49,6 +49,36 @@ The authoritative testing policy and conventions live in
   collection in CI even though it passes locally with the full deps installed.
 - **CI pins Python 3.11.** Local 3.14+ fails some tests with `RuntimeError: There is no current event loop` — a local artifact, not a regression. Avoid manual `asyncio.get_event_loop()` in new tests.
 
+### Authz-aware test fixture setup
+
+When you modify endpoint authorization (adding caller-org intersection checks,
+role-based access, assigned-org validation, etc.), the new authz preconditions
+can break tests in **any file that exercises that endpoint** — not just the
+files in your PR diff. CI runs the full `pytest tests/` suite (~3918 tests),
+so a test file you never touched can fail if its fixture doesn't seed the data
+the new check requires.
+
+**Before pushing authz changes:**
+1. Grep for ALL test files that call the modified endpoint:
+   `grep -rl "users.*organizations\|users.*groups" backend/tests/`
+2. For each file found, verify its fixture seeds the relational data the new
+   check needs (e.g., `org_members` rows for caller-org intersection checks).
+3. Run the full test suite locally (from `backend/`): `pytest tests/ -q --tb=short`
+
+**Common fixture gaps when adding org-scoped authz:**
+- Test creates users + orgs but no `org_members` entries → caller-org
+  intersection check sees empty sets → 403 where test expects 200.
+- Test fixture places data in a row that a per-test INSERT also targets →
+  `UNIQUE(org_id, user_id)` constraint violation. Always check for per-test
+  INSERTs in the same table before placing fixture data.
+
+**Real example (PR #240):** `test_user_org_roles.py` had its own `setup_db`
+fixture that created users and orgs but no `org_members`. The caller-org
+intersection check added to `update_user_organizations` caused failures in
+`TestPerOrgRoleMemberships` and `TestLegacyOrgIdsFormat` (the third class,
+`TestDeleteUserOwnerGuard`, uses DELETE and was unaffected). Fix: seed
+`ADMIN_ID` into all orgs and `TARGET_ID` into a non-conflicting org in `setup_db`.
+
 ### Conftest.py shared fixtures (post-PR #215)
 
 The conftest.py now has 3 autouse fixtures plus 1 session-scoped fixture:

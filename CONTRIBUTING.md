@@ -78,7 +78,7 @@ frontend, and embedding/LLM services together.
 
 ## Before you push — run the CI gates locally
 
-CI (`.github/workflows/ci.yml`) has three required jobs. Reproduce them locally
+CI (`.github/workflows/ci.yml`) has four required jobs. Reproduce them locally
 so your PR goes green on the first try:
 
 **Backend** (from `backend/`):
@@ -105,6 +105,17 @@ npm run build
 ```bash
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
+python scripts/check_sast_baseline.py   # SAST baseline/scope/workflow integrity
+```
+
+**SAST** (from repo root; requires `bandit` from `backend/requirements-dev.txt`):
+
+```bash
+python scripts/run_bandit.py
+# Fails only on NEW findings vs backend/security/bandit-baseline.json.
+# If you intentionally accept a new pre-existing finding, regenerate with
+#   python scripts/run_bandit.py --update-baseline
+# and justify the newly-suppressed finding IDs in your PR.
 ```
 
 ## Testing expectations

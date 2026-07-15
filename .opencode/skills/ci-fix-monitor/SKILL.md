@@ -3,7 +3,7 @@ name: ci-fix-monitor
 description: >
   Monitor and fix CI on an open RAGAPPv3 pull request until every required check
   is green. Load when asked to watch CI, diagnose red checks, or drive a PR to
-  passing. Maps the three real CI jobs (Frontend, Backend, Quality contracts),
+  passing. Maps the four real CI jobs (Frontend, Backend, Quality contracts, SAST),
   enforces diagnose-before-fix, and covers re-push / rebase. This repo has NO
   dist-check, biome, bun, or per-OS matrix — ignore that guidance. Updated for
   PR #215 (issue #209): Backend now runs the full `pytest tests/` suite
@@ -24,13 +24,14 @@ locally before re-pushing, use `ci-compatibility-audit`.
 ## The CI surface (what can go red)
 
 CI is a single PR-triggered workflow (`.github/workflows/ci.yml`, triggered on
-`pull_request` against `master`) with **exactly three jobs**, all Ubuntu-only:
+`pull_request` against `master`) with **exactly four jobs**, all Ubuntu-only:
 
 | Job | Steps that can fail | Run locally from |
 |-----|--------------------|------------------|
 | **Frontend** | `npm ci --engine-strict`, toolchain graph check, `npm run typecheck`, `npm run lint` (`--max-warnings 0`), API smoke subset, `npm test`, `npm run build`, two subpath builds | `frontend/` |
 | **Backend** | `ruff check .`, **`pytest --tb=short -v --timeout=300 tests/`** (full suite, 3918 tests), `pytest --cov=app --cov-report=term-missing -q --timeout=300 tests/` (coverage) | `backend/` |
-| **Quality contracts** | `python scripts/check_config_contract.py`, `python scripts/check_pr_scope_drift.py` | repo root |
+| **Quality contracts** | `python scripts/check_config_contract.py`, `python scripts/check_pr_scope_drift.py`, `python scripts/check_sast_baseline.py` | repo root |
+| **SAST** | `python scripts/run_bandit.py` (bandit baseline gate; fails on new findings vs `backend/security/bandit-baseline.json`) | repo root |
 
 > The Backend job runs the **full pytest tests/** suite since PR #215 / FR-4
 > (issue #209). It takes ~18m on CI Linux (5.6x slower than local). A green
@@ -57,7 +58,7 @@ tool availability with `ToolSearch` before the first call in a session.
 ## Step 1 — Fetch current status
 
 List all check runs for the PR head commit. If every required check is green,
-report success and stop. Otherwise record which of the three jobs is red.
+report success and stop. Otherwise record which of the four jobs is red.
 
 ## Step 2 — Get the real error before fixing anything
 
@@ -178,8 +179,8 @@ read each commit; giant commits hide intent.
 
 ## Step 7 — Verify all green
 
-Do not declare victory until all three required jobs (Frontend, Backend, Quality
-contracts) are green. A `skipped` check is acceptable only if it is skipped on
+Do not declare victory until all four required jobs (Frontend, Backend, Quality
+contracts, SAST) are green. A `skipped` check is acceptable only if it is skipped on
 `master` too (path-filter gate) — confirm that explicitly.
 
 ## Anti-patterns

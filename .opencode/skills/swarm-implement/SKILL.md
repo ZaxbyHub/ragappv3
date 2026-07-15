@@ -1,15 +1,15 @@
 ---
 name: swarm-implement
-description: Execute complex implementation work with a swarm-like Codex workflow: parallel exploration, scoped planning, selective deep validation, and independent reviewer/critic checks where risk justifies them. Use for feature work, bug fixes, refactors, and multi-file changes.
+description: Execute complex implementation work with a swarm-like workflow: parallel exploration, scoped planning, selective deep validation, and independent reviewer/critic checks where risk justifies them. Use for feature work, bug fixes, refactors, and multi-file changes.
 disable-model-invocation: true
 ---
 
 # /swarm-implement
 
-Use this skill for implementation work when you want Codex to behave like a fast, high-quality swarm rather than a single-threaded assistant.
+Use this skill for implementation work when you want opencode-swarm to behave like a fast, high-quality swarm rather than a single-threaded assistant.
 
 ## Purpose
-Complete real coding tasks across many projects while preserving Codex speed and adding swarm-style quality discipline.
+Complete real coding tasks across many projects while preserving speed and adding swarm-style quality discipline.
 
 ## Core operating model
 Use this execution ladder:
@@ -23,18 +23,6 @@ Use this execution ladder:
 
 This is not a slow full-swarm recreation.
 This is a speed-preserving, quality-maximizing workflow.
-
-## Command Namespace
-
-Swarm commands: always /swarm <subcommand> — never bare subcommand names.
-
-CRITICAL — these CC built-ins share names with swarm commands and MUST be avoided:
-  /plan → use /swarm plan (reading) or do not invoke (entering plan mode)
-  /reset → NEVER invoke — wipes conversation context
-  /checkpoint → NEVER invoke bare — use /swarm checkpoint <action>
-
-HIGH — these CC built-ins produce wrong output:
-  /status → use /swarm status (not CC /status)
 
 ## Quality and speed policy
 - Quality and pre-ship defect detection are paramount.

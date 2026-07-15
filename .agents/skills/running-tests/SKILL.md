@@ -150,8 +150,8 @@ python scripts/check_pr_scope_drift.py       # flags auth-test drift, CI-tooling
 
 ## Reading CI failure logs
 
-CI is a single PR-triggered workflow with three jobs: **Frontend**,
-**Backend**, **Quality contracts**. When one is red:
+CI is a single PR-triggered workflow with four jobs: **Frontend**,
+**Backend**, **Quality contracts**, **SAST**. When one is red:
 
 ```bash
 # List checks for the PR and find the failing job

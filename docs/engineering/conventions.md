@@ -15,7 +15,7 @@ update this doc when a convention genuinely changes.
 - **Backend** — Python 3.11, FastAPI + SQLite + LanceDB, under `backend/`.
 - **Frontend** — React + TypeScript + Vite, Vitest, shadcn/ui + Tailwind, under `frontend/`.
 - **Contract scripts** — `scripts/check_config_contract.py`, `scripts/check_pr_scope_drift.py` (run in CI).
-- **CI** — `.github/workflows/ci.yml` (jobs: Backend, Frontend, Quality contracts). See `docs/engineering/testing.md` and the `ci-compatibility-audit` skill.
+- **CI** — `.github/workflows/ci.yml` (jobs: Backend, Frontend, Quality contracts, SAST). See `docs/engineering/testing.md` and the `ci-compatibility-audit` skill.
 - **User-facing docs** — `docs/` (admin-guide, email-ingestion, release, etc.). Engineering docs live under `docs/engineering/`.
 
 ---
