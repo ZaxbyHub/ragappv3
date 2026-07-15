@@ -215,17 +215,23 @@ class _SimplePool:
 
 class TestWikiEventsStreamDI(WikiDITestBase):
     """
-    Verify wiki_events_stream uses evaluate: Callable = Depends(get_evaluate_policy).
+    Verify wiki_events_stream resolves auth + vault permission via a short-lived
+    request.app.state.db_pool connection released before the SSE stream begins
+    (issue #301 pattern, mirroring /chat/stream's get_stream_auth).
 
-    The endpoint receives evaluate via FastAPI dependency injection, which reuses
-    the request-scoped connection from get_db. This is consistent with the
-    Issue 205 spec and allows FastAPI to override get_evaluate_policy in tests.
+    The endpoint declares ``request`` (for the pool) and does NOT declare
+    evaluate/db dependencies — the vault read-check runs inline via
+    _evaluate_policy inside the short-lived ``with`` block.
     """
 
     def test_wiki_events_stream_no_db_dependency(self):
         """
         The endpoint must NOT accept db as a FastAPI dependency.
-        It uses evaluate: Callable = Depends(get_evaluate_policy) instead.
+
+        Post issue #301 fix, it resolves auth + permission inside a short-lived
+        request.app.state.db_pool connection (released before the stream begins),
+        so it must not declare Depends(get_db) (which would pin a connection
+        across the SSE stream).
         """
         import inspect
 
@@ -234,13 +240,20 @@ class TestWikiEventsStreamDI(WikiDITestBase):
         param_names = {p.name for p in sig.parameters.values()}
         self.assertNotIn(
             "db", param_names,
-            "wiki_events_stream must NOT have a db parameter — "
-            "it uses evaluate via Depends(get_evaluate_policy) instead"
+            "wiki_events_stream must NOT have a db parameter — it uses a "
+            "short-lived request.app.state.db_pool connection (issue #301)"
         )
 
-    def test_wiki_events_stream_has_evaluate_dependency(self):
+    def test_wiki_events_stream_has_request_dependency(self):
         """
-        The endpoint must accept evaluate as a dependency from get_evaluate_policy.
+        The endpoint must accept ``request`` (for request.app.state.db_pool) and
+        must NOT declare evaluate/db dependencies.
+
+        Post issue #301 fix, wiki_events_stream resolves auth + the vault
+        read-permission check inside a short-lived connection sourced from
+        request.app.state.db_pool (released before the stream begins), rather
+        than via Depends(get_evaluate_policy)/Depends(get_db) which pinned a
+        connection across the stream.
         """
         import inspect
 
@@ -248,9 +261,20 @@ class TestWikiEventsStreamDI(WikiDITestBase):
         sig = inspect.signature(wiki_events_stream)
         param_names = {p.name for p in sig.parameters.values()}
         self.assertIn(
+            "request", param_names,
+            "wiki_events_stream must have a request parameter (sources "
+            "request.app.state.db_pool for the short-lived auth connection)"
+        )
+        self.assertNotIn(
             "evaluate", param_names,
-            "wiki_events_stream must have an evaluate parameter from "
-            "Depends(get_evaluate_policy)"
+            "wiki_events_stream must NOT declare evaluate via Depends — the "
+            "vault check now runs inline via _evaluate_policy inside a "
+            "short-lived connection (issue #301 pattern)."
+        )
+        self.assertNotIn(
+            "db", param_names,
+            "wiki_events_stream must NOT declare db via Depends(get_db) — that "
+            "would pin a pooled connection across the SSE stream (issue #301)."
         )
 
     def test_wiki_events_stream_is_async(self):
@@ -263,35 +287,57 @@ class TestWikiEventsStreamDI(WikiDITestBase):
             "wiki_events_stream must be an async function"
         )
 
-    def test_wiki_events_stream_calls_evaluate_via_di(self):
+    def test_wiki_events_stream_runs_permission_check(self):
         """
-        Verify the endpoint calls evaluate (from Depends(get_evaluate_policy))
-        with (user, 'vault', vault_id, 'read').
+        Verify the endpoint runs the vault read-permission check via
+        _evaluate_policy inside the short-lived connection, releasing it before
+        the stream begins.
 
-        Since evaluate is now a Depends(get_evaluate_policy) parameter, direct
-        invocation requires passing evaluate=tracking_evaluate as a keyword arg.
-        We call the endpoint directly to avoid TestClient's SSE stream deadlock
-        on Windows.
+        Calls the endpoint directly with a mocked pool + _resolve_active_user +
+        _evaluate_policy to avoid TestClient's SSE stream deadlock on Windows,
+        and asserts the permission check ran with (user, 'vault', vault_id,
+        'read') and the connection was acquired/released.
         """
-        from fastapi.responses import StreamingResponse
+        from unittest.mock import MagicMock
 
         from app.api.routes.wiki import wiki_events_stream
 
         called = []
 
-        async def tracking_evaluate(user, resource, resource_id, action):
+        async def tracking_evaluate(conn, user, resource, resource_id, action):
             called.append((user, resource, resource_id, action))
             return True
 
-        async def direct_call():
-            return await wiki_events_stream(vault_id=1, user=_MOCK_SUPERADMIN, evaluate=tracking_evaluate)
+        # Mock request whose app.state.db_pool yields a fake connection.
+        class _FakeCM:
+            def __enter__(self):
+                return "fake-conn"
 
-        response = asyncio.run(direct_call())
+            def __exit__(self, *exc):
+                return False
+
+        class _FakePool:
+            def connection(self):
+                return _FakeCM()
+
+        fake_request = MagicMock()
+        fake_request.app.state.db_pool = _FakePool()
+        fake_request.headers.get.return_value = None
+        fake_request.cookies.get.return_value = None
+
+        with patch("app.api.routes.wiki._resolve_active_user", return_value=_MOCK_SUPERADMIN):
+            with patch("app.api.routes.wiki._evaluate_policy", side_effect=tracking_evaluate):
+                with patch("app.api.routes.wiki.get_wiki_event_bus") as mock_bus:
+                    mock_bus.return_value.subscribe.return_value = MagicMock()
+                    response = asyncio.run(
+                        wiki_events_stream(request=fake_request, vault_id=1)
+                    )
+
+        from fastapi.responses import StreamingResponse
         self.assertIsInstance(response, StreamingResponse)
-
         self.assertEqual(
             len(called), 1,
-            "evaluate must be called exactly once via Depends(get_evaluate_policy)"
+            "_evaluate_policy must be called exactly once for the vault read check"
         )
         self.assertEqual(called[0][1], "vault")
         self.assertEqual(called[0][2], 1)

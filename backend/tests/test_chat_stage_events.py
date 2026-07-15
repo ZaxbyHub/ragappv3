@@ -400,10 +400,12 @@ class TestChatSSEStageForwarding(unittest.TestCase):
 
     def tearDown(self):
         from app.api.deps import get_current_active_user, get_rag_engine
+        from app.api.routes.chat import get_stream_auth
         from app.main import app
 
         app.dependency_overrides.pop(get_rag_engine, None)
         app.dependency_overrides.pop(get_current_active_user, None)
+        app.dependency_overrides.pop(get_stream_auth, None)
         if hasattr(app.state, '_test_services'):
             for key in app.state._test_services:
                 try:
@@ -414,6 +416,7 @@ class TestChatSSEStageForwarding(unittest.TestCase):
 
     def _set_mock_rag_engine(self, mock_query_fn):
         from app.api.deps import get_current_active_user, get_rag_engine
+        from app.api.routes.chat import get_stream_auth
         from app.main import app
 
         mock_engine = MagicMock()
@@ -426,7 +429,9 @@ class TestChatSSEStageForwarding(unittest.TestCase):
             "email": "testuser@example.com",
             "role": "admin",
         }
-        app.dependency_overrides[get_current_active_user] = lambda: mock_user
+        # The stream route resolves auth via get_stream_auth (issue #301); override
+        # that seam directly with the admin mock user.
+        app.dependency_overrides[get_stream_auth] = lambda: mock_user
 
         if not hasattr(app.state, '_test_services'):
             app.state._test_services = []

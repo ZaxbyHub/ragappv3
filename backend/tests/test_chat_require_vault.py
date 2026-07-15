@@ -61,6 +61,7 @@ except ImportError:
     sys.modules["unstructured.documents"] = _unstructured.documents
     sys.modules["unstructured.documents.elements"] = _unstructured.documents.elements
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from app.api.deps import (
@@ -69,6 +70,8 @@ from app.api.deps import (
     get_rag_engine,
 )
 from app.api.routes.chat import (
+    ChatStreamRequest,
+    get_stream_auth,
     non_stream_chat_response,
     stream_chat_response,
 )
@@ -81,19 +84,39 @@ class TestRequireVaultWiring(unittest.TestCase):
     """Test suite for require_vault parameter wiring."""
 
     def _set_route_mocks(self, user_role="member", user_id=1, vault_id=None):
-        app.dependency_overrides[get_rag_engine] = lambda: MagicMock()
-        app.dependency_overrides[get_current_active_user] = lambda: {
+        mock_user = {
             "id": user_id,
             "username": "testuser",
             "role": user_role,
         }
+        app.dependency_overrides[get_rag_engine] = lambda: MagicMock()
+        app.dependency_overrides[get_current_active_user] = lambda: mock_user
         app.dependency_overrides[get_evaluate_policy] = lambda: AsyncMock(
             return_value=True
         )
+        # The /chat/stream route resolves auth+authz via get_stream_auth (issue
+        # #301). Override it to mirror the production boundary: vault_id=None
+        # ("All Vaults") is admin-only; this drives the stream-route tests below.
+        async def _stream_auth(request: Request, body: ChatStreamRequest):
+            if body.vault_id is None and user_role not in ("superadmin", "admin"):
+                from fastapi import HTTPException
+
+                raise HTTPException(
+                    status_code=403,
+                    detail="Searching all vaults requires admin access. Please select a specific vault.",
+                )
+            return mock_user
+
+        app.dependency_overrides[get_stream_auth] = _stream_auth
         self._vault_id = vault_id
 
     def tearDown(self):
-        for key in [get_rag_engine, get_current_active_user, get_evaluate_policy]:
+        for key in [
+            get_rag_engine,
+            get_current_active_user,
+            get_evaluate_policy,
+            get_stream_auth,
+        ]:
             app.dependency_overrides.pop(key, None)
 
     def test_non_stream_forwards_require_vault_to_query(self):

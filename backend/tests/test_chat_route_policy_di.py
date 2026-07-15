@@ -10,7 +10,7 @@ the DI path: a deny → 403, an allow → reaches the engine.
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
 from app.api.deps import (
@@ -18,7 +18,7 @@ from app.api.deps import (
     get_evaluate_policy,
     get_rag_engine,
 )
-from app.api.routes.chat import router
+from app.api.routes.chat import ChatStreamRequest, get_stream_auth, router
 
 
 def _make_client(*, allow: bool, mock_user: dict = None) -> tuple[TestClient, MagicMock]:
@@ -42,6 +42,24 @@ def _make_client(*, allow: bool, mock_user: dict = None) -> tuple[TestClient, Ma
         return allow
 
     app.dependency_overrides[get_evaluate_policy] = lambda: _evaluate
+
+    # The /chat/stream route resolves auth+authz via get_stream_auth (issue #301),
+    # which is a separate seam from get_current_active_user/get_evaluate_policy.
+    # Override it to mirror the production boundary: vault_id set -> allow/deny
+    # via the `allow` flag; vault_id=None ("All Vaults") -> admin-only gate.
+    async def _stream_auth(request: Request, body: ChatStreamRequest):
+        if body.vault_id is not None:
+            if not allow:
+                raise HTTPException(status_code=403, detail="No read access to this vault")
+        else:
+            if mock_user.get("role") not in ("superadmin", "admin"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Searching all vaults requires admin access. Please select a specific vault.",
+                )
+        return mock_user
+
+    app.dependency_overrides[get_stream_auth] = _stream_auth
 
     mock_rag = MagicMock()
 

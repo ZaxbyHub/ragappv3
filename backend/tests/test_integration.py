@@ -313,6 +313,7 @@ def setup_app_state(app, **overrides):
 
     # Bypass authentication and CSRF for integration tests (tests cover functionality, not auth)
     from app.api.deps import get_current_active_user
+    from app.api.routes.chat import get_stream_auth
     from app.security import csrf_protect
 
     app.dependency_overrides[get_current_active_user] = lambda: {
@@ -323,6 +324,16 @@ def setup_app_state(app, **overrides):
         "must_change_password": 0,
     }
     app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+    # The /chat/stream route resolves auth+authz via get_stream_auth (issue #301),
+    # a separate seam from get_current_active_user. Override it with the same
+    # bypassed superadmin user so integration tests of the stream path proceed.
+    app.dependency_overrides[get_stream_auth] = lambda: {
+        "id": 0,
+        "username": "admin",
+        "role": "superadmin",
+        "is_active": 1,
+        "must_change_password": 0,
+    }
 
     if "background_processor" in overrides:
         app.state.background_processor = overrides["background_processor"]
@@ -343,6 +354,7 @@ def setup_app_state(app, **overrides):
 
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
+        app.dependency_overrides.pop(get_stream_auth, None)
         shutil.rmtree(test_data_dir, ignore_errors=True)
 
     return cleanup
@@ -389,10 +401,12 @@ class TestIntegration(unittest.TestCase):
         import shutil
 
         from app.api.deps import get_current_active_user
+        from app.api.routes.chat import get_stream_auth
         from app.main import app
         from app.security import csrf_protect
         app.dependency_overrides.pop(get_current_active_user, None)
         app.dependency_overrides.pop(csrf_protect, None)
+        app.dependency_overrides.pop(get_stream_auth, None)
 
         from app.config import settings
         settings.data_dir = self._orig_data_dir

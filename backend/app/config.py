@@ -167,6 +167,12 @@ class Settings(BaseSettings):
     """Dedicated SQLiteConnectionPool max_size for MemoryStore concurrent
     retrieval operations. Default 10 matches the application pool default
     and removes the historical bottleneck of 2."""
+    db_pool_max_size: int = 10
+    """Maximum number of connections in the main application SQLiteConnectionPool
+    (the singleton seeded at startup and shared by the get_pool() cache). Default
+    10. Must be >= 1. This is the pool backing auth/permission checks, route DB
+    access, and (briefly) the streaming-chat pre-stream auth boundary. Separate
+    from memory_store_pool_size, which governs the MemoryStore pool."""
     memory_relevance_filter_enabled: bool = True
     """When True, apply similarity thresholds to filter out weakly related memories
     before injecting them into the prompt. Prevents unrelated memories from polluting
@@ -808,6 +814,23 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"memory_store_pool_size must be >= 5 (got {v}); "
                 "lower values bottleneck concurrent MemoryStore retrieval"
+            )
+        return v
+
+    @field_validator("db_pool_max_size", mode="after")
+    @classmethod
+    def validate_db_pool_max_size(cls, v: int) -> int:
+        """Ensure the main application DB pool size is at least 1.
+
+        A pool of 0 would make every get_connection() block to exhaustion and
+        raise RuntimeError, breaking all DB-backed requests. There is no upper
+        bound here (SQLite serializes writers regardless); operators tune this
+        against expected concurrent request count.
+        """
+        if v < 1:
+            raise ValueError(
+                f"db_pool_max_size must be >= 1 (got {v}); "
+                "a zero/negative pool size would exhaust on every checkout"
             )
         return v
 

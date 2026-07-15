@@ -19,6 +19,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
+    _evaluate_policy,
+    _resolve_active_user,
     get_current_active_user,
     get_db,
     get_evaluate_policy,
@@ -672,14 +674,70 @@ async def chat(
         raise
 
 
+async def get_stream_auth(
+    request: Request,
+    body: ChatStreamRequest,
+) -> dict:
+    """Resolve auth + vault authz for /chat/stream using a SHORT-LIVED pooled
+    connection that is released BEFORE the streaming response begins (issue #301).
+
+    The legacy path resolved auth via Depends(get_current_active_user) +
+    Depends(get_evaluate_policy), both of which carry the request-scoped
+    yield-dependency get_db; FastAPI deferred get_db's teardown until the
+    StreamingResponse body finished — pinning one pooled connection across the
+    entire LLM generation and capping concurrency at the pool size (~10).
+
+    Here we source the pool from request.app.state.db_pool (NOT get_pool, which
+    preserves the S-003 no-double-connection invariant — no standalone get_pool
+    call on the request path) and run the full authz decision (vault
+    read-permission AND the all-vaults admin check) inside one `with` block.
+    The block closes when this dependency returns, which FastAPI does BEFORE
+    invoking chat_stream's body — so the connection is back in the pool before
+    stream_chat_response constructs the StreamingResponse. Tests override this
+    single seam via app.dependency_overrides[get_stream_auth].
+
+    Note (pre-existing): pool.connection() -> get_connection() uses a synchronous
+    blocking Queue.get(timeout=5). That is an inherited characteristic of the
+    legacy SQLiteConnectionPool (the old get_db path was identical); making
+    checkout async is out of scope for #301/#302. If the pool is exhausted the
+    block is bounded to max_wait_attempts*5s, a pool_exhausted event is logged,
+    and the RuntimeError surfaces as a 500.
+    """
+    pool = request.app.state.db_pool
+    with pool.connection() as conn:
+        user = await _resolve_active_user(
+            conn,
+            request,
+            request.headers.get("authorization"),
+            request.cookies.get("access_token"),
+        )
+        if body.vault_id is not None:
+            if not await _evaluate_policy(conn, user, "vault", body.vault_id, "read"):
+                raise HTTPException(status_code=403, detail="No read access to this vault")
+        else:
+            # vault_id=None ("All Vaults") searches across all vaults without filtering.
+            # Restrict to admin/superadmin — non-admin users must specify a vault_id.
+            if user.get("role") not in ("superadmin", "admin"):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Searching all vaults requires admin access. Please select a specific vault.",
+                )
+    # <-- pooled connection released here, before the SSE stream starts.
+    # Structured db_released event (observability): proves the auth connection
+    # did not span the SSE generation (the #301 fix).
+    from app.api.deps import log_db_released
+
+    log_db_released("chat_stream", vault_id=body.vault_id)
+    return user
+
+
 @router.post("/chat/stream")
 @limiter.limit(settings.chat_rate_limit)
 async def chat_stream(
     request: Request,
     body: ChatStreamRequest,
     rag_engine: RAGEngine = Depends(get_rag_engine),
-    user: dict = Depends(get_current_active_user),
-    evaluate: Callable = Depends(get_evaluate_policy),
+    user: dict = Depends(get_stream_auth),
     _csrf_token: str = Depends(csrf_protect),
     _=Depends(require_model_ready),
 ):
@@ -693,17 +751,6 @@ async def chat_stream(
             status_code=400, detail="The last message must be from the user"
         )
 
-    if body.vault_id is not None:
-        if not await evaluate(user, "vault", body.vault_id, "read"):
-            raise HTTPException(status_code=403, detail="No read access to this vault")
-    else:
-        # vault_id=None ("All Vaults") searches across all vaults without filtering.
-        # Restrict to admin/superadmin — non-admin users must specify a vault_id.
-        if user.get("role") not in ("superadmin", "admin"):
-            raise HTTPException(
-                status_code=403,
-                detail="Searching all vaults requires admin access. Please select a specific vault.",
-            )
     require_vault = user.get("role") not in ("superadmin", "admin")
     history = [msg.model_dump(exclude_none=True) for msg in body.messages[:-1]]
     effective_mode = ChatMode(body.mode) if body.mode else None

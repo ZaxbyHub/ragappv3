@@ -141,6 +141,22 @@ def get_db_pool(request: Request) -> SQLiteConnectionPool:
     return request.app.state.db_pool
 
 
+def log_db_released(scope: str, *, vault_id: int | None = None) -> None:
+    """Emit a structured ``db_released`` event.
+
+    Called by streaming-route auth boundaries (get_stream_auth, wiki_events_stream)
+    immediately after they release the short-lived pooled connection acquired for
+    pre-stream auth/permission checks. This makes the #301 connection-lifecycle
+    fix observable: the event fires before the SSE stream begins, proving the
+    auth connection did not span the generation. Pair with the ``pool_exhausted``
+    event in SQLiteConnectionPool.get_connection for end-to-end pool visibility.
+    """
+    extra = {"event": "db_released", "scope": scope}
+    if vault_id is not None:
+        extra["vault_id"] = vault_id
+    logger.info("db_released scope=%s", scope, extra=extra)
+
+
 def get_settings() -> Settings:
     """Return the application settings."""
     return settings
@@ -260,17 +276,29 @@ def _fetch_user_row_with_pwc(db: sqlite3.Connection, user_id: int) -> tuple | No
         return row
 
 
-async def get_current_active_user(
+async def _resolve_active_user(
+    conn: sqlite3.Connection | None,
     request: Request,
-    authorization: str | None = Header(None),
-    access_token: str | None = Cookie(None),
-    db: sqlite3.Connection = Depends(get_db),
+    authorization: str | None,
+    access_token: str | None,
 ) -> dict:
-    """
-    FastAPI dependency to get the current authenticated user.
+    """Resolve and validate the active user from request credentials.
 
-    When users_enabled=False: Validates against admin_secret_token
-    When users_enabled=True: Validates JWT token and fetches user from database
+    Shared implementation for the request-scoped DI dependency
+    ``get_current_active_user`` (which receives a pooled connection via
+    ``Depends(get_db)``) and the streaming-chat auth boundary in
+    ``chat_stream`` (which uses a short-lived connection released before the
+    SSE stream begins — see issue #301). Keeping a single code path guarantees
+    both callers enforce identical authentication and post-auth checks:
+
+    admin-secret fallback (users_enabled=False), JWT decode + token-type check,
+    denylist (``is_access_token_denied``), fingerprint, active-user cache,
+    ``is_active``, ``must_change_password`` path exemption, and password-change
+    invalidation.
+
+    ``conn`` may be unused on the ``users_enabled=False`` admin-secret branch
+    (that path takes no DB); every other branch uses ``conn`` exactly as the
+    legacy DI dependency did. Returns the validated user dict.
     """
     # Extract token from Authorization header or fall back to cookie
     if authorization and authorization.lower().startswith("bearer "):
@@ -335,7 +363,7 @@ async def get_current_active_user(
 
     # Denylist check: verify when jti is present, skip when absent (backward compatible).
     jti = payload.get("jti")
-    if jti and is_access_token_denied(db, jti):
+    if jti and is_access_token_denied(conn, jti):
         raise HTTPException(
             status_code=401,
             detail="token_invalid",
@@ -385,7 +413,7 @@ async def get_current_active_user(
 
     if cached_user is None:
         row = await asyncio.to_thread(
-            lambda: _fetch_user_row_with_pwc(db, user_id)
+            lambda: _fetch_user_row_with_pwc(conn, user_id)
         )
 
         if not row:
@@ -471,6 +499,25 @@ async def get_current_active_user(
         )
 
     return dict(user)
+
+
+async def get_current_active_user(
+    request: Request,
+    authorization: str | None = Header(None),
+    access_token: str | None = Cookie(None),
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """
+    FastAPI dependency to get the current authenticated user.
+
+    When users_enabled=False: Validates against admin_secret_token
+    When users_enabled=True: Validates JWT token and fetches user from database
+
+    Thin wrapper around ``_resolve_active_user`` so that the request-scoped
+    pooled connection (``Depends(get_db)``) and the streaming-chat short-lived
+    connection share one identical auth implementation.
+    """
+    return await _resolve_active_user(db, request, authorization, access_token)
 
 
 async def get_current_user_or_service_account(

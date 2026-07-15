@@ -52,6 +52,7 @@ except ImportError:
     sys.modules['unstructured.documents'] = _unstructured.documents
     sys.modules['unstructured.documents.elements'] = _unstructured.documents.elements
 
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 # Create a temporary database for testing
@@ -892,6 +893,15 @@ class TestVaultScopedRoutes(unittest.TestCase):
             return True
 
         app.dependency_overrides[get_evaluate_policy] = lambda: allow_policy
+        # The /chat/stream route resolves auth+authz via get_stream_auth (issue #301),
+        # a separate seam from get_current_active_user/get_evaluate_policy. Override
+        # it with the admin mock user so the stream route tests proceed to the engine.
+        from app.api.routes.chat import ChatStreamRequest, get_stream_auth
+
+        async def _stream_auth_admin(request: Request, body: ChatStreamRequest):
+            return {"id": 1, "username": "test-admin", "role": "admin"}
+
+        app.dependency_overrides[get_stream_auth] = _stream_auth_admin
         from app.security import csrf_protect
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
         self._csrf_protect = csrf_protect
@@ -906,6 +916,8 @@ class TestVaultScopedRoutes(unittest.TestCase):
         app.dependency_overrides.pop(get_rag_engine, None)
         app.dependency_overrides.pop(get_embedding_service, None)
         app.dependency_overrides.pop(getattr(self, '_csrf_protect', None), None)
+        from app.api.routes.chat import get_stream_auth
+        app.dependency_overrides.pop(get_stream_auth, None)
         if hasattr(self, '_connection_pool'):
             self._connection_pool.close_all()
         import shutil

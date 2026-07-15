@@ -11,7 +11,7 @@ from fastapi import FastAPI
 
 from app.config import settings
 from app.middleware.logging import SensitiveFieldFilter
-from app.models.database import get_pool, run_migrations
+from app.models.database import SQLiteConnectionPool, get_pool, run_migrations
 from app.security import CSRFManager
 from app.services.background_tasks import get_background_processor
 from app.services.email_service import EmailIngestionService
@@ -355,6 +355,35 @@ async def lifespan(app: FastAPI):
         )
     _load_persisted_settings(str(settings.sqlite_path))
 
+    # Seed the application DB pool BEFORE any other get_pool() caller can run.
+    # get_pool() is a first-call-wins singleton keyed on the sqlite_path, so a
+    # caller that requests a smaller (or default) max_size earlier in startup
+    # would permanently cache that size for the process. migrate_uploads() below
+    # is exactly such a caller (_lookup_vault_id used to seed at the default 5
+    # before this line sized the pool at 10) — sizing first closes issue #302.
+    #
+    # Wrapped in try/except so a seeding failure does not hard-crash startup
+    # with an opaque traceback: app.state.db_pool is referenced directly by the
+    # streaming auth boundaries (get_stream_auth, wiki_events_stream) and by
+    # MemoryStore init below, so it must always be set. On failure we fall back
+    # to a fresh pool constructed directly (bypassing the singleton cache) at a
+    # conservative default size — degraded capacity, but the app still boots.
+    try:
+        app.state.db_pool = get_pool(
+            str(settings.sqlite_path), max_size=settings.db_pool_max_size
+        )
+    except Exception as e:
+        logger.error(
+            "DB pool seeding failed (sqlite_path=%s, max_size=%d): %s — "
+            "falling back to a default-size pool (degraded capacity)",
+            settings.sqlite_path,
+            settings.db_pool_max_size,
+            e,
+        )
+        app.state.db_pool = SQLiteConnectionPool(
+            str(settings.sqlite_path), max_size=5
+        )
+
     # Migrate uploads to per-vault directories (run before accepting requests)
     try:
         from app.services.upload_path import migrate_uploads
@@ -363,8 +392,6 @@ async def lifespan(app: FastAPI):
         await asyncio.wait_for(asyncio.to_thread(migrate_uploads, False), timeout=15)
     except Exception as e:
         logger.warning(f"Upload migration failed (continuing anyway): {e}")
-
-    app.state.db_pool = get_pool(str(settings.sqlite_path), max_size=10)
 
     # Dual LLM clients: Thinking (gpt-oss-120b on DGX Spark via ollama_chat_url)
     # and Instant (Nemotron 3 Nano 4B on LM Studio via instant_chat_url).

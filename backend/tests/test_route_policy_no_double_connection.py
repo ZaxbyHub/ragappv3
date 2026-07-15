@@ -229,25 +229,41 @@ def test_denied_route_returns_403_without_standalone_pool(db_path):
 # ---------------------------------------------------------------------------
 
 
-def test_wiki_events_stream_uses_di_evaluate_policy(db_path):
-    """wiki_events_stream uses the DI evaluate_policy (migrated from standalone).
+def test_wiki_events_stream_releases_connection_and_no_standalone_pool(db_path):
+    """wiki_events_stream resolves auth+authz via a short-lived connection
+    sourced from request.app.state.db_pool (NOT get_pool), released before the
+    SSE stream begins — the same #301 pattern as /chat/stream's get_stream_auth.
 
-    The endpoint's pre-stream permission check uses the injected ``evaluate``
-    callable from ``Depends(get_evaluate_policy)``, consistent with the S-003
-    migration. This test verifies both that get_pool is NOT called (no
-    standalone evaluate_policy) AND that the DI evaluate callable IS invoked
-    with the correct arguments.
+    Asserts the S-003 no-standalone-get_pool invariant still holds (get_pool is
+    NOT called on the request path) AND that the pre-stream permission check
+    ran (the route reached the event bus, which only happens after the vault
+    read check passed).
     """
     import asyncio
 
-    closed = asyncio.Event()
+    from app.models.database import SQLiteConnectionPool, _pool_cache, _pool_cache_lock
+
+    with _pool_cache_lock:
+        for p in list(_pool_cache.values()):
+            try:
+                p.close_all()
+            except Exception:
+                pass
+        _pool_cache.clear()
+
+    # Seed a vault the superadmin can read.
+    _conn = sqlite3.connect(db_path)
+    _conn.execute("INSERT OR IGNORE INTO vaults (id, name) VALUES (1, 'V1')")
+    _conn.commit()
+    _conn.close()
+
+    subscribe_calls = []
 
     class _ImmediateCloseBus:
-        def subscribe(self, _vault_id):
-            class _Q:
-                def __init__(self):
-                    self._tasks = []
+        def subscribe(self, vault_id):
+            subscribe_calls.append(vault_id)
 
+            class _Q:
                 async def get(self):
                     await asyncio.sleep(0.01)
                     raise asyncio.CancelledError()
@@ -258,56 +274,51 @@ def test_wiki_events_stream_uses_di_evaluate_policy(db_path):
             return _Q()
 
         def unsubscribe(self, _vault_id, _queue):
-            closed.set()
-
-    # Track DI evaluate invocations
-    evaluate_calls = []
-
-    async def _tracking_evaluate(*args, **kwargs):
-        evaluate_calls.append((args, kwargs))
-        return True
+            pass
 
     app = FastAPI()
     app.include_router(wiki.router, prefix="/api")
     app.state.vector_store = None
-    app.dependency_overrides[get_current_active_user] = lambda: {
-        "id": 1,
-        "username": "admin",
-        "role": "superadmin",
-        "is_active": True,
-        "must_change_password": False,
-    }
-    app.dependency_overrides[get_evaluate_policy] = lambda: _tracking_evaluate
+    # The route sources its connection from app.state.db_pool (the lifespan
+    # singleton), NOT from get_db/get_pool. Install a real pool against the
+    # temp DB so _resolve_active_user + _evaluate_policy run end-to-end.
+    pool = SQLiteConnectionPool(db_path, max_size=5)
+    app.state.db_pool = pool
 
-    def _get_db():
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-        finally:
-            conn.close()
+    # Bypass JWT: override _resolve_active_user so the auth boundary still runs
+    # (acquiring + releasing the conn) but returns a known superadmin without
+    # needing a real token. The vault read-check then runs for real.
+    async def _resolve(_conn, _request, _auth, _cookie):
+        return {"id": 1, "username": "admin", "role": "superadmin"}
 
-    app.dependency_overrides[get_db] = _get_db
+    with patch("app.api.routes.wiki._resolve_active_user", side_effect=_resolve):
+        with patch("app.api.routes.wiki.get_wiki_event_bus", return_value=_ImmediateCloseBus()):
+            with patch("app.api.deps.get_pool") as mock_get_pool:
+                try:
+                    client = TestClient(app)
+                    client.get("/api/wiki/events", params={"vault_id": 1})
+                except Exception:
+                    pass
 
-    client = TestClient(app)
-
-    with patch("app.api.routes.wiki.get_wiki_event_bus", return_value=_ImmediateCloseBus()):
-        with patch("app.api.deps.get_pool") as mock_get_pool:
+    # The permission check passed -> the route reached the event bus.
+    assert subscribe_calls == [1], (
+        "wiki_events_stream must run the vault read-permission check and reach "
+        f"the event bus; subscribe_calls={subscribe_calls}"
+    )
+    # S-003 invariant: get_pool is NOT called on the request path (the route
+    # reads request.app.state.db_pool directly).
+    assert mock_get_pool.call_count == 0, (
+        "wiki_events_stream must not call app.api.deps.get_pool — it sources its "
+        "connection from request.app.state.db_pool (issue #301 pattern)."
+    )
+    pool.close_all()
+    with _pool_cache_lock:
+        for p in list(_pool_cache.values()):
             try:
-                client.get("/api/wiki/events", params={"vault_id": 1})
+                p.close_all()
             except Exception:
                 pass
-
-    # DI evaluate must have been called with the vault read check
-    assert len(evaluate_calls) >= 1, (
-        "wiki_events_stream must invoke the DI evaluate callable for its "
-        "pre-stream permission check."
-    )
-    # get_pool must NOT have been called (no standalone evaluate_policy)
-    assert mock_get_pool.call_count == 0, (
-        "wiki_events_stream must use DI get_evaluate_policy, not standalone "
-        "evaluate_policy. The S-003 migration moved this endpoint to DI."
-    )
+        _pool_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -352,3 +363,87 @@ def test_batch_memory_wiki_status_does_not_raise_typeerror(db_path, monkeypatch)
         f"(re-check the helper arity after the S-003 DI migration)."
     )
     assert "statuses" in resp.json()
+
+
+# ---------------------------------------------------------------------------
+# /chat/stream (issue #301): the streaming route resolves auth via the
+# get_stream_auth dependency, which sources its connection from
+# request.app.state.db_pool — NOT get_pool — so the S-003 no-standalone-get_pool
+# invariant still holds. The connection is acquired and released inside
+# get_stream_auth BEFORE the StreamingResponse begins (verified separately in
+# test_chat_stream_connection_release.py). Here we assert only the S-003
+# property: get_pool is not invoked on the request path.
+# ---------------------------------------------------------------------------
+
+
+def test_chat_stream_does_not_open_standalone_pool(db_path):
+    """POST /api/chat/stream must not call app.api.deps.get_pool on the request
+    path. The route uses get_stream_auth, which reads request.app.state.db_pool
+    (the singleton seeded at startup) and runs auth inside a short-lived
+    connection() context manager — preserving the S-003 invariant while
+    releasing the connection before streaming (issue #301).
+    """
+    from unittest.mock import MagicMock
+
+    from fastapi import Request
+
+    from app.api.deps import get_rag_engine, require_model_ready
+    from app.api.routes.chat import ChatStreamRequest, get_stream_auth
+    from app.models.database import SQLiteConnectionPool, _pool_cache, _pool_cache_lock
+    from app.security import csrf_protect
+
+    with _pool_cache_lock:
+        for p in list(_pool_cache.values()):
+            try:
+                p.close_all()
+            except Exception:
+                pass
+        _pool_cache.clear()
+
+    app = FastAPI()
+    app.include_router(chat.router, prefix="/api")
+    app.state.vector_store = None
+    # Seed app.state.db_pool with a real pool against the temp DB so get_stream_auth
+    # (when not overridden) would have a pool to read. We override get_stream_auth
+    # below to inject a user without JWT, but still set the pool for realism.
+    app.state.db_pool = SQLiteConnectionPool(db_path, max_size=5)
+
+    async def _stream_auth_override(request: Request, body: ChatStreamRequest):
+        return {"id": 1, "username": "admin", "role": "superadmin"}
+
+    app.dependency_overrides[get_stream_auth] = _stream_auth_override
+    app.dependency_overrides[get_rag_engine] = lambda: MagicMock(
+        query=lambda *a, **k: _async_done_gen()
+    )
+    app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+    app.dependency_overrides[require_model_ready] = lambda: True
+
+    client = TestClient(app)
+    try:
+        with patch("app.api.deps.get_pool") as mock_get_pool:
+            resp = client.post(
+                "/api/chat/stream",
+                json={"messages": [{"role": "user", "content": "test"}], "vault_id": 1},
+            )
+        assert resp.status_code == 200, resp.text
+        assert mock_get_pool.call_count == 0, (
+            "chat_stream must not call app.api.deps.get_pool — get_stream_auth "
+            "sources its connection from request.app.state.db_pool, preserving "
+            "the S-003 no-standalone-get_pool invariant (issue #301)."
+        )
+    finally:
+        app.dependency_overrides.clear()
+        app.state.db_pool.close_all()
+        with _pool_cache_lock:
+            for p in list(_pool_cache.values()):
+                try:
+                    p.close_all()
+                except Exception:
+                    pass
+            _pool_cache.clear()
+
+
+async def _async_done_gen():
+    """Minimal async generator mimicking RAGEngine.query(stream=True)."""
+    yield {"type": "content", "content": "hi"}
+    yield {"type": "done", "sources": [], "memories_used": []}

@@ -3191,6 +3191,17 @@ class SQLiteConnectionPool:
                 continue
 
         # Max attempts exhausted
+        # Structured event (observability): a pool_exhausted event means the pool
+        # could not satisfy a checkout within the wait budget. This surfaces the
+        # #301/#302 capacity class of problem at runtime — e.g. a route still
+        # pinning connections across a stream, or db_pool_max_size undersized.
+        logger.warning(
+            "pool_exhausted sqlite_path=%s max_size=%d created=%d wait_attempts=%d",
+            self.sqlite_path,
+            self.max_size,
+            self._created_count,
+            max_wait_attempts,
+        )
         raise RuntimeError(
             f"Could not obtain a connection from the pool after {max_wait_attempts} attempts"
         )
@@ -3262,24 +3273,46 @@ _pool_cache_lock = threading.Lock()
 
 def get_pool(sqlite_path: str, max_size: int = 5) -> SQLiteConnectionPool:
     """
-    Get or create a connection pool for the given SQLite path.
+    Get or create a connection pool for the given sqlite path.
 
     This function implements a singleton pattern, returning the same
     pool instance for the same sqlite_path.
 
     Args:
         sqlite_path: Path to the SQLite database file.
-        max_size: Maximum number of connections in the pool.
+        max_size: Maximum number of connections in the pool. Only honored on the
+            FIRST call for a given path; later calls return the cached pool.
 
     Returns:
         SQLiteConnectionPool: A connection pool instance.
+
+    Note:
+        Because the cache keys only on ``sqlite_path``, a request for a LARGER
+        ``max_size`` than the cached pool's size cannot be satisfied (the
+        ``Queue(maxsize=...)`` is fixed at construction). When this happens we
+        log a warning so the silent-seeding class of bug (issue #302, where an
+        early caller cached a smaller default) is observable. We intentionally
+        do NOT raise — several callers legitimately request smaller sizes
+        (document_processor/file_watcher) — and we do NOT resize, which is
+        impossible post-construction.
     """
     global _pool_cache
 
     with _pool_cache_lock:
-        if sqlite_path not in _pool_cache:
-            _pool_cache[sqlite_path] = SQLiteConnectionPool(sqlite_path, max_size)
-        return _pool_cache[sqlite_path]
+        cached = _pool_cache.get(sqlite_path)
+        if cached is None:
+            cached = SQLiteConnectionPool(sqlite_path, max_size)
+            _pool_cache[sqlite_path] = cached
+        elif max_size > cached.max_size:
+            logger.warning(
+                "get_pool: sqlite_path=%s already cached at max_size=%d; "
+                "requested max_size=%d ignored (singleton cannot resize). "
+                "Seed the pool at the intended size at startup. See issue #302.",
+                sqlite_path,
+                cached.max_size,
+                max_size,
+            )
+        return cached
 
 
 @contextmanager
