@@ -2200,6 +2200,43 @@ class VectorStore:
             logger.warning(f"Failed to fetch chunks by UID: {e}")
             return []
 
+    async def get_chunks_by_file_range(
+        self,
+        file_id: str,
+        chunk_index: int,
+        before: int,
+        after: int,
+    ) -> List[Dict[str, Any]]:
+        """Fetch neighbor chunks of a target chunk within the same file (Issue #396).
+
+        Used by the configurable context-window endpoint to build structured
+        before/match/after context. ``file_id`` is the LanceDB string column
+        (escaped via ``_lance_escape``); ``chunk_index`` selects the center; the
+        range ``[chunk_index - before, chunk_index + after]`` is fetched and
+        returned sorted by ``chunk_index`` (client-side — LanceDB ``orderby`` is
+        not relied on elsewhere in this codebase). Non-contiguous indices (gaps
+        from failed-chunk retries) are handled naturally: only existing rows
+        return.
+        """
+        if self.table is None:
+            return []
+        if before <= 0 and after <= 0:
+            return []
+        lo = int(chunk_index) - max(0, before)
+        hi = int(chunk_index) + max(0, after)
+        esc_file = _lance_escape(str(file_id))
+        query = (
+            f"file_id = '{esc_file}' "
+            f"AND chunk_index BETWEEN {int(lo)} AND {int(hi)}"
+        )
+        try:
+            rows = await self.table.query().where(query).to_list()
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning(f"Failed to fetch neighbor chunks: {e}")
+            return []
+        rows.sort(key=lambda r: r.get("chunk_index", 0) if isinstance(r, dict) else 0)
+        return rows
+
     async def get_stats(self) -> Dict[str, Any]:
         """
         Get statistics about the vector store.

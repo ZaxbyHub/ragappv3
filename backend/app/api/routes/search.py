@@ -11,7 +11,7 @@ import sqlite3
 from collections.abc import Callable
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
@@ -68,7 +68,14 @@ class SearchResponse(BaseModel):
 
 
 class ChunkContextResponse(BaseModel):
-    """Expanded context for a retrieved chunk."""
+    """Expanded context for a retrieved chunk.
+
+    Backward-compatible: ``context_text``/``context_source`` remain the opaque
+    window used by existing clients. New structured fields (Issue #396):
+    ``matched_text`` is the chunk itself; ``before``/``after`` are ordered lists
+    of neighbor chunk texts selected by the ``context_before``/``context_after``
+    query params (empty when the params are 0, the default).
+    """
 
     id: str
     file_id: str
@@ -77,6 +84,9 @@ class ChunkContextResponse(BaseModel):
     chunk_text: str
     context_text: str
     context_source: str
+    matched_text: str = ""
+    before: List[str] = []
+    after: List[str] = []
 
 
 def _record_get(record: Any, key: str, default: Any = None) -> Any:
@@ -218,6 +228,8 @@ async def search(
 @router.get("/search/chunks/{chunk_id}/context", response_model=ChunkContextResponse)
 async def get_chunk_context(
     chunk_id: str,
+    context_before: int = Query(0, ge=0, le=10, description="Neighbor chunks before the match"),
+    context_after: int = Query(0, ge=0, le=10, description="Neighbor chunks after the match"),
     user: dict = Depends(get_current_user_or_service_account),
     db: sqlite3.Connection = Depends(get_db),
     vector_store: VectorStore = Depends(get_vector_store),
@@ -284,6 +296,38 @@ async def get_chunk_context(
         context_text = chunk_text
         context_source = "chunk"
 
+    # Configurable neighbor context (Issue #396). Fetch chunks before/after by
+    # file_id + chunk_index range and split into ordered before/after lists.
+    before_texts: List[str] = []
+    after_texts: List[str] = []
+    if context_before > 0 or context_after > 0:
+        center_idx = _record_get(chunk, "chunk_index", metadata.get("chunk_index", 0))
+        try:
+            center_idx_int = int(center_idx)
+        except (TypeError, ValueError):
+            center_idx_int = 0
+        get_range = getattr(vector_store, "get_chunks_by_file_range", None)
+        if get_range is not None:
+            try:
+                neighbors = await get_range(
+                    file_id, center_idx_int, context_before, context_after
+                )
+            except (OSError, RuntimeError, ValueError):
+                neighbors = []
+            for nbr in neighbors:
+                nbr_idx = _record_get(nbr, "chunk_index", None)
+                nbr_text = str(_record_get(nbr, "text", "") or "")
+                try:
+                    nbr_idx_int = int(nbr_idx) if nbr_idx is not None else None
+                except (TypeError, ValueError):
+                    continue
+                if nbr_idx_int is None or nbr_idx_int == center_idx_int:
+                    continue
+                if nbr_idx_int < center_idx_int:
+                    before_texts.append(nbr_text)
+                else:
+                    after_texts.append(nbr_text)
+
     return ChunkContextResponse(
         id=str(_record_get(chunk, "id", chunk_id) or chunk_id),
         file_id=file_id,
@@ -292,4 +336,7 @@ async def get_chunk_context(
         chunk_text=chunk_text,
         context_text=context_text,
         context_source=context_source,
+        matched_text=chunk_text,
+        before=before_texts,
+        after=after_texts,
     )

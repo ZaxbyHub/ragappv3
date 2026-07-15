@@ -405,6 +405,82 @@ CREATE TABLE posts (
         self.assertEqual(row["chunk_count"], 1)
         self.assertEqual(row["chunks_failed"], 1)
 
+        # [PRR-008] Verify the failed chunk was also persisted to the
+        # failed_chunks table (the chunk-scoped retry data source).
+        conn = sqlite3.connect(self.temp_db_path)
+        conn.row_factory = sqlite3.Row
+        fc_rows = conn.execute(
+            "SELECT chunk_index, chunk_text FROM failed_chunks WHERE file_id = ?",
+            (result.file_id,),
+        ).fetchall()
+        conn.close()
+        self.assertEqual(len(fc_rows), 1, "failed_chunks must hold the dropped chunk")
+        self.assertEqual(fc_rows[0]["chunk_index"], 1)
+
+    def test_process_file_above_50pct_failure_clears_failed_chunks(self):
+        """[PRR-001] On >50% embedding failure the document aborts to status
+        'error' and the failed_chunks rows persisted before the abort are
+        cleared (they're unreachable for chunk-retry since status != 'indexed').
+        No desync: chunks_failed stays 0 and failed_chunks is empty."""
+
+        class AllFailEmbeddingService:
+            MAX_TEXT_LENGTH = 8192
+            embedding_doc_prefix = ""
+
+            async def embed_batch(self, texts, batch_size=None, fail_fast=True):
+                # Every batch fails → 100% failure → >50% abort.
+                # With batch_size=1, each text is its own batch; return every
+                # batch index as failed.
+                n_batches = max(1, (len(texts) + max(1, batch_size or 1) - 1) // max(1, batch_size or 1))
+                embeddings = [None for _ in texts]
+                return (embeddings, list(range(n_batches)))
+
+        class FakeVectorStore:
+            def __init__(self):
+                self.records = []
+
+            async def init_table(self, embedding_dim):
+                self.embedding_dim = embedding_dim
+
+            async def add_chunks(self, records):
+                self.records.extend(records)
+
+            async def delete_old_generation_by_file(self, file_id, new_hash_short):
+                return 0
+
+            async def delete_by_file(self, file_id):
+                return 0
+
+            async def count_by_file(self, file_id):
+                return 1
+
+        original_batch_size = settings.embedding_batch_size
+        settings.embedding_batch_size = 1
+        self.processor.embedding_service = AllFailEmbeddingService()
+        self.processor.vector_store = FakeVectorStore()
+
+        try:
+            with self.assertRaises(DocumentProcessingError):
+                asyncio.run(
+                    self.processor.process_file(self.sql_file_path, vault_id=1)
+                )
+        finally:
+            settings.embedding_batch_size = original_batch_size
+
+        conn = sqlite3.connect(self.temp_db_path)
+        conn.row_factory = sqlite3.Row
+        file_row = conn.execute(
+            "SELECT status, chunks_failed FROM files ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        fc_count = conn.execute("SELECT COUNT(*) FROM failed_chunks").fetchone()[0]
+        conn.close()
+
+        self.assertIsNotNone(file_row)
+        self.assertEqual(file_row["status"], "error")
+        # No desync: chunks_failed is 0 AND failed_chunks table is empty.
+        self.assertEqual(file_row["chunks_failed"], 0)
+        self.assertEqual(fc_count, 0, "failed_chunks must be cleared on >50% abort")
+
     def test_base_vector_record_preserves_raw_text_without_enrichment(self):
         """Initial indexing stores raw evidence and does not add synthetic search text."""
         chunk = ProcessedChunk(

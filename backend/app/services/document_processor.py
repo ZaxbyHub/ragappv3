@@ -1039,6 +1039,304 @@ class DocumentProcessor:
                 record["sparse_embedding"] = None
         return record
 
+    @staticmethod
+    def _build_failed_chunk_metadata(
+        chunk: ProcessedChunk, document_text: str
+    ) -> Dict[str, Any]:
+        """Build the rebuild metadata JSON for a failed chunk (Issue #396).
+
+        Captures everything ``_rebuild_vector_record_from_stored`` needs to
+        reconstruct a valid vector record later without re-parsing the source:
+        raw_text, parent_window offsets + text, chunk_position, page_number,
+        chunk_bbox, chunk_scale, chunk_uid. Enrichment is intentionally omitted
+        (a chunk that failed embedding never reached the enrichment stage).
+        """
+        meta = {
+            "raw_text": chunk.raw_text or chunk.text,
+            "chunk_index": chunk.chunk_index,
+            "chunk_scale": chunk.metadata.get("chunk_scale", "default"),
+            "chunk_uid": chunk.chunk_uid,
+            "chunk_position": chunk.chunk_position,
+            "parent_window_start": chunk.parent_window_start,
+            "parent_window_end": chunk.parent_window_end,
+            "page_number": chunk.metadata.get("page_number"),
+            "chunk_bbox": chunk.metadata.get("chunk_bbox"),
+            "total_chunks": chunk.metadata.get("total_chunks"),
+        }
+        if (
+            chunk.parent_window_start is not None
+            and chunk.parent_window_end is not None
+            and document_text
+        ):
+            meta["parent_window_text"] = document_text[
+                chunk.parent_window_start : chunk.parent_window_end
+            ]
+        return meta
+
+    def _persist_failed_chunks(
+        self,
+        file_id: int,
+        chunks: List[ProcessedChunk],
+        failed_indices: set,
+        document_text: str,
+        conn: sqlite3.Connection,
+        error_reason: Optional[str] = None,
+    ) -> None:
+        """Persist failed-chunk identity + rebuild metadata (Issue #396).
+
+        Clears any prior ``failed_chunks`` rows for this file first (idempotent
+        re-ingest), then inserts one row per failed chunk. Called inside the
+        caller's transaction; does not commit.
+        """
+        conn.execute(
+            "DELETE FROM failed_chunks WHERE file_id = ?", (file_id,)
+        )
+        for idx in sorted(failed_indices):
+            if idx >= len(chunks):
+                continue
+            chunk = chunks[idx]
+            meta_json = json.dumps(
+                self._build_failed_chunk_metadata(chunk, document_text)
+            )
+            conn.execute(
+                "INSERT INTO failed_chunks "
+                "(file_id, chunk_index, chunk_text, chunk_metadata, error_reason) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    file_id,
+                    chunk.chunk_index,
+                    chunk.text,
+                    meta_json,
+                    error_reason,
+                ),
+            )
+
+    @staticmethod
+    def _rebuild_chunk_from_stored(
+        stored_row: Any,
+    ) -> tuple[ProcessedChunk, Dict[str, Any]]:
+        """Reconstruct a ProcessedChunk + its metadata dict from a failed_chunks row.
+
+        Returns (chunk, stored_meta) so the caller can read parent_window_text
+        and other rebuild-only fields from stored_meta separately. [N4]
+        """
+        stored_meta: Dict[str, Any] = json.loads(stored_row["chunk_metadata"])
+        chunk_meta = {
+            "chunk_scale": stored_meta.get("chunk_scale", "default"),
+            "chunk_index": stored_meta.get("chunk_index", stored_row["chunk_index"]),
+            "total_chunks": stored_meta.get("total_chunks") or 1,
+            "raw_text": stored_meta.get("raw_text"),
+            "page_number": stored_meta.get("page_number"),
+            "chunk_bbox": stored_meta.get("chunk_bbox"),
+            "chunk_uid": stored_meta.get("chunk_uid"),
+        }
+        chunk = ProcessedChunk(
+            text=stored_row["chunk_text"],
+            metadata=chunk_meta,
+            chunk_index=stored_row["chunk_index"],
+            chunk_uid=stored_meta.get("chunk_uid"),
+            raw_text=stored_meta.get("raw_text"),
+            parent_window_start=stored_meta.get("parent_window_start"),
+            parent_window_end=stored_meta.get("parent_window_end"),
+            chunk_position=stored_meta.get("chunk_position"),
+        )
+        return chunk, stored_meta
+
+    def _rebuild_vector_record_from_stored(
+        self,
+        *,
+        file_id: int,
+        vault_id: int,
+        file_hash: str,
+        stored_row: Any,
+        stored_meta: Dict[str, Any],
+        chunk: ProcessedChunk,
+        embedding: List[float],
+    ) -> Dict[str, Any]:
+        """Rebuild a vector record for a previously-failed chunk (Issue #396).
+
+        Unlike ``_build_vector_record``, this does NOT require ``document_text``
+        or an ``enrichment`` object — ``parent_window_text`` is read from the
+        stored JSON, and enrichment is omitted (retried chunks re-enter the
+        enrichment queue separately). [C1.1, N4]
+        """
+        chunk_scale = chunk.metadata.get("chunk_scale", "default")
+        chunk_metadata = chunk.metadata.copy()
+        chunk_metadata["chunk_uid"] = chunk.chunk_uid or self._build_chunk_uid(
+            file_id, chunk
+        )
+        chunk_metadata["file_id"] = str(file_id)
+        chunk_metadata["chunk_count"] = chunk.metadata.get("total_chunks") or 1
+        chunk_metadata["chunk_scale"] = chunk_scale
+        chunk_metadata["raw_text"] = chunk.raw_text or chunk.text
+        if chunk.parent_window_start is not None:
+            chunk_metadata["parent_window_start"] = chunk.parent_window_start
+        if chunk.parent_window_end is not None:
+            chunk_metadata["parent_window_end"] = chunk.parent_window_end
+        if chunk.chunk_position is not None:
+            chunk_metadata["chunk_position"] = chunk.chunk_position
+        parent_window_text = stored_meta.get("parent_window_text")
+        if isinstance(parent_window_text, str) and parent_window_text.strip():
+            chunk_metadata["parent_window_text"] = parent_window_text
+
+        # Mirror the reupload_safe_order id branch from _build_vector_record. [N4]
+        if settings.reupload_safe_order:
+            record_id = (
+                f"{file_id}_{file_hash[:8]}_{chunk_scale}_{chunk.chunk_index}"
+            )
+        else:
+            record_id = chunk_metadata["chunk_uid"]
+
+        return {
+            "id": record_id,
+            "text": chunk.text,  # no enrichment on retry
+            "file_id": str(file_id),
+            "chunk_index": chunk.chunk_index,
+            "vault_id": str(vault_id),
+            "chunk_scale": chunk_scale,
+            "parent_doc_id": str(file_id),
+            "parent_window_start": chunk.parent_window_start,
+            "parent_window_end": chunk.parent_window_end,
+            "chunk_position": chunk.chunk_position,
+            "metadata": json.dumps(chunk_metadata),
+            "embedding": embedding,
+        }
+
+    async def retry_failed_chunks(self, file_id: int) -> Dict[str, Any]:
+        """Re-embed and re-index only the failed chunks for an indexed file.
+
+        Returns a summary dict: {retried, succeeded, still_failing,
+        failed_chunk_indices}. Raises ``ValueError`` when the file is not in a
+        retryable state (status != 'indexed') so the caller can map to 409.
+        [C1.2, C1.3, C1.4, N1, N3]
+        """
+        if self.embedding_service is None or self.vector_store is None:
+            raise RuntimeError("Embedding service or vector store unavailable")
+
+        conn = self.pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id, vault_id, file_hash, status, chunks_failed FROM files WHERE id = ?",
+                (file_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"File {file_id} not found")
+            if row["status"] != "indexed":
+                raise ValueError(
+                    f"File {file_id} status is '{row['status']}', must be 'indexed'"
+                )
+            vault_id = int(row["vault_id"])
+            file_hash = str(row["file_hash"] or "")
+
+            stored_rows = conn.execute(
+                "SELECT id, chunk_index, chunk_text, chunk_metadata, attempts "
+                "FROM failed_chunks WHERE file_id = ? ORDER BY chunk_index",
+                (file_id,),
+            ).fetchall()
+        finally:
+            self.pool.release_connection(conn)
+
+        if not stored_rows:
+            return {
+                "retried": 0,
+                "succeeded": 0,
+                "still_failing": 0,
+                "failed_chunk_indices": [],
+            }
+
+        # [N3] Pre-check: skip chunks already in LanceDB (reconcile a prior
+        # partial success where LanceDB write succeeded but SQLite DELETE failed).
+        to_embed: list[tuple[Any, ProcessedChunk, Dict[str, Any]]] = []
+        already_indexed_ids: list[int] = []  # failed_chunks row ids to clear
+        for srow in stored_rows:
+            chunk, stored_meta = self._rebuild_chunk_from_stored(srow)
+            chunk_scale = chunk.metadata.get("chunk_scale", "default")
+            if settings.reupload_safe_order:
+                record_id = (
+                    f"{file_id}_{file_hash[:8]}_{chunk_scale}_{chunk.chunk_index}"
+                )
+            else:
+                record_id = chunk.chunk_uid or self._build_chunk_uid(file_id, chunk)
+            existing = await self.vector_store.get_chunks_by_uid([record_id])
+            if existing:
+                already_indexed_ids.append(int(srow["id"]))
+                continue
+            to_embed.append((srow, chunk, stored_meta))
+
+        # Embed + build records per chunk. [N1] embed_batch(fail_fast=False)
+        # returns None placeholders on failure rather than raising.
+        records: list[Dict[str, Any]] = []
+        succeeded_row_ids: list[int] = []
+        still_failing: list[tuple[int, str, int]] = []  # (chunk_index, reason, row_id)
+        for srow, chunk, stored_meta in to_embed:
+            embs, failed = await self.embedding_service.embed_batch(
+                [chunk.text], fail_fast=False
+            )
+            if failed or not embs or embs[0] is None:
+                reason = "embedding returned None"
+                still_failing.append(
+                    (int(srow["chunk_index"]), reason, int(srow["id"]))
+                )
+                continue
+            record = self._rebuild_vector_record_from_stored(
+                file_id=file_id,
+                vault_id=vault_id,
+                file_hash=file_hash,
+                stored_row=srow,
+                stored_meta=stored_meta,
+                chunk=chunk,
+                embedding=embs[0],
+            )
+            records.append(record)
+            succeeded_row_ids.append(int(srow["id"]))
+
+        # [N3] LanceDB write FIRST (not transactional with SQLite), then SQLite
+        # cleanup in its own try/except. On SQLite failure the next retry's
+        # pre-check reconciles already-indexed chunks.
+        if records:
+            await self.vector_store.add_chunks(records)
+
+        conn = self.pool.get_connection()
+        try:
+            clear_ids = already_indexed_ids + succeeded_row_ids
+            if clear_ids:
+                placeholders = ",".join("?" * len(clear_ids))
+                conn.execute(
+                    f"DELETE FROM failed_chunks WHERE id IN ({placeholders})",
+                    clear_ids,
+                )
+            for _chunk_index, reason, row_id in still_failing:
+                conn.execute(
+                    "UPDATE failed_chunks SET attempts = attempts + 1, error_reason = ? "
+                    "WHERE id = ?",
+                    (reason, row_id),
+                )
+            conn.execute(
+                "UPDATE files SET chunks_failed = "
+                "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
+                "chunk_count = chunk_count + ? "
+                "WHERE id = ?",
+                (file_id, len(records), file_id),
+            )
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            logger.warning(
+                "SQLite cleanup after retry of file %d failed; LanceDB already "
+                "updated. Next retry will reconcile.",
+                file_id,
+                exc_info=True,
+            )
+        finally:
+            self.pool.release_connection(conn)
+
+        return {
+            "retried": len(to_embed),
+            "succeeded": len(records),
+            "still_failing": len(still_failing),
+            "failed_chunk_indices": [ci for ci, _r, _rid in still_failing],
+        }
+
     async def _swap_in_enriched_vector_records(
         self, records: List[Dict[str, Any]], old_ids: List[str]
     ) -> None:
@@ -1747,6 +2045,9 @@ class DocumentProcessor:
 
             # Update status to processing
             self._update_status(file_id, "processing", conn)
+            # Clear stale failed-chunk records from a prior partial-failure ingest
+            # (Issue #396). Idempotent re-ingest must not accumulate stale rows.
+            conn.execute("DELETE FROM failed_chunks WHERE file_id = ?", (file_id,))
             conn.commit()
         finally:
             # Release connection before long-running operations
@@ -1951,12 +2252,61 @@ class DocumentProcessor:
                             failed_batch_indices,
                         )
 
+                        # Persist failed-chunk identity for chunk-scoped retry
+                        # (Issue #396) BEFORE dropping them from the kept list.
+                        # Uses the ORIGINAL chunks list (indices are into it).
+                        try:
+                            _fc_conn = self.pool.get_connection()
+                            try:
+                                self._persist_failed_chunks(
+                                    file_id,
+                                    chunks,
+                                    failed_chunk_indices,
+                                    document_text,
+                                    _fc_conn,
+                                )
+                                _fc_conn.commit()
+                            finally:
+                                self.pool.release_connection(_fc_conn)
+                        except sqlite3.Error:
+                            logger.warning(
+                                "Failed to persist failed-chunk identity for file %d "
+                                "(retry-chunks endpoint will be unavailable for this ingest).",
+                                file_id,
+                                exc_info=True,
+                            )
+
                         original_chunk_count = len(chunks)
                         chunks = kept_chunks
                         embeddings = kept_embeddings
                         chunks_failed_count = len(failed_chunk_indices)
 
                         if failure_pct > 50:
+                            # The file is about to land in status='error', which
+                            # the chunk-scoped retry endpoint rejects (409). The
+                            # failed_chunks rows persisted above are therefore
+                            # unreachable for chunk retry and would desync from
+                            # files.chunks_failed (which stays 0 on the error
+                            # path). Clear them so the only recovery is the
+                            # whole-document retry, which re-ingests from scratch.
+                            try:
+                                _abort_conn = self.pool.get_connection()
+                                try:
+                                    _abort_conn.execute(
+                                        "DELETE FROM failed_chunks WHERE file_id = ?",
+                                        (file_id,),
+                                    )
+                                    _abort_conn.commit()
+                                finally:
+                                    self.pool.release_connection(_abort_conn)
+                            except sqlite3.Error:
+                                logger.warning(
+                                    "Could not clear failed_chunks rows before "
+                                    ">50%% abort for file %d; rows will be cleared "
+                                    "on next re-ingest.",
+                                    file_id,
+                                    exc_info=True,
+                                )
                             raise DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
                                 "Aborting document ingest." % (len(failed_chunk_indices), original_chunk_count, failure_pct),
@@ -2268,6 +2618,9 @@ class DocumentProcessor:
         conn = self.pool.get_connection()
         try:
             self._update_status(file_id, "processing", conn)
+            # Clear stale failed-chunk records from a prior partial-failure ingest
+            # (Issue #396). Idempotent re-ingest must not accumulate stale rows.
+            conn.execute("DELETE FROM failed_chunks WHERE file_id = ?", (file_id,))
             conn.commit()
         finally:
             self.pool.release_connection(conn)
@@ -2440,12 +2793,61 @@ class DocumentProcessor:
                             failed_batch_indices,
                         )
 
+                        # Persist failed-chunk identity for chunk-scoped retry
+                        # (Issue #396) BEFORE dropping them from the kept list.
+                        # Uses the ORIGINAL chunks list (indices are into it).
+                        try:
+                            _fc_conn = self.pool.get_connection()
+                            try:
+                                self._persist_failed_chunks(
+                                    file_id,
+                                    chunks,
+                                    failed_chunk_indices,
+                                    document_text,
+                                    _fc_conn,
+                                )
+                                _fc_conn.commit()
+                            finally:
+                                self.pool.release_connection(_fc_conn)
+                        except sqlite3.Error:
+                            logger.warning(
+                                "Failed to persist failed-chunk identity for file %d "
+                                "(retry-chunks endpoint will be unavailable for this ingest).",
+                                file_id,
+                                exc_info=True,
+                            )
+
                         original_chunk_count = len(chunks)
                         chunks = kept_chunks
                         embeddings = kept_embeddings
                         chunks_failed_count = len(failed_chunk_indices)
 
                         if failure_pct > 50:
+                            # The file is about to land in status='error', which
+                            # the chunk-scoped retry endpoint rejects (409). The
+                            # failed_chunks rows persisted above are therefore
+                            # unreachable for chunk retry and would desync from
+                            # files.chunks_failed (which stays 0 on the error
+                            # path). Clear them so the only recovery is the
+                            # whole-document retry, which re-ingests from scratch.
+                            try:
+                                _abort_conn = self.pool.get_connection()
+                                try:
+                                    _abort_conn.execute(
+                                        "DELETE FROM failed_chunks WHERE file_id = ?",
+                                        (file_id,),
+                                    )
+                                    _abort_conn.commit()
+                                finally:
+                                    self.pool.release_connection(_abort_conn)
+                            except sqlite3.Error:
+                                logger.warning(
+                                    "Could not clear failed_chunks rows before "
+                                    ">50%% abort for file %d; rows will be cleared "
+                                    "on next re-ingest.",
+                                    file_id,
+                                    exc_info=True,
+                                )
                             raise DocumentProcessingError(
                                 "Too many embedding failures: %d/%d chunks failed (%.0f%%). "
                                 "Aborting document ingest." % (len(failed_chunk_indices), original_chunk_count, failure_pct),

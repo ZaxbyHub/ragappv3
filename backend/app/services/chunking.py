@@ -132,6 +132,33 @@ class SemanticChunker:
 
         return metadata
 
+    @staticmethod
+    def _capture_bbox(element_metadata: Any) -> Optional[dict]:
+        """Reduce unstructured ``coordinates.points`` to an axis-aligned bbox.
+
+        ``coordinates.points`` is a tuple of ``(x, y)`` corner pairs; this
+        returns ``{"left","top","right","bottom"}`` or ``None`` when coordinates
+        are absent/malformed (merged CompositeElement chunks frequently drop
+        them, and unstructured is stubbed in CI). Issue #396.
+        """
+        coords = getattr(element_metadata, "coordinates", None)
+        if coords is None:
+            return None
+        points = getattr(coords, "points", None)
+        if not points or len(points) < 2:
+            return None
+        try:
+            xs = [float(p[0]) for p in points]
+            ys = [float(p[1]) for p in points]
+        except (TypeError, ValueError, IndexError):
+            return None
+        return {
+            "left": min(xs),
+            "top": min(ys),
+            "right": max(xs),
+            "bottom": max(ys),
+        }
+
     def _is_preserve_element(self, element: Element) -> bool:
         """
         Check if an element should be preserved intact (not split).
@@ -189,6 +216,13 @@ class SemanticChunker:
                     metadata["page_number"] = orig_meta.page_number
                 if hasattr(orig_meta, "filename") and orig_meta.filename:
                     metadata["source_file"] = orig_meta.filename
+                # Capture page-highlight bounding box from unstructured layout
+                # coordinates when available (Issue #396). Defensive: unstructured
+                # is stubbed in CI, and merged CompositeElement chunks frequently
+                # drop coordinates, so the key is simply absent when unavailable.
+                bbox = SemanticChunker._capture_bbox(orig_meta)
+                if bbox is not None:
+                    metadata["chunk_bbox"] = bbox
 
             processed_chunk = ProcessedChunk(
                 text=chunk_text, metadata=metadata, chunk_index=idx
