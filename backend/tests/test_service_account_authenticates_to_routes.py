@@ -590,23 +590,45 @@ class TestSAClientAuthentication(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_bearer_key_without_sak_prefix_returns_401(self):
-        """F-6: a Bearer key lacking the sak_ prefix is rejected with 401.
+        """F-6: a Bearer key lacking the sak_ prefix is rejected with 401 even when
+        its hash matches a real service_accounts row.
 
         Covers the `if not raw_key.startswith("sak_")` branch in
-        get_current_user_or_service_account (deps.py). Without this test, a
-        regression removing the prefix check would silently pass all 24
-        existing SA assertions (which all use sak_ keys).
+        get_current_user_or_service_account (deps.py). Inserting a real row whose
+        key lacks the sak_ prefix makes this test DISCRIMINATING: if the prefix
+        check were removed, the key would match the row and authenticate (200),
+        failing this test. A non-existent key would also 401 but only via the
+        no-row path (deps.py), so it cannot detect removal of the prefix check.
         """
-        # A plausible-looking Bearer key that does NOT start with sak_.
+        # Insert a service_accounts row whose raw key does NOT start with sak_.
+        # If the prefix guard were removed, this key would hash-match the row
+        # and authenticate — making this a true regression test for the branch.
+        non_sak_key = "plain_key_no_prefix_12345678901234567890"
+        non_sak_key_hash = hashlib.sha256(non_sak_key.encode()).hexdigest()
+        from datetime import datetime, timezone
+
+        conn = self._connection_pool.get_connection()
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO service_accounts (name, key_hash, scopes, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("SA-NoPrefix", non_sak_key_hash, "documents:read", now),
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
         response = self.client.get(
             "/api/documents/1",
-            headers={"Authorization": "Bearer not_a_sak_key_12345"},
+            headers={"Authorization": f"Bearer {non_sak_key}"},
         )
         if response.status_code != 401:
             raise AssertionError(
-                f"Expected 401 for Bearer key without sak_ prefix, "
-                f"got {response.status_code}: {response.json()}"
+                f"Expected 401 for Bearer key without sak_ prefix (even though its "
+                f"hash matches a real SA row), got {response.status_code}: {response.json()}"
             )
+
 
     def test_revoked_service_account_returns_401(self):
         """F-6: a revoked service account (revoked_at IS NOT NULL) is rejected with 401.

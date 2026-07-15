@@ -106,6 +106,32 @@ def verify_no_async_in_to_thread(source):
     return len(violations) == 0, violations
 
 
+def count_to_thread_call_nodes(source):
+    """Count actual asyncio.to_thread(...) CALL nodes (AST), ignoring comments.
+
+    Unlike count_to_thread_calls (a substring match), this parses the source and
+    counts only real call expressions, so a comment mentioning 'asyncio.to_thread'
+    does not satisfy the check.
+    """
+    if not source:
+        return 0
+    tree = ast.parse(source)
+    count = 0
+
+    class CallVisitor(ast.NodeVisitor):
+        def visit_Call(self, node):
+            nonlocal count
+            if isinstance(node.func, ast.Attribute) and node.func.attr == 'to_thread':
+                value = node.func.value
+                if (isinstance(value, ast.Name) and value.id == 'asyncio'):
+                    count += 1
+            self.generic_visit(node)
+
+    CallVisitor().visit(tree)
+    return count
+
+
+
 # =============================================================================
 # Source Inspection Tests - deps.py
 # =============================================================================
@@ -186,6 +212,36 @@ class TestDepsSourceInspection(unittest.IsolatedAsyncioTestCase):
         from app.api import deps
 
         source = get_function_source(deps, 'get_user_orgs')
+        self.assertIsNotNone(source)
+        is_clean, violations = verify_no_async_in_to_thread(source)
+        self.assertTrue(is_clean, f"Violations: {violations}")
+
+    def test_get_current_user_or_service_account_uses_to_thread(self):
+        """The service-account DB lookup in get_current_user_or_service_account is
+        wrapped in asyncio.to_thread (F-3), mirroring _resolve_active_user.
+
+        Uses AST call-node detection (not a substring match) so a comment
+        mentioning 'asyncio.to_thread' cannot satisfy the check. Without this
+        assertion, a regression reverting the SA row fetch to a synchronous
+        db.execute would be invisible (behavioral SA tests pass sync or async).
+        """
+        from app.api import deps
+
+        source = get_function_source(deps, 'get_current_user_or_service_account')
+        self.assertIsNotNone(source)
+        call_count = count_to_thread_call_nodes(source)
+        self.assertGreaterEqual(
+            call_count, 1,
+            f"Expected at least 1 asyncio.to_thread CALL in "
+            f"get_current_user_or_service_account, got {call_count} "
+            f"(AST node count; comments do not count)",
+        )
+
+    def test_get_current_user_or_service_account_no_async_in_to_thread(self):
+        """get_current_user_or_service_account does NOT pass async functions to to_thread."""
+        from app.api import deps
+
+        source = get_function_source(deps, 'get_current_user_or_service_account')
         self.assertIsNotNone(source)
         is_clean, violations = verify_no_async_in_to_thread(source)
         self.assertTrue(is_clean, f"Violations: {violations}")
