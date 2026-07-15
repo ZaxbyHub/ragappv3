@@ -463,7 +463,7 @@ curl http://localhost:9090/api/health?deep=true | jq .vector_store
 | POST | `/api/auth/refresh` | Refresh access token using httpOnly cookie |
 | GET | `/api/auth/me` | Get current authenticated user profile |
 | PATCH | `/api/auth/me` | Update current user profile (full_name only; use POST /change-password for password) |
-| POST | `/api/auth/change-password` | Change current user's password (requires fingerprint-bound access token) |
+| POST | `/api/auth/change-password` | Change current user's password (requires fingerprint-bound access token). Changing the password bumps the `password_changed_at` epoch, invalidating all previously-issued access tokens — users must re-authenticate. |
 | POST | `/api/auth/revoke-all` | Revoke all active sessions for the current user (admin+) |
 
 ### Service Accounts

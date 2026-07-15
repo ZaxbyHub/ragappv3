@@ -584,3 +584,62 @@ class TestSAClientAuthentication(unittest.TestCase):
                 f"Expected 401 for unauthenticated GET /api/tags/documents/1, "
                 f"got {response.status_code}: {response.json()}"
             )
+
+    # -------------------------------------------------------------------------
+    # F-6 negative tests: non-sak_ prefix and revoked service account
+    # -------------------------------------------------------------------------
+
+    def test_bearer_key_without_sak_prefix_returns_401(self):
+        """F-6: a Bearer key lacking the sak_ prefix is rejected with 401.
+
+        Covers the `if not raw_key.startswith("sak_")` branch in
+        get_current_user_or_service_account (deps.py). Without this test, a
+        regression removing the prefix check would silently pass all 24
+        existing SA assertions (which all use sak_ keys).
+        """
+        # A plausible-looking Bearer key that does NOT start with sak_.
+        response = self.client.get(
+            "/api/documents/1",
+            headers={"Authorization": "Bearer not_a_sak_key_12345"},
+        )
+        if response.status_code != 401:
+            raise AssertionError(
+                f"Expected 401 for Bearer key without sak_ prefix, "
+                f"got {response.status_code}: {response.json()}"
+            )
+
+    def test_revoked_service_account_returns_401(self):
+        """F-6: a revoked service account (revoked_at IS NOT NULL) is rejected with 401.
+
+        Covers the `if revoked_at is not None` branch in
+        get_current_user_or_service_account (deps.py). Without this test, a
+        regression removing the revoked_at check would silently pass all 24
+        existing SA assertions (which never set revoked_at).
+        """
+        # Insert a service account that is explicitly revoked but otherwise valid.
+        revoked_key = "sak_test_revoked_key_12345678901234567890"
+        revoked_key_hash = hashlib.sha256(revoked_key.encode()).hexdigest()
+        from datetime import datetime, timezone
+
+        conn = self._connection_pool.get_connection()
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "INSERT INTO service_accounts (name, key_hash, scopes, created_at, revoked_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("SA-Revoked", revoked_key_hash, "documents:read", now, now),
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        response = self.client.get(
+            "/api/documents/1",
+            headers={"Authorization": f"Bearer {revoked_key}"},
+        )
+        if response.status_code != 401:
+            raise AssertionError(
+                f"Expected 401 for revoked service account, "
+                f"got {response.status_code}: {response.json()}"
+            )
+

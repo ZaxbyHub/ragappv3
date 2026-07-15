@@ -436,3 +436,74 @@ class TestPasswordEpochInvalidatesTokens(unittest.TestCase):
             )
 
         test_pool.close_all()
+
+    def test_token_accepted_when_iat_equals_password_epoch(self):
+        """F-5 boundary: a token whose integer-second iat equals password_changed_at
+        is ACCEPTED (the strict `<` comparison admits equality).
+
+        This documents and locks the 1-second JWT NumericDate (RFC 7519) acceptance
+        floor. Pre-existing tests rely on time.sleep(1) to move past the boundary;
+        none pin iat == int(password_changed_at). If someone flips `<` to `<=`, this
+        test fails.
+        """
+        import uuid
+
+        import jwt as pyjwt
+
+        from app.services.auth_service import get_jwt_config
+
+        # (a) Create user and login to get a token whose iat we know exactly.
+        username = f"testuser_boundary_{uuid.uuid4().hex[:8]}"
+        user_id, token = self._create_user_and_login(username, "BoundaryPass123")
+
+        # Verify the token works initially (password_changed_at is 0 → epoch check skipped)
+        me_response = self.client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if me_response.status_code != 200:
+            raise AssertionError(
+                f"Precondition: token should be valid, got {me_response.status_code}"
+            )
+
+        # (b) DECODE the token to extract its exact integer-second iat. The token's iat
+        # is the authoritative boundary value — NOT time.time(), which is a different
+        # second by the time this runs.
+        secret, algorithm = get_jwt_config()
+        decoded = pyjwt.decode(token, secret, algorithms=[algorithm])
+        iat_int = int(decoded["iat"])
+
+        # (c) Set password_changed_at to the EXACT same integer second as the token's
+        # iat. With strict `<`, int(pwd_epoch) == token_iat evaluates False → accepted.
+        # (password_changed_at is a REAL column; writing an int is fine — sqlite coerces.)
+        conn = self.test_pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE users SET password_changed_at = ? WHERE id = ?",
+                (iat_int, user_id),
+            )
+            conn.commit()
+        finally:
+            self.test_pool.release_connection(conn)
+
+        # Sanity: confirm the DB value rounds to the same integer second.
+        epoch = self._get_password_changed_at(user_id)
+        if int(epoch) != iat_int:
+            raise AssertionError(
+                f"Precondition: int(password_changed_at)={int(epoch)} should equal iat={iat_int}"
+            )
+
+        # Clear any cached principal so the epoch check actually runs against the DB value.
+        from app.api.deps import invalidate_active_user_cache
+        invalidate_active_user_cache(user_id)
+
+        # (d) Present the SAME token — expect 200 (floor accepted), NOT 401.
+        me_with_token = self.client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if me_with_token.status_code != 200:
+            raise AssertionError(
+                f"Expected 200 (token accepted at the iat == epoch boundary), "
+                f"got {me_with_token.status_code}: {me_with_token.json()}"
+            )

@@ -118,7 +118,7 @@ def _rotate_refresh_token_block(
                         db,
                         event_type="auth.refresh_reuse_detected",
                         target_user_id=user_id,
-                        ip_address=request.client.host if request and request.client else None,
+                        ip_address=_request_ip(request),
                         user_agent=request.headers.get("user-agent") if request else None,
                         metadata={"session_id": session_id, "reason": "stale_token_fetchone"},
                     )
@@ -156,7 +156,7 @@ def _rotate_refresh_token_block(
                     db,
                     event_type="auth.refresh_reuse_detected",
                     target_user_id=user_id,
-                    ip_address=request.client.host if request and request.client else None,
+                    ip_address=_request_ip(request),
                     user_agent=request.headers.get("user-agent") if request else None,
                     metadata={"session_id": session_id, "reason": "integrity_error"},
                 )
@@ -168,6 +168,16 @@ def _rotate_refresh_token_block(
             invalidate_active_user_cache(user_id)
         except Exception:
             logger.warning("Failed to revoke family on refresh reuse", exc_info=True)
+        finally:
+            # F-1: close the EXCLUSIVE transaction before the connection returns to the
+            # pool. Without this, a failed record_security_event leaves the DELETE above
+            # in an open transaction and release_connection() does not roll back, so the
+            # next request reuses a poisoned connection. ROLLBACK also discards that
+            # DELETE — when audit logging fails the family revocation is abandoned (only
+            # this request gets a 401); this matches the sibling stale_token_fetchone
+            # branch above and is accepted for parity.
+            if exclusive_started and db.in_transaction:
+                db.execute("ROLLBACK")
         raise HTTPException(status_code=401, detail="Refresh token already used", headers={"WWW-Authenticate": "Bearer"})
     except HTTPException:
         raise
@@ -588,7 +598,7 @@ async def refresh(
     try:
         # Wrap entire exclusive-lock block in a single to_thread call
         await asyncio.to_thread(lambda: _rotate_refresh_token_block(
-            db, session_id, token_hash, user_id, new_refresh_token_hash, new_expires_at
+            db, session_id, token_hash, user_id, new_refresh_token_hash, new_expires_at, request
         ))
     except HTTPException:
         raise

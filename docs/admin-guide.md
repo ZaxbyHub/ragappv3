@@ -912,6 +912,58 @@ KnowledgeVault has built-in JWT-based authentication with role-based access cont
 
 2. **Multi-User Mode** (`USERS_ENABLED=true`): Requires `ADMIN_SECRET_TOKEN` to be set for the initial admin account, then allows user management via the UI.
 
+### Security Audit Events
+
+KnowledgeVault writes security-relevant events to a **tamper-evident** `security_audit_log` table. Each row carries an HMAC-SHA256 digest (`hmac_sha256`) computed over the canonical event fields with the current `audit_hmac_key_version`, so any in-place modification of a row can be detected by recomputing the digest. Rows are append-only by convention — nothing in the application deletes or rewrites them.
+
+**Schema** (`backend/app/models/database.py`):
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | INTEGER PK | Auto-increment |
+| `event_type` | TEXT | One of the types listed below |
+| `actor_user_id` / `actor_username` | INTEGER / TEXT | Who performed the action (NULL for system/anonymous) |
+| `target_user_id` / `target_username` | INTEGER / TEXT | The user the action affects (NULL when N/A) |
+| `ip_address` | TEXT | Proxy-aware via `_request_ip()` (honors `X-Forwarded-For` when `TRUST_PROXY_HEADERS=true`) |
+| `user_agent` | TEXT | Request `User-Agent` |
+| `metadata_json` | TEXT | JSON object with event-specific detail (e.g. `{"session_id": ..., "reason": ...}`) |
+| `key_version` / `hmac_sha256` | TEXT | HMAC key version and digest for tamper-evidence |
+| `created_at` | TIMESTAMP | Defaults to `CURRENT_TIMESTAMP` |
+
+Indexes exist on `event_type`, `actor_user_id`, `target_user_id`, and `created_at`.
+
+**Event catalogue:**
+
+| `event_type` | Emitted by | Meaning |
+|--------------|-----------|---------|
+| `auth.login_success` | `POST /api/auth/login` | Successful login (JWT issued) |
+| `auth.login_failed` | `POST /api/auth/login` | Failed login (bad credentials, inactive user, etc.) |
+| `auth.logout` | `POST /api/auth/logout` | Explicit logout (refresh cookie cleared, access token denylisted) |
+| `auth.refresh_reuse_detected` | `POST /api/auth/refresh` | A previously-rotated refresh token was replayed — the entire session family is revoked. `metadata.reason` is `stale_token_fetchone` (session already rotated) or `integrity_error` (duplicate-session collision on rotation) |
+| `auth.password_changed` | `POST /api/auth/change-password` | User changed their own password (invalidates prior access tokens via `password_changed_at`) |
+| `auth.session_revoked` | `DELETE /api/auth/sessions/{session_id}` | One session was revoked |
+| `auth.sessions_revoked` | `DELETE /api/auth/sessions` | All sessions for a user were revoked |
+| `user.register` | `POST /api/auth/register` | A new user self-registered |
+| `user.created` | `POST /users` | An admin created a user |
+| `user.updated` | `PATCH /users/{id}` | An admin updated a user's profile |
+| `user.password_reset` | `PATCH /users/{id}/password` | An admin reset a user's password |
+| `user.role_updated` | `PATCH /users/{id}/role` | An admin changed a user's role |
+| `user.active_updated` | `PATCH /users/{id}/active` | An admin enabled/disabled a user |
+| `membership.organizations_replaced` | `PUT /users/{id}/organizations` | A user's org membership set was replaced |
+| `membership.groups_replaced` | `PUT /users/{id}/groups` | A user's group membership set was replaced |
+
+**Querying** (example — find all reuse-detection events for a user):
+
+```sql
+SELECT created_at, ip_address, user_agent, metadata_json
+FROM security_audit_log
+WHERE event_type = 'auth.refresh_reuse_detected'
+  AND target_user_id = ?
+ORDER BY created_at DESC;
+```
+
+**HMAC verification** (optional, for forensic integrity): recompute the digest using the message format in `security_audit._build_digest` (`event_type|actor_user_id|actor_username|target_user_id|target_username|ip_address|user_agent|metadata_json|key_version`) and the key returned by `_audit_key()` (derived from `JWT_SECRET_KEY`, falling back to `ADMIN_SECRET_TOKEN`), then compare against the stored `hmac_sha256`.
+
 ### Service Accounts
 
 Service accounts provide scoped, rotatable API keys for programmatic access (CI/CD, automation, server-to-server integrations).
