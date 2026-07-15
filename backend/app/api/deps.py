@@ -488,6 +488,12 @@ async def _resolve_active_user(
     # FR-007: invalidate access tokens issued before the user's last password change.
     # password_changed_at epoch is bumped by change_password and admin_reset_password
     # (real password-change events). Login rehash is NOT a password change.
+    #
+    # The strict `<` comparison means a token whose integer-second iat equals
+    # password_changed_at is ACCEPTED. This 1-second acceptance floor is the natural
+    # precision of JWT NumericDate (RFC 7519, integer seconds); change_password also
+    # deletes all refresh sessions, so only an access token issued in the same second
+    # can survive, valid for at most ACCESS_TOKEN_EXPIRE_MINUTES.
     pwd_epoch = user.get("password_changed_at") or 0
     token_iat = payload.get("iat", 0) if isinstance(payload, dict) else 0
     if pwd_epoch > 0 and token_iat < int(pwd_epoch):
@@ -574,11 +580,17 @@ async def get_current_user_or_service_account(
 
     # Hash the raw key and look up service_accounts
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-    cursor = db.execute(
-        "SELECT id, name, scopes, revoked_at FROM service_accounts WHERE key_hash = ?",
-        (key_hash,),
-    )
-    row = cursor.fetchone()
+
+    def _fetch_sa_row():
+        cursor = db.execute(
+            "SELECT id, name, scopes, revoked_at FROM service_accounts WHERE key_hash = ?",
+            (key_hash,),
+        )
+        return cursor.fetchone()
+
+    # F-3: run the synchronous DB read off the event loop, mirroring
+    # _resolve_active_user's _fetch_user_row_with_pwc + asyncio.to_thread pattern.
+    row = await asyncio.to_thread(_fetch_sa_row)
     if not row:
         raise HTTPException(status_code=401, detail="Not authenticated")
     sa_id, sa_name, sa_scopes_str, revoked_at = row

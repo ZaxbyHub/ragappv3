@@ -12,6 +12,7 @@ returned 401 without revoking the family and without logging.
 """
 
 import hashlib
+import json
 import os
 import sys
 import tempfile
@@ -372,13 +373,29 @@ class TestRefreshReuseRevokesFamily(unittest.TestCase):
         conn = self.test_pool.get_connection()
         try:
             audit_rows = conn.execute(
-                "SELECT event_type, target_user_id FROM security_audit_log "
+                "SELECT event_type, target_user_id, metadata_json, ip_address "
+                "FROM security_audit_log "
                 "WHERE event_type = ? AND target_user_id = ?",
                 ("auth.refresh_reuse_detected", user_id),
             ).fetchall()
             self.assertEqual(
                 len(audit_rows), 1,
                 f"Expected exactly 1 audit event for user {user_id}, got {len(audit_rows)}"
+            )
+            # F-4: assert the discriminating reason field so a regression that swaps
+            # the stale_token_fetchone / integrity_error reasons is caught.
+            meta = json.loads(audit_rows[0][2] or "{}")
+            self.assertEqual(
+                meta.get("reason"),
+                "stale_token_fetchone",
+                f"Expected reason='stale_token_fetchone', got metadata={audit_rows[0][2]}",
+            )
+            # F-2: the request's client IP must be captured (not NULL), confirming
+            # request= was propagated and _request_ip() resolved it.
+            self.assertEqual(
+                audit_rows[0][3],
+                "127.0.0.1",
+                f"Expected ip_address='127.0.0.1', got {audit_rows[0][3]!r}",
             )
         finally:
             self.test_pool.release_connection(conn)
@@ -524,7 +541,8 @@ class TestRefreshReuseRevokesFamily(unittest.TestCase):
         conn = self.test_pool.get_connection()
         try:
             audit_rows = conn.execute(
-                "SELECT event_type, target_user_id, metadata_json FROM security_audit_log "
+                "SELECT event_type, target_user_id, metadata_json, ip_address "
+                "FROM security_audit_log "
                 "WHERE event_type = ? AND target_user_id = ?",
                 ("auth.refresh_reuse_detected", user_id),
             ).fetchall()
@@ -532,8 +550,136 @@ class TestRefreshReuseRevokesFamily(unittest.TestCase):
                 len(audit_rows), 1,
                 f"Expected exactly 1 audit event for user {user_id}, got {len(audit_rows)}"
             )
+            # F-4: assert the discriminating reason field.
+            meta = json.loads(audit_rows[0][2] or "{}")
+            self.assertEqual(
+                meta.get("reason"),
+                "integrity_error",
+                f"Expected reason='integrity_error', got metadata={audit_rows[0][2]}",
+            )
+            # F-2: the request's client IP must be captured (not NULL), confirming
+            # request= was propagated and _request_ip() resolved it.
+            self.assertEqual(
+                audit_rows[0][3],
+                "127.0.0.1",
+                f"Expected ip_address='127.0.0.1', got {audit_rows[0][3]!r}",
+            )
         finally:
             self.test_pool.release_connection(conn)
+
+    def test_integrity_error_branch_rolls_back_on_audit_failure(self):
+        """F-1 regression: IntegrityError branch must roll back the EXCLUSIVE tx even
+        when record_security_event raises, so the connection is not returned to the
+        pool poisoned with an open transaction.
+
+        This is the falsification probe from issue #306: patch record_security_event
+        to raise, trigger the IntegrityError branch, then assert conn.in_transaction
+        is False after the HTTPException is raised. Pre-fix code left the transaction
+        open (no finally/ROLLBACK on this branch).
+        """
+        from fastapi.testclient import TestClient
+
+        from app.api.routes import auth as auth_routes
+
+        client = TestClient(self.app)
+
+        # Register a user (creates user_id=1)
+        register_resp = client.post(
+            "/api/auth/register",
+            json={"username": "reuseie_rb", "password": "Password123"},
+        )
+        self.assertEqual(register_resp.status_code, 200)
+
+        user_id = 1
+        token_a = "token_a_aaaa"
+        collision_marker = "collision_marker_zzzz"
+        token_hash_a = hashlib.sha256(token_a.encode()).hexdigest()
+        collision_hash = hashlib.sha256(collision_marker.encode()).hexdigest()
+
+        # Create session A and a collision session (same hash as the new token)
+        conn = self.test_pool.get_connection()
+        try:
+            expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+            conn.execute(
+                "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at) VALUES (?, ?, ?)",
+                (user_id, token_hash_a, expires_at),
+            )
+            conn.execute(
+                "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at) VALUES (?, ?, ?)",
+                (user_id, collision_hash, expires_at),
+            )
+            conn.commit()
+        finally:
+            self.test_pool.release_connection(conn)
+
+        # Resolve session_id for token A
+        conn = self.test_pool.get_connection()
+        try:
+            session_id_a = conn.execute(
+                "SELECT id FROM user_sessions WHERE refresh_token_hash = ?",
+                (token_hash_a,),
+            ).fetchone()[0]
+        finally:
+            self.test_pool.release_connection(conn)
+
+        new_expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+
+        mock_request = MagicMock()
+        mock_request.client.host = "127.0.0.1"
+        mock_request.headers.get.return_value = "test-agent"
+
+        # Patch the audit emitter to RAISE — this is the F-1 hazard trigger. The local
+        # `from app.services.security_audit import record_security_event` re-reads the
+        # module attribute at call time, so patching the module attr is the correct
+        # target (NOT app.api.routes.auth.record_security_event).
+        conn = self.test_pool.get_connection()
+        ie_exc = None
+        in_transaction_after = "UNSET"
+        try:
+            with patch(
+                "app.services.security_audit.record_security_event",
+                side_effect=RuntimeError("forced audit failure for F-1 probe"),
+            ):
+                try:
+                    auth_routes._rotate_refresh_token_block(
+                        db=conn,
+                        session_id=session_id_a,
+                        token_hash=token_hash_a,
+                        user_id=user_id,
+                        new_refresh_token_hash=collision_hash,
+                        new_expires_at=new_expires_at,
+                        request=mock_request,
+                    )
+                except Exception as exc:
+                    ie_exc = exc
+                # Capture transaction state IMMEDIATELY on the same connection before
+                # any release rollback/cleanup could mask the poisoning.
+                in_transaction_after = conn.in_transaction
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+            self.test_pool.release_connection(conn)
+
+        # Assertion (a): the branch still raises HTTPException 401 (reuse detected)
+        self.assertIsNotNone(ie_exc, "Expected HTTPException 401 on IntegrityError branch")
+        self.assertTrue(
+            hasattr(ie_exc, "status_code") and ie_exc.status_code == 401,
+            f"Expected 401, got {type(ie_exc).__name__}: {ie_exc}",
+        )
+
+        # Assertion (b) — THE F-1 FIX: the EXCLUSIVE transaction must be closed before
+        # the connection returns to the pool, even when audit logging failed.
+        # Pre-fix this was True (poisoned conn); post-fix the finally/ROLLBACK makes
+        # it False.
+        self.assertFalse(
+            in_transaction_after,
+            "F-1 REGRESSION: connection returned to the pool with an open EXCLUSIVE "
+            "transaction after audit failure (conn.in_transaction is True). The "
+            "IntegrityError branch is missing its finally/ROLLBACK guard.",
+        )
+
+        # Clean up active-user cache
+        invalidate_active_user_cache(user_id)
 
 
 if __name__ == "__main__":
