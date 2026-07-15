@@ -47,6 +47,13 @@ Tests for concurrent permission queries live in `backend/tests/test_effective_va
 - The `_SQLITE_SERIALIZED` flag in `deps.py` controls whether the concurrent or sequential branch runs; tests may monkey-patch `deps._SQLITE_SERIALIZED` to force either path.
 - Seeds multiple vaults, groups, and memberships; asserts each vault returns the correct effective permission string.
 
+### Auth override async-path tests (`test_auth_override_async_path.py`)
+Tests for the `get_current_user_or_service_account` dependency-override branch (issue #312 / `authz-bridging-exceptions` skill) live in `backend/tests/test_auth_override_async_path.py`. Key patterns and policy:
+- The override branch in `deps.py` (`get_current_user_or_service_account`) reads `app.dependency_overrides[get_current_active_user]` and must `await` the result only when it is a coroutine: `user = await _result if inspect.iscoroutine(_result) else _result`. The check must use `inspect.iscoroutine` — never `inspect.isawaitable` (the historical anti-pattern the `authz-bridging-exceptions` skill documents).
+- The test overrides `get_current_active_user` with a **module-scope `async def`** (not a sync lambda) that calls another `async def`, matching AC-2 of the skill, then drives a real route (`GET /api/tags/documents/{id}`) through `TestClient`.
+- **Two bug classes are guarded, and the distinction matters:** (1) *drop-the-await* is falsified **behaviorally** by a 200 (authorized) / 403 (denied) pair — mutating the branch to skip the await makes both fail because the raw coroutine reaches `_evaluate_policy`. (2) *`isawaitable`-vs-`iscoroutine`* is **not** behaviorally falsifiable here (the override is *called* before the check, so `_result` is a coroutine on which both predicates return True); it is pinned only by a **source-string tripwire** (`test_override_branch_uses_iscoroutine_not_isawaitable`). A purely behavioral falsifier for class 2 would require an `isawaitable` check on an uncalled `async def`, which does not exist in `deps.py`.
+- `get_evaluate_policy` has no `dependency_overrides` read of its own; FastAPI resolves overrides of it directly. So a test overriding `get_evaluate_policy` with an `async def` would be vacuous — the override branch under test is on `get_current_active_user`.
+
 ---
 
 ## 3. Frontend testing (Vitest + React Testing Library + jsdom)
