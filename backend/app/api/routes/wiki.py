@@ -11,14 +11,17 @@ import sqlite3
 from dataclasses import asdict
 from typing import Callable, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
+    _evaluate_policy,
+    _resolve_active_user,
     get_current_active_user,
     get_db,
     get_evaluate_policy,
+    log_db_released,
     require_model_ready,
 )
 from app.config import settings
@@ -738,9 +741,8 @@ async def list_wiki_jobs(
 
 @router.get("/wiki/events")
 async def wiki_events_stream(
+    request: Request,
     vault_id: int = Query(...),
-    user: dict = Depends(get_current_active_user),
-    evaluate: Callable = Depends(get_evaluate_policy),
 ):
     """SSE stream of terminal-state wiki compile job events for a vault.
 
@@ -749,18 +751,26 @@ async def wiki_events_stream(
     the existing REST endpoints on each event. A 15-second keepalive comment
     keeps proxies and load balancers from idling the connection out.
 
-    Connection-lifecycle note: ``get_current_active_user`` resolves
-    ``Depends(get_db)``, so this endpoint already holds one pooled connection
-    for the entire stream lifetime (FastAPI only runs the ``get_db`` generator
-    teardown after the stream completes). That long-lived connection is a
-    separate concern from issue #205 (S-003 double-connection) and is tracked
-    under issue #301 (SSE connection pinning).
-
-    The pre-stream permission check uses the injected ``evaluate`` callable
-    from ``Depends(get_evaluate_policy)``.
+    Connection-lifecycle note: auth + the vault read-permission check are
+    resolved against a SHORT-LIVED pooled connection (sourced from
+    request.app.state.db_pool) that is released BEFORE the StreamingResponse
+    begins — mirroring the /chat/stream get_stream_auth pattern (issue #301).
+    Previously this endpoint held one pooled connection for the entire stream
+    lifetime via Depends(get_db); FastAPI only ran get_db's teardown after the
+    stream completed, pinning a pool slot indefinitely.
     """
-    if not await evaluate(user, "vault", vault_id, "read"):
-        raise HTTPException(status_code=403, detail="No read access to this vault")
+    pool = request.app.state.db_pool
+    with pool.connection() as conn:
+        user = await _resolve_active_user(
+            conn,
+            request,
+            request.headers.get("authorization"),
+            request.cookies.get("access_token"),
+        )
+        if not await _evaluate_policy(conn, user, "vault", vault_id, "read"):
+            raise HTTPException(status_code=403, detail="No read access to this vault")
+    # <-- pooled connection released here, before the SSE stream starts.
+    log_db_released("wiki_events_stream", vault_id=vault_id)
 
     bus = get_wiki_event_bus()
     queue = bus.subscribe(vault_id)

@@ -145,7 +145,10 @@ def migrate_uploads(dry_run: bool = False) -> MigrationResult:
 
 def _lookup_vault_id(filename: str) -> int:
     from app.models.database import get_pool
-    pool = get_pool(str(settings.sqlite_path))
+    # Pass the configured pool size so that even if this runs before lifespan
+    # seeds the pool (defense in depth), it caches at the intended size rather
+    # than the default 5. See issue #302.
+    pool = get_pool(str(settings.sqlite_path), max_size=settings.db_pool_max_size)
     conn = pool.get_connection()
     try:
         row = conn.execute(

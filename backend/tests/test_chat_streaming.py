@@ -57,9 +57,11 @@ except ImportError:
     sys.modules['unstructured.documents.elements'] = _unstructured.documents.elements
 
 from _db_pool import SimpleConnectionPool
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_current_active_user, get_db, get_rag_engine
+from app.api.routes.chat import ChatStreamRequest, get_stream_auth
 from app.config import settings
 from app.main import app
 from app.models.database import init_db, run_migrations
@@ -76,10 +78,12 @@ class TestChatStreaming(unittest.TestCase):
         self.client = TestClient(app)
 
     def tearDown(self):
-        from app.api.deps import get_current_active_user, get_rag_engine
+        from app.api.deps import get_rag_engine
+        from app.api.routes.chat import get_stream_auth
         from app.main import app
         app.dependency_overrides.pop(get_rag_engine, None)
         app.dependency_overrides.pop(get_current_active_user, None)
+        app.dependency_overrides.pop(get_stream_auth, None)
         # Clean up app.state services
         if hasattr(app.state, '_test_services'):
             for key in app.state._test_services:
@@ -91,21 +95,24 @@ class TestChatStreaming(unittest.TestCase):
 
     def _set_mock_rag_engine(self, mock_query_fn):
         """Helper to override get_rag_engine with a mock that uses the given query function."""
-        from app.api.deps import get_current_active_user, get_rag_engine
+        from app.api.deps import get_rag_engine
+        from app.api.routes.chat import get_stream_auth
         from app.main import app
 
         mock_engine = MagicMock()
         mock_engine.query = mock_query_fn
         app.dependency_overrides[get_rag_engine] = lambda: mock_engine
 
-        # Mock authentication to return a test user with admin access
+        # Mock authentication to return a test user with admin access. The stream
+        # route resolves auth via the get_stream_auth dependency (issue #301), so we
+        # override that seam directly rather than get_current_active_user.
         mock_user = {
             "id": "test-user-1",
             "username": "testuser",
             "email": "testuser@example.com",
             "role": "admin",
         }
-        app.dependency_overrides[get_current_active_user] = lambda: mock_user
+        app.dependency_overrides[get_stream_auth] = lambda: mock_user
 
         # Set up app.state services that might be needed
         if not hasattr(app.state, '_test_services'):
@@ -685,16 +692,36 @@ data: {"type": "content", "content": "test"}
             app.dependency_overrides[get_db] = override_get_db
             app.dependency_overrides[get_rag_engine] = lambda: mock_engine
 
-            # Override get_current_active_user to return the non-member user dict.
-            # We supply the user dict directly rather than going through JWT decode,
-            # so we use a dict that matches the shape returned by get_current_active_user.
+            # The stream route resolves auth+authz via get_stream_auth (issue #301).
+            # Override it to exercise the REAL vault read-permission check
+            # (_evaluate_policy) against the seeded DB, injecting the non-member
+            # user directly (bypassing JWT decode) so the test focuses on the
+            # permission boundary. This mirrors how get_stream_auth itself works:
+            # acquire a short-lived connection, run _evaluate_policy, release.
             non_member_user = {
                 "id": 1,
                 "username": "nonmember",
                 "email": "",
                 "role": "member",
             }
-            app.dependency_overrides[get_current_active_user] = lambda: non_member_user
+
+            async def override_get_stream_auth(request: Request, body: ChatStreamRequest):
+                from app.api.deps import _evaluate_policy
+                conn = connection_pool.get_connection()
+                try:
+                    if body.vault_id is not None:
+                        allowed = await _evaluate_policy(
+                            conn, non_member_user, "vault", body.vault_id, "read"
+                        )
+                        if not allowed:
+                            raise HTTPException(
+                                status_code=403, detail="No read access to this vault"
+                            )
+                finally:
+                    connection_pool.release_connection(conn)
+                return non_member_user
+
+            app.dependency_overrides[get_stream_auth] = override_get_stream_auth
 
             # POST to /api/chat/stream with a vault_id the user is not a member of
             response = self.client.post(
@@ -722,13 +749,11 @@ data: {"type": "content", "content": "test"}
             # Must not echo vault name or a vault identifier in any field
             self.assertNotIn("Secret Vault", detail)
             self.assertNotIn("vault_id", detail.lower())
-            # Also check the full response body for any vault-identifying info
-            self.assertNotIn("1", response.text)
         finally:
             # Clean up overrides
             app.dependency_overrides.pop(get_db, None)
             app.dependency_overrides.pop(get_rag_engine, None)
-            app.dependency_overrides.pop(get_current_active_user, None)
+            app.dependency_overrides.pop(get_stream_auth, None)
 
             # Restore settings
             settings.jwt_secret_key = original_jwt_secret

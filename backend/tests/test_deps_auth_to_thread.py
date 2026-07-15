@@ -114,19 +114,24 @@ class TestDepsSourceInspection(unittest.IsolatedAsyncioTestCase):
     """Verify deps.py functions use asyncio.to_thread via source inspection."""
 
     def test_get_current_active_user_uses_to_thread(self):
-        """get_current_active_user wraps db.execute in asyncio.to_thread."""
+        """The active-user resolution wraps db.execute in asyncio.to_thread.
+
+        get_current_active_user is a thin wrapper around _resolve_active_user
+        (shared with the streaming-chat auth boundary, issue #301); the
+        to_thread-wrapped DB fetch lives in _resolve_active_user.
+        """
         from app.api import deps
 
-        source = get_function_source(deps, 'get_current_active_user')
+        source = get_function_source(deps, '_resolve_active_user')
         self.assertIsNotNone(source)
         self.assertIn('asyncio.to_thread', source)
         self.assertIn('lambda', source)
 
     def test_get_current_active_user_no_async_in_to_thread(self):
-        """get_current_active_user does NOT pass async functions to to_thread."""
+        """_resolve_active_user does NOT pass async functions to to_thread."""
         from app.api import deps
 
-        source = get_function_source(deps, 'get_current_active_user')
+        source = get_function_source(deps, '_resolve_active_user')
         self.assertIsNotNone(source)
         is_clean, violations = verify_no_async_in_to_thread(source)
         self.assertTrue(is_clean, f"Violations: {violations}")
