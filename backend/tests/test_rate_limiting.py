@@ -445,7 +445,9 @@ class TestWhitelistLimiter(unittest.TestCase):
     def test_limiter_instance_exported(self):
         """limiter instance must be exported from limiter.py."""
         src = _read_file(LIMITER_PY)
-        self.assertIn("limiter = WhitelistLimiter", src)
+        # The module-level limiter is constructed via build_limiter(), which
+        # returns a WhitelistLimiter wired to the configured storage backend.
+        self.assertIn("limiter = build_limiter", src)
 
     def test_whitelist_limiter_extends_limiter(self):
         """WhitelistLimiter must extend Limiter from slowapi."""
@@ -934,6 +936,124 @@ class TestRuntimeRateLimitEnforcement(unittest.TestCase):
             for _ in range(5):
                 req = self._make_request(lim, {"X-API-Key": api_key})
                 self.assertEqual(handler(req), "ok")
+
+
+class TestStorageUriWiring(unittest.TestCase):
+    """Verify the rate limiter wires a shared Redis backend (#401).
+
+    Without ``storage_uri``, slowapi falls back to per-process MemoryStorage,
+    so under ``uvicorn --workers N`` each worker keeps its own counters and the
+    effective limit is multiplied by N. ``build_limiter`` / ``_resolve_storage_uri``
+    do not exist on pre-fix code, so these tests fail there (genuine regression
+    guard) and pass once the factory is wired.
+    """
+
+    def test_resolve_storage_uri_returns_redis_url_unchanged(self):
+        """A configured Redis URL is passed through (trimmed) byte-for-byte."""
+        from app.limiter import _resolve_storage_uri
+
+        self.assertEqual(
+            _resolve_storage_uri("redis://localhost:6379/0"),
+            "redis://localhost:6379/0",
+        )
+
+    def test_resolve_storage_uri_preserves_db_index_and_credentials(self):
+        """Redis URLs with a db index, password, or TLS scheme survive."""
+        from app.limiter import _resolve_storage_uri
+
+        self.assertEqual(
+            _resolve_storage_uri("redis://:s3cret@redis:6379/2"),
+            "redis://:s3cret@redis:6379/2",
+        )
+        self.assertEqual(
+            _resolve_storage_uri("rediss://tls-redis:6379/1"),
+            "rediss://tls-redis:6379/1",
+        )
+
+    def test_resolve_storage_uri_falls_back_to_memory_when_empty(self):
+        """CI runs REDIS_URL="" with no Redis service — must resolve to memory."""
+        from app.limiter import _resolve_storage_uri
+
+        self.assertEqual(_resolve_storage_uri(""), "memory://")
+
+    def test_resolve_storage_uri_falls_back_to_memory_when_whitespace(self):
+        """A whitespace-only REDIS_URL is treated as unconfigured."""
+        from app.limiter import _resolve_storage_uri
+
+        self.assertEqual(_resolve_storage_uri("   "), "memory://")
+
+    def test_redis_reachable_returns_false_for_unreachable_host(self):
+        """The real (un-mocked) probe returns False, never raises, against an
+        unreachable Redis. Guards the ``except Exception`` net that prevents a
+        dead Redis from crashing ``import app.limiter``."""
+        from app.limiter import _redis_reachable
+
+        # Port 1 is refused immediately; no live Redis needed. Short timeout
+        # keeps the test fast.
+        self.assertFalse(_redis_reachable("redis://127.0.0.1:1/0", timeout=1.0))
+
+    def test_redis_reachable_returns_false_for_malformed_url(self):
+        """A malformed REDIS_URL (ValueError from redis.from_url) must return
+        False, not crash the import. This is the regression that the broad
+        ``except Exception`` in ``_redis_reachable`` prevents."""
+        from app.limiter import _redis_reachable
+
+        for bad in ("not-a-url", "redis://localhost:notaport/0", "://broken"):
+            self.assertFalse(_redis_reachable(bad), msg=f"expected False for {bad!r}")
+
+    def test_build_limiter_uses_redis_when_redis_url_configured(self):
+        """With a Redis URL and a reachable Redis, the limiter's storage backend
+        is RedisStorage so counters are shared across workers.
+
+        ``_redis_reachable`` is stubbed True so no live Redis is required.
+        Fails on pre-fix code (build_limiter absent)."""
+        from limits.storage import RedisStorage
+
+        with patch("app.limiter._redis_reachable", return_value=True):
+            from app.limiter import build_limiter
+
+            lim = build_limiter("redis://localhost:6379/0")
+            self.assertIsInstance(lim._storage, RedisStorage)
+
+    def test_build_limiter_falls_back_to_memory_in_ci(self):
+        """With an empty Redis URL (CI), storage is MemoryStorage and the
+        runtime fallback is disabled — behavior identical to pre-fix. The Redis
+        probe is never called (empty URL short-circuits in _resolve_storage_uri)."""
+        from limits.storage import MemoryStorage
+
+        with patch("app.limiter._redis_reachable") as probe:
+            from app.limiter import build_limiter
+
+            lim = build_limiter("")
+            self.assertIsInstance(lim._storage, MemoryStorage)
+            # No fallback limiter should be constructed in the memory-only path.
+            self.assertFalse(lim._in_memory_fallback_enabled)
+            # Empty URL must not trigger a network probe.
+            probe.assert_not_called()
+
+    def test_build_limiter_falls_back_to_memory_when_redis_unreachable(self):
+        """A configured-but-unreachable Redis degrades to per-process memory,
+        so import and reset() do not error in Redis-less environments
+        (consistent with CSRFManager's startup fallback)."""
+        from limits.storage import MemoryStorage
+
+        with patch("app.limiter._redis_reachable", return_value=False):
+            from app.limiter import build_limiter
+
+            lim = build_limiter("redis://localhost:6379/0")
+            self.assertIsInstance(lim._storage, MemoryStorage)
+            # No Redis -> no runtime fallback needed.
+            self.assertFalse(lim._in_memory_fallback_enabled)
+
+    def test_build_limiter_enables_runtime_fallback_when_redis_configured(self):
+        """With a reachable Redis, the runtime in-memory fallback is enabled so
+        a later Redis blip degrades to a per-process limit instead of failing
+        closed (503 on every rate-limited request)."""
+        with patch("app.limiter._redis_reachable", return_value=True):
+            from app.limiter import build_limiter
+
+            lim = build_limiter("redis://localhost:6379/0")
+            self.assertTrue(lim._in_memory_fallback_enabled)
 
 
 if __name__ == "__main__":
