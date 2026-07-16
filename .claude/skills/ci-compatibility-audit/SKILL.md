@@ -41,6 +41,19 @@ Repository contract job:
 
 - `python scripts/check_config_contract.py`
 - `python scripts/check_pr_scope_drift.py`
+- `python scripts/check_sast_baseline.py` — fails if the SAST baseline grew on
+  the PR (suppresses new findings without `SAST_ALLOW_BASELINE_EXPANSION=1`),
+  if the `sast` CI job no longer runs `run_bandit.py`, or if the scan scope
+  (`TARGET`) drifted from `backend/app`.
+
+SAST job:
+
+- `pip install -r backend/requirements-dev.txt` (gets `bandit`)
+- `python scripts/run_bandit.py` — runs bandit against the committed baseline at
+  `backend/security/bandit-baseline.json` and **fails only on NEW findings**
+  (pre-existing findings are suppressed by the baseline). See
+  `backend/security/README.md` for the suppressed-finding counts and the
+  baseline-regeneration workflow (`python scripts/run_bandit.py --update-baseline`).
 
 > **Note (post-PR #215):** Earlier versions of this skill documented a
 > "narrow pytest subset" (8 test files). That subset was the pre-FR-4 state.
@@ -59,6 +72,12 @@ Repository contract job:
 - Pull request diff checks have enough fetch depth.
 - Local validation commands mirror CI when possible.
 - Truncated CI output does not hide the command exit status.
+- SAST: if `backend/app` changed, run `python scripts/run_bandit.py` locally.
+  If it reports NEW findings, either fix them or (if acceptable pre-existing
+  debt) regenerate the baseline with `--update-baseline` and justify the
+  newly-suppressed finding IDs in the PR.
+- Regression falsifiability: if the change adds a regression test, was it
+  verified falsifiable (revert the fix, confirm the test fails, restore)?
 - For the 60m job timeout: tests with `pytest-timeout=300` per-test are bounded, but the cumulative suite (~36m with coverage) MUST fit. If you add tests that take cumulatively >20m, the job will fail. Profile slow tests with `pytest --durations=20`.
 
 ## Local Mirror Commands
@@ -71,6 +90,8 @@ cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/ap
 cd backend && ruff check . && pytest --tb=short -v --timeout=300 tests/
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
+python scripts/check_sast_baseline.py
+python scripts/run_bandit.py
 ```
 
 Run these before pushing so a CI-only lint/type failure doesn't cost a

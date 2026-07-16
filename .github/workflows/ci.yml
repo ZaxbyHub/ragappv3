@@ -78,6 +78,28 @@ jobs:
       - name: PR scope drift check
         run: python scripts/check_pr_scope_drift.py
 
+      - name: SAST baseline integrity check
+        run: python scripts/check_sast_baseline.py
+
+  sast:
+    name: SAST (bandit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install bandit
+        run: pip install -r backend/requirements-dev.txt
+
+      - name: SAST scan (fails on new findings vs baseline)
+        run: python scripts/run_bandit.py
+
   backend:
     name: Backend
     runs-on: ubuntu-latest

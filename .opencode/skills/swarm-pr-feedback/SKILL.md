@@ -15,6 +15,24 @@ and you need to act on its findings.
 
 ---
 
+## Pre-flight: get onto the correct branch first
+
+Explorers and verification steps read files from the working tree. If the PR
+branch is not checked out locally, you verify and fix against the wrong code.
+Before ingesting the review bundle:
+
+```bash
+git status --porcelain            # must be empty; stash if dirty
+git fetch origin <branch-name>
+git checkout <branch-name>        # or: git checkout --track origin/<branch-name>
+```
+
+Then scope every diff/verification to the PR's actual commit range
+(`base_ref..head_ref`), not the full branch accumulation. See `swarm-pr-review`
+Phase 0 "PR Branch Checkout (mandatory)" for the canonical version.
+
+---
+
 ## Inputs
 
 The user provides one or more of:
@@ -149,6 +167,22 @@ Add or update a `## Review follow-up` section in the PR description:
 **F-003 — DEFERRED** (short title)
 [Why deferred (coverage gap, separate issue, out of PR scope) + issue link if filed.]
 ```
+
+---
+
+## Persisting findings (survive context compaction)
+
+Review-bundle resolution touches many findings across ingest, verification, and
+fixing. If held only in conversation context, a context compaction silently
+erases the per-finding classification and forces re-verification. After
+ingestion (Step 1) and after fixing (Step 4), persist findings to a structured
+scratch artifact (e.g. `.swarm/evidence/review-{id}/{phase}.json` — gitignored
+local working state, NOT committed). Minimum fields per finding: `finding_id`,
+`status` (PENDING/CONFIRMED/DISPROVED/PRE_EXISTING), `severity`, `file_line`,
+`evidence`, `next_action`. The canonical schema and checkpoint triggers live in
+the `swarm-pr-review` skill ("Persisting Findings to Survive Context
+Compaction") — reference it rather than duplicating. On resume after
+compaction, reload these artifacts and continue from the last checkpoint.
 
 ---
 

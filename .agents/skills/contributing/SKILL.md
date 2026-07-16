@@ -3,8 +3,8 @@ name: contributing
 description: >
   End-to-end contribution workflow for RAGAPPv3 (KnowledgeVault). Load before
   creating branches, commits, or PRs. Covers branch hygiene against master,
-  conventional commits, the three real CI gates (Frontend, Backend, Quality
-  contracts), and where to go for publication. This repo is Python/FastAPI +
+  conventional commits, the four real CI gates (Frontend, Backend, Quality
+  contracts, SAST), and where to go for publication. This repo is Python/FastAPI +
   npm/Vite — there is NO release-please, biome, bun, or dist-check.
 ---
 
@@ -54,10 +54,10 @@ generated artifacts.
 > this repo — but `master` history and the human reviewers expect the format, so
 > follow it.
 
-## 3. Run the CI gates locally (three jobs, all must pass)
+## 3. Run the CI gates locally (four jobs, all must pass)
 
 CI (`.github/workflows/ci.yml`) is PR-triggered against `master` and has exactly
-three jobs. Reproduce them so your PR goes green on the first try.
+four jobs. Reproduce them so your PR goes green on the first try.
 
 ### Backend (from `backend/`)
 
@@ -88,11 +88,22 @@ npm run build       # tsc && vite build (CI also runs two subpath builds)
 ```bash
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
+python scripts/check_sast_baseline.py
 ```
 
 `check_pr_scope_drift.py` flags drift such as auth tests changed without matching
 auth runtime/doc changes, and CI/tooling changes without a contract update — fix
 the underlying drift rather than gaming the diff.
+
+### SAST (from repo root; `bandit` is in `backend/requirements-dev.txt`)
+
+```bash
+python scripts/run_bandit.py
+# Fails only on NEW findings vs backend/security/bandit-baseline.json.
+# To accept a new pre-existing finding intentionally, regenerate with
+#   python scripts/run_bandit.py --update-baseline
+# and justify the newly-suppressed finding IDs in the PR.
+```
 
 For the authoritative, always-current CI-mirror command list, run the
 `ci-compatibility-audit` skill before pushing.

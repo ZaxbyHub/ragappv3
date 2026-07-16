@@ -1,0 +1,24 @@
+# Bandit SAST configuration for RAGAPPv3 backend.
+#
+# CI / local entrypoint: python scripts/run_bandit.py
+# Regenerate the committed baseline: python scripts/run_bandit.py --update-baseline
+#
+# The scan target (backend/app) and baseline path are set by run_bandit.py.
+# This file pins which directories bandit must NOT descend into; the patterns
+# below are matched against the full path of each discovered file.
+
+# Exclude test fixtures (assert/exec/mock patterns are intentional and noisy) and
+# bytecode caches. Production migration scripts under backend/app/migrations/ are
+# NOT excluded — they are real runnable code and should be scanned; any findings
+# there are absorbed by the committed baseline like any other pre-existing debt.
+exclude_dirs:
+  - "tests"
+  - "*/__pycache__/*"
+  - "*/test_*/*"
+
+recursive: true
+
+# We rely on the committed baseline (backend/security/bandit-baseline.json) to
+# suppress pre-existing findings, so no test IDs are skipped here. Skipping a
+# rule globally would hide it from the baseline diff entirely.
+skips: []

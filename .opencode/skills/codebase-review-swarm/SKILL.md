@@ -53,6 +53,24 @@ Use these baselines unless repository policy explicitly requires stricter or old
 - WCAG 2.2 AA for UI accessibility.
 - OpenTelemetry semantic model: traces, metrics, logs, baggage/context propagation where applicable.
 
+## Pre-flight: git ref availability
+
+Explorer agents read files from the working tree, not from git history. Before
+Phase 0 inventory, ensure the working tree reflects the ref under review:
+
+```bash
+git status --porcelain            # must be empty; stash if dirty
+git fetch origin <ref>
+git checkout <ref>                # or: git checkout --track origin/<ref>
+```
+
+Pass the actual commit range (`base_ref..head_ref`, or the specific review
+commit range) into every explorer delegation so candidates are scoped to the
+reviewed changes, not a stale or accumulated branch state. A dirty tree or a
+wrong checkout makes every quoted file:line a candidate false positive. See
+`swarm-pr-review` Phase 0 "PR Branch Checkout (mandatory)" for the canonical
+version of this pre-flight.
+
 ## Execution outline
 
 1. Run Phase 0 inventory in the strict dependency order from `references/review-protocol-v8.2.md` and write the source-of-truth packet.
@@ -64,3 +82,10 @@ Use these baselines unless repository policy explicitly requires stricter or old
 7. Run inline critic for CRITICAL/HIGH defects (Phase 2C), enhancement critic for all kept enhancements (Phase 2E), and final whole-report critic (Phase 5).
 8. Write `review-report.md` only after coverage closure and final critic PASS. Verify `git status` shows no source file modifications (skill invariant: read-only review).
 9. Final response reports only the run path, selected tracks, counts summary, highest-risk items, coverage limitations, and confirmation that no source files were modified. Optionally create GitHub issues tracking the findings (one for CRITICAL+HIGH, one for MEDIUM, one for remaining) — this is user-driven, not automatic.
+
+When the report proposes a regression test as part of a remediation
+recommendation, that test MUST be falsifiable: reverting the recommended fix
+must make the test fail. A proposed guard that passes both with and without the
+fix is not a valid regression test (see the `writing-tests` skill, "Verify
+regression tests are non-vacuous"). Note this requirement in the finding so the
+implementer does not ship theater.

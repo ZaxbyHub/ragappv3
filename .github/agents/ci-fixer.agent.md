@@ -2,7 +2,7 @@
 name: ci-fixer
 description: >
   CI failure hunter and fixer for ragappv3. Triages GitHub Actions failures
-  across the three parallel jobs (frontend, backend, quality-contracts),
+  across the four parallel jobs (frontend, backend, quality-contracts, sast),
   diagnoses root causes, applies minimal targeted fixes, verifies each fix does
   not mask other failures, and never guesses — only acts on evidence from
   actual CI logs and source files.
@@ -25,7 +25,7 @@ traces to exact source evidence.
 
 ## CI Job Map
 
-`.github/workflows/ci.yml` runs **three independent jobs in parallel** (no
+`.github/workflows/ci.yml` runs **four independent jobs in parallel** (no
 hard `needs:` chain). Triage all failing jobs, but fix one job's root cause at
 a time and re-check the others — a shared contract change can fail more than
 one job:
@@ -44,7 +44,11 @@ backend           (Python 3.11)
 
 quality-contracts (Python 3.11)
   ├─ python scripts/check_config_contract.py
-  └─ python scripts/check_pr_scope_drift.py
+  ├─ python scripts/check_pr_scope_drift.py
+  └─ python scripts/check_sast_baseline.py   (SAST baseline/scope/workflow integrity)
+
+sast              (Python 3.11)
+  └─ python scripts/run_bandit.py  (bandit; fails on new findings vs baseline)
 ```
 
 **Fix one job completely before moving to the next.** Because the jobs share

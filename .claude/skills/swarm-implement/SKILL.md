@@ -72,6 +72,22 @@ upstream changes. Never use the full branch accumulation (`master..HEAD`) which
 includes merge artifacts from prior PRs and causes wasted exploration. Record
 the base ref, head ref, and commit range explicitly for downstream explorers.
 
+**Pre-flight: branch and clean tree.** Before dispatching any explorer for a PR
+or branch-scoped task, get the working tree onto the correct branch first —
+explorers read files via the filesystem, so a stale checkout makes them analyze
+the wrong code and produce invalid candidates:
+
+```bash
+git status --porcelain            # must be empty; stash if dirty
+git fetch origin <branch-name>
+git checkout <branch-name>        # or: git checkout --track origin/<branch-name>
+```
+
+Then pass the actual commit range (base ref, head ref, `base..head`) into every
+explorer delegation so explorers scope to the PR's changes, not the full branch
+accumulation. See `swarm-pr-review` Phase 0 "PR Branch Checkout (mandatory)"
+for the canonical version of this pre-flight.
+
 ### Phase 2 — Plan
 Create a concrete implementation plan before editing for any non-trivial task.
 The plan should include:
@@ -94,6 +110,14 @@ Always run the strongest objective checks available for the task:
 - build
 - targeted repro scripts
 - local runtime verification where relevant
+
+**Regression tests must be falsifiable.** When a fix ships with a regression
+test, verify the test actually guards the fix: temporarily revert ONLY the
+source fix (leave the new test in place), run the test, and confirm it fails
+with the original defect; then restore the fix and confirm it passes. A test
+that passes both with and without the fix is not a regression guard — it is
+theater. See the `writing-tests` skill ("Verify regression tests are
+non-vacuous") for the canonical wording.
 
 If you cannot verify it, do not claim it is done.
 
@@ -133,6 +157,20 @@ In the main thread, summarize:
 - what critic challenged
 - final remaining risks
 - whether the task is actually complete
+
+### Persisting validation findings (survive context compaction)
+Long tasks generate many candidates and reviewer/critic findings. If they live
+only in conversation context, a context compaction silently erases them and
+forces expensive re-runs. After each validation phase (post-explorer,
+post-reviewer, post-critic, pre-synthesis), persist findings to a structured
+scratch artifact (e.g. `.swarm/evidence/review-{id}/{phase}.json` — gitignored
+local working state, NOT committed). Minimum fields per finding: `finding_id`,
+`status` (PENDING/CONFIRMED/DISPROVED/PRE_EXISTING), `severity`, `file_line`,
+`evidence`, `next_action`. The canonical schema and checkpoint triggers live in
+the `swarm-pr-review` skill ("Persisting Findings to Survive Context
+Compaction") — reference it rather than duplicating. On resume after compaction,
+reload these artifacts and continue from the last checkpoint instead of
+re-dispatching explorers for already-persisted lanes.
 
 ## Hard rules
 - Do not let implementation context self-approve high-risk work.
