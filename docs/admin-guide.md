@@ -1183,6 +1183,8 @@ KnowledgeVault uses `slowapi` for per-IP rate limiting. The default limits are:
 | Vault creation | 30/minute |
 | Memory mutations | 30/minute |
 
+**Multi-worker deployments:** The rate limiter stores its counters in Redis (the same `REDIS_URL` used for CSRF tokens and the embedding cache), so configured limits hold correctly when the app runs under multiple workers (e.g. `uvicorn --workers N`). If Redis becomes unreachable at runtime, the limiter falls back to per-worker in-memory counters, which weakens the effective limit by roughly the worker count until Redis recovers (slowapi re-probes with exponential backoff). When `REDIS_URL` is empty (e.g. CI), the limiter uses in-memory storage only.
+
 **Trusting reverse proxy headers:** When deployed behind a reverse proxy, you may want the rate limiter to use the `X-Forwarded-For` header to identify clients instead of the direct connection IP. Set `TRUST_PROXY_HEADERS=true` in `.env`:
 
 ```env

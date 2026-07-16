@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover
 from app.config import settings
 from app.services.circuit_breaker import CircuitBreakerError, embeddings_cb
 from app.services.ssrf import assert_url_safe
+from app.utils.secrets import redact_url
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +191,10 @@ class EmbeddingService:
                 # Verify connectivity with a quiet ping
                 self._redis_client.ping()
                 self._redis_available = True
-                logger.info("Embedding Redis L2 cache connected: %s", settings.redis_url)
+                logger.info(
+                    "Embedding Redis L2 cache connected: %s",
+                    redact_url(settings.redis_url),
+                )
             except Exception as e:
                 logger.warning("Embedding Redis L2 cache unavailable (will use LRU fallback): %s", e)
                 self._redis_client = None
