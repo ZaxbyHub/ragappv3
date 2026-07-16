@@ -102,6 +102,8 @@ def _redis_reachable(redis_url: str, timeout: float = 1.0) -> bool:
     CSRFManager pattern (``except Exception`` at security.py) — the probe must
     not crash ``import app.limiter``.
     """
+    import contextlib
+
     import redis
 
     try:
@@ -120,10 +122,11 @@ def _redis_reachable(redis_url: str, timeout: float = 1.0) -> bool:
         # (TimeoutError, ConnectionError) and any other probe failure.
         return False
     finally:
-        try:
+        # close() can raise on an already-broken connection; suppress rather
+        # than use try/except: pass (bandit B110). The ping result above is
+        # the value that matters.
+        with contextlib.suppress(Exception):
             client.close()
-        except Exception:
-            pass
 
 
 def build_limiter(redis_url: str) -> WhitelistLimiter:
