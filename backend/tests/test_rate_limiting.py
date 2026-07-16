@@ -982,78 +982,113 @@ class TestStorageUriWiring(unittest.TestCase):
 
         self.assertEqual(_resolve_storage_uri("   "), "memory://")
 
-    def test_redis_reachable_returns_false_for_unreachable_host(self):
-        """The real (un-mocked) probe returns False, never raises, against an
-        unreachable Redis. Guards the ``except Exception`` net that prevents a
-        dead Redis from crashing ``import app.limiter``."""
-        from app.limiter import _redis_reachable
-
-        # Port 1 is refused immediately; no live Redis needed. Short timeout
-        # keeps the test fast.
-        self.assertFalse(_redis_reachable("redis://127.0.0.1:1/0", timeout=1.0))
-
-    def test_redis_reachable_returns_false_for_malformed_url(self):
-        """A malformed REDIS_URL (ValueError from redis.from_url) must return
-        False, not crash the import. This is the regression that the broad
-        ``except Exception`` in ``_redis_reachable`` prevents."""
-        from app.limiter import _redis_reachable
-
-        for bad in ("not-a-url", "redis://localhost:notaport/0", "://broken"):
-            self.assertFalse(_redis_reachable(bad), msg=f"expected False for {bad!r}")
-
     def test_build_limiter_uses_redis_when_redis_url_configured(self):
-        """With a Redis URL and a reachable Redis, the limiter's storage backend
-        is RedisStorage so counters are shared across workers.
-
-        ``_redis_reachable`` is stubbed True so no live Redis is required.
-        Fails on pre-fix code (build_limiter absent)."""
+        """With a Redis URL, the limiter's storage backend is RedisStorage so
+        counters are shared across workers. slowapi connects lazily, so no live
+        Redis is required for this assertion. Fails on pre-fix code
+        (build_limiter absent)."""
         from limits.storage import RedisStorage
 
-        with patch("app.limiter._redis_reachable", return_value=True):
-            from app.limiter import build_limiter
+        from app.limiter import build_limiter
 
-            lim = build_limiter("redis://localhost:6379/0")
-            self.assertIsInstance(lim._storage, RedisStorage)
+        lim = build_limiter("redis://localhost:6379/0")
+        self.assertIsInstance(lim._storage, RedisStorage)
+        # The resolved URI is passed through to slowapi unchanged (F-LO1).
+        self.assertEqual(lim._storage_uri, "redis://localhost:6379/0")
+        # build_limiter returns a WhitelistLimiter (preserves the health-check
+        # whitelist bypass) — a type-anchor guard (PRR-005).
+        from app.limiter import WhitelistLimiter
+
+        self.assertIsInstance(lim, WhitelistLimiter)
 
     def test_build_limiter_falls_back_to_memory_in_ci(self):
         """With an empty Redis URL (CI), storage is MemoryStorage and the
-        runtime fallback is disabled — behavior identical to pre-fix. The Redis
-        probe is never called (empty URL short-circuits in _resolve_storage_uri)."""
+        runtime fallback is disabled — behavior identical to pre-fix."""
         from limits.storage import MemoryStorage
 
-        with patch("app.limiter._redis_reachable") as probe:
-            from app.limiter import build_limiter
+        from app.limiter import build_limiter
 
-            lim = build_limiter("")
-            self.assertIsInstance(lim._storage, MemoryStorage)
-            # No fallback limiter should be constructed in the memory-only path.
-            self.assertFalse(lim._in_memory_fallback_enabled)
-            # Empty URL must not trigger a network probe.
-            probe.assert_not_called()
-
-    def test_build_limiter_falls_back_to_memory_when_redis_unreachable(self):
-        """A configured-but-unreachable Redis degrades to per-process memory,
-        so import and reset() do not error in Redis-less environments
-        (consistent with CSRFManager's startup fallback)."""
-        from limits.storage import MemoryStorage
-
-        with patch("app.limiter._redis_reachable", return_value=False):
-            from app.limiter import build_limiter
-
-            lim = build_limiter("redis://localhost:6379/0")
-            self.assertIsInstance(lim._storage, MemoryStorage)
-            # No Redis -> no runtime fallback needed.
-            self.assertFalse(lim._in_memory_fallback_enabled)
+        lim = build_limiter("")
+        self.assertIsInstance(lim._storage, MemoryStorage)
+        # No fallback limiter should be constructed in the memory-only path.
+        self.assertFalse(lim._in_memory_fallback_enabled)
 
     def test_build_limiter_enables_runtime_fallback_when_redis_configured(self):
-        """With a reachable Redis, the runtime in-memory fallback is enabled so
-        a later Redis blip degrades to a per-process limit instead of failing
-        closed (503 on every rate-limited request)."""
-        with patch("app.limiter._redis_reachable", return_value=True):
-            from app.limiter import build_limiter
+        """With a Redis URL, the runtime in-memory fallback is enabled so a
+        Redis blip degrades to a per-process limit instead of failing closed
+        (503 on every rate-limited request). slowapi connects lazily, so no
+        live Redis is required."""
+        from app.limiter import build_limiter
 
-            lim = build_limiter("redis://localhost:6379/0")
-            self.assertTrue(lim._in_memory_fallback_enabled)
+        lim = build_limiter("redis://localhost:6379/0")
+        self.assertTrue(lim._in_memory_fallback_enabled)
+
+    def test_module_global_limiter_is_whitelist_limiter(self):
+        """The imported module-global limiter is a WhitelistLimiter (PRR-005):
+        a regression where build_limiter returned a plain Limiter would drop
+        the health-check whitelist bypass (_check_request_limit override)."""
+        from app.limiter import WhitelistLimiter, limiter
+
+        self.assertIsInstance(limiter, WhitelistLimiter)
+
+
+class TestRedisUrlRedaction(unittest.TestCase):
+    """The Redis URL may embed a password; it must never be logged verbatim
+    (F-001). redact_url masks the password while preserving host/port/db."""
+
+    def test_redact_url_masks_password(self):
+        from app.utils.secrets import redact_url
+
+        self.assertEqual(
+            redact_url("redis://:s3cret@redis:6379/2"),
+            "redis://:***@redis:6379/2",
+        )
+
+    def test_redact_url_masks_user_password_keeps_user(self):
+        from app.utils.secrets import redact_url
+
+        self.assertEqual(
+            redact_url("redis://app:p%40ss@redis:6379/0"),
+            "redis://app:***@redis:6379/0",
+        )
+
+    def test_redact_url_passthrough_when_no_credentials(self):
+        from app.utils.secrets import redact_url
+
+        self.assertEqual(redact_url("redis://localhost:6379/0"), "redis://localhost:6379/0")
+        self.assertEqual(redact_url("memory://"), "memory://")
+
+    def test_redact_url_handles_tls_and_sentinel(self):
+        from app.utils.secrets import redact_url
+
+        self.assertEqual(
+            redact_url("rediss://:pw@tls-redis:6379/1"),
+            "rediss://:***@tls-redis:6379/1",
+        )
+        self.assertEqual(
+            redact_url("redis+sentinel://:pw@host:26379/mymaster/0"),
+            "redis+sentinel://:***@host:26379/mymaster/0",
+        )
+
+    def test_redact_url_handles_multi_host_sentinel_without_crashing(self):
+        """Multi-host cluster/sentinel URLs (host:port,host:port) must not
+        crash on ``parsed.port`` (ValueError) and must not drop host entries.
+        Guards the import-time call from build_limiter (F-001 critic finding)."""
+        from app.utils.secrets import redact_url
+
+        self.assertEqual(
+            redact_url("redis+sentinel://:pw@h1:26379,h2:26379/mymaster/0"),
+            "redis+sentinel://:***@h1:26379,h2:26379/mymaster/0",
+        )
+        self.assertEqual(
+            redact_url("redis+sentinel://app:pw@h1:26379,h2:26379/mymaster/0"),
+            "redis+sentinel://app:***@h1:26379,h2:26379/mymaster/0",
+        )
+        # No credentials — passthrough, no host loss, no crash.
+        self.assertEqual(
+            redact_url("redis+sentinel://h1:26379,h2:26379/mymaster/0"),
+            "redis+sentinel://h1:26379,h2:26379/mymaster/0",
+        )
 
 
 if __name__ == "__main__":

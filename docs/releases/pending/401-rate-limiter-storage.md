@@ -15,65 +15,82 @@
   condition: `.github/workflows/ci.yml` sets `REDIS_URL=""` with no Redis service)
   to `memory://`, since `limits.storage.storage_from_string("")` raises
   `ConfigurationError`.
-- `_redis_reachable(redis_url)` construction-time probe mirrors
-  `CSRFManager.__init__` (`security.py`): if Redis is configured but not
-  reachable at startup (e.g. local dev without Redis), the limiter falls back to
-  `memory://`. This is required because the autouse test fixture
-  `conftest._reset_rate_limiter` calls `limiter.reset()`, and
-  `RedisStorage.reset()` issues a real Redis Lua flush that throws
-  `ConnectionError` in Redis-less environments — slowapi's `in_memory_fallback`
-  only fires inside `_check_request_limit`, not in `reset()`. The probe never
-  raises (`except Exception`, like CSRFManager).
-- `in_memory_fallback_enabled=True` only when a real Redis backend is wired, so
-  a Redis blip *after* startup degrades to a per-process limit instead of
-  failing closed (503 on every state-changing route).
+- `build_limiter` does NOT probe Redis at construction time. The limiter must be
+  built at module import (slowapi's `@limiter.limit(...)` decorators in the route
+  files run at import and require a concrete `Limiter` instance), so a blocking
+  startup probe would delay import by up to ~1s when Redis is unreachable
+  (unlike `CSRFManager`/`EmbeddingService`, which can defer to the lifespan
+  because they are resolved via FastAPI `Depends`, not decorators). Instead the
+  configured `storage_uri` is passed straight to slowapi, which connects lazily
+  on the first rate-limited request.
+- `in_memory_fallback_enabled=True` whenever a real (non-memory) backend is
+  configured, so a Redis failure at request time degrades to a per-process limit
+  instead of failing closed (503 on every state-changing route). slowapi
+  re-probes the backend with exponential backoff and returns to Redis when it
+  recovers.
+
+### Backend — Redis URLs are redacted in logs (F-001)
+- `backend/app/utils/secrets.py` (new): `redact_url(url)` masks any embedded
+  `user:password@` in a connection string (Redis/DB URIs) to `user:***@`,
+  preserving scheme/host/port/db. Handles `redis://`, `rediss://`,
+  `redis+sentinel://`, no-credential URLs (passthrough), and unparseable strings
+  (never raises — safe in a logging path).
+- `backend/app/limiter.py`: the "wired to Redis" log uses `redact_url` so a
+  `REDIS_URL` carrying a password is not leaked to log aggregators.
+- `backend/app/services/embeddings.py`: the "Embedding Redis L2 cache connected"
+  log (previously the most severe leak — unconditional on every boot) now uses
+  `redact_url`.
 
 ### Tests
 - `TestStorageUriWiring` (`test_rate_limiting.py`):
   - `_resolve_storage_uri` pure-function cases (redis URL passthrough incl. db
     index/password/TLS; empty/whitespace → `memory://`).
-  - `build_limiter` wiring (Redis URL + reachable → `RedisStorage`; empty →
-    `MemoryStorage` + no fallback; unreachable → `MemoryStorage`; reachable →
-    runtime fallback enabled). These FAIL on pre-fix code (`build_limiter`
-    absent) — genuine regression guard.
-  - Real (un-mocked) `_redis_reachable` probe tests: returns `False` (never
-    raises) for an unreachable host and for malformed URLs. These guard the
-    `except Exception` net that prevents a malformed `REDIS_URL` from crashing
-    `import app.limiter`.
+  - `build_limiter` wiring: Redis URL → `RedisStorage` (+ asserts the resolved
+    URI is passed through and that the result is a `WhitelistLimiter` — the
+    type-anchor that catches a regression dropping the whitelist bypass);
+    empty → `MemoryStorage` + no fallback; Redis URL → runtime fallback enabled.
+    These FAIL on pre-fix code (`build_limiter` absent) — genuine regression guard.
+  - `test_module_global_limiter_is_whitelist_limiter`: runtime `isinstance` guard
+    on the imported module global (PRR-005).
+- `TestRedisUrlRedaction` (`test_rate_limiting.py`): `redact_url` masks password
+  / user+password, passes through no-credential URLs, handles TLS + sentinel (F-001).
+- `backend/tests/conftest.py`: the autouse `_reset_rate_limiter` fixture now
+  swallows any exception from `limiter.reset()` (not just ImportError/AttributeError),
+  so running the suite with a non-empty `REDIS_URL` but no reachable Redis does
+  not crash every test via `RedisStorage.reset()`.
 - Updated one existing source-scan assertion (`test_limiter_instance_exported`)
-  from `limiter = WhitelistLimiter` to `limiter = build_limiter` (type guarantee
-  still covered by `test_whitelist_limiter_extends_limiter`).
+  from `limiter = WhitelistLimiter` to `limiter = build_limiter`.
 
 ### Docs
 - `docs/admin-guide.md` Rate Limiting section: documents that counters are
-  stored in Redis under multi-worker deployments, and honestly distinguishes the
-  two degraded paths: Redis reachable at startup but blips later → per-worker
-  weakening until recovery; Redis unreachable at startup → per-worker mode for
-  the worker lifetime (restart to re-share counters); empty `REDIS_URL` (CI) →
-  in-memory only.
+  stored in Redis under multi-worker deployments and the runtime fallback
+  behavior (per-worker weakening until Redis recovers).
+- `docs/release.md` infrastructure checklist: Redis line now notes it backs CSRF,
+  the embedding cache, AND shared rate-limit counters.
 
 ## Why
 #302 finding 3 / #401: the slowapi limiter had no `storage_uri`, so it defaulted
 to in-process memory — one bucket set per worker. The admin guide described a
 multi-worker "cluster" where Redis is "already used", which could lead an
-operator to believe rate limits were safely shared; they were not.
+operator to believe rate limits were safely shared; they were not. The redaction
+hardening (F-001) closes a credential-leak path in the limiter and (more
+severely) the embedding service's unconditional connection log.
 
 ## Migration / configuration
 No migration required. Deployments that already set `REDIS_URL` (the documented
 Docker setup, which gates the app on `redis: condition: service_healthy`) now
 share rate-limit counters across workers automatically. Deployments without
-Redis keep the prior per-process behavior (no `REDIS_URL`, or Redis unreachable
-at startup).
+Redis (empty `REDIS_URL`, e.g. CI) keep the prior per-process in-memory behavior.
 
 ## Known caveats
-- If Redis is unreachable at startup, the limiter runs in per-worker in-memory
-  mode for the lifetime of those workers (the limiter is constructed once at
-  import; there is no runtime re-probe/recovery state machine). Restart the
-  workers once Redis is available to re-share counters. Adding a
-  `_check_redis_available`-style re-probe was judged scope creep for a
-  complexity-S fix; the documented Docker deployment gates startup on Redis
-  health, so this degraded path is not the normal case.
-- `in_memory_fallback_enabled=True` (runtime, reachable-Redis path) weakens the
+- The limiter is constructed once at import with the configured `storage_uri`;
+  it does not probe Redis at construction (to avoid blocking import) and there
+  is no startup-time fallback to `memory://`. If Redis is down at startup, the
+  first request triggers slowapi's lazy connect + `in_memory_fallback` flip
+  (per-process limit until Redis recovers via exponential-backoff re-probe).
+  The documented Docker deployment gates startup on Redis health, so this is an
+  edge case, not the normal path.
+- `in_memory_fallback_enabled=True` (when Redis is configured) weakens the
   effective limit by roughly the worker count while Redis is down — an
-  availability-over-security trade (the opposite of the CSRF layer's fail-closed
+  availability-over-security trade (different from the CSRF layer's fail-closed
   choice), documented inline and in the admin guide.

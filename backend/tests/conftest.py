@@ -69,18 +69,25 @@ def _bypass_csrf_for_csrf_naive_tests(request):
 def _reset_rate_limiter():
     """Reset the in-memory rate limiter and circuit breakers before every test.
 
-    Tests that share the FastAPI app instance share the same MemoryStorage
-    bucket. Without a reset, a test file that issues many requests to a
-    rate-limited endpoint can exhaust the quota and cause 429 errors in
-    subsequent test files, producing spurious failures.
+    Tests that share the FastAPI app instance share the same storage bucket.
+    Without a reset, a test file that issues many requests to a rate-limited
+    endpoint can exhaust the quota and cause 429 errors in subsequent test
+    files, producing spurious failures.
 
     Similarly, tests that trip the embeddings circuit breaker leave it open for
     subsequent tests.
+
+    The reset is best-effort: in CI the limiter uses in-memory storage
+    (``REDIS_URL=""``), whose reset is a harmless clear. When a developer runs
+    the suite with a non-empty ``REDIS_URL`` but no reachable Redis, the limiter
+    is wired to Redis and ``reset()`` raises a connection error — that is an
+    environment artifact, not a test failure, so it is swallowed alongside the
+    import/attribute guards.
     """
     try:
         from app.limiter import limiter
         limiter.reset()
-    except (ImportError, AttributeError):
+    except Exception:
         pass
     try:
         from app.services.circuit_breaker import embeddings_cb
@@ -91,7 +98,7 @@ def _reset_rate_limiter():
     try:
         from app.limiter import limiter
         limiter.reset()
-    except (ImportError, AttributeError):
+    except Exception:
         pass
     try:
         from app.services.circuit_breaker import embeddings_cb
@@ -288,6 +295,12 @@ def pytest_configure(config):
     os.environ["ADMIN_SECRET_TOKEN"] = "test-admin-key"
     os.environ["USERS_ENABLED"] = "false"
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
+    # Force the rate limiter to in-memory storage for the test suite. No test
+    # exercises real-Redis limiting, and without this the module-global limiter
+    # (now wired to settings.redis_url, which defaults to redis://localhost)
+    # would make each autouse limiter.reset() block ~4s on a Redis connection
+    # timeout. This matches CI, which sets REDIS_URL="" with no Redis service.
+    os.environ["REDIS_URL"] = ""
 
     app_keys = [
         k for k in list(sys.modules.keys()) if k == "app" or k.startswith("app.")

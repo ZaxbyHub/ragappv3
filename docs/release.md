@@ -66,7 +66,7 @@ Before deploying KnowledgeVault to production, ensure the following:
 - [ ] SQLite database directory (`/data/knowledgevault`) with appropriate permissions
 - [ ] LanceDB vector store directory with write access
 - [ ] Vault directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`) with sufficient disk space for each vault
-- [ ] Redis instance running for CSRF token storage (default: `redis://localhost:6379/0`)
+- [ ] Redis instance running for CSRF token storage, embedding L2 cache, and shared rate-limit counters (default: `redis://localhost:6379/0`)
 - [ ] Ollama or OpenAI-compatible embedding service accessible
 - [ ] LLM chat service accessible (Ollama, OpenAI, or compatible API)
 

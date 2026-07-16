@@ -9,6 +9,7 @@ from slowapi.util import get_remote_address
 from starlette.requests import Request
 
 from app.config import settings
+from app.utils.secrets import redact_url
 
 logger = logging.getLogger("rate_limit")
 
@@ -88,88 +89,52 @@ def _resolve_storage_uri(redis_url: str) -> str:
     return "memory://"
 
 
-def _redis_reachable(redis_url: str, timeout: float = 1.0) -> bool:
-    """Probe whether the configured Redis is reachable.
-
-    Mirrors the CSRFManager startup probe (security.py): if Redis is not up at
-    construction, the limiter cannot share counters, so the caller falls back
-    to in-memory storage rather than constructing a RedisStorage whose
-    ``reset()`` / first-request would error out in Redis-less environments.
-    The probe is a single ``PING`` with a short socket timeout.
-
-    Never raises: a malformed URL (``ValueError``), an unsupported scheme, or
-    any connection error is treated as unreachable. This matches the
-    CSRFManager pattern (``except Exception`` at security.py) — the probe must
-    not crash ``import app.limiter``.
-    """
-    import contextlib
-
-    import redis
-
-    try:
-        client = redis.from_url(
-            redis_url, socket_connect_timeout=timeout, socket_timeout=timeout
-        )
-    except Exception:
-        # Malformed URL or unsupported scheme (e.g. redis+sentinel://) —
-        # redis.from_url raises ValueError, not a RedisError subclass.
-        return False
-    try:
-        client.ping()
-        return True
-    except Exception:
-        # Broad catch (like CSRFManager.__init__): covers redis.RedisError
-        # (TimeoutError, ConnectionError) and any other probe failure.
-        return False
-    finally:
-        # close() can raise on an already-broken connection; suppress rather
-        # than use try/except: pass (bandit B110). The ping result above is
-        # the value that matters.
-        with contextlib.suppress(Exception):
-            client.close()
-
-
 def build_limiter(redis_url: str) -> WhitelistLimiter:
-    """Construct the shared rate limiter.
+    """Construct the shared rate limiter (non-blocking at import).
 
     ``storage_uri`` shares counters across workers via Redis when configured,
     closing the per-worker isolation defect where ``uvicorn --workers N``
-    multiplied every configured limit by N. When Redis is configured but not
-    reachable at construction (e.g. local dev without Redis), the limiter
-    falls back to ``memory://`` — consistent with how ``security.py`` handles
-    Redis failover for CSRF — so the module import and ``limiter.reset()`` do
-    not error out in Redis-less environments.
+    multiplied every configured limit by N. Unlike ``CSRFManager`` and
+    ``EmbeddingService`` (which probe Redis lazily during lifespan startup),
+    the limiter CANNOT be constructed in the lifespan: slowapi's
+    ``@limiter.limit(...)`` decorators run at module-import time in every route
+    file and require a concrete ``Limiter`` instance to register route limits.
+    So the limiter is necessarily built at import. To avoid blocking import on
+    a Redis probe (up to ~1s when Redis is unreachable), this constructor does
+    NOT probe Redis — it passes the configured ``storage_uri`` straight to
+    slowapi, which connects lazily on the first rate-limited request.
 
-    ``in_memory_fallback_enabled`` additionally keeps a per-process limit
-    enforcing if a reachable Redis becomes unreachable later at runtime, rather
-    than failing closed (503 on every rate-limited request). NOTE: this runtime
-    fallback uses per-process MemoryStorage, so under ``--workers N`` with
-    Redis down the effective limit is weakened by roughly the worker count
-    until Redis recovers. This trades weaker limiting for availability on a
-    Redis blip — the opposite of the CSRF layer's fail-closed choice
-    (security.py) — so a transient Redis outage does not take down all
-    state-changing routes. The tradeoff is intentional.
+    ``in_memory_fallback_enabled`` is set whenever a real (non-memory) backend
+    is configured so that, if Redis is unreachable at request time, slowapi
+    falls back to a per-process limit instead of failing closed (503 on every
+    rate-limited request). NOTE: this runtime fallback uses per-process
+    MemoryStorage, so under ``--workers N`` with Redis down the effective limit
+    is weakened by roughly the worker count until Redis recovers (slowapi
+    re-probes with exponential backoff). This trades weaker limiting for
+    availability on a Redis blip — a different choice from the CSRF layer's
+    fail-closed behavior (security.py) — so a transient Redis outage does not
+    take down all state-changing routes. The tradeoff is intentional.
+
+    A consequence of not probing at construction: if Redis is down at startup,
+    the limiter is still wired to ``redis://...`` (not ``memory://``), so the
+    first request after startup triggers the lazy connect + fallback flip. In
+    a multi-worker deployment the documented path (docker-compose gates app
+    startup on ``redis: condition: service_healthy``) keeps Redis up at boot,
+    so counters are shared in the normal case.
     """
-    resolved = _resolve_storage_uri(redis_url)
-    if resolved == "memory://":
-        # No Redis configured (CI / REDIS_URL empty).
-        storage_uri = "memory://"
-    elif _redis_reachable(resolved):
-        logger.info("Rate limiter connected to Redis for shared counters")
-        storage_uri = resolved
+    storage_uri = _resolve_storage_uri(redis_url)
+    if storage_uri == "memory://":
+        logger.info("Rate limiter using in-memory storage (no Redis configured)")
     else:
-        logger.warning(
-            "Redis unreachable for rate limiter (%s); using per-process "
-            "in-memory counters (limits not shared across workers)",
-            resolved,
+        logger.info(
+            "Rate limiter wired to Redis for shared counters: %s",
+            redact_url(storage_uri),
         )
-        storage_uri = "memory://"
     return WhitelistLimiter(
         key_func=get_client_ip,
         storage_uri=storage_uri,
-        # Only meaningful with a real (non-memory) backend. When storage is
-        # memory:// (no Redis configured, or Redis unreachable at startup) no
-        # fallback limiter is constructed — behavior identical to pre-fix.
+        # Only meaningful with a real (non-memory) backend. With memory://
+        # (CI / empty REDIS_URL) no fallback limiter is constructed.
         in_memory_fallback_enabled=storage_uri != "memory://",
     )
 
