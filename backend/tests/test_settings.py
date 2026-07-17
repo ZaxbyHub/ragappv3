@@ -611,15 +611,22 @@ class TestSettingsInfraRedaction(unittest.TestCase):
     def setUp(self):
         # Seed non-empty infra values onto the singleton and enable the curator
         # so the redaction of wiki_llm_curator_enabled is observable too.
-        self._saved = {f: getattr(settings, f) for f in self.SEEDED_VALUES}
-        self._saved_curator_enabled = settings.wiki_llm_curator_enabled
-        self._saved_users_enabled = settings.users_enabled
+        # Register each restoration with addCleanup IMMEDIATELY after the
+        # mutation so a later setUp failure (e.g. pool init) cannot leak the
+        # seeded values into other test classes (tearDown only runs after a
+        # successful setUp; addCleanup runs unconditionally).
         for f, v in self.SEEDED_VALUES.items():
+            original = getattr(settings, f)
             setattr(settings, f, v)
+            self.addCleanup(setattr, settings, f, original)
+        original_curator_enabled = settings.wiki_llm_curator_enabled
         settings.wiki_llm_curator_enabled = True
+        self.addCleanup(setattr, settings, "wiki_llm_curator_enabled", original_curator_enabled)
         # users_enabled toggling is irrelevant here because we override the auth
         # dependency directly, but keep it deterministic.
+        original_users_enabled = settings.users_enabled
         settings.users_enabled = False
+        self.addCleanup(setattr, settings, "users_enabled", original_users_enabled)
 
         # Local imports match the existing test_settings.py setUp pattern.
         from app.api.deps import get_current_active_user, get_db
@@ -635,19 +642,11 @@ class TestSettingsInfraRedaction(unittest.TestCase):
                 self._test_pool.release_connection(conn)
 
         app.dependency_overrides[get_db] = override_get_db
-        self._get_db = get_db
+        self.addCleanup(app.dependency_overrides.pop, get_db, None)
         self._get_current_active_user = get_current_active_user
-        self.client = TestClient(app)
-
-    def tearDown(self):
-        # Restore every seeded singleton field exactly.
-        for f, v in self._saved.items():
-            setattr(settings, f, v)
-        settings.wiki_llm_curator_enabled = self._saved_curator_enabled
-        settings.users_enabled = self._saved_users_enabled
-        app.dependency_overrides.pop(self._get_db, None)
         # Pop any role override a sub-test set; harmless if absent.
-        app.dependency_overrides.pop(self._get_current_active_user, None)
+        self.addCleanup(app.dependency_overrides.pop, get_current_active_user, None)
+        self.client = TestClient(app)
 
     def _override_role(self, role):
         app.dependency_overrides[self._get_current_active_user] = lambda: {
@@ -676,6 +675,14 @@ class TestSettingsInfraRedaction(unittest.TestCase):
         # Non-sensitive field still present (proves the response is well-formed
         # and redaction is selective, not a blanket wipe).
         self.assertIn("chunk_size_chars", data)
+        # effective_sources must not leak provenance for redacted infra fields
+        # (otherwise a viewer learns whether each URL was kv/env/default set).
+        effective_sources = data.get("effective_sources", {})
+        for field in self.REDACTED_FIELDS:
+            self.assertNotIn(
+                field, effective_sources,
+                f"viewer effective_sources leaks provenance for redacted '{field}'",
+            )
 
     def test_member_sees_redacted_infra_fields(self):
         self._override_role("member")
@@ -685,6 +692,9 @@ class TestSettingsInfraRedaction(unittest.TestCase):
         for field in self.REDACTED_FIELDS:
             self.assertEqual(data[field], "", f"member redaction failed on {field}")
         self.assertFalse(data["wiki_llm_curator_enabled"])
+        effective_sources = data.get("effective_sources", {})
+        for field in self.REDACTED_FIELDS:
+            self.assertNotIn(field, effective_sources)
 
     def test_admin_sees_full_infra_fields(self):
         self._override_role("admin")
@@ -698,6 +708,13 @@ class TestSettingsInfraRedaction(unittest.TestCase):
             )
         # Admin sees the true curator enable flag.
         self.assertTrue(data["wiki_llm_curator_enabled"])
+        # Admin sees the full effective_sources map (infra fields NOT stripped).
+        effective_sources = data.get("effective_sources", {})
+        for field in self.REDACTED_FIELDS:
+            self.assertIn(
+                field, effective_sources,
+                f"admin effective_sources should include '{field}'",
+            )
 
     def test_superadmin_sees_full_infra_fields(self):
         self._override_role("superadmin")

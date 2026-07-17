@@ -534,5 +534,140 @@ class TestChangePassword(unittest.TestCase):
         self.assertIn("whitespace", response.json()["detail"].lower())
 
 
+class TestChangePasswordRateLimit(unittest.TestCase):
+    """Real-ASGI HTTP 429 regression test for #387 MED-8.
+
+    Drives the actual POST /auth/change-password route through TestClient with
+    a fully-wired app (auth + DB + middleware). The @limiter.limit("10/minute")
+    decorator on the route enforces per-IP; the TestClient always presents the
+    same client IP, so 11 calls within the window trip the limit.
+
+    slowapi checks the limit inside the decorator wrapper AFTER FastAPI resolves
+    dependencies, so every call must carry valid auth + a parseable body to
+    count. We reuse a single login token and send a deliberately-wrong
+    current_password: calls 1-10 return 400 (the limit counter still increments
+    because the check runs before the handler body verifies the password), and
+    the 11th call returns 429.
+
+    This closes the gap between the source-scan test (proves the decorator
+    exists) and the actual HTTP behavior the issue's AC2 requires ("returns 429
+    after the Nth attempt"). The RateLimitExceeded -> 429 translation is
+    performed by SlowAPIMiddleware's default handler (no explicit exception
+    handler registration in main.py is required).
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_db(self.db_path)
+        run_migrations(self.db_path)
+
+        self._original_jwt_secret = settings.jwt_secret_key
+        self._original_users_enabled = settings.users_enabled
+        settings.jwt_secret_key = "test-secret-key-for-testing-at-least-32-chars-long"
+        settings.users_enabled = True
+        self.addCleanup(setattr, settings, "jwt_secret_key", self._original_jwt_secret)
+        self.addCleanup(setattr, settings, "users_enabled", self._original_users_enabled)
+
+        self.test_pool = SQLiteConnectionPool(self.db_path, max_size=5)
+        self.addCleanup(self.test_pool.close_all)
+
+        from app.api.deps import get_db
+        from app.main import app as main_app
+        from app.security import CSRFManager, csrf_protect
+
+        def get_test_db():
+            conn = self.test_pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self.test_pool.release_connection(conn)
+
+        main_app.dependency_overrides[get_db] = get_test_db
+        self.addCleanup(main_app.dependency_overrides.pop, get_db, None)
+        self.csrf_manager = CSRFManager(
+            redis_url="redis://localhost:6379/0", ttl=900
+        )
+        main_app.state.csrf_manager = self.csrf_manager
+        main_app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        self.addCleanup(main_app.dependency_overrides.pop, csrf_protect, None)
+
+        self.client = TestClient(main_app)
+        self.app = main_app
+
+        import shutil
+        self.addCleanup(lambda: shutil.rmtree(self.temp_dir, ignore_errors=True))
+
+    def test_change_password_route_endpoint_is_wrapped(self):
+        """The router must store the limiter-WRAPPED endpoint, not the raw func.
+
+        This guards the decorator ORDER: ``@router.post`` must be outermost so
+        it captures the ``@limiter.limit``-wrapped function. The reverse order
+        (limiter above router) silently breaks enforcement because the router
+        stores the unwrapped function and the limit check never fires.
+        """
+        from app.api.routes.auth import router
+
+        for route in router.routes:
+            if hasattr(route, "path") and "change-password" in route.path:
+                self.assertTrue(
+                    hasattr(route.endpoint, "__wrapped__"),
+                    "route.endpoint must be the limiter-wrapped function "
+                    "(decorator order: @router.post outermost, @limiter.limit below)",
+                )
+                return
+        self.fail("change-password route not found in router")
+
+    def test_change_password_returns_429_after_limit(self):
+        """The 11th change-password call within the window returns HTTP 429.
+
+        Drives the real POST /auth/change-password route through TestClient.
+        The @limiter.limit("10/minute") decorator (with @router.post outermost
+        so the router stores the wrapper) enforces per-IP; the TestClient
+        always presents the same client IP, so 11 calls within the window trip
+        the limit. Calls 1-10 use a wrong current_password (return 400) but
+        still count toward the limit because slowapi checks before the handler
+        body runs. The 11th call returns 429.
+
+        The RateLimitExceeded exception (raised by the decorator wrapper) is a
+        Starlette HTTPException with status_code=429, so the framework's
+        default exception handler converts it to the 429 response.
+        """
+        # Register + login once; the rate limit is per-IP, not per-token.
+        self.client.post(
+            "/api/auth/register",
+            json={"username": "ratelimituser", "password": "OldPass123"},
+        )
+        login_response = self.client.post(
+            "/api/auth/login",
+            json={"username": "ratelimituser", "password": "OldPass123"},
+        )
+        self.assertEqual(login_response.status_code, 200)
+        access_token = login_response.json()["access_token"]
+        headers = {"Authorization": f"Bearer {access_token}"}
+        body = {"current_password": "WrongPassword999", "new_password": "NewPass456"}
+
+        # First 10 calls: wrong current_password -> 400, but the rate-limit
+        # counter increments (slowapi checks before the handler body runs).
+        for i in range(10):
+            resp = self.client.post(
+                "/api/auth/change-password", headers=headers, json=body
+            )
+            self.assertEqual(
+                resp.status_code, 400,
+                f"call {i + 1}/10 should return 400 (wrong password), "
+                f"got {resp.status_code}",
+            )
+
+        # 11th call: rate limit tripped -> HTTP 429.
+        resp = self.client.post(
+            "/api/auth/change-password", headers=headers, json=body
+        )
+        self.assertEqual(
+            resp.status_code, 429,
+            f"11th call should return 429 (rate limited), got {resp.status_code}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -749,6 +749,11 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
     (``useSettingsStore.ts`` validateForm) with spurious errors on a form the
     caller cannot successfully submit anyway (POST/PUT are admin-gated).
 
+    Finally, strips the redacted fields' entries from ``effective_sources`` so a
+    non-admin cannot infer from the kv/env/default provenance map whether a given
+    infra URL was configured (a one-bit topology hint per field). The remaining
+    non-infra entries are left intact for the frontend badges that render them.
+
     Admins and superadmins are returned unchanged.
     """
     from app.api.deps import UserRole
@@ -761,6 +766,12 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
     # Keep the curator enable flag consistent with the redacted URL/model so
     # the frontend's required-when-enabled validator does not fire for non-admins.
     settings_dict["wiki_llm_curator_enabled"] = False
+    # Drop the provenance hints for redacted fields so a non-admin cannot learn
+    # from effective_sources whether an infra URL was set (kv) vs default.
+    effective_sources = settings_dict.get("effective_sources")
+    if isinstance(effective_sources, dict):
+        for field in INFRA_REDACTED_FIELDS:
+            effective_sources.pop(field, None)
     return settings_dict
 
 

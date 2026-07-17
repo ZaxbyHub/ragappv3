@@ -1292,20 +1292,27 @@ class TestVaultNameLogSanitization(unittest.IsolatedAsyncioTestCase):
         with open(src_path, "r", encoding="utf-8") as f:
             src = f.read()
 
-        # Find every f-string/interpolation of {vault_name} that is NOT wrapped
+        # Find every f-string/interpolation of vault_name that is NOT wrapped
         # in _sanitize_log_value. We allow self._sanitize_log_value(vault_name)
         # and attribute accesses like vault_name.something (none expected).
         import re
-        # Match an opening brace immediately followed by vault_name and a closing
-        # brace, but NOT when preceded by _sanitize_log_value( on the same token.
-        # Pattern: a `{vault_name}` not preceded by `_sanitize_log_value(`.
-        raw_interpolations = re.findall(
-            r"(?<!_sanitize_log_value\()\{vault_name\}",
-            src,
+        # Match any replacement field that interpolates vault_name in any form:
+        #   {vault_name}, {vault_name!r}, {vault_name:10}, { vault_name }
+        # Then check each match's surrounding context to see whether it is the
+        # argument to a _sanitize_log_value(...) call (sanitized -> allowed).
+        all_vault_fields = list(
+            re.finditer(r"\{\s*vault_name\b[^}]*\}", src)
         )
+        raw_interpolations = []
+        for m in all_vault_fields:
+            # Look at the ~25 chars before the match for the sanitize prefix.
+            prefix = src[max(0, m.start() - 25):m.start()]
+            if "_sanitize_log_value(" in prefix:
+                continue  # sanitized — allowed
+            raw_interpolations.append(m.group(0))
         self.assertEqual(
             raw_interpolations, [],
-            "Found raw {vault_name} interpolation(s) in email_service.py not "
+            "Found raw vault_name interpolation(s) in email_service.py not "
             "wrapped in self._sanitize_log_value(): " + str(raw_interpolations),
         )
 

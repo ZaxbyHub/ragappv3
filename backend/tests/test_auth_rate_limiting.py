@@ -99,17 +99,28 @@ class TestRateLimitingDecorators(unittest.TestCase):
 
         Regression for #387 MED-8: this endpoint was previously unthrottled,
         leaving an authenticated brute-force vector against current_password.
-        The decorator must sit immediately above @router.post('/change-password'),
-        matching the register/login/refresh convention.
+
+        The decorator order is ``@router.post`` OUTERMOST, then
+        ``@limiter.limit`` directly below it. This order is deliberate and
+        load-bearing: ``@router.post`` must capture the limiter-WRAPPED
+        function so the router stores the wrapper (not the raw endpoint).
+        The reverse order (limiter above router) silently breaks enforcement
+        because the router stores the unwrapped function and the limit check
+        never fires. The pre-existing register/login/refresh routes have the
+        broken order; change-password is fixed here and a follow-up should
+        correct the others.
         """
+        # Match @router.post('/change-password') immediately followed by
+        # @limiter.limit("10/minute") — the CORRECT enforcement order.
         match = re.search(
-            r'@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)\s*\n\s*@router\.post\(\s*["\']\/change-password["\']',
+            r'@router\.post\(\s*["\']\/change-password["\']\s*\)\s*\n\s*@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)',
             self.src,
         )
         self.assertIsNotNone(
             match,
-            "Could not find @limiter.limit decorator before "
-            "@router.post('/change-password')",
+            "Could not find @router.post('/change-password') followed by "
+            "@limiter.limit — the decorator order must be router-outermost "
+            "for enforcement to fire",
         )
         self.assertEqual(
             match.group(1),
@@ -236,17 +247,16 @@ class TestMainPySecurityWarnings(unittest.TestCase):
 class TestChangePasswordRuntimeEnforcement(unittest.TestCase):
     """Runtime proof that a 10/minute limit actually blocks the 11th call.
 
-    The source-scan test above proves the decorator is present; this test
-    proves the policy enforces. Mirrors the established runtime pattern in
+    The source-scan test above proves the decorator is present with the correct
+    order (router-outermost); this test proves the policy enforces by driving
+    a real slowapi Limiter directly. Mirrors the established runtime pattern in
     backend/tests/test_rate_limiting.py::TestRuntimeRateLimitEnforcement.
 
-    Note: a full HTTP 429 integration test through the ASGI app is brittle in
-    CI because slowapi's in-memory limiter state leaks across tests in the same
-    process (see backend/tests/conftest.py note about 429 interference). The
-    in-process RateLimitExceeded assertion is the load-bearing claim: if the
-    decorator enforces at the wrapper level, SlowAPIMiddleware (registered in
-    main.py) translates the raised RateLimitExceeded into an HTTP 429 via
-    slowapi's default _rate_limit_exceeded_handler.
+    The full HTTP 429 integration test lives in
+    ``test_change_password.py::TestChangePasswordRateLimit`` and drives the
+    real ASGI app. Both are needed: this one proves the limit policy enforces
+    in isolation; that one proves the route is wired so enforcement fires in
+    production.
     """
 
     def _make_request(self, lim):
