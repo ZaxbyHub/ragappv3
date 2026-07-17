@@ -572,5 +572,162 @@ class TestConnectionEndpoint(unittest.TestCase):
             settings.reranker_url = original_reranker_url
 
 
+class TestSettingsInfraRedaction(unittest.TestCase):
+    """Regression tests for #387 MED-4: GET /settings must redact infra-URL and
+    model-name fields for callers below the admin role. Admin/superadmin callers
+    still receive the full values so the Settings form is populated.
+
+    These tests FAIL on pre-fix code (no redaction -> a viewer sees real URLs).
+    """
+
+    # Known non-empty values seeded onto the settings singleton so redaction is
+    # observable. Distinct sentinels make it obvious if a field is left un-redacted.
+    SEEDED_VALUES = {
+        "ollama_embedding_url": "http://embedding.internal:11434",
+        "ollama_chat_url": "http://chat.internal:11434",
+        "instant_chat_url": "http://instant.internal:1234",
+        "reranker_url": "http://reranker.internal:8000",
+        "wiki_llm_curator_url": "http://curator.internal:8080",
+        "embedding_model": "nomic-embed-text",
+        "chat_model": "llama3:8b",
+        "instant_chat_model": "nemotron-3-nano-4b",
+        "reranker_model": "BAAI/bge-reranker-v2-m3",
+        "wiki_llm_curator_model": "curator-model",
+    }
+
+    REDACTED_FIELDS = (
+        "ollama_embedding_url",
+        "ollama_chat_url",
+        "instant_chat_url",
+        "reranker_url",
+        "wiki_llm_curator_url",
+        "embedding_model",
+        "chat_model",
+        "instant_chat_model",
+        "reranker_model",
+        "wiki_llm_curator_model",
+    )
+
+    def setUp(self):
+        # Seed non-empty infra values onto the singleton and enable the curator
+        # so the redaction of wiki_llm_curator_enabled is observable too.
+        # Register each restoration with addCleanup IMMEDIATELY after the
+        # mutation so a later setUp failure (e.g. pool init) cannot leak the
+        # seeded values into other test classes (tearDown only runs after a
+        # successful setUp; addCleanup runs unconditionally).
+        for f, v in self.SEEDED_VALUES.items():
+            original = getattr(settings, f)
+            setattr(settings, f, v)
+            self.addCleanup(setattr, settings, f, original)
+        original_curator_enabled = settings.wiki_llm_curator_enabled
+        settings.wiki_llm_curator_enabled = True
+        self.addCleanup(setattr, settings, "wiki_llm_curator_enabled", original_curator_enabled)
+        # users_enabled toggling is irrelevant here because we override the auth
+        # dependency directly, but keep it deterministic.
+        original_users_enabled = settings.users_enabled
+        settings.users_enabled = False
+        self.addCleanup(setattr, settings, "users_enabled", original_users_enabled)
+
+        # Local imports match the existing test_settings.py setUp pattern.
+        from app.api.deps import get_current_active_user, get_db
+        from app.models.database import get_pool
+
+        self._test_pool = get_pool(str(TEST_DB_PATH))
+
+        def override_get_db():
+            conn = self._test_pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self._test_pool.release_connection(conn)
+
+        app.dependency_overrides[get_db] = override_get_db
+        self.addCleanup(app.dependency_overrides.pop, get_db, None)
+        self._get_current_active_user = get_current_active_user
+        # Pop any role override a sub-test set; harmless if absent.
+        self.addCleanup(app.dependency_overrides.pop, get_current_active_user, None)
+        self.client = TestClient(app)
+
+    def _override_role(self, role):
+        app.dependency_overrides[self._get_current_active_user] = lambda: {
+            "id": 1,
+            "username": f"test-{role}",
+            "role": role,
+            "is_active": 1,
+            "must_change_password": 0,
+        }
+
+    def test_viewer_sees_redacted_infra_fields(self):
+        self._override_role("viewer")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        for field in self.REDACTED_FIELDS:
+            self.assertEqual(
+                data[field], "",
+                f"viewer should see redacted '{field}', got {data[field]!r}",
+            )
+        # Curator enable flag must be coerced to False (URL/model redacted).
+        self.assertFalse(
+            data["wiki_llm_curator_enabled"],
+            "viewer should see wiki_llm_curator_enabled=False after redaction",
+        )
+        # Non-sensitive field still present (proves the response is well-formed
+        # and redaction is selective, not a blanket wipe).
+        self.assertIn("chunk_size_chars", data)
+        # effective_sources must not leak provenance for redacted infra fields
+        # (otherwise a viewer learns whether each URL was kv/env/default set).
+        effective_sources = data.get("effective_sources", {})
+        for field in self.REDACTED_FIELDS:
+            self.assertNotIn(
+                field, effective_sources,
+                f"viewer effective_sources leaks provenance for redacted '{field}'",
+            )
+
+    def test_member_sees_redacted_infra_fields(self):
+        self._override_role("member")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        for field in self.REDACTED_FIELDS:
+            self.assertEqual(data[field], "", f"member redaction failed on {field}")
+        self.assertFalse(data["wiki_llm_curator_enabled"])
+        effective_sources = data.get("effective_sources", {})
+        for field in self.REDACTED_FIELDS:
+            self.assertNotIn(field, effective_sources)
+
+    def test_admin_sees_full_infra_fields(self):
+        self._override_role("admin")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        for field, expected in self.SEEDED_VALUES.items():
+            self.assertEqual(
+                data[field], expected,
+                f"admin should see the real '{field}', got {data[field]!r}",
+            )
+        # Admin sees the true curator enable flag.
+        self.assertTrue(data["wiki_llm_curator_enabled"])
+        # Admin sees the full effective_sources map (infra fields NOT stripped).
+        effective_sources = data.get("effective_sources", {})
+        for field in self.REDACTED_FIELDS:
+            self.assertIn(
+                field, effective_sources,
+                f"admin effective_sources should include '{field}'",
+            )
+
+    def test_superadmin_sees_full_infra_fields(self):
+        self._override_role("superadmin")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        for field, expected in self.SEEDED_VALUES.items():
+            self.assertEqual(
+                data[field], expected,
+                f"superadmin should see the real '{field}', got {data[field]!r}",
+            )
+        self.assertTrue(data["wiki_llm_curator_enabled"])
+
+
 if __name__ == "__main__":
     unittest.main()

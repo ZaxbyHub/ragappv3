@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 72,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 43087,
+      "loc": 43177,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -62,7 +62,7 @@
       "SEVERITY.LOW": 20,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 943,
+      "loc": 944,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -244,7 +244,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 872,
+      "loc": 909,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -608,7 +608,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 231,
+      "loc": 244,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1154,7 +1154,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 416,
+      "loc": 443,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1323,7 +1323,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 40,
+      "loc": 52,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1801,7 +1801,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "858                     db.rollback()\n859                 except Exception:\n860                     pass\n861                 raise\n",
+      "code": "859                     db.rollback()\n860                 except Exception:\n861                     pass\n862                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -1812,17 +1812,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 859,
+      "line_number": 860,
       "line_range": [
-        859,
-        860
+        860,
+        861
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "899                     db.rollback()\n900                 except Exception:\n901                     pass\n902                 raise\n",
+      "code": "900                     db.rollback()\n901                 except Exception:\n902                     pass\n903                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -1833,17 +1833,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 900,
+      "line_number": 901,
       "line_range": [
-        900,
-        901
+        901,
+        902
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "921         \"access_token\": access_token,\n922         \"token_type\": \"bearer\",\n923         \"expires_in\": 15 * 60,\n924     }\n925 \n926 \n927 @router.get(\"/sessions\")\n",
+      "code": "922         \"access_token\": access_token,\n923         \"token_type\": \"bearer\",\n924         \"expires_in\": 15 * 60,\n925     }\n926 \n927 \n928 @router.get(\"/sessions\")\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -1854,20 +1854,20 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'bearer'",
-      "line_number": 922,
+      "line_number": 923,
       "line_range": [
-        920,
         921,
         922,
         923,
-        924
+        924,
+        925
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "1004                     db.rollback()\n1005                 except Exception:\n1006                     pass\n1007                 raise\n",
+      "code": "1005                     db.rollback()\n1006                 except Exception:\n1007                     pass\n1008                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -1878,17 +1878,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1005,
+      "line_number": 1006,
       "line_range": [
-        1005,
-        1006
+        1006,
+        1007
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1078                     db.rollback()\n1079                 except Exception:\n1080                     pass\n1081                 raise\n",
+      "code": "1079                     db.rollback()\n1080                 except Exception:\n1081                     pass\n1082                 raise\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/api/routes/auth.py",
@@ -1899,17 +1899,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1079,
+      "line_number": 1080,
       "line_range": [
-        1079,
-        1080
+        1080,
+        1081
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1116         \"access_token\": access_token,\n1117         \"token_type\": \"bearer\",\n1118         \"expires_in\": 15 * 60,\n1119     }\n",
+      "code": "1117         \"access_token\": access_token,\n1118         \"token_type\": \"bearer\",\n1119         \"expires_in\": 15 * 60,\n1120     }\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "backend/app/api/routes/auth.py",
@@ -1920,13 +1920,13 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'bearer'",
-      "line_number": 1117,
+      "line_number": 1118,
       "line_range": [
-        1115,
         1116,
         1117,
         1118,
-        1119
+        1119,
+        1120
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",

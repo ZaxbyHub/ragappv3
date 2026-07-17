@@ -94,6 +94,41 @@ class TestRateLimitingDecorators(unittest.TestCase):
             f"Expected rate limit '30/minute' on refresh, got '{match.group(1)}'",
         )
 
+    def test_change_password_has_10_per_minute_limit(self):
+        """change-password endpoint must have @limiter.limit('10/minute').
+
+        Regression for #387 MED-8: this endpoint was previously unthrottled,
+        leaving an authenticated brute-force vector against current_password.
+
+        The decorator order is ``@router.post`` OUTERMOST, then
+        ``@limiter.limit`` directly below it. This order is deliberate and
+        load-bearing: ``@router.post`` must capture the limiter-WRAPPED
+        function so the router stores the wrapper (not the raw endpoint).
+        The reverse order (limiter above router) silently breaks enforcement
+        because the router stores the unwrapped function and the limit check
+        never fires. The pre-existing register/login/refresh routes have the
+        broken order; change-password is fixed here and a follow-up should
+        correct the others.
+        """
+        # Match @router.post('/change-password') immediately followed by
+        # @limiter.limit("10/minute") — the CORRECT enforcement order.
+        match = re.search(
+            r'@router\.post\(\s*["\']\/change-password["\']\s*\)\s*\n\s*@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)',
+            self.src,
+        )
+        self.assertIsNotNone(
+            match,
+            "Could not find @router.post('/change-password') followed by "
+            "@limiter.limit — the decorator order must be router-outermost "
+            "for enforcement to fire",
+        )
+        self.assertEqual(
+            match.group(1),
+            "10/minute",
+            f"Expected rate limit '10/minute' on change-password, "
+            f"got '{match.group(1)}'",
+        )
+
 
 class TestRegisterRequestParameter(unittest.TestCase):
     """Verify register handler accepts request: Request parameter."""
@@ -207,6 +242,78 @@ class TestMainPySecurityWarnings(unittest.TestCase):
             r"SECURITY WARNING.*CORS.*wildcard",
             "main.py must log a SECURITY WARNING about CORS wildcard",
         )
+
+
+class TestChangePasswordRuntimeEnforcement(unittest.TestCase):
+    """Runtime proof that a 10/minute limit actually blocks the 11th call.
+
+    The source-scan test above proves the decorator is present with the correct
+    order (router-outermost); this test proves the policy enforces by driving
+    a real slowapi Limiter directly. Mirrors the established runtime pattern in
+    backend/tests/test_rate_limiting.py::TestRuntimeRateLimitEnforcement.
+
+    The full HTTP 429 integration test lives in
+    ``test_change_password.py::TestChangePasswordRateLimit`` and drives the
+    real ASGI app. Both are needed: this one proves the limit policy enforces
+    in isolation; that one proves the route is wired so enforcement fires in
+    production.
+    """
+
+    def _make_request(self, lim):
+        """Build a real Starlette Request wired with the slowapi state the
+        SlowAPIMiddleware normally sets. Mirrors the proven helper in
+        backend/tests/test_rate_limiting.py::TestRuntimeRateLimitEnforcement.
+        """
+        from types import SimpleNamespace
+
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+
+        app = Starlette()
+        app.state.limiter = lim
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/change-password",
+            "headers": [],
+            "query_string": b"",
+            "client": ("testclient", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "root_path": "",
+            "app": app,
+        }
+        req = Request(scope)
+        # The middleware normally initializes view_rate_limit on request.state
+        # before the decorated handler reads it.
+        req.state.view_rate_limit = SimpleNamespace()
+        return req
+
+    def test_change_password_limit_blocks_after_10(self):
+        """A handler under a 10/minute limit must raise on the 11th call."""
+        from slowapi.errors import RateLimitExceeded
+
+        from app.limiter import WhitelistLimiter
+
+        lim = WhitelistLimiter(
+            key_func=lambda _request=None: "testclient",
+            storage_uri="memory://",
+        )
+
+        @lim.limit("10/minute")
+        def handler(request):
+            return "ok"
+
+        # First 10 calls are within the limit (fresh request per call, matching
+        # the established runtime pattern).
+        for i in range(10):
+            self.assertEqual(
+                handler(self._make_request(lim)), "ok",
+                f"call {i + 1} should pass",
+            )
+        # 11th call must be rejected.
+        with self.assertRaises(RateLimitExceeded):
+            handler(self._make_request(lim))
 
 
 if __name__ == "__main__":
