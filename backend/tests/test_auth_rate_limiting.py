@@ -94,6 +94,30 @@ class TestRateLimitingDecorators(unittest.TestCase):
             f"Expected rate limit '30/minute' on refresh, got '{match.group(1)}'",
         )
 
+    def test_change_password_has_10_per_minute_limit(self):
+        """change-password endpoint must have @limiter.limit('10/minute').
+
+        Regression for #387 MED-8: this endpoint was previously unthrottled,
+        leaving an authenticated brute-force vector against current_password.
+        The decorator must sit immediately above @router.post('/change-password'),
+        matching the register/login/refresh convention.
+        """
+        match = re.search(
+            r'@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)\s*\n\s*@router\.post\(\s*["\']\/change-password["\']',
+            self.src,
+        )
+        self.assertIsNotNone(
+            match,
+            "Could not find @limiter.limit decorator before "
+            "@router.post('/change-password')",
+        )
+        self.assertEqual(
+            match.group(1),
+            "10/minute",
+            f"Expected rate limit '10/minute' on change-password, "
+            f"got '{match.group(1)}'",
+        )
+
 
 class TestRegisterRequestParameter(unittest.TestCase):
     """Verify register handler accepts request: Request parameter."""
@@ -207,6 +231,79 @@ class TestMainPySecurityWarnings(unittest.TestCase):
             r"SECURITY WARNING.*CORS.*wildcard",
             "main.py must log a SECURITY WARNING about CORS wildcard",
         )
+
+
+class TestChangePasswordRuntimeEnforcement(unittest.TestCase):
+    """Runtime proof that a 10/minute limit actually blocks the 11th call.
+
+    The source-scan test above proves the decorator is present; this test
+    proves the policy enforces. Mirrors the established runtime pattern in
+    backend/tests/test_rate_limiting.py::TestRuntimeRateLimitEnforcement.
+
+    Note: a full HTTP 429 integration test through the ASGI app is brittle in
+    CI because slowapi's in-memory limiter state leaks across tests in the same
+    process (see backend/tests/conftest.py note about 429 interference). The
+    in-process RateLimitExceeded assertion is the load-bearing claim: if the
+    decorator enforces at the wrapper level, SlowAPIMiddleware (registered in
+    main.py) translates the raised RateLimitExceeded into an HTTP 429 via
+    slowapi's default _rate_limit_exceeded_handler.
+    """
+
+    def _make_request(self, lim):
+        """Build a real Starlette Request wired with the slowapi state the
+        SlowAPIMiddleware normally sets. Mirrors the proven helper in
+        backend/tests/test_rate_limiting.py::TestRuntimeRateLimitEnforcement.
+        """
+        from types import SimpleNamespace
+
+        from starlette.applications import Starlette
+        from starlette.requests import Request
+
+        app = Starlette()
+        app.state.limiter = lim
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/change-password",
+            "headers": [],
+            "query_string": b"",
+            "client": ("testclient", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+            "root_path": "",
+            "app": app,
+        }
+        req = Request(scope)
+        # The middleware normally initializes view_rate_limit on request.state
+        # before the decorated handler reads it.
+        req.state.view_rate_limit = SimpleNamespace()
+        return req
+
+    def test_change_password_limit_blocks_after_10(self):
+        """A handler under a 10/minute limit must raise on the 11th call."""
+        from slowapi.errors import RateLimitExceeded
+
+        from app.limiter import WhitelistLimiter
+
+        lim = WhitelistLimiter(
+            key_func=lambda _request=None: "testclient",
+            storage_uri="memory://",
+        )
+
+        @lim.limit("10/minute")
+        def handler(request):
+            return "ok"
+
+        # First 10 calls are within the limit (fresh request per call, matching
+        # the established runtime pattern).
+        for i in range(10):
+            self.assertEqual(
+                handler(self._make_request(lim)), "ok",
+                f"call {i + 1} should pass",
+            )
+        # 11th call must be rejected.
+        with self.assertRaises(RateLimitExceeded):
+            handler(self._make_request(lim))
 
 
 if __name__ == "__main__":

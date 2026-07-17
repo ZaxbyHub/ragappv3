@@ -433,7 +433,7 @@ class EmailIngestionService:
         # Extract vault name from subject tag [VaultName] or #vaultname
         vault_name = self._extract_vault_name(subject)
         vault_id = await self._resolve_vault_id(vault_name)
-        logger.debug(f"Resolved vault_id={vault_id} for vault_name={vault_name}")
+        logger.debug(f"Resolved vault_id={vault_id} for vault_name={self._sanitize_log_value(vault_name)}")
 
         # Extract and process attachments
         processed_attachments = 0
@@ -681,11 +681,11 @@ class EmailIngestionService:
             row = cursor.fetchone()
             if row:
                 vault_id = row["id"]
-                logger.debug(f"Resolved vault '{vault_name}' to id={vault_id}")
+                logger.debug(f"Resolved vault '{self._sanitize_log_value(vault_name)}' to id={vault_id}")
                 return vault_id
 
             raise ValueError(
-                f"Email references vault '{vault_name}' which does not exist in the database. Rejecting email."
+                f"Email references vault '{self._sanitize_log_value(vault_name)}' which does not exist in the database. Rejecting email."
             )
         finally:
             self.pool.release_connection(conn)

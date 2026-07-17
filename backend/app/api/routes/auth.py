@@ -789,6 +789,7 @@ async def update_me(
     }
 
 
+@limiter.limit("10/minute")
 @router.post("/change-password")
 async def change_password(
     request: Request,

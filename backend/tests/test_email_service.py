@@ -1199,5 +1199,116 @@ class TestSaveAttachmentSentinel(unittest.TestCase):
             "Double-close occurred if count > 1.")
 
 
+class TestVaultNameLogSanitization(unittest.IsolatedAsyncioTestCase):
+    """Regression tests for #387 LOW-2: vault_name must be routed through
+    _sanitize_log_value at every log/exception interpolation site so a forged
+    email subject cannot inject log lines.
+
+    Covers email_service.py lines 436, 684, 688. Line 688's ValueError message
+    also propagates to the logger.error({e}) at line 259, so sanitizing at the
+    source covers that downstream path too.
+
+    Uses IsolatedAsyncioTestCase (not plain TestCase) because two of the test
+    methods are ``async def`` — pytest-asyncio's auto mode does NOT rewrite
+    async methods on unittest.TestCase subclasses, so they would silently
+    no-op (the coroutine is never awaited, the test reports PASS regardless of
+    the implementation). IsolatedAsyncioTestCase makes unittest itself drive
+    the event loop for these methods.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.settings = Settings()
+        self.settings.data_dir = Path(self.temp_dir)
+        self.settings.uploads_dir.mkdir(parents=True, exist_ok=True)
+        db_path = os.path.join(self.temp_dir, 'test.db')
+        from app.models.database import init_db
+        init_db(db_path)
+        self.pool = SQLiteConnectionPool(db_path, max_size=2)
+        self.service = EmailIngestionService(
+            self.settings, self.pool, FakeBackgroundProcessor()
+        )
+
+    def tearDown(self):
+        self.pool.close_all()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    async def test_resolve_vault_id_success_log_sanitizes_vault_name(self):
+        """Line 684: the success-branch debug log must not leak control chars.
+
+        Seeds a vault whose name contains a newline (simulating a forged
+        subject tag) and asserts the captured debug record carries no newline.
+        Fails on pre-fix code (raw f-string interpolation).
+        """
+        tainted_name = "Legal\nINFO: leaked"
+        conn = self.pool.get_connection()
+        conn.execute("INSERT INTO vaults (name) VALUES (?)", (tainted_name,))
+        conn.commit()
+        self.pool.release_connection(conn)
+
+        with self.assertLogs("app.services.email_service", level="DEBUG") as cm:
+            vault_id = await self.service._resolve_vault_id(tainted_name)
+        self.assertIsNotNone(vault_id)
+
+        resolved_records = [
+            r.getMessage() for r in cm.records
+            if "Resolved vault" in r.getMessage()
+        ]
+        self.assertTrue(
+            resolved_records,
+            "Expected a 'Resolved vault' debug record; got: " + str(cm.output),
+        )
+        for msg in resolved_records:
+            self.assertNotIn("\n", msg, f"newline leaked into log record: {msg!r}")
+            self.assertNotIn("\r", msg, f"CR leaked into log record: {msg!r}")
+
+    async def test_resolve_vault_id_not_found_error_sanitizes_vault_name(self):
+        """Lines 688 (and indirectly 259): the ValueError message raised for a
+        missing vault must not carry control chars from the supplied name.
+
+        Fails on pre-fix code (raw f-string interpolation in the ValueError).
+        """
+        tainted_name = "Ghost\nINJECTED LOG LINE"
+        with self.assertRaises(ValueError) as ctx:
+            await self.service._resolve_vault_id(tainted_name)
+        msg = str(ctx.exception)
+        self.assertNotIn("\n", msg, f"newline leaked into ValueError: {msg!r}")
+        self.assertNotIn("\r", msg, f"CR leaked into ValueError: {msg!r}")
+        # The sanitized name (newlines -> spaces) should still be present so the
+        # message remains useful to an operator.
+        self.assertIn("Ghost", msg)
+
+    def test_no_raw_vault_name_interpolation_in_source(self):
+        """Structural guard for the 'grep confirms no raw interpolation'
+        acceptance criterion. Asserts that every interpolation of vault_name in
+        email_service.py is wrapped in _sanitize_log_value. Covers line 436
+        (inside _process_email, which is impractical to drive in a unit test)
+        plus guards 684/688 against regression.
+        """
+        src_path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "services", "email_service.py"
+        )
+        with open(src_path, "r", encoding="utf-8") as f:
+            src = f.read()
+
+        # Find every f-string/interpolation of {vault_name} that is NOT wrapped
+        # in _sanitize_log_value. We allow self._sanitize_log_value(vault_name)
+        # and attribute accesses like vault_name.something (none expected).
+        import re
+        # Match an opening brace immediately followed by vault_name and a closing
+        # brace, but NOT when preceded by _sanitize_log_value( on the same token.
+        # Pattern: a `{vault_name}` not preceded by `_sanitize_log_value(`.
+        raw_interpolations = re.findall(
+            r"(?<!_sanitize_log_value\()\{vault_name\}",
+            src,
+        )
+        self.assertEqual(
+            raw_interpolations, [],
+            "Found raw {vault_name} interpolation(s) in email_service.py not "
+            "wrapped in self._sanitize_log_value(): " + str(raw_interpolations),
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

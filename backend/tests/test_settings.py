@@ -572,5 +572,145 @@ class TestConnectionEndpoint(unittest.TestCase):
             settings.reranker_url = original_reranker_url
 
 
+class TestSettingsInfraRedaction(unittest.TestCase):
+    """Regression tests for #387 MED-4: GET /settings must redact infra-URL and
+    model-name fields for callers below the admin role. Admin/superadmin callers
+    still receive the full values so the Settings form is populated.
+
+    These tests FAIL on pre-fix code (no redaction -> a viewer sees real URLs).
+    """
+
+    # Known non-empty values seeded onto the settings singleton so redaction is
+    # observable. Distinct sentinels make it obvious if a field is left un-redacted.
+    SEEDED_VALUES = {
+        "ollama_embedding_url": "http://embedding.internal:11434",
+        "ollama_chat_url": "http://chat.internal:11434",
+        "instant_chat_url": "http://instant.internal:1234",
+        "reranker_url": "http://reranker.internal:8000",
+        "wiki_llm_curator_url": "http://curator.internal:8080",
+        "embedding_model": "nomic-embed-text",
+        "chat_model": "llama3:8b",
+        "instant_chat_model": "nemotron-3-nano-4b",
+        "reranker_model": "BAAI/bge-reranker-v2-m3",
+        "wiki_llm_curator_model": "curator-model",
+    }
+
+    REDACTED_FIELDS = (
+        "ollama_embedding_url",
+        "ollama_chat_url",
+        "instant_chat_url",
+        "reranker_url",
+        "wiki_llm_curator_url",
+        "embedding_model",
+        "chat_model",
+        "instant_chat_model",
+        "reranker_model",
+        "wiki_llm_curator_model",
+    )
+
+    def setUp(self):
+        # Seed non-empty infra values onto the singleton and enable the curator
+        # so the redaction of wiki_llm_curator_enabled is observable too.
+        self._saved = {f: getattr(settings, f) for f in self.SEEDED_VALUES}
+        self._saved_curator_enabled = settings.wiki_llm_curator_enabled
+        self._saved_users_enabled = settings.users_enabled
+        for f, v in self.SEEDED_VALUES.items():
+            setattr(settings, f, v)
+        settings.wiki_llm_curator_enabled = True
+        # users_enabled toggling is irrelevant here because we override the auth
+        # dependency directly, but keep it deterministic.
+        settings.users_enabled = False
+
+        # Local imports match the existing test_settings.py setUp pattern.
+        from app.api.deps import get_current_active_user, get_db
+        from app.models.database import get_pool
+
+        self._test_pool = get_pool(str(TEST_DB_PATH))
+
+        def override_get_db():
+            conn = self._test_pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self._test_pool.release_connection(conn)
+
+        app.dependency_overrides[get_db] = override_get_db
+        self._get_db = get_db
+        self._get_current_active_user = get_current_active_user
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        # Restore every seeded singleton field exactly.
+        for f, v in self._saved.items():
+            setattr(settings, f, v)
+        settings.wiki_llm_curator_enabled = self._saved_curator_enabled
+        settings.users_enabled = self._saved_users_enabled
+        app.dependency_overrides.pop(self._get_db, None)
+        # Pop any role override a sub-test set; harmless if absent.
+        app.dependency_overrides.pop(self._get_current_active_user, None)
+
+    def _override_role(self, role):
+        app.dependency_overrides[self._get_current_active_user] = lambda: {
+            "id": 1,
+            "username": f"test-{role}",
+            "role": role,
+            "is_active": 1,
+            "must_change_password": 0,
+        }
+
+    def test_viewer_sees_redacted_infra_fields(self):
+        self._override_role("viewer")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        for field in self.REDACTED_FIELDS:
+            self.assertEqual(
+                data[field], "",
+                f"viewer should see redacted '{field}', got {data[field]!r}",
+            )
+        # Curator enable flag must be coerced to False (URL/model redacted).
+        self.assertFalse(
+            data["wiki_llm_curator_enabled"],
+            "viewer should see wiki_llm_curator_enabled=False after redaction",
+        )
+        # Non-sensitive field still present (proves the response is well-formed
+        # and redaction is selective, not a blanket wipe).
+        self.assertIn("chunk_size_chars", data)
+
+    def test_member_sees_redacted_infra_fields(self):
+        self._override_role("member")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        for field in self.REDACTED_FIELDS:
+            self.assertEqual(data[field], "", f"member redaction failed on {field}")
+        self.assertFalse(data["wiki_llm_curator_enabled"])
+
+    def test_admin_sees_full_infra_fields(self):
+        self._override_role("admin")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        for field, expected in self.SEEDED_VALUES.items():
+            self.assertEqual(
+                data[field], expected,
+                f"admin should see the real '{field}', got {data[field]!r}",
+            )
+        # Admin sees the true curator enable flag.
+        self.assertTrue(data["wiki_llm_curator_enabled"])
+
+    def test_superadmin_sees_full_infra_fields(self):
+        self._override_role("superadmin")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        for field, expected in self.SEEDED_VALUES.items():
+            self.assertEqual(
+                data[field], expected,
+                f"superadmin should see the real '{field}', got {data[field]!r}",
+            )
+        self.assertTrue(data["wiki_llm_curator_enabled"])
+
+
 if __name__ == "__main__":
     unittest.main()

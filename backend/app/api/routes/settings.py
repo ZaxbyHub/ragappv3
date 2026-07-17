@@ -719,6 +719,51 @@ def _build_settings_dict() -> dict:
     return base
 
 
+# Fields that disclose infrastructure topology (URLs) and model identities to
+# a caller. Blanked on GET /settings for callers below the admin role so a
+# viewer/member cannot map the deployment's internal hosts/ports or model
+# inventory. Admins/superadmins (and admin-secret / service-account callers,
+# which are hardcoded to the superadmin role) still see the real values so the
+# Settings form is populated for them.
+INFRA_REDACTED_FIELDS: tuple[str, ...] = (
+    "ollama_embedding_url",
+    "ollama_chat_url",
+    "instant_chat_url",
+    "reranker_url",
+    "wiki_llm_curator_url",
+    "embedding_model",
+    "chat_model",
+    "instant_chat_model",
+    "reranker_model",
+    "wiki_llm_curator_model",
+)
+
+
+def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
+    """Blank infra-URL/model fields for callers below the admin role.
+
+    Also forces ``wiki_llm_curator_enabled`` to False for non-admins: the
+    curator URL and model are redacted, so leaving the enable flag True would
+    (a) disclose that a curator backend is wired up and (b) trip the frontend
+    "Curator URL is required when curator is enabled" validator
+    (``useSettingsStore.ts`` validateForm) with spurious errors on a form the
+    caller cannot successfully submit anyway (POST/PUT are admin-gated).
+
+    Admins and superadmins are returned unchanged.
+    """
+    from app.api.deps import UserRole
+
+    if UserRole.level(role) >= UserRole.level("admin"):
+        return settings_dict
+    for field in INFRA_REDACTED_FIELDS:
+        if field in settings_dict:
+            settings_dict[field] = ""
+    # Keep the curator enable flag consistent with the redacted URL/model so
+    # the frontend's required-when-enabled validator does not fire for non-admins.
+    settings_dict["wiki_llm_curator_enabled"] = False
+    return settings_dict
+
+
 def _compute_effective_sources(conn: Optional[sqlite3.Connection]) -> dict[str, str]:
     """Map each ALLOWED_FIELD to the source of its current effective value.
 
@@ -821,9 +866,17 @@ def get_settings(
     user: dict = Depends(get_current_active_user),
     conn: sqlite3.Connection = Depends(get_db),
 ):
-    """Return current public settings dict (including embedding_batch_size)."""
+    """Return current public settings dict (including embedding_batch_size).
+
+    Infra-URL and model-name fields are redacted for callers below the admin
+    role (see ``_redact_infra_for_non_admin``); admin/superadmin callers
+    receive the full values to populate the Settings form.
+    """
     settings_dict = _build_settings_dict()
     settings_dict["effective_sources"] = _compute_effective_sources(conn)
+    settings_dict = _redact_infra_for_non_admin(
+        settings_dict, user.get("role", "viewer")
+    )
     return SettingsResponse.model_validate(settings_dict)
 
 
