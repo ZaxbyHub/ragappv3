@@ -167,8 +167,11 @@ class FakeMemoryStore:
         )
 
     def search_memories(
-        self, query: str, limit: int = 5, vault_id: Optional[int] = None
+        self, query: str, limit: int = 5, vault_id: Optional[int] = None,
+        include_global: bool = False,
     ) -> List[FakeMemoryRecord]:
+        # include_global accepted (issue #404); global-exclusion behavior is
+        # covered by dedicated tests against the real MemoryStore.
         return self._memories[:limit]
 
 

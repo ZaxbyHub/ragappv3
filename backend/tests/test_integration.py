@@ -226,7 +226,9 @@ class FakeMemoryStore:
             updated_at=None,
         )
 
-    def search_memories(self, query: str, limit: int = 5, vault_id=None) -> List:
+    def search_memories(self, query: str, limit: int = 5, vault_id=None, include_global: bool = False) -> List:
+        # include_global accepted (issue #404); global-exclusion behavior is
+        # covered by dedicated tests against the real MemoryStore.
         return self._memories[:limit]
 
 
@@ -1083,7 +1085,8 @@ class TestAsyncIntegration(unittest.IsolatedAsyncioTestCase):
 
         results = []
         async for chunk in self.rag_engine.query(
-            "remember that integration tests are important", [], stream=False
+            "remember that integration tests are important", [], stream=False,
+            can_write_memory=True,
         ):
             results.append(chunk)
 

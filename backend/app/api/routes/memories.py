@@ -236,12 +236,41 @@ def _memory_record_to_response(
     )
 
 
+def _require_admin_for_global(user: dict, vault_id: Optional[int]) -> None:
+    """Global memories (``vault_id IS NULL``) are admin/superadmin only.
+
+    Enforced on every memory read/create/update/delete path so the global
+    tier cannot be reached by a non-admin via any route. Vault-scoped
+    operations (``vault_id is not None``) delegate to the existing
+    per-vault ``evaluate()`` checks at the call site (issue #404,
+    MEDIUM-11).
+    """
+    if vault_id is None and user.get("role") not in ("superadmin", "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Global memories are admin-only. Specify a vault_id for vault-scoped access.",
+        )
+
+
+def _is_admin(user: dict) -> bool:
+    """True when the caller may see/write global (vault_id IS NULL) memories."""
+    return user.get("role") in ("superadmin", "admin")
+
+
 async def _perform_memory_search(
-    memory_store: MemoryStore, query: str, limit: int, vault_id: Optional[int] = None
+    memory_store: MemoryStore,
+    query: str,
+    limit: int,
+    vault_id: Optional[int] = None,
+    include_global: bool = False,
 ) -> List[MemoryResponse]:
     try:
         records = await asyncio.to_thread(
-            memory_store.search_memories, query=query, limit=limit, vault_id=vault_id
+            memory_store.search_memories,
+            query=query,
+            limit=limit,
+            vault_id=vault_id,
+            include_global=include_global,
         )
     except MemoryStoreError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -267,25 +296,40 @@ async def list_memories(
     created_at, and updated_at fields.
 
     Authorization:
-    - vault_id=N: requires read access to vault N (returns vault-scoped + global memories).
-    - vault_id=None: admin/superadmin only (returns all memories across all vaults).
-      Non-admin callers should specify vault_id explicitly.
+    - vault_id=N: requires read access to vault N. Admin/superadmin callers
+      also see global (vault_id IS NULL) memories alongside the vault's own;
+      non-admin callers see ONLY the vault's own memories (issue #404,
+      MEDIUM-11 — global memories are admin-only to prevent cross-tenant
+      leakage).
+    - vault_id=None: admin/superadmin only (returns all memories across all
+      vaults). Non-admin callers must specify vault_id explicitly.
     """
     if vault_id is not None:
         if not await evaluate(user, "vault", vault_id, "read"):
             raise HTTPException(status_code=403, detail="No read access to this vault")
-        # Include global memories (vault_id IS NULL) alongside vault-scoped memories
-        cursor = await asyncio.to_thread(
-            conn.execute,
-            """
+        # Global memories (vault_id IS NULL) are admin-only. Non-admins get
+        # Two static SQL branches (no f-string interpolation) so bandit B608
+        # is not triggered. Non-admins get vault-scoped rows exclusively;
+        # admins get the union with global (vault_id IS NULL) memories.
+        # Mirrors the include_global flag threaded through
+        # MemoryStore.search_memories (issue #404, MEDIUM-11).
+        if _is_admin(user):
+            sql = """
             SELECT id, content, category, tags, source, importance, expires_at, created_at, updated_at
             FROM memories
             WHERE (vault_id = ? OR vault_id IS NULL)
               AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
             ORDER BY created_at DESC
-            """,
-            (vault_id,),
-        )
+            """
+        else:
+            sql = """
+            SELECT id, content, category, tags, source, importance, expires_at, created_at, updated_at
+            FROM memories
+            WHERE vault_id = ?
+              AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+            ORDER BY created_at DESC
+            """
+        cursor = await asyncio.to_thread(conn.execute, sql, (vault_id,))
     else:
         # Listing across all vaults — restrict to admin/superadmin to prevent
         # cross-vault leakage. Non-admin users must specify a vault_id.
@@ -347,7 +391,14 @@ async def create_memory(
     Create a new memory.
 
     Uses MemoryStore.add_memory to add a new memory to the database.
+
+    Authorization: vault-scoped memories require write access to the vault;
+    global memories (vault_id is None) require admin/superadmin (issue #404).
     """
+    # Global-memory tier (vault_id IS NULL) is admin-only. Checked before the
+    # per-vault write check so a non-admin POSTing {"vault_id": null} is
+    # rejected rather than silently persisting an unscoped memory.
+    _require_admin_for_global(user, body.vault_id)
     if body.vault_id is not None:
         if not await evaluate(user, "vault", body.vault_id, "write"):
             raise HTTPException(status_code=403, detail="No write access to this vault")
@@ -414,6 +465,8 @@ async def update_memory(
 
         # Check vault write permission
         memory_vault_id = row[1]
+        # Global memories (vault_id IS NULL) are admin-only (issue #404).
+        _require_admin_for_global(user, memory_vault_id)
         if memory_vault_id is not None:
             if not await evaluate(user, "vault", memory_vault_id, "write"):
                 raise HTTPException(
@@ -593,6 +646,8 @@ async def delete_memory(
 
     # Check vault admin permission
     memory_vault_id = row[1]
+    # Global memories (vault_id IS NULL) are admin-only (issue #404).
+    _require_admin_for_global(user, memory_vault_id)
     if memory_vault_id is not None:
         if not await evaluate(user, "vault", memory_vault_id, "admin"):
             raise HTTPException(status_code=403, detail="No admin access to this vault")
@@ -660,9 +715,13 @@ async def search_memories(
 
     Authorization: requires vault read access when vault_id is provided;
     admin/superadmin only when vault_id is omitted (cross-vault search).
+    Global memories (vault_id IS NULL) are only returned to admin/superadmin
+    callers (issue #404, MEDIUM-11).
     """
     await _authorize_memory_search(evaluate, user, vault_id)
-    results = await _perform_memory_search(memory_store, query, limit, vault_id)
+    results = await _perform_memory_search(
+        memory_store, query, limit, vault_id, include_global=_is_admin(user)
+    )
     return MemorySearchResponse(results=results, total=len(results))
 
 
@@ -680,13 +739,19 @@ async def search_memories_post(
 
     Authorization: requires vault read access when vault_id is provided;
     admin/superadmin only when vault_id is omitted (cross-vault search).
+    Global memories (vault_id IS NULL) are only returned to admin/superadmin
+    callers (issue #404, MEDIUM-11).
     """
     await _authorize_memory_search(evaluate, user, request.vault_id)
     # Handle empty or whitespace-only queries gracefully
     if not request.query or not request.query.strip():
         return MemorySearchResponse(results=[], total=0)
     results = await _perform_memory_search(
-        memory_store, request.query, request.limit, request.vault_id
+        memory_store,
+        request.query,
+        request.limit,
+        request.vault_id,
+        include_global=_is_admin(user),
     )
     return MemorySearchResponse(results=results, total=len(results))
 

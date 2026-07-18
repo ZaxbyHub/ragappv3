@@ -165,7 +165,7 @@ class FakeMemoryStore:
     def detect_memory_intent(self, query: str) -> Optional[str]:
         return None
 
-    async def search_memories(self, query: str, top_k: int, vault_id=None) -> List:
+    async def search_memories(self, query: str, top_k: int, vault_id=None, include_global: bool = False) -> List:
         return []
 
 

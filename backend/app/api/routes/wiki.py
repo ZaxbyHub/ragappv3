@@ -704,6 +704,13 @@ async def promote_memory_to_wiki(
             target_page_id=request.target_page_id,
             status=request.status,
             created_by=user.get("id"),
+            # Global memories are admin-only (issue #404): a vault-writer must
+            # not be able to promote a global memory and thereby read its
+            # content. The global gate raises ValueError (→ 404 via the handler
+            # below) so a non-admin cannot distinguish "no such memory" from
+            # "global memory exists" (PRR-008 existence-oracle); the cross-vault
+            # PermissionError remains 403.
+            is_admin=user.get("role") in ("superadmin", "admin"),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

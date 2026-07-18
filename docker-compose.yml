@@ -2,7 +2,14 @@ services:
 
   # Harrier Embedding Server (replaces flag-embed-server)
   harrier-embed:
-    image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest
+    # Pinned by digest for supply-chain integrity (issue #404 / #391).
+    # cuda-latest is a floating multi-arch tag (linux/amd64 + attestation);
+    # the digest below is the manifest-LIST digest, so Docker still selects
+    # the correct platform image at pull time. Pinning freezes the image at
+    # today's build — dependabot (docker ecosystem) will open PRs when a new
+    # digest is published. Update both harrier-embed and reranker together
+    # (same upstream image).
+    image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
     container_name: harrier-embed
     restart: unless-stopped
     command: --model-id microsoft/harrier-oss-v1-0.6b --port 8080 --max-batch-tokens 16384 --max-client-batch-size 128
@@ -28,7 +35,8 @@ services:
 
   # Reranker Server (bge-reranker-v2-m3 via TEI)
   reranker:
-    image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest
+    # Pinned by digest — see harrier-embed note above (same upstream image).
+    image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
     container_name: reranker
     restart: unless-stopped
     command: --model-id BAAI/bge-reranker-v2-m3 --port 8081 --max-batch-tokens 8192
@@ -52,7 +60,10 @@ services:
 
   # Redis
   redis:
-    image: redis:7-alpine
+    # Pinned by digest for supply-chain integrity (issue #404 / #391).
+    # redis:7-alpine is a multi-arch manifest list; the digest below is the
+    # list digest. Dependabot (docker ecosystem) will surface digest updates.
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
     container_name: knowledgevault_redis
     restart: unless-stopped
     ports:

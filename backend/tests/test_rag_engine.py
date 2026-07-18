@@ -105,7 +105,10 @@ class FakeMemoryStore:
         self.added.append(content)
         return MemoryRecord(id=1, content=content, category=category, tags=tags, source=source, created_at=None, updated_at=None)
 
-    def search_memories(self, query: str, limit: int = 5, vault_id=None):
+    def search_memories(self, query: str, limit: int = 5, vault_id=None, include_global: bool = False):
+        # include_global is accepted (issue #404) but ignored by this fake —
+        # the global-exclusion behavior is covered by test_memory_global_authz.py
+        # and test_rag_engine_memory_scope.py against the real MemoryStore.
         return self._memories[:limit]
 
 
@@ -133,7 +136,7 @@ class RAGEngineTests(unittest.IsolatedAsyncioTestCase):
         engine.vector_store = cast(VectorStore, FakeVectorStore([]))
         engine.memory_store = cast(MemoryStore, memory_store)
         engine.llm_client = cast(LLMClient, FakeLLMClient(response=""))
-        results = [msg async for msg in engine.query("remember that foo", [], stream=False)]
+        results = [msg async for msg in engine.query("remember that foo", [], stream=False, can_write_memory=True)]
         content_msgs = [r for r in results if r.get("type") == "content"]
         self.assertGreaterEqual(len(content_msgs), 1)
         self.assertIn("Memory stored", content_msgs[0]["content"])

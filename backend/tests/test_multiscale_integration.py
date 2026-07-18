@@ -104,7 +104,7 @@ class FakeMemoryStore:
             updated_at=None,
         )
 
-    def search_memories(self, query: str, limit: int = 5, vault_id=None):
+    def search_memories(self, query: str, limit: int = 5, vault_id=None, include_global: bool = False):
         return self._memories[:limit]
 
 

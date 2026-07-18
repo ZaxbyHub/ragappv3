@@ -625,6 +625,8 @@ class RAGEngine:
         temperature: Optional[float] = None,
         retrieval_mode: Optional[str] = None,
         citation_mode: Optional[str] = None,
+        include_global: bool = False,
+        can_write_memory: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute a RAG query: embed, search, build prompt, call LLM.
 
@@ -634,6 +636,17 @@ class RAGEngine:
                 to prevent cross-vault data leakage via an unscoped query.
             user_id: Authenticated user ID for per-user A/B subject_key derivation.
                 When provided, used as the A/B sticky subject instead of org_id.
+            include_global: When True, global (``vault_id IS NULL``) memories
+                are eligible for retrieval alongside vault-scoped ones. Defaults
+                to ``False`` (fail-closed) so a caller that forgets the flag
+                cannot leak global memories into a non-admin's prompt (issue
+                #404, MEDIUM-11). Admin code paths pass ``True`` explicitly.
+                Has no effect when ``vault_id is None``.
+            can_write_memory: When False (default — fail-closed), a detected
+                "remember ..." memory-store directive is NOT persisted; the
+                user gets a feedback chunk instead. Callers MUST verify the
+                user has write access to ``vault_id`` (or is an admin when
+                ``vault_id is None``) before passing True (issue #404).
         """
         if require_vault and vault_id is None:
             raise ValueError(
@@ -672,6 +685,15 @@ class RAGEngine:
         # ------------------------------------------------------------------
         if settings.agentic_rag_enabled:
             logger.info("[query] Agentic RAG enabled — routing through AgenticPlanner")
+            # DEFENSE-IN-DEPTH NOTE (zaxbysauce review, Z-1): this early return
+            # bypasses the include_global / can_write_memory gates below because
+            # the agentic path does NOT retrieve or persist memories today
+            # (memories_used is hardcoded to [] at the done chunk). If a future
+            # AgenticTool ever adds memory retrieval or "remember ..." handling,
+            # it MUST thread include_global and can_write_memory from this
+            # query() call into the tool — global memories are admin-only and
+            # chat writes require vault write access (issue #404). Do not add a
+            # memory-touching tool here without wiring those flags through.
             try:
                 from app.services.agentic_tools import RetrievalTool, SynthesisTool
 
@@ -730,9 +752,32 @@ class RAGEngine:
         trace = RAGTrace(original_query=user_input)
         trace.distance_threshold = self.max_distance_threshold
         # Memory intent detection
+        memory_content: Optional[str] = None
         try:
             memory_content = self.memory_store.detect_memory_intent(user_input)
             if memory_content:
+                # Authorization gate (issue #404): a "remember ..." directive
+                # must not persist unless the caller has write access to the
+                # target vault (or is an admin writing a global memory when
+                # vault_id is None). The route layer resolves can_write_memory
+                # BEFORE entering this generator (the engine cannot call the
+                # policy DI directly because the streaming path has already
+                # released its DB connection). When blocked, give the user
+                # explicit feedback rather than silently dropping the memory —
+                # but do NOT raise; a "remember" directive is best-effort and
+                # should not fail the entire chat turn.
+                if not can_write_memory:
+                    logger.info(
+                        "[query] Memory-store directive ignored: caller lacks write access "
+                        "to vault_id=%s (can_write_memory=False)",
+                        vault_id,
+                    )
+                    yield {
+                        "type": "content",
+                        "content": "I can't save memories to this vault.",
+                    }
+                    yield {"type": "done"}
+                    return
                 memory = await asyncio.to_thread(
                     self.memory_store.add_memory, memory_content, source="chat", vault_id=vault_id
                 )
@@ -743,7 +788,22 @@ class RAGEngine:
                 yield {"type": "done"}
                 return
         except Exception as exc:
+            # A failure here is either intent-detection or add_memory. The deny
+            # path (can_write_memory=False above) gives explicit feedback; match
+            # that UX when a "remember ..." directive was detected (memory_content
+            # truthy) but the store failed, so the user isn't silently dropped to
+            # retrieval after explicitly asking to remember something (PRR-007).
+            # If intent detection itself failed (memory_content still None), just
+            # fall through — there was no directive to act on. Best-effort: never
+            # raise on the chat hot path.
             logger.error("Memory intent detection/add failed (%s): %s", type(exc).__name__, exc)
+            if memory_content:
+                yield {
+                    "type": "content",
+                    "content": "I couldn't save that memory — please try again later.",
+                }
+                yield {"type": "done"}
+                return
 
         # Follow-up rewriting: when the latest user message is a short or
         # referential follow-up ("try again", "continue", "expand on that"),
@@ -931,6 +991,7 @@ class RAGEngine:
                         user_input,
                         settings.memory_retrieval_top_k,
                         vault_id=vault_id,
+                        include_global=include_global,
                     )
                     # Apply context_top_k cap so prompt context stays bounded
                     # even when memory_retrieval_top_k is large.

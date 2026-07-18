@@ -297,7 +297,14 @@ class WikiCompileProcessor:
                 memory_id = input_json.get("memory_id")
                 if not memory_id:
                     return {"skipped": True, "reason": "no memory_id in input_json"}
-                return compiler.promote_memory(memory_id=memory_id, vault_id=job.vault_id)
+                # is_admin=True: this is a trusted system background job, not a
+                # user-context call. The interactive /wiki/promote-memory route
+                # (the only user-facing caller) passes the role-derived value;
+                # here we run as a privileged worker so global memories may be
+                # promoted (issue #404).
+                return compiler.promote_memory(
+                    memory_id=memory_id, vault_id=job.vault_id, is_admin=True
+                )
 
             if job.trigger_type in ("manual", "settings_reindex"):
                 return self._handle_reindex(job, store, compiler, input_json)
@@ -315,7 +322,10 @@ class WikiCompileProcessor:
         vault_id = job.vault_id
         memory_id = input_json.get("memory_id")
         if memory_id:
-            return compiler.promote_memory(memory_id=memory_id, vault_id=vault_id)
+            # Trusted system job — see is_admin note at the trigger_type=="memory" call above.
+            return compiler.promote_memory(
+                memory_id=memory_id, vault_id=vault_id, is_admin=True
+            )
 
         stale_claims = store.list_claims(vault_id=vault_id, status="superseded")
         # Dedup memory_id across claims/sources: a single memory commonly
@@ -332,7 +342,8 @@ class WikiCompileProcessor:
         reprocessed = 0
         for memory_id in seen_memory_ids:
             try:
-                compiler.promote_memory(memory_id=memory_id, vault_id=vault_id)
+                # Trusted system job — see is_admin note at the trigger_type=="memory" call above.
+                compiler.promote_memory(memory_id=memory_id, vault_id=vault_id, is_admin=True)
                 reprocessed += 1
             except Exception as exc:
                 logger.warning(

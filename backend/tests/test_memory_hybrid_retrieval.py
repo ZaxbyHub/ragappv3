@@ -108,6 +108,68 @@ class TestHybridFallbacks(unittest.TestCase):
             _cleanup_store(store, path)
 
 
+class TestIncludeGlobalFlag(unittest.TestCase):
+    """Direct store-layer coverage for the include_global SQL branches (PRR-005).
+
+    Exercises MemoryStore.search_memories (FTS arm) with include_global True/False
+    against real rows, distinguishing which SQL branch fired by inspecting
+    whether the global (vault_id IS NULL) memory surfaces. The dense arm shares
+    the identical clause-toggle logic, so FTS coverage is sufficient to prove
+    the branch selection; dense is exercised indirectly via the hybrid path in
+    TestHybridSemanticPath when include_global=True returns the global row.
+    """
+
+    def test_include_global_false_excludes_global_memory(self):
+        """include_global=False (non-admin default) → a global memory does NOT
+        surface in a vault-scoped search. Pre-#404 the OR-vault_id-IS-NULL
+        clause always included it."""
+        store, path = _make_store(embedding_service=None)
+        try:
+            store.add_memory("shared global note about reports", vault_id=None)
+            store.add_memory("vault one note about reports", vault_id=1)
+            results = store.search_memories("reports", limit=5, vault_id=1, include_global=False)
+            self.assertTrue(results, "expected the vault-scoped match")
+            for r in results:
+                self.assertEqual(
+                    r.vault_id, 1,
+                    f"include_global=False leaked a non-vault row (vault_id={r.vault_id})",
+                )
+        finally:
+            _cleanup_store(store, path)
+
+    def test_include_global_true_includes_global_memory(self):
+        """include_global=True (admin) → the global memory surfaces alongside
+        the vault-scoped one."""
+        store, path = _make_store(embedding_service=None)
+        try:
+            store.add_memory("shared global note about reports", vault_id=None)
+            store.add_memory("vault one note about reports", vault_id=1)
+            results = store.search_memories("reports", limit=5, vault_id=1, include_global=True)
+            vault_ids = {r.vault_id for r in results}
+            self.assertIn(1, vault_ids, "vault-scoped match missing")
+            self.assertIn(None, vault_ids, "include_global=True did not surface the global memory")
+        finally:
+            _cleanup_store(store, path)
+
+    def test_include_global_ignored_when_vault_id_none(self):
+        """When vault_id is None (admin cross-vault scan), include_global has
+        no effect — all non-expired memories are returned regardless. Pins
+        the documented contract so a future refactor can't silently regress."""
+        store, path = _make_store(embedding_service=None)
+        try:
+            store.add_memory("global note about alpha", vault_id=None)
+            store.add_memory("vault one note about alpha", vault_id=1)
+            # Both flags should yield the same (full) set when vault_id is None.
+            res_false = store.search_memories("alpha", limit=5, vault_id=None, include_global=False)
+            res_true = store.search_memories("alpha", limit=5, vault_id=None, include_global=True)
+            ids_false = {r.id for r in res_false}
+            ids_true = {r.id for r in res_true}
+            self.assertEqual(ids_false, ids_true, "vault_id=None path diverged by include_global flag")
+            self.assertTrue(ids_false, "expected matches when vault_id is None")
+        finally:
+            _cleanup_store(store, path)
+
+
 class TestHybridSemanticPath(unittest.TestCase):
     def test_semantic_query_retrieves_related_memory(self):
         embedder = _StubEmbedder()
