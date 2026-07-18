@@ -348,11 +348,13 @@ class WikiCompiler:
         # ``memory_vault_id != vault_id`` check above is skipped for global
         # memories (NULL is never equal to an int), so this explicit gate is
         # required.
+        #
+        # Raise ValueError (→ 404 at the route) rather than PermissionError
+        # (→ 403) so a non-admin prober cannot distinguish "no such memory"
+        # from "global memory exists" via the status code (PRR-008
+        # existence-oracle). Admins never reach this branch (is_admin=True).
         if memory_vault_id is None and not is_admin:
-            raise PermissionError(
-                f"Memory {memory_id} is a global memory; promoting global "
-                f"memories requires admin access."
-            )
+            raise ValueError(f"Memory {memory_id} not found")
 
         content: str = memory["content"]
         extraction = extract_entities_from_text(content)

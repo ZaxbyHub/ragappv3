@@ -330,16 +330,19 @@ class TestGlobalMemoryWriteAuthz(_GlobalMemoryAuthBase):
 class TestGlobalMemoryPromoteAuthz(_GlobalMemoryAuthBase):
     """promote_memory: a vault-writer must not promote (read) a global memory."""
 
-    def test_member_writer_promote_global_memory_403(self):
+    def test_member_writer_promote_global_memory_not_found(self):
         """member_writer (WRITE on vault 2) POST /wiki/promote-memory targeting
-        the global memory 1002 → 403. Pre-fix: the vault-scope check was
-        skipped for global memories and promotion succeeded (content read)."""
+        the global memory 1002 → 404 (not 403). Pre-fix: the vault-scope check
+        was skipped for global memories and promotion succeeded (content read).
+        Post-fix (#404 + PRR-008): the gate returns 404 indistinguishable from
+        a non-existent memory, so a non-admin cannot learn which IDs are
+        global via a status-code oracle."""
         resp = self.client.post(
             "/api/wiki/promote-memory",
             json={"memory_id": 1002, "vault_id": 2},
             headers=self._h(self._member_writer_token()),
         )
-        self.assertEqual(resp.status_code, 403, resp.text)
+        self.assertEqual(resp.status_code, 404, resp.text)
 
 
 class TestChatMemoryWriteAuthz(_GlobalMemoryAuthBase):
@@ -471,6 +474,87 @@ class TestChatMemoryWriteAuthz(_GlobalMemoryAuthBase):
         finally:
             app.dependency_overrides.pop(get_rag_engine, None)
             app.dependency_overrides.pop(get_stream_auth, None)
+
+
+class TestGetStreamAuthRealFlagComputation(_GlobalMemoryAuthBase):
+    """End-to-end test for the REAL get_stream_auth flag computation (PRR-006).
+
+    Unlike TestChatMemoryWriteAuthz (which overrides get_stream_auth with a
+    synthetic dict), this calls the real ``get_stream_auth`` coroutine directly
+    with a ``Request`` whose ``app.state.db_pool`` is a production
+    SQLiteConnectionPool backed by the seeded test DB. This exercises the real
+    ``_resolve_active_user`` + ``_evaluate_policy(..., "write")`` path and
+    asserts the stashed ``_can_write_memory`` / ``_include_global_memories``
+    flags are computed correctly for a read-only member vs a write member."""
+
+    def _make_stream_request(self, token: str, vault_id):
+        """Build a minimal Starlette Request carrying the auth header and the
+        production pool on app.state.db_pool."""
+        from starlette.applications import Starlette
+        from starlette.datastructures import Headers
+
+        from app.api.routes.chat import ChatStreamRequest
+
+        # Install the PRODUCTION pool (has the .connection() context manager the
+        # real get_stream_auth uses) on a throwaway app's state. Reuse the test
+        # DB path the base class already seeded via SimpleConnectionPool.
+        from app.models.database import SQLiteConnectionPool
+
+        pool = SQLiteConnectionPool(self._db_path, max_size=3)
+        star_app = Starlette()
+        star_app.state.db_pool = pool
+        # Reuse the main app's state for log_db_released (it reads app.state);
+        # get_stream_auth only touches request.app.state.db_pool + headers.
+        request = MagicMock()
+        request.app = star_app
+        request.headers = Headers({"authorization": f"Bearer {token}"})
+        request.cookies = {}
+        body = ChatStreamRequest(
+            messages=[{"role": "user", "content": "remember the key"}],
+            vault_id=vault_id,
+        )
+        return request, body, pool
+
+    def test_readonly_member_gets_can_write_memory_false(self):
+        """The real get_stream_auth computes _can_write_memory=False for a
+        member with READ-only access to the vault (PRR-006)."""
+        import asyncio
+
+        from app.api.routes.chat import get_stream_auth
+
+        request, body, pool = self._make_stream_request(
+            self._member_reader_token(), vault_id=2
+        )
+        try:
+            user = asyncio.run(get_stream_auth(request, body))
+            self.assertEqual(user.get("role"), "member")
+            self.assertFalse(
+                user.get("_can_write_memory", True),
+                "real get_stream_auth granted write to a read-only member",
+            )
+            self.assertFalse(user.get("_include_global_memories", True))
+        finally:
+            pool.close_all()
+
+    def test_write_member_gets_can_write_memory_true(self):
+        """The real get_stream_auth computes _can_write_memory=True for a
+        member with WRITE access to the vault."""
+        import asyncio
+
+        from app.api.routes.chat import get_stream_auth
+
+        request, body, pool = self._make_stream_request(
+            self._member_writer_token(), vault_id=2
+        )
+        try:
+            user = asyncio.run(get_stream_auth(request, body))
+            self.assertTrue(
+                user.get("_can_write_memory", False),
+                "real get_stream_auth denied write to a write member",
+            )
+            self.assertFalse(user.get("_include_global_memories", True))
+        finally:
+            pool.close_all()
 
 
 if __name__ == "__main__":

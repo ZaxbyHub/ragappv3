@@ -124,7 +124,9 @@ class FakeMemoryStore:
         self.added.append(content)
         return MemoryRecord(id=1, content=content, category=category, tags=tags, source=source, created_at=None, updated_at=None)
 
-    def search_memories(self, query: str, limit: int = 5, vault_id=None):
+    def search_memories(self, query: str, limit: int = 5, vault_id=None, include_global: bool = False):
+        # include_global accepted (issue #404); not asserted here — global
+        # exclusion is covered by test_memory_global_authz.py.
         self.search_vault_ids.append(vault_id)
         return self._memories[:limit]
 

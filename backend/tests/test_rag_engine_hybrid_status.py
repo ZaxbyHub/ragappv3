@@ -51,7 +51,7 @@ class FakeMemoryStore:
         from app.services.memory_store import MemoryRecord
         return MemoryRecord(id=1, content=content, category=category, tags=tags, source=source, created_at=None, updated_at=None)
 
-    def search_memories(self, query: str, limit: int = 5, vault_id=None):
+    def search_memories(self, query: str, limit: int = 5, vault_id=None, include_global: bool = False):
         return []
 
 

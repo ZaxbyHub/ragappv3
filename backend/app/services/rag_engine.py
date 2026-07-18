@@ -677,7 +677,7 @@ class RAGEngine:
         #
         # NOTE: When agentic_rag_enabled is True, this branch yields a
         # simplified response directly from AgenticPlanner and returns
-        # early (line 672). The early return skips:
+        # early (the `return` after the done chunk below). The early return skips:
         #   - answer_contract enforcement (no structured JSON contract)
         #   - citation repair (no citation normalization/repair pass)
         #   - full trace assembly (no extended trace logged to evidence)
@@ -685,6 +685,15 @@ class RAGEngine:
         # ------------------------------------------------------------------
         if settings.agentic_rag_enabled:
             logger.info("[query] Agentic RAG enabled — routing through AgenticPlanner")
+            # DEFENSE-IN-DEPTH NOTE (zaxbysauce review, Z-1): this early return
+            # bypasses the include_global / can_write_memory gates below because
+            # the agentic path does NOT retrieve or persist memories today
+            # (memories_used is hardcoded to [] at the done chunk). If a future
+            # AgenticTool ever adds memory retrieval or "remember ..." handling,
+            # it MUST thread include_global and can_write_memory from this
+            # query() call into the tool — global memories are admin-only and
+            # chat writes require vault write access (issue #404). Do not add a
+            # memory-touching tool here without wiring those flags through.
             try:
                 from app.services.agentic_tools import RetrievalTool, SynthesisTool
 
@@ -743,6 +752,7 @@ class RAGEngine:
         trace = RAGTrace(original_query=user_input)
         trace.distance_threshold = self.max_distance_threshold
         # Memory intent detection
+        memory_content: Optional[str] = None
         try:
             memory_content = self.memory_store.detect_memory_intent(user_input)
             if memory_content:
@@ -778,7 +788,22 @@ class RAGEngine:
                 yield {"type": "done"}
                 return
         except Exception as exc:
+            # A failure here is either intent-detection or add_memory. The deny
+            # path (can_write_memory=False above) gives explicit feedback; match
+            # that UX when a "remember ..." directive was detected (memory_content
+            # truthy) but the store failed, so the user isn't silently dropped to
+            # retrieval after explicitly asking to remember something (PRR-007).
+            # If intent detection itself failed (memory_content still None), just
+            # fall through — there was no directive to act on. Best-effort: never
+            # raise on the chat hot path.
             logger.error("Memory intent detection/add failed (%s): %s", type(exc).__name__, exc)
+            if memory_content:
+                yield {
+                    "type": "content",
+                    "content": "I couldn't save that memory — please try again later.",
+                }
+                yield {"type": "done"}
+                return
 
         # Follow-up rewriting: when the latest user message is a short or
         # referential follow-up ("try again", "continue", "expand on that"),

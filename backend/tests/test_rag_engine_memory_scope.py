@@ -226,32 +226,48 @@ class TestIncludeGlobalFlag:
 class TestPromoteMemoryDefaultFailClosed:
     """promote_memory's is_admin default must be fail-closed (reviewer finding)."""
 
-    def test_default_is_admin_false_blocks_global_promotion(self):
-        """A caller that omits is_admin cannot promote a global memory."""
+    def _build_db_with_global_memory(self):
+        """Shared scaffolding: in-memory DB with a global memory (id=1)."""
         import sqlite3
-        import tempfile
-        from pathlib import Path
 
-        from app.services.wiki_compiler import WikiCompiler
-        from app.services.wiki_store import WikiStore
-
-        # Build an in-memory DB with a global memory.
         db = sqlite3.connect(":memory:")
         db.row_factory = sqlite3.Row
-        db.execute(
-            "CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, "
-            "vault_id INTEGER, category TEXT, tags TEXT, source TEXT)"
+        # Minimal schema promote_memory reads/writes.
+        db.executescript(
+            """
+            CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, vault_id INTEGER,
+                                   category TEXT, tags TEXT, source TEXT);
+            CREATE TABLE vaults (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE wiki_pages (id INTEGER PRIMARY KEY, vault_id INTEGER, title TEXT,
+                                     content TEXT, source_type TEXT, source_memory_id INTEGER,
+                                     status TEXT, page_type TEXT, created_at TEXT, updated_at TEXT);
+            """
         )
         db.execute(
             "INSERT INTO memories (id, content, vault_id) VALUES (1, 'global secret', NULL)"
         )
+        db.execute("INSERT INTO vaults (id, name) VALUES (2, 'V2')")
         db.commit()
+        return db
 
+    def test_default_is_admin_false_blocks_global_promotion(self):
+        """A caller that omits is_admin cannot promote a global memory."""
+        from app.services.wiki_compiler import WikiCompiler
+        from app.services.wiki_store import WikiStore
+
+        db = self._build_db_with_global_memory()
         store = WikiStore(db)
         compiler = WikiCompiler(db, store)
-        with pytest.raises(PermissionError):
-            # is_admin intentionally OMITTED — must default to False and block
-            # promotion of the global (vault_id IS NULL) memory.
+        # is_admin intentionally OMITTED — must default to False and block
+        # promotion of the global (vault_id IS NULL) memory. PRR-008: the gate
+        # raises ValueError (→ 404 at the route, indistinguishable from
+        # not-found) rather than PermissionError to avoid a status-code oracle.
+        with pytest.raises(ValueError):
             compiler.promote_memory(memory_id=1, vault_id=2)
+
+    # The POSITIVE counterpart (admin with is_admin=True succeeds) lives in
+    # test_wiki_compiler.py::TestPromoteMemory::test_admin_promotes_global_memory,
+    # which uses the full-schema _make_env fixture needed to complete the
+    # promotion pipeline (PRR-004).
 
 

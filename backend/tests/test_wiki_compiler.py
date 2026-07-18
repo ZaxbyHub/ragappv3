@@ -168,11 +168,23 @@ class TestPromoteMemory(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.compiler.promote_memory(memory_id=mem_id, vault_id=1)
 
-    def test_promote_null_vault_memory_uses_request_vault(self):
-        """Memory with vault_id=NULL should be promotable to any vault."""
+    def test_admin_promotes_global_memory_to_request_vault(self):
+        """A global memory (vault_id=NULL) is promotable to a target vault by
+        an authorized (admin) caller (PRR-001 + PRR-004). Global memories are
+        admin-only under #404, so is_admin=True is required; a non-admin caller
+        is covered by TestGlobalMemoryPromoteAuthz in test_memory_global_authz.py
+        (which asserts the 404 existence-oracle-safe denial)."""
         mem_id = self._insert_memory(AFOMIS_TEXT, vault_id=None)
-        result = self.compiler.promote_memory(memory_id=mem_id, vault_id=1)
+        result = self.compiler.promote_memory(memory_id=mem_id, vault_id=1, is_admin=True)
         self.assertEqual(result["page"].vault_id, 1)
+
+    def test_non_admin_promote_global_memory_denied_not_found(self):
+        """A non-admin caller (is_admin omitted → default False) cannot promote
+        a global memory; the gate raises ValueError (→ 404 at the route,
+        indistinguishable from not-found) per PRR-008."""
+        mem_id = self._insert_memory(AFOMIS_TEXT, vault_id=None)
+        with self.assertRaises(ValueError):
+            self.compiler.promote_memory(memory_id=mem_id, vault_id=1)
 
     def test_promote_nonexistent_memory_raises(self):
         with self.assertRaises(ValueError):

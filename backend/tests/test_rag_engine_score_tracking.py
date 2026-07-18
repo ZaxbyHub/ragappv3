@@ -131,7 +131,7 @@ class FakeMemoryStore:
     def detect_memory_intent(self, text: str) -> Optional[str]:
         return self.intent
 
-    def search_memories(self, query: str, limit: int, vault_id=None) -> list:
+    def search_memories(self, query: str, limit: int, vault_id=None, include_global: bool = False) -> list:
         """Sync version for asyncio.to_thread compatibility."""
         return []
 
