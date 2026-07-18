@@ -4,7 +4,7 @@
 # and could build/run differently than what CI validated.
 # Digest pin (issue #404 / #391) freezes the base image for supply-chain
 # integrity; dependabot (docker ecosystem, "/") opens PRs on new digests.
-FROM node:20.19-alpine@sha256:658d0f63e501824d6c23e06d4bb95c71e7d704537c9d9272f488ac03a370d448 AS frontend-builder
+FROM node:26.5-alpine@sha256:e88a35be04478413b7c71c455cd9865de9b9360e1f43456be5951032d7ac1a66 AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
