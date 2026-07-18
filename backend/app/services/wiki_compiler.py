@@ -311,11 +311,22 @@ class WikiCompiler:
         target_page_id: Optional[int] = None,
         status: str = "needs_review",
         created_by: Optional[int] = None,
+        is_admin: bool = False,
     ) -> dict:
         """
         Promote a memory record into wiki pages, entities, claims, and relations.
 
         Returns dict with keys: page, claims, entities, relations.
+
+        ``is_admin`` gates promotion of GLOBAL memories (``vault_id IS NULL``).
+        Global memories are admin-only under the #404 security model, so a
+        non-admin caller — who legitimately has write access to a vault — must
+        not be able to promote (and thereby read the content of) a global
+        memory into their vault. Defaults to ``False`` (fail-closed) so a
+        caller that forgets the flag cannot promote a global memory. The
+        interactive ``/wiki/promote-memory`` route passes the caller's
+        role-derived value; trusted system callers (e.g. the background
+        WikiCompileProcessor) pass ``True`` explicitly.
         """
         # Load memory — FK verify vault scope
         self._db.row_factory = sqlite3.Row
@@ -330,6 +341,17 @@ class WikiCompiler:
         if memory_vault_id is not None and memory_vault_id != vault_id:
             raise PermissionError(
                 f"Memory {memory_id} belongs to vault {memory_vault_id}, not {vault_id}"
+            )
+        # Global-memory tier (vault_id IS NULL) is admin-only (issue #404).
+        # Without this, any user with write access to a vault could promote a
+        # global memory and read its content. The existing
+        # ``memory_vault_id != vault_id`` check above is skipped for global
+        # memories (NULL is never equal to an int), so this explicit gate is
+        # required.
+        if memory_vault_id is None and not is_admin:
+            raise PermissionError(
+                f"Memory {memory_id} is a global memory; promoting global "
+                f"memories requires admin access."
             )
 
         content: str = memory["content"]

@@ -468,7 +468,7 @@ class MemoryStore:
 
     @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
     def _fts_search(
-        self, query: str, limit: int, vault_id: Optional[int]
+        self, query: str, limit: int, vault_id: Optional[int], include_global: bool = False
     ) -> List[MemoryRecord]:
         """FTS5 lexical search. Returns up to ``limit`` rows ordered by rank.
 
@@ -478,8 +478,14 @@ class MemoryStore:
 
         Vault scoping:
             ``vault_id=None`` — scan ALL vaults (admin/global mode, no filter).
-            ``vault_id=<int>`` — filter to that vault OR ``vault_id IS NULL``
-            (includes vault-less memories shared across all vaults).
+            ``vault_id=<int>`` — filter to that vault. When
+            ``include_global=True`` (admin caller), global memories
+            (``vault_id IS NULL``) are also returned alongside the vault's
+            own rows; when ``include_global=False`` (default — non-admin
+            caller), only the vault's own rows are returned. This default
+            prevents a non-admin member of vault N from reading global
+            memories via the ``OR vault_id IS NULL`` union (issue #404,
+            MEDIUM-11).
         """
         if not query or not query.strip():
             return []
@@ -511,16 +517,38 @@ class MemoryStore:
                     """
                     params: tuple = (sanitized_query, limit)
                 else:
-                    sql = """
-                    SELECT m.id, m.content, m.category, m.tags, m.source, m.vault_id, m.importance, m.expires_at, m.created_at, m.updated_at, f.rank
-                    FROM memories_fts f
-                    JOIN memories m ON f.rowid = m.id
-                    WHERE memories_fts MATCH ?
-                    AND (m.vault_id = ? OR m.vault_id IS NULL)
-                    AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))
-                    ORDER BY rank
-                    LIMIT ?
-                    """
+                    # Two static SQL branches (no f-string interpolation) so
+                    # bandit B608 does not flag string-based query building.
+                    # The include_global flag toggles the same
+                    # ``OR vault_id IS NULL`` clause in BOTH FTS and dense
+                    # search (RRF fusion safety — mismatched candidate
+                    # universes between the two arms would produce
+                    # nonsensical fused rankings). When False (non-admin
+                    # caller), only the vault's own rows are returned,
+                    # preventing cross-tenant leakage of global memories
+                    # (issue #404, MEDIUM-11).
+                    if include_global:
+                        sql = """
+                        SELECT m.id, m.content, m.category, m.tags, m.source, m.vault_id, m.importance, m.expires_at, m.created_at, m.updated_at, f.rank
+                        FROM memories_fts f
+                        JOIN memories m ON f.rowid = m.id
+                        WHERE memories_fts MATCH ?
+                        AND (m.vault_id = ? OR m.vault_id IS NULL)
+                        AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))
+                        ORDER BY rank
+                        LIMIT ?
+                        """
+                    else:
+                        sql = """
+                        SELECT m.id, m.content, m.category, m.tags, m.source, m.vault_id, m.importance, m.expires_at, m.created_at, m.updated_at, f.rank
+                        FROM memories_fts f
+                        JOIN memories m ON f.rowid = m.id
+                        WHERE memories_fts MATCH ?
+                        AND m.vault_id = ?
+                        AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))
+                        ORDER BY rank
+                        LIMIT ?
+                        """
                     params = (sanitized_query, vault_id, limit)
 
                 cursor = conn.execute(sql, params)
@@ -555,6 +583,7 @@ class MemoryStore:
         limit: int,
         vault_id: Optional[int],
         candidate_ids: Optional[List[int]] = None,
+        include_global: bool = False,
     ) -> List[MemoryRecord]:
         """Cosine-similarity dense search across vault-scoped memories.
 
@@ -569,8 +598,13 @@ class MemoryStore:
 
         Vault scoping:
             ``vault_id=None`` — scan ALL vaults (admin/global mode, no filter).
-            ``vault_id=<int>`` — filter to that vault OR ``vault_id IS NULL``
-            (includes vault-less memories shared across all vaults).
+            ``vault_id=<int>`` — filter to that vault. When
+            ``include_global=True`` (admin caller), global memories
+            (``vault_id IS NULL``) are also returned; when
+            ``include_global=False`` (default — non-admin caller), only the
+            vault's own rows are returned (issue #404, MEDIUM-11). The flag
+            toggles the identical ``OR vault_id IS NULL`` clause used by
+            ``_fts_search`` so RRF fusion sees matching candidate universes.
         """
         if not query_embedding:
             return []
@@ -588,13 +622,26 @@ class MemoryStore:
                 """
                 params: tuple = ()
             else:
-                sql = """
-                SELECT id, content, category, tags, source, vault_id, importance, expires_at, created_at, updated_at, embedding
-                FROM memories
-                WHERE embedding IS NOT NULL
-                  AND (vault_id = ? OR vault_id IS NULL)
-                  AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
-                """
+                # Two static SQL branches (no f-string interpolation) so bandit
+                # B608 is not triggered. The include_global flag toggles the
+                # identical ``OR vault_id IS NULL`` clause used by _fts_search
+                # so RRF fusion sees matching candidate universes.
+                if include_global:
+                    sql = """
+                    SELECT id, content, category, tags, source, vault_id, importance, expires_at, created_at, updated_at, embedding
+                    FROM memories
+                    WHERE embedding IS NOT NULL
+                      AND (vault_id = ? OR vault_id IS NULL)
+                      AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+                    """
+                else:
+                    sql = """
+                    SELECT id, content, category, tags, source, vault_id, importance, expires_at, created_at, updated_at, embedding
+                    FROM memories
+                    WHERE embedding IS NOT NULL
+                      AND vault_id = ?
+                      AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+                    """
                 params = (vault_id,)
             if candidate_ids:
                 placeholders = ','.join('?' * len(candidate_ids))
@@ -668,7 +715,11 @@ class MemoryStore:
         return scored[:limit]
 
     def search_memories(
-        self, query: str, limit: int = 5, vault_id: Optional[int] = None
+        self,
+        query: str,
+        limit: int = 5,
+        vault_id: Optional[int] = None,
+        include_global: bool = False,
     ) -> List[MemoryRecord]:
         """Hybrid memory retrieval: FTS5 lexical + dense semantic + RRF fusion.
 
@@ -680,9 +731,17 @@ class MemoryStore:
         ``score_type`` on returned records reflects which path produced
         them: ``"rrf"`` when fusion happened, ``"fts"`` or ``"dense"``
         otherwise.
+
+        ``include_global`` controls whether global (``vault_id IS NULL``)
+        memories are returned alongside a vault's own rows when
+        ``vault_id`` is set. Defaults to ``False`` (secure — non-admin
+        callers must not see global memories). Admin code paths pass
+        ``True``. The flag is applied identically to both FTS and dense
+        arms so RRF fusion sees matching candidate universes (issue #404,
+        MEDIUM-11). It has no effect when ``vault_id is None``.
         """
         # FTS results — always run.
-        fts_records = self._fts_search(query, limit, vault_id)
+        fts_records = self._fts_search(query, limit, vault_id, include_global)
 
         # Dense results — best-effort, run UNFILTERED across the vault.
         # Synchronously embed when we already have an event loop (this method
@@ -710,7 +769,7 @@ class MemoryStore:
                 # FTS hit set, which made semantic-only recall impossible whenever
                 # FTS returned any candidate. RRF fusion below still rewards
                 # memories found by both arms.
-                dense_records = self._dense_search(query_emb, limit, vault_id)
+                dense_records = self._dense_search(query_emb, limit, vault_id, include_global=include_global)
 
         # No dense path → return FTS as-is.
         if not dense_records:

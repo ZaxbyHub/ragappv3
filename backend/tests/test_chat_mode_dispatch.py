@@ -182,7 +182,7 @@ class _StubMemoryStore:
     def detect_memory_intent(self, text):
         return None
 
-    def search_memories(self, query, limit=5, vault_id=None):
+    def search_memories(self, query, limit=5, vault_id=None, include_global=False):
         return []
 
 

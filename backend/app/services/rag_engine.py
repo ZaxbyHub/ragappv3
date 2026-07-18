@@ -625,6 +625,8 @@ class RAGEngine:
         temperature: Optional[float] = None,
         retrieval_mode: Optional[str] = None,
         citation_mode: Optional[str] = None,
+        include_global: bool = False,
+        can_write_memory: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute a RAG query: embed, search, build prompt, call LLM.
 
@@ -634,6 +636,17 @@ class RAGEngine:
                 to prevent cross-vault data leakage via an unscoped query.
             user_id: Authenticated user ID for per-user A/B subject_key derivation.
                 When provided, used as the A/B sticky subject instead of org_id.
+            include_global: When True, global (``vault_id IS NULL``) memories
+                are eligible for retrieval alongside vault-scoped ones. Defaults
+                to ``False`` (fail-closed) so a caller that forgets the flag
+                cannot leak global memories into a non-admin's prompt (issue
+                #404, MEDIUM-11). Admin code paths pass ``True`` explicitly.
+                Has no effect when ``vault_id is None``.
+            can_write_memory: When False (default — fail-closed), a detected
+                "remember ..." memory-store directive is NOT persisted; the
+                user gets a feedback chunk instead. Callers MUST verify the
+                user has write access to ``vault_id`` (or is an admin when
+                ``vault_id is None``) before passing True (issue #404).
         """
         if require_vault and vault_id is None:
             raise ValueError(
@@ -733,6 +746,28 @@ class RAGEngine:
         try:
             memory_content = self.memory_store.detect_memory_intent(user_input)
             if memory_content:
+                # Authorization gate (issue #404): a "remember ..." directive
+                # must not persist unless the caller has write access to the
+                # target vault (or is an admin writing a global memory when
+                # vault_id is None). The route layer resolves can_write_memory
+                # BEFORE entering this generator (the engine cannot call the
+                # policy DI directly because the streaming path has already
+                # released its DB connection). When blocked, give the user
+                # explicit feedback rather than silently dropping the memory —
+                # but do NOT raise; a "remember" directive is best-effort and
+                # should not fail the entire chat turn.
+                if not can_write_memory:
+                    logger.info(
+                        "[query] Memory-store directive ignored: caller lacks write access "
+                        "to vault_id=%s (can_write_memory=False)",
+                        vault_id,
+                    )
+                    yield {
+                        "type": "content",
+                        "content": "I can't save memories to this vault.",
+                    }
+                    yield {"type": "done"}
+                    return
                 memory = await asyncio.to_thread(
                     self.memory_store.add_memory, memory_content, source="chat", vault_id=vault_id
                 )
@@ -931,6 +966,7 @@ class RAGEngine:
                         user_input,
                         settings.memory_retrieval_top_k,
                         vault_id=vault_id,
+                        include_global=include_global,
                     )
                     # Apply context_top_k cap so prompt context stays bounded
                     # even when memory_retrieval_top_k is large.

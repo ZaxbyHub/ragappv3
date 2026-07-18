@@ -2,7 +2,9 @@
 # Pinned to node 20.19 to match CI (ci.yml node-version "20.19.0") so a green
 # CI run proves the shipped image builds (B6-2, #289). node:26 diverged from CI
 # and could build/run differently than what CI validated.
-FROM node:20.19-alpine AS frontend-builder
+# Digest pin (issue #404 / #391) freezes the base image for supply-chain
+# integrity; dependabot (docker ecosystem, "/") opens PRs on new digests.
+FROM node:20.19-alpine@sha256:658d0f63e501824d6c23e06d4bb95c71e7d704537c9d9272f488ac03a370d448 AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -42,7 +44,8 @@ RUN npm run build
 # Stage 2: Backend with Unstructured dependencies
 # Pinned to python 3.11 to match CI (ci.yml python-version "3.11") so a green
 # CI run proves the shipped image builds and runs (B6-2, #289).
-FROM python:3.11-slim AS backend
+# Digest pin (issue #404 / #391); dependabot (docker, "/") maintains updates.
+FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93 AS backend
 
 # Install system dependencies for Unstructured
 # Note: libmagic1 needed for python-magic on Linux

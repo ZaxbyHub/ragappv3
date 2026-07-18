@@ -704,6 +704,11 @@ async def promote_memory_to_wiki(
             target_page_id=request.target_page_id,
             status=request.status,
             created_by=user.get("id"),
+            # Global memories are admin-only (issue #404): a vault-writer must
+            # not be able to promote a global memory and thereby read its
+            # content. The PermissionError surfaces as a 403 via the handler
+            # below.
+            is_admin=user.get("role") in ("superadmin", "admin"),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

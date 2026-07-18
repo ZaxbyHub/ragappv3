@@ -232,6 +232,8 @@ def stream_chat_response(
     temperature: Optional[float] = None,
     retrieval_mode: Optional[str] = None,
     citation_mode: Optional[str] = None,
+    include_global: bool = False,
+    can_write_memory: bool = False,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
@@ -299,6 +301,7 @@ def stream_chat_response(
                 require_vault=require_vault, user_id=user_id,
                 temperature=temperature, retrieval_mode=retrieval_mode,
                 citation_mode=citation_mode,
+                include_global=include_global, can_write_memory=can_write_memory,
             )
             rag_gen_ait = rag_gen.__aiter__()
 
@@ -478,6 +481,8 @@ async def non_stream_chat_response(
     temperature: Optional[float] = None,
     retrieval_mode: Optional[str] = None,
     citation_mode: Optional[str] = None,
+    include_global: bool = False,
+    can_write_memory: bool = False,
 ) -> ChatResponse:
     """
     Generate a non-streaming chat response.
@@ -512,6 +517,7 @@ async def non_stream_chat_response(
             require_vault=require_vault, user_id=user_id,
             temperature=temperature, retrieval_mode=retrieval_mode,
             citation_mode=citation_mode,
+            include_global=include_global, can_write_memory=can_write_memory,
         ):
             chunk_type = chunk.get("type")
             logger.debug(
@@ -636,21 +642,37 @@ async def chat(
             status_code=400,
             detail="Streaming is not supported on this endpoint. Use /chat/stream for streaming responses.",
         )
+    # Role-derived authorization flags (issue #404). These are resolved HERE
+    # (where the DI evaluate + DB connection are available) and threaded into
+    # the RAG engine, which runs as a long-lived async generator AFTER this
+    # dependency scope closes — so the engine cannot call the policy DI
+    # directly. ``include_global`` gates whether global (vault_id IS NULL)
+    # memories are eligible for retrieval (admin-only — prevents cross-tenant
+    # leakage into a non-admin's prompt). ``can_write_memory`` gates whether a
+    # detected "remember ..." directive is persisted (requires write access to
+    # the vault, or admin when vault_id is None).
+    is_admin = user.get("role") in ("superadmin", "admin")
     if body.vault_id is not None:
         # Use the DI evaluate_policy variant so the permission check reuses the
         # request's pooled DB connection instead of opening a second one. This
         # halves per-request pool usage on the hot chat path (pool max_size=10).
         if not await evaluate(user, "vault", body.vault_id, "read"):
             raise HTTPException(status_code=403, detail="No read access to this vault")
+        # Write access for the memory-intent path (R12/#404): a member with
+        # read-only access must not be able to write a vault memory via
+        # "remember ...". Admins always pass.
+        can_write_memory = is_admin or await evaluate(user, "vault", body.vault_id, "write")
     else:
         # vault_id=None ("All Vaults") searches across all vaults without filtering.
         # Restrict to admin/superadmin — non-admin users must specify a vault_id.
-        if user.get("role") not in ("superadmin", "admin"):
+        if not is_admin:
             raise HTTPException(
                 status_code=403,
                 detail="Searching all vaults requires admin access. Please select a specific vault.",
             )
-    require_vault = user.get("role") not in ("superadmin", "admin")
+        can_write_memory = True
+    include_global = is_admin
+    require_vault = not is_admin
     effective_mode = ChatMode(body.mode) if body.mode else None
     # Convert validated ChatMessage objects to plain dicts for downstream
     # functions that expect List[Dict[str, Any]]. Mirror the streaming path
@@ -665,6 +687,8 @@ async def chat(
             mode=effective_mode,
             require_vault=require_vault,
             user_id=user.get("id"),
+            include_global=include_global,
+            can_write_memory=can_write_memory,
             temperature=body.temperature,
             retrieval_mode=body.retrieval_mode,
             citation_mode=body.citation_mode,
@@ -711,17 +735,31 @@ async def get_stream_auth(
             request.headers.get("authorization"),
             request.cookies.get("access_token"),
         )
+        is_admin = user.get("role") in ("superadmin", "admin")
         if body.vault_id is not None:
             if not await _evaluate_policy(conn, user, "vault", body.vault_id, "read"):
                 raise HTTPException(status_code=403, detail="No read access to this vault")
+            # Resolve write permission HERE (inside the pooled-connection block)
+            # so the memory-intent path in the RAG engine — which runs AFTER
+            # this connection is released — can decide whether a "remember ..."
+            # directive may persist. A member with read-only access must not
+            # write a vault memory via chat (issue #404, R12).
+            can_write_memory = is_admin or await _evaluate_policy(
+                conn, user, "vault", body.vault_id, "write"
+            )
         else:
             # vault_id=None ("All Vaults") searches across all vaults without filtering.
             # Restrict to admin/superadmin — non-admin users must specify a vault_id.
-            if user.get("role") not in ("superadmin", "admin"):
+            if not is_admin:
                 raise HTTPException(
                     status_code=403,
                     detail="Searching all vaults requires admin access. Please select a specific vault.",
                 )
+            can_write_memory = True
+        # Stash the role-derived flags on the user dict so chat_stream can
+        # thread them into the RAG engine without re-opening a connection.
+        user["_include_global_memories"] = is_admin
+        user["_can_write_memory"] = can_write_memory
     # <-- pooled connection released here, before the SSE stream starts.
     # Structured db_released event (observability): proves the auth connection
     # did not span the SSE generation (the #301 fix).
@@ -752,6 +790,9 @@ async def chat_stream(
         )
 
     require_vault = user.get("role") not in ("superadmin", "admin")
+    # Role-derived flags resolved inside get_stream_auth (issue #404).
+    include_global = bool(user.get("_include_global_memories"))
+    can_write_memory = bool(user.get("_can_write_memory"))
     history = [msg.model_dump(exclude_none=True) for msg in body.messages[:-1]]
     effective_mode = ChatMode(body.mode) if body.mode else None
     return stream_chat_response(
@@ -765,6 +806,8 @@ async def chat_stream(
         temperature=body.temperature,
         retrieval_mode=body.retrieval_mode,
         citation_mode=body.citation_mode,
+        include_global=include_global,
+        can_write_memory=can_write_memory,
     )
 
 

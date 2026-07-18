@@ -178,7 +178,7 @@ class FakeMemoryStore:
             source=source
         )
 
-    def search_memories(self, query: str, limit: int = 5, vault_id: Optional[int] = None) -> List[FakeMemoryRecord]:
+    def search_memories(self, query: str, limit: int = 5, vault_id: Optional[int] = None, include_global: bool = False) -> List[FakeMemoryRecord]:
         return self._memories[:limit]
 
 
