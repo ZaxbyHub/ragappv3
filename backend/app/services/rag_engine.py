@@ -677,7 +677,7 @@ class RAGEngine:
         #
         # NOTE: When agentic_rag_enabled is True, this branch yields a
         # simplified response directly from AgenticPlanner and returns
-        # early (the `return` after the done chunk below). The early return skips:
+        # early (line 672). The early return skips:
         #   - answer_contract enforcement (no structured JSON contract)
         #   - citation repair (no citation normalization/repair pass)
         #   - full trace assembly (no extended trace logged to evidence)
