@@ -84,15 +84,25 @@ class WhitelistLimiter(Limiter):
         """
         if _should_whitelist(request):
             return
-        original_path = request.scope.get("path")
-        normalized = original_path.rstrip("/") or "/" if original_path else original_path
-        if original_path != normalized:
-            request.scope["path"] = normalized
+        # Normalize the scope path so trailing-slash and non-slash variants of
+        # the SAME route share one rate-limit bucket (see class docstring). Guard
+        # against request stand-ins that don't expose a real scope dict (e.g.
+        # MagicMock(spec=Request) in direct-call unit tests): in that case skip
+        # normalization and delegate unchanged.
+        scope = getattr(request, "scope", None)
+        original_path = scope.get("path") if isinstance(scope, dict) else None
+        normalized = (
+            (original_path.rstrip("/") or "/")
+            if original_path
+            else original_path
+        )
+        if original_path != normalized and isinstance(scope, dict):
+            scope["path"] = normalized
         try:
             super()._check_request_limit(request, endpoint_func, in_middleware)
         finally:
-            if original_path != normalized:
-                request.scope["path"] = original_path
+            if original_path != normalized and isinstance(scope, dict):
+                scope["path"] = original_path
 
 
 def _resolve_storage_uri(redis_url: str) -> str:
