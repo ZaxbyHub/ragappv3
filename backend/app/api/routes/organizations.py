@@ -117,6 +117,7 @@ def _is_org_admin_or_owner(conn: sqlite3.Connection, org_id: int, user_id: int) 
     return row[0] in ("owner", "admin")
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 async def list_organizations(user: dict = Depends(require_role("member"))):
     """List organizations. Superadmin/admin see all; others see their own."""
@@ -170,6 +171,7 @@ async def list_organizations(user: dict = Depends(require_role("member"))):
         pool.release_connection(conn)
 
 
+@router.post("", include_in_schema=False)
 @router.post("/")
 async def create_organization(
     req: OrganizationCreateRequest,

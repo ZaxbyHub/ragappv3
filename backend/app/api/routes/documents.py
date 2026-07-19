@@ -743,7 +743,7 @@ def _build_files_fts_query(raw_search: str) -> str:
     return " ".join(f"{token}*" for token in tokens[:8])
 
 
-@router.get("", response_model=DocumentListResponse)
+@router.get("", response_model=DocumentListResponse, include_in_schema=False)
 @router.get("/", response_model=DocumentListResponse)
 async def list_documents(
     vault_id: Optional[int] = Query(None, description="Filter by vault ID"),
@@ -1596,7 +1596,7 @@ async def toggle_file_enrichment(
     return document
 
 
-@router.post("", response_model=UploadResponse)
+@router.post("", response_model=UploadResponse, include_in_schema=False)
 @router.post("/", response_model=UploadResponse)
 async def upload_document_root(
     request: Request,

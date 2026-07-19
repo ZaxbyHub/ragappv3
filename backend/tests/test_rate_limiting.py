@@ -22,6 +22,7 @@ CHAT_PY = os.path.join(os.path.dirname(__file__), "..", "app", "api", "routes", 
 SEARCH_PY = os.path.join(os.path.dirname(__file__), "..", "app", "api", "routes", "search.py")
 VAULTS_PY = os.path.join(os.path.dirname(__file__), "..", "app", "api", "routes", "vaults.py")
 MEMORIES_PY = os.path.join(os.path.dirname(__file__), "..", "app", "api", "routes", "memories.py")
+SETTINGS_PY = os.path.join(os.path.dirname(__file__), "..", "app", "api", "routes", "settings.py")
 CONFIG_PY = os.path.join(os.path.dirname(__file__), "..", "app", "config.py")
 LIMITER_PY = os.path.join(os.path.dirname(__file__), "..", "app", "limiter.py")
 
@@ -278,6 +279,68 @@ class TestRateLimitingDecoratorsMemories(unittest.TestCase):
         self.assertIsNotNone(
             match,
             "DELETE /memories/{memory_id} must use @limiter.limit(settings.memory_mutation_rate_limit)",
+        )
+
+
+class TestRateLimitingDecoratorsSettings(unittest.TestCase):
+    """Verify rate limiting decorators on settings POST/PUT endpoints.
+
+    Regression guard for issue #389 (F-PRE-004): POST and PUT /settings must
+    carry @limiter.limit. These source-inspection assertions will fail if the
+    decorator is removed, even though the runtime behavior (returning a
+    pre-validated SettingsResponse) would not change — so a behavior-only test
+    cannot catch this regression.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = _read_file(SETTINGS_PY)
+
+    def test_limiter_import_present(self):
+        """settings.py must import limiter from app.limiter."""
+        self.assertIn(
+            "from app.limiter import limiter",
+            self.src,
+            "Missing 'from app.limiter import limiter' import in settings.py",
+        )
+
+    def test_settings_post_endpoint_has_rate_limit(self):
+        """POST /settings endpoint must have @limiter.limit decorator."""
+        pattern = (
+            r"@router\.post\s*\(\s*[\"']/settings[\"']"
+            r"(?:.*?\n\s*)?"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, self.src, re.DOTALL)
+        self.assertIsNotNone(
+            match,
+            "Could not find @router.post('/settings') followed by @limiter.limit decorator",
+        )
+
+    def test_settings_put_endpoint_has_rate_limit(self):
+        """PUT /settings endpoint must have @limiter.limit decorator."""
+        pattern = (
+            r"@router\.put\s*\(\s*[\"']/settings[\"']"
+            r"(?:.*?\n\s*)?"
+            r"@limiter\.limit\s*\("
+        )
+        match = re.search(pattern, self.src, re.DOTALL)
+        self.assertIsNotNone(
+            match,
+            "Could not find @router.put('/settings') followed by @limiter.limit decorator",
+        )
+
+    def test_settings_post_put_use_admin_rate_limit(self):
+        """POST and PUT /settings must use settings.admin_rate_limit."""
+        pattern = (
+            r"@limiter\.limit\s*\(\s*settings\.admin_rate_limit\s*\)"
+        )
+        matches = re.findall(pattern, self.src)
+        # POST and PUT both use it — expect at least 2 occurrences.
+        self.assertGreaterEqual(
+            len(matches),
+            2,
+            "POST and PUT /settings must both use @limiter.limit(settings.admin_rate_limit)",
         )
 
 

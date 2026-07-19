@@ -2,7 +2,9 @@
 Vault API tests — CRUD operations, isolation, cascade delete, and edge cases.
 """
 
+import atexit
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -68,6 +70,10 @@ def setup_test_db():
     return str(TEST_DB_PATH)
 
 setup_test_db()
+# Clean up the module-level temp dir at interpreter shutdown. Per-test temp
+# dirs are removed in each class's tearDown; this only covers the dir created
+# at import time by setup_test_db() above (see issue #390, F-PRE-003).
+atexit.register(shutil.rmtree, TEST_DATA_DIR, ignore_errors=True)
 
 from _db_pool import SimpleConnectionPool
 
@@ -775,6 +781,10 @@ class TestAccessibleVaultsEndpoint(unittest.TestCase):
         self.assertIn("vaults", data)
         self.assertEqual(len(data["vaults"]), 1)
         self.assertEqual(data["vaults"][0]["name"], "OrgVault")
+        # The accessible endpoint must include the org_id field for org-scoped
+        # vaults (regression guard — see issue #390, F-006).
+        self.assertIn("org_id", data["vaults"][0])
+        self.assertEqual(data["vaults"][0]["org_id"], org_id)
 
     def test_accessible_vaults_org_member_cant_see_other_org_vault(self):
         """User cannot see vaults from other organizations."""
@@ -1672,6 +1682,12 @@ class TestVaultResponseOrgId(unittest.TestCase):
             "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
             (1, "admin", "abc123", "superadmin", 1),
         )
+        # Second user with a non-admin role so org_id behavior can be exercised
+        # through the member role too (see issue #390, F-004).
+        conn.execute(
+            "INSERT INTO users (id, username, hashed_password, role, is_active) VALUES (?, ?, ?, ?, ?)",
+            (2, "member", "abc123", "member", 1),
+        )
         conn.commit()
         self._connection_pool.release_connection(conn)
 
@@ -1704,6 +1720,17 @@ class TestVaultResponseOrgId(unittest.TestCase):
             self._connection_pool.close_all()
         import shutil
         shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def _mock_user(self, user_id, username, role="member", is_active=1):
+        """Swap the authenticated user for the current test."""
+        app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": user_id,
+            "username": username,
+            "role": role,
+            "is_active": is_active,
+            "full_name": username,
+            "must_change_password": False,
+        }
 
     def _insert_org(self, conn, name):
         cursor = conn.execute(
@@ -1750,6 +1777,23 @@ class TestVaultResponseOrgId(unittest.TestCase):
         )
         self.assertEqual(resp_create.status_code, 201)
 
+        # Positive case: an org-scoped vault must surface its org_id (not None)
+        # in the LIST response. A regression that dropped org_id from org-scoped
+        # vaults would otherwise go uncaught (see issue #390, F-005).
+        conn = self._connection_pool.get_connection()
+        org_id = self._insert_org(conn, "ListOrg")
+        conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (org_id, 1, "owner"),
+        )
+        conn.commit()
+        self._connection_pool.release_connection(conn)
+        resp_org_vault = self.client.post(
+            "/api/vaults",
+            json={"name": "ListOrgVault", "description": "", "org_id": org_id},
+        )
+        self.assertEqual(resp_org_vault.status_code, 201)
+
         resp_list = self.client.get("/api/vaults")
         self.assertEqual(resp_list.status_code, 200)
         vaults = resp_list.json()["vaults"]
@@ -1758,6 +1802,8 @@ class TestVaultResponseOrgId(unittest.TestCase):
             self.assertIn("org_id", vault)
         created_vault = next(v for v in vaults if v["name"] == "ListVault")
         self.assertIsNone(created_vault["org_id"])
+        org_vault = next(v for v in vaults if v["name"] == "ListOrgVault")
+        self.assertEqual(org_vault["org_id"], org_id)
 
     def test_get_single_vault_includes_org_id(self):
         """GET /api/vaults/{id} includes org_id=None for a vault without an org."""
@@ -1794,6 +1840,65 @@ class TestVaultResponseOrgId(unittest.TestCase):
         )
         self.assertEqual(resp_put.status_code, 200)
         self.assertEqual(resp_put.json()["org_id"], org_id)
+
+    def test_vault_response_org_id_member_role(self):
+        """A member-role user sees the correct org_id on an org-scoped vault.
+
+        Mirrors test_vault_response_org_id_is_populated_for_org_vault but
+        authenticates as a member (not superadmin) so the org_id field is
+        exercised through the most common role. A regression that branched
+        org_id resolution on the caller's role would otherwise go uncaught
+        (see issue #390, F-004).
+        """
+        conn = self._connection_pool.get_connection()
+        org_id = self._insert_org(conn, "MemberOrg")
+        conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (org_id, 2, "owner"),
+        )
+        conn.commit()
+        self._connection_pool.release_connection(conn)
+
+        self._mock_user(2, "member", role="member")
+        resp = self.client.post(
+            "/api/vaults",
+            json={"name": "MemberOrgVault", "description": "", "org_id": org_id},
+        )
+        self.assertEqual(resp.status_code, 201)
+        data = resp.json()
+        self.assertIn("org_id", data)
+        self.assertEqual(data["org_id"], org_id)
+
+    def test_org_vault_org_id_preserved_after_name_change(self):
+        """org_id survives a PUT that changes only the vault name.
+
+        The existing test_org_vault_org_id_preserved_after_update only PUTs
+        ``description``; this companion PUTs ``name`` to cover the other
+        update branch (see issue #390, F-007).
+        """
+        conn = self._connection_pool.get_connection()
+        org_id = self._insert_org(conn, "NameChangeOrg")
+        conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, ?)",
+            (org_id, 1, "owner"),
+        )
+        conn.commit()
+        self._connection_pool.release_connection(conn)
+
+        resp = self.client.post(
+            "/api/vaults",
+            json={"name": "OrgVaultRenameMe", "description": "", "org_id": org_id},
+        )
+        self.assertEqual(resp.status_code, 201)
+        vault_id = resp.json()["id"]
+
+        resp_put = self.client.put(
+            f"/api/vaults/{vault_id}",
+            json={"name": "RenamedOrgVault"},
+        )
+        self.assertEqual(resp_put.status_code, 200)
+        self.assertEqual(resp_put.json()["org_id"], org_id)
+        self.assertEqual(resp_put.json()["name"], "RenamedOrgVault")
 
 
 if __name__ == '__main__':

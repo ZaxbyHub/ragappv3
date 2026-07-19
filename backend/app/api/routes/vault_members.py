@@ -74,6 +74,7 @@ class VaultGroupAccessUpdateRequest(BaseModel):
         return v
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 def list_vault_members(
     vault_id: int,
@@ -120,6 +121,7 @@ def list_vault_members(
     return {"members": members, "total": total_count}
 
 
+@router.post("", include_in_schema=False)
 @router.post("/")
 def add_vault_member(
     vault_id: int,
@@ -298,6 +300,7 @@ def remove_vault_member(
 # =============================================================================
 
 
+@group_access_router.get("", include_in_schema=False)
 @group_access_router.get("/")
 async def list_vault_group_access(
     vault_id: int,
@@ -352,6 +355,7 @@ async def list_vault_group_access(
     return {"group_access": group_access, "total": total_count}
 
 
+@group_access_router.post("", include_in_schema=False)
 @group_access_router.post("/")
 def grant_vault_group_access(
     vault_id: int,
