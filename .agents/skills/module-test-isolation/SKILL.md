@@ -101,6 +101,8 @@ If the test fails in combined mode but passes in isolation, it has a
 module-test-isolation defect. Fix the test's setUp/tearDown to reset
 module state.
 
+tracked_by: no automated test; this is a pattern advisory applied per-failing-test. The active-user-cache example is tracked_by backend/tests/test_active_user_cache.py.
+
 ## Anti-patterns to avoid
 
 - Global dict that grows during tests without a teardown.

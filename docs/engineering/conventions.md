@@ -147,6 +147,8 @@ Repo-specific skills worth knowing: `commit-pr` (branch/commit/PR protocol), `ci
 
 **When adding or changing a repo-specific skill, mirror it across all three trees** (or keep it a thin pointer to a canonical doc, as `engineering-conventions` does) so every runner stays consistent. Do not assume one tree's contents apply to another. Skills explicitly tied to *other* projects (e.g. an "opencode-swarm internals" skill) do not belong here.
 
+The full skill specification — scope categories (repo-specific vs runner-specific vs framework-vendored vs adapter vs generated), canonical-tree precedence, frontmatter shape, the adapter-skill pattern, the `.secretscanignore` validation contract, and the AC traceability format — lives in `docs/engineering/skill-conventions.md`. Drift is enforced in CI by `scripts/check_skill_sync.py`; run `python scripts/sync_skills.py --check` locally before pushing skill changes.
+
 ---
 
 ## 5. Branch / commit / PR

@@ -16,7 +16,8 @@ update a PR, or apply PR review follow-up in this repository.
 ## Repository Facts
 
 - Default branch: `master`.
-- Branch prefix: `codex/` unless the user requests another prefix.
+- Branch prefix: match your agent runner's convention — `claude/` for Claude
+  Code, `codex/` for Codex — unless the user requests another prefix.
 - Backend: Python/FastAPI under `backend/`.
 - Frontend: npm/Vite/Vitest under `frontend/`.
 - Default PR state: draft, unless the user explicitly asks for ready review.
@@ -35,8 +36,8 @@ and the current change touches them.
    - Fetch the target branch with `git fetch origin master`.
 
 2. Choose the branch strategy.
-   - If detached with existing work or commits, create `codex/<short-slug>` at the current `HEAD`.
-   - If starting fresh from `master`, create `codex/<short-slug>` from current `origin/master`.
+   - If detached with existing work or commits, create `<prefix>/<short-slug>` at the current `HEAD`.
+   - If starting fresh from `master`, create `<prefix>/<short-slug>` from current `origin/master`.
    - If already on a feature branch for this work, stay there.
    - If the branch has diverged from `origin/master`, check mergeability before pushing.
 

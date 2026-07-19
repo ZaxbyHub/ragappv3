@@ -1,15 +1,15 @@
 ---
 name: swarm-implement
-description: Execute complex implementation work with a swarm-like Codex workflow: parallel exploration, scoped planning, selective deep validation, and independent reviewer/critic checks where risk justifies them. Use for feature work, bug fixes, refactors, and multi-file changes.
+description: Execute complex implementation work with a swarm-like workflow: parallel exploration, scoped planning, selective deep validation, and independent reviewer/critic checks where risk justifies them. Use for feature work, bug fixes, refactors, and multi-file changes.
 disable-model-invocation: true
 ---
 
 # /swarm-implement
 
-Use this skill for implementation work when you want Codex to behave like a fast, high-quality swarm rather than a single-threaded assistant.
+Use this skill for implementation work when you want the agent runner to behave like a fast, high-quality swarm rather than a single-threaded assistant.
 
 ## Purpose
-Complete real coding tasks across many projects while preserving Codex speed and adding swarm-style quality discipline.
+Complete real coding tasks across many projects while preserving the runner's native speed and adding swarm-style quality discipline.
 
 ## Core operating model
 Use this execution ladder:
@@ -23,18 +23,6 @@ Use this execution ladder:
 
 This is not a slow full-swarm recreation.
 This is a speed-preserving, quality-maximizing workflow.
-
-## Command Namespace
-
-Swarm commands: always /swarm <subcommand> — never bare subcommand names.
-
-CRITICAL — these CC built-ins share names with swarm commands and MUST be avoided:
-  /plan → use /swarm plan (reading) or do not invoke (entering plan mode)
-  /reset → NEVER invoke — wipes conversation context
-  /checkpoint → NEVER invoke bare — use /swarm checkpoint <action>
-
-HIGH — these CC built-ins produce wrong output:
-  /status → use /swarm status (not CC /status)
 
 ## Quality and speed policy
 - Quality and pre-ship defect detection are paramount.
@@ -66,6 +54,17 @@ Determine the exact task scope first:
 
 If the task is unclear, ask a small number of targeted questions or create a short written plan before coding.
 
+### Phase 1 — Parallel exploration
+Launch parallel subagents for disjoint investigation tasks such as:
+- repository mapping for relevant subsystems
+- locating existing patterns to follow
+- finding tests, schemas, contracts, and integration points
+- identifying likely side effects and touched modules
+- checking dependency or migration implications
+
+Do not use the main thread for broad repo reading if subagents can do it.
+Keep the main context focused.
+
 **Merge-base-aware scope:** When analyzing a PR branch, scope the diff to the
 correct commit range — use `git merge-base origin/master HEAD` to find the
 divergence point, then use the three-dot diff `origin/master...HEAD` to exclude
@@ -88,17 +87,6 @@ Then pass the actual commit range (base ref, head ref, `base..head`) into every
 explorer delegation so explorers scope to the PR's changes, not the full branch
 accumulation. See `swarm-pr-review` Phase 0 "PR Branch Checkout (mandatory)"
 for the canonical version of this pre-flight.
-
-### Phase 1 — Parallel exploration
-Launch parallel subagents for disjoint investigation tasks such as:
-- repository mapping for relevant subsystems
-- locating existing patterns to follow
-- finding tests, schemas, contracts, and integration points
-- identifying likely side effects and touched modules
-- checking dependency or migration implications
-
-Do not use the main thread for broad repo reading if subagents can do it.
-Keep the main context focused.
 
 ### Phase 2 — Plan
 Create a concrete implementation plan before editing for any non-trivial task.
@@ -175,14 +163,14 @@ Long tasks generate many candidates and reviewer/critic findings. If they live
 only in conversation context, a context compaction silently erases them and
 forces expensive re-runs. After each validation phase (post-explorer,
 post-reviewer, post-critic, pre-synthesis), persist findings to a structured
-scratch artifact (e.g. `.swarm/evidence/review-{id}/{phase}.json` — gitignored
-local working state, NOT committed). Minimum fields per finding: `finding_id`,
-`status` (PENDING/CONFIRMED/DISPROVED/PRE_EXISTING), `severity`, `file_line`,
-`evidence`, `next_action`. The canonical schema and checkpoint triggers live in
-the `swarm-pr-review` skill ("Persisting Findings to Survive Context
-Compaction") — reference it rather than duplicating. On resume after compaction,
-reload these artifacts and continue from the last checkpoint instead of
-re-dispatching explorers for already-persisted lanes.
+scratch artifact (e.g. `.zcode/session/tasks/<task-slug>/evidence.json` —
+gitignored local working state, NOT committed). Minimum fields per finding:
+`finding_id`, `status` (PENDING/CONFIRMED/DISPROVED/PRE_EXISTING), `severity`,
+`file_line`, `evidence`, `next_action`. The canonical schema and checkpoint
+triggers live in the `swarm-pr-review` skill ("Persisting Findings to Survive
+Context Compaction") — reference it rather than duplicating. On resume after
+compaction, reload these artifacts and continue from the last checkpoint
+instead of re-dispatching explorers for already-persisted lanes.
 
 ## Hard rules
 - Do not let implementation context self-approve high-risk work.

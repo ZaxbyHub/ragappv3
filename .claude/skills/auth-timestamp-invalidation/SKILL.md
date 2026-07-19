@@ -87,13 +87,18 @@ grep -rn "decode_access_token" backend/app/ --include="*.py"
 
 - The `password_changed_at` column is added to the `users` table via
   a migration.
+  tracked_by: backend/tests/schema_constants.py
 - The migration is idempotent (uses `PRAGMA table_info`).
+  tracked_by: backend/tests/test_password_epoch_invalidates_tokens.py
 - After password change, outstanding access tokens issued before
   `password_changed_at` are rejected with 401.
+  tracked_by: backend/tests/test_password_epoch_invalidates_tokens.py
 - The active-user cache is invalidated on password change and on the
   epoch-check rejection.
+  tracked_by: backend/tests/test_active_user_cache.py
 - A test that issues a token, changes the password, then presents the old
   token, gets 401.
+  tracked_by: backend/tests/test_password_epoch_invalidates_tokens.py
 
 ## Connection to other skills
 

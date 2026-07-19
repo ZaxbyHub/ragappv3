@@ -45,6 +45,14 @@ Repository contract job:
   the PR (suppresses new findings without `SAST_ALLOW_BASELINE_EXPANSION=1`),
   if the `sast` CI job no longer runs `run_bandit.py`, or if the scan scope
   (`TARGET`) drifted from `backend/app`.
+- `python scripts/check_skill_sync.py` — fails if repo-specific skills drifted
+  across the three runner trees (`.claude/skills/`, `.agents/skills/`,
+  `.opencode/skills/`). See `docs/engineering/skill-conventions.md` for the
+  mirror rule and `scripts/sync_skills.py` for propagation.
+- `python scripts/check_secretscan.py` — fails if `.secretscanignore` has
+  unparseable globs, adversarial positive samples are not ignored, or
+  adversarial negative samples are over-matched. Stale and overly-broad globs
+  emit advisory (non-fatal) warnings.
 
 SAST job:
 
@@ -72,13 +80,13 @@ SAST job:
 - Pull request diff checks have enough fetch depth.
 - Local validation commands mirror CI when possible.
 - Truncated CI output does not hide the command exit status.
-- For the 60m job timeout: tests with `pytest-timeout=300` per-test are bounded, but the cumulative suite (~36m with coverage) MUST fit. If you add tests that take cumulatively >20m, the job will fail. Profile slow tests with `pytest --durations=20`.
 - SAST: if `backend/app` changed, run `python scripts/run_bandit.py` locally.
   If it reports NEW findings, either fix them or (if acceptable pre-existing
   debt) regenerate the baseline with `--update-baseline` and justify the
   newly-suppressed finding IDs in the PR.
 - Regression falsifiability: if the change adds a regression test, was it
   verified falsifiable (revert the fix, confirm the test fails, restore)?
+- For the 60m job timeout: tests with `pytest-timeout=300` per-test are bounded, but the cumulative suite (~36m with coverage) MUST fit. If you add tests that take cumulatively >20m, the job will fail. Profile slow tests with `pytest --durations=20`.
 
 ## Local Mirror Commands
 
@@ -91,6 +99,8 @@ cd backend && ruff check . && pytest --tb=short -v --timeout=300 tests/
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py
+python scripts/check_skill_sync.py
+python scripts/check_secretscan.py
 python scripts/run_bandit.py
 ```
 

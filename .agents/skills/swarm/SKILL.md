@@ -1,6 +1,6 @@
 ---
 name: swarm
-description: Enable a high-quality swarm-like Codex workflow for the current session, and optionally execute a task immediately using that mode. Uses parallel subagents for breadth, independent reviewer validation for precision, and critic challenge for final confidence. Use when the user wants swarm-like behavior, higher review rigor, or maximum quality without sacrificing Codex speed.
+description: Enable a high-quality swarm-like workflow for the current session, and optionally execute a task immediately using that mode. Uses parallel subagents for breadth, independent reviewer validation for precision, and critic challenge for final confidence. Use when the user wants swarm-like behavior, higher review rigor, or maximum quality without sacrificing the agent runner's native speed.
 disable-model-invocation: true
 argument-hint: "[optional task]"
 ---
@@ -12,95 +12,33 @@ If arguments are provided, enable swarm mode first and then execute that task us
 
 Argument handling:
 - If no arguments are provided: only enable swarm mode.
-- If the first word of `$ARGUMENTS` is a **known plugin subcommand** (see list below): do NOT treat it as a swarm task. Instead, tell the user to run it as a slash command directly (e.g., `/swarm close`, `/swarm handoff`). These are OpenCode plugin commands handled by the swarm plugin's command system, not tasks for the swarm workflow. Do NOT try to interpret or execute them yourself.
-- Otherwise: enable swarm mode, then treat `$ARGUMENTS` as the task to execute immediately.
-
-### SWARM-NAMESPACED subcommands — DO NOT confuse with Codex built-in commands
-
-These are invoked as `/swarm <subcommand>`, NOT as bare `/subcommand`:
-
-- `/swarm status` — show current swarm status
-- `/swarm plan` — view or manage implementation plan
-- `/swarm agents` — list available swarm agents
-- `/swarm history` — view swarm execution history
-- `/swarm config` — view swarm configuration
-- `/swarm evidence` — view evidence files
-- `/swarm handoff` — hand off to another agent
-- `/swarm archive` — archive swarm sessions
-- `/swarm diagnose` / `/swarm diagnosis` — diagnose swarm issues
-- `/swarm preflight` — run preflight checks
-- `/swarm sync-plan` — sync plan with repository
-- `/swarm benchmark` — run benchmarks
-- `/swarm export` — export swarm data
-- `/swarm reset` — reset swarm state
-- `/swarm rollback` — rollback to previous state
-- `/swarm retrieve` — retrieve swarm data
-- `/swarm clarify` — clarify swarm task
-- `/swarm analyze` — analyze swarm execution
-- `/swarm specify` — specify swarm requirements
-- `/swarm brainstorm` — brainstorm swarm tasks
-- `/swarm qa-gates` — manage QA gates
-- `/swarm dark-matter` — detect hidden couplings
-- `/swarm knowledge` — manage knowledge base
-- `/swarm curate` — curate knowledge
-- `/swarm turbo` — enable turbo mode
-- `/swarm full-auto` — enable full auto mode
-- `/swarm write-retro` — write retrospective
-- `/swarm reset-session` — reset session
-- `/swarm simulate` — simulate swarm execution
-- `/swarm promote` — promote knowledge
-- `/swarm issue` — create issue
-- `/swarm pr-review` — review pull request
-- `/swarm checkpoint` — checkpoint session state
-- `/swarm close` — close swarm session
-
-### CRITICAL NAMING CONFLICTS
-
-These swarm subcommands share exact names with CC built-in commands.
-Invoking the bare form instead of `/swarm <name>` causes irreversible damage:
-
-| Swarm Command | CC Built-in | Damage |
-|---|---|---|
-| `/swarm plan` | CC `/plan` | Enters CC plan mode — blocks execution |
-| `/swarm reset` | CC `/reset` | Wipes entire conversation context |
-| `/swarm checkpoint` | CC `/checkpoint` | Reverts conversation history |
-
-All swarm commands: `/swarm <subcommand>`. Never the bare name.
-
-### COMMAND INVOCATION RULE
-
-All commands in this list are invoked as `/swarm <subcommand>`.
-Never invoke the bare subcommand as a standalone slash command.
-`/plan`, `/status`, `/reset`, `/checkpoint`, `/agents`, `/config`, `/export`, `/doctor`
-are Codex built-in commands with completely different behaviors.
-The `/swarm` prefix is mandatory, not optional.
+- If arguments are provided: enable swarm mode, then treat `$ARGUMENTS` as the task to execute immediately.
 
 Examples:
-- `/swarm` — enable swarm mode only
-- `/swarm implement OAuth login without breaking existing session handling` — enable swarm mode, then execute the task
-- `/swarm fix the failing auth refresh tests and verify the session flow` — enable swarm mode, then execute the task
-- `/swarm close` — this is a plugin subcommand; tell the user it will be handled by the plugin command system
-- `/swarm handoff` — this is a plugin subcommand; tell the user it will be handled by the plugin command system
+- `/swarm`
+- `/swarm implement OAuth login without breaking existing session handling`
+- `/swarm fix the failing auth refresh tests and verify the session flow`
+- `/swarm refactor this parser safely and check for regressions`
 
 ## Goal
-Turn Codex into a swarm-like orchestrator while preserving Codex speed advantages.
+Turn the agent runner into a swarm-like orchestrator while preserving its native speed advantages.
 
 ## What this mode changes
-When enabled, Codex should:
+When enabled, the agent should:
 - use parallel subagents aggressively for disjoint exploration, codebase mapping, and specialist review
 - separate candidate generation from validation
 - use independent reviewer and critic contexts that are explicitly skeptical and suspicious
 - avoid letting implementation and verification happen in the same context when verification quality would benefit from separation
 - keep quality as the only metric that matters
 - treat time pressure as nonexistent
-- preserve normal Codex strengths: parallel subagents, scoped exploration, and fast synthesis
+- preserve the runner's native strengths: parallel subagents, scoped exploration, and fast synthesis
 - protect speed by spending the deepest validation effort only where it materially reduces ship risk
 
 ## Quality and speed policy
 Code quality and pre-ship defect detection are paramount.
 Speed still matters.
-The point of swarm mode is not to recreate slow serial swarm behavior inside Codex.
-The point is to keep Codex fast by parallelizing everything that can safely be parallelized while preserving a strict validation architecture.
+The point of swarm mode is not to recreate slow serial swarm behavior inside the runner.
+The point is to keep the runner fast by parallelizing everything that can safely be parallelized while preserving a strict validation architecture.
 
 That means:
 - parallelize breadth aggressively
@@ -137,8 +75,8 @@ Lower-risk work can use a lighter path if evidence is strong:
 - isolated low-risk cleanup with no behavior change
 
 ## Enablement steps
-1. Create `.Codex/session/` if it does not exist.
-2. Create or overwrite `.Codex/session/swarm-mode.md` with the exact content below.
+1. Create `.zcode/session/` if it does not exist.
+2. Create or overwrite `.zcode/session/swarm-mode.md` with the exact content below.
 3. Confirm that swarm mode is now enabled for this session.
 4. For the user's next complex task, follow the swarm-mode contract automatically unless the user disables it.
 
@@ -223,7 +161,11 @@ After enabling swarm mode, immediately execute `$ARGUMENTS` using this swarm-lik
 2. Launch parallel exploration for disjoint investigation work.
 3. Create a scoped plan.
 4. Implement in coherent units.
-5. Run objective verification.
+5. Run objective verification. Before any push or PR, run the
+   `ci-compatibility-audit` skill so this repo's CI gates (backend ruff,
+   frontend typecheck/lint/test/build, quality-contract scripts) are green
+   locally first — a CI-only lint or type failure costs a full push → fail →
+   fixup-commit round trip.
    **Behavioral-change test trap:** When a change intentionally modifies behavior
    (not just adds it), search for pre-existing tests that assert the OLD behavior
    before pushing. These tests will fail CI even when the change is correct.

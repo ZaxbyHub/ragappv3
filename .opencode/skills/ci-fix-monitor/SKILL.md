@@ -30,7 +30,7 @@ CI is a single PR-triggered workflow (`.github/workflows/ci.yml`, triggered on
 |-----|--------------------|------------------|
 | **Frontend** | `npm ci --engine-strict`, toolchain graph check, `npm run typecheck`, `npm run lint` (`--max-warnings 0`), API smoke subset, `npm test`, `npm run build`, two subpath builds | `frontend/` |
 | **Backend** | `ruff check .`, **`pytest --tb=short -v --timeout=300 tests/`** (full suite, 3918 tests), `pytest --cov=app --cov-report=term-missing -q --timeout=300 tests/` (coverage) | `backend/` |
-| **Quality contracts** | `python scripts/check_config_contract.py`, `python scripts/check_pr_scope_drift.py`, `python scripts/check_sast_baseline.py` | repo root |
+| **Quality contracts** | `python scripts/check_config_contract.py`, `python scripts/check_pr_scope_drift.py`, `python scripts/check_sast_baseline.py`, `python scripts/check_skill_sync.py` (skill-tree drift), `python scripts/check_secretscan.py` (`.secretscanignore` globs) | repo root |
 | **SAST** | `python scripts/run_bandit.py` (bandit baseline gate; fails on new findings vs `backend/security/bandit-baseline.json`) | repo root |
 
 > The Backend job runs the **full pytest tests/** suite since PR #215 / FR-4
