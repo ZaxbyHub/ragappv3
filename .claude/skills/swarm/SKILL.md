@@ -1,6 +1,6 @@
 ---
 name: swarm
-description: Enable a high-quality swarm-like Claude Code workflow for the current session, and optionally execute a task immediately using that mode. Uses parallel subagents for breadth, independent reviewer validation for precision, and critic challenge for final confidence. Use when the user wants swarm-like behavior, higher review rigor, or maximum quality without sacrificing Claude Code speed.
+description: Enable a high-quality swarm-like workflow for the current session, and optionally execute a task immediately using that mode. Uses parallel subagents for breadth, independent reviewer validation for precision, and critic challenge for final confidence. Use when the user wants swarm-like behavior, higher review rigor, or maximum quality without sacrificing the agent runner's native speed.
 disable-model-invocation: true
 argument-hint: "[optional task]"
 ---
@@ -21,24 +21,24 @@ Examples:
 - `/swarm refactor this parser safely and check for regressions`
 
 ## Goal
-Turn Claude Code into a swarm-like orchestrator while preserving Claude Code speed advantages.
+Turn the agent runner into a swarm-like orchestrator while preserving its native speed advantages.
 
 ## What this mode changes
-When enabled, Claude should:
+When enabled, the agent should:
 - use parallel subagents aggressively for disjoint exploration, codebase mapping, and specialist review
 - separate candidate generation from validation
 - use independent reviewer and critic contexts that are explicitly skeptical and suspicious
 - avoid letting implementation and verification happen in the same context when verification quality would benefit from separation
 - keep quality as the only metric that matters
 - treat time pressure as nonexistent
-- preserve normal Claude Code strengths: parallel subagents, scoped exploration, and fast synthesis
+- preserve the runner's native strengths: parallel subagents, scoped exploration, and fast synthesis
 - protect speed by spending the deepest validation effort only where it materially reduces ship risk
 
 ## Quality and speed policy
 Code quality and pre-ship defect detection are paramount.
 Speed still matters.
-The point of swarm mode is not to recreate slow serial swarm behavior inside Claude Code.
-The point is to keep Claude Code fast by parallelizing everything that can safely be parallelized while preserving a strict validation architecture.
+The point of swarm mode is not to recreate slow serial swarm behavior inside the runner.
+The point is to keep the runner fast by parallelizing everything that can safely be parallelized while preserving a strict validation architecture.
 
 That means:
 - parallelize breadth aggressively
@@ -75,8 +75,10 @@ Lower-risk work can use a lighter path if evidence is strong:
 - isolated low-risk cleanup with no behavior change
 
 ## Enablement steps
-1. Create `.claude/session/` if it does not exist.
-2. Create or overwrite `.claude/session/swarm-mode.md` with the exact content below.
+1. Create `.zcode/session/` if it does not exist. (For this repo's primary
+   runner, ZCode, the session dir is `.zcode/session/`. A secondary runner
+   with a different session-dir convention should adapt this path.)
+2. Create or overwrite `.zcode/session/swarm-mode.md` with the exact content below.
 3. Confirm that swarm mode is now enabled for this session.
 4. For the user's next complex task, follow the swarm-mode contract automatically unless the user disables it.
 

@@ -81,6 +81,12 @@ jobs:
       - name: SAST baseline integrity check
         run: python scripts/check_sast_baseline.py
 
+      - name: Skill tree sync drift check
+        run: python scripts/check_skill_sync.py
+
+      - name: Secretscan ignore validation
+        run: python scripts/check_secretscan.py
+
   sast:
     name: SAST (bandit)
     runs-on: ubuntu-latest

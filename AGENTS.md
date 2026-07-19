@@ -31,6 +31,16 @@ skills:
 
 When you add or change a repo-specific skill, mirror it across all three trees
 (or keep it a thin pointer to a canonical doc) so every runner stays consistent.
+Skill file structure, frontmatter shape, the mirror rule, the adapter-skill
+pattern, and the `.secretscanignore` validation contract are specified in
+`docs/engineering/skill-conventions.md`. Drift is enforced in CI by
+`scripts/check_skill_sync.py`; `.secretscanignore` validity is enforced by
+`scripts/check_secretscan.py`.
+
+`.opencode/skill-routing.yaml` is intentionally absent: the opencode-swarm
+plugin uses directory-based skill discovery (`.opencode/skills/<name>/SKILL.md`),
+there is no consumer for a routing YAML, and adding one would be unwired
+(see `docs/releases/pending/skills-narrowed-directives.md`).
 
 ## Non-negotiables
 
@@ -44,5 +54,5 @@ When you add or change a repo-specific skill, mirror it across all three trees
 
 `.github/workflows/ci.yml` — jobs: **Backend** (ruff + targeted pytest),
 **Frontend** (typecheck, lint `--max-warnings 0`, test, build, subpath build),
-**Quality contracts** (`check_config_contract.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`),
+**Quality contracts** (`check_config_contract.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_skill_sync.py`, `check_secretscan.py`),
 **SAST** (`scripts/run_bandit.py` — bandit baseline gate, fails on new findings).

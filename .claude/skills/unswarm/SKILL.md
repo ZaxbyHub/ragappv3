@@ -1,6 +1,6 @@
 ---
 name: unswarm
-description: Disable swarm mode for the current Claude Code session and return to normal behavior.
+description: Disable swarm mode for the current session and return to normal behavior.
 disable-model-invocation: true
 ---
 
@@ -9,6 +9,6 @@ disable-model-invocation: true
 Disable swarm mode for the current session.
 
 ## Steps
-1. If `.claude/session/swarm-mode.md` exists, delete it.
+1. If `.zcode/session/swarm-mode.md` exists, delete it.
 2. Confirm that swarm mode is now disabled.
-3. Resume normal Claude Code behavior for future tasks.
+3. Resume normal agent-runner behavior for future tasks.

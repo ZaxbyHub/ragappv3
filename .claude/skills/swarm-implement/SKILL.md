@@ -1,15 +1,15 @@
 ---
 name: swarm-implement
-description: Execute complex implementation work with a swarm-like Claude Code workflow: parallel exploration, scoped planning, selective deep validation, and independent reviewer/critic checks where risk justifies them. Use for feature work, bug fixes, refactors, and multi-file changes.
+description: Execute complex implementation work with a swarm-like workflow: parallel exploration, scoped planning, selective deep validation, and independent reviewer/critic checks where risk justifies them. Use for feature work, bug fixes, refactors, and multi-file changes.
 disable-model-invocation: true
 ---
 
 # /swarm-implement
 
-Use this skill for implementation work when you want Claude Code to behave like a fast, high-quality swarm rather than a single-threaded assistant.
+Use this skill for implementation work when you want the agent runner to behave like a fast, high-quality swarm rather than a single-threaded assistant.
 
 ## Purpose
-Complete real coding tasks across many projects while preserving Claude Code speed and adding swarm-style quality discipline.
+Complete real coding tasks across many projects while preserving the runner's native speed and adding swarm-style quality discipline.
 
 ## Core operating model
 Use this execution ladder:
@@ -163,14 +163,14 @@ Long tasks generate many candidates and reviewer/critic findings. If they live
 only in conversation context, a context compaction silently erases them and
 forces expensive re-runs. After each validation phase (post-explorer,
 post-reviewer, post-critic, pre-synthesis), persist findings to a structured
-scratch artifact (e.g. `.swarm/evidence/review-{id}/{phase}.json` — gitignored
-local working state, NOT committed). Minimum fields per finding: `finding_id`,
-`status` (PENDING/CONFIRMED/DISPROVED/PRE_EXISTING), `severity`, `file_line`,
-`evidence`, `next_action`. The canonical schema and checkpoint triggers live in
-the `swarm-pr-review` skill ("Persisting Findings to Survive Context
-Compaction") — reference it rather than duplicating. On resume after compaction,
-reload these artifacts and continue from the last checkpoint instead of
-re-dispatching explorers for already-persisted lanes.
+scratch artifact (e.g. `.zcode/session/tasks/<task-slug>/evidence.json` —
+gitignored local working state, NOT committed). Minimum fields per finding:
+`finding_id`, `status` (PENDING/CONFIRMED/DISPROVED/PRE_EXISTING), `severity`,
+`file_line`, `evidence`, `next_action`. The canonical schema and checkpoint
+triggers live in the `swarm-pr-review` skill ("Persisting Findings to Survive
+Context Compaction") — reference it rather than duplicating. On resume after
+compaction, reload these artifacts and continue from the last checkpoint
+instead of re-dispatching explorers for already-persisted lanes.
 
 ## Hard rules
 - Do not let implementation context self-approve high-risk work.

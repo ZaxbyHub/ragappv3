@@ -121,13 +121,21 @@ fallback pattern), refactor each to use `iscoroutine`.
 
 - All auth override branches in this repo use `inspect.iscoroutine` (NOT
   `isawaitable`) for the post-await check.
+  tracked_by: backend/tests/test_auth_override_async_path.py
 - A test that sets `app.dependency_overrides[get_evaluate_policy]` to a sync
   function returning `True` passes (correct fallback).
+  tracked_by: backend/tests/test_auth_override_async_path.py
 - A test that sets it to an `async def` function that calls another `async def`
   function does not break the dependency.
+  tracked_by: backend/tests/test_auth_override_async_path.py
 - The audit event for `auth.refresh_reuse_detected` is recorded with the
   proxy-aware IP from `security_audit._request_ip`, not `request.client.host`
   directly.
+  tracked_by: backend/tests/test_reverse_proxy_hardening_231.py:275
+  (companion source-text guard at :258; the refresh-reuse audit path itself
+  is exercised by `backend/tests/test_refresh_reuse_revokes_family.py` for
+  request= propagation, but that test cannot distinguish `_request_ip` from
+  raw `request.client.host` because it sets both to `127.0.0.1`.)
 
 ## Connection to other skills
 
