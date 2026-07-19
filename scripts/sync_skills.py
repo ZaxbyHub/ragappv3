@@ -107,9 +107,13 @@ PER_SKILL_CANONICAL: dict[str, str] = {
     # .agents; treat .opencode as canonical for this skill so propagation
     # preserves it rather than deleting it.
     "ci-fix-monitor": ".opencode/skills",
-    # .claude/commit-pr has runner-neutral branch-prefix guidance
-    # ("claude/ for Claude Code, codex/ for Codex") and the canonical ragappv3
-    # frontmatter (no `effort:` key); .agents still says just "codex/".
+    # .claude/commit-pr is the canonical source for the runner-neutral
+    # branch-prefix guidance ("claude/ for Claude Code, codex/ for Codex") and
+    # the ragappv3-specific 110-line body without the `effort:` key. Other trees
+    # had divergent content (.agents had a codex-only prefix; .opencode had
+    # `effort: medium` plus a different 576-line opencode-swarm body); sync
+    # propagates the .claude copy to both. Keeping .claude canonical preserves
+    # the runner-neutral wording even though all three trees now agree.
     "commit-pr": ".claude/skills",
 }
 
@@ -154,9 +158,21 @@ def all_skill_names() -> set[str]:
 
 
 def canonical_tree_for(skill: str) -> str:
-    """Pick the canonical source tree for a skill, honoring per-skill overrides."""
+    """Pick the canonical source tree for a skill, honoring per-skill overrides.
+
+    Raises a clear RuntimeError if an override names a tree that does not
+    contain the skill's SKILL.md (defends propagate() against a later
+    shutil.copytree FileNotFoundError).
+    """
     if skill in PER_SKILL_CANONICAL:
-        return PER_SKILL_CANONICAL[skill]
+        override = PER_SKILL_CANONICAL[skill]
+        if not (ROOT / override / skill / "SKILL.md").is_file():
+            raise RuntimeError(
+                f"PER_SKILL_CANONICAL[{skill!r}] = {override!r} but "
+                f"{override}/{skill}/SKILL.md does not exist. "
+                f"Either restore the override-tree copy or update PER_SKILL_CANONICAL."
+            )
+        return override
     present = [t for t in CANONICAL_PRECEDENCE if (ROOT / t / skill / "SKILL.md").is_file()]
     if not present:
         raise RuntimeError(f"canonical_tree_for called on absent skill: {skill}")

@@ -131,7 +131,11 @@ fallback pattern), refactor each to use `iscoroutine`.
 - The audit event for `auth.refresh_reuse_detected` is recorded with the
   proxy-aware IP from `security_audit._request_ip`, not `request.client.host`
   directly.
-  tracked_by: backend/tests/test_refresh_reuse_revokes_family.py
+  tracked_by: backend/tests/test_reverse_proxy_hardening_231.py:275
+  (companion source-text guard at :258; the refresh-reuse audit path itself
+  is exercised by `backend/tests/test_refresh_reuse_revokes_family.py` for
+  request= propagation, but that test cannot distinguish `_request_ip` from
+  raw `request.client.host` because it sets both to `127.0.0.1`.)
 
 ## Connection to other skills
 

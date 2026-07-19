@@ -57,10 +57,14 @@ POSITIVE_SAMPLES = (
     # exercises `**/.opencode/**` requiring correct `**` semantics (path that
     # exists today under .opencode/)
     ".opencode/skills/codebase-review-swarm/README.md",
+    # exercises `package-lock.json` basename-match at any depth (a real
+    # lockfile under frontend/)
+    "frontend/package-lock.json",
 )
 
 # Adversarial negative samples — each MUST NOT match any pattern. Chosen to
-# exercise `**` segment boundaries: a naive prefix or substring matcher fails.
+# exercise `**` segment boundaries, leading-slash anchoring, and char-class
+# handling: a naive prefix/substring/literal matcher fails.
 # Note: these deliberately use a non-.md extension to avoid matching the
 # broad `**/*.md` ignore line (which legitimately catches any .md file).
 NEGATIVE_SAMPLES = (
@@ -70,6 +74,15 @@ NEGATIVE_SAMPLES = (
     "backend/tests_something/main.py",
     # must NOT match `**/.claude/**` (segment boundary)
     ".claude_backup/foo.py",
+    # Regression guard for PRR-004: if a future .secretscanignore line uses
+    # interior `**/` (e.g. `backend/**/fixtures/scary.txt`), this sample must
+    # NOT match it (no such pattern today; sample proves the matcher respects
+    # segment boundaries if one is added).
+    "backend/app/scary_fixtures.txt",
+    # Regression guard for PRR-007: if a future pattern uses a char class
+    # (e.g. `[abc].txt`), this sample must NOT match (proves `d` is excluded).
+    # No current pattern uses classes; sample is forward-defense.
+    "d.txt",
 )
 
 OVERLY_BROAD_FRACTION = 0.50
@@ -109,21 +122,26 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
     """Convert a gitignore-style glob to a regex matching the WHOLE path.
 
     Supports:
-      **  matches any number of characters including path separators
-          (i.e. any number of path segments, including zero). Used as
-          `**/foo` (anywhere), `foo/**` (descendants of foo), or
-          `a/**/b` (zero or more segments between a and b).
+      **  matches any number of whole path segments (including zero). Forms:
+            **/foo   foo at any depth (including root)
+            foo/**   any descendant of foo (including zero segments)
+            a/**/b   b under a with zero or more intermediate segments
+                    (`a/b`, `a/x/b`, `a/x/y/b` match; `a/xb` does NOT)
       *   matches any characters except a path separator
       ?   matches a single non-separator character
+      [abc] / [a-z]   character class (one char from the set)
+      [!abc]          negated character class
       everything else is literal
 
     Patterns with no internal slash match the basename of any path
-    (gitignore semantics). Patterns containing a slash match against the
-    full path anchored at the root. Trailing `/` on a pattern matches a
+    (gitignore semantics). Patterns containing a slash (or a leading slash)
+    match against the full path anchored at the root: `/foo` matches only
+    root-level `foo`, not `a/foo`. Trailing `/` on a pattern matches a
     directory and all its descendants.
     """
     p = pattern
-    p = p[1:] if p.startswith("/") else p
+    leading_slash = p.startswith("/")
+    p = p[1:] if leading_slash else p
 
     leading_doublestar = False
     if p.startswith("**/"):
@@ -140,9 +158,11 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
         # `**/` at the start matches any leading path including the empty prefix.
         # `a`, `x/a`, `x/y/a` all match `**/a`.
         out.append(r"(?:.*/)?")
-    elif "/" not in p:
-        # No slash anywhere in the pattern: gitignore matches the basename at
-        # any depth. e.g. `package-lock.json` matches `frontend/package-lock.json`.
+    elif not leading_slash and "/" not in p:
+        # No slash anywhere in pattern AND no leading slash: gitignore matches
+        # the basename at any depth (e.g. `package-lock.json` matches
+        # `frontend/package-lock.json`). A leading slash (`/foo`) anchors to
+        # the root only and does NOT get this basename-depth fallback.
         out.append(r"(?:.*/)?")
 
     i = 0
@@ -150,13 +170,37 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
         c = p[i]
         if c == "*":
             if i + 1 < len(p) and p[i + 1] == "*":
-                # `**` matches any chars including separators. Consume a
-                # following slash so `/**/` becomes `/.*/` (and `/**` end
-                # becomes `.*`), matching zero or more segments.
-                out.append(r".*")
-                i += 2
-                if i < len(p) and p[i] == "/":
-                    i += 1
+                # Determine whether this `**` is segment-delimited on both
+                # sides (the only case where gitignore grants it cross-segment
+                # power). Otherwise treat as two single `*`.
+                before_slash = i == 0 or p[i - 1] == "/"
+                after_idx = i + 2
+                # `**` at the END of the pattern matches any descendant path
+                # (including files, not just directories). `**` followed by `/`
+                # matches zero or more whole segments.
+                at_end = after_idx >= len(p)
+                after_slash = at_end or p[after_idx] == "/"
+                if before_slash and after_slash:
+                    if at_end:
+                        # Trailing `**` after a slash (e.g. `backend/tests/**`):
+                        # the slash is already in the pattern, so emit `.*` to
+                        # match any descendant path including files. Matches
+                        # `backend/tests/conftest.py`, `backend/tests/x/y.py`.
+                        out.append(r".*")
+                        i += 2
+                        continue
+                    # `/**/` between literals: zero or more whole segments.
+                    # Emit `(?:[^/]+/)*` so `a/**/b` matches `a/b`, `a/x/b`,
+                    # `a/x/y/b` but NOT `a/xb`. Consume the following slash.
+                    out.append(r"(?:[^/]+/)*")
+                    i += 2
+                    if i < len(p) and p[i] == "/":
+                        i += 1
+                    continue
+                # `**` not segment-delimited: treat as greedy single-segment
+                # `[^/]*` (rare in real gitignore files; defensive).
+                out.append(r"[^/]*")
+                i += 1
                 continue
             out.append(r"[^/]*")
             i += 1
@@ -164,6 +208,25 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
         if c == "?":
             out.append(r"[^/]")
             i += 1
+            continue
+        if c == "[":
+            # Character class: parse until matching `]`. Support `[!...]`
+            # negation per gitignore. If no closing `]`, treat `[` as literal.
+            close = p.find("]", i + 1)
+            if close == -1:
+                out.append(re.escape(c))
+                i += 1
+                continue
+            body = p[i + 1 : close]
+            negate = body.startswith("!")
+            if negate:
+                body = body[1:]
+            # Translate gitignore char-class body to regex char-class body.
+            # `]` is already consumed; no escaping needed inside a char class
+            # except backslash. Range expressions (`a-z`) pass through.
+            prefix = "^" if negate else ""
+            out.append("[" + prefix + body + "]")
+            i = close + 1
             continue
         out.append(re.escape(c))
         i += 1
@@ -253,30 +316,49 @@ def main() -> int:
     # patterns are exempt. Patterns containing wildcards are inherently
     # defensive (they describe shape classes, not specific paths); only warn on
     # literal-path patterns (no `*`, no `?`) that point at something which does
-    # not exist, AND on `<dir>/**` patterns where the leading directory does not
-    # exist. Those are the only stale candidates we can detect with confidence
-    # (e.g. `.swarm/**` is caught because `.swarm/` does not exist).
+    # not exist, AND on `<dir>/**` patterns where the named directory does not
+    # exist anywhere under ROOT. Those are the only stale candidates we can
+    # detect with confidence (e.g. `.swarm/**` is caught because no `.swarm/`
+    # directory exists anywhere).
     if candidates:
+        # Cache on-disk directory paths (relative posix) once. Used to decide
+        # whether a `<dir>/**` pattern targets a directory that exists at any
+        # depth. We match the pattern itself against these paths via the same
+        # glob_to_regex the validator uses elsewhere — no ad-hoc last-segment
+        # heuristics.
+        on_disk_dirs = [
+            p.relative_to(ROOT).as_posix()
+            for p in ROOT.rglob("*")
+            if p.is_dir() and ".git" not in p.parts
+        ]
         for line_no, _raw, glob, is_defensive in patterns:
             if is_defensive:
                 continue
             if "*" in glob or "?" in glob:
-                # Special-case: `<dir>/**` where <dir> is a literal directory
-                # that does not exist on disk at all (strip a leading `**/`
-                # before testing so `**/.opencode/**` resolves to `.opencode/`).
+                # Special-case: `<dir>/**` (possibly with a leading `**/`).
+                # Treat the glob as a directory-targeting pattern and test it
+                # against on-disk directory paths. If no directory matches,
+                # the pattern is stale.
                 if glob.endswith("/**"):
-                    head = glob[:-3]
-                    if head.startswith("**/"):
-                        head = head[3:]
-                    # `a/**/b/**` is too complex; skip the directory-existence
-                    # check when any other wildcard remains.
-                    if "*" not in head and "?" not in head and head:
-                        if not (ROOT / head).exists():
-                            _print(
-                                f"secretscan: warning line {line_no} pattern "
-                                f"{glob!r} targets nonexistent directory "
-                                f"{head!r} (stale)"
-                            )
+                    # Build a directory-matching glob: `foo/**` -> `foo` and
+                    # `foo/*` (descendant dirs); `**/foo/**` -> `foo` at any
+                    # depth. Use glob_to_regex on a synthesized "directory or
+                    # descendant directory" form.
+                    dir_glob = glob[:-3]  # strip the trailing `/**`
+                    # Match either the dir itself or any descendant dir.
+                    dir_regex = glob_to_regex(dir_glob + "/**")
+                    # Also match the directory itself (no trailing slash).
+                    self_regex = glob_to_regex(dir_glob)
+                    anywhere = any(
+                        dir_regex.match(d + "/") or self_regex.match(d)
+                        for d in on_disk_dirs
+                    )
+                    if not anywhere:
+                        _print(
+                            f"secretscan: warning line {line_no} pattern "
+                            f"{glob!r} targets nonexistent directory "
+                            f"(stale)"
+                        )
                 continue
             regex = glob_to_regex(glob)
             if not any(regex.match(c) for c in candidates):

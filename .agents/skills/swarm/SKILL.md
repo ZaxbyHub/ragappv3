@@ -75,7 +75,9 @@ Lower-risk work can use a lighter path if evidence is strong:
 - isolated low-risk cleanup with no behavior change
 
 ## Enablement steps
-1. Create `.zcode/session/` if it does not exist.
+1. Create `.zcode/session/` if it does not exist. (For this repo's primary
+   runner, ZCode, the session dir is `.zcode/session/`. A secondary runner
+   with a different session-dir convention should adapt this path.)
 2. Create or overwrite `.zcode/session/swarm-mode.md` with the exact content below.
 3. Confirm that swarm mode is now enabled for this session.
 4. For the user's next complex task, follow the swarm-mode contract automatically unless the user disables it.

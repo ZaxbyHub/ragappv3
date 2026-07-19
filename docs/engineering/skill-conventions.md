@@ -43,10 +43,28 @@ edited in one tree but not the others, or present in two trees but missing
 from the third) without forcing every tree to carry every other runner's
 single-tree skills.
 
-Per-tree description wording differences are forbidden for non-adapter
-repo-specific skills. Use runner-neutral phrasing such as "the agent runner"
-or "the current session" rather than naming a specific runner ("Claude Code",
-"Codex", "opencode-swarm"). This keeps the skill portable and avoids drift.
+Per-tree **frontmatter `description:`** wording differences are forbidden for
+non-adapter repo-specific skills. Use runner-neutral phrasing such as "the
+agent runner" or "the current session" rather than naming a specific runner
+("Claude Code", "Codex", "opencode-swarm"). This keeps the skill portable and
+avoids drift.
+
+**Body-level references are scoped differently.** A skill body may legitimately
+name the primary runner's actual runtime paths (for example
+`.zcode/session/swarm-mode.md` for this repo's primary runner, ZCode) when
+that path is the real file the skill writes. Two rules govern body paths:
+
+1. The path must be **the actual runtime file** for this repo's primary runner
+   (verifiable on disk — e.g. `.zcode/session/swarm-mode.md` exists).
+2. The path must be **identical across all three trees** (so the mirror rule's
+   byte-identical requirement holds). Per-runner portability is a secondary
+   concern; if a secondary runner (Claude Code, Codex, opencode-swarm) needs
+   a different session path, that's a follow-up adaptation the secondary
+   runner's plugin can make, not a violation of this spec.
+
+When a body path is primary-runner-specific, prefer adding a one-line comment
+naming the runner ("for this repo's primary runner, ZCode") so a future
+contributor doesn't read it as universal.
 
 ## Canonical-tree precedence
 
