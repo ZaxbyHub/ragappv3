@@ -50,27 +50,51 @@ REFRESH_TOKEN_COOKIE_NAME = "refresh_token"
 REFRESH_TOKEN_MAX_AGE_DAYS = 30
 
 
-def _record_failed_attempt_db(
-    db,
-    user_id: int,
-    failed_attempts: int,
-) -> None:
+def _record_failed_attempt_db(db, user_id: int) -> int:
     """Record a failed login attempt and lock out the account if threshold reached.
 
-    Executes in a single transaction with rollback on failure.
+    F-2.4 (#393): re-reads ``failed_attempts`` inside ``BEGIN IMMEDIATE`` after
+    the atomic UPDATE so concurrent incrementers cannot bypass the lockout
+    threshold on a stale snapshot. Executes in a single transaction with
+    rollback on failure.
+
+    Returns the fresh post-increment ``failed_attempts`` count so the caller
+    can choose an accurate HTTP status for the trip request (401 vs 423)
+    without re-reading — the stale caller-snapshotted value cannot be trusted
+    under concurrency.
     """
     try:
+        # Clear any dangling implicit transaction (e.g., from the login SELECT).
+        if db.in_transaction:
+            db.rollback()
+        db.execute("BEGIN IMMEDIATE")
         db.execute(
             "UPDATE users SET failed_attempts = failed_attempts + 1 WHERE id = ?",
             (user_id,),
         )
-        if failed_attempts + 1 >= 5:
+        # F-2.4: re-read the post-UPDATE value under the write lock before
+        # deciding whether to set locked_until. The stale caller-snapshotted
+        # value is intentionally ignored — concurrent failed logins can each
+        # observe a stale read of N and skip lockout even at >= 5 attempts.
+        # PRR-002: guard the None case — if the user row was deleted between
+        # the login SELECT and this re-read (concurrent superadmin delete),
+        # fetchone() returns None. Roll back the no-op UPDATE and return 0 so
+        # the caller issues a generic 401 rather than a TypeError → 500.
+        row = db.execute(
+            "SELECT failed_attempts FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            db.rollback()
+            return 0
+        fresh = row[0]
+        if fresh >= 5:
             lockout_until = datetime.now(timezone.utc) + timedelta(minutes=15)
             db.execute(
                 "UPDATE users SET locked_until = ? WHERE id = ?",
                 (lockout_until.isoformat(), user_id),
             )
         db.commit()
+        return fresh
     except Exception:
         db.rollback()
         raise
@@ -251,34 +275,68 @@ async def register(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Check username uniqueness (case-insensitive)
-    existing = await asyncio.to_thread(
-        lambda: db.execute(
-            "SELECT id FROM users WHERE username = ? COLLATE NOCASE", (body.username,)
-        ).fetchone()
-    )
-    if existing:
-        raise HTTPException(status_code=409, detail="Username already exists")
+    # Check username uniqueness (case-insensitive) — performed INSIDE the
+    # BEGIN IMMEDIATE transaction below (F-2.1, #393) so concurrent
+    # registrations of the same username get a clean 409 instead of racing
+    # the pre-check SELECT and surfacing an IntegrityError as HTTP 500.
 
     hashed_pw = await async_hash_password(body.password)
+
+    # F-2.3 (#393): hoist refresh-token + cookie inputs above _register_db so
+    # they are in closure scope when the session INSERT is merged into the
+    # same transaction as the user INSERT. These are pure computations
+    # independent of the transaction; if the transaction rolls back, the
+    # generated hashes are simply discarded.
+    user_agent = request.headers.get("user-agent", "")
+    refresh_token_raw, refresh_token_hash = create_refresh_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
+    ip_address = _request_ip(request)
 
     try:
         def _register_db():
             try:
-                # Clear any dangling implicit transaction from the outer SELECT check
+                # Clear any dangling implicit transaction from a prior SELECT.
                 if db.in_transaction:
                     db.rollback()
                 db.execute("BEGIN IMMEDIATE")
+                # F-2.1: uniqueness check INSIDE the write lock so concurrent
+                # registrations cannot both pass the check before either
+                # acquires BEGIN IMMEDIATE.
+                existing = db.execute(
+                    "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
+                    (body.username,),
+                ).fetchone()
+                if existing:
+                    db.rollback()
+                    raise HTTPException(status_code=409, detail="Username already exists")
                 # Atomic: count read and insert are in the same transaction
                 user_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
                 role = "superadmin" if user_count == 0 else "member"
-                user_id = db.execute(
-                    "INSERT INTO users (username, hashed_password, full_name, role, is_active) VALUES (?, ?, ?, ?, 1)",
-                    (body.username, hashed_pw, body.full_name, role),
-                ).lastrowid
+                try:
+                    user_id = db.execute(
+                        "INSERT INTO users (username, hashed_password, full_name, role, is_active) VALUES (?, ?, ?, ?, 1)",
+                        (body.username, hashed_pw, body.full_name, role),
+                    ).lastrowid
+                except sqlite3.IntegrityError:
+                    # F-2.1 defense-in-depth: a concurrent INSERT that landed
+                    # between our in-txn SELECT and INSERT (cannot happen
+                    # under a single BEGIN IMMEDIATE writer, but cheap
+                    # insurance). Narrow to the user INSERT only so vault /
+                    # session IntegrityErrors are not mislabeled.
+                    db.rollback()
+                    raise HTTPException(status_code=409, detail="Username already exists")
                 assign_user_to_default_vault(db, user_id)
+                # F-2.3: session INSERT in the SAME transaction as the user
+                # INSERT so a crash between cannot leave a registered user
+                # with no login session.
+                db.execute(
+                    "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, refresh_token_hash, expires_at.isoformat(), ip_address, user_agent),
+                )
                 db.commit()
                 return user_id, role
+            except HTTPException:
+                raise
             except Exception:
                 try:
                     db.rollback()
@@ -287,40 +345,19 @@ async def register(
                 raise
 
         user_id, role = await asyncio.to_thread(_register_db)
+    except HTTPException:
+        # F-2.1: let the 409 from _register_db propagate unchanged. Without
+        # this branch the broad `except Exception` below would convert the
+        # 409 into a 500 (HTTPException is a subclass of Exception).
+        raise
     except Exception:
         logger.error("Failed to create user with default assignments", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
-    # Create tokens for auto-login
-    user_agent = request.headers.get("user-agent", "")
+    # Create access token for auto-login (depends on user_id/role from above).
     access_token = create_access_token(
         user_id, body.username, role, client_fingerprint=compute_client_fingerprint(user_agent)
     )
-    refresh_token_raw, refresh_token_hash = create_refresh_token()
-
-    # Store refresh token session
-    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
-    ip_address = _request_ip(request)
-
-    try:
-        def _register_session_db():
-            try:
-                db.execute(
-                    "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, refresh_token_hash, expires_at.isoformat(), ip_address, user_agent),
-                )
-                db.commit()
-            except Exception:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-                raise
-
-        await asyncio.to_thread(_register_session_db)
-    except Exception:
-        logger.error("Failed to create session", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
     # Set refresh token cookie
     response.set_cookie(
@@ -434,7 +471,15 @@ async def login(
             )
 
     if not await async_verify_password(body.password, hashed_pw):
-        await asyncio.to_thread(_record_failed_attempt_db, db, user_id, failed_attempts)
+        # F-2.4: use the fresh post-increment count returned by
+        # _record_failed_attempt_db (re-read under BEGIN IMMEDIATE) for both
+        # the audit metadata and the trip-response status. The stale
+        # ``failed_attempts`` snapshot read before any lock cannot be trusted
+        # under concurrency — using it could return 401 for the very request
+        # that trips the lockout (DB counter already at 5).
+        fresh_failed_attempts = await asyncio.to_thread(
+            _record_failed_attempt_db, db, user_id
+        )
         await safe_record_security_event(
             db,
             event_type="auth.login_failed",
@@ -443,10 +488,10 @@ async def login(
             request=request,
             metadata={
                 "reason": "bad_password",
-                "failed_attempts": failed_attempts + 1,
+                "failed_attempts": fresh_failed_attempts,
             },
         )
-        if failed_attempts + 1 >= 5:
+        if fresh_failed_attempts >= 5:
             raise HTTPException(
                 status_code=423,
                 detail="Account locked due to too many failed attempts. Try again in 15 minutes.",
@@ -836,6 +881,16 @@ async def change_password(
     new_hashed_pw = await async_hash_password(body.new_password)
     new_epoch = datetime.now(timezone.utc).timestamp()
 
+    # F-2.2 (#393): hoist refresh-token + cookie inputs above _change_password_db
+    # so they are in closure scope when the new-session INSERT is merged into
+    # the same transaction as the password UPDATE + session DELETE. These are
+    # pure computations independent of the transaction; if the transaction
+    # rolls back, the generated hashes are simply discarded.
+    user_agent = request.headers.get("user-agent", "")
+    ip_address = _request_ip(request)
+    refresh_token_raw, refresh_token_hash = create_refresh_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
+
     # Update password, clear must_change_password, bump password_changed_at epoch (FR-007)
     # and revoke all sessions in a transaction
     try:
@@ -849,11 +904,19 @@ async def change_password(
                     "DELETE FROM user_sessions WHERE user_id = ?",
                     (user_id,),
                 )
+                # F-2.2: new-session INSERT in the SAME transaction as the
+                # password UPDATE + old-session DELETE, so a crash between
+                # cannot leave the user with a changed password and no valid
+                # session (old sessions deleted, new one never committed).
+                # Include ip_address/user_agent for audit-trail parity with
+                # the register and login session INSERTs (PRR-005).
                 db.execute(
-                    "UPDATE users SET must_change_password = 0 WHERE id = ?",
-                    (user_id,),
+                    "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at, ip_address, user_agent) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, refresh_token_hash, expires_at.isoformat(), ip_address, user_agent),
                 )
                 db.commit()
+            except HTTPException:
+                raise
             except Exception:
                 try:
                     db.rollback()
@@ -862,6 +925,12 @@ async def change_password(
                 raise
 
         await asyncio.to_thread(_change_password_db)
+    except HTTPException:
+        # PRR-003: let any HTTPException from inside _change_password_db
+        # propagate unchanged, mirroring the register handler's F-2.1 shim.
+        # Without this branch the broad `except Exception` below would
+        # convert it to 500 (HTTPException is a subclass of Exception).
+        raise
     except Exception:
         logger.error("Failed to change password", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
@@ -877,35 +946,10 @@ async def change_password(
         metadata={"sessions_revoked": True},
     )
 
-    # Generate new tokens
-    user_agent = request.headers.get("user-agent", "")
+    # Generate new access token (username/role/user_id already in scope).
     access_token = create_access_token(
         user_id, username, role, client_fingerprint=compute_client_fingerprint(user_agent)
     )
-    refresh_token_raw, refresh_token_hash = create_refresh_token()
-
-    # Store new refresh token session
-    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_MAX_AGE_DAYS)
-
-    try:
-        def _create_session_db():
-            try:
-                db.execute(
-                    "INSERT INTO user_sessions (user_id, refresh_token_hash, expires_at) VALUES (?, ?, ?)",
-                    (user_id, refresh_token_hash, expires_at.isoformat()),
-                )
-                db.commit()
-            except Exception:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-                raise
-
-        await asyncio.to_thread(_create_session_db)
-    except Exception:
-        logger.error("Failed to create new session", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal error occurred. Please try again later.")
 
     # Set httpOnly refresh cookie
     response.set_cookie(

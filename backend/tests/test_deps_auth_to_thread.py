@@ -255,14 +255,21 @@ class TestAuthSourceInspection(unittest.TestCase):
     """Verify auth.py route handlers use asyncio.to_thread via source inspection."""
 
     def test_register_uses_to_thread(self):
-        """register endpoint wraps SQLite calls in asyncio.to_thread."""
+        """register endpoint wraps SQLite calls in asyncio.to_thread.
+
+        Note: prior to #393 (F-2.1/F-2.3), register had 3 to_thread calls
+        (uniqueness pre-check SELECT, user INSERT txn, session INSERT txn).
+        The uniqueness check moved inside the BEGIN IMMEDIATE transaction
+        and the session INSERT was merged into the same transaction, leaving
+        a single to_thread call wrapping the whole atomic block.
+        """
         from app.api.routes import auth
 
         source = get_function_source(auth, 'register')
         self.assertIsNotNone(source)
         self.assertIn('asyncio.to_thread', source)
         count = count_to_thread_calls(source)
-        self.assertGreaterEqual(count, 2, f"Expected at least 2, got {count}")
+        self.assertGreaterEqual(count, 1, f"Expected at least 1, got {count}")
 
     def test_register_no_async_in_to_thread(self):
         """register does NOT pass async functions to to_thread."""
@@ -424,13 +431,20 @@ class TestLambdaPattern(unittest.TestCase):
         self.assertIsNotNone(source)
         self.assertIn('rollback', source.lower())
 
-    def test_register_uses_lambda_pattern(self):
-        """register has db operations inside lambdas passed to to_thread."""
+    def test_register_uses_to_thread_pattern(self):
+        """register has db operations inside a def passed to to_thread.
+
+        Note: prior to #393 (F-2.1), register also had a lambda-wrapped
+        uniqueness pre-check; that SELECT was moved inside the BEGIN
+        IMMEDIATE transaction and the lambda was removed. The invariant
+        under test is 'DB operations run off the event loop via to_thread',
+        not the specific use of lambda.
+        """
         from app.api.routes import auth
 
         source = get_function_source(auth, 'register')
         self.assertIsNotNone(source)
-        self.assertIn('lambda', source.lower())
+        self.assertIn('to_thread', source)
 
     def test_login_uses_lambda_pattern(self):
         """login has db operations inside lambdas passed to to_thread."""
@@ -457,13 +471,20 @@ class TestToThreadCallCounts(unittest.TestCase):
     """Verify minimum to_thread call counts per endpoint via source inspection."""
 
     def test_register_minimum_to_thread_calls(self):
-        """register should have at least 3 to_thread calls."""
+        """register should have at least 1 to_thread call.
+
+        Note: prior to #393 (F-2.1/F-2.3), register had 3 to_thread calls
+        (uniqueness pre-check SELECT, user INSERT, session INSERT). The
+        uniqueness check moved inside the BEGIN IMMEDIATE transaction and
+        the session INSERT was merged into the same transaction, leaving a
+        single to_thread call wrapping the whole atomic block.
+        """
         from app.api.routes import auth
 
         source = get_function_source(auth, 'register')
         self.assertIsNotNone(source)
         count = count_to_thread_calls(source)
-        self.assertGreaterEqual(count, 3, f"Expected at least 3, got {count}")
+        self.assertGreaterEqual(count, 1, f"Expected at least 1, got {count}")
 
     def test_login_minimum_to_thread_calls(self):
         """login should have at least 2 to_thread calls."""
@@ -475,13 +496,19 @@ class TestToThreadCallCounts(unittest.TestCase):
         self.assertGreaterEqual(count, 2, f"Expected at least 2, got {count}")
 
     def test_change_password_minimum_to_thread_calls(self):
-        """change_password should have at least 3 to_thread calls."""
+        """change_password should have at least 2 to_thread calls.
+
+        Note: prior to #393 (F-2.2), change_password had 3 to_thread calls
+        (fetch current hash, change-password txn, new-session INSERT txn).
+        The new-session INSERT was merged into the change-password
+        transaction, leaving the fetch + the atomic change block.
+        """
         from app.api.routes import auth
 
         source = get_function_source(auth, 'change_password')
         self.assertIsNotNone(source)
         count = count_to_thread_calls(source)
-        self.assertGreaterEqual(count, 3, f"Expected at least 3, got {count}")
+        self.assertGreaterEqual(count, 2, f"Expected at least 2, got {count}")
 
 
 # =============================================================================
