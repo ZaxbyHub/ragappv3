@@ -8,6 +8,7 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
 from app.config import settings
+from app.limiter import limiter
 from app.security import CSRFManager, csrf_protect, issue_csrf_token
 from app.services.ssrf import URLBlocked, assert_url_safe
 from app.services.ssrf_transport import SSRFSafeTransport
@@ -891,8 +892,9 @@ def get_settings(
     return SettingsResponse.model_validate(settings_dict)
 
 
-@router.post("/settings/", include_in_schema=False)
-@router.post("/settings")
+@router.post("/settings/", response_model=SettingsResponse, include_in_schema=False)
+@router.post("/settings", response_model=SettingsResponse)
+@limiter.limit(settings.admin_rate_limit)
 def post_settings(
     update: SettingsUpdate,
     request: Request,
@@ -913,8 +915,9 @@ def post_settings(
     return result
 
 
-@router.put("/settings/", include_in_schema=False)
-@router.put("/settings")
+@router.put("/settings/", response_model=SettingsResponse, include_in_schema=False)
+@router.put("/settings", response_model=SettingsResponse)
+@limiter.limit(settings.admin_rate_limit)
 def put_settings(
     update: SettingsUpdate,
     request: Request,

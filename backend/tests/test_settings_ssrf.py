@@ -508,6 +508,37 @@ class TestEmbeddingUrlSettingsGate(unittest.TestCase):
 class TestChatUrlSettingsGate(unittest.TestCase):
     """Regression coverage for validating chat URLs before partial writes."""
 
+    def _make_request(self, thinking_llm_client, instant_llm_client):
+        """Build a request stand-in that satisfies the @limiter.limit wrapper.
+
+        ``post_settings`` and ``put_settings`` are decorated with
+        ``@limiter.limit(...)``, whose wrapper validates that the ``request``
+        argument ``isinstance(request, starlette.requests.Request)`` before the
+        handler body runs. These tests call the handlers directly (not via
+        TestClient) with a hand-rolled request, so the stand-in must pass that
+        isinstance check. A ``MagicMock(spec=Request)`` does so while still
+        allowing free attribute access for ``request.app.state``.
+
+        Pre-setting ``request.state._rate_limiting_complete = True`` makes
+        slowapi skip its ``_check_request_limit`` call: these tests exercise
+        SSRF rejection, not rate limiting, and would otherwise consume quota
+        from the shared in-memory limiter.
+        """
+        from starlette.datastructures import State
+        from starlette.requests import Request
+
+        request = MagicMock(spec=Request)
+        state = State()
+        state.thinking_llm_client = thinking_llm_client
+        state.instant_llm_client = instant_llm_client
+        request.app.state = state
+        # Skip the rate-limit count (these tests exercise SSRF rejection, not
+        # rate limiting) and pre-set the post-response header-injection target
+        # so the helper is safe to reuse for successful handler calls too.
+        request.state._rate_limiting_complete = True
+        request.state.view_rate_limit = None
+        return request
+
     def _make_settings_conn(self, key: str, value: str):
         import json
         import sqlite3
@@ -537,8 +568,6 @@ class TestChatUrlSettingsGate(unittest.TestCase):
         return json.loads(row[0])
 
     def test_post_settings_rejects_chat_url_before_mutation_or_persistence(self):
-        from types import SimpleNamespace
-
         from fastapi import HTTPException
 
         from app.api.routes.settings import SettingsUpdate, post_settings
@@ -549,13 +578,8 @@ class TestChatUrlSettingsGate(unittest.TestCase):
         original_live = live_settings.ollama_chat_url
         conn = self._make_settings_conn("ollama_chat_url", existing_url)
         fake_client = MagicMock()
-        request = SimpleNamespace(
-            app=SimpleNamespace(
-                state=SimpleNamespace(
-                    thinking_llm_client=fake_client,
-                    instant_llm_client=None,
-                )
-            )
+        request = self._make_request(
+            thinking_llm_client=fake_client, instant_llm_client=None
         )
         update = SettingsUpdate(ollama_chat_url=rejected_url)
 
@@ -572,8 +596,6 @@ class TestChatUrlSettingsGate(unittest.TestCase):
             conn.close()
 
     def test_put_settings_rejects_instant_url_before_mutation_or_persistence(self):
-        from types import SimpleNamespace
-
         from fastapi import HTTPException
 
         from app.api.routes.settings import SettingsUpdate, put_settings
@@ -584,13 +606,8 @@ class TestChatUrlSettingsGate(unittest.TestCase):
         original_live = live_settings.instant_chat_url
         conn = self._make_settings_conn("instant_chat_url", existing_url)
         fake_client = MagicMock()
-        request = SimpleNamespace(
-            app=SimpleNamespace(
-                state=SimpleNamespace(
-                    thinking_llm_client=None,
-                    instant_llm_client=fake_client,
-                )
-            )
+        request = self._make_request(
+            thinking_llm_client=None, instant_llm_client=fake_client
         )
         update = SettingsUpdate(instant_chat_url=rejected_url)
 
@@ -607,8 +624,6 @@ class TestChatUrlSettingsGate(unittest.TestCase):
             conn.close()
 
     def test_post_settings_persistence_failure_does_not_mutate_or_rebind(self):
-        from types import SimpleNamespace
-
         from app.api.routes.settings import SettingsUpdate, post_settings
         from app.config import settings as live_settings
 
@@ -625,13 +640,8 @@ class TestChatUrlSettingsGate(unittest.TestCase):
         original_top_k = live_settings.retrieval_top_k
         original_model = live_settings.chat_model
         fake_client = MagicMock()
-        request = SimpleNamespace(
-            app=SimpleNamespace(
-                state=SimpleNamespace(
-                    thinking_llm_client=fake_client,
-                    instant_llm_client=None,
-                )
-            )
+        request = self._make_request(
+            thinking_llm_client=fake_client, instant_llm_client=None
         )
         update = SettingsUpdate(
             retrieval_top_k=original_top_k + 1,
@@ -650,8 +660,6 @@ class TestChatUrlSettingsGate(unittest.TestCase):
             live_settings.chat_model = original_model
 
     def test_post_settings_mid_persist_failure_rolls_back_partial_writes(self):
-        from types import SimpleNamespace
-
         from app.api.routes.settings import SettingsUpdate, post_settings
         from app.config import settings as live_settings
 
@@ -689,13 +697,8 @@ class TestChatUrlSettingsGate(unittest.TestCase):
         original_model = live_settings.chat_model
         failing_conn = FailingAfterFirstWrite()
         fake_client = MagicMock()
-        request = SimpleNamespace(
-            app=SimpleNamespace(
-                state=SimpleNamespace(
-                    thinking_llm_client=fake_client,
-                    instant_llm_client=None,
-                )
-            )
+        request = self._make_request(
+            thinking_llm_client=fake_client, instant_llm_client=None
         )
         update = SettingsUpdate(
             retrieval_top_k=original_top_k + 1,

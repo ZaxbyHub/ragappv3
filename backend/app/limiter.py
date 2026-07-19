@@ -69,10 +69,40 @@ class WhitelistLimiter(Limiter):
         endpoint_func: Optional[Callable[..., Any]],
         in_middleware: bool = True,
     ) -> None:
-        """Skip rate limiting if the request is whitelisted."""
+        """Skip rate limiting if the request is whitelisted.
+
+        Also normalize the scope path so that trailing-slash and non-slash
+        variants of the SAME route share one rate-limit bucket. slowapi uses
+        ``request["path"]`` verbatim as the bucket key when ``key_style="url"``
+        (the default), so without normalization a route registered as both
+        ``/api/settings`` and ``/api/settings/`` gets two independent buckets —
+        letting a client double the effective limit by alternating paths. This
+        mirrors the path normalization already applied by the maintenance and
+        main middlewares (``.rstrip("/")`` or ``"/"``). The swap is scoped to
+        this method only (restored in ``finally``) so handlers still see their
+        original path; routing has already completed before this runs.
+        """
         if _should_whitelist(request):
             return
-        super()._check_request_limit(request, endpoint_func, in_middleware)
+        # Normalize the scope path so trailing-slash and non-slash variants of
+        # the SAME route share one rate-limit bucket (see class docstring). Guard
+        # against request stand-ins that don't expose a real scope dict (e.g.
+        # MagicMock(spec=Request) in direct-call unit tests): in that case skip
+        # normalization and delegate unchanged.
+        scope = getattr(request, "scope", None)
+        original_path = scope.get("path") if isinstance(scope, dict) else None
+        normalized = (
+            (original_path.rstrip("/") or "/")
+            if original_path
+            else original_path
+        )
+        if original_path != normalized and isinstance(scope, dict):
+            scope["path"] = normalized
+        try:
+            super()._check_request_limit(request, endpoint_func, in_middleware)
+        finally:
+            if original_path != normalized and isinstance(scope, dict):
+                scope["path"] = original_path
 
 
 def _resolve_storage_uri(redis_url: str) -> str:
@@ -130,13 +160,28 @@ def build_limiter(redis_url: str) -> WhitelistLimiter:
             "Rate limiter wired to Redis for shared counters: %s",
             redact_url(storage_uri),
         )
-    return WhitelistLimiter(
+    limiter_instance = WhitelistLimiter(
         key_func=get_client_ip,
         storage_uri=storage_uri,
         # Only meaningful with a real (non-memory) backend. With memory://
         # (CI / empty REDIS_URL) no fallback limiter is constructed.
         in_memory_fallback_enabled=storage_uri != "memory://",
+        # Passed here for documentation; see the force assignment below for why
+        # this alone is not sufficient.
+        headers_enabled=False,
     )
+    # The rate-limited route handlers in this codebase do NOT declare a
+    # ``response: Response`` parameter, so slowapi's ``_inject_headers``
+    # post-response path would raise "parameter `response` must be an instance
+    # of starlette.responses.Response" if headers were ever enabled. slowapi's
+    # __init__ ORs the constructor value with the RATELIMIT_HEADERS_ENABLED env
+    # var, so passing headers_enabled=False above does NOT prevent an operator
+    # from enabling headers via env. Forcing the attribute here overrides both
+    # paths; enabling headers later requires a code change to this line AND an
+    # audit of every rate-limited handler (chat, search, vaults, memories,
+    # documents, settings, auth) to add the Response param first.
+    limiter_instance._headers_enabled = False
+    return limiter_instance
 
 
 # Create the limiter instance
