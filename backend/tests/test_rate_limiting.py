@@ -1094,6 +1094,24 @@ class TestStorageUriWiring(unittest.TestCase):
 
         self.assertIsInstance(limiter, WhitelistLimiter)
 
+    def test_build_limiter_forces_headers_disabled_even_with_env_var(self):
+        """build_limiter must force _headers_enabled=False AFTER construction
+        so the RATELIMIT_HEADERS_ENABLED env var cannot re-enable headers
+        (PRR-014). The rate-limited handlers in this codebase do NOT declare
+        a ``response: Response`` parameter, so slowapi's _inject_headers
+        post-response path would raise if headers were enabled. slowapi's
+        __init__ ORs the constructor value with the env var, so the force
+        assignment is the only thing that defeats the OR."""
+        from app.limiter import build_limiter
+
+        with patch.dict(os.environ, {"RATELIMIT_HEADERS_ENABLED": "true"}):
+            lim = build_limiter("memory://")
+        self.assertFalse(
+            lim._headers_enabled,
+            "build_limiter must force _headers_enabled=False so the env var "
+            "RATELIMIT_HEADERS_ENABLED cannot enable the broken header path",
+        )
+
 
 class TestRedisUrlRedaction(unittest.TestCase):
     """The Redis URL may embed a password; it must never be logged verbatim

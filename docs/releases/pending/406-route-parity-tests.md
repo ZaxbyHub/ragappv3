@@ -21,6 +21,41 @@
   `@limiter.limit(settings.admin_rate_limit)` (matches the admin-mutation idiom
   in documents.py / memories.py). GET `/settings` is unchanged.
 
+  **Shared-bucket behavior (intentional):** POST and PUT `/settings` share a
+  single `admin_rate_limit` (10/minute) bucket — slowapi's default
+  `key_style="url"` does not split by HTTP method. This is the desired
+  behavior: an admin hammering settings mutations should be collectively
+  throttled regardless of verb, not given 20/minute by alternating POST/PUT.
+  Verified by `test_post_and_put_share_one_bucket`.
+
+### Backend — rate-limit quota normalization (PRR-001, pre-existing defect closed here)
+- **`WhitelistLimiter._check_request_limit`** now normalizes the request scope
+  path (`rstrip("/")`) before delegating to slowapi. slowapi's default
+  `key_style="url"` uses `request["path"]` verbatim as the bucket key, so any
+  route registered with both slash and non-slash variants (settings, vaults,
+  memories, organizations, vault_members, group-access) previously had TWO
+  independent buckets per method — a client could double the effective limit
+  by alternating paths. The normalization mirrors what `main.py:130` and
+  `maintenance.py:31` already do. The scope swap is scoped to the limit check
+  (restored in `finally`) so handlers still see their original path; routing
+  has already completed before this runs. Regression guard:
+  `test_alternating_slash_and_non_slash_shares_bucket`.
+
+### Backend — limiter headers guard (PRR-014, latent defect)
+- **`build_limiter`** now forces `limiter_instance._headers_enabled = False`
+  after construction. The rate-limited handlers in this codebase do NOT
+  declare a `response: Response` parameter, so slowapi's `_inject_headers`
+  post-response path would raise if headers were ever enabled. Passing
+  `headers_enabled=False` to the constructor is NOT sufficient on its own —
+  slowapi's `Limiter.__init__` ORs the constructor value with the
+  `RATELIMIT_HEADERS_ENABLED` env var (`False or True == True`), so an
+  operator could re-enable headers via env and resurrect the exception. The
+  post-construction force-assignment overrides the OR result and is the
+  effective guard; enabling headers later now requires a code change to this
+  line AND an audit of every rate-limited handler (chat, search, vaults,
+  memories, documents, settings, auth) to add the `Response` param first.
+  Regression guard: `test_build_limiter_forces_headers_disabled_even_with_env_var`.
+
 ### Tests — vault coverage (issue #390)
 - **F-004**: added `test_vault_response_org_id_member_role` — exercises the
   org_id field through the member role, not just superadmin.
