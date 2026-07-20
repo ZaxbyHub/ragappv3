@@ -82,6 +82,7 @@ function FolderNameInput({
   return (
     <div className="flex items-center gap-1 py-1">
       <Input
+        // eslint-disable-next-line jsx-a11y-x/no-autofocus -- Intentional immediate focus for the inline folder create/rename field.
         autoFocus
         className="h-7 text-sm"
         placeholder={placeholder}

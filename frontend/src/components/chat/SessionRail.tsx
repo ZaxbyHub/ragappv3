@@ -545,6 +545,7 @@ export function SessionGroup({
       </button>
 
       {isOpen && (
+        // eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- role="list" container uses event delegation for roving-tabindex arrow-key navigation; each child SessionItem also has its own onKeyDown (lines 572+). APG listbox pattern.
         <div
           className="mt-1 space-y-0.5"
           role="list"

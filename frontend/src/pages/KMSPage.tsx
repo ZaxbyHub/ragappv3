@@ -254,6 +254,7 @@ export default function KMSPage() {
                 value={newTitle}
                 onChange={(e) => setNewTitle(e.target.value)}
                 placeholder="Entry title"
+                // eslint-disable-next-line jsx-a11y-x/no-autofocus -- Intentional first-field focus when the create-entry dialog opens.
                 autoFocus
               />
             </div>

@@ -12,6 +12,7 @@ const Label = React.forwardRef<
   React.LabelHTMLAttributes<HTMLLabelElement> &
     VariantProps<typeof labelVariants>
 >(({ className, ...props }, ref) => (
+  // eslint-disable-next-line jsx-a11y-x/label-has-associated-control -- Callers supply the control association through htmlFor in the forwarded props.
   <label
     ref={ref}
     className={cn(labelVariants(), className)}

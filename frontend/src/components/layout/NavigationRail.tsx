@@ -228,9 +228,9 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
               data-resolved-appearance={resolvedDark ? "dark" : "light"}
             >
               {resolvedDark ? (
-                <HugeiconsIcon strokeWidth={1.2} icon={MoonIcon} size={16} className="flex-shrink-0" />
+                <HugeiconsIcon strokeWidth={1.2} icon={MoonIcon} size={16} className="flex-shrink-0" aria-hidden="true" />
               ) : (
-                <HugeiconsIcon strokeWidth={1.2} icon={Sun02Icon} size={16} className="flex-shrink-0" />
+                <HugeiconsIcon strokeWidth={1.2} icon={Sun02Icon} size={16} className="flex-shrink-0" aria-hidden="true" />
               )}
               <span className={cn("text-[11px] opacity-0 blur-sm transition-all duration-200 ease-in-out whitespace-nowrap", !isExpanded && "sr-only", isExpanded && "opacity-100 blur-none")}>Theme</span>
             </button>
@@ -255,7 +255,7 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
           className="flex items-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground text-sm transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring w-full gap-2 px-3 py-1.5 mb-3 h-8"
           aria-label="Log out"
         >
-          <HugeiconsIcon strokeWidth={1.2} icon={Logout01Icon} size={16} className="flex-shrink-0" />
+          <HugeiconsIcon strokeWidth={1.2} icon={Logout01Icon} size={16} className="flex-shrink-0" aria-hidden="true" />
           <span className={cn("text-[11px] opacity-0 blur-sm transition-all duration-200 ease-in-out whitespace-nowrap", !isExpanded && "sr-only", isExpanded && "opacity-100 blur-none")}>Log out</span>
         </button>
 
@@ -313,9 +313,9 @@ function NavRow({
       title={isExpanded ? undefined : item.label}
     >
       {isHugeicon(Icon) ? (
-        <HugeiconsIcon strokeWidth={1.2} icon={Icon} size={16} className="flex-shrink-0" />
+        <HugeiconsIcon strokeWidth={1.2} icon={Icon} size={16} className="flex-shrink-0" aria-hidden="true" />
       ) : (
-        <Icon className="w-4 h-4 flex-shrink-0" />
+        <Icon className="w-4 h-4 flex-shrink-0" aria-hidden="true" />
       )}
       {isExpanded && <span className="truncate whitespace-nowrap">{item.label}</span>}
     </NavLink>

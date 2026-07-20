@@ -113,6 +113,7 @@ export default function ChangePasswordRequiredPage() {
                 value={currentPassword}
                 onChange={(e) => setCurrentPassword(e.target.value)}
                 disabled={submitting}
+                // eslint-disable-next-line jsx-a11y-x/no-autofocus -- Intentional first-field focus for the forced password-change flow.
                 autoFocus
                 aria-required="true"
                 aria-invalid={!!error}

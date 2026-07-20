@@ -36,9 +36,20 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
 
   return (
     <div className="flex h-screen overflow-hidden">
-      {/* Skip navigation link (CR-3) */}
+      {/* Skip navigation link (CR-3, LOW-14/#394).
+          PageShell wraps every authenticated route (App.tsx shell routes
+          159-305), so this link is present on every page that has repeated
+          navigation to bypass. Shell-less routes (/login, /register, /setup,
+          /change-password, /404) intentionally bypass PageShell — they are
+          full-page forms with no repeated nav blocks, so WCAG 2.4.1 (Bypass
+          Blocks) does not require a skip link there. The nested <main> in
+          ChatShell.tsx is a separate landmark-duplicate finding tracked
+          outside this issue. */}
       <a
         href="#main-content"
+        onClick={(event) => {
+          event.currentTarget.ownerDocument.getElementById("main-content")?.focus();
+        }}
         className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:bg-primary focus:text-primary-foreground focus:rounded-sm focus:text-sm focus:font-medium focus:shadow-lg"
       >
         Skip to main content
@@ -48,7 +59,11 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
       <Navigation activeItem={activeItem} onItemSelect={onItemSelect} healthStatus={healthStatus} />
 
       {/* Main Content Area */}
-      <main id="main-content" className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden"
+      >
         <div className={isChat ? "flex-1 min-h-0 overflow-hidden" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 mx-auto w-full"}>
           <AnimatePresence mode="wait">
             <motion.div
