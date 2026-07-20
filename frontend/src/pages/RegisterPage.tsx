@@ -117,7 +117,7 @@ export default function RegisterPage() {
             <div className="space-y-2">
               <Label htmlFor="register-username">Username</Label>
               <div className="relative">
-                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
                 <Input
                   id="register-username"
                   type="text"
@@ -140,7 +140,7 @@ export default function RegisterPage() {
             <div className="space-y-2">
               <Label htmlFor="register-fullname">Full name</Label>
               <div className="relative">
-                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
                 <Input
                   id="register-fullname"
                   type="text"
@@ -170,7 +170,7 @@ export default function RegisterPage() {
                 </ul>
               )}
               <div className="relative">
-                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
                 <Input
                   id="register-password"
                   type={showPassword ? "text" : "password"}
@@ -191,7 +191,7 @@ export default function RegisterPage() {
                   onClick={() => setShowPassword((v) => !v)}
                   aria-label={showPassword ? "Hide password" : "Show password"}
                 >
-                  {showPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" />}
+                  {showPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" aria-hidden="true" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" aria-hidden="true" />}
                 </Button>
               </div>
               {errors.password && (
@@ -202,7 +202,7 @@ export default function RegisterPage() {
             <div className="space-y-2">
               <Label htmlFor="register-confirm-password">Confirm Password</Label>
               <div className="relative">
-                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
                 <Input
                   id="register-confirm-password"
                   type={showConfirmPassword ? "text" : "password"}
@@ -223,7 +223,7 @@ export default function RegisterPage() {
                   onClick={() => setShowConfirmPassword((v) => !v)}
                   aria-label={showConfirmPassword ? "Hide password confirmation" : "Show password confirmation"}
                 >
-                  {showConfirmPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" />}
+                  {showConfirmPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" aria-hidden="true" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" aria-hidden="true" />}
                 </Button>
               </div>
               {errors.confirmPassword && (
@@ -252,7 +252,7 @@ export default function RegisterPage() {
                 </>
               ) : (
                 <>
-                  <HugeiconsIcon strokeWidth={1.2} icon={UserAdd01Icon} className="mr-2 h-4 w-4" />
+                  <HugeiconsIcon strokeWidth={1.2} icon={UserAdd01Icon} className="mr-2 h-4 w-4" aria-hidden="true" />
                   Create Account
                 </>
               )}

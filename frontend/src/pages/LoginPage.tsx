@@ -166,7 +166,7 @@ export default function LoginPage() {
             <div className="space-y-2">
               <Label htmlFor="login-username">Username</Label>
               <div className="relative">
-                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={User02Icon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
                 <Input
                   id="login-username"
                   type="text"
@@ -185,7 +185,7 @@ export default function LoginPage() {
             <div className="space-y-2">
               <Label htmlFor="login-password">Password</Label>
               <div className="relative">
-                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <HugeiconsIcon strokeWidth={1.2} icon={LockPasswordIcon} className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
                 <Input
                   id="login-password"
                   type={showPassword ? "text" : "password"}
@@ -206,7 +206,7 @@ export default function LoginPage() {
                   onClick={() => setShowPassword((v) => !v)}
                   aria-label={showPassword ? "Hide password" : "Show password"}
                 >
-                  {showPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" />}
+                  {showPassword ? <HugeiconsIcon strokeWidth={1.2} icon={ViewOffSlashIcon} className="h-4 w-4" aria-hidden="true" /> : <HugeiconsIcon strokeWidth={1.2} icon={ViewIcon} className="h-4 w-4" aria-hidden="true" />}
                 </Button>
               </div>
             </div>
@@ -227,7 +227,7 @@ export default function LoginPage() {
                 </>
               ) : (
                 <>
-                  <HugeiconsIcon strokeWidth={1.2} icon={Login01Icon} className="mr-2 h-4 w-4" />
+                  <HugeiconsIcon strokeWidth={1.2} icon={Login01Icon} className="mr-2 h-4 w-4" aria-hidden="true" />
                   Sign In
                 </>
               )}
