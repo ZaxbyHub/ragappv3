@@ -36,6 +36,11 @@ import { useVaultStore } from "@/stores/useVaultStore";
 import { useUploadStore } from "@/stores/useUploadStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { EmptyState } from "@/components/EmptyState";
+import {
+  FILENAME_COL_WIDTH_MIN,
+  FILENAME_COL_WIDTH_MAX,
+  clampFilenameColWidth,
+} from "@/lib/resizeClamp";
 import { useBulkSelection } from "@/components/documents/useBulkSelection";
 import { useDocumentPolling } from "@/components/documents/useDocumentPolling";
 import { DocumentStatsCards } from "@/components/documents/DocumentStatsCards";
@@ -91,7 +96,13 @@ export default function DocumentsPage() {
     try {
       const stored = window.localStorage.getItem(FILENAME_COL_WIDTH_KEY);
       const parsed = stored ? parseInt(stored, 10) : NaN;
-      if (Number.isFinite(parsed) && parsed >= 120 && parsed <= 600) return parsed;
+      if (
+        Number.isFinite(parsed) &&
+        parsed >= FILENAME_COL_WIDTH_MIN &&
+        parsed <= FILENAME_COL_WIDTH_MAX
+      ) {
+        return parsed;
+      }
     } catch {
       // ignore
     }
@@ -301,7 +312,7 @@ export default function DocumentsPage() {
 
       const handleMouseMove = (moveEvent: MouseEvent) => {
         const deltaX = moveEvent.clientX - dragState.current.startX;
-        const newWidth = Math.max(120, Math.min(600, dragState.current.startWidth + deltaX));
+        const newWidth = clampFilenameColWidth(dragState.current.startWidth + deltaX);
         setFilenameColWidth(newWidth);
       };
 
@@ -313,6 +324,60 @@ export default function DocumentsPage() {
 
       document.addEventListener("mousemove", handleMouseMove);
       document.addEventListener("mouseup", handleMouseUp);
+    },
+    [filenameColWidth]
+  );
+
+  // Keyboard parity for the filename-column resize handle (WCAG 2.1.1).
+  // Drag-consistent direction: ArrowRight grows, ArrowLeft shrinks (matches
+  // the mouse handler's deltaX = clientX - startX). Step = 16px grid unit.
+  // Clamp via the shared helper so aria-valuenow stays within
+  // [FILENAME_COL_WIDTH_MIN, FILENAME_COL_WIDTH_MAX] (matches the mouse +
+  // touch handlers below).
+  const handleResizeKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const KEYBOARD_RESIZE_STEP = 16;
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        setFilenameColWidth(
+          clampFilenameColWidth(filenameColWidth + KEYBOARD_RESIZE_STEP)
+        );
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        setFilenameColWidth(
+          clampFilenameColWidth(filenameColWidth - KEYBOARD_RESIZE_STEP)
+        );
+      }
+    },
+    [filenameColWidth]
+  );
+
+  // Touch parity for the filename-column resize handle (WCAG 2.5.1).
+  // Document touchmove listener attached with { passive: false } so
+  // preventDefault suppresses page scroll during the drag.
+  const handleResizeTouchStart = useCallback(
+    (e: React.TouchEvent<HTMLDivElement>) => {
+      if (e.touches.length !== 1) return;
+      const startX = e.touches[0].clientX;
+      const startWidth = filenameColWidth;
+      document.body.style.cursor = "col-resize";
+
+      const handleTouchMove = (moveEvent: TouchEvent) => {
+        if (moveEvent.touches.length !== 1) return;
+        moveEvent.preventDefault();
+        const deltaX = moveEvent.touches[0].clientX - startX;
+        const newWidth = clampFilenameColWidth(startWidth + deltaX);
+        setFilenameColWidth(newWidth);
+      };
+
+      const handleTouchEnd = () => {
+        document.body.style.cursor = "";
+        document.removeEventListener("touchmove", handleTouchMove);
+        document.removeEventListener("touchend", handleTouchEnd);
+      };
+
+      document.addEventListener("touchmove", handleTouchMove, { passive: false });
+      document.addEventListener("touchend", handleTouchEnd);
     },
     [filenameColWidth]
   );
@@ -691,6 +756,8 @@ export default function DocumentsPage() {
             canMutateDocuments={canMutateDocuments}
             filenameColWidth={filenameColWidth}
             onResizeMouseDown={handleResizeMouseDown}
+            onResizeKeyDown={handleResizeKeyDown}
+            onResizeTouchStart={handleResizeTouchStart}
             onSelectAll={handleSelectAll}
             onSelectOne={selectOne}
             wikiStatusMap={wikiStatusMap}

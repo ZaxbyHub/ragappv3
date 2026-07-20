@@ -166,6 +166,7 @@ export function RetrievalSettings({
                 step={0.1}
                 value={formData.hybrid_alpha || 0.5}
                 onChange={(e) => onChange("hybrid_alpha", e.target.value)}
+                aria-label="Hybrid Alpha"
                 className="flex-1"
               />
             </div>

@@ -377,3 +377,257 @@ describe("ChatShell Mobile Layout", () => {
     });
   });
 });
+
+// WCAG 2.1.1 (Keyboard) + 2.5.1 (Pointer Gestures) parity for the resize
+// handles — see issue #394 LOW-1.
+describe("ChatShell resize handle keyboard + touch parity", () => {
+  beforeEach(() => {
+    mockStoreState = {
+      sessionRailOpen: true,
+      rightPaneOpen: false,
+      rightPaneWidth: 320,
+      sessionRailWidth: 280,
+      activeSessionId: null,
+      activeSessionTitle: null,
+      sessionListRefreshToken: 0,
+      activeRightTab: "evidence",
+      sessionSearchQuery: "",
+      pinnedSessionIds: [],
+      toggleSessionRail: vi.fn(),
+      toggleRightPane: vi.fn(),
+      setRightPaneWidth: vi.fn(),
+      setSessionRailWidth: vi.fn(),
+      setActiveSessionId: vi.fn(),
+      setActiveSessionTitle: vi.fn(),
+      requestSessionListRefresh: vi.fn(),
+      openSessionRail: vi.fn(),
+      closeSessionRail: vi.fn(),
+      openRightPane: vi.fn(),
+      closeRightPane: vi.fn(),
+      setActiveRightTab: vi.fn(),
+      setSessionSearchQuery: vi.fn(),
+      togglePinSession: vi.fn(),
+      isSessionPinned: vi.fn(),
+      setSelectedEvidenceSource: vi.fn(),
+    };
+  });
+
+  describe("session rail handle", () => {
+    it("is focusable (tabIndex=0) when rail is open", () => {
+      mockStoreState.sessionRailOpen = true;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      expect(handle.tabIndex).toBe(0);
+    });
+
+    it("is NOT focusable (tabIndex=-1) when rail is collapsed (WCAG 2.4.7)", () => {
+      mockStoreState.sessionRailOpen = false;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      expect(handle.tabIndex).toBe(-1);
+    });
+
+    it("ArrowRight grows the rail by 16px (drag-consistent)", () => {
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledTimes(1);
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledWith(280 + 16);
+    });
+
+    it("ArrowLeft shrinks the rail by 16px", () => {
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.keyDown(handle, { key: "ArrowLeft" });
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledWith(280 - 16);
+    });
+
+    it("ArrowUp/ArrowDown are ignored", () => {
+      mockStoreState.sessionRailOpen = true;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.keyDown(handle, { key: "ArrowUp" });
+      fireEvent.keyDown(handle, { key: "ArrowDown" });
+      expect(mockStoreState.setSessionRailWidth).not.toHaveBeenCalled();
+    });
+
+    it("exposes aria-valuenow/min/max for the focusable separator widget", () => {
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      expect(handle.getAttribute("aria-valuenow")).toBe("280");
+      expect(handle.getAttribute("aria-valuemin")).toBe("240");
+      expect(handle.getAttribute("aria-valuemax")).toBe("400");
+    });
+
+    it("touch drag updates width via the store setter (rAF-coalesced)", () => {
+      const rafCallbacks: FrameRequestCallback[] = [];
+      const requestAnimationFrameSpy = vi
+        .spyOn(window, "requestAnimationFrame")
+        .mockImplementation((cb) => {
+          rafCallbacks.push(cb);
+          return rafCallbacks.length;
+        });
+
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      requestAnimationFrameSpy.mockClear();
+      rafCallbacks.length = 0;
+
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 200 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 240 } as unknown as Touch],
+      });
+
+      expect(mockStoreState.setSessionRailWidth).not.toHaveBeenCalled();
+      act(() => {
+        rafCallbacks.forEach((cb) => cb(0));
+      });
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledTimes(1);
+      // startWidth (280) + delta (240-200=40) = 320
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledWith(320);
+
+      requestAnimationFrameSpy.mockRestore();
+    });
+  });
+
+  describe("right pane handle", () => {
+    it("is positioned absolutely inside a relative aside so it has visible height (WCAG 2.4.7)", () => {
+      // Regression guard for reviewer finding: handle was previously
+      // position:relative with no height, making the new tabIndex={0}
+      // create a focusable-invisible element. Now aside is relative and
+      // handle is absolute (matches the session-rail pattern).
+      mockStoreState.rightPaneOpen = true;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      // The handle must be absolutely positioned so top:0/bottom:0 stretch it.
+      expect(handle.className).toContain("absolute");
+      expect(handle.className).not.toContain("relative");
+      // The parent <aside> must be the positioned ancestor.
+      const aside = handle.closest("aside");
+      expect(aside?.className).toContain("relative");
+    });
+
+    it("ArrowLeft grows the pane by 16px (drag-consistent — opposite sign)", () => {
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.rightPaneWidth = 400;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      fireEvent.keyDown(handle, { key: "ArrowLeft" });
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledTimes(1);
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledWith(400 + 16);
+    });
+
+    it("ArrowRight shrinks the pane by 16px", () => {
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.rightPaneWidth = 400;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledWith(400 - 16);
+    });
+
+    it("exposes aria-valuenow/min/max for the focusable separator widget", () => {
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.rightPaneWidth = 400;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      expect(handle.getAttribute("aria-valuenow")).toBe("400");
+      expect(handle.getAttribute("aria-valuemin")).toBe("320");
+      expect(handle.getAttribute("aria-valuemax")).toBe("600");
+    });
+
+    it("touch drag updates width via the store setter (rAF-coalesced, reversed sign)", () => {
+      const rafCallbacks: FrameRequestCallback[] = [];
+      const requestAnimationFrameSpy = vi
+        .spyOn(window, "requestAnimationFrame")
+        .mockImplementation((cb) => {
+          rafCallbacks.push(cb);
+          return rafCallbacks.length;
+        });
+
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.rightPaneWidth = 400;
+
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      requestAnimationFrameSpy.mockClear();
+      rafCallbacks.length = 0;
+
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      // Drag LEFT (clientX decreases) = pane GROWS (delta = startX - clientX > 0)
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 500 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 460 } as unknown as Touch],
+      });
+
+      act(() => {
+        rafCallbacks.forEach((cb) => cb(0));
+      });
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledTimes(1);
+      // startWidth (400) + delta (500-460=40) = 440
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledWith(440);
+
+      requestAnimationFrameSpy.mockRestore();
+    });
+  });
+});

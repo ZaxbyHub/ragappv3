@@ -24,6 +24,8 @@ interface DocumentTableProps {
   canMutateDocuments: boolean;
   filenameColWidth: number;
   onResizeMouseDown: (e: React.MouseEvent<HTMLDivElement>) => void;
+  onResizeKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => void;
+  onResizeTouchStart: (e: React.TouchEvent<HTMLDivElement>) => void;
   onSelectAll: (checked: boolean | "indeterminate") => void;
   onSelectOne: (docId: string, checked: boolean) => void;
   wikiStatusMap: Record<string, DocumentWikiStatus>;
@@ -78,6 +80,8 @@ export function DocumentTable({
   canMutateDocuments,
   filenameColWidth,
   onResizeMouseDown,
+  onResizeKeyDown,
+  onResizeTouchStart,
   onSelectAll,
   onSelectOne,
   wikiStatusMap,
@@ -138,12 +142,19 @@ export function DocumentTable({
                         <ArrowDown className="w-3 h-3" aria-hidden="true" />
                       ))}
                   </button>
+                  {/* eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- APG window-splitter pattern; keyboard + touch parity provided (WCAG 2.1.1/2.5.1). */}
                   <div
-                    className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-border transition-colors"
+                    className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-border transition-colors touch-none"
                     onMouseDown={onResizeMouseDown}
+                    onKeyDown={onResizeKeyDown}
+                    onTouchStart={onResizeTouchStart}
                     role="separator"
                     aria-orientation="vertical"
                     aria-label="Resize filename column"
+                    aria-valuemin={120}
+                    aria-valuemax={600}
+                    aria-valuenow={filenameColWidth}
+                    tabIndex={0}
                   />
                 </th>
                 <SortHeader
@@ -178,7 +189,6 @@ export function DocumentTable({
               </tr>
             </thead>
             <tbody
-              role="rowgroup"
               style={{ height: `${tableVirtualizer.getTotalSize()}px`, position: "relative" }}
             >
               {tableVirtualizer.getVirtualItems().map((virtualItem) => {
@@ -268,6 +278,7 @@ export function DocumentTable({
                         if (!ws || ws.wiki_status === "not_compiled" || ws.wiki_status === "skipped") {
                           return (
                             <button
+                              type="button"
                               className="text-xs text-muted-foreground hover:text-foreground underline"
                               onClick={() => onCompileDocument(docId)}
                               disabled={isCompiling}
@@ -290,13 +301,15 @@ export function DocumentTable({
                               ? "Compiling…"
                               : "Failed";
                         return (
-                          <span
-                            className={`text-xs font-mono cursor-pointer ${color}`}
+                          <button
+                            type="button"
+                            className={`text-xs font-mono cursor-pointer bg-transparent border-0 p-0 ${color}`}
                             onClick={() => onCompileDocument(docId)}
                             title={`Wiki: ${ws.wiki_status} — ${ws.pages_count} pages, ${ws.claims_count} claims, ${ws.lint_count} lint issues. Click to recompile.`}
+                            aria-label={`Recompile wiki for ${doc.filename}. Status: ${ws.wiki_status}.`}
                           >
                             {label}
-                          </span>
+                          </button>
                         );
                       })()}
                     </td>

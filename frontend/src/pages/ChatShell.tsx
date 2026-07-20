@@ -248,6 +248,114 @@ export default function ChatShell() {
     window.addEventListener("blur", onMouseUp);
   };
 
+  // Keyboard resize step (px) — single grid unit. The store setters clamp
+  // the final value to the legal range (useChatShellStore:95-96), so we
+  // don't re-implement clamping here.
+  const KEYBOARD_RESIZE_STEP = 16;
+
+  // Keyboard parity for the session-rail resize handle. Drag-consistent
+  // direction: ArrowRight grows the rail (matches onMouseMove sign at
+  // line 224: delta = clientX - startX). WCAG 2.1.1 (Keyboard).
+  const handleSessionRailKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setSessionRailWidth(sessionRailWidth + KEYBOARD_RESIZE_STEP);
+    } else if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setSessionRailWidth(sessionRailWidth - KEYBOARD_RESIZE_STEP);
+    }
+  };
+
+  // Keyboard parity for the right-pane resize handle. Drag-consistent
+  // direction: ArrowLeft grows the pane (matches onMouseMove sign at
+  // line 190: delta = startX - clientX, drag-left = wider).
+  const handleResizeKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setRightPaneWidth(rightPaneWidth + KEYBOARD_RESIZE_STEP);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setRightPaneWidth(rightPaneWidth - KEYBOARD_RESIZE_STEP);
+    }
+  };
+
+  // Touch-drag parity for the session-rail resize handle. Document-level
+  // touchmove/touchend listeners are attached with { passive: false } so
+  // preventDefault actually suppresses page scroll (React 17+ attaches
+  // onTouchStart as a passive root listener, so e.preventDefault() inside
+  // the React handler is a no-op — the suppression has to happen on the
+  // document listener). removeEventListener needs no options: per the DOM
+  // spec, listener identity is (type, callback, capture) only.
+  const handleSessionRailTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    const startX = e.touches[0].clientX;
+    const startWidth = sessionRailWidth;
+    let pendingWidth = startWidth;
+    let frame: number | null = null;
+    const onTouchMove = (moveEvent: TouchEvent) => {
+      if (moveEvent.touches.length !== 1) return;
+      moveEvent.preventDefault();
+      const delta = moveEvent.touches[0].clientX - startX;
+      pendingWidth = Math.max(200, Math.min(400, startWidth + delta));
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        setSessionRailWidth(pendingWidth);
+        frame = null;
+      });
+    };
+    const onTouchEnd = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+        setSessionRailWidth(pendingWidth);
+        frame = null;
+      }
+      document.removeEventListener("touchmove", onTouchMove);
+      document.removeEventListener("touchend", onTouchEnd);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("touchmove", onTouchMove, { passive: false });
+    document.addEventListener("touchend", onTouchEnd);
+  };
+
+  // Touch-drag parity for the right-pane resize handle (sign matches the
+  // mouse handler at line 190: delta = startX - clientX).
+  const handleResizeTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    const startX = e.touches[0].clientX;
+    const startWidth = rightPaneWidth;
+    let pendingWidth = startWidth;
+    let frame: number | null = null;
+    const onTouchMove = (moveEvent: TouchEvent) => {
+      if (moveEvent.touches.length !== 1) return;
+      moveEvent.preventDefault();
+      const delta = startX - moveEvent.touches[0].clientX;
+      pendingWidth = Math.max(240, Math.min(600, startWidth + delta));
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        setRightPaneWidth(pendingWidth);
+        frame = null;
+      });
+    };
+    const onTouchEnd = () => {
+      if (frame !== null) {
+        window.cancelAnimationFrame(frame);
+        setRightPaneWidth(pendingWidth);
+        frame = null;
+      }
+      document.removeEventListener("touchmove", onTouchMove);
+      document.removeEventListener("touchend", onTouchEnd);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("touchmove", onTouchMove, { passive: false });
+    document.addEventListener("touchend", onTouchEnd);
+  };
+
   // Per-pane ErrorBoundary fallbacks — FR-017: isolate pane failures
   // SC-046: Retry resets the ErrorBoundary state (pane remount) instead of full page reload.
   const sessionsFallback = (reset: () => void) => (
@@ -300,12 +408,19 @@ export default function ChatShell() {
         <ErrorBoundary fallback={sessionsFallback}>
           <SessionRail />
         </ErrorBoundary>
+        {/* eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- role="separator" with resize handlers is the APG window-splitter pattern (keyboard + touch parity provided). */}
         <div
-          className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/40 transition-colors"
+          className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/40 transition-colors touch-none"
           onMouseDown={handleSessionRailResizeStart}
+          onTouchStart={handleSessionRailTouchStart}
+          onKeyDown={handleSessionRailKeyDown}
           role="separator"
           aria-label="Resize session panel"
           aria-orientation="vertical"
+          aria-valuemin={240}
+          aria-valuemax={400}
+          aria-valuenow={sessionRailWidth}
+          tabIndex={sessionRailOpen ? 0 : -1}
         />
       </aside>
 
@@ -367,14 +482,27 @@ export default function ChatShell() {
       {/* DESKTOP: Right Pane (persistent resizable sidebar) */}
       <aside
         className={cn(
-          "hidden lg:flex lg:flex-col lg:flex-shrink-0 lg:border-l lg:border-border lg:bg-background lg:transition-all lg:duration-300 lg:ease-in-out",
+          "relative hidden lg:flex lg:flex-col lg:flex-shrink-0 lg:border-l lg:border-border lg:bg-background lg:transition-all lg:duration-300 lg:ease-in-out",
           rightPaneOpen ? "lg:translate-x-0 lg:opacity-100 blur-none" : "lg:w-0 lg:opacity-0 lg:overflow-hidden blur-sm"
         )}
         style={{ width: rightPaneOpen ? `${rightPaneWidth}px` : undefined }}
         aria-label="Details panel"
       >
         {rightPaneOpen && (
-          <div className="relative left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/40 transition-colors hidden lg:block" onMouseDown={handleResizeStart} role="separator" aria-label="Resize details panel" aria-orientation="vertical" />
+          // eslint-disable-next-line jsx-a11y-x/no-noninteractive-element-interactions -- APG window-splitter pattern (keyboard + touch parity provided; rendered only when rightPaneOpen is true so never a focusable-invisible tab stop).
+          <div
+            className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-primary/20 active:bg-primary/40 transition-colors hidden lg:block touch-none"
+            onMouseDown={handleResizeStart}
+            onTouchStart={handleResizeTouchStart}
+            onKeyDown={handleResizeKeyDown}
+            role="separator"
+            aria-label="Resize details panel"
+            aria-orientation="vertical"
+            aria-valuemin={320}
+            aria-valuemax={600}
+            aria-valuenow={rightPaneWidth}
+            tabIndex={0}
+          />
         )}
         <div className="flex h-full flex-col p-4 bg-card/80 flex-shrink-0 w-full">
           <ErrorBoundary fallback={sourcesFallback}>
