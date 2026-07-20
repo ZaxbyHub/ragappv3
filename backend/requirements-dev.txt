@@ -1,4 +1,4 @@
-ruff>=0.15.20,<1.0
+ruff>=0.15.22,<1.0
 pytest-cov>=7.1.0,<8.0
 pytest-asyncio>=1.4.0,<2.0
 requests>=2.31.0,<3.0
