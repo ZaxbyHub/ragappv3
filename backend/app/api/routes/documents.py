@@ -300,17 +300,18 @@ async def retry_document(
 
         await background_processor.enqueue(row["file_path"], vault_id=row["vault_id"], file_id=file_id)
 
-        user_id = (
-            str(current_user["id"])
-            if current_user and current_user.get("id")
-            else user.get("id", "unknown")
+        # Route the audit write through the never-raises wrapper: the retry
+        # was already enqueued above, and calling the raising audit writer
+        # directly turned a misconfigured signer (e.g. missing
+        # AUDIT_HMAC_KEY_V1) into a 500 on an operation that had succeeded.
+        audit_user = (
+            current_user if current_user and current_user.get("id") else user
         )
-        await asyncio.to_thread(
-            _record_document_action,
+        await _safe_record_action(
             file_id,
             "retry",
             "scheduled",
-            user_id,
+            audit_user,
             secret_manager,
             conn,
         )
@@ -320,21 +321,20 @@ async def retry_document(
         raise
     except (sqlite3.Error, OSError, RuntimeError) as exc:
         logger.exception("Error reprocessing document %d", file_id)
-        user_id = (
-            str(current_user["id"])
-            if current_user and current_user.get("id")
-            else user.get("id", "unknown")
+        # Same never-raises wrapper as the success path: an audit-signer
+        # failure here would otherwise mask the original error with a
+        # SecretManagerError traceback.
+        audit_user = (
+            current_user if current_user and current_user.get("id") else user
         )
-        await asyncio.to_thread(
-            _record_document_action,
+        await _safe_record_action(
             file_id,
             "retry",
             "error",
-            user_id,
+            audit_user,
             secret_manager,
             conn,
         )
-        await asyncio.to_thread(conn.commit)
         raise HTTPException(status_code=500, detail=f"Retry failed: {exc}")
 
 

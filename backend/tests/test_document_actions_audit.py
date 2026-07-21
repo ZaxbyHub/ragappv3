@@ -180,53 +180,76 @@ class TestRecordDocumentAction(unittest.TestCase):
 
 
 class TestRetryDocumentAuditWiring(unittest.IsolatedAsyncioTestCase):
-    """Tests for user_id computation in retry_document call sites."""
+    """Tests for audit wiring in retry_document call sites.
+
+    SUPERSEDED (audit-500 fix): retry_document no longer computes user_id
+    inline nor calls _record_document_action directly. Both the success and
+    error paths route through _safe_record_action (never raises), because a
+    misconfigured audit signer (e.g. missing AUDIT_HMAC_KEY_V1) turned an
+    already-enqueued retry into a 500 — and, on the error path, masked the
+    original failure. Identity selection (JWT current_user preferred, admin
+    token user as fallback) now happens via the audit_user expression and
+    _user_id_str inside the wrapper, so the old str(current_user["id"])
+    source assertions no longer apply.
+    """
 
     async def test_retry_accepts_current_user_param(self):
         """retry_document must accept current_user parameter."""
         sig = inspect.signature(retry_document)
         self.assertIn("current_user", sig.parameters)
 
-    async def test_user_id_from_jwt_when_available(self):
-        """When current_user has 'id', user_id should be str(current_user['id'])."""
-        # Read the source to verify the logic
+    async def test_retry_prefers_current_user_for_audit(self):
+        """audit_user prefers JWT current_user, falls back to admin-token user."""
         source = inspect.getsource(retry_document)
-        # Verify the primary path uses current_user["id"]
-        self.assertIn('current_user["id"]', source)
-        self.assertIn("str(current_user", source)
+        self.assertIn("audit_user", source)
+        self.assertIn(
+            'current_user if current_user and current_user.get("id") else user',
+            source,
+        )
 
-    async def test_user_id_fallback_to_auth(self):
-        """When current_user is None, falls back to user.get('id', 'unknown')."""
+    async def test_retry_uses_safe_wrapper_on_both_paths(self):
+        """Both success and error paths use _safe_record_action; no raw call remains."""
         source = inspect.getsource(retry_document)
-        self.assertIn("user.get", source)
-        self.assertIn('"unknown"', source)
-
-    async def test_both_call_sites_compute_user_id(self):
-        """Both success and error paths must compute user_id before _record_document_action."""
-        source = inspect.getsource(retry_document)
-        # Count occurrences of user_id computation pattern
-        # There should be two: one in try block, one in except block
-        compute_pattern = 'str(current_user["id"])'
-        count = source.count(compute_pattern)
         self.assertEqual(
-            count,
+            source.count("_safe_record_action("),
             2,
-            f"Expected 2 user_id computations (success + error paths), found {count}",
+            "Expected _safe_record_action on both the scheduled and error paths",
+        )
+        self.assertNotIn(
+            "_record_document_action",
+            source,
+            "retry_document must not call the raising audit writer directly",
         )
 
-    async def test_retry_calls_record_action_with_user_id(self):
-        """Both _record_document_action calls must pass user_id as positional arg."""
-        source = inspect.getsource(retry_document)
-        # Split on _record_document_action to find all call sites
-        call_sites = source.split("_record_document_action")[1:]
-        self.assertGreaterEqual(
-            len(call_sites),
-            2,
-            "Expected at least 2 call sites for _record_document_action",
+
+class TestSafeRecordActionNeverRaises(unittest.IsolatedAsyncioTestCase):
+    """_safe_record_action must swallow audit-signer failures (DD-C010).
+
+    Regression: with AUDIT_HMAC_KEY_V1 unset, get_hmac_key raises
+    SecretManagerError; routed through the raw writer this became a 500 on
+    an operation (enqueue) that had already succeeded.
+    """
+
+    async def test_secret_manager_error_swallowed(self):
+        from app.api.routes.documents import _safe_record_action
+        from app.services.secret_manager import SecretManagerError
+
+        sm = MagicMock()
+        sm.get_hmac_key.side_effect = SecretManagerError(
+            "HMAC key for version 'v1' is not configured"
         )
-        for site in call_sites:
-            # Each call site should reference user_id
-            self.assertIn("user_id", site.split(")")[0])
+        conn = MagicMock()
+
+        # Must not raise despite the signer being misconfigured.
+        await _safe_record_action(1, "retry", "scheduled", {"id": 1}, sm, conn)
+
+    # SUPERSEDED (audit-500 fix): the former
+    # test_retry_calls_record_action_with_user_id asserted that
+    # retry_document called _record_document_action directly with an inline
+    # user_id — that raw call is exactly what the fix removed (it 500'd on a
+    # misconfigured signer). The user_id-forwarding guarantee now lives in
+    # _safe_record_action/_user_id_str and is covered by
+    # TestRetryDocumentAuditWiring above.
 
 
 class TestDocumentActionsSchema(unittest.TestCase):

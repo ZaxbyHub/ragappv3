@@ -139,6 +139,12 @@ services:
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
       # REQUIRED — generate with: python -c "import secrets; print(secrets.token_urlsafe(48))"
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      # Audit-log HMAC signing key (secret_manager reads AUDIT_HMAC_KEY_V1 or
+      # AUDIT_HMAC_KEY). Without a mapping here, a value in .env never reaches
+      # the container and audit-signing admin endpoints fail.
+      # Generate with: openssl rand -hex 32
+      - AUDIT_HMAC_KEY_V1=${AUDIT_HMAC_KEY_V1:-}
+      - AUDIT_HMAC_KEY=${AUDIT_HMAC_KEY:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - PARENT_RETRIEVAL_ENABLED=${PARENT_RETRIEVAL_ENABLED:-true}
       - PARENT_WINDOW_CHARS=${PARENT_WINDOW_CHARS:-6000}

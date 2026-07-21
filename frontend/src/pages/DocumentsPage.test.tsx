@@ -1019,6 +1019,69 @@ describe('DocumentsPage - Drag to Resize Filename Column', () => {
       dropzoneTestHandle.current.onRejected = null;
     });
 
+    it('does not falsely reject small files (point-free filter regression)', async () => {
+      // Regression: handleFiles used acceptedFiles.filter(isUploadTooLarge),
+      // so filter() passed the array index into the maxFileSizeBytes
+      // parameter — file N was checked against an N-byte limit and every
+      // real-world file was banner'd as "too large" while still uploading.
+      // A writable active vault is required or handleFiles early-returns
+      // before the size filter (which would make this test vacuous).
+      vi.mocked(useVaultStore).mockReturnValue({
+        activeVaultId: 1,
+        vaults: [{ id: 1, name: 'V', current_user_permission: 'write' }],
+      } as unknown as ReturnType<typeof useVaultStore>);
+
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('upload-dropzone-stub')).toBeInTheDocument();
+      });
+
+      const smallFiles = [
+        new File(['a'.repeat(1_000)], 'a.docx'),
+        new File(['b'.repeat(2_000)], 'b.docx'),
+        new File(['c'.repeat(3_000)], 'c.xlsx'),
+      ];
+      await act(async () => {
+        dropzoneTestHandle.current.onFiles?.(smallFiles);
+      });
+
+      expect(screen.queryByTestId('rejected-files-banner')).not.toBeInTheDocument();
+    });
+
+    it('still rejects a genuinely oversized file', async () => {
+      vi.mocked(useVaultStore).mockReturnValue({
+        activeVaultId: 1,
+        vaults: [{ id: 1, name: 'V', current_user_permission: 'write' }],
+      } as unknown as ReturnType<typeof useVaultStore>);
+
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByTestId('upload-dropzone-stub')).toBeInTheDocument();
+      });
+
+      // Fake a >100MB size without allocating it.
+      const bigFile = new File(['x'], 'big.docx');
+      Object.defineProperty(bigFile, 'size', { value: 101 * 1024 * 1024 });
+      await act(async () => {
+        dropzoneTestHandle.current.onFiles?.([bigFile]);
+      });
+
+      expect(screen.getByTestId('rejected-files-banner')).toBeInTheDocument();
+      expect(screen.getByTestId('rejected-files-list').textContent).toContain(
+        'big.docx is too large'
+      );
+    });
+
     it('does not render the rejected-files banner when no rejection has occurred', async () => {
       await act(async () => {
         const result = render(<DocumentsPage />);

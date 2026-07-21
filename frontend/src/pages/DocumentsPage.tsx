@@ -407,7 +407,11 @@ export default function DocumentsPage() {
         toast.error("Select a vault with write access before uploading");
         return;
       }
-      const oversizedFiles = acceptedFiles.filter(isUploadTooLarge);
+      // Explicit lambda, not point-free: filter() passes (element, index,
+      // array), and the index landed in isUploadTooLarge's maxFileSizeBytes
+      // parameter — checking file N against an N-byte limit, so every file
+      // was flagged "too large" regardless of real size.
+      const oversizedFiles = acceptedFiles.filter((file) => isUploadTooLarge(file));
       if (oversizedFiles.length > 0) {
         const rejected = oversizedFiles.map((file) => uploadSizeExceededMessage(file.name));
         setRejectedFiles(rejected);
