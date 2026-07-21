@@ -622,6 +622,53 @@ data: {"type": "content", "content": "test"}
         # repaired_content must NOT be present when no citations were repaired
         self.assertNotIn("repaired_content", done_event)
 
+    def test_stream_chat_done_event_repaired_content_when_only_normalized(self):
+        """Done event must include repaired_content when the only change is
+        fullwidth-bracket normalization (【S1】 -> [S1]), even though the
+        citation itself is valid and nothing was stripped.
+
+        Regression coverage: cv.invalid_stripped alone used to gate whether
+        repaired_content was sent to the client, so pure normalization (a
+        valid citation, just fullwidth brackets) never replaced the raw
+        streamed text and the user kept seeing 【S1】 in the final message.
+        """
+        async def mock_query(*args, **kwargs):
+            yield {"type": "content", "content": "Answer based on 【S1】 source."}
+            yield {
+                "type": "done",
+                "sources": [{"source_label": "S1", "file_id": "doc1.txt", "score": 0.9}],
+                "memories_used": [],
+            }
+
+        self._set_mock_rag_engine(mock_query)
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={"messages": [{"role": "user", "content": "test"}]}
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        events = self._parse_sse_events(response.text)
+        done_events = [
+            e["data"] for e in events
+            if e.get("data", {}).get("type") == "done"
+        ]
+        self.assertEqual(len(done_events), 1, "Expected exactly one done event")
+        done_event = done_events[0]
+
+        # citation_validation must NOT be present — the citation is valid,
+        # nothing was stripped.
+        self.assertNotIn("citation_validation", done_event)
+
+        # repaired_content MUST be present — the fullwidth bracket was
+        # normalized to ASCII and the client needs the corrected text.
+        self.assertIn("repaired_content", done_event)
+        repaired = done_event["repaired_content"]
+        self.assertIsNotNone(repaired)
+        self.assertIn("[S1]", repaired)
+        self.assertNotIn("【S1】", repaired)
+
     def test_stream_non_vault_member_returns_403(self):
         """A non-vault-member user must receive 403 when streaming to a vault,
         and the response body must NOT reveal whether the vault exists.

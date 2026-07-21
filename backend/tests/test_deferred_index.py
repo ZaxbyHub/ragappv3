@@ -137,7 +137,22 @@ class TestFTSIndexGuard(unittest.IsolatedAsyncioTestCase):
 
     async def test_fts_index_skipped_when_already_exists(self):
         """
-        Test that FTS index creation is skipped when 'fts_text' already exists.
+        Test that FTS index creation is skipped when an FTS index already
+        exists on the 'text' column.
+
+        NOTE: superseded assumption — this test previously set
+        ``existing_fts_index.name = "fts_text"`` and relied on a by-name
+        check. Verified against lancedb==0.34.0 (the pinned version): a
+        FTS index created via ``create_index(column="text", config=FTS())``
+        (no explicit ``name=``, which is what this codebase has always
+        passed) is auto-named "text_idx" by LanceDB's default
+        "{column}_idx" convention, never "fts_text". The by-name check
+        could therefore never match a real index this method created. The
+        production code now detects existence via ``index_type`` +
+        ``columns`` instead (matching how LanceDB itself resolves which
+        index to use at query time), so this fixture models a realistic
+        existing index: ``name="text_idx", index_type="FTS",
+        columns=["text"]``.
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -145,9 +160,11 @@ class TestFTSIndexGuard(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=[])
 
-        # Mock existing FTS index
+        # Mock existing FTS index (real LanceDB default name/type/columns)
         existing_fts_index = MagicMock()
-        existing_fts_index.name = "fts_text"
+        existing_fts_index.name = "text_idx"
+        existing_fts_index.index_type = "FTS"
+        existing_fts_index.columns = ["text"]
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[existing_fts_index])
@@ -168,6 +185,197 @@ class TestFTSIndexGuard(unittest.IsolatedAsyncioTestCase):
 
         # Verify create_index was NOT called (FTS already exists)
         mock_table.create_index.assert_not_called()
+
+    async def test_fts_index_creation_ignores_non_fts_indices(self):
+        """
+        Test that a non-FTS index on an unrelated column (e.g. the vector
+        index) is not mistaken for an existing FTS index on 'text'.
+        """
+        store = VectorStore(db_path=Path("/tmp/test_lancedb"))
+
+        mock_db = MagicMock()
+        mock_db.table_names = AsyncMock(return_value=[])
+
+        other_index = MagicMock()
+        other_index.name = "embedding_idx"
+        other_index.index_type = "IvfPq"
+        other_index.columns = ["embedding"]
+
+        mock_table = MagicMock()
+        mock_table.list_indices = AsyncMock(return_value=[other_index])
+        mock_table.create_index = AsyncMock()
+
+        mock_db.create_table = AsyncMock(return_value=mock_table)
+
+        store.db = mock_db
+
+        with patch("app.services.vector_store.pa") as mock_pa:
+            mock_pa.schema.return_value = MagicMock()
+
+            with patch("app.services.vector_store.settings") as mock_settings:
+                mock_settings.vector_metric = "cosine"
+                mock_settings.write_lock_timeout_seconds = 30
+
+                with patch("app.services.vector_store.FTS") as mock_fts:
+                    mock_fts.return_value = MagicMock()
+
+                    await store.init_table(embedding_dim=384)
+
+        # embedding_idx is not an FTS index on 'text', so creation should
+        # still be attempted.
+        mock_table.create_index.assert_called_once()
+
+    async def test_fts_index_conflict_on_create_is_tolerated(self):
+        """
+        Test that an "already exists" error from create_index (e.g. a
+        legacy FTS index on 'text' that this method's existence check
+        missed) is treated as recoverable: logged at INFO, NOT as the
+        "hybrid search will be unavailable" WARNING, since LanceDB
+        resolves FTS/hybrid queries by column rather than index name and
+        the already-exists error itself proves a usable index is present.
+        """
+        store = VectorStore(db_path=Path("/tmp/test_lancedb"))
+
+        mock_db = MagicMock()
+        mock_db.table_names = AsyncMock(return_value=[])
+
+        mock_table = MagicMock()
+        mock_table.list_indices = AsyncMock(return_value=[])  # check misses it
+        mock_table.create_index = AsyncMock(
+            side_effect=RuntimeError(
+                "Index name 'text_idx' already exists, please specify a "
+                "different name or use replace=True"
+            )
+        )
+
+        mock_db.create_table = AsyncMock(return_value=mock_table)
+
+        store.db = mock_db
+
+        with patch("app.services.vector_store.pa") as mock_pa:
+            mock_pa.schema.return_value = MagicMock()
+
+            with patch("app.services.vector_store.settings") as mock_settings:
+                mock_settings.vector_metric = "cosine"
+                mock_settings.write_lock_timeout_seconds = 30
+
+                with patch("app.services.vector_store.FTS") as mock_fts:
+                    mock_fts.return_value = MagicMock()
+
+                    with patch("app.services.vector_store.logger") as mock_logger:
+                        await store.init_table(embedding_dim=384)
+
+        mock_table.create_index.assert_called_once()
+        # Tolerant INFO log, not the "unavailable" warning.
+        info_messages = [call.args[0] for call in mock_logger.info.call_args_list]
+        self.assertTrue(
+            any("already" in msg and "exists" in msg for msg in info_messages),
+            f"Expected an INFO log about the tolerated conflict, got: {info_messages}",
+        )
+        for call in mock_logger.warning.call_args_list:
+            self.assertNotIn("hybrid search will be unavailable", call.args[0])
+
+    async def test_fts_index_genuine_creation_failure_still_warns(self):
+        """
+        Test that a genuine (non-conflict) create_index failure still logs
+        the original "hybrid search will be unavailable" WARNING —
+        the conflict-tolerance branch must not swallow real failures.
+        """
+        store = VectorStore(db_path=Path("/tmp/test_lancedb"))
+
+        mock_db = MagicMock()
+        mock_db.table_names = AsyncMock(return_value=[])
+
+        mock_table = MagicMock()
+        mock_table.list_indices = AsyncMock(return_value=[])
+        mock_table.create_index = AsyncMock(
+            side_effect=RuntimeError("disk I/O error while building index")
+        )
+
+        mock_db.create_table = AsyncMock(return_value=mock_table)
+
+        store.db = mock_db
+
+        with patch("app.services.vector_store.pa") as mock_pa:
+            mock_pa.schema.return_value = MagicMock()
+
+            with patch("app.services.vector_store.settings") as mock_settings:
+                mock_settings.vector_metric = "cosine"
+                mock_settings.write_lock_timeout_seconds = 30
+
+                with patch("app.services.vector_store.FTS") as mock_fts:
+                    mock_fts.return_value = MagicMock()
+
+                    with patch("app.services.vector_store.logger") as mock_logger:
+                        await store.init_table(embedding_dim=384)
+
+        mock_table.create_index.assert_called_once()
+        warning_messages = [
+            call.args[0] for call in mock_logger.warning.call_args_list
+        ]
+        self.assertTrue(
+            any("hybrid search will be unavailable" in msg for msg in warning_messages),
+            f"Expected the unchanged WARNING path, got: {warning_messages}",
+        )
+
+    async def test_fts_index_different_fields_conflict_still_warns(self):
+        """
+        Test that LanceDB's OTHER "already exists" message —
+        "Index name '<name>' already exists with different fields, please
+        specify a different name" (no "or use replace=True" suffix) — is
+        NOT treated as the benign tolerate-and-log case.
+
+        This message means an index with that name exists but is NOT
+        equivalent to the one just requested (e.g. different columns/config),
+        which is a genuine misconfiguration, not proof that a working FTS
+        index on 'text' is already present. It must fall through to the
+        unchanged "hybrid search will be unavailable" WARNING path.
+        """
+        store = VectorStore(db_path=Path("/tmp/test_lancedb"))
+
+        mock_db = MagicMock()
+        mock_db.table_names = AsyncMock(return_value=[])
+
+        mock_table = MagicMock()
+        mock_table.list_indices = AsyncMock(return_value=[])
+        mock_table.create_index = AsyncMock(
+            side_effect=RuntimeError(
+                "Index name 'text_idx' already exists with different "
+                "fields, please specify a different name"
+            )
+        )
+
+        mock_db.create_table = AsyncMock(return_value=mock_table)
+
+        store.db = mock_db
+
+        with patch("app.services.vector_store.pa") as mock_pa:
+            mock_pa.schema.return_value = MagicMock()
+
+            with patch("app.services.vector_store.settings") as mock_settings:
+                mock_settings.vector_metric = "cosine"
+                mock_settings.write_lock_timeout_seconds = 30
+
+                with patch("app.services.vector_store.FTS") as mock_fts:
+                    mock_fts.return_value = MagicMock()
+
+                    with patch("app.services.vector_store.logger") as mock_logger:
+                        await store.init_table(embedding_dim=384)
+
+        mock_table.create_index.assert_called_once()
+        warning_messages = [
+            call.args[0] for call in mock_logger.warning.call_args_list
+        ]
+        self.assertTrue(
+            any("hybrid search will be unavailable" in msg for msg in warning_messages),
+            f"Expected the 'different fields' conflict to still warn, got: {warning_messages}",
+        )
+        # And must NOT be logged as the tolerant INFO message.
+        info_messages = [call.args[0] for call in mock_logger.info.call_args_list]
+        self.assertFalse(
+            any("already" in msg and "exists" in msg for msg in info_messages),
+            f"'different fields' conflict should not be tolerated, got INFO: {info_messages}",
+        )
 
 
 class TestMaybeCreateVectorIndex(unittest.IsolatedAsyncioTestCase):

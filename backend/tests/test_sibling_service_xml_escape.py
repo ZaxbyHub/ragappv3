@@ -52,10 +52,12 @@ class TestQueryTransformerUserQueryEscaped:
             # Verify the LLM was called at least once
             assert mock_llm.chat_completion.call_count >= 1
             # transform() may call chat_completion twice (step-back + HyDE).
-            # Step-back uses keyword args (query_transformer.py:224):
-            #   chat_completion(messages=messages, max_tokens=100, temperature=...)
-            # HyDE uses positional args (query_transformer.py:407):
-            #   chat_completion(messages, max_tokens=350, temperature=...)
+            # Step-back uses keyword args (query_transformer.py:299):
+            #   chat_completion(messages=messages, max_tokens=2000, temperature=...)
+            # HyDE uses positional args (query_transformer.py:481):
+            #   chat_completion(messages, max_tokens=2000, temperature=...)
+            # (max_tokens raised from 100/350 to 2000 — reasoning models consume
+            # the completion budget with chain-of-thought before emitting content.)
             # Find the step-back call (the one with messages= as a kwarg).
             step_back_call = next(
                 call for call in mock_llm.chat_completion.call_args_list

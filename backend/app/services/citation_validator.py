@@ -23,6 +23,25 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 # Case-sensitive: S/M/W/K only — lowercase variants are treated as plain text.
 _CITATION_RE = re.compile(r"\[(S|M|W|K)(\d+)\]")
 
+# Some deployed LLMs emit fullwidth CJK brackets (U+3010/U+3011) around
+# citation labels instead of ASCII brackets, e.g. 【S1】 instead of [S1].
+# Same case-sensitivity as _CITATION_RE.
+_FULLWIDTH_CITATION_RE = re.compile(r"【(S|M|W|K)(\d+)】")
+
+
+def normalize_citation_brackets(content: str) -> str:
+    """Convert fullwidth 【S1】-style citations to ASCII [S1].
+
+    ``_CITATION_RE`` (and everything downstream of it — validation, repair,
+    parsing, scoring) only recognizes ASCII brackets. Some deployed LLMs emit
+    the fullwidth CJK bracket variant instead, which would otherwise count as
+    an uncited claim and can never be stripped/normalized. Call this before
+    any citation parsing so all downstream logic sees ASCII.
+    """
+    if not content:
+        return content
+    return _FULLWIDTH_CITATION_RE.sub(r"[\1\2]", content)
+
 
 @dataclass(frozen=True)
 class CitationValidationResult:
@@ -41,6 +60,12 @@ class CitationValidationResult:
     citation_confidence: Dict[str, float] = field(default_factory=dict)
     # Answer sentences that have no citation AND low overlap with all sources.
     unverifiable_claims: Tuple[str, ...] = field(default_factory=lambda: ())
+    # True when normalize_citation_brackets() changed the content (e.g. a
+    # fullwidth 【S1】 was converted to ASCII [S1]). Callers must treat this
+    # the same as invalid_stripped when deciding whether repaired_content
+    # needs to replace the raw streamed text — pure normalization leaves
+    # invalid_stripped False even though the content changed.
+    normalized_citations: bool = False
 
 
 def _label_set(prefix: str, count: int) -> set[str]:
@@ -108,6 +133,10 @@ def validate_and_repair_citations(
             invalid_kms_citations=(),
         )
 
+    original_content = content
+    content = normalize_citation_brackets(content)
+    normalized_citations = content != original_content
+
     valid_s = _label_set("S", source_count)
     valid_m = _label_set("M", memory_count)
     valid_w = _label_set("W", wiki_count)
@@ -170,6 +199,7 @@ def validate_and_repair_citations(
         uncited_factual_warning=uncited_factual_warning,
         invalid_wiki_citations=tuple(dict.fromkeys(invalid_wiki)),
         invalid_kms_citations=tuple(dict.fromkeys(invalid_kms)),
+        normalized_citations=normalized_citations,
     )
 
 
@@ -180,9 +210,10 @@ def parse_citations(content: str) -> Tuple[List[str], List[str]]:
     occurrence in ``content``. Signature unchanged for backward compatibility.
     [W#] citations are ignored here — use parse_wiki_citations() instead.
     """
+    content = normalize_citation_brackets(content or "")
     sources: List[str] = []
     memories: List[str] = []
-    for m in _CITATION_RE.finditer(content or ""):
+    for m in _CITATION_RE.finditer(content):
         label = f"{m.group(1)}{m.group(2)}"
         if m.group(1) == "S" and label not in sources:
             sources.append(label)
@@ -193,8 +224,9 @@ def parse_citations(content: str) -> Tuple[List[str], List[str]]:
 
 def parse_wiki_citations(content: str) -> List[str]:
     """Return [W#] labels found in content, deduped, in first-occurrence order."""
+    content = normalize_citation_brackets(content or "")
     wikis: List[str] = []
-    for m in _CITATION_RE.finditer(content or ""):
+    for m in _CITATION_RE.finditer(content):
         if m.group(1) == "W":
             label = f"W{m.group(2)}"
             if label not in wikis:
@@ -204,8 +236,9 @@ def parse_wiki_citations(content: str) -> List[str]:
 
 def parse_kms_citations(content: str) -> List[str]:
     """Return [K#] labels found in content, deduped, in first-occurrence order."""
+    content = normalize_citation_brackets(content or "")
     kms: List[str] = []
-    for m in _CITATION_RE.finditer(content or ""):
+    for m in _CITATION_RE.finditer(content):
         if m.group(1) == "K":
             label = f"K{m.group(2)}"
             if label not in kms:
@@ -240,15 +273,6 @@ def _tokenize(text: str) -> Set[str]:
     return set(cleaned.split())
 
 
-def _jaccard(tokens_a: Set[str], tokens_b: Set[str]) -> float:
-    """Jaccard coefficient between two token sets. Returns 0 when both are empty."""
-    if not tokens_a and not tokens_b:
-        return 0.0
-    intersection = len(tokens_a & tokens_b)
-    union = len(tokens_a | tokens_b)
-    return intersection / union if union else 0.0
-
-
 # -------------------------------------------------------------------------- #
 # Sentence-split helpers (mirrors context_distiller logic for consistency)
 # -------------------------------------------------------------------------- #
@@ -263,31 +287,40 @@ def _split_sentences(text: str) -> List[str]:
 
 
 # -------------------------------------------------------------------------- #
-# Jaccard-based citation confidence
+# Containment-based citation confidence
 # -------------------------------------------------------------------------- #
 
-#: Default Jaccard threshold below which an uncited sentence is "unverifiable".
-UNVERIFIABLE_THRESHOLD = 0.15
+#: Containment threshold below which an uncited sentence is "unverifiable":
+#: at least half the claim's unique tokens must appear in some source. Uses
+#: containment rather than Jaccard because a short (~15-token) claim sentence
+#: compared against a long (~200-token) source caps Jaccard around 0.08 even
+#: for a verbatim quote, since Jaccard's denominator includes every unrelated
+#: token in the source. Containment only divides by the claim's own token
+#: count, so it isn't punished for the source being long.
+UNVERIFIABLE_THRESHOLD = 0.5
 
 
 def _sentence_overlap(claim_sentence: str, source_text: str) -> float:
-    """Jaccard token overlap between a claim sentence and a source text.
+    """Containment overlap between a claim sentence and a source text.
 
-    Uses the full source_text (all distilled content for that source index).
-    Optionally a caller may supply a tighter span via ``source_span`` when
-    provenance character offsets are available — but for the base case we
-    compare against the full source text so every cited sentence has at least
-    one overlapping source by construction.
+    |claim_tokens ∩ source_tokens| / |claim_tokens|. Returns 0.0 when the
+    claim has no tokens. Uses the full source_text (all distilled content for
+    that source index). Optionally a caller may supply a tighter span via
+    ``source_span`` when provenance character offsets are available — but for
+    the base case we compare against the full source text so every cited
+    sentence has at least one overlapping source by construction.
     """
     claim_tokens = _tokenize(claim_sentence)
+    if not claim_tokens:
+        return 0.0
     source_tokens = _tokenize(source_text)
-    return _jaccard(claim_tokens, source_tokens)
+    return len(claim_tokens & source_tokens) / len(claim_tokens)
 
 
 def _best_overlap_for_claim(
     claim_sentence: str, source_texts: Sequence[str]
 ) -> float:
-    """Maximum Jaccard overlap between a claim sentence and any source text."""
+    """Maximum containment overlap between a claim sentence and any source text."""
     if not source_texts:
         return 0.0
     return max(_sentence_overlap(claim_sentence, src) for src in source_texts)
@@ -298,14 +331,15 @@ def _compute_citation_confidence(
     valid_citations: Sequence[str],
     source_texts: Sequence[str],
 ) -> Dict[str, float]:
-    """Compute Jaccard-based confidence per valid citation label.
+    """Compute containment-based confidence per valid citation label.
 
     Algorithm:
       1. Split the answer content into sentences (sentence-boundary aware).
       2. For each valid [S#] label, find the *first* sentence that contains it
          → that is the "claim sentence" for this citation.
       3. Look up the cited source text (sources[source_num - 1]).
-      4. Score = Jaccard(claim_sentence tokens, source_text tokens).
+      4. Score = containment(claim_sentence tokens, source_text tokens) —
+         the fraction of the claim's own tokens found in the source.
 
     Returns a dict mapping label (e.g. "S1") → confidence score [0.0, 1.0].
     """
@@ -340,6 +374,17 @@ def _compute_citation_confidence(
     return confidences
 
 
+def _strip_leading_markdown(sentence: str) -> str:
+    """Strip leading list/heading/quote/table decoration from a sentence.
+
+    Handles numbered-list prefixes (``"2. "``) and leading ``#``/``*``/``-``/
+    ``>``/``|`` characters, so the remaining word count reflects actual
+    content rather than markdown structure.
+    """
+    stripped = re.sub(r"^\d+\.\s*", "", sentence.strip())
+    return stripped.lstrip("#*->|").strip()
+
+
 def _find_unverifiable_claims(
     content: str,
     valid_citations: Sequence[str],
@@ -350,7 +395,14 @@ def _find_unverifiable_claims(
 
     Unverifiable claims are factual-sounding sentences that:
       - Have no [S#]/[M#]/[W#]/[K#] citation, AND
-      - Score below ``threshold`` Jaccard overlap against *every* retrieved source.
+      - Score below ``threshold`` containment overlap against *every*
+        retrieved source.
+
+    Non-claim fragments are skipped before scoring — markdown table rows,
+    headers, and anything too short to carry real content once list/heading/
+    quote decoration is stripped. The naive ``_SENTENCE_RE`` split turns
+    markdown structure (e.g. a numbered list) into pseudo-claims like "2."
+    that would otherwise always score below threshold and get flagged.
 
     Returns sentences in document order (first-occurrence order).
     """
@@ -369,6 +421,15 @@ def _find_unverifiable_claims(
         if sentence in seen_uncited:
             continue
         seen_uncited.add(sentence)
+        # Skip non-claim fragments: markdown table rows, headers, and
+        # anything too short to carry a real claim once list/heading/quote
+        # decoration is stripped. The "|" check also skips prose sentences
+        # that merely contain a pipe — an accepted under-flagging tradeoff
+        # for this advisory surface.
+        if sentence.startswith("#") or "|" in sentence:
+            continue
+        if len(_strip_leading_markdown(sentence).split()) < 5:
+            continue
         best = _best_overlap_for_claim(sentence, source_texts)
         if best < threshold:
             unverifiable.append(sentence)
@@ -385,7 +446,7 @@ def score_citations(
 
     This is a pure, side-effect-free extension to ``validate_and_repair_citations``.
     It adds:
-      - ``citation_confidence``: Jaccard overlap score per valid [S#] citation.
+      - ``citation_confidence``: containment overlap score per valid [S#] citation.
       - ``unverifiable_claims``: answer sentences with no citation AND low overlap.
 
     Callers that only need valid/invalid citation labels should continue calling
@@ -403,10 +464,15 @@ def score_citations(
 
     Returns:
         A CitationValidationResult (created from a minimal valid result) that
-        carries ``citation_confidence`` and ``unverifiable_claims``. The result
-        is not repaired (repaired_content == content); use
+        carries ``citation_confidence`` and ``unverifiable_claims``. No invalid
+        citations are stripped, but fullwidth 【S#】 citations are normalized to
+        ASCII, so ``repaired_content`` may differ from the input (and
+        ``normalized_citations`` reports it); use
         ``validate_and_repair_citations`` separately when repair is also needed.
     """
+    normalized = normalize_citation_brackets(content)
+    normalized_changed = normalized != content
+    content = normalized
     if not content:
         return CitationValidationResult(
             repaired_content="",
@@ -445,6 +511,7 @@ def score_citations(
         uncited_factual_warning=False,
         citation_confidence=citation_confidence,
         unverifiable_claims=tuple(unverifiable),
+        normalized_citations=normalized_changed,
     )
 
 
@@ -491,6 +558,7 @@ def repair_against_sources_and_memories(
 
 __all__ = [
     "CitationValidationResult",
+    "normalize_citation_brackets",
     "validate_and_repair_citations",
     "parse_citations",
     "parse_wiki_citations",

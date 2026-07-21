@@ -451,12 +451,23 @@ async def lifespan(app: FastAPI):
     if settings.hybrid_search_enabled:
         try:
             indices = await app.state.vector_store.table.list_indices()
-            fts_index_exists = any(idx.name == "fts_text" for idx in indices)
+            # Match by index type + column, not by name: LanceDB auto-names
+            # FTS indices (e.g. "text_idx") and no create_index call in this
+            # codebase passes an explicit name, so a name-equality check on
+            # "fts_text" never matches a real index and fired a false
+            # "missing index" error on every startup (same root cause as the
+            # vector_store.init_table existence check).
+            fts_index_exists = any(
+                getattr(idx, "index_type", "") == "FTS"
+                and "text" in (getattr(idx, "columns", None) or [])
+                for idx in indices
+            )
             if not fts_index_exists:
                 logger.error(
-                    "Hybrid search is enabled but the FTS index is missing on the 'text' column. "
-                    "FTS search will not function. Create the index with "
-                    "VectorStore._ensure_fts_index() or rebuild the table."
+                    "Hybrid search is enabled but no FTS index exists on the "
+                    "'text' column. FTS search will not function. The index is "
+                    "created automatically by VectorStore.init_table() at "
+                    "startup; check earlier logs for FTS index creation errors."
                 )
         except Exception as e:
             logger.error(

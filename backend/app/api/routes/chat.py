@@ -422,14 +422,18 @@ def stream_chat_response(
                 "uncited_factual_warning": cv.uncited_factual_warning,
                 "has_evidence": cv.has_evidence,
             }
-            # When invalid citations were stripped, hand the cleaned text to the
+            # When invalid citations were stripped, or a fullwidth 【S#】-style
+            # citation was normalized to ASCII, hand the cleaned text to the
             # client as the canonical content so the hallucinated [S#] chip is
-            # removed from what is displayed-on-completion and persisted. The
-            # raw tokens were already streamed (a brief flicker), but reload and
-            # history now show the repaired content. Only sent when something
-            # actually changed, to avoid needless content swaps on clean answers.
+            # removed (or the fullwidth bracket is swapped for ASCII) from
+            # what is displayed-on-completion and persisted. The raw tokens
+            # were already streamed (a brief flicker), but reload and history
+            # now show the repaired content. Only sent when something actually
+            # changed, to avoid needless content swaps on clean answers.
             repaired_content = (
-                cv.repaired_content if cv.invalid_stripped else None
+                cv.repaired_content
+                if (cv.invalid_stripped or cv.normalized_citations)
+                else None
             )
         except Exception as cv_exc:  # noqa: BLE001 — defensive
             logger.warning("Citation validation failed: %s", cv_exc)

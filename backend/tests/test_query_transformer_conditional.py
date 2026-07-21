@@ -8,8 +8,13 @@ Validates that:
 """
 
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.services.query_transformer import _is_exact_or_document_query
+from app.services.query_transformer import (
+    QueryPlanner,
+    QueryTransformer,
+    _is_exact_or_document_query,
+)
 
 
 class TestQueryTypeDetection(unittest.TestCase):
@@ -56,6 +61,62 @@ class TestQueryTypeDetection(unittest.TestCase):
         self.assertFalse(
             _is_exact_or_document_query("Why does the system use reranking?")
         )
+
+
+class TestQueryTransformerTokenBudgets(unittest.IsolatedAsyncioTestCase):
+    """Regression guard for the max_tokens budgets on query_transformer.py's
+    utility LLM calls (step-back, follow-up rewrite, HyDE, query planning).
+
+    Reasoning models emit chain-of-thought into a separate field that still
+    consumes the completion token budget before any content appears. Tiny
+    max_tokens caps starve them into empty responses, so these calls must
+    request enough headroom (2000). See query_transformer.py:298-299.
+    """
+
+    async def test_all_utility_llm_calls_request_2000_token_budget(self):
+        mock_llm = MagicMock()
+        mock_llm.chat_completion = AsyncMock(
+            return_value="a sufficiently long mocked response"
+        )
+
+        with patch("app.services.query_transformer.settings") as mock_settings:
+            mock_settings.stepback_enabled = True
+            mock_settings.hyde_enabled = False
+            mock_settings.redis_url = None
+            mock_settings.chat_model = "test-model"
+            mock_settings.query_transform_temperature = 0.0
+            mock_settings.hyde_temperature = 0.0
+
+            qt = QueryTransformer(llm_client=mock_llm)
+
+            # Step-back (query_transformer.py:298)
+            await qt.transform("What is gradient descent in neural networks?")
+            assert mock_llm.chat_completion.call_args.kwargs["max_tokens"] == 2000
+
+            # Follow-up rewrite (query_transformer.py:442)
+            mock_llm.chat_completion.reset_mock()
+            chat_history = [
+                {"role": "user", "content": "What is the refund policy?"},
+                {"role": "assistant", "content": "Refunds are available within 30 days."},
+            ]
+            await qt.rewrite_followup("tell me more", chat_history=chat_history)
+            assert mock_llm.chat_completion.call_args.kwargs["max_tokens"] == 2000
+
+            # HyDE (query_transformer.py:481)
+            mock_llm.chat_completion.reset_mock()
+            await qt.generate_hyde("What is gradient descent?")
+            assert mock_llm.chat_completion.call_args.kwargs["max_tokens"] == 2000
+
+            # Query planning (query_transformer.py:728) — needs a non-simple
+            # query to hit the LLM path instead of the cheap heuristic.
+            mock_llm.chat_completion = AsyncMock(
+                return_value='["part A of the question", "part B of the question"]'
+            )
+            planner = QueryPlanner(llm_client=mock_llm)
+            await planner.plan(
+                "Compare the pricing tiers and the feature differences between plan A and plan B"
+            )
+            assert mock_llm.chat_completion.call_args.kwargs["max_tokens"] == 2000
 
 
 if __name__ == "__main__":

@@ -7,7 +7,10 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.services.citation_validator import (
+    normalize_citation_brackets,
     parse_citations,
+    parse_kms_citations,
+    parse_wiki_citations,
     repair_against_sources_and_memories,
     score_citations,
     validate_and_repair_citations,
@@ -157,66 +160,71 @@ class TestRepairAgainstSourcesAndMemories(unittest.TestCase):
 
 
 class TestScoreCitationsConfidence(unittest.TestCase):
-    """FR-004: citation confidence scoring via lexical (Jaccard) overlap.
+    """FR-004: citation confidence scoring via lexical (containment) overlap.
 
-    Jaccard = |claim_tokens ∩ source_tokens| / |claim_tokens ∪ source_tokens|
+    SUPERSEDES the original Jaccard-based expectations: for a short claim
+    sentence against a long source, Jaccard's union term (which includes
+    every unrelated source token) crushes the score even for a verbatim
+    quote — e.g. a 15-token sentence quoted from a 200-token source maxes
+    out around 0.08 Jaccard, well below any sane confidence threshold. The
+    metric is now containment: |claim_tokens ∩ source_tokens| / |claim_tokens|,
+    i.e. "what fraction of the claim's own tokens are found in the source."
     All expected values below are hand-computed from the token sets.
     """
 
     def test_high_overlap_citation_high_confidence(self):
         # content: "The capital of France is Paris [S1]."
         # source: "Paris is the capital of France and its largest city."
-        # claim_tokens (strip punctuation): {"the","capital","of","france","is","paris","s1"}
+        # claim_tokens (strip punctuation): {"the","capital","of","france","is","paris","s1"} (7)
         # source_tokens: {"paris","is","the","capital","of","france","and","its","largest","city"}
-        # intersection = 6, union = 11 → Jaccard = 6/11 ≈ 0.5455
+        # intersection = 6 ("s1" not in source) → containment = 6/7 ≈ 0.8571
         content = "The capital of France is Paris [S1]."
         source_text = "Paris is the capital of France and its largest city."
         result = score_citations(content, [source_text])
         self.assertIn("S1", result.citation_confidence)
-        self.assertAlmostEqual(result.citation_confidence["S1"], 6 / 11, places=4)
+        self.assertAlmostEqual(result.citation_confidence["S1"], 6 / 7, places=4)
 
     def test_low_overlap_citation_low_confidence(self):
         # content: "The sky is green [S1]."
         # source: "Python is a programming language developed in 1991."
-        # Python's string.punctuation strips trailing digits too:
-        # claim_tokens (strip punctuation "[]1,"): {"the","sky","is","green","s"}
-        # source_tokens (strip punctuation "-", trailing "1" from "1991"): {"python","is","a","programming","language","developed","in","199"}
-        # intersection = {"is"} → size 1, union = 12 → Jaccard = 1/12 ≈ 0.0833
+        # claim_tokens (strip punctuation "[]."): {"the","sky","is","green","s1"} (5)
+        # source_tokens: {"python","is","a","programming","language","developed","in","1991"}
+        # intersection = {"is"} → containment = 1/5 = 0.2
         content = "The sky is green [S1]."
         source_text = "Python is a programming language developed in 1991."
         result = score_citations(content, [source_text])
         self.assertIn("S1", result.citation_confidence)
-        self.assertAlmostEqual(result.citation_confidence["S1"], 1 / 12, places=4)
+        self.assertAlmostEqual(result.citation_confidence["S1"], 1 / 5, places=4)
 
     def test_partial_overlap_medium_confidence(self):
         # content: "Python is a programming language [S1]."
         # source: "Python is a general-purpose high-level programming language."
         # Python's string.punctuation strips hyphens:
-        # claim_tokens: {"python","is","a","programming","language","s"}
+        # claim_tokens: {"python","is","a","programming","language","s1"} (6)
         # source_tokens: {"python","is","a","generalpurpose","highlevel","programming","language"}
-        # intersection = 5, union = 8 → Jaccard = 5/8 = 0.625
+        # intersection = 5 ("s1" not in source) → containment = 5/6 ≈ 0.8333
         content = "Python is a programming language [S1]."
         source_text = "Python is a general-purpose high-level programming language."
         result = score_citations(content, [source_text])
         self.assertIn("S1", result.citation_confidence)
-        self.assertAlmostEqual(result.citation_confidence["S1"], 5 / 8, places=4)
+        self.assertAlmostEqual(result.citation_confidence["S1"], 5 / 6, places=4)
 
     def test_mixed_citations_individual_scores(self):
         # S1: "Dogs are mammals [S1]." vs source_s1
-        # claim_tokens: {"dogs","are","mammals","s1"}
+        # claim_tokens: {"dogs","are","mammals","s1"} (4)
         # source_tokens: {"dogs","belong","to","the","canine","family","and","are","domesticated","mammals"}
-        # intersection = {"dogs","are","mammals"} → size 3, union = 11 → Jaccard = 3/11 ≈ 0.2727
+        # intersection = {"dogs","are","mammals"} → containment = 3/4 = 0.75
         # S2: "Cats are also mammals [S2]." vs source_s2 ("The capital of France is Paris.")
-        # claim_tokens: {"cats","are","also","mammals","s2"}
+        # claim_tokens: {"cats","are","also","mammals","s2"} (5)
         # source_tokens: {"the","capital","of","france","is","paris"}
-        # intersection = ∅ → Jaccard = 0.0
+        # intersection = ∅ → containment = 0.0
         content = "Dogs are mammals [S1]. Cats are also mammals [S2]."
         source_s1 = "Dogs belong to the canine family and are domesticated mammals."
         source_s2 = "The capital of France is Paris."
         result = score_citations(content, [source_s1, source_s2])
         self.assertIn("S1", result.citation_confidence)
         self.assertIn("S2", result.citation_confidence)
-        self.assertAlmostEqual(result.citation_confidence["S1"], 3 / 11, places=4)
+        self.assertAlmostEqual(result.citation_confidence["S1"], 3 / 4, places=4)
         self.assertAlmostEqual(result.citation_confidence["S2"], 0.0, places=4)
 
     def test_empty_content_returns_empty_confidence(self):
@@ -233,17 +241,21 @@ class TestScoreCitationsConfidence(unittest.TestCase):
 class TestUnverifiableClaims(unittest.TestCase):
     """FR-004: unverifiable-claims list — answer sentences with no citation and low source overlap.
 
-    Sentences with no [S#] citation and Jaccard < 0.15 against all sources are flagged.
-    Expected values hand-computed: each sentence's tokens vs "python is a programming language"
-    token set {"python","is","a","programming","language"}.
+    SUPERSEDES the original Jaccard/0.15 expectations (see
+    TestScoreCitationsConfidence for why containment replaced Jaccard).
+    Sentences with no [S#] citation and containment < 0.5 (UNVERIFIABLE_THRESHOLD)
+    against all sources are flagged — but only sentences with >= 5 word tokens
+    once markdown list/heading/quote decoration is stripped; shorter fragments
+    (e.g. a numbered-list split leaving "2.") are skipped before scoring so
+    they don't masquerade as unverifiable claims.
     """
 
     def test_uncited_low_overlap_sentence_in_unverifiable(self):
-        # All four sentences score Jaccard < 0.15 against the Python source:
-        #  "The system processes input in three steps." → overlap={"in"} → 1/10=0.1 < 0.15
-        #  "First, parsing."  → overlap={"a"} → 1/7≈0.143 < 0.15
-        #  "Second, validation." → overlap=∅ → 0.0 < 0.15
-        #  "Third, transformation." → overlap=∅ → 0.0 < 0.15
+        # Only the first sentence has >= 5 word tokens; the other three
+        # ("First, parsing." etc.) are 2-word fragments and are skipped
+        # before scoring regardless of overlap.
+        #  "The system processes input in three steps." (7 words) vs
+        #  "Python is a programming language." → intersection=∅ → containment=0.0 < 0.5
         content = (
             "The system processes input in three steps. "
             "First, parsing. Second, validation. Third, transformation."
@@ -252,21 +264,12 @@ class TestUnverifiableClaims(unittest.TestCase):
         result = score_citations(content, source_texts)
         self.assertEqual(
             result.unverifiable_claims,
-            (
-                "The system processes input in three steps.",
-                "First, parsing.",
-                "Second, validation.",
-                "Third, transformation.",
-            ),
+            ("The system processes input in three steps.",),
         )
 
     def test_cited_sentence_not_in_unverifiable(self):
-        # Both cited sentences score Jaccard >= 0.15 against their respective sources:
-        #  "The sky is blue [S1]" vs "The sky is blue on clear days."
-        #    → overlap={"the","sky","is","blue"} → 4/9≈0.444 ≥ 0.15
-        #  "Dogs are mammals [S2]" vs "Dogs are domesticated mammals."
-        #    → overlap={"dogs","are","mammals"} → 3/8=0.375 ≥ 0.15
-        # → unverifiable_claims must be exactly empty.
+        # Cited sentences are skipped regardless of overlap score (the [S#]
+        # citation itself excludes them from consideration).
         content = "The sky is blue [S1]. Dogs are mammals [S2]."
         source_s1 = "The sky is blue on clear days."
         source_s2 = "Dogs are domesticated mammals."
@@ -293,6 +296,122 @@ class TestUnverifiableClaims(unittest.TestCase):
         result = score_citations(content, [])
         # No sources → unverifiable list should be empty
         self.assertEqual(result.unverifiable_claims, ())
+
+    def test_verbatim_sentence_from_long_source_not_flagged(self):
+        # A sentence copied verbatim from a long, multi-sentence source has
+        # containment 1.0 (every claim token appears in the source) — under
+        # the old Jaccard metric this would score far below 0.15 purely
+        # because the source has many other unrelated tokens.
+        source_text = (
+            "Mitochondria are membrane-bound organelles found in most eukaryotic cells. "
+            "They generate most of the cell's supply of adenosine triphosphate, used as "
+            "a source of chemical energy. Mitochondria have a double membrane structure, "
+            "and the inner membrane is folded into structures called cristae that increase "
+            "the surface area available for energy production."
+        )
+        verbatim_sentence = (
+            "Mitochondria have a double membrane structure, and the inner membrane is "
+            "folded into structures called cristae that increase the surface area "
+            "available for energy production."
+        )
+        unrelated_sentence = (
+            "The stock market rallied sharply after the central bank cut interest "
+            "rates unexpectedly."
+        )
+        content = f"{verbatim_sentence} {unrelated_sentence}"
+        result = score_citations(content, [source_text])
+        self.assertNotIn(verbatim_sentence, result.unverifiable_claims)
+        self.assertIn(unrelated_sentence, result.unverifiable_claims)
+
+    def test_markdown_fragments_never_flagged(self):
+        # A numbered-list split fragment ("2."), a markdown header, and a
+        # table row must never appear in unverifiable_claims — the naive
+        # sentence splitter turns markdown structure into pseudo-claims with
+        # no real content. A genuine unrelated sentence in the same content
+        # IS still flagged, proving the skip is fragment-specific rather than
+        # suppressing the whole feature.
+        content = (
+            "2. "
+            "# Overview Header Section Title. "
+            "| Name | Value | Total |. "
+            "This unrelated claim about rocket propulsion physics has "
+            "absolutely no matching source content at all."
+        )
+        source_texts = [
+            "Gardening requires regular watering, sunlight, and healthy soil "
+            "composition for best plant growth results."
+        ]
+        result = score_citations(content, source_texts)
+        self.assertNotIn("2.", result.unverifiable_claims)
+        self.assertFalse(
+            any(c.startswith("#") for c in result.unverifiable_claims),
+            f"header fragment leaked into unverifiable_claims: {result.unverifiable_claims}",
+        )
+        self.assertFalse(
+            any("|" in c for c in result.unverifiable_claims),
+            f"table-row fragment leaked into unverifiable_claims: {result.unverifiable_claims}",
+        )
+        self.assertIn(
+            "This unrelated claim about rocket propulsion physics has "
+            "absolutely no matching source content at all.",
+            result.unverifiable_claims,
+        )
+
+
+class TestFullwidthCitationNormalization(unittest.TestCase):
+    """Task A: fullwidth CJK bracket citations (【S1】) must be treated as [S1]."""
+
+    def test_normalize_citation_brackets_converts_all_prefixes(self):
+        content = "See 【S1】 and 【M2】 and 【W3】 and 【K4】."
+        self.assertEqual(
+            normalize_citation_brackets(content),
+            "See [S1] and [M2] and [W3] and [K4].",
+        )
+
+    def test_normalize_citation_brackets_leaves_ascii_and_empty_unchanged(self):
+        self.assertEqual(normalize_citation_brackets("Already [S1] ascii."), "Already [S1] ascii.")
+        self.assertEqual(normalize_citation_brackets(""), "")
+
+    def test_parse_citations_recognizes_fullwidth(self):
+        sources, memories = parse_citations("Claim 【S1】 and 【M2】.")
+        self.assertEqual(sources, ["S1"])
+        self.assertEqual(memories, ["M2"])
+
+    def test_parse_wiki_and_kms_citations_recognize_fullwidth(self):
+        self.assertEqual(parse_wiki_citations("See 【W3】."), ["W3"])
+        self.assertEqual(parse_kms_citations("See 【K4】."), ["K4"])
+
+    def test_validate_and_repair_normalizes_and_flags_normalized_citations(self):
+        result = validate_and_repair_citations(
+            "Claim 【S1】.", source_count=1, memory_count=0
+        )
+        self.assertIn("[S1]", result.repaired_content)
+        self.assertNotIn("【S1】", result.repaired_content)
+        self.assertEqual(result.valid_citations, ("S1",))
+        self.assertFalse(result.invalid_stripped)
+        self.assertTrue(result.normalized_citations)
+
+    def test_validate_and_repair_no_normalization_flag_when_already_ascii(self):
+        result = validate_and_repair_citations(
+            "Claim [S1].", source_count=1, memory_count=0
+        )
+        self.assertFalse(result.normalized_citations)
+
+    def test_validate_and_repair_strips_invalid_fullwidth_citation(self):
+        # A fullwidth citation to a non-existent source is normalized AND
+        # then stripped as invalid, same as the ASCII case.
+        result = validate_and_repair_citations(
+            "Claim 【S99】.", source_count=1, memory_count=0
+        )
+        self.assertNotIn("S99", result.repaired_content)
+        self.assertEqual(result.invalid_citations, ("S99",))
+        self.assertTrue(result.invalid_stripped)
+
+    def test_score_citations_recognizes_fullwidth(self):
+        content = "Paris is the capital of France 【S1】."
+        source_text = "Paris is the capital of France."
+        result = score_citations(content, [source_text])
+        self.assertIn("S1", result.citation_confidence)
 
 
 class TestBackwardCompatibility(unittest.TestCase):

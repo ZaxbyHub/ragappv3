@@ -453,10 +453,31 @@ class VectorStore:
             )
 
         # Create FTS index only if missing (FR-014)
+        #
+        # Existence check: detect by index_type + columns, NOT by name. This
+        # code has never passed an explicit name= to create_index(), so
+        # LanceDB always auto-names the FTS index itself; confirmed against
+        # lancedb==0.34.0 (pinned in requirements-lock.txt) that the
+        # auto-generated name follows the same "{column}_idx" convention used
+        # for the vector index (see "embedding_idx" a few dozen lines above) —
+        # i.e. "text_idx", never "fts_text". A by-name check against the
+        # literal "fts_text" can therefore never match an index this method
+        # itself created, which is the same class of bug already fixed for
+        # the vector index at ~line 401 ("IVF_PQ" vs "IvfPq"). LanceDB also
+        # resolves which FTS index to use at *query* time by column, not by
+        # name (AsyncTable.search()/nearest_to_text(): "By default, all
+        # indexed columns are searched"; the same column+index_type match is
+        # used internally by LanceDB's own query_type="auto" FTS detection),
+        # so matching on (index_type, columns) here mirrors how LanceDB
+        # itself decides whether hybrid search has an index to use.
         fts_index_exists = False
         try:
             indices = await self.table.list_indices()
-            fts_index_exists = any(idx.name == "fts_text" for idx in indices)
+            fts_index_exists = any(
+                getattr(idx, "index_type", None) == "FTS"
+                and "text" in (getattr(idx, "columns", None) or [])
+                for idx in indices
+            )
         except (OSError, RuntimeError, ValueError):
             pass
 
@@ -469,9 +490,45 @@ class VectorStore:
                 )
                 logger.info("Full-text search index created on 'text' column")
             except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(
-                    f"FTS index creation failed (hybrid search will be unavailable): {e}"
-                )
+                error_text = str(e)
+                if "already exists" in error_text and "different fields" not in error_text:
+                    # create_index's conflict check (replace=False) is purely
+                    # by index name: LanceDB raises "Index name '<name>'
+                    # already exists, please specify a different name or use
+                    # replace=True". We never pass a custom name=, so the
+                    # name it just tried to create is the same deterministic
+                    # default ("text_idx") that an already-existing FTS index
+                    # on this column would also have — this branch means a
+                    # working FTS index is already present (e.g. missed by
+                    # the check above due to a metadata-read race, or an
+                    # index whose columns/index_type could not be introspected).
+                    # LanceDB resolves FTS/hybrid queries by column, not
+                    # index name, so hybrid search is NOT unavailable here.
+                    # We tolerate and log rather than retrying with
+                    # replace=True: that would force a full FTS rebuild over
+                    # the whole table (non-trivial cost at startup on large
+                    # tables) to replace an index that already works.
+                    #
+                    # NOTE: LanceDB has a second, distinct "already exists"
+                    # message for a genuine conflict: "Index name '<name>'
+                    # already exists with different fields, please specify a
+                    # different name" (no "or use replace=True" suffix) —
+                    # raised when the existing index with that name is NOT
+                    # equivalent to the one being requested (e.g. built on
+                    # different columns/config). That is a real
+                    # misconfiguration, not a benign "it already works" case,
+                    # so it must fall through to the warning branch below
+                    # rather than being tolerated here.
+                    logger.info(
+                        "FTS index creation skipped: an FTS index already "
+                        "exists on the 'text' column; hybrid search will "
+                        "use it (%s)",
+                        e,
+                    )
+                else:
+                    logger.warning(
+                        f"FTS index creation failed (hybrid search will be unavailable): {e}"
+                    )
         else:
             logger.debug("FTS index already exists, skipping creation")
 

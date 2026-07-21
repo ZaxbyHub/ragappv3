@@ -4,9 +4,9 @@ import { cn } from "@/lib/utils";
 interface CitationConfidenceProps {
   /**
    * Confidence score between 0 and 1.
-   * - >= 0.7 → green (high confidence)
-   * - >= 0.4 → amber (medium confidence)
-   * - < 0.4 → red (low confidence)
+   * - >= 0.8 → green (high confidence)
+   * - >= 0.5 → amber (medium confidence)
+   * - < 0.5 → red (low confidence)
    * - undefined/null → no indicator rendered
    */
   score?: number;
@@ -15,9 +15,13 @@ interface CitationConfidenceProps {
   className?: string;
 }
 
+// Calibrated for the backend's containment metric (|claim ∩ source| / |claim|):
+// a verbatim-supported citation scores ~1.0 and a grounded paraphrase ~0.5-0.8.
+// The previous 0.7/0.4 bands were tuned for the old Jaccard metric, whose
+// scores rarely exceeded ~0.5 even for strong matches.
 const CONFIDENCE_THRESHOLDS = {
-  high: 0.7,
-  medium: 0.4,
+  high: 0.8,
+  medium: 0.5,
 } as const;
 
 const CONFIDENCE_COLORS = {

@@ -149,7 +149,10 @@ describe("SC-009 Citation confidence indicators", () => {
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 
-  it("renders a high-confidence (green) dot for score >= 0.7", () => {
+  // Thresholds recalibrated 0.7/0.4 → 0.8/0.5 for the backend's containment
+  // metric (supersedes the Jaccard-era bands; fixtures 0.9/0.55/0.25 span the
+  // new bands unchanged).
+  it("renders a high-confidence (green) dot for score >= 0.8", () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."
@@ -164,7 +167,7 @@ describe("SC-009 Citation confidence indicators", () => {
     expect(dots[0]).toHaveClass("bg-emerald-500");
   });
 
-  it("renders a medium-confidence (amber) dot for score >= 0.4 and < 0.7", () => {
+  it("renders a medium-confidence (amber) dot for score >= 0.5 and < 0.8", () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."
@@ -179,7 +182,7 @@ describe("SC-009 Citation confidence indicators", () => {
     expect(dots[0]).toHaveClass("bg-amber-500");
   });
 
-  it("renders a low-confidence (red) dot for score < 0.4", () => {
+  it("renders a low-confidence (red) dot for score < 0.5", () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."

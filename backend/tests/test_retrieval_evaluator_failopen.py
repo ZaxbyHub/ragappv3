@@ -51,5 +51,24 @@ class TestRetrievalEvaluatorFailOpen(unittest.IsolatedAsyncioTestCase):
         client.chat_completion.assert_not_awaited()
 
 
+class TestRetrievalEvaluatorTokenBudget(unittest.IsolatedAsyncioTestCase):
+    """Regression guard: reasoning models emit chain-of-thought into a
+    separate field that still consumes the completion token budget before
+    any content appears. A cap too tight starves the evaluator into an
+    empty response, which fail-opens to CONFIDENT and silently disables
+    CRAG correction. See retrieval_evaluator.py:82.
+    """
+
+    @pytest.mark.asyncio
+    async def test_evaluate_requests_2000_token_budget(self):
+        client = MagicMock()
+        client.chat_completion = AsyncMock(return_value="CONFIDENT")
+        evaluator = RetrievalEvaluator(client)
+
+        await evaluator.evaluate("q", [{"text": "a relevant chunk"}])
+
+        assert client.chat_completion.call_args.kwargs["max_tokens"] == 2000
+
+
 if __name__ == "__main__":
     unittest.main()

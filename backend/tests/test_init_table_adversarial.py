@@ -715,16 +715,33 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
                 with patch("app.services.vector_store.FTS") as mock_fts:
                     mock_fts.return_value = MagicMock()
 
-                    # Should crash on "any(idx.name == 'fts_text' for idx in indices)"
-                    # when indices is None
+                    # Should crash on "for idx in indices" (indices is None,
+                    # not iterable) before the per-index predicate even runs.
+                    # Still true after the FTS-exists check was rewritten to
+                    # match on (idx.index_type, idx.columns) instead of
+                    # idx.name (see test_fts_index_object_missing_attributes
+                    # below) -- the None-iteration TypeError is unaffected by
+                    # which attributes the predicate reads.
                     with self.assertRaises(TypeError):
                         await store.init_table(embedding_dim=384)
 
-    async def test_fts_index_object_missing_name_attribute(self):
+    async def test_fts_index_object_missing_attributes(self):
         """
-        ATTACK VECTOR: Index object in list_indices lacks 'name' attribute.
+        ATTACK VECTOR: Index object in list_indices lacks 'index_type'/'columns'.
 
-        Test handling of malformed index objects.
+        NOTE: superseded assumption — this test previously deleted only
+        `.name` and asserted an AttributeError, because the FTS-exists
+        check used to do a direct `idx.name == "fts_text"` attribute
+        access. Verified against lancedb==0.34.0: real FTS indices are
+        never actually named "fts_text" (LanceDB auto-names them
+        "text_idx"), so that by-name check was replaced with a check on
+        `idx.index_type` / `idx.columns` (matching how LanceDB itself
+        resolves which index to use for FTS/hybrid queries). The new check
+        reads those two attributes via `getattr(idx, ..., default)` —
+        mirroring the same defensive pattern already used a few lines above
+        for the embedding_idx check — so a malformed index object missing
+        them no longer crashes the whole init_table() call; it is simply
+        treated as "not a matching FTS index" and creation proceeds.
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -733,9 +750,10 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
 
         mock_table = MagicMock()
 
-        # Index object without 'name' attribute
+        # Index object without 'index_type' or 'columns' attributes
         mock_idx = MagicMock()
-        del mock_idx.name  # Remove name attribute
+        del mock_idx.index_type
+        del mock_idx.columns
 
         mock_table.list_indices = AsyncMock(return_value=[mock_idx])
         mock_table.create_index = AsyncMock()
@@ -753,9 +771,12 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
                 with patch("app.services.vector_store.FTS") as mock_fts:
                     mock_fts.return_value = MagicMock()
 
-                    # Should crash on accessing idx.name
-                    with self.assertRaises(AttributeError):
-                        await store.init_table(embedding_dim=384)
+                    # Should NOT crash: getattr(..., default) treats the
+                    # malformed object as "not a matching FTS index" and
+                    # falls through to attempting creation.
+                    await store.init_table(embedding_dim=384)
+
+        mock_table.create_index.assert_called_once()
 
 
 class TestAdversarialTableJustCreatedState(unittest.IsolatedAsyncioTestCase):

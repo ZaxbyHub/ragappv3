@@ -294,8 +294,10 @@ class QueryTransformer:
                 },
             ]
 
+            # Reasoning models consume the completion budget with chain-of-thought
+            # before emitting content; tiny caps starve them into empty responses.
             step_back = await self._llm_client.chat_completion(
-                messages=messages, max_tokens=100, temperature=settings.query_transform_temperature
+                messages=messages, max_tokens=2000, temperature=settings.query_transform_temperature
             )
 
             if step_back and step_back.strip():
@@ -439,7 +441,7 @@ class QueryTransformer:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=120,
+                max_tokens=2000,
                 temperature=settings.query_transform_temperature,
             )
         except Exception as exc:  # noqa: BLE001 — defensive
@@ -478,7 +480,7 @@ class QueryTransformer:
                 {"role": "user", "content": user_prompt},
             ]
             response = await self._llm_client.chat_completion(
-                messages, max_tokens=350, temperature=settings.hyde_temperature
+                messages, max_tokens=2000, temperature=settings.hyde_temperature
             )
             response = response.strip()
             if len(response) < 20:
@@ -725,7 +727,7 @@ class QueryPlanner:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=300,
+                max_tokens=2000,
                 temperature=0.0,
             )
         except Exception as e:

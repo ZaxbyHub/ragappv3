@@ -11,6 +11,7 @@ from app.config import settings
 from app.models.chat_mode import ChatMode
 from app.services.answer_contract import build_answer_contract
 from app.services.citation_validator import (
+    normalize_citation_brackets,
     parse_citations,
     parse_kms_citations,
     parse_wiki_citations,
@@ -1478,8 +1479,12 @@ class RAGEngine:
                 yield chunk
 
         # Citation parsing for the trace (does not modify content; the
-        # chat route does the user-visible repair).
-        full_response = "".join(assembled_response)
+        # chat route does the user-visible repair). Normalize fullwidth
+        # 【S#】-style citations once here so every downstream consumer of
+        # full_response — parse_citations for the trace, the answer
+        # contract's own citation regex, and citation repair — sees ASCII
+        # [S#] labels. Some deployed models emit the fullwidth form.
+        full_response = normalize_citation_brackets("".join(assembled_response))
         cited_sources, cited_memories = parse_citations(full_response)
         cited_wikis = parse_wiki_citations(full_response)
         cited_kms = parse_kms_citations(full_response)
@@ -1550,14 +1555,20 @@ class RAGEngine:
             trace.answer_supported = None
 
         # Citation confidence scoring and unverifiable-claims (FR-004).
-        # Build source texts from the distilled sources so we can score citation
-        # alignment with retrieved evidence. v1 uses full-source lexical overlap;
-        # provenance-narrowed scoring is reserved for a future iteration.
+        # Read source texts from relevant_chunks (the retrieved RAGSource
+        # objects), NOT from done_msg["sources"]: the source dicts built by
+        # to_source_metadata() carry only a 300-char display "snippet", never
+        # the full chunk "text" (see document_retrieval.to_source_metadata),
+        # so scoring against done_msg sources silently yields all-empty
+        # source_texts and every uncited sentence gets flagged unverifiable.
+        # Index alignment with S{i+1} labels is guaranteed because
+        # _build_done_message builds sources via a straight, unfiltered
+        # ``for idx, chunk in enumerate(relevant_chunks): to_source_metadata(
+        # chunk, source_index=idx + 1)`` — relevant_chunks[i] <-> sources[i] <-> S{i+1}.
+        # v1 uses full-source lexical overlap; provenance-narrowed scoring is
+        # reserved for a future iteration.
         try:
-            source_texts = [
-                s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")
-                for s in done_msg.get("sources", [])
-            ]
+            source_texts = [getattr(c, "text", "") or "" for c in relevant_chunks]
             confidence_result = score_citations(
                 full_response,
                 source_texts,

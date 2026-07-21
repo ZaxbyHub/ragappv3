@@ -133,10 +133,14 @@ class TestTableJustCreatedTracking(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
 
-        # Mock table with existing FTS index
+        # Mock table with existing FTS index. Real LanceDB default name is
+        # "text_idx" (verified against lancedb==0.34.0), not "fts_text";
+        # index_type/columns are what the FTS-exists check now matches on.
         mock_table = MagicMock()
         existing_fts = MagicMock()
-        existing_fts.name = "fts_text"
+        existing_fts.name = "text_idx"
+        existing_fts.index_type = "FTS"
+        existing_fts.columns = ["text"]
         mock_table.list_indices = AsyncMock(return_value=[existing_fts])
         mock_table.create_index = AsyncMock()
 
@@ -224,9 +228,19 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
 
     async def test_fts_index_not_recreated_when_already_exists(self):
         """
-        Test that FTS index creation is skipped when 'fts_text' already exists.
+        Test that FTS index creation is skipped when an FTS index already
+        exists on the 'text' column.
 
-        This verifies the fts_index_exists guard prevents duplicate FTS creation.
+        NOTE: superseded assumption — previously modeled the existing index
+        as ``name="fts_text"``. Verified against lancedb==0.34.0: LanceDB
+        auto-names an FTS index created via create_index(column="text",
+        config=FTS()) (no explicit name=, which is all this codebase has
+        ever passed) as "text_idx" ("{column}_idx" convention), never
+        "fts_text" — a by-name check against "fts_text" could never match a
+        real index. The guard now matches on index_type + columns instead
+        (mirroring how LanceDB itself resolves which index to use for
+        FTS/hybrid queries), so this fixture models the real shape:
+        ``name="text_idx", index_type="FTS", columns=["text"]``.
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -234,9 +248,11 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=[])
 
-        # Mock existing FTS index
+        # Mock existing FTS index (real LanceDB default name/type/columns)
         existing_fts = MagicMock()
-        existing_fts.name = "fts_text"
+        existing_fts.name = "text_idx"
+        existing_fts.index_type = "FTS"
+        existing_fts.columns = ["text"]
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[existing_fts])
@@ -263,6 +279,11 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
         Test that debug log is emitted when FTS index already exists.
 
         This verifies the 'FTS index already exists, skipping creation' log path.
+
+        NOTE: superseded assumption — see
+        test_fts_index_not_recreated_when_already_exists above for why the
+        existing-index fixture now sets index_type/columns rather than
+        relying on name="fts_text".
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -270,9 +291,11 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=[])
 
-        # Mock existing FTS index
+        # Mock existing FTS index (real LanceDB default name/type/columns)
         existing_fts = MagicMock()
-        existing_fts.name = "fts_text"
+        existing_fts.name = "text_idx"
+        existing_fts.index_type = "FTS"
+        existing_fts.columns = ["text"]
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[existing_fts])
