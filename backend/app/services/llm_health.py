@@ -60,19 +60,18 @@ class LLMHealthChecker:
 
         try:
             if service is None:
+                # Self-created probe service gets the checker's short timeout.
+                # An injected service is the shared production instance and
+                # keeps its own configured timeout: temporarily clobbering it
+                # to the checker's 5s both falsely fails slow-but-healthy
+                # embedding backends and races concurrent real embed calls
+                # that read the same mutable attribute.
                 service = EmbeddingService()
+                service.timeout = self.timeout
 
-            # Temporarily override timeout for health check
-            original_timeout = service.timeout
-            service.timeout = self.timeout
-
-            try:
-                # Attempt to embed a simple ping message
-                await service.embed_single("ping")
-                return {"ok": True, "error": None}
-            finally:
-                # Restore original timeout
-                service.timeout = original_timeout
+            # Attempt to embed a simple ping message
+            await service.embed_single("ping")
+            return {"ok": True, "error": None}
 
         except EmbeddingError as e:
             return {"ok": False, "error": f"Embedding service error: {str(e)}"}
