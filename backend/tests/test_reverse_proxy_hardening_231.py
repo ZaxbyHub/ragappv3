@@ -188,14 +188,18 @@ class TestSSEHeartbeat(unittest.TestCase):
         self.assertIn('HEARTBEAT_INTERVAL', content)
 
     def test_heartbeat_emitted_on_timeout(self):
-        """When the RAG engine stalls, a ': heartbeat\\n\\n' comment is emitted."""
-        import asyncio
-        import json
+        """When the RAG engine stalls, a ': heartbeat\\n\\n' comment is emitted.
 
-        # Build a mock RAG engine whose first chunk arrives after a simulated stall.
-        # We patch asyncio.wait_for to raise TimeoutError on the first call to
-        # simulate a 15s gap, then delegate to the real wait_for for subsequent calls.
+        Rewritten for the asyncio.wait-based heartbeat loop: the old version
+        patched asyncio.wait_for (implementation-coupled, and wait_for's
+        cancel-on-timeout was itself the bug the loop no longer has). The
+        stall is now real: the mock engine sleeps longer than the patched
+        HEARTBEAT_INTERVAL before yielding.
+        """
+        import asyncio
+
         async def mock_query(*args, **kwargs):
+            await asyncio.sleep(0.25)
             yield {"type": "content", "content": "late"}
             yield {"type": "done", "sources": [], "memories_used": []}
 
@@ -204,19 +208,9 @@ class TestSSEHeartbeat(unittest.TestCase):
 
         from app.api.routes.chat import stream_chat_response
 
-        original_wait_for = asyncio.wait_for
-        call_count = [0]
-
-        async def mock_wait_for(coro, timeout):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                coro.close()
-                raise asyncio.TimeoutError()
-            return await original_wait_for(coro, timeout)
-
         async def run_test():
             results = []
-            with patch('app.api.routes.chat.asyncio.wait_for', mock_wait_for):
+            with patch('app.api.routes.chat.HEARTBEAT_INTERVAL', 0.05):
                 response = stream_chat_response(
                     message="test", history=[], rag_engine=mock_engine
                 )
@@ -224,23 +218,78 @@ class TestSSEHeartbeat(unittest.TestCase):
                     results.append(chunk)
             return results
 
-        try:
-            original_loop = asyncio.get_event_loop_policy().get_event_loop()
-        except (RuntimeError, AttributeError):
-            original_loop = None
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            results = loop.run_until_complete(run_test())
-        finally:
-            loop.close()
-            if original_loop is not None:
-                asyncio.get_event_loop_policy().set_event_loop(original_loop)
+        results = asyncio.run(run_test())
 
         heartbeat_found = any(
             isinstance(r, str) and ': heartbeat\n\n' in r for r in results
         )
         self.assertTrue(heartbeat_found, "No ': heartbeat\\n\\n' comment found in SSE output")
+
+    def test_stalled_generator_survives_heartbeat_and_delivers_content(self):
+        """Regression: a stall longer than HEARTBEAT_INTERVAL must NOT kill the stream.
+
+        The old loop used asyncio.wait_for, which cancels the pending
+        __anext__() on timeout — throwing CancelledError into the RAG
+        generator and killing it mid-LLM-stream. Reasoning models emit no
+        content deltas for longer than the interval while reasoning, so every
+        such chat turn ended with 0 content and an empty done payload. This
+        asserts content produced AFTER a multi-heartbeat stall still reaches
+        the client and the engine's done payload (sources) survives.
+        """
+        import asyncio
+        import json
+
+        async def mock_query(*args, **kwargs):
+            yield {"type": "stage", "stage": "drafting"}
+            # Silent reasoning phase spanning several heartbeat intervals.
+            await asyncio.sleep(0.25)
+            yield {"type": "content", "content": "THE ANSWER"}
+            yield {
+                "type": "done",
+                "sources": [{"source_label": "S1"}],
+                "memories_used": [],
+            }
+
+        mock_engine = MagicMock()
+        mock_engine.query = mock_query
+
+        from app.api.routes.chat import stream_chat_response
+
+        async def run_test():
+            results = []
+            with patch('app.api.routes.chat.HEARTBEAT_INTERVAL', 0.05):
+                response = stream_chat_response(
+                    message="test", history=[], rag_engine=mock_engine
+                )
+                async for chunk in response.body_iterator:
+                    results.append(chunk)
+            return results
+
+        results = asyncio.run(run_test())
+
+        data_events = []
+        for r in results:
+            if not isinstance(r, str):
+                continue
+            for line in r.split("\n"):
+                if line.startswith("data: "):
+                    data_events.append(json.loads(line[6:]))
+
+        contents = [e["content"] for e in data_events if e.get("type") == "content"]
+        self.assertEqual(
+            contents, ["THE ANSWER"],
+            f"Content after the stall was lost (generator killed?): {data_events}",
+        )
+        dones = [e for e in data_events if e.get("type") == "done"]
+        self.assertTrue(dones, "No done event in SSE output")
+        self.assertEqual(
+            dones[-1].get("sources"), [{"source_label": "S1"}],
+            "Engine done payload (sources) did not survive the stall",
+        )
+        heartbeat_found = any(
+            isinstance(r, str) and ': heartbeat\n\n' in r for r in results
+        )
+        self.assertTrue(heartbeat_found, "Expected heartbeats during the stall")
 
 
 class TestAuthSessionIpUsesRequestHelper(unittest.TestCase):

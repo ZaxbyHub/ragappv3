@@ -1,54 +1,71 @@
-# Chat "0 content output" regression — root cause (code-confirmed) + fix plan
+# Chat "0 content output" regression — ROOT CAUSE CONFIRMED + FIX
 
-Branch: `claude/chat-output-regression-18p9op`  •  Repo at 63e723d  •  Reviewer-validated (all 5 code claims CONFIRMED)
+Branch: `claude/chat-output-regression-18p9op` • Repo at 63e723d • Status: fixed, tested, CI gates green locally.
 
-## Mechanism (all code-verified in this repo)
-Chat `/chat/stream` → `rag_engine.query(stream=True)` → `_stream_llm_response` → `LLMClient.chat_completion_stream`.
+## Final root cause (code-confirmed + runtime-proven on Python 3.11)
 
-1. `chat_completion_stream` (llm_client.py:413-417) DROPS every delta whose `content` is empty →
-   all `reasoning`/`reasoning_content` deltas are discarded; only real `content` is streamed.
-2. It also suppresses inline `<think>…</think>`. If a `<think>` opens but `</think>` never arrives
-   before stream end, `_thinking_active` stays True and ALL remaining text is suppressed. There is
-   **no post-loop `_buffer` flush** (llm_client.py:~564) — a legit terminated answer still sitting in
-   `_buffer` at stream-end is also dropped (second latent bug).
-3. `_stream_llm_response` (rag_engine.py:2306-2329) sets `emitted_content=True` on ANY yielded chunk
-   — **including a whitespace-only chunk** — and after the loop `return`s at 2316 with **NO
-   non-streaming fallback** when zero content was produced. (GLM's report: old code had a fallback here.)
-4. Non-streaming `chat_completion` (llm_client.py:245-250) reads `message.content` then
-   `sanitize_assistant_content`, whose `_UNTERMINATED_THINK_TAIL_RE` (assistant_sanitizer.py:31,74)
-   strips an unterminated `<think>…` (no close) to `""`. So a budget-truncated reasoning response is
-   ALSO empty in non-streaming.
-5. Budgets (rag_engine.py:736/742): INSTANT `max_tokens = settings.instant_max_tokens`
-   (default 4096 in config.py:56, but **this deployment set 16384** in settings_kv); THINKING
-   hardcoded **32768**. Utility calls use tiny budgets (query-transform 100, retrieval-eval 64) that
-   reasoning models can't answer within → already returning empty per GLM logs.
+**The SSE heartbeat loop added by issue #231 (reverse-proxy hardening, one of the 80 upgrade
+commits) kills the RAG generator whenever the model is silent for >15s.**
 
-## Why GLM's restored fallback "didn't fire"
-Two concrete, code-backed reasons:
-- **Whitespace defeats the guard.** If the model streams any whitespace-only `content` (e.g. `"\n\n"`),
-  `chat_completion_stream` yields it, `emitted_content=True`, and `if emitted_content: return` skips the
-  fallback. User sees a blank answer.
-- **Same-budget fallback is also empty.** If it's budget exhaustion (finish_reason=length, unterminated
-  `<think>`), the non-streaming fallback at the SAME 16384/32768 budget returns `""` too (sanitizer
-  strips the unterminated tail). Fallback runs but yields nothing.
+`backend/app/api/routes/chat.py` (pre-fix lines 308-318):
 
-## Two sub-modes — need ONE live datum to pick (diag_stream_vs_nonstream.py)
-- **A (budget/non-convergence):** stream=0 content, finish_reason="length"; the model burns the whole
-  budget reasoning. Fix needs budget reduction + honest empty-handling, NOT just a fallback.
-- **B (filter/whitespace):** stream has content deltas (model answered) but suppressed / only whitespace;
-  non-stream has real content. A *correct* fallback (non-whitespace guard) fixes it.
-GLM's own evidence (tiny-budget utility calls also return empty) strongly favors A being real/dominant.
+```python
+chunk = await asyncio.wait_for(rag_gen_ait.__anext__(), timeout=HEARTBEAT_INTERVAL)  # 15.0s
+except asyncio.TimeoutError:
+    yield ": heartbeat\n\n"
+    continue
+```
 
-## Fix plan (layers; A-answer selects emphasis)
-- **L1 (both):** in `_stream_llm_response`, count only NON-whitespace content; after the loop, if none,
-  fall back to non-streaming `chat_completion`; yield if non-empty; else emit an honest error chunk
-  (not a silent blank done).
-- **L2 (latent bugs):** flush trailing `_buffer` after the stream loop when not `_thinking_active`;
-  treat stream-end-while-`_thinking_active` as "no content" so L1 triggers.
-- **L3 (sub-mode A):** reasoning models over-reason under huge budgets. Lower `instant_max_tokens`
-  (16384→~4096 or less) and the hardcoded 32768; raise the tiny utility budgets (64/100) — or route
-  utility calls to a non-reasoning path. Meta-root-cause: app's reasoning-filter + budgets assume
-  models that emit content promptly; the deployment switched to reasoning models that don't.
+`asyncio.wait_for` **cancels** the awaited `__anext__()` task on timeout. Cancelling `__anext__`
+throws `CancelledError` INTO the async generator at its current suspension point (deep inside
+`chat_completion_stream`'s `aiter_lines`), terminating the whole generator. The next loop
+iteration's `__anext__()` raises `StopAsyncIteration` → route finalizes with empty
+`collected_content` and its own initialized `sources=[]` → `done` with 0 content / 0 sources.
 
-## Status: root cause CONFIRMED at code level. Awaiting GLM live diagnostic (finish_reason +
-## content-delta counts for the real heavy prompt) before finalizing L3 emphasis and implementing.
+Why every turn hit it: `llm_client.chat_completion_stream` (413-417) silently skips all
+`reasoning`/`reasoning_content` deltas, so during a reasoning model's thinking phase the engine
+yields NOTHING for 15-100s (GLM diagnostics: nemotron ~60-100s, ChatGPTN ~15-25s before first
+content). The 15s silence window fires on essentially every real RAG turn in both modes.
+
+## Evidence chain
+1. GLM live diagnostics: both models return real content at every budget, streaming and
+   non-streaming, `finish_reason='stop'`; reasoning arrives as a separate field (no `<think>`
+   in content). Ruled out budget exhaustion, `<think>` filtering, endpoint issues.
+2. Timing: real failing turn ends at ~20s (Drafting at ~5s + 15s HEARTBEAT_INTERVAL) while
+   actual generation takes 30-142s. Exact match to a Drafting+15s cancellation.
+3. Runtime repro (scratchpad/repro_waitfor_kill.py, Python 3.11.15): generator killed by
+   CancelledError, events `['stage','heartbeat']`, 0 content — bug reproduced in isolation.
+4. Explains GLM's failed hot-patch: the generator dies by CancelledError mid-`async for`, so
+   the code after the streaming loop (the restored fallback + its log line) never executes.
+
+## Fix (committed on this branch)
+`chat.py`: replaced cancel-on-timeout `wait_for` with a persistent-pull pattern:
+- `next_chunk_task = asyncio.ensure_future(rag_gen_ait.__anext__())` created once per chunk;
+- `await asyncio.wait({next_chunk_task}, timeout=HEARTBEAT_INTERVAL)` — on timeout the task
+  KEEPS RUNNING; the route emits `: heartbeat` and re-waits on the same task;
+- `finally:` cancels a still-pending pull on client disconnect (no task leak);
+- `HEARTBEAT_INTERVAL` hoisted to module level (same name; patchable in tests).
+
+Tests (`backend/tests/test_reverse_proxy_hardening_231.py`):
+- `test_heartbeat_emitted_on_timeout` rewritten off the implementation-coupled
+  `asyncio.wait_for` mock (that mock encoded the bug) to a real stall.
+- NEW `test_stalled_generator_survives_heartbeat_and_delivers_content`: content emitted after a
+  multi-heartbeat stall must reach the client and the engine's done sources must survive.
+
+Verification: repro proves mechanism; heartbeat+chat/stream batch 168 passed ×2 (stable);
+`ruff check .` clean; all 5 `scripts/check_*.py` contract scripts pass. The one-off
+4-failure batch run did not reproduce on either tree state (env flake, unrelated files).
+
+## Secondary (real but NOT this regression; not fixed here)
+- Tiny utility budgets: query-transform max_tokens=100, retrieval-eval max_tokens=64 return
+  empty on reasoning models (budget consumed by the reasoning field) — degrades retrieval
+  quality; pipeline fail-opens. Candidate follow-up.
+- `_stream_llm_response` still has no non-streaming fallback when a stream truly yields no
+  content; `chat_completion_stream` has no post-loop `_buffer` flush. Latent, not triggered
+  by these models (they DO emit content once the route stops killing the stream).
+- Deployment settings: `instant_max_tokens=16384` vs config default 4096 (works; just large).
+
+## Deploy note for GLM
+Rebuild image from this branch, or hot-patch `backend/app/api/routes/chat.py` into the
+container (docker cp + restart). Revert the rag_engine.py hot-patch fallback if desired —
+it's harmless but wasn't the fix.

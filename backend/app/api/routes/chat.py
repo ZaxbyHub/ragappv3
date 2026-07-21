@@ -45,6 +45,13 @@ from app.utils.assistant_sanitizer import sanitize_chat_messages_content
 # Track background tasks to prevent garbage collection
 _background_tasks: Set[asyncio.Task] = set()
 
+# Heartbeat: emit a periodic SSE comment (": heartbeat\n\n") during long
+# generation gaps so intermediate proxies with short read timeouts (e.g. the
+# nginx default 60s) don't drop the connection. Per the SSE spec, lines
+# starting with ":" are comments that EventSource clients silently discard.
+# Module-level so tests can patch it to a short interval.
+HEARTBEAT_INTERVAL = 15.0  # seconds
+
 
 router = APIRouter()
 
@@ -288,14 +295,15 @@ def stream_chat_response(
             resolved_mode = ChatMode.THINKING
         yield f"data: {json.dumps({'type': 'mode', 'mode': resolved_mode.value})}\n\n"
 
+        # Pending pull from the RAG generator. Must survive heartbeat timeouts:
+        # asyncio.wait_for would CANCEL the pending __anext__() on timeout,
+        # which throws CancelledError into the generator mid-LLM-stream and
+        # kills it. Reasoning models emit no content deltas for longer than
+        # HEARTBEAT_INTERVAL while reasoning, so every such turn ended with a
+        # dead generator and an empty done payload (0 content, 0 sources).
+        # asyncio.wait leaves the task running on timeout instead.
+        next_chunk_task: Optional[asyncio.Task] = None
         try:
-            # Heartbeat: emit a periodic SSE comment (": heartbeat\n\n") during
-            # long generation gaps so intermediate proxies with short read
-            # timeouts (e.g. the nginx default 60s) don't drop the connection.
-            # Per the SSE spec, lines starting with ":" are comments that
-            # EventSource clients silently discard.
-            HEARTBEAT_INTERVAL = 15.0  # seconds
-
             rag_gen = rag_engine.query(
                 message, history, stream=True, vault_id=vault_id, mode=mode,
                 require_vault=require_vault, user_id=user_id,
@@ -306,14 +314,19 @@ def stream_chat_response(
             rag_gen_ait = rag_gen.__aiter__()
 
             while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        rag_gen_ait.__anext__(), timeout=HEARTBEAT_INTERVAL
-                    )
-                except asyncio.TimeoutError:
-                    # No data from the model for a full interval — send keepalive.
+                if next_chunk_task is None:
+                    next_chunk_task = asyncio.ensure_future(rag_gen_ait.__anext__())
+                done_set, _pending = await asyncio.wait(
+                    {next_chunk_task}, timeout=HEARTBEAT_INTERVAL
+                )
+                if not done_set:
+                    # No data from the model for a full interval — send keepalive
+                    # while the same pull keeps waiting in the background.
                     yield ": heartbeat\n\n"
                     continue
+                finished_task, next_chunk_task = next_chunk_task, None
+                try:
+                    chunk = finished_task.result()
                 except StopAsyncIteration:
                     break
 
@@ -384,6 +397,16 @@ def stream_chat_response(
             error_msg = "An error occurred during chat processing"
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'INTERNAL_ERROR'})}\n\n"
             return
+        finally:
+            if next_chunk_task is not None:
+                # Stream ended with a pull still in flight (e.g. client
+                # disconnected at a heartbeat) — cancel it so the RAG
+                # generator and its LLM stream shut down instead of leaking.
+                next_chunk_task.cancel()
+                try:
+                    await next_chunk_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001 — cleanup only
+                    pass
 
         # Citation validation pass: parse the assembled assistant content and
         # check every [S#]/[M#]/[W#] citation against the available labels.
