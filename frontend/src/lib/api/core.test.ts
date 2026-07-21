@@ -438,3 +438,52 @@ describe("getTokenExpiry / isTokenNearExpiry — newly exported functions", () =
     expect(isTokenNearExpiry("")).toBe(false);
   });
 });
+
+describe("api/core.ts — CSRF cookie rotation (regression)", () => {
+  // The server rotates the CSRF cookie on login, refresh, and logout. The
+  // old ensureCsrfToken returned the in-memory cache without re-reading the
+  // cookie, so after the first silent /auth/refresh every mutation sent
+  // header != cookie and 403'd ("CSRF token missing or mismatch") until a
+  // full reload. The cookie must always win over the cache.
+  afterEach(async () => {
+    const { resetCsrfToken } = await import("@/lib/api/core");
+    resetCsrfToken();
+    // Expire the test cookie
+    document.cookie = "X-CSRF-Token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+  });
+
+  it("prefers the live cookie over a stale cached token after rotation", async () => {
+    const { ensureCsrfToken, resetCsrfToken } = await import("@/lib/api/core");
+    resetCsrfToken();
+
+    // Seed cache from cookie A (pre-rotation)
+    document.cookie = "X-CSRF-Token=token-A; path=/";
+    expect(await ensureCsrfToken()).toBe("token-A");
+
+    // Server rotates the cookie (login/refresh/logout response)
+    document.cookie = "X-CSRF-Token=token-B; path=/";
+
+    // The header token must mirror the CURRENT cookie, not the cached value
+    expect(await ensureCsrfToken()).toBe("token-B");
+  });
+
+  it("falls back to the cached token when the cookie is absent", async () => {
+    const { ensureCsrfToken, resetCsrfToken } = await import("@/lib/api/core");
+    resetCsrfToken();
+
+    document.cookie = "X-CSRF-Token=token-C; path=/";
+    expect(await ensureCsrfToken()).toBe("token-C");
+
+    // Cookie expires but cache persists (e.g. cookie cleared mid-session)
+    document.cookie = "X-CSRF-Token=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+    expect(await ensureCsrfToken()).toBe("token-C");
+  });
+
+  it("preserves '=' characters in token values (base64 padding)", async () => {
+    const { ensureCsrfToken, resetCsrfToken } = await import("@/lib/api/core");
+    resetCsrfToken();
+
+    document.cookie = "X-CSRF-Token=abc123%3D%3D; path=/";
+    expect(await ensureCsrfToken()).toBe("abc123==");
+  });
+});

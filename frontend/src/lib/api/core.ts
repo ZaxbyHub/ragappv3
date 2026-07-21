@@ -61,14 +61,20 @@ export function getCsrfToken(): string | null {
 }
 
 export async function ensureCsrfToken(): Promise<string> {
-  if (_csrfToken) return _csrfToken;
-
-  // Check cookie first
+  // Cookie first, always: the server ROTATES the CSRF cookie on login,
+  // refresh, and logout, and the double-submit check compares the header
+  // against the CURRENT cookie. Returning a cached token from before a
+  // rotation sends header != cookie and every mutation 403s ("CSRF token
+  // missing or mismatch") until the next full reload — the cookie on hand
+  // is authoritative, the memory cache is only a fallback for when the
+  // cookie is unreadable.
   const cookieToken = getCsrfCookie();
   if (cookieToken) {
     _csrfToken = cookieToken;
     return cookieToken;
   }
+
+  if (_csrfToken) return _csrfToken;
 
   if (!_csrfFetchPromise) {
     const newPromise: Promise<string> = fetch(`${API_BASE_URL}/csrf-token`, { credentials: "include" })
@@ -192,6 +198,10 @@ async function _doRefresh(): Promise<string | null> {
     if (!response.ok) return null;
     const data = await response.json();
     _jwtAccessToken = data.access_token;
+    // The refresh response rotated the CSRF cookie — drop the cached token
+    // so the next mutation re-reads the fresh cookie instead of sending a
+    // stale header that no longer matches.
+    resetCsrfToken();
     return data.access_token;
   } catch {
     return null;
