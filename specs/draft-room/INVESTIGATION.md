@@ -185,4 +185,4 @@ Phase 1 maps roles onto what exists: thinking client = writer/plan/copy/fact-che
 
 ## 9. Verification note
 
-Plugin claims: verified first-hand (all agent prompts, guardrails, pre-check tool, state machine, config read at commit `690fcea`). ragappv3 claims: mapped by three parallel explorer passes; an independent reviewer pass against source is in flight and any corrections will land as a follow-up commit. Anchors above use `~` where line numbers may drift.
+Plugin claims: verified first-hand (all agent prompts, guardrails, pre-check tool, state machine, config read at commit `690fcea`). ragappv3 claims: mapped by three parallel explorer passes, then re-verified by an independent reviewer pass that opened every cited file — all 22 load-bearing claims confirmed. Two precision notes from that pass: the `files.parsed_text` persistence is at `document_processor.py:2988–2991`, and `wiki_compile_jobs` lacks the `input_json`/`retry_count` columns that `kms_compile_jobs` has (hence §4.2 clones the **kms** table shape). Anchors above use `~` where line numbers may drift.
