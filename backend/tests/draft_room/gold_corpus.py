@@ -118,6 +118,7 @@ _SINGLE_QUOTES = "‘’‚‛′"
 _DASHES = "‐‑‒–—―−"
 _WHITESPACE_RE = re.compile(r"\s+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+")
+_BLOCK_OPENER_RE = re.compile(r"\s*(?:#{1,6}\s|>\s|[-*+]\s|\d+\.\s|\||---|\*\*)")
 
 
 class GoldCorpusError(ValueError):
@@ -194,24 +195,40 @@ def split_sentences(text: str) -> tuple[str, ...]:
     """Split text into comparable sentence units.
 
     Inputs: ``text`` — any string.
-    Outputs: a tuple of non-empty, whitespace-normalised sentence strings. A
-    sentence boundary is a ``.``, ``!``, ``?`` or ``;`` followed by whitespace;
-    blank-line-separated blocks (headings, table rows, list items) are treated
-    as their own units so that structured Markdown does not collapse into one
-    giant sentence.
+    Outputs: a tuple of non-empty, whitespace-normalised sentence strings.
+
+    Blocks are formed first: a blank line ends a block, and so does a line that
+    opens a Markdown structure (heading, block quote, bullet, numbered item, or
+    table row). Continuation lines are joined with a single space, so a
+    hard-wrapped paragraph is not shredded at its line breaks. Each block is
+    then split on ``.``, ``!``, ``?`` or ``;`` followed by whitespace.
 
     Deterministic and oracle-backed: a fixed regular-expression rule, not an
     LLM judge.
     """
     units: list[str] = []
-    for block in text.split("\n"):
-        stripped = block.strip()
-        if not stripped:
-            continue
-        for piece in _SENTENCE_SPLIT_RE.split(stripped):
-            candidate = _WHITESPACE_RE.sub(" ", piece).strip()
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if not buffer:
+            return
+        block = _WHITESPACE_RE.sub(" ", " ".join(buffer)).strip()
+        buffer.clear()
+        if not block:
+            return
+        for piece in _SENTENCE_SPLIT_RE.split(block):
+            candidate = piece.strip()
             if candidate:
                 units.append(candidate)
+
+    for line in text.split("\n"):
+        if not line.strip():
+            flush()
+            continue
+        if _BLOCK_OPENER_RE.match(line):
+            flush()
+        buffer.append(line.strip())
+    flush()
     return tuple(units)
 
 
