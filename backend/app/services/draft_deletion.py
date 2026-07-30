@@ -13,8 +13,9 @@ path, only IDs and counts.
 from __future__ import annotations
 
 import logging
+import shutil
 
-from app.services.draft_input_storage import DraftInputStorage
+from app.services.draft_input_storage import DraftInputPathError, DraftInputStorage
 from app.services.draft_store import DraftConflictError, DraftStore
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,18 @@ class DraftDeletionService:
 
         for token, _relpath in tokens:
             self._storage.commit_tombstone(token)
+
+        # The project's input files are gone; drop the now-empty
+        # "<owner_id>/<draft_id>" tree so no orphan directory is left behind
+        # (startup reconciliation would otherwise remove it later, but a
+        # whole-draft delete is a comprehensive purge in its own right).
+        try:
+            project_dir = self._storage.resolve(f"{owner_id}/{draft_id}")
+            if project_dir.is_dir():
+                shutil.rmtree(project_dir, ignore_errors=True)
+        except DraftInputPathError:
+            logger.warning("draft_project_dir_cleanup_skipped draft_id=%s", draft_id)
+
         logger.info("draft_deleted draft_id=%s input_count=%s", draft_id, len(tokens))
 
     # ── cascades ─────────────────────────────────────────────────────────
