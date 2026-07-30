@@ -845,7 +845,11 @@ class DraftStore:
     ) -> DraftInputRecord:
         """Load one input, constrained through its owning draft."""
         row = self._db.execute(
-            f"SELECT {_INPUT_COLUMNS} FROM draft_inputs i "
+            "SELECT id, draft_id, role, authority, as_of_date, original_name, "
+            "stored_name, extension, media_type, size_bytes, content_sha256, "
+            "storage_relpath, parsed_text_sha256, parsed_char_count, parse_status, "
+            "parse_error, locked_spans_json, created_at, updated_at "
+            "FROM draft_inputs i "
             "WHERE i.id = ? AND i.draft_id = ? AND EXISTS ("
             "  SELECT 1 FROM drafts d WHERE d.id = i.draft_id AND d.created_by = ?)",
             (input_id, draft_id, owner_id),
@@ -858,7 +862,11 @@ class DraftStore:
         """All inputs for an owned draft, oldest first."""
         self.get_draft(draft_id, owner_id)
         rows = self._db.execute(
-            f"SELECT {_INPUT_COLUMNS} FROM draft_inputs "
+            "SELECT id, draft_id, role, authority, as_of_date, original_name, "
+            "stored_name, extension, media_type, size_bytes, content_sha256, "
+            "storage_relpath, parsed_text_sha256, parsed_char_count, parse_status, "
+            "parse_error, locked_spans_json, created_at, updated_at "
+            "FROM draft_inputs "
             "WHERE draft_id = ? ORDER BY created_at ASC, id ASC",
             (draft_id,),
         ).fetchall()
@@ -1168,15 +1176,25 @@ class DraftStore:
         include_content: bool = True,
     ) -> DraftRevisionRecord:
         """Load one immutable revision, constrained through its owning draft."""
-        extra = (
-            ", content_md, sections_json, citations_json, qa_summary_json"
-            if include_content
-            else ""
-        )
+        if include_content:
+            query = (
+                "SELECT id, draft_id, parent_revision_id, job_id, revision_no, "
+                "source, content_sha256, fact_status, is_current, created_by, "
+                "created_at, content_md, sections_json, citations_json, "
+                "qa_summary_json FROM draft_revisions r "
+                "WHERE r.id = ? AND r.draft_id = ? AND EXISTS ("
+                "  SELECT 1 FROM drafts d WHERE d.id = r.draft_id AND d.created_by = ?)"
+            )
+        else:
+            query = (
+                "SELECT id, draft_id, parent_revision_id, job_id, revision_no, "
+                "source, content_sha256, fact_status, is_current, created_by, "
+                "created_at FROM draft_revisions r "
+                "WHERE r.id = ? AND r.draft_id = ? AND EXISTS ("
+                "  SELECT 1 FROM drafts d WHERE d.id = r.draft_id AND d.created_by = ?)"
+            )
         row = self._db.execute(
-            f"SELECT {_REVISION_SUMMARY_COLUMNS}{extra} FROM draft_revisions r "
-            "WHERE r.id = ? AND r.draft_id = ? AND EXISTS ("
-            "  SELECT 1 FROM drafts d WHERE d.id = r.draft_id AND d.created_by = ?)",
+            query,
             (revision_id, draft_id, owner_id),
         ).fetchone()
         if row is None:
@@ -1189,7 +1207,9 @@ class DraftStore:
         """The draft's current revision summary, or None when it has none."""
         self.get_draft(draft_id, owner_id)
         row = self._db.execute(
-            f"SELECT {_REVISION_SUMMARY_COLUMNS} FROM draft_revisions "
+            "SELECT id, draft_id, parent_revision_id, job_id, revision_no, source, "
+            "content_sha256, fact_status, is_current, created_by, created_at "
+            "FROM draft_revisions "
             "WHERE draft_id = ? AND is_current = 1",
             (draft_id,),
         ).fetchone()
@@ -1207,7 +1227,9 @@ class DraftStore:
             ).fetchone()[0]
         )
         rows = self._db.execute(
-            f"SELECT {_REVISION_SUMMARY_COLUMNS} FROM draft_revisions "
+            "SELECT id, draft_id, parent_revision_id, job_id, revision_no, source, "
+            "content_sha256, fact_status, is_current, created_by, created_at "
+            "FROM draft_revisions "
             "WHERE draft_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (draft_id, per_page, max(page - 1, 0) * per_page),
         ).fetchall()
@@ -1269,7 +1291,12 @@ class DraftStore:
     def get_job(self, *, draft_id: int, owner_id: int, job_id: int) -> DraftJobRecord:
         """Load one job, constrained through its owning draft."""
         row = self._db.execute(
-            f"SELECT {_JOB_COLUMNS} FROM draft_jobs j "
+            "SELECT id, draft_id, vault_id, created_by, job_type, input_id, "
+            "parent_job_id, attempt_no, idempotency_key, status, active_stage, "
+            "start_stage, retry_count, model_call_count, max_model_calls, "
+            "timeout_seconds, progress_percent, cancel_requested_at, heartbeat_at, "
+            "error_code, error_message, created_at, started_at, completed_at "
+            "FROM draft_jobs j "
             "WHERE j.id = ? AND j.draft_id = ? AND EXISTS ("
             "  SELECT 1 FROM drafts d WHERE d.id = j.draft_id AND d.created_by = ?)",
             (job_id, draft_id, owner_id),
@@ -1305,11 +1332,11 @@ class DraftStore:
         clause = " AND ".join(where)
         total = int(
             self._db.execute(
-                f"SELECT COUNT(*) FROM draft_jobs WHERE {clause}", params
+                f"SELECT COUNT(*) FROM draft_jobs WHERE {clause}", params  # nosec B608 - clause is built only from literal fragments; all values are bound parameters
             ).fetchone()[0]
         )
         rows = self._db.execute(
-            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE {clause} "
+            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE {clause} "  # nosec B608 - clause is built only from literal fragments; all values are bound parameters
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (*params, per_page, max(page - 1, 0) * per_page),
         ).fetchall()
@@ -1365,7 +1392,13 @@ class DraftStore:
             self._db.rollback()
             raise
         row = self._db.execute(
-            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE id = ?", (job_id,)
+            "SELECT id, draft_id, vault_id, created_by, job_type, input_id, "
+            "parent_job_id, attempt_no, idempotency_key, status, active_stage, "
+            "start_stage, retry_count, model_call_count, max_model_calls, "
+            "timeout_seconds, progress_percent, cancel_requested_at, heartbeat_at, "
+            "error_code, error_message, created_at, started_at, completed_at "
+            "FROM draft_jobs WHERE id = ?",
+            (job_id,),
         ).fetchone()
         return None if row is None else _row_to_job(row)
 
