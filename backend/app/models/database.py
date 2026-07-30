@@ -177,7 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_draft_events_draft_created
 
 
 # Database schema definition
-SCHEMA = """
+_BASE_SCHEMA = """
 -- Vaults table: stores document collection vaults
 CREATE TABLE IF NOT EXISTS vaults (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1037,7 +1037,13 @@ CREATE TABLE IF NOT EXISTS prompt_ab_exposures (
     UNIQUE(experiment_id, subject_key)
 );
 CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id ON prompt_ab_exposures(experiment_id);
-""" + _DRAFT_ROOM_CORE_DDL
+"""
+
+# The full schema. Both operands are static DDL literals defined above with no
+# interpolation and no caller input; the concatenation exists so that
+# _DRAFT_ROOM_CORE_DDL has exactly one definition, shared by SCHEMA and by
+# migrate_add_draft_room_core, and the two therefore cannot drift apart.
+SCHEMA = _BASE_SCHEMA + _DRAFT_ROOM_CORE_DDL  # nosec B608 - static DDL only
 
 
 
