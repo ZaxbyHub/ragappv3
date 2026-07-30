@@ -36,7 +36,7 @@ from fastapi.testclient import TestClient
 from app.api.deps import get_db, get_vector_store
 from app.config import settings
 from app.main import app
-from app.security import csrf_protect
+from app.security import CSRFManager, csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
 
 
@@ -156,6 +156,12 @@ class DraftSecurityTestBase(unittest.TestCase):
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
         app.state.db_pool = self._connection_pool
+        # get_csrf_manager() 503s without this (normally set by lifespan startup,
+        # which TestClient(app) does not run here). Redis is unreachable in this
+        # environment, so CSRFManager falls back to its in-memory store — needed
+        # by TestCSRFEnforcement, which removes the csrf_protect override to
+        # exercise the real dependency.
+        app.state.csrf_manager = CSRFManager(redis_url="redis://localhost:6379/0", ttl=900)
 
         self._mock_vector_store = MagicMock()
         self._mock_vector_store.db = MagicMock()
@@ -209,6 +215,8 @@ class DraftSecurityTestBase(unittest.TestCase):
         app.dependency_overrides.pop(get_vector_store, None)
         if hasattr(app.state, "db_pool"):
             del app.state.db_pool
+        if hasattr(app.state, "csrf_manager"):
+            del app.state.csrf_manager
         if hasattr(self, "_connection_pool"):
             self._connection_pool.close_all()
         shutil.rmtree(self._temp_dir, ignore_errors=True)
@@ -248,6 +256,18 @@ class DraftSecurityTestBase(unittest.TestCase):
             headers=headers,
         )
 
+    def _advance_to_running(self, draft_id: int) -> None:
+        """See ``test_draft_routes.py`` for rationale: manual-revision creation
+        on a fresh draft requires the store's 'running' predecessor state,
+        which only the (out-of-scope, PR 2) compile pipeline sets in
+        production; simulated here via direct SQL for test setup."""
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute("UPDATE drafts SET status = 'running' WHERE id = ?", (draft_id,))
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
     def _revoke_vault_access(self, user_id: int, vault_id: int) -> None:
         conn = self._connection_pool.get_connection()
         try:
@@ -267,6 +287,7 @@ class TestNonOwnerIsolation(DraftSecurityTestBase):
         input_id = upload.json()["input"]["id"]
         job_id = upload.json()["job"]["id"]
 
+        self._advance_to_running(draft_id)
         rev = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions",
             json={"base_revision_id": None, "lock_version": 1, "content_md": "v1"},
@@ -434,6 +455,7 @@ class TestDisabledGate(DraftSecurityTestBase):
     def test_disabled_blocks_mutations_but_keeps_cleanup_available(self):
         # Create one draft while enabled so we have something to inspect/export/delete.
         draft_id = self._create_draft().json()["id"]
+        self._advance_to_running(draft_id)
         rev = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions",
             json={"base_revision_id": None, "lock_version": 1, "content_md": "v1"},

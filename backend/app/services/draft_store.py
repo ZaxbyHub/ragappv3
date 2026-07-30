@@ -114,7 +114,13 @@ REVISION_SOURCES: frozenset[str] = frozenset({"pipeline", "manual"})
 
 # Transitions reachable through ordinary operation.
 _DRAFT_TRANSITIONS: dict[str, frozenset[str]] = {
-    "draft": frozenset({"queued", "archived"}),
+    # 'draft' -> 'needs_review' is the manual-authoring edge. SPEC section 10.3
+    # lists the compile lifecycle (draft -> queued -> running -> needs_review),
+    # but section 3.3 states that saving a manual revision sets the project to
+    # needs_review, and this release ships manual revisions with no compile
+    # path at all. Without this edge the very first manual save on a new draft
+    # is rejected and the feature is unreachable.
+    "draft": frozenset({"queued", "needs_review", "archived"}),
     "queued": frozenset({"running", "failed", "cancelled"}),
     "running": frozenset({"needs_review", "failed", "cancelled"}),
     "needs_review": frozenset({"queued", "ready", "archived"}),
