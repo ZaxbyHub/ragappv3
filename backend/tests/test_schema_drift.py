@@ -27,7 +27,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # and document the change in the commit message.
 # 44 -> 45: master added `document_reindex_jobs` (reindex jobs table).
 # 45 -> 46: PR #410 added `failed_chunks` (per-chunk retry identity, Issue #396).
-EXPECTED_BASE_TABLE_COUNT = 46
+# 46 -> 51: Draft Room adds drafts, draft_inputs, draft_revisions, draft_jobs,
+# and draft_events (issue #435, specs/draft-room/SPEC.md section 5).
+EXPECTED_BASE_TABLE_COUNT = 51
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.
