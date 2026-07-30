@@ -254,56 +254,146 @@ class TestDeleteDraft(DraftDeletionTestBase):
             self.store.get_draft(draft.id, 1)
 
 
-class TestCascades(DraftDeletionTestBase):
-    def test_vault_delete_purges_bytes_for_every_affected_draft(self):
+class TestPreparePurgeForVault(DraftDeletionTestBase):
+    """Service-level tests for the vault-scoped prepare/commit/restore flow.
+
+    Unlike a single draft's ``delete_draft``, these never touch draft rows —
+    that is left to the caller's own parent-row-delete transaction (the FK
+    ``ON DELETE CASCADE`` from ``drafts`` to ``vaults``/``users``). See the
+    route-level tests below for the row side of the story.
+    """
+
+    def test_prepare_tombstones_every_input_without_touching_rows(self):
         d1 = self.make_draft(vault_id=1, title="A")
         d2 = self.make_draft(vault_id=1, title="B")
         r1 = self.add_input(d1.id)
         r2 = self.add_input(d2.id)
 
-        purged = self.deletion.delete_drafts_for_vault(self.store, 1)
+        plan = self.deletion.prepare_purge_for_vault(self.store, 1)
 
-        self.assertEqual(purged, 2)
+        self.assertEqual(len(plan.tokens), 2)
+        self.assertEqual(set(plan.draft_owner_pairs), {(d1.id, 1), (d2.id, 1)})
+        # Files are tombstoned (moved into .trash), not deleted outright.
         self.assertFalse(self.storage.exists(r1.storage_relpath))
         self.assertFalse(self.storage.exists(r2.storage_relpath))
-        with self.assertRaises(DraftNotFoundError):
-            self.store.get_draft(d1.id, 1)
-        with self.assertRaises(DraftNotFoundError):
-            self.store.get_draft(d2.id, 1)
+        # Rows are untouched by prepare — only the caller's own transaction
+        # (or, in these unit tests, a direct row delete) removes them.
+        self.store.get_draft(d1.id, 1)
+        self.store.get_draft(d2.id, 1)
 
-    def test_user_delete_purges_bytes_for_every_owned_draft(self):
+    def test_prepare_does_not_touch_a_different_vault(self):
+        d1 = self.make_draft(vault_id=1)
+        d2 = self.make_draft(vault_id=2)
+        r1 = self.add_input(d1.id)
+        r2 = self.add_input(d2.id)
+
+        plan = self.deletion.prepare_purge_for_vault(self.store, 1)
+
+        self.assertEqual(len(plan.tokens), 1)
+        self.assertFalse(self.storage.exists(r1.storage_relpath))
+        self.assertTrue(self.storage.exists(r2.storage_relpath))
+
+    def test_commit_purge_discards_tombstones_and_drops_project_dirs(self):
+        d1 = self.make_draft(vault_id=1)
+        self.add_input(d1.id)
+        plan = self.deletion.prepare_purge_for_vault(self.store, 1)
+
+        self.deletion.commit_purge(plan)
+
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
+        self.assertFalse((self.root / "1" / str(d1.id)).exists())
+
+    def test_restore_purge_returns_bytes_to_their_original_paths(self):
+        d1 = self.make_draft(vault_id=1)
+        r1 = self.add_input(d1.id)
+        content = self.storage.resolve(r1.storage_relpath).read_bytes()
+        plan = self.deletion.prepare_purge_for_vault(self.store, 1)
+
+        self.deletion.restore_purge(plan)
+
+        self.assertTrue(self.storage.exists(r1.storage_relpath))
+        self.assertEqual(self.storage.resolve(r1.storage_relpath).read_bytes(), content)
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
+
+
+class TestPreparePurgeForUser(DraftDeletionTestBase):
+    def test_prepare_scopes_to_owner_across_vaults(self):
         d1 = self.make_draft(owner_id=1, vault_id=1, title="A")
         d2 = self.make_draft(owner_id=1, vault_id=2, title="B")
+        d3 = self.make_draft(owner_id=2, vault_id=1, title="C")
         r1 = self.add_input(d1.id, owner_id=1)
         r2 = self.add_input(d2.id, owner_id=1)
+        r3 = self.add_input(d3.id, owner_id=2)
 
-        purged = self.deletion.delete_drafts_for_user(self.store, 1)
+        plan = self.deletion.prepare_purge_for_user(self.store, 1)
 
-        self.assertEqual(purged, 2)
+        self.assertEqual(len(plan.tokens), 2)
         self.assertFalse(self.storage.exists(r1.storage_relpath))
         self.assertFalse(self.storage.exists(r2.storage_relpath))
+        # A different owner's draft is untouched.
+        self.assertTrue(self.storage.exists(r3.storage_relpath))
 
-    def test_one_failing_draft_does_not_abort_the_cascade(self):
-        d1 = self.make_draft(vault_id=1, title="A")
-        d2 = self.make_draft(vault_id=1, title="B")
-        self.add_input(d1.id)
-        self.add_input(d2.id)
+    def test_restore_purge_after_user_prepare(self):
+        d1 = self.make_draft(owner_id=1, vault_id=1)
+        r1 = self.add_input(d1.id, owner_id=1)
+        content = self.storage.resolve(r1.storage_relpath).read_bytes()
 
-        real_delete_draft_row = self.store.delete_draft_row
+        plan = self.deletion.prepare_purge_for_user(self.store, 1)
+        self.deletion.restore_purge(plan)
 
-        def flaky_delete(*, draft_id, owner_id):
-            if draft_id == d1.id:
-                raise RuntimeError("simulated failure")
-            return real_delete_draft_row(draft_id=draft_id, owner_id=owner_id)
+        self.assertTrue(self.storage.exists(r1.storage_relpath))
+        self.assertEqual(self.storage.resolve(r1.storage_relpath).read_bytes(), content)
 
-        with patch.object(self.store, "delete_draft_row", side_effect=flaky_delete):
-            purged = self.deletion.delete_drafts_for_vault(self.store, 1)
 
-        self.assertEqual(purged, 1)
-        # d1 survives because its own deletion failed and was rolled back.
-        self.store.get_draft(d1.id, 1)
-        with self.assertRaises(DraftNotFoundError):
-            self.store.get_draft(d2.id, 1)
+class _FailingCommitConnProxy:
+    """Wraps a real sqlite3 connection but raises on ``commit()``.
+
+    Used to simulate the vault/user-delete handler's own transaction failing
+    *after* the Draft Room purge has already been prepared (files tombstoned
+    into ``.trash``, no rows touched yet) — the regression guard for the core
+    finding: bytes and rows must never disagree even when the parent-row
+    delete itself fails. Everything except ``commit`` is delegated to the
+    real connection, including attribute writes (``DraftStore`` sets
+    ``row_factory`` on it). ``sqlite3.Connection`` methods cannot be
+    monkeypatched directly (they are read-only slots on the C type), hence
+    the wrapper instead of ``patch.object``.
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        object.__setattr__(self, "_real", real)
+
+    def commit(self):
+        raise sqlite3.OperationalError("simulated commit failure")
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._real, name, value)
+
+
+class _FailingCommitPool:
+    """Wraps a real connection pool, handing out ``_FailingCommitConnProxy``
+    connections. ``users.py::delete_user`` gets its connection via
+    ``app.models.database.get_pool`` directly rather than the ``get_db``
+    FastAPI dependency, so it needs this pool-level wrapper instead of a
+    dependency override to exercise the same forced-commit-failure path."""
+
+    def __init__(self, real_pool) -> None:
+        self._real_pool = real_pool
+
+    def get_connection(self):
+        return _FailingCommitConnProxy(self._real_pool.get_connection())
+
+    def release_connection(self, conn) -> None:
+        real_conn = getattr(conn, "_real", conn)
+        self._real_pool.release_connection(real_conn)
 
 
 class _RouteTestPool:
@@ -517,17 +607,22 @@ class TestVaultDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
         self.assertFalse(self.storage.exists(input_in.storage_relpath))
         self.assertEqual(self._draft_row_count(draft_in.id), 0)
         self.assertFalse((self.root / "200" / str(draft_in.id)).exists())
+        # No leftover tombstone: commit_purge ran and discarded it.
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
 
         # Isolation guard: a draft in a DIFFERENT vault is untouched.
         self.assertTrue(self.storage.exists(input_other.storage_relpath))
         self.assertEqual(self._draft_row_count(draft_other.id), 1)
 
-    def test_purge_failure_does_not_block_vault_deletion(self):
+    def test_purge_prepare_failure_does_not_block_vault_deletion(self):
         draft_in, input_in = self._make_draft_with_input(owner_id=200, vault_id=501)
 
         with patch.object(
             DraftDeletionService,
-            "delete_drafts_for_vault",
+            "prepare_purge_for_vault",
             side_effect=RuntimeError("simulated purge failure"),
         ):
             with self.assertLogs("app.api.routes.vaults", level="WARNING") as logs:
@@ -540,11 +635,76 @@ class TestVaultDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(self._draft_row_count(draft_in.id), 0)
         self.assertTrue(
-            any("draft_room_vault_purge_failed" in line for line in logs.output)
+            any(
+                "draft_room_vault_purge_prepare_failed" in line
+                for line in logs.output
+            )
         )
         # File is orphaned in this simulated-failure scenario (expected: the
         # purge itself failed), but the parent deletion was not blocked.
         self.assertTrue(self.storage.exists(input_in.storage_relpath))
+
+    def test_transaction_failure_after_purge_prepare_restores_files_and_keeps_vault(
+        self,
+    ):
+        """Core regression guard: force the vault-delete transaction to fail
+        AFTER the purge has already tombstoned files. The vault, its drafts,
+        and their input files must all survive intact — the whole point of
+        splitting the tombstone flow around the parent-row delete instead of
+        running it to completion beforehand.
+        """
+        draft_in, input_in = self._make_draft_with_input(owner_id=200, vault_id=501)
+        content = self.storage.resolve(input_in.storage_relpath).read_bytes()
+
+        real_conn = self._connection_pool.get_connection()
+
+        def override_get_db_failing():
+            proxy = _FailingCommitConnProxy(real_conn)
+            try:
+                yield proxy
+            finally:
+                self._connection_pool.release_connection(real_conn)
+
+        app.dependency_overrides[get_db] = override_get_db_failing
+        try:
+            resp = self.client.delete(
+                "/api/vaults/501", headers=self._headers(100, "root-admin", "superadmin")
+            )
+        finally:
+            def override_get_db():
+                conn = self._connection_pool.get_connection()
+                try:
+                    yield conn
+                finally:
+                    self._connection_pool.release_connection(conn)
+
+            app.dependency_overrides[get_db] = override_get_db
+
+        self.assertEqual(resp.status_code, 500, resp.text)
+
+        # The vault itself survives the rollback.
+        conn = self._connection_pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id FROM vaults WHERE id = ?", (501,)
+            ).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # The draft row survives (its DELETE was rolled back with the vault's).
+        self.assertEqual(self._draft_row_count(draft_in.id), 1)
+
+        # The input file was restored from its tombstone and is still readable.
+        self.assertTrue(self.storage.exists(input_in.storage_relpath))
+        self.assertEqual(
+            self.storage.resolve(input_in.storage_relpath).read_bytes(), content
+        )
+        # No leftover tombstone after the restore.
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
 
 
 class TestUserDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
@@ -561,17 +721,22 @@ class TestUserDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
         self.assertFalse(self.storage.exists(input_a.storage_relpath))
         self.assertEqual(self._draft_row_count(draft_a.id), 0)
         self.assertFalse((self.root / "200" / str(draft_a.id)).exists())
+        # No leftover tombstone: commit_purge ran and discarded it.
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
 
         # Isolation guard: a draft owned by a DIFFERENT user is untouched.
         self.assertTrue(self.storage.exists(input_b.storage_relpath))
         self.assertEqual(self._draft_row_count(draft_b.id), 1)
 
-    def test_purge_failure_does_not_block_user_deletion(self):
+    def test_purge_prepare_failure_does_not_block_user_deletion(self):
         draft_a, input_a = self._make_draft_with_input(owner_id=200, vault_id=501)
 
         with patch.object(
             DraftDeletionService,
-            "delete_drafts_for_user",
+            "prepare_purge_for_user",
             side_effect=RuntimeError("simulated purge failure"),
         ):
             with self.assertLogs("app.api.routes.users", level="WARNING") as logs:
@@ -584,9 +749,64 @@ class TestUserDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(self._draft_row_count(draft_a.id), 0)
         self.assertTrue(
-            any("draft_room_user_purge_failed" in line for line in logs.output)
+            any(
+                "draft_room_user_purge_prepare_failed" in line
+                for line in logs.output
+            )
         )
         self.assertTrue(self.storage.exists(input_a.storage_relpath))
+
+    def test_transaction_failure_after_purge_prepare_restores_files_and_keeps_user(
+        self,
+    ):
+        """Core regression guard, user-delete side: force the delete
+        transaction to fail AFTER the purge has already tombstoned files. The
+        user row, its drafts, and their input files must all survive intact.
+
+        ``delete_user`` fetches its connection via ``get_pool`` directly
+        (not the ``get_db`` dependency the vault route uses), so the failure
+        is injected by patching ``app.api.routes.users.get_pool`` to hand
+        back a ``_FailingCommitPool`` wrapping the real pool for this one
+        request, instead of overriding ``get_db``.
+        """
+        draft_a, input_a = self._make_draft_with_input(owner_id=200, vault_id=501)
+        content = self.storage.resolve(input_a.storage_relpath).read_bytes()
+
+        from app.models.database import get_pool as real_get_pool
+
+        real_pool = real_get_pool(str(settings.sqlite_path))
+        failing_pool = _FailingCommitPool(real_pool)
+
+        with patch("app.api.routes.users.get_pool", return_value=failing_pool):
+            resp = self.client.delete(
+                "/api/users/200",
+                headers=self._headers(100, "root-admin", "superadmin"),
+            )
+
+        self.assertEqual(resp.status_code, 500, resp.text)
+
+        # The user row survives the rollback.
+        conn = self._connection_pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id FROM users WHERE id = ?", (200,)
+            ).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # The draft row survives (its DELETE was rolled back with the user's).
+        self.assertEqual(self._draft_row_count(draft_a.id), 1)
+
+        # The input file was restored from its tombstone and is still readable.
+        self.assertTrue(self.storage.exists(input_a.storage_relpath))
+        self.assertEqual(
+            self.storage.resolve(input_a.storage_relpath).read_bytes(), content
+        )
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
 
 
 if __name__ == "__main__":
