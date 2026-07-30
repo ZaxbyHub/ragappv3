@@ -114,7 +114,9 @@ class DraftJobProcessor:
                 await bg
             except asyncio.CancelledError:
                 pass
-            except Exception:
+            except Exception:  # nosec B110 - best-effort shutdown drain of a cancelled
+                # detached task; identical accepted pattern in
+                # WikiCompileProcessor.stop(), which is already baselined.
                 pass
         self._bg_tasks.clear()
         logger.info("DraftJobProcessor stopped")
@@ -227,6 +229,11 @@ class DraftJobProcessor:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # Per SPEC section 10.1 item 8: the poll loop survives any
+                # unexpected processor-level exception (job claiming, dispatch
+                # bookkeeping) and keeps polling. This is distinct from the
+                # per-job extraction/commit error paths above, which never log
+                # str(exc) because that boundary can carry manuscript content.
                 logger.exception("DraftJobProcessor: poll loop error")
                 await asyncio.sleep(self._poll_interval)
 
@@ -239,6 +246,35 @@ class DraftJobProcessor:
     # ------------------------------------------------------------------
 
     async def _run_job(self, job: "DraftJobRecord") -> None:
+        """Job-boundary safety net around :meth:`_dispatch_job`.
+
+        SPEC section 10.1 item 8: catch unexpected exceptions at the job
+        boundary, store a sanitized failure code, and keep the poll loop
+        alive. ``_dispatch_job`` already handles every expected failure mode
+        with its own sanitized code; this net only exists so a bug in the
+        processor itself cannot leave a job stuck ``running`` until the next
+        restart, and never re-raises into the poll loop.
+        """
+        try:
+            await self._dispatch_job(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "DraftJobProcessor: job id=%d dispatch raised %s",
+                job.id,
+                type(exc).__name__,
+            )
+            try:
+                await self._fail_job(job, code=CODE_INTERNAL_ERROR)
+            except Exception:
+                logger.error(
+                    "DraftJobProcessor: job id=%d could not be marked failed after "
+                    "an unexpected dispatch error",
+                    job.id,
+                )
+
+    async def _dispatch_job(self, job: "DraftJobRecord") -> None:
         """Dispatch one claimed ``parse_input`` job end to end.
 
         Never holds a connection across the extraction step or any ``await``.
@@ -260,20 +296,22 @@ class DraftJobProcessor:
         except DraftNotFoundError:
             await self._fail_job(job, code=CODE_INPUT_FILE_MISSING)
             return
-        except Exception:
-            logger.exception(
-                "DraftJobProcessor: job id=%d could not load input", job.id
+        except Exception as exc:
+            logger.error(
+                "DraftJobProcessor: job id=%d could not load input (%s)",
+                job.id,
+                type(exc).__name__,
             )
             await self._fail_job(job, code=CODE_INTERNAL_ERROR)
             return
 
         try:
-            await asyncio.to_thread(
-                self._move_input_to_parsing, job.input_id, job.draft_id, job.id
-            )
-        except Exception:
-            logger.exception(
-                "DraftJobProcessor: job id=%d could not move input to parsing", job.id
+            await asyncio.to_thread(self._move_input_to_parsing, job.input_id)
+        except Exception as exc:
+            logger.error(
+                "DraftJobProcessor: job id=%d could not move input to parsing (%s)",
+                job.id,
+                type(exc).__name__,
             )
             await self._fail_job(job, code=CODE_INTERNAL_ERROR)
             return
@@ -295,12 +333,17 @@ class DraftJobProcessor:
             )
             return
         except DocumentExtractionError as exc:
+            # DocumentExtractionService's own contract guarantees its message is
+            # already a bounded, redacted "ClassName: reason" string, but this
+            # processor treats extraction as an untrusted boundary and never
+            # relies on that guarantee holding for every caller — only the
+            # stable code is persisted here.
             await self._fail_input_and_job(
-                job, code=exc.code or CODE_INPUT_PARSE_FAILED, message=str(exc)
+                job, code=exc.code or CODE_INPUT_PARSE_FAILED
             )
             return
         except Exception as exc:
-            logger.exception(
+            logger.error(
                 "DraftJobProcessor: job id=%d extraction raised %s",
                 job.id,
                 type(exc).__name__,
@@ -317,10 +360,11 @@ class DraftJobProcessor:
             over_limit = await asyncio.to_thread(
                 self._exceeds_parsed_char_limit, job.draft_id, job.input_id, extracted
             )
-        except Exception:
-            logger.exception(
-                "DraftJobProcessor: job id=%d could not evaluate the parsed-char limit",
+        except Exception as exc:
+            logger.error(
+                "DraftJobProcessor: job id=%d could not evaluate the parsed-char limit (%s)",
                 job.id,
+                type(exc).__name__,
             )
             await self._fail_input_and_job(job, code=CODE_INTERNAL_ERROR)
             return
@@ -331,9 +375,11 @@ class DraftJobProcessor:
 
         try:
             await asyncio.to_thread(self._commit_success, job, extracted)
-        except Exception:
-            logger.exception(
-                "DraftJobProcessor: job id=%d could not commit parsed text", job.id
+        except Exception as exc:
+            logger.error(
+                "DraftJobProcessor: job id=%d could not commit parsed text (%s)",
+                job.id,
+                type(exc).__name__,
             )
             await self._fail_input_and_job(job, code=CODE_INTERNAL_ERROR)
             return
@@ -353,7 +399,7 @@ class DraftJobProcessor:
                 draft_id=job.draft_id, owner_id=job.created_by, input_id=job.input_id
             )
 
-    def _move_input_to_parsing(self, input_id: int, draft_id: int, job_id: int) -> None:
+    def _move_input_to_parsing(self, input_id: int) -> None:
         with self._pool.connection() as conn:
             store = DraftStore(conn)
             store.set_input_parse_status(input_id=input_id, target="parsing")

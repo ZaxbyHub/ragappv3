@@ -14,6 +14,9 @@ from app.middleware.logging import SensitiveFieldFilter
 from app.models.database import SQLiteConnectionPool, get_pool, run_migrations
 from app.security import CSRFManager
 from app.services.background_tasks import get_background_processor
+from app.services.document_extraction import DocumentExtractionService
+from app.services.draft_input_storage import DraftInputStorage
+from app.services.draft_job_processor import DraftJobProcessor
 from app.services.email_service import EmailIngestionService
 from app.services.embeddings import EmbeddingService
 from app.services.file_watcher import FileWatcher
@@ -620,6 +623,26 @@ async def lifespan(app: FastAPI):
         logger.warning("WikiCompileProcessor start failed (continuing): %s", e)
         app.state.wiki_compile_processor = None
 
+    # Start DraftJobProcessor (background Draft Room parse-job worker).
+    # Not gated on settings.draft_room_enabled: SPEC section 9.2 requires owner
+    # cleanup and durable orphan/job recovery to keep working even while the
+    # feature is disabled for new work. The DISABLED gate belongs on the
+    # mutating HTTP routes, not on this background worker.
+    try:
+        app.state.draft_job_processor = DraftJobProcessor(
+            pool=app.state.db_pool,
+            storage=DraftInputStorage(settings.data_dir / "draft-room"),
+            extraction=DocumentExtractionService(),
+        )
+        await _safe_await(
+            app.state.draft_job_processor.start(),
+            "DraftJobProcessor start",
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning("DraftJobProcessor start failed (continuing): %s", e)
+        app.state.draft_job_processor = None
+
     # Start KMSCompileProcessor (background KMS job worker) only if KMS is enabled
     if settings.kms_enabled:
         try:
@@ -724,6 +747,8 @@ async def lifespan(app: FastAPI):
         await app.state.background_processor.stop()
     if getattr(app.state, "wiki_compile_processor", None):
         await app.state.wiki_compile_processor.stop()
+    if getattr(app.state, "draft_job_processor", None):
+        await app.state.draft_job_processor.stop()
     if getattr(app.state, "kms_compile_processor", None):
         await app.state.kms_compile_processor.stop()
     # Close both underlying LLM clients. The ``llm_client`` attr is an

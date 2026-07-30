@@ -971,3 +971,15 @@ def assign_user_to_default_vault(db: sqlite3.Connection, user_id: int) -> None:
     except sqlite3.OperationalError:
         # vaults or vault_members table doesn't exist yet (pre-migration)
         logger.warning("Could not assign user %d to Default vault (tables may not exist yet)", user_id)
+
+
+def get_draft_job_processor(request: Request):
+    """Return the Draft Room job processor from app state.
+
+    Appended at the end of the module (rather than alongside the other
+    ``get_X(request)`` accessors) so it does not shift the line numbers of
+    every pre-existing bandit finding below it in this file — this repo's
+    SAST baseline keys findings by exact line number (see
+    ``scripts/run_bandit.py``).
+    """
+    return request.app.state.draft_job_processor
