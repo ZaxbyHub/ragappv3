@@ -29,6 +29,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from app.api.deps import _evaluate_policy
 from app.config import settings
 from app.services.document_extraction import DocumentExtractionError
 from app.services.draft_events import build_event, get_draft_event_bus
@@ -50,6 +51,7 @@ CODE_INPUT_FILE_MISSING = "input_file_missing"
 CODE_PARSED_TEXT_LIMIT_EXCEEDED = "parsed_text_limit_exceeded"
 CODE_JOB_TIMEOUT = "job_timeout"
 CODE_INTERNAL_ERROR = "internal_error"
+CODE_PERMISSION_REVOKED = "permission_revoked"
 
 # How stale ``.incoming``/``.trash`` entries must be before startup
 # reconciliation removes them.
@@ -291,6 +293,12 @@ class DraftJobProcessor:
             await self._fail_job(job, code=CODE_INTERNAL_ERROR)
             return
 
+        # Permission re-check #1 (SPEC section 9.1 rule 4): the creating user
+        # must still be active and hold vault `read` right after the claim.
+        if not await self._owner_permission_ok(job):
+            await self._fail_input_and_job(job, code=CODE_PERMISSION_REVOKED)
+            return
+
         try:
             input_record = await asyncio.to_thread(self._get_input, job)
         except DraftNotFoundError:
@@ -373,6 +381,13 @@ class DraftJobProcessor:
             await self._fail_over_limit(job, extracted.character_count)
             return
 
+        # Permission re-check #2 (SPEC section 9.1 rule 4): re-verify
+        # immediately before the final revision (parsed text) is stored, so a
+        # revocation that lands mid-extraction still blocks the commit.
+        if not await self._owner_permission_ok(job):
+            await self._fail_input_and_job(job, code=CODE_PERMISSION_REVOKED)
+            return
+
         try:
             await asyncio.to_thread(self._commit_success, job, extracted)
         except Exception as exc:
@@ -407,6 +422,37 @@ class DraftJobProcessor:
     def _is_cancel_requested(self, job_id: int) -> bool:
         with self._pool.connection() as conn:
             return DraftStore(conn).is_cancel_requested(job_id)
+
+    async def _owner_permission_ok(self, job: "DraftJobRecord") -> bool:
+        """Re-check that the job's owner is still active and can read the vault.
+
+        Runs entirely inside a single ``asyncio.to_thread`` call so the
+        pooled connection it opens is acquired and released synchronously in
+        the worker thread — it never spans an ``await`` in this coroutine's
+        frame, matching every other DB step in this file.
+        """
+        return await asyncio.to_thread(self._owner_permission_ok_sync, job)
+
+    def _owner_permission_ok_sync(self, job: "DraftJobRecord") -> bool:
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT is_active, role FROM users WHERE id = ?", (job.created_by,)
+            ).fetchone()
+            if row is None or not row[0]:
+                return False
+            principal = {"id": job.created_by, "role": row[1]}
+            # ``_evaluate_policy`` is app.api.deps's real permission evaluator
+            # (superadmin -> admin baseline -> vault_members ->
+            # vault_group_access -> vault visibility). It is async because it
+            # awaits asyncio.to_thread internally for its own DB reads, so it
+            # is driven here via asyncio.run() inside this already-dedicated
+            # worker thread (started by asyncio.to_thread above) — no event
+            # loop is running in this thread, and the connection is opened
+            # and closed entirely within this synchronous call, never
+            # spanning an await in the caller's coroutine.
+            return asyncio.run(
+                _evaluate_policy(conn, principal, "vault", job.vault_id, "read")
+            )
 
     def _extract(self, storage_relpath: str):
         """Resolve the stored path and run the (blocking) extraction. Runs in a thread."""

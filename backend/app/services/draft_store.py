@@ -705,30 +705,6 @@ class DraftStore:
         )
         self._db.commit()
 
-    def list_events(
-        self, *, draft_id: int, owner_id: int, limit: int = 100
-    ) -> list[dict[str, Any]]:
-        """Most-recent audit events for an owned draft (newest first)."""
-        self.get_draft(draft_id, owner_id)
-        rows = self._db.execute(
-            "SELECT id, job_id, revision_id, actor_user_id, event_type, event_json, "
-            "created_at FROM draft_events WHERE draft_id = ? "
-            "ORDER BY created_at DESC, id DESC LIMIT ?",
-            (draft_id, limit),
-        ).fetchall()
-        return [
-            {
-                "id": r[0],
-                "job_id": r[1],
-                "revision_id": r[2],
-                "actor_user_id": r[3],
-                "event_type": r[4],
-                "event": json.loads(r[5]) if r[5] else {},
-                "created_at": r[6],
-            }
-            for r in rows
-        ]
-
     # ── inputs ───────────────────────────────────────────────────────────
 
     def reserve_input(

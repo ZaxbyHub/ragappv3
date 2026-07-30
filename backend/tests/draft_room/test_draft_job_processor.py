@@ -40,6 +40,7 @@ from app.services.draft_job_processor import (
     CODE_INPUT_PARSE_FAILED,
     CODE_JOB_TIMEOUT,
     CODE_PARSED_TEXT_LIMIT_EXCEEDED,
+    CODE_PERMISSION_REVOKED,
     DraftJobProcessor,
 )
 from app.services.draft_store import DraftStore, sha256_text
@@ -164,6 +165,14 @@ class DraftJobProcessorTestBase(unittest.IsolatedAsyncioTestCase):
             "VALUES (1,'owner','hash','Owner','member',1)"
         )
         seed.execute("INSERT OR IGNORE INTO vaults (id, name, description) VALUES (1,'V','')")
+        # Every existing dispatch test relies on the owner passing the
+        # permission_revoked re-check (finding 1); grant explicit vault read
+        # so those tests keep exercising the parse-path behavior they were
+        # written for rather than the new permission gate.
+        seed.execute(
+            "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission) "
+            "VALUES (1,1,'read')"
+        )
         seed.commit()
         seed.close()
 
@@ -264,6 +273,45 @@ class DraftJobProcessorTestBase(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.sleep(interval)
         self.fail("condition not met before timeout")
+
+    def make_user_and_vault(
+        self, user_id, vault_id, *, is_active=1, role="member", grant_read=True
+    ):
+        """Seed a distinct user/vault pair, deliberately using high IDs so it
+        never collides with the ``Default`` vault (id 1) that migrations
+        auto-create."""
+        with self.pool.connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, "
+                "role, is_active) VALUES (?, ?, 'hash', 'U', ?, ?)",
+                (user_id, f"user{user_id}", role, is_active),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (?, ?, '')",
+                (vault_id, f"vault{vault_id}"),
+            )
+            if grant_read:
+                conn.execute(
+                    "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission) "
+                    "VALUES (?, ?, 'read')",
+                    (vault_id, user_id),
+                )
+            conn.commit()
+
+    def set_user_active(self, user_id, is_active: bool) -> None:
+        with self.pool.connection() as conn:
+            conn.execute(
+                "UPDATE users SET is_active = ? WHERE id = ?", (int(is_active), user_id)
+            )
+            conn.commit()
+
+    def revoke_vault_read(self, user_id, vault_id) -> None:
+        with self.pool.connection() as conn:
+            conn.execute(
+                "DELETE FROM vault_members WHERE user_id = ? AND vault_id = ?",
+                (user_id, vault_id),
+            )
+            conn.commit()
 
 
 # ── Happy path ───────────────────────────────────────────────────────────
@@ -679,6 +727,116 @@ class TestSSEPublication(DraftJobProcessorTestBase):
 
         event_types = [e.get("type") for e in events]
         self.assertIn("job_completed", event_types)
+
+
+# ── Permission re-check (SPEC section 9.1 rule 4, issue #435 finding 1) ────
+
+
+class TestPermissionRevocation(DraftJobProcessorTestBase):
+    async def test_deactivated_owner_fails_with_permission_revoked(self):
+        self.make_user_and_vault(9001, 9001)
+        draft = self.make_draft(owner_id=9001, vault_id=9001)
+        input_record = await self.add_input(draft.id, owner_id=9001)
+        job = self.enqueue_parse_job(draft.id, 9001, input_record.id)
+
+        resolved_path = str(self.storage.resolve(input_record.storage_relpath))
+        self.extraction.responses[resolved_path] = ExtractedDocument(
+            text="never persisted", character_count=16, media_type="text/plain", warnings=[]
+        )
+
+        self.set_user_active(9001, False)
+
+        await self.processor.start()
+        try:
+            await self.wait_until(
+                lambda: self.get_job(draft.id, 9001, job.id).status
+                in ("completed", "failed", "cancelled")
+            )
+        finally:
+            await self.processor.stop()
+
+        job_after = self.get_job(draft.id, 9001, job.id)
+        self.assertEqual(job_after.status, "failed")
+        self.assertEqual(job_after.error_code, CODE_PERMISSION_REVOKED)
+
+        raw = self.raw_input_row(input_record.id)
+        self.assertIsNone(raw["parsed_text"])
+        self.assertEqual(raw["parse_status"], "failed")
+        self.assertEqual(raw["parse_error"], CODE_PERMISSION_REVOKED)
+
+    async def test_owner_without_vault_read_fails_with_permission_revoked(self):
+        self.make_user_and_vault(9002, 9002, grant_read=False)
+        draft = self.make_draft(owner_id=9002, vault_id=9002)
+        input_record = await self.add_input(draft.id, owner_id=9002)
+        job = self.enqueue_parse_job(draft.id, 9002, input_record.id)
+
+        resolved_path = str(self.storage.resolve(input_record.storage_relpath))
+        self.extraction.responses[resolved_path] = ExtractedDocument(
+            text="never persisted", character_count=16, media_type="text/plain", warnings=[]
+        )
+
+        await self.processor.start()
+        try:
+            await self.wait_until(
+                lambda: self.get_job(draft.id, 9002, job.id).status
+                in ("completed", "failed", "cancelled")
+            )
+        finally:
+            await self.processor.stop()
+
+        job_after = self.get_job(draft.id, 9002, job.id)
+        self.assertEqual(job_after.status, "failed")
+        self.assertEqual(job_after.error_code, CODE_PERMISSION_REVOKED)
+
+        raw = self.raw_input_row(input_record.id)
+        self.assertIsNone(raw["parsed_text"])
+        self.assertEqual(raw["parse_status"], "failed")
+        self.assertEqual(raw["parse_error"], CODE_PERMISSION_REVOKED)
+
+    async def test_revocation_during_extraction_blocks_precommit(self):
+        """Proves the pre-commit re-check exists independently of the
+        post-claim one: permission is valid when extraction starts and is
+        revoked by the extraction call itself, so only the second check can
+        catch it."""
+        self.make_user_and_vault(9003, 9003)
+        draft = self.make_draft(owner_id=9003, vault_id=9003)
+        input_record = await self.add_input(draft.id, owner_id=9003)
+        job = self.enqueue_parse_job(draft.id, 9003, input_record.id)
+
+        resolved_path = str(self.storage.resolve(input_record.storage_relpath))
+
+        def extract_and_revoke():
+            self.revoke_vault_read(9003, 9003)
+            return ExtractedDocument(
+                text="should never be persisted",
+                character_count=26,
+                media_type="text/plain",
+                warnings=[],
+            )
+
+        self.extraction.responses[resolved_path] = extract_and_revoke
+
+        await self.processor.start()
+        try:
+            await self.wait_until(
+                lambda: self.get_job(draft.id, 9003, job.id).status
+                in ("completed", "failed", "cancelled")
+            )
+        finally:
+            await self.processor.stop()
+
+        job_after = self.get_job(draft.id, 9003, job.id)
+        self.assertEqual(job_after.status, "failed")
+        self.assertEqual(job_after.error_code, CODE_PERMISSION_REVOKED)
+
+        raw = self.raw_input_row(input_record.id)
+        self.assertIsNone(raw["parsed_text"])
+        self.assertEqual(raw["parse_status"], "failed")
+        self.assertEqual(raw["parse_error"], CODE_PERMISSION_REVOKED)
+        # Extraction did run (the pre-extraction check passed) — this is what
+        # distinguishes this test from the first two, which never reach
+        # extraction at all.
+        self.assertEqual(self.extraction.calls, [resolved_path])
 
 
 if __name__ == "__main__":
