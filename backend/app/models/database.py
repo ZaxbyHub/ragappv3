@@ -16,6 +16,166 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Draft Room core schema (issue #435, specs/draft-room/SPEC.md section 5).
+#
+# Private, owner-scoped drafting projects.  Draft inputs live ONLY in these
+# tables and under data/draft-room/; they never become `files` rows and never
+# enter retrieval, Wiki, KMS, chat, ingestion, embedding, or indexing surfaces.
+#
+# Defined as its own constant, appended to SCHEMA below and executed verbatim by
+# migrate_add_draft_room_core(), so a fresh database and a migrated database
+# cannot drift apart.
+_DRAFT_ROOM_CORE_DDL = """
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vault_id INTEGER NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+    created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK (mode IN ('rewrite','compose')),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN (
+        'draft','queued','running','needs_review','ready','failed','cancelled','archived'
+    )),
+    tier TEXT NOT NULL DEFAULT 'standard' CHECK (tier IN (
+        'standard','high_stakes','sensitive'
+    )),
+    brief_json TEXT NOT NULL DEFAULT '{}',
+    lock_version INTEGER NOT NULL DEFAULT 1,
+    ready_revision_id INTEGER,
+    ready_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    ready_at TIMESTAMP,
+    archived_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_drafts_owner_updated
+    ON drafts(created_by, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_drafts_owner_vault_status
+    ON drafts(created_by, vault_id, status);
+
+CREATE TABLE IF NOT EXISTS draft_inputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN (
+        'manuscript','reference','style','background','challenge'
+    )),
+    authority TEXT NOT NULL DEFAULT 'unknown' CHECK (authority IN (
+        'primary','official','secondary','user_asserted','unknown'
+    )),
+    as_of_date TEXT,
+    original_name TEXT NOT NULL,
+    stored_name TEXT NOT NULL,
+    extension TEXT NOT NULL,
+    media_type TEXT,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    content_sha256 TEXT NOT NULL,
+    storage_relpath TEXT NOT NULL UNIQUE,
+    parsed_text TEXT,
+    parsed_text_sha256 TEXT,
+    parsed_char_count INTEGER CHECK (parsed_char_count IS NULL OR parsed_char_count >= 0),
+    parse_status TEXT NOT NULL DEFAULT 'pending' CHECK (parse_status IN (
+        'pending','parsing','ready','failed','cancelled'
+    )),
+    parse_error TEXT,
+    locked_spans_json TEXT NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(draft_id, content_sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_draft_inputs_draft_status
+    ON draft_inputs(draft_id, parse_status);
+
+CREATE TABLE IF NOT EXISTS draft_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    parent_revision_id INTEGER REFERENCES draft_revisions(id) ON DELETE SET NULL,
+    job_id INTEGER,
+    revision_no INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('pipeline','manual')),
+    content_md TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    sections_json TEXT NOT NULL DEFAULT '[]',
+    citations_json TEXT NOT NULL DEFAULT '[]',
+    qa_summary_json TEXT NOT NULL DEFAULT '{}',
+    fact_status TEXT NOT NULL DEFAULT 'not_run' CHECK (fact_status IN (
+        'not_run','running','passed','findings','invalidated'
+    )),
+    is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0,1)),
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(draft_id, revision_no)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_draft_revisions_one_current
+    ON draft_revisions(draft_id) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_draft_revisions_draft_created
+    ON draft_revisions(draft_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS draft_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    vault_id INTEGER NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+    created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    job_type TEXT NOT NULL CHECK (job_type IN ('parse_input','compile')),
+    input_id INTEGER REFERENCES draft_inputs(id) ON DELETE CASCADE,
+    parent_job_id INTEGER REFERENCES draft_jobs(id) ON DELETE SET NULL,
+    attempt_no INTEGER NOT NULL DEFAULT 1 CHECK (attempt_no >= 1),
+    idempotency_key TEXT,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+        'pending','running','completed','failed','cancelled'
+    )),
+    active_stage TEXT,
+    input_revision_id INTEGER REFERENCES draft_revisions(id) ON DELETE SET NULL,
+    output_revision_id INTEGER REFERENCES draft_revisions(id) ON DELETE SET NULL,
+    input_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    brief_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    model_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    prompt_bundle_version TEXT,
+    start_stage TEXT CHECK (start_stage IS NULL OR start_stage IN (
+        'research','outline','draft','lint','copy','standards','fact'
+    )),
+    compile_input_sha256 TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    model_call_count INTEGER NOT NULL DEFAULT 0,
+    max_model_calls INTEGER NOT NULL,
+    timeout_seconds INTEGER NOT NULL,
+    progress_percent REAL NOT NULL DEFAULT 0,
+    cancel_requested_at TIMESTAMP,
+    heartbeat_at TIMESTAMP,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_draft_jobs_claim
+    ON draft_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_draft_jobs_draft_created
+    ON draft_jobs(draft_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_draft_jobs_one_active_compile
+    ON draft_jobs(draft_id)
+    WHERE job_type = 'compile' AND status IN ('pending','running');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_draft_jobs_one_active_parse
+    ON draft_jobs(input_id)
+    WHERE job_type = 'parse_input' AND status IN ('pending','running');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_draft_jobs_idempotency
+    ON draft_jobs(created_by, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS draft_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    job_id INTEGER REFERENCES draft_jobs(id) ON DELETE SET NULL,
+    revision_id INTEGER REFERENCES draft_revisions(id) ON DELETE SET NULL,
+    actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    event_type TEXT NOT NULL,
+    event_json TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_draft_events_draft_created
+    ON draft_events(draft_id, created_at DESC);
+"""
+
+
 # Database schema definition
 SCHEMA = """
 -- Vaults table: stores document collection vaults
@@ -877,7 +1037,8 @@ CREATE TABLE IF NOT EXISTS prompt_ab_exposures (
     UNIQUE(experiment_id, subject_key)
 );
 CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id ON prompt_ab_exposures(experiment_id);
-"""
+""" + _DRAFT_ROOM_CORE_DDL
+
 
 
 def init_db(sqlite_path: str) -> None:
@@ -1044,6 +1205,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_prompt_org_overrides(sqlite_path)
     migrate_add_prompt_ab_experiments(sqlite_path)
     migrate_add_password_changed_at(sqlite_path)
+    migrate_add_draft_room_core(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -3659,5 +3821,31 @@ def migrate_add_password_changed_at(sqlite_path: str) -> None:
                 "ALTER TABLE users ADD COLUMN password_changed_at REAL NOT NULL DEFAULT 0"
             )
             conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_draft_room_core(sqlite_path: str) -> None:
+    """
+    Migration: create the Draft Room core tables (issue #435, SPEC.md section 5).
+
+    Creates `drafts`, `draft_inputs`, `draft_revisions`, `draft_jobs`, and
+    `draft_events` together with every CHECK constraint, uniqueness rule,
+    foreign key, and partial index in the specification.
+
+    Executes ``_DRAFT_ROOM_CORE_DDL`` — the exact same constant that is appended
+    to ``SCHEMA`` — so a database created by ``init_db`` and a legacy database
+    upgraded by this migration converge on an identical schema.  Every statement
+    is ``CREATE ... IF NOT EXISTS``, so repeat execution is a no-op and existing
+    data is preserved.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript(_DRAFT_ROOM_CORE_DDL)
+        conn.commit()
     finally:
         conn.close()

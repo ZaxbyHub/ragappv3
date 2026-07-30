@@ -100,6 +100,14 @@ services:
       # PRODUCTION: set to your domain, e.g. https://knowledgevault.example.com
       - BACKEND_CORS_ORIGINS=${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-100}
+      # Draft Room (private drafting projects) — disabled by default.
+      - DRAFT_ROOM_ENABLED=${DRAFT_ROOM_ENABLED:-false}
+      - DRAFT_MAX_INPUTS=${DRAFT_MAX_INPUTS:-10}
+      - DRAFT_MAX_TOTAL_INPUT_MB=${DRAFT_MAX_TOTAL_INPUT_MB:-250}
+      - DRAFT_MAX_TOTAL_PARSED_CHARS=${DRAFT_MAX_TOTAL_PARSED_CHARS:-500000}
+      - DRAFT_PARSE_TIMEOUT_SECONDS=${DRAFT_PARSE_TIMEOUT_SECONDS:-300}
+      - DRAFT_UPLOAD_RATE_LIMIT=${DRAFT_UPLOAD_RATE_LIMIT:-20/minute}
+      - DRAFT_POLL_INTERVAL_SECONDS=${DRAFT_POLL_INTERVAL_SECONDS:-2.0}
       - OLLAMA_EMBEDDING_URL=${OLLAMA_EMBEDDING_URL:-http://harrier-embed:8080/v1/embeddings}
       - OLLAMA_CHAT_URL=${OLLAMA_CHAT_URL:-http://host.docker.internal:11434}
       - INSTANT_CHAT_URL=${INSTANT_CHAT_URL:-http://host.docker.internal:1234}
