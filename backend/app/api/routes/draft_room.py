@@ -849,6 +849,7 @@ async def archive_draft(
     evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ) -> DraftSummary:
+    _require_enabled()
     owner_id = int(user["id"])
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
@@ -870,6 +871,7 @@ async def restore_draft(
     evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ) -> DraftSummary:
+    _require_enabled()
     owner_id = int(user["id"])
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
@@ -897,16 +899,6 @@ async def delete_draft(
     store = DraftStore(db)
     # Ownership check first: a draft owned by someone else is 404, never 403.
     await _run_store(lambda: store.get_draft(draft_id, owner_id))
-    # Recorded through the global HMAC audit log (not draft_events, which is
-    # about to cascade-delete) so the deletion event survives without
-    # retaining manuscript content (SPEC section 9.3).
-    await safe_record_security_event(
-        db,
-        event_type="draft_deleted",
-        actor=user,
-        request=request,
-        metadata={"draft_id": draft_id},
-    )
     deletion = DraftDeletionService(storage)
     try:
         await asyncio.to_thread(
@@ -914,6 +906,23 @@ async def delete_draft(
         )
     except DraftStoreError as exc:
         raise _map_store_error(exc) from exc
+    # Recorded through the global HMAC audit log (not draft_events, which
+    # cascade-deletes) only once deletion has actually succeeded — writing
+    # it earlier would leave a signed, tamper-evident row asserting a
+    # deletion that a guard check (e.g. DraftConflictError code='active_job'
+    # -> 409) rejected. `security_audit_log` has no foreign key on drafts
+    # (app/models/database.py) and this event's metadata is just the
+    # `draft_id`, so nothing about the record depends on the draft's rows
+    # still existing — recording after the cascade loses no information
+    # while guaranteeing the record only ever reflects a real deletion
+    # (SPEC section 9.3).
+    await safe_record_security_event(
+        db,
+        event_type="draft_deleted",
+        actor=user,
+        request=request,
+        metadata={"draft_id": draft_id},
+    )
 
 
 # ── inputs ───────────────────────────────────────────────────────────────────
@@ -991,7 +1000,13 @@ async def upload_draft_input(
                 max_total_input_bytes=settings.draft_max_total_input_mb * 1024 * 1024,
             )
         )
-    except DraftRoomHTTPError:
+    except BaseException:
+        # Any failure here — not just the translated DraftRoomHTTPError —
+        # must discard the staged `.part` file (SPEC section 6.1: "Delete
+        # partial files on any error"). `_run_store` only translates
+        # DraftStoreError; a raw sqlite3.OperationalError (e.g. "database is
+        # locked") would otherwise propagate untranslated and strand the
+        # staged bytes until the 24h startup reconcile.
         await asyncio.to_thread(storage.discard, staged)
         raise
 
@@ -1043,6 +1058,7 @@ async def update_draft_input(
     evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ) -> DraftInput:
+    _require_enabled()
     owner_id = int(user["id"])
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
@@ -1214,6 +1230,7 @@ async def retry_draft_job(
     evaluate: Callable = Depends(get_evaluate_policy),
     _csrf_token: str = Depends(csrf_protect),
 ) -> DraftJob:
+    _require_enabled()
     owner_id = int(user["id"])
     store = DraftStore(db)
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))

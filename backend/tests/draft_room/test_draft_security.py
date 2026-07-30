@@ -20,7 +20,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from queue import Empty, Queue
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -38,6 +38,7 @@ from app.config import settings
 from app.main import app
 from app.security import CSRFManager, csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
+from app.services.draft_store import DraftStore
 
 
 class _PoolWithConnectionCM:
@@ -455,6 +456,29 @@ class TestDisabledGate(DraftSecurityTestBase):
     def test_disabled_blocks_mutations_but_keeps_cleanup_available(self):
         # Create one draft while enabled so we have something to inspect/export/delete.
         draft_id = self._create_draft().json()["id"]
+
+        # An input and a cancelled (i.e. retryable) job, created while still
+        # enabled — upload and cancel are both gated/independent of the flag
+        # respectively, so both must happen before disabling.
+        upload = self._upload_input(draft_id)
+        input_id = upload.json()["input"]["id"]
+        job_id = upload.json()["job"]["id"]
+        cancel_resp = self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/cancel",
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(cancel_resp.status_code, 200, cancel_resp.text)
+        self.assertEqual(cancel_resp.json()["status"], "cancelled")
+
+        # A second, still-pending job so cancel-while-disabled can be
+        # exercised below (cancel only reduces private processing, so it
+        # stays available regardless of the flag).
+        second_upload = self._upload_input(
+            draft_id, filename="b.txt", content=b"a different manuscript body"
+        )
+        self.assertEqual(second_upload.status_code, 202, second_upload.text)
+        pending_job_id = second_upload.json()["job"]["id"]
+
         self._advance_to_running(draft_id)
         rev = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/revisions",
@@ -495,6 +519,43 @@ class TestDisabledGate(DraftSecurityTestBase):
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(resp.json()["code"], "draft_room_disabled")
 
+        # PATCH input is an edit — gated (finding 1).
+        resp = self.client.patch(
+            f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}",
+            json={"role": "reference"},
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["code"], "draft_room_disabled")
+
+        # Job retry increases private processing — gated (finding 2).
+        resp = self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/retry",
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["code"], "draft_room_disabled")
+
+        # Archive and restore mutate project state and are not on SPEC section
+        # 9.2's cleanup allowlist (capabilities, owner list/read/export, cancel,
+        # whole-draft delete), so they are gated too. Whole-draft delete remains
+        # the available cleanup path below.
+        resp = self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/archive",
+            json={"lock_version": 2},
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["code"], "draft_room_disabled")
+
+        resp = self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/restore",
+            json={"lock_version": 2},
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertEqual(resp.json()["code"], "draft_room_disabled")
+
         # Owner list/read/export/cancel/delete stay available.
         resp = self.client.get("/api/draft-room/drafts", headers=self._owner_headers())
         self.assertEqual(resp.status_code, 200)
@@ -511,10 +572,90 @@ class TestDisabledGate(DraftSecurityTestBase):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
 
+        resp = self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/jobs/{pending_job_id}/cancel",
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
         resp = self.client.delete(
             f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()
         )
         self.assertEqual(resp.status_code, 204, resp.text)
+
+
+class TestStagedUploadCleanup(DraftSecurityTestBase):
+    def test_untranslated_store_error_still_discards_staged_file(self):
+        """Finding 3: a non-``DraftStoreError`` raised out of ``reserve_input``
+        (e.g. raw ``sqlite3.OperationalError`` — "database is locked") must
+        still discard the staged ``.part`` file, not just the translated
+        ``DraftRoomHTTPError`` path."""
+        draft_id = self._create_draft().json()["id"]
+        incoming_dir = Path(self._temp_dir) / "draft-room" / ".incoming"
+
+        # The untranslated sqlite3.OperationalError propagates past FastAPI's
+        # registered handlers (only DraftRoomHTTPError/RequestValidationError
+        # are registered) as an unhandled ASGI exception; the discard we are
+        # testing runs synchronously inside the route before that
+        # propagation, so what the test client does with the exception
+        # afterward is incidental — disable the client's re-raise so the
+        # request completes and we can inspect the filesystem.
+        no_raise_client = TestClient(app, raise_server_exceptions=False)
+        no_raise_client.headers["user-agent"] = ""
+        with patch.object(
+            DraftStore,
+            "reserve_input",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            resp = no_raise_client.post(
+                f"/api/draft-room/drafts/{draft_id}/inputs",
+                data={"role": "manuscript", "authority": "primary"},
+                files={"file": ("a.txt", b"manuscript body", "text/plain")},
+                headers=self._owner_headers(),
+            )
+        self.assertEqual(resp.status_code, 500, resp.text)
+
+        self.assertTrue(incoming_dir.exists())
+        self.assertEqual(
+            list(incoming_dir.iterdir()),
+            [],
+            "staged .part file was left behind after an untranslated store error",
+        )
+
+
+class TestDeleteAuditOrdering(DraftSecurityTestBase):
+    def test_rejected_delete_with_running_job_writes_no_audit_row(self):
+        """Finding 4: a delete rejected with 409 (active running job) must not
+        leave a ``draft_deleted`` security-audit row asserting a deletion
+        that never happened."""
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id)
+        job_id = upload.json()["job"]["id"]
+
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE draft_jobs SET status = 'running' WHERE id = ?", (job_id,)
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        resp = self.client.delete(
+            f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()
+        )
+        self.assertEqual(resp.status_code, 409, resp.text)
+
+        conn = self._connection_pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM security_audit_log WHERE event_type = 'draft_deleted' "
+                "AND metadata_json LIKE ?",
+                (f'%"draft_id":{draft_id}%',),
+            ).fetchone()
+        finally:
+            self._connection_pool.release_connection(conn)
+        self.assertEqual(row[0], 0, "draft_deleted audit row written for a rejected delete")
 
 
 if __name__ == "__main__":
