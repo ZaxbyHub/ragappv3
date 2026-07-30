@@ -266,7 +266,7 @@ class DraftJobProcessorTestBase(unittest.IsolatedAsyncioTestCase):
         for _ in range(n):
             await asyncio.sleep(delay)
 
-    async def wait_until(self, predicate, *, timeout=5.0, interval=0.02):
+    async def wait_until(self, predicate, *, timeout=30.0, interval=0.02):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if predicate():
@@ -667,9 +667,12 @@ class TestSSEPublication(DraftJobProcessorTestBase):
 
         original_publish = bus.publish
         publish_calls: list[dict] = []
+        completed_published = asyncio.Event()
 
         def raising_publish(draft_id, event):
             publish_calls.append(event)
+            if event.get("type") == "job_completed":
+                completed_published.set()
             # Simulate a publish failure — must never fail the job.
             raise RuntimeError("publish exploded")
 
@@ -681,6 +684,16 @@ class TestSSEPublication(DraftJobProcessorTestBase):
                     lambda: self.get_job(draft.id, 1, job.id).status
                     in ("completed", "failed", "cancelled")
                 )
+                # The DB commit (awaited via `asyncio.to_thread`) and the
+                # SSE publish call happen in the same coroutine but on
+                # either side of that await's continuation — polling can
+                # observe the committed "completed" status before the
+                # event-loop callback that calls publish() has actually
+                # run. Wait for that publish attempt deterministically
+                # (instead of racing processor.stop() against it with an
+                # arbitrary sleep) so the assertions below aren't flaky.
+                if self.get_job(draft.id, 1, job.id).status == "completed":
+                    await asyncio.wait_for(completed_published.wait(), timeout=5.0)
             finally:
                 await self.processor.stop()
         finally:

@@ -211,5 +211,29 @@ class DraftDeletionService:
         for token, relpath in tokens:
             try:
                 self._storage.restore_tombstone(token, relpath)
-            except Exception:
-                logger.error("draft_tombstone_restore_failed")
+            except Exception as exc:
+                owner_id, draft_id, input_id = _parse_relpath_ids(relpath)
+                logger.error(
+                    "draft_tombstone_restore_failed",
+                    extra={
+                        "event": "draft_tombstone_restore_failed",
+                        "token": token,
+                        "owner_id": owner_id,
+                        "draft_id": draft_id,
+                        "input_id": input_id,
+                        "exception_class": type(exc).__name__,
+                    },
+                )
+
+
+def _parse_relpath_ids(relpath: str) -> tuple[str | None, str | None, str | None]:
+    """Best-effort ``(owner_id, draft_id, input_id)`` from a storage relpath.
+
+    Layout is ``<owner_id>/<draft_id>/inputs/<input_id>/<uuid><extension>``
+    (see ``build_input_relpath``). Extracts only the numeric ID segments —
+    never the filename/extension segment — for diagnostic logging.
+    """
+    parts = relpath.split("/")
+    if len(parts) >= 4 and parts[2] == "inputs":
+        return parts[0], parts[1], parts[3]
+    return None, None, None

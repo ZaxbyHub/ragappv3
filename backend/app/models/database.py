@@ -1043,7 +1043,8 @@ CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id ON prompt_ab_ex
 # interpolation and no caller input; the concatenation exists so that
 # _DRAFT_ROOM_CORE_DDL has exactly one definition, shared by SCHEMA and by
 # migrate_add_draft_room_core, and the two therefore cannot drift apart.
-SCHEMA = _BASE_SCHEMA + _DRAFT_ROOM_CORE_DDL  # nosec B608 - static DDL only
+# static DDL only
+SCHEMA = _BASE_SCHEMA + _DRAFT_ROOM_CORE_DDL  # nosec B608
 
 
 

@@ -471,13 +471,15 @@ class DraftStore:
             params.append(status)
         clause = " AND ".join(where)
 
+        # clause is built only from literal fragments; all values are bound parameters
         total = int(
             self._db.execute(
-                f"SELECT COUNT(*) FROM drafts WHERE {clause}", params  # nosec B608 - clause is built only from literal fragments; all values are bound parameters
+                f"SELECT COUNT(*) FROM drafts WHERE {clause}", params  # nosec B608
             ).fetchone()[0]
         )
+        # clause is built only from literal fragments; all values are bound parameters
         rows = self._db.execute(
-            f"SELECT {_DRAFT_COLUMNS} FROM drafts WHERE {clause} "  # nosec B608 - clause is built only from literal fragments; all values are bound parameters
+            f"SELECT {_DRAFT_COLUMNS} FROM drafts WHERE {clause} "  # nosec B608
             "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
             (*params, per_page, max(page - 1, 0) * per_page),
         ).fetchall()
@@ -1312,13 +1314,15 @@ class DraftStore:
             where.append("status = ?")
             params.append(status)
         clause = " AND ".join(where)
+        # clause is built only from literal fragments; all values are bound parameters
         total = int(
             self._db.execute(
-                f"SELECT COUNT(*) FROM draft_jobs WHERE {clause}", params  # nosec B608 - clause is built only from literal fragments; all values are bound parameters
+                f"SELECT COUNT(*) FROM draft_jobs WHERE {clause}", params  # nosec B608
             ).fetchone()[0]
         )
+        # clause is built only from literal fragments; all values are bound parameters
         rows = self._db.execute(
-            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE {clause} "  # nosec B608 - clause is built only from literal fragments; all values are bound parameters
+            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE {clause} "  # nosec B608
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (*params, per_page, max(page - 1, 0) * per_page),
         ).fetchall()

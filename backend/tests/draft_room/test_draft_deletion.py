@@ -808,6 +808,72 @@ class TestUserDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
             list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
         )
 
+    def test_last_superadmin_guard_restores_purged_draft_input(self):
+        """Regression guard for the previously-untested ``except HTTPException``
+        rollback branch in ``delete_user``: the last-active-superadmin guard
+        trips AFTER ``prepare_purge_for_user`` has already tombstoned the
+        target's draft input files. The user row must survive, and the
+        draft's input file must be restored to its original path and still
+        readable.
+
+        Base ``setUp`` seeds two active superadmins (100, 101). They are
+        demoted here so the only active superadmin left in the system is the
+        target (301) -- otherwise the DB-backed ``COUNT(*)`` guard the route
+        checks never sees ``count == 1`` and the branch under test is never
+        reached. The caller authenticates via the admin-secret-token bypass
+        (``users_enabled=False``), which returns a virtual superadmin
+        principal (id=0) that is NOT a DB row, so it does not inflate that
+        same count.
+        """
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute("UPDATE users SET role='admin' WHERE id IN (100, 101)")
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (301,'sole-superadmin','h','Sole','superadmin',1)"
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        draft, record = self._make_draft_with_input(owner_id=301, vault_id=501)
+        content = self.storage.resolve(record.storage_relpath).read_bytes()
+
+        original_admin_secret_token = settings.admin_secret_token
+        original_users_enabled = settings.users_enabled
+        settings.admin_secret_token = "test-admin-secret-token-for-435"
+        settings.users_enabled = False
+        try:
+            resp = self.client.delete(
+                "/api/users/301",
+                headers={"Authorization": f"Bearer {settings.admin_secret_token}"},
+            )
+        finally:
+            settings.admin_secret_token = original_admin_secret_token
+            settings.users_enabled = original_users_enabled
+
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertIn("last superadmin", resp.json()["detail"].lower())
+
+        # The user row still exists -- the DELETE was rolled back.
+        conn = self._connection_pool.get_connection()
+        try:
+            row = conn.execute("SELECT id FROM users WHERE id = ?", (301,)).fetchone()
+            self.assertIsNotNone(row)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # The draft's input file was restored to its original path and is readable.
+        self.assertTrue(self.storage.exists(record.storage_relpath))
+        self.assertEqual(
+            self.storage.resolve(record.storage_relpath).read_bytes(), content
+        )
+        # No leftover tombstone after the restore.
+        trash_dir = self.root / ".trash"
+        self.assertEqual(
+            list(trash_dir.iterdir()) if trash_dir.is_dir() else [], []
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
