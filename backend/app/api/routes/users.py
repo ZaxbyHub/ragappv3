@@ -21,6 +21,9 @@ from app.config import settings
 from app.models.database import get_pool
 from app.security import csrf_protect
 from app.services.auth_service import password_strength_check
+from app.services.draft_deletion import DraftDeletionService
+from app.services.draft_input_storage import DraftInputStorage
+from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -608,6 +611,32 @@ async def delete_user(
             raise HTTPException(
                 status_code=400,
                 detail=f"User owns organization(s) {owned_orgs}. Transfer ownership before deleting.",
+            )
+
+        # Purge Draft Room bytes before the DELETE below: drafts.created_by
+        # cascades on user delete, losing the rows that name the files to
+        # remove. Only SELECTs have run on `conn` so far (no open
+        # transaction), so DraftDeletionService's own per-draft BEGIN
+        # IMMEDIATE (via DraftStore) can't nest inside anything here. Not
+        # gated on draft_room_enabled (SPEC 9.2) — cleanup must run even if
+        # disabled.
+        try:
+            draft_store = DraftStore(conn)
+            draft_deletion = DraftDeletionService(
+                DraftInputStorage(settings.data_dir / "draft-room")
+            )
+            purged = await asyncio.to_thread(
+                draft_deletion.delete_drafts_for_user, draft_store, user_id
+            )
+            logger.info(
+                "draft_room_user_purge user_id=%s purged=%s", user_id, purged
+            )
+        except (sqlite3.Error, OSError, RuntimeError) as e:
+            # Never block the user delete on a purge failure.
+            logger.warning(
+                "draft_room_user_purge_failed user_id=%s reason=%s",
+                user_id,
+                type(e).__name__,
             )
 
         if target_role == "superadmin":

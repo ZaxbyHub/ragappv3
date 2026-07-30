@@ -27,6 +27,9 @@ from app.api.deps import (
 from app.config import settings
 from app.limiter import limiter
 from app.security import csrf_protect
+from app.services.draft_deletion import DraftDeletionService
+from app.services.draft_input_storage import DraftInputStorage
+from app.services.draft_store import DraftStore
 from app.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -585,6 +588,31 @@ async def delete_vault(
         )
 
     vault_name = row[1]
+
+    # Purge Draft Room bytes before the row deletion below: drafts.vault_id
+    # cascades on vault delete, losing the rows that name the files to
+    # remove. Runs before BEGIN IMMEDIATE because DraftDeletionService opens
+    # its own BEGIN IMMEDIATE per draft on this same `conn` — nesting inside
+    # the handler's own transaction would raise. Not gated on
+    # draft_room_enabled (SPEC 9.2) — cleanup must run even if disabled.
+    try:
+        draft_store = DraftStore(conn)
+        draft_deletion = DraftDeletionService(
+            DraftInputStorage(settings.data_dir / "draft-room")
+        )
+        purged = await asyncio.to_thread(
+            draft_deletion.delete_drafts_for_vault, draft_store, vault_id
+        )
+        logger.info(
+            "draft_room_vault_purge vault_id=%s purged=%s", vault_id, purged
+        )
+    except (sqlite3.Error, OSError, RuntimeError) as e:
+        # Never block the vault delete, matching the vector-store precedent.
+        logger.warning(
+            "draft_room_vault_purge_failed vault_id=%s reason=%s",
+            vault_id,
+            type(e).__name__,
+        )
 
     try:
         # Start transaction. BEGIN IMMEDIATE acquires the write lock up front

@@ -16,7 +16,8 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from queue import Empty, Queue
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -25,6 +26,13 @@ try:
 except ImportError:
     sys.modules["lancedb"] = types.ModuleType("lancedb")
 
+from fastapi.testclient import TestClient
+
+from app.api.deps import get_db, get_vector_store
+from app.config import settings
+from app.main import app
+from app.security import csrf_protect
+from app.services.auth_service import compute_client_fingerprint, create_access_token
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_input_storage import DraftInputStorage
 from app.services.draft_store import DraftConflictError, DraftNotFoundError, DraftStore
@@ -296,6 +304,289 @@ class TestCascades(DraftDeletionTestBase):
         self.store.get_draft(d1.id, 1)
         with self.assertRaises(DraftNotFoundError):
             self.store.get_draft(d2.id, 1)
+
+
+class _RouteTestPool:
+    """Thread-safe SQLite pool matching the ``get_connection``/
+    ``release_connection`` idiom the route tests need for the ``get_db``
+    override (copied inline — mirrors ``tests/_db_pool.py`` and
+    ``tests/draft_room/test_draft_routes.py`` — this module lives one
+    directory deeper than ``tests/_db_pool.py`` so a bare-name import would
+    need an extra ``sys.path`` entry; a local copy avoids that)."""
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        self._pool: Queue = Queue(maxsize=5)
+        self._closed = False
+
+    def get_connection(self) -> sqlite3.Connection:
+        if self._closed:
+            raise RuntimeError("Pool closed")
+        try:
+            return self._pool.get_nowait()
+        except Empty:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            return conn
+
+    def release_connection(self, conn: sqlite3.Connection) -> None:
+        if self._closed:
+            conn.close()
+            return
+        try:
+            self._pool.put_nowait(conn)
+        except Exception:
+            conn.close()
+
+    def close_all(self) -> None:
+        self._closed = True
+        while True:
+            try:
+                self._pool.get_nowait().close()
+            except Empty:
+                break
+
+
+class DraftRouteWiringTestBase(unittest.TestCase):
+    """Route-level tests proving DELETE /api/vaults/{id} and DELETE
+    /api/users/{id} purge Draft Room private bytes (issue #435), not just
+    that the service methods work in isolation. Harness mirrors
+    ``test_tags_routes.py``. Vault ids are >= 501 to avoid colliding with the
+    ``Default`` vault (id=1) seeded by
+    ``migrate_assign_orphan_users_to_default_vault``.
+    """
+
+    def setUp(self):
+        self.client = TestClient(app)
+        self.client.headers["user-agent"] = ""
+        self._temp_dir = tempfile.mkdtemp()
+
+        self._original_jwt_secret = settings.jwt_secret_key
+        self._original_users_enabled = settings.users_enabled
+        self._original_data_dir = settings.data_dir
+
+        settings.data_dir = Path(self._temp_dir)
+        settings.jwt_secret_key = os.urandom(32).hex()
+        settings.users_enabled = True
+
+        self._db_path = str(Path(self._temp_dir) / "app.db")
+
+        from app.models.database import _pool_cache, _pool_cache_lock
+
+        with _pool_cache_lock:
+            for _path, pool in list(_pool_cache.items()):
+                pool.close_all()
+            _pool_cache.clear()
+
+        from app.models.database import init_db, run_migrations
+
+        init_db(self._db_path)
+        run_migrations(self._db_path)
+        self._connection_pool = _RouteTestPool(self._db_path)
+
+        def override_get_db():
+            conn = self._connection_pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self._connection_pool.release_connection(conn)
+
+        app.dependency_overrides[get_db] = override_get_db
+        app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
+
+        self._mock_vector_store = MagicMock()
+        self._mock_vector_store.delete_by_vault = AsyncMock(return_value=0)
+        app.dependency_overrides[get_vector_store] = lambda: self._mock_vector_store
+
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (100,'root-admin','h','Root','superadmin',1)"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (101,'root-admin-2','h','Root2','superadmin',1)"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (200,'owner-a','h','Owner A','member',1)"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (201,'owner-b','h','Owner B','member',1)"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (501,'VaultA','')"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (502,'VaultB','')"
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        self.root = Path(self._temp_dir) / "draft-room"
+        self.storage = DraftInputStorage(self.root)
+
+    def tearDown(self):
+        from app.models.database import _pool_cache, _pool_cache_lock
+
+        with _pool_cache_lock:
+            for _path, pool in list(_pool_cache.items()):
+                pool.close_all()
+            _pool_cache.clear()
+
+        settings.jwt_secret_key = self._original_jwt_secret
+        settings.users_enabled = self._original_users_enabled
+        settings.data_dir = self._original_data_dir
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(csrf_protect, None)
+        app.dependency_overrides.pop(get_vector_store, None)
+        if hasattr(self, "_connection_pool"):
+            self._connection_pool.close_all()
+        shutil.rmtree(self._temp_dir, ignore_errors=True)
+
+    def _headers(self, user_id, username, role):
+        token = create_access_token(
+            user_id, username, role, client_fingerprint=compute_client_fingerprint("")
+        )
+        return {"Authorization": f"Bearer {token}"}
+
+    def _make_draft_with_input(self, *, owner_id, vault_id, title="Draft"):
+        conn = self._connection_pool.get_connection()
+        try:
+            store = DraftStore(conn)
+            draft = store.create_draft(
+                vault_id=vault_id,
+                created_by=owner_id,
+                title=title,
+                mode="compose",
+                tier="standard",
+                brief_json="{}",
+            )
+            upload = FakeUpload("a.txt", b"private manuscript bytes")
+            staged = asyncio.run(
+                self.storage.stage_upload(
+                    upload, allowed_extensions={".txt"}, max_file_bytes=10_000_000
+                )
+            )
+            record = store.reserve_input(
+                draft_id=draft.id,
+                owner_id=owner_id,
+                role="reference",
+                authority="unknown",
+                as_of_date=None,
+                original_name=staged.original_name,
+                stored_name=staged.stored_name,
+                extension=staged.extension,
+                media_type=staged.media_type,
+                size_bytes=staged.size_bytes,
+                content_sha256=staged.content_sha256,
+                max_inputs=100,
+                max_total_input_bytes=10_000_000,
+            )
+            self.storage.finalize(staged, record.storage_relpath)
+            return draft, record
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _draft_row_count(self, draft_id):
+        conn = self._connection_pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM drafts WHERE id = ?", (draft_id,)
+            ).fetchone()
+            return row[0]
+        finally:
+            self._connection_pool.release_connection(conn)
+
+
+class TestVaultDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
+    def test_deleting_vault_purges_files_and_rows_and_spares_other_vault(self):
+        draft_in, input_in = self._make_draft_with_input(owner_id=200, vault_id=501)
+        draft_other, input_other = self._make_draft_with_input(owner_id=200, vault_id=502)
+
+        resp = self.client.delete(
+            "/api/vaults/501", headers=self._headers(100, "root-admin", "superadmin")
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        # Purged vault's draft: file gone, row gone, owner/draft dir gone.
+        self.assertFalse(self.storage.exists(input_in.storage_relpath))
+        self.assertEqual(self._draft_row_count(draft_in.id), 0)
+        self.assertFalse((self.root / "200" / str(draft_in.id)).exists())
+
+        # Isolation guard: a draft in a DIFFERENT vault is untouched.
+        self.assertTrue(self.storage.exists(input_other.storage_relpath))
+        self.assertEqual(self._draft_row_count(draft_other.id), 1)
+
+    def test_purge_failure_does_not_block_vault_deletion(self):
+        draft_in, input_in = self._make_draft_with_input(owner_id=200, vault_id=501)
+
+        with patch.object(
+            DraftDeletionService,
+            "delete_drafts_for_vault",
+            side_effect=RuntimeError("simulated purge failure"),
+        ):
+            with self.assertLogs("app.api.routes.vaults", level="WARNING") as logs:
+                resp = self.client.delete(
+                    "/api/vaults/501",
+                    headers=self._headers(100, "root-admin", "superadmin"),
+                )
+
+        # Vault deletion must proceed despite the purge failure.
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self._draft_row_count(draft_in.id), 0)
+        self.assertTrue(
+            any("draft_room_vault_purge_failed" in line for line in logs.output)
+        )
+        # File is orphaned in this simulated-failure scenario (expected: the
+        # purge itself failed), but the parent deletion was not blocked.
+        self.assertTrue(self.storage.exists(input_in.storage_relpath))
+
+
+class TestUserDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
+    def test_deleting_user_purges_files_and_rows_and_spares_other_user(self):
+        draft_a, input_a = self._make_draft_with_input(owner_id=200, vault_id=501)
+        draft_b, input_b = self._make_draft_with_input(owner_id=201, vault_id=501)
+
+        resp = self.client.delete(
+            "/api/users/200", headers=self._headers(100, "root-admin", "superadmin")
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        # Deleted user's draft: file gone, row gone.
+        self.assertFalse(self.storage.exists(input_a.storage_relpath))
+        self.assertEqual(self._draft_row_count(draft_a.id), 0)
+        self.assertFalse((self.root / "200" / str(draft_a.id)).exists())
+
+        # Isolation guard: a draft owned by a DIFFERENT user is untouched.
+        self.assertTrue(self.storage.exists(input_b.storage_relpath))
+        self.assertEqual(self._draft_row_count(draft_b.id), 1)
+
+    def test_purge_failure_does_not_block_user_deletion(self):
+        draft_a, input_a = self._make_draft_with_input(owner_id=200, vault_id=501)
+
+        with patch.object(
+            DraftDeletionService,
+            "delete_drafts_for_user",
+            side_effect=RuntimeError("simulated purge failure"),
+        ):
+            with self.assertLogs("app.api.routes.users", level="WARNING") as logs:
+                resp = self.client.delete(
+                    "/api/users/200",
+                    headers=self._headers(100, "root-admin", "superadmin"),
+                )
+
+        # User deletion must proceed despite the purge failure.
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self._draft_row_count(draft_a.id), 0)
+        self.assertTrue(
+            any("draft_room_user_purge_failed" in line for line in logs.output)
+        )
+        self.assertTrue(self.storage.exists(input_a.storage_relpath))
 
 
 if __name__ == "__main__":
