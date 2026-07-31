@@ -156,6 +156,19 @@ _INPUT_RECOVERY_TRANSITIONS: dict[str, frozenset[str]] = {
     "parsing": frozenset({"pending"}),
 }
 
+# A parse commits the input's status and the job's status in two separate
+# transactions, so a crash between them leaves the input terminal while the job
+# is still 'running'. Re-queueing such a job would be wrong twice over: the work
+# already finished, and every terminal parse state has no outgoing transition
+# (see ``_INPUT_TRANSITIONS``), so the retry could not legally move the input
+# back out and the job would fail permanently. Recovery instead settles the job
+# onto the outcome the input already records.
+_TERMINAL_PARSE_TO_JOB_STATUS: dict[str, str] = {
+    "ready": "completed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
+
 # Statuses that mean a job is still consuming resources.
 ACTIVE_JOB_STATUSES: tuple[str, ...] = ("pending", "running")
 
@@ -1597,12 +1610,39 @@ class DraftStore:
         self._begin_immediate()
         try:
             rows = self._db.execute(
-                "SELECT id, input_id, cancel_requested_at FROM draft_jobs "
-                "WHERE status = 'running' AND job_type = 'parse_input'"
+                "SELECT j.id, j.input_id, j.cancel_requested_at, i.parse_status "
+                "FROM draft_jobs j "
+                "LEFT JOIN draft_inputs i ON i.id = j.input_id "
+                "WHERE j.status = 'running' AND j.job_type = 'parse_input'"
             ).fetchall()
             reset = 0
+            settled = 0
             for row in rows:
                 job_id, input_id, cancel_requested_at = row[0], row[1], row[2]
+                parse_status = row[3]
+                settled_status = _TERMINAL_PARSE_TO_JOB_STATUS.get(parse_status)
+                if settled_status is not None:
+                    # The parse itself committed; only the job's own status
+                    # write was lost. Settle the job onto that outcome rather
+                    # than re-running work whose result is already stored.
+                    if settled_status == "completed":
+                        self._db.execute(
+                            "UPDATE draft_jobs SET status = 'completed', "
+                            "progress_percent = 100.0, "
+                            "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (job_id,),
+                        )
+                    else:
+                        # Leave progress_percent alone: whatever the worker had
+                        # recorded before dying is the truthful last value, and
+                        # the input row already carries the parse_error detail.
+                        self._db.execute(
+                            "UPDATE draft_jobs SET status = ?, "
+                            "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (settled_status, job_id),
+                        )
+                    settled += 1
+                    continue
                 if cancel_requested_at is not None:
                     self._db.execute(
                         "UPDATE draft_jobs SET status = 'cancelled', "
@@ -1640,6 +1680,12 @@ class DraftStore:
             logger.warning(
                 "draft room: reset %d orphaned parse job(s) to pending after restart",
                 reset,
+            )
+        if settled:
+            logger.warning(
+                "draft room: settled %d orphaned parse job(s) onto their input's "
+                "already-committed outcome after restart",
+                settled,
             )
         return reset
 

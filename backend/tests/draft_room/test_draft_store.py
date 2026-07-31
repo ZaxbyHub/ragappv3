@@ -707,7 +707,11 @@ class TestConcurrentManualRevisions(DraftStoreTestBase):
             conn.execute("PRAGMA foreign_keys = ON")
             store = DraftStore(conn)
             try:
-                barrier.wait(timeout=5)
+                # Generous: this only bounds how long threads wait to line up,
+                # not the contention window under test. A loaded CI runner can
+                # take seconds to schedule 8 threads, and a BrokenBarrierError
+                # here would fail the test for reasons unrelated to the race.
+                barrier.wait(timeout=60)
                 try:
                     rev = store.create_manual_revision(
                         draft_id=draft.id,

@@ -906,6 +906,11 @@ async def delete_draft(
         )
     except DraftStoreError as exc:
         raise _map_store_error(exc) from exc
+    except DraftInputStorageError as exc:
+        # delete_draft tombstones every input before dropping the rows, so a
+        # filesystem fault surfaces here as well. Mapped like delete_draft_input
+        # does, rather than escaping as an unhandled 500.
+        raise _map_storage_error(exc) from exc
     # Recorded through the global HMAC audit log (not draft_events, which
     # cascade-deletes) only once deletion has actually succeeded — writing
     # it earlier would leave a signed, tamper-evident row asserting a

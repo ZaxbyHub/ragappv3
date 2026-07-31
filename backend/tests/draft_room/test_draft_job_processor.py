@@ -23,6 +23,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from queue import Empty, Queue
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -543,6 +544,30 @@ class TestTimeout(DraftJobProcessorTestBase):
 # ── Startup recovery ─────────────────────────────────────────────────────
 
 
+class TestStartCancellation(DraftJobProcessorTestBase):
+    async def test_cancelled_start_does_not_leave_processor_half_initialized(self):
+        """lifespan wraps start() in a timeout whose expiry it swallows, so a
+        slow startup recovery cancels start() after _running=True but before the
+        poll loop task exists. Without the reset the processor then reports
+        itself running, accepts stop(), and silently never claims a job.
+        """
+        started = asyncio.Event()
+
+        def _slow_recover():
+            started.set()
+            time.sleep(5)
+
+        with patch.object(self.processor, "_recover_on_startup", _slow_recover):
+            task = asyncio.create_task(self.processor.start())
+            await asyncio.wait_for(started.wait(), timeout=5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertFalse(self.processor._running)
+        self.assertIsNone(self.processor._task)
+
+
 class TestStartupRecovery(DraftJobProcessorTestBase):
     async def test_orphaned_running_job_and_parsing_input_reset_to_pending(self):
         draft = self.make_draft()
@@ -569,6 +594,47 @@ class TestStartupRecovery(DraftJobProcessorTestBase):
 
         input_after = self.get_input(draft.id, 1, input_record.id)
         self.assertEqual(input_after.parse_status, "pending")
+
+    async def test_job_settles_onto_input_outcome_when_only_job_write_was_lost(self):
+        """_commit_success writes the input's parse status and the job's status
+        in two separate transactions. A crash between them leaves the input
+        terminal and the job 'running'.
+
+        Re-queueing would be wrong twice: the parse already succeeded and its
+        text is stored, and terminal parse states have no outgoing transition,
+        so the retry could not move the input out of 'ready' and the job would
+        fail permanently on an input that parsed correctly. Recovery must settle
+        the job onto the outcome the input already records.
+        """
+        for parse_status, expected_job_status in (
+            ("ready", "completed"),
+            ("failed", "failed"),
+            ("cancelled", "cancelled"),
+        ):
+            with self.subTest(parse_status=parse_status):
+                draft = self.make_draft()
+                input_record = await self.add_input(draft.id)
+                job = self.enqueue_parse_job(draft.id, 1, input_record.id)
+
+                with self.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE draft_jobs SET status = 'running' WHERE id = ?",
+                        (job.id,),
+                    )
+                    conn.execute(
+                        "UPDATE draft_inputs SET parse_status = ? WHERE id = ?",
+                        (parse_status, input_record.id),
+                    )
+                    conn.commit()
+
+                await asyncio.to_thread(self.processor._recover_on_startup)
+
+                job_after = self.get_job(draft.id, 1, job.id)
+                self.assertEqual(job_after.status, expected_job_status)
+                # The input's already-committed outcome is authoritative and
+                # must not be rewritten by recovery.
+                input_after = self.get_input(draft.id, 1, input_record.id)
+                self.assertEqual(input_after.parse_status, parse_status)
 
     async def test_pending_input_without_active_job_and_present_file_is_reenqueued(self):
         draft = self.make_draft()

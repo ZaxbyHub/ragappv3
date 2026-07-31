@@ -22,7 +22,7 @@ from app.models.database import get_pool
 from app.security import csrf_protect
 from app.services.auth_service import password_strength_check
 from app.services.draft_deletion import DraftDeletionService
-from app.services.draft_input_storage import DraftInputStorage
+from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
 
@@ -639,8 +639,11 @@ async def delete_user(
                 user_id,
                 len(draft_purge_plan.draft_owner_pairs),
             )
-        except (sqlite3.Error, OSError, RuntimeError) as e:
+        except (sqlite3.Error, OSError, RuntimeError, DraftInputStorageError) as e:
             # Never block the user delete on a purge failure.
+            # DraftInputStorageError is listed explicitly: it derives from
+            # Exception, not OSError, so a tombstone/resolve failure would
+            # otherwise escape and 500 the delete, contradicting this promise.
             logger.warning(
                 "draft_room_user_purge_prepare_failed user_id=%s reason=%s",
                 user_id,

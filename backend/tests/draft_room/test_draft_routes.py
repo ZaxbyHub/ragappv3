@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -39,6 +39,8 @@ from app.config import settings
 from app.main import app
 from app.security import CSRFManager, csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
+from app.services.draft_deletion import DraftDeletionService
+from app.services.draft_input_storage import DraftInputPathError
 
 
 class _PoolWithConnectionCM:
@@ -442,6 +444,29 @@ class TestDraftLifecycle(DraftRoomTestBase):
             self.assertIsNotNone(row)
         finally:
             self._connection_pool.release_connection(conn)
+
+
+class TestDeleteDraftErrorMapping(DraftRoomTestBase):
+    def test_storage_error_is_mapped_not_a_bare_500(self):
+        """delete_draft tombstones inputs before dropping rows, so it can raise
+        DraftInputStorageError as well as DraftStoreError. Only the latter was
+        caught, so a filesystem fault escaped as an unhandled 500 instead of the
+        documented error contract -- inconsistent with delete_draft_input, which
+        maps both.
+        """
+        draft_id = self._create_draft().json()["id"]
+
+        with patch.object(
+            DraftDeletionService,
+            "delete_draft",
+            side_effect=DraftInputPathError("simulated resolve fault"),
+        ):
+            resp = self.client.delete(
+                f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()
+            )
+
+        self.assertEqual(resp.status_code, 400, resp.text)
+        self.assertEqual(resp.json()["code"], "invalid_storage_path")
 
 
 class TestManualRevisions(DraftRoomTestBase):

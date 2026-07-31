@@ -28,7 +28,7 @@ from app.config import settings
 from app.limiter import limiter
 from app.security import csrf_protect
 from app.services.draft_deletion import DraftDeletionService
-from app.services.draft_input_storage import DraftInputStorage
+from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
 from app.services.draft_store import DraftStore
 from app.services.vector_store import VectorStore
 
@@ -613,8 +613,11 @@ async def delete_vault(
             vault_id,
             len(draft_purge_plan.draft_owner_pairs),
         )
-    except (sqlite3.Error, OSError, RuntimeError) as e:
+    except (sqlite3.Error, OSError, RuntimeError, DraftInputStorageError) as e:
         # Never block the vault delete, matching the vector-store precedent.
+        # DraftInputStorageError is listed explicitly: it derives from Exception,
+        # not OSError, so a tombstone/resolve failure would otherwise escape this
+        # handler and 500 the delete -- the opposite of what this block promises.
         logger.warning(
             "draft_room_vault_purge_prepare_failed vault_id=%s reason=%s",
             vault_id,

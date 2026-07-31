@@ -401,6 +401,21 @@ class TestVaultAccessRevocation(DraftSecurityTestBase):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
 
+        # Single-input delete is NOT on SPEC section 9.1 rule 3's list, so it
+        # stays blocked. Pinned deliberately: the rule enumerates metadata
+        # listing, cancellation, and whole-draft delete, but justifies them as
+        # "reduce private data/processing" -- a rationale that would also cover
+        # this route. The strict reading is what ships, and the owner's cleanup
+        # goal stays reachable through whole-draft delete asserted below. If the
+        # SPEC is later clarified the other way, this assertion is the thing
+        # that should change, and it should change on purpose.
+        input_id = upload.json()["input"]["id"]
+        resp = self.client.delete(
+            f"/api/draft-room/drafts/{draft_id}/inputs/{input_id}",
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 403, resp.text)
+
         # Whole-draft delete still works.
         resp = self.client.delete(
             f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()

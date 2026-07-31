@@ -95,10 +95,19 @@ class DraftJobProcessor:
         if self._running:
             return
         self._running = True
-        # Startup recovery must complete before the poll loop begins and
-        # before HTTP traffic is accepted (SPEC section 10.1 item 6).
-        await asyncio.to_thread(self._recover_on_startup)
-        self._task = asyncio.create_task(self._poll_loop())
+        try:
+            # Startup recovery must complete before the poll loop begins and
+            # before HTTP traffic is accepted (SPEC section 10.1 item 6).
+            await asyncio.to_thread(self._recover_on_startup)
+            self._task = asyncio.create_task(self._poll_loop())
+        except BaseException:
+            # The caller wraps this in a timeout and swallows the result, so
+            # without this reset a cancelled recovery would leave _running=True
+            # with no poll loop: a processor that reports started, accepts
+            # stop(), and silently never runs a job. CancelledError is a
+            # BaseException, hence the broad catch.
+            self._running = False
+            raise
         logger.info("DraftJobProcessor started")
 
     async def stop(self) -> None:

@@ -34,7 +34,7 @@ from app.main import app
 from app.security import csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
 from app.services.draft_deletion import DraftDeletionService
-from app.services.draft_input_storage import DraftInputStorage
+from app.services.draft_input_storage import DraftInputPathError, DraftInputStorage
 from app.services.draft_store import DraftConflictError, DraftNotFoundError, DraftStore
 
 
@@ -644,6 +644,38 @@ class TestVaultDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
         # purge itself failed), but the parent deletion was not blocked.
         self.assertTrue(self.storage.exists(input_in.storage_relpath))
 
+    def test_storage_error_during_prepare_does_not_block_vault_deletion(self):
+        """DraftInputStorageError must not escape the purge-prepare handler.
+
+        The sibling test above injects RuntimeError, which the handler already
+        caught -- so it passed while the real hazard went unguarded.
+        DraftInputStorageError derives from Exception, not OSError, so a
+        tombstone/resolve fault escaped and 500'd the vault delete, the exact
+        opposite of the handler's "never block the delete" contract.
+        """
+        draft_in, input_in = self._make_draft_with_input(owner_id=200, vault_id=501)
+
+        with patch.object(
+            DraftDeletionService,
+            "prepare_purge_for_vault",
+            side_effect=DraftInputPathError("simulated resolve fault"),
+        ):
+            with self.assertLogs("app.api.routes.vaults", level="WARNING") as logs:
+                resp = self.client.delete(
+                    "/api/vaults/501",
+                    headers=self._headers(100, "root-admin", "superadmin"),
+                )
+
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self._draft_row_count(draft_in.id), 0)
+        self.assertTrue(
+            any(
+                "draft_room_vault_purge_prepare_failed" in line
+                for line in logs.output
+            )
+        )
+        self.assertTrue(self.storage.exists(input_in.storage_relpath))
+
     def test_transaction_failure_after_purge_prepare_restores_files_and_keeps_vault(
         self,
     ):
@@ -746,6 +778,31 @@ class TestUserDeleteWiresDraftRoomPurge(DraftRouteWiringTestBase):
                 )
 
         # User deletion must proceed despite the purge failure.
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(self._draft_row_count(draft_a.id), 0)
+        self.assertTrue(
+            any(
+                "draft_room_user_purge_prepare_failed" in line
+                for line in logs.output
+            )
+        )
+        self.assertTrue(self.storage.exists(input_a.storage_relpath))
+
+    def test_storage_error_during_prepare_does_not_block_user_deletion(self):
+        """User-delete side of the same gap; see the vault test for rationale."""
+        draft_a, input_a = self._make_draft_with_input(owner_id=200, vault_id=501)
+
+        with patch.object(
+            DraftDeletionService,
+            "prepare_purge_for_user",
+            side_effect=DraftInputPathError("simulated resolve fault"),
+        ):
+            with self.assertLogs("app.api.routes.users", level="WARNING") as logs:
+                resp = self.client.delete(
+                    "/api/users/200",
+                    headers=self._headers(100, "root-admin", "superadmin"),
+                )
+
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(self._draft_row_count(draft_a.id), 0)
         self.assertTrue(
