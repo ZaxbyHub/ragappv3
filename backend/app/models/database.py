@@ -175,6 +175,185 @@ CREATE INDEX IF NOT EXISTS idx_draft_events_draft_created
     ON draft_events(draft_id, created_at DESC);
 """
 
+# Draft Room pipeline schema (issue #436, specs/draft-room/SPEC.md section 5.5-5.7).
+#
+# Compile-pipeline stage checkpoints, retrieved-evidence snapshots, and the
+# factuality tables (claims / claim sources / findings) that sit on top of
+# `_DRAFT_ROOM_CORE_DDL`.
+#
+# Defined as its own constant, appended to SCHEMA below and executed verbatim by
+# migrate_add_draft_room_pipeline(), so a fresh database and a migrated database
+# cannot drift apart.
+_DRAFT_ROOM_PIPELINE_DDL = """
+CREATE TABLE IF NOT EXISTS draft_job_stages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES draft_jobs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL CHECK (stage IN (
+        'intake','research','outline','draft','lint','copy','standards','fact','assemble'
+    )),
+    attempt INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+        'pending','running','completed','failed','skipped','cancelled'
+    )),
+    input_sha256 TEXT NOT NULL,
+    artifact_json TEXT NOT NULL DEFAULT '{}',
+    artifact_sha256 TEXT,
+    content_md TEXT,
+    candidate_sha256 TEXT,
+    semantic_changed INTEGER NOT NULL DEFAULT 0 CHECK (semantic_changed IN (0,1)),
+    prompt_id TEXT,
+    prompt_version TEXT,
+    prompt_sha256 TEXT,
+    model_name TEXT,
+    temperature REAL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    error_code TEXT,
+    error_message TEXT,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    UNIQUE(job_id, stage, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_draft_job_stages_job
+    ON draft_job_stages(job_id, id);
+
+-- NOTE: file_id, wiki_page_id, wiki_claim_id, kms_entry_id are intentionally
+-- plain snapshot columns, NOT foreign keys. Evidence rows are durable
+-- historical snapshots of what was retrieved at compile time; deleting or
+-- mutating the source file/wiki/KMS row later must never cascade-delete or
+-- null out the evidence's recorded identity (SPEC.md 5.6). Exactly one
+-- identity family is populated per row: draft_input -> draft_input_id;
+-- document -> file_id; wiki -> wiki_page_id (+ optional wiki_claim_id);
+-- kms -> kms_entry_id. That cross-column exclusivity is enforced by
+-- DraftStore at insertion (SQLite CHECK constraints cannot reference the
+-- NULL-ness of sibling columns conditionally per source_kind in a way that
+-- stays readable here without duplicating the whole enum four times), but the
+-- source_kind CHECK and the four partial identity indexes below are enforced
+-- in SQL.
+CREATE TABLE IF NOT EXISTS draft_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES draft_jobs(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    source_kind TEXT NOT NULL CHECK (source_kind IN (
+        'draft_input','document','wiki','kms'
+    )),
+    draft_input_id INTEGER REFERENCES draft_inputs(id) ON DELETE SET NULL,
+    file_id INTEGER,
+    wiki_page_id INTEGER,
+    wiki_claim_id INTEGER,
+    kms_entry_id INTEGER,
+    chunk_uid TEXT,
+    title TEXT NOT NULL,
+    passage TEXT NOT NULL,
+    passage_sha256 TEXT NOT NULL,
+    source_content_sha256 TEXT NOT NULL,
+    page_number INTEGER,
+    section TEXT,
+    retrieval_score REAL,
+    authority TEXT NOT NULL DEFAULT 'unknown',
+    as_of_date TEXT,
+    source_updated_at TEXT,
+    source_deleted_at TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(job_id, label),
+    CHECK (
+        (source_kind = 'draft_input' AND draft_input_id IS NOT NULL
+            AND file_id IS NULL AND wiki_page_id IS NULL
+            AND wiki_claim_id IS NULL AND kms_entry_id IS NULL)
+        OR (source_kind = 'document' AND file_id IS NOT NULL
+            AND draft_input_id IS NULL AND wiki_page_id IS NULL
+            AND wiki_claim_id IS NULL AND kms_entry_id IS NULL)
+        OR (source_kind = 'wiki' AND wiki_page_id IS NOT NULL
+            AND draft_input_id IS NULL AND file_id IS NULL
+            AND kms_entry_id IS NULL)
+        OR (source_kind = 'kms' AND kms_entry_id IS NOT NULL
+            AND draft_input_id IS NULL AND file_id IS NULL
+            AND wiki_page_id IS NULL AND wiki_claim_id IS NULL)
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_draft_evidence_job_kind
+    ON draft_evidence(job_id, source_kind);
+CREATE INDEX IF NOT EXISTS idx_draft_evidence_document_identity
+    ON draft_evidence(file_id) WHERE source_kind = 'document';
+CREATE INDEX IF NOT EXISTS idx_draft_evidence_wiki_page_identity
+    ON draft_evidence(wiki_page_id) WHERE source_kind = 'wiki';
+CREATE INDEX IF NOT EXISTS idx_draft_evidence_wiki_claim_identity
+    ON draft_evidence(wiki_claim_id) WHERE wiki_claim_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_draft_evidence_kms_identity
+    ON draft_evidence(kms_entry_id) WHERE source_kind = 'kms';
+
+CREATE TABLE IF NOT EXISTS draft_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    revision_id INTEGER NOT NULL REFERENCES draft_revisions(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    claim_text TEXT NOT NULL,
+    claim_sha256 TEXT NOT NULL,
+    span_start INTEGER NOT NULL,
+    span_end INTEGER NOT NULL,
+    claim_type TEXT NOT NULL CHECK (claim_type IN ('factual','quote','opinion')),
+    status TEXT NOT NULL CHECK (status IN (
+        'supported','contradicted','ambiguous','stale','unsupported','opinion'
+    )),
+    severity TEXT NOT NULL CHECK (severity IN ('info','warning','blocker')),
+    rationale TEXT NOT NULL DEFAULT '',
+    retrieval_audit_json TEXT NOT NULL DEFAULT '{}',
+    resolution TEXT NOT NULL DEFAULT 'open' CHECK (resolution IN (
+        'open','resolved_by_revision','accepted','waived'
+    )),
+    resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    resolved_at TIMESTAMP,
+    resolution_note TEXT,
+    UNIQUE(revision_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS draft_claim_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    claim_id INTEGER NOT NULL REFERENCES draft_claims(id) ON DELETE CASCADE,
+    evidence_id INTEGER NOT NULL REFERENCES draft_evidence(id) ON DELETE CASCADE,
+    relationship TEXT NOT NULL CHECK (relationship IN ('supports','contradicts','context')),
+    exact_quote TEXT NOT NULL,
+    passage_start INTEGER,
+    passage_end INTEGER,
+    lexical_overlap_score REAL CHECK (
+        lexical_overlap_score IS NULL OR
+        (lexical_overlap_score >= 0 AND lexical_overlap_score <= 1)
+    ),
+    UNIQUE(claim_id, evidence_id, relationship)
+);
+
+CREATE TABLE IF NOT EXISTS draft_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    revision_id INTEGER REFERENCES draft_revisions(id) ON DELETE CASCADE,
+    job_id INTEGER REFERENCES draft_jobs(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL,
+    rule_id TEXT NOT NULL,
+    rule_version TEXT NOT NULL,
+    category TEXT NOT NULL CHECK (category IN (
+        'boilerplate','style','preservation','factuality','quote','conflict','security','operational'
+    )),
+    severity TEXT NOT NULL CHECK (severity IN ('info','warning','blocker')),
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN (
+        'open','applied','dismissed','waived','resolved_by_revision'
+    )),
+    waivable INTEGER NOT NULL DEFAULT 1 CHECK (waivable IN (0,1)),
+    message TEXT NOT NULL,
+    original_text TEXT,
+    suggestion TEXT,
+    span_start INTEGER,
+    span_end INTEGER,
+    span_text_sha256 TEXT,
+    resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    resolved_at TIMESTAMP,
+    resolution_note TEXT,
+    waiver_rule_version TEXT,
+    waiver_text_sha256 TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_draft_findings_open
+    ON draft_findings(draft_id, status, severity);
+"""
+
 
 # Database schema definition
 _BASE_SCHEMA = """
@@ -1039,12 +1218,13 @@ CREATE TABLE IF NOT EXISTS prompt_ab_exposures (
 CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id ON prompt_ab_exposures(experiment_id);
 """
 
-# The full schema. Both operands are static DDL literals defined above with no
+# The full schema. All operands are static DDL literals defined above with no
 # interpolation and no caller input; the concatenation exists so that
-# _DRAFT_ROOM_CORE_DDL has exactly one definition, shared by SCHEMA and by
-# migrate_add_draft_room_core, and the two therefore cannot drift apart.
+# _DRAFT_ROOM_CORE_DDL / _DRAFT_ROOM_PIPELINE_DDL each have exactly one
+# definition, shared by SCHEMA and by their respective migrate_add_* functions,
+# and therefore cannot drift apart.
 # static DDL only
-SCHEMA = _BASE_SCHEMA + _DRAFT_ROOM_CORE_DDL  # nosec B608
+SCHEMA = _BASE_SCHEMA + _DRAFT_ROOM_CORE_DDL + _DRAFT_ROOM_PIPELINE_DDL  # nosec B608
 
 
 
@@ -1213,6 +1393,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_prompt_ab_experiments(sqlite_path)
     migrate_add_password_changed_at(sqlite_path)
     migrate_add_draft_room_core(sqlite_path)
+    migrate_add_draft_room_pipeline(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -3853,6 +4034,33 @@ def migrate_add_draft_room_core(sqlite_path: str) -> None:
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_DRAFT_ROOM_CORE_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_draft_room_pipeline(sqlite_path: str) -> None:
+    """
+    Migration: create the Draft Room pipeline tables (issue #436, SPEC.md 5.5-5.7).
+
+    Creates `draft_job_stages`, `draft_evidence`, `draft_claims`,
+    `draft_claim_sources`, and `draft_findings` together with every CHECK
+    constraint, uniqueness rule, foreign key, and partial index in the
+    specification.
+
+    Executes ``_DRAFT_ROOM_PIPELINE_DDL`` — the exact same constant that is
+    appended to ``SCHEMA`` — so a database created by ``init_db`` and a legacy
+    database upgraded by this migration converge on an identical schema. Every
+    statement is ``CREATE ... IF NOT EXISTS``, so repeat execution is a no-op
+    and existing data is preserved.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript(_DRAFT_ROOM_PIPELINE_DDL)
         conn.commit()
     finally:
         conn.close()
