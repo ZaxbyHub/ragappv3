@@ -37,7 +37,7 @@ from collections.abc import Sequence
 from urllib.parse import urlparse
 
 from app.config import settings
-from app.services.ssrf import assert_url_safe
+from app.services.ssrf import URLBlocked, assert_url_safe
 
 __all__ = [
     "ProviderPolicyError",
@@ -196,10 +196,29 @@ def assert_provider_allowed(url: str, *, sensitive: bool) -> None:
     only at enqueue time.
 
     Composes with (does not replace) :func:`app.services.ssrf.assert_url_safe`:
-    the SSRF guard's blocklist and this allowlist are both mandatory gates,
-    run in sequence. ``assert_url_safe`` runs first because a URL that fails
-    basic SSRF hygiene (bad scheme, embedded credentials, resolves to a
-    blocked address) should never even reach allowlist comparison.
+    the SSRF guard's blocklist and this allowlist are both mandatory gates.
+
+    ORDER MATTERS, and the allowlist runs FIRST:
+
+    * ``assert_url_safe`` performs DNS resolution. Running it first would
+      resolve hostnames that are not on the allowlist at all, turning a
+      rejected configuration into an outbound DNS lookup for an arbitrary
+      host -- a side channel this gate exists to prevent. The allowlist
+      check is purely lexical (scheme/host/port) and cannot leak.
+    * SPEC §9.2 requires failing closed with a *stable provider-policy
+      error*. ``assert_url_safe`` raises ``URLBlocked``, which callers
+      classifying non-retryable provider-policy failures would not
+      recognize, so its failure is wrapped in ``ProviderPolicyError``.
+
+    Both gates still run for an allowlisted origin; neither is optional.
+
+    OPERATIONAL NOTE -- sensitive-tier loopback: listing a loopback origin in
+    ``draft_sensitive_allowed_model_origins`` is necessary but NOT sufficient.
+    ``assert_url_safe`` independently blocks loopback/private addresses unless
+    the operator sets ``ALLOW_LOCAL_SERVICES=1``. Both are required, which is
+    what SPEC §9.2's "literal loopback cleartext explicitly allowed by policy"
+    means in this codebase: the allowlist names the origin, and the
+    environment opt-in authorizes local destinations.
 
     Args:
         url: the candidate provider base URL (e.g. an ``LLMClient.base_url``).
@@ -222,12 +241,7 @@ def assert_provider_allowed(url: str, *, sensitive: bool) -> None:
             contains the configured allowlist or the URL's full form -- at
             most the bare hostname.
     """
-    # Gate 1: the shared SSRF blocklist (scheme, credentials, resolved
-    # address safety). Let its own exception type propagate unchanged; it
-    # already follows the "no IP/allowlist leakage" contract.
-    assert_url_safe(url)
-
-    # Gate 2: origin parsing (this module's own scheme/shape checks). A
+    # Gate 1: origin parsing (this module's own scheme/shape checks). A
     # request URL legitimately carries a path (``/v1/chat/completions``), so
     # only its origin is compared; allowlist entries stay strictly origin-only.
     scheme, host, port = _parse_strict_origin(url, allow_path=True)
@@ -256,6 +270,21 @@ def assert_provider_allowed(url: str, *, sensitive: bool) -> None:
             f"Provider origin not allowed (host={host!r}).",
             code="provider_origin_not_allowed",
         )
+
+    # Gate 2: the shared SSRF blocklist (embedded credentials, resolved
+    # address safety). Runs only for an already-allowlisted origin, so no
+    # DNS lookup is ever issued for a host this policy rejects. Its
+    # URLBlocked is re-raised as ProviderPolicyError so callers get the
+    # stable provider-policy code SPEC §9.2 requires; the original message
+    # already honors the no-leakage contract, and `from None` keeps any
+    # resolved-address detail out of the propagated traceback.
+    try:
+        assert_url_safe(url)
+    except URLBlocked as exc:
+        raise ProviderPolicyError(
+            f"Provider origin failed SSRF safety checks (host={host!r}): {exc}",
+            code="provider_origin_not_allowed",
+        ) from None
 
 
 def provider_snapshot(client: object) -> dict[str, str]:
