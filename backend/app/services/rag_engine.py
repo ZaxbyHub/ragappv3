@@ -3312,15 +3312,21 @@ class RAGEngine:
 
 
 # ---------------------------------------------------------------------------
-# Module-level alias so ``retrieve_sources`` is importable directly —
-# ``from app.services.rag_engine import retrieve_sources`` — matching the
-# pinned SPEC §4.4 interface literally. The real implementation lives on
-# ``RAGEngine`` so it can use engine-scoped state (vector_store,
-# embedding_service, document/wiki/kms adapters) without constructing a
-# second, independent RAG engine (SPEC §4.3 prohibited coupling). Callers
-# that already hold an engine instance invoke it as a bound method
-# (``engine.retrieve_sources(...)``); this alias is the same function object
-# and is called the same way (``retrieve_sources(engine, query, vault_id,
-# limit=..., source_kinds=...)``).
+# ``retrieve_sources`` is deliberately NOT re-exported as a module-level
+# function. The implementation needs engine-scoped state (vector_store,
+# embedding_service, document/wiki/KMS adapters), and the live engine is
+# owned by the application at ``app.state.rag_engine`` (see
+# ``app/api/deps.py::get_rag_engine``), so a module-level function could not
+# reach it without constructing a second, independent RAG engine — which
+# SPEC §4.3 prohibits.
+#
+# A bare ``retrieve_sources = RAGEngine.retrieve_sources`` alias would be
+# actively misleading: it is an *unbound* function, so a caller following the
+# SPEC §4.4 signature (``retrieve_sources(query, vault_id, limit=...)``)
+# would silently bind ``query`` to ``self``.
+#
+# Draft Room therefore consumes the BOUND method through injection:
+# ``PipelineDeps.retrieve_sources = engine.retrieve_sources``, which has
+# exactly the SPEC §4.4 signature and lets tests substitute a deterministic
+# fake without touching the engine.
 # ---------------------------------------------------------------------------
-retrieve_sources = RAGEngine.retrieve_sources
