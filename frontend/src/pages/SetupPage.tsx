@@ -127,6 +127,7 @@ export default function SetupPage() {
                   value={formData.username}
                   onChange={handleChange("username")}
                   disabled={isLoading}
+                  // eslint-disable-next-line jsx-a11y-x/no-autofocus -- Intentional first-field focus for initial administrator setup.
                   autoFocus
                   aria-required="true"
                   aria-describedby={errors.username ? "setup-username-error" : undefined}

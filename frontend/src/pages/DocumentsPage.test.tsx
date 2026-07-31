@@ -272,7 +272,8 @@ import { getDocumentStats, listDocuments, deleteDocument } from '@/lib/api';
 
 describe('DocumentsPage - Drag to Resize Filename Column', () => {
   let container: HTMLElement;
-  let unmount: () => void;
+  let unmount: (() => void) | undefined;
+  const filenameWidthKey = 'ragapp_doc_table_filename_col';
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -293,14 +294,21 @@ describe('DocumentsPage - Drag to Resize Filename Column', () => {
       activeVaultId: null,
       vaults: [],
     } as ReturnType<typeof useVaultStore>);
+    vi.mocked(window.localStorage.getItem).mockReturnValue(null);
+    window.localStorage.removeItem(filenameWidthKey);
     document.body.style.cursor = '';
+    document.body.style.userSelect = '';
   });
 
   afterEach(() => {
     if (unmount) {
       unmount();
     }
+    unmount = undefined;
+    window.localStorage.removeItem(filenameWidthKey);
     document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    vi.restoreAllMocks();
   });
 
   // Helper to find the resize handle element
@@ -1008,6 +1016,165 @@ describe('DocumentsPage - Drag to Resize Filename Column', () => {
       });
 
       expect(container).toBeTruthy();
+    });
+  });
+
+  describe('page-owned resize behavior and lifecycle', () => {
+    const renderPage = async () => {
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
+      const handle = await screen.findByRole('separator', {
+        name: 'Resize filename column',
+      });
+      return handle;
+    };
+
+    it('renders and persists the actual width produced by mouse and keyboard resizing', async () => {
+      vi.mocked(window.localStorage.getItem).mockReturnValue('300');
+      const handle = await renderPage();
+      expect(handle).toHaveAttribute('aria-valuenow', '300');
+
+      fireEvent.mouseDown(handle, { clientX: 100 });
+      fireEvent.mouseMove(document, { clientX: 140 });
+      fireEvent.mouseUp(document);
+      await waitFor(() => {
+        expect(handle).toHaveAttribute('aria-valuenow', '340');
+        expect(window.localStorage.setItem).toHaveBeenCalledWith(filenameWidthKey, '340');
+      });
+
+      fireEvent.keyDown(handle, { key: 'ArrowLeft' });
+      await waitFor(() => {
+        expect(handle).toHaveAttribute('aria-valuenow', '324');
+        expect(window.localStorage.setItem).toHaveBeenCalledWith(filenameWidthKey, '324');
+      });
+    });
+
+    it('clamps repeated keyboard resizing at the declared ARIA bounds', async () => {
+      const handle = await renderPage();
+
+      for (let index = 0; index < 40; index += 1) {
+        fireEvent.keyDown(handle, { key: 'ArrowRight' });
+      }
+      await waitFor(() => {
+        expect(handle).toHaveAttribute('aria-valuenow', '600');
+      });
+
+      for (let index = 0; index < 40; index += 1) {
+        fireEvent.keyDown(handle, { key: 'ArrowLeft' });
+      }
+      await waitFor(() => {
+        expect(handle).toHaveAttribute('aria-valuenow', '120');
+      });
+    });
+
+    it('ends a touch drag on touchcancel and ignores later stale touch moves', async () => {
+      document.body.style.cursor = 'wait';
+      document.body.style.userSelect = 'text';
+      const handle = await renderPage();
+
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 100 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 150 } as unknown as Touch],
+      });
+      await waitFor(() => {
+        expect(handle).toHaveAttribute('aria-valuenow', '300');
+      });
+
+      fireEvent.touchCancel(document);
+      expect(document.body.style.cursor).toBe('wait');
+      expect(document.body.style.userSelect).toBe('text');
+
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 200 } as unknown as Touch],
+      });
+      expect(handle).toHaveAttribute('aria-valuenow', '300');
+    });
+
+    it('replaces a touch drag with a mouse drag and makes the old touch listener inert', async () => {
+      const handle = await renderPage();
+
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 100 } as unknown as Touch],
+      });
+      fireEvent.mouseDown(handle, { clientX: 200 });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 150 } as unknown as Touch],
+      });
+      expect(handle).toHaveAttribute('aria-valuenow', '250');
+
+      fireEvent.mouseMove(document, { clientX: 250 });
+      await waitFor(() => {
+        expect(handle).toHaveAttribute('aria-valuenow', '300');
+      });
+      fireEvent.mouseUp(document);
+    });
+
+    it('terminates a one-touch drag when it becomes multi-touch', async () => {
+      document.body.style.cursor = 'help';
+      document.body.style.userSelect = 'auto';
+      const handle = await renderPage();
+
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 100 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [
+          { clientX: 120 } as unknown as Touch,
+          { clientX: 140 } as unknown as Touch,
+        ],
+      });
+
+      expect(document.body.style.cursor).toBe('help');
+      expect(document.body.style.userSelect).toBe('auto');
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 200 } as unknown as Touch],
+      });
+      expect(handle).toHaveAttribute('aria-valuenow', '250');
+    });
+
+    it('cancels a mouse drag on blur and ignores later stale mouse moves', async () => {
+      document.body.style.cursor = 'progress';
+      document.body.style.userSelect = 'text';
+      const handle = await renderPage();
+
+      fireEvent.mouseDown(handle, { clientX: 100 });
+      fireEvent(window, new Event('blur'));
+      expect(document.body.style.cursor).toBe('progress');
+      expect(document.body.style.userSelect).toBe('text');
+
+      fireEvent.mouseMove(document, { clientX: 200 });
+      expect(handle).toHaveAttribute('aria-valuenow', '250');
+    });
+
+    it('removes the exact active listeners and restores captured styles on unmount', async () => {
+      const addSpy = vi.spyOn(document, 'addEventListener');
+      const removeSpy = vi.spyOn(document, 'removeEventListener');
+      document.body.style.cursor = 'crosshair';
+      document.body.style.userSelect = 'contain';
+      const handle = await renderPage();
+
+      fireEvent.mouseDown(handle, { clientX: 100 });
+      const mouseMoveCallback = addSpy.mock.calls.find(
+        ([type]) => type === 'mousemove'
+      )?.[1];
+      const mouseUpCallback = addSpy.mock.calls.find(
+        ([type]) => type === 'mouseup'
+      )?.[1];
+      expect(mouseMoveCallback).toBeTypeOf('function');
+      expect(mouseUpCallback).toBeTypeOf('function');
+
+      unmount?.();
+      unmount = undefined;
+
+      expect(removeSpy).toHaveBeenCalledWith('mousemove', mouseMoveCallback);
+      expect(removeSpy).toHaveBeenCalledWith('mouseup', mouseUpCallback);
+      expect(document.body.style.cursor).toBe('crosshair');
+      expect(document.body.style.userSelect).toBe('contain');
     });
   });
 

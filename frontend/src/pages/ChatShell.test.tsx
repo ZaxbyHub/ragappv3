@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { BrowserRouter } from "react-router-dom";
 import ChatShell from "./ChatShell";
@@ -374,6 +374,443 @@ describe("ChatShell Mobile Layout", () => {
 
       requestAnimationFrameSpy.mockRestore();
       cancelAnimationFrameSpy.mockRestore();
+    });
+  });
+});
+
+// WCAG 2.1.1 (Keyboard) + 2.5.1 (Pointer Gestures) parity for the resize
+// handles — see issue #394 LOW-1.
+describe("ChatShell resize handle keyboard + touch parity", () => {
+  beforeEach(() => {
+    mockStoreState = {
+      sessionRailOpen: true,
+      rightPaneOpen: false,
+      rightPaneWidth: 320,
+      sessionRailWidth: 280,
+      activeSessionId: null,
+      activeSessionTitle: null,
+      sessionListRefreshToken: 0,
+      activeRightTab: "evidence",
+      sessionSearchQuery: "",
+      pinnedSessionIds: [],
+      toggleSessionRail: vi.fn(),
+      toggleRightPane: vi.fn(),
+      setRightPaneWidth: vi.fn(),
+      setSessionRailWidth: vi.fn(),
+      setActiveSessionId: vi.fn(),
+      setActiveSessionTitle: vi.fn(),
+      requestSessionListRefresh: vi.fn(),
+      openSessionRail: vi.fn(),
+      closeSessionRail: vi.fn(),
+      openRightPane: vi.fn(),
+      closeRightPane: vi.fn(),
+      setActiveRightTab: vi.fn(),
+      setSessionSearchQuery: vi.fn(),
+      togglePinSession: vi.fn(),
+      isSessionPinned: vi.fn(),
+      setSelectedEvidenceSource: vi.fn(),
+    };
+  });
+
+  describe("session rail handle", () => {
+    it("is focusable (tabIndex=0) when rail is open", () => {
+      mockStoreState.sessionRailOpen = true;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      expect(handle.tabIndex).toBe(0);
+    });
+
+    it("is NOT focusable (tabIndex=-1) when rail is collapsed (WCAG 2.4.7)", () => {
+      mockStoreState.sessionRailOpen = false;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      expect(handle.tabIndex).toBe(-1);
+    });
+
+    it("ArrowRight grows the rail by 16px (drag-consistent)", () => {
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledTimes(1);
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledWith(280 + 16);
+    });
+
+    it("ArrowLeft shrinks the rail by 16px", () => {
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.keyDown(handle, { key: "ArrowLeft" });
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledWith(280 - 16);
+    });
+
+    it("ArrowUp/ArrowDown are ignored", () => {
+      mockStoreState.sessionRailOpen = true;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.keyDown(handle, { key: "ArrowUp" });
+      fireEvent.keyDown(handle, { key: "ArrowDown" });
+      expect(mockStoreState.setSessionRailWidth).not.toHaveBeenCalled();
+    });
+
+    it("exposes aria-valuenow/min/max for the focusable separator widget", () => {
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      expect(handle.getAttribute("aria-valuenow")).toBe("280");
+      expect(handle.getAttribute("aria-valuemin")).toBe("240");
+      expect(handle.getAttribute("aria-valuemax")).toBe("400");
+    });
+
+    it("touch drag updates width via the store setter (rAF-coalesced)", () => {
+      const rafCallbacks: FrameRequestCallback[] = [];
+      const requestAnimationFrameSpy = vi
+        .spyOn(window, "requestAnimationFrame")
+        .mockImplementation((cb) => {
+          rafCallbacks.push(cb);
+          return rafCallbacks.length;
+        });
+
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      requestAnimationFrameSpy.mockClear();
+      rafCallbacks.length = 0;
+
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 200 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 240 } as unknown as Touch],
+      });
+
+      expect(mockStoreState.setSessionRailWidth).not.toHaveBeenCalled();
+      act(() => {
+        rafCallbacks.forEach((cb) => cb(0));
+      });
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledTimes(1);
+      // startWidth (280) + delta (240-200=40) = 320
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledWith(320);
+
+      requestAnimationFrameSpy.mockRestore();
+    });
+  });
+
+  describe("right pane handle", () => {
+    it("is positioned absolutely inside a relative aside so it has visible height (WCAG 2.4.7)", () => {
+      // Regression guard for reviewer finding: handle was previously
+      // position:relative with no height, making the new tabIndex={0}
+      // create a focusable-invisible element. Now aside is relative and
+      // handle is absolute (matches the session-rail pattern).
+      mockStoreState.rightPaneOpen = true;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      // The handle must be absolutely positioned so top:0/bottom:0 stretch it.
+      expect(handle.className).toContain("absolute");
+      expect(handle.className).not.toContain("relative");
+      // The parent <aside> must be the positioned ancestor.
+      const aside = handle.closest("aside");
+      expect(aside?.className).toContain("relative");
+    });
+
+    it("ArrowLeft grows the pane by 16px (drag-consistent — opposite sign)", () => {
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.rightPaneWidth = 400;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      fireEvent.keyDown(handle, { key: "ArrowLeft" });
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledTimes(1);
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledWith(400 + 16);
+    });
+
+    it("ArrowRight shrinks the pane by 16px", () => {
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.rightPaneWidth = 400;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      fireEvent.keyDown(handle, { key: "ArrowRight" });
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledWith(400 - 16);
+    });
+
+    it("exposes aria-valuenow/min/max for the focusable separator widget", () => {
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.rightPaneWidth = 400;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      expect(handle.getAttribute("aria-valuenow")).toBe("400");
+      expect(handle.getAttribute("aria-valuemin")).toBe("320");
+      expect(handle.getAttribute("aria-valuemax")).toBe("600");
+    });
+
+    it("touch drag updates width via the store setter (rAF-coalesced, reversed sign)", () => {
+      const rafCallbacks: FrameRequestCallback[] = [];
+      const requestAnimationFrameSpy = vi
+        .spyOn(window, "requestAnimationFrame")
+        .mockImplementation((cb) => {
+          rafCallbacks.push(cb);
+          return rafCallbacks.length;
+        });
+
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.rightPaneWidth = 400;
+
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+      requestAnimationFrameSpy.mockClear();
+      rafCallbacks.length = 0;
+
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      // Drag LEFT (clientX decreases) = pane GROWS (delta = startX - clientX > 0)
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 500 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 460 } as unknown as Touch],
+      });
+
+      act(() => {
+        rafCallbacks.forEach((cb) => cb(0));
+      });
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledTimes(1);
+      // startWidth (400) + delta (500-460=40) = 440
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledWith(440);
+
+      requestAnimationFrameSpy.mockRestore();
+    });
+  });
+
+  describe("active resize lifecycle", () => {
+    afterEach(() => {
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      vi.restoreAllMocks();
+    });
+
+    const renderBothHandles = () => {
+      mockStoreState.sessionRailOpen = true;
+      mockStoreState.rightPaneOpen = true;
+      mockStoreState.sessionRailWidth = 280;
+      mockStoreState.rightPaneWidth = 320;
+      return render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+    };
+
+    const mockAnimationFrames = () => {
+      const callbacks: FrameRequestCallback[] = [];
+      const requestSpy = vi
+        .spyOn(window, "requestAnimationFrame")
+        .mockImplementation((callback) => {
+          callbacks.push(callback);
+          return callbacks.length;
+        });
+      const cancelSpy = vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+      return { callbacks, requestSpy, cancelSpy };
+    };
+
+    it("cancels a pending touch frame on touchcancel and restores captured body styles", () => {
+      const { callbacks, cancelSpy } = mockAnimationFrames();
+      document.body.style.cursor = "wait";
+      document.body.style.userSelect = "text";
+      renderBothHandles();
+
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 200 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 240 } as unknown as Touch],
+      });
+      fireEvent.touchCancel(document);
+
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
+      expect(document.body.style.cursor).toBe("wait");
+      expect(document.body.style.userSelect).toBe("text");
+
+      act(() => {
+        callbacks.forEach((callback) => callback(0));
+      });
+      expect(mockStoreState.setSessionRailWidth).not.toHaveBeenCalled();
+    });
+
+    it("cancels an active touch drag on unmount without allowing a stale frame to update", () => {
+      const { callbacks, cancelSpy } = mockAnimationFrames();
+      document.body.style.cursor = "crosshair";
+      document.body.style.userSelect = "contain";
+      const { unmount } = renderBothHandles();
+
+      const handle = screen.getByRole("separator", { name: "Resize details panel" });
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 500 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 460 } as unknown as Touch],
+      });
+      const dragFrameId = callbacks.length;
+      unmount();
+
+      expect(cancelSpy).toHaveBeenCalledWith(dragFrameId);
+      expect(document.body.style.cursor).toBe("crosshair");
+      expect(document.body.style.userSelect).toBe("contain");
+
+      act(() => {
+        callbacks.forEach((callback) => callback(0));
+      });
+      expect(mockStoreState.setRightPaneWidth).not.toHaveBeenCalled();
+    });
+
+    it("replaces a touch drag with a cross-handle mouse drag and makes old callbacks inert", () => {
+      const { callbacks } = mockAnimationFrames();
+      renderBothHandles();
+
+      const sessionHandle = screen.getByRole("separator", { name: "Resize session panel" });
+      const detailsHandle = screen.getByRole("separator", { name: "Resize details panel" });
+      fireEvent.touchStart(sessionHandle, {
+        touches: [{ clientX: 200 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 240 } as unknown as Touch],
+      });
+
+      fireEvent.mouseDown(detailsHandle, { clientX: 500 });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 300 } as unknown as Touch],
+      });
+      fireEvent.mouseMove(document, { clientX: 460 });
+
+      act(() => {
+        callbacks.forEach((callback) => callback(0));
+      });
+      expect(mockStoreState.setSessionRailWidth).not.toHaveBeenCalled();
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledTimes(1);
+      expect(mockStoreState.setRightPaneWidth).toHaveBeenCalledWith(360);
+
+      fireEvent.mouseUp(document);
+    });
+
+    it("replaces a same-handle mouse drag instead of running both listener sets", () => {
+      const { callbacks } = mockAnimationFrames();
+      renderBothHandles();
+
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.mouseDown(handle, { clientX: 100 });
+      fireEvent.mouseMove(document, { clientX: 120 });
+      fireEvent.mouseDown(handle, { clientX: 200 });
+      fireEvent.mouseMove(document, { clientX: 250 });
+
+      act(() => {
+        callbacks.forEach((callback) => callback(0));
+      });
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledTimes(1);
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledWith(330);
+
+      fireEvent.mouseUp(document);
+    });
+
+    it("flushes a pending touch width exactly once on normal touchend", () => {
+      const { callbacks, cancelSpy } = mockAnimationFrames();
+      renderBothHandles();
+
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 200 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 240 } as unknown as Touch],
+      });
+      fireEvent.touchEnd(document);
+
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledTimes(1);
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledWith(320);
+
+      act(() => {
+        callbacks.forEach((callback) => callback(0));
+      });
+      expect(mockStoreState.setSessionRailWidth).toHaveBeenCalledTimes(1);
+    });
+
+    it("terminates a one-touch drag when it becomes multi-touch", () => {
+      const { callbacks } = mockAnimationFrames();
+      document.body.style.cursor = "help";
+      document.body.style.userSelect = "auto";
+      renderBothHandles();
+
+      const handle = screen.getByRole("separator", { name: "Resize session panel" });
+      fireEvent.touchStart(handle, {
+        touches: [{ clientX: 200 } as unknown as Touch],
+      });
+      fireEvent.touchMove(document, {
+        touches: [
+          { clientX: 220 } as unknown as Touch,
+          { clientX: 260 } as unknown as Touch,
+        ],
+      });
+
+      expect(document.body.style.cursor).toBe("help");
+      expect(document.body.style.userSelect).toBe("auto");
+
+      fireEvent.touchMove(document, {
+        touches: [{ clientX: 300 } as unknown as Touch],
+      });
+      act(() => {
+        callbacks.forEach((callback) => callback(0));
+      });
+      expect(mockStoreState.setSessionRailWidth).not.toHaveBeenCalled();
     });
   });
 });

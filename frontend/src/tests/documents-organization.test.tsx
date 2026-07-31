@@ -72,6 +72,8 @@ function renderTable(overrides: Partial<Parameters<typeof DocumentTable>[0]> = {
     canMutateDocuments: true,
     filenameColWidth: 250,
     onResizeMouseDown: vi.fn(),
+    onResizeKeyDown: vi.fn(),
+    onResizeTouchStart: vi.fn(),
     onSelectAll: vi.fn(),
     onSelectOne: vi.fn(),
     wikiStatusMap: {},
@@ -110,6 +112,35 @@ describe("DocumentTable sorting", () => {
     expect(screen.getByText("finance")).toBeInTheDocument();
     const link = screen.getByRole("link", { name: "alpha.txt" });
     expect(link).toHaveAttribute("href", "/documents/1");
+  });
+});
+
+// WCAG 2.1.1 keyboard parity + ARIA range integrity for the filename-column
+// resize separator — see issue #394 LOW-1 scope expansion to DocumentTable.
+describe("DocumentTable filename column resize handle a11y", () => {
+  it("exposes aria-valuenow/min/max on the separator", () => {
+    renderTable({ filenameColWidth: 250 });
+    const handle = screen.getByRole("separator", { name: "Resize filename column" });
+    expect(handle.getAttribute("aria-valuemin")).toBe("120");
+    expect(handle.getAttribute("aria-valuemax")).toBe("600");
+    expect(handle.getAttribute("aria-valuenow")).toBe("250");
+    expect(handle.tabIndex).toBe(0);
+  });
+
+  it("ArrowRight delegates to onResizeKeyDown", () => {
+    const onResizeKeyDown = vi.fn();
+    renderTable({ onResizeKeyDown });
+    const handle = screen.getByRole("separator", { name: "Resize filename column" });
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(onResizeKeyDown).toHaveBeenCalledTimes(1);
+  });
+
+  it("ArrowLeft delegates to onResizeKeyDown", () => {
+    const onResizeKeyDown = vi.fn();
+    renderTable({ onResizeKeyDown });
+    const handle = screen.getByRole("separator", { name: "Resize filename column" });
+    fireEvent.keyDown(handle, { key: "ArrowLeft" });
+    expect(onResizeKeyDown).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -36,6 +36,11 @@ import { useVaultStore } from "@/stores/useVaultStore";
 import { useUploadStore } from "@/stores/useUploadStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { EmptyState } from "@/components/EmptyState";
+import {
+  FILENAME_COL_WIDTH_MIN,
+  FILENAME_COL_WIDTH_MAX,
+  clampFilenameColWidth,
+} from "@/lib/resizeClamp";
 import { useBulkSelection } from "@/components/documents/useBulkSelection";
 import { useDocumentPolling } from "@/components/documents/useDocumentPolling";
 import { DocumentStatsCards } from "@/components/documents/DocumentStatsCards";
@@ -91,7 +96,13 @@ export default function DocumentsPage() {
     try {
       const stored = window.localStorage.getItem(FILENAME_COL_WIDTH_KEY);
       const parsed = stored ? parseInt(stored, 10) : NaN;
-      if (Number.isFinite(parsed) && parsed >= 120 && parsed <= 600) return parsed;
+      if (
+        Number.isFinite(parsed) &&
+        parsed >= FILENAME_COL_WIDTH_MIN &&
+        parsed <= FILENAME_COL_WIDTH_MAX
+      ) {
+        return parsed;
+      }
     } catch {
       // ignore
     }
@@ -105,18 +116,85 @@ export default function DocumentsPage() {
       // ignore (quota / private mode)
     }
   }, [filenameColWidth]);
-  const dragState = useRef<{ startX: number; startWidth: number }>({ startX: 0, startWidth: 0 });
+  type ResizeCleanup = () => void;
+  const activeResizeCleanupRef = useRef<ResizeCleanup | null>(null);
+
+  const beginResizeGesture = useCallback(
+    (mode: "mouse" | "touch", startX: number, startWidth: number) => {
+      activeResizeCleanupRef.current?.();
+
+      const originalCursor = document.body.style.cursor;
+      const originalUserSelect = document.body.style.userSelect;
+      let active = true;
+
+      const applyClientX = (clientX: number) => {
+        if (!active || activeResizeCleanupRef.current !== cleanup) return;
+        setFilenameColWidth(clampFilenameColWidth(startWidth + clientX - startX));
+      };
+      const handleMouseMove = (moveEvent: MouseEvent) => {
+        applyClientX(moveEvent.clientX);
+      };
+      const handleMouseUp = () => cleanup();
+      const handleTouchMove = (moveEvent: TouchEvent) => {
+        if (moveEvent.touches.length !== 1) {
+          cleanup();
+          return;
+        }
+        moveEvent.preventDefault();
+        applyClientX(moveEvent.touches[0].clientX);
+      };
+      const handleTouchEnd = () => cleanup();
+      const handleTouchCancel = () => cleanup();
+      const handleBlur = () => cleanup();
+
+      function cleanup() {
+        if (!active) return;
+        active = false;
+        const ownsLifecycle = activeResizeCleanupRef.current === cleanup;
+
+        if (mode === "mouse") {
+          document.removeEventListener("mousemove", handleMouseMove);
+          document.removeEventListener("mouseup", handleMouseUp);
+        } else {
+          document.removeEventListener("touchmove", handleTouchMove);
+          document.removeEventListener("touchend", handleTouchEnd);
+          document.removeEventListener("touchcancel", handleTouchCancel);
+        }
+        window.removeEventListener("blur", handleBlur);
+
+        if (ownsLifecycle) {
+          document.body.style.cursor = originalCursor;
+          document.body.style.userSelect = originalUserSelect;
+          activeResizeCleanupRef.current = null;
+        }
+      }
+
+      activeResizeCleanupRef.current = cleanup;
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      window.addEventListener("blur", handleBlur);
+      if (mode === "mouse") {
+        document.addEventListener("mousemove", handleMouseMove);
+        document.addEventListener("mouseup", handleMouseUp);
+      } else {
+        document.addEventListener("touchmove", handleTouchMove, { passive: false });
+        document.addEventListener("touchend", handleTouchEnd);
+        document.addEventListener("touchcancel", handleTouchCancel);
+      }
+    },
+    []
+  );
 
   // Optimistic delete state
   const [optimisticallyDeletedIds, setOptimisticallyDeletedIds] = useState<Set<string>>(new Set());
   const pendingDeleteTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
-  // Cleanup on unmount: restore cursor if destroyed mid-drag.
-  useEffect(() => {
-    return () => {
-      document.body.style.cursor = "";
-    };
-  }, []);
+  useEffect(
+    () => () => {
+      activeResizeCleanupRef.current?.();
+    },
+    []
+  );
 
   // Flush pending deletes on unmount. The user already confirmed each delete
   // (the 3s undo window simply hadn't elapsed); cancelling the timers would
@@ -295,26 +373,47 @@ export default function DocumentsPage() {
   const handleResizeMouseDown = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       e.preventDefault();
-      dragState.current = { startX: e.clientX, startWidth: filenameColWidth };
-      const originalCursor = document.body.style.cursor;
-      document.body.style.cursor = "col-resize";
+      beginResizeGesture("mouse", e.clientX, filenameColWidth);
+    },
+    [beginResizeGesture, filenameColWidth]
+  );
 
-      const handleMouseMove = (moveEvent: MouseEvent) => {
-        const deltaX = moveEvent.clientX - dragState.current.startX;
-        const newWidth = Math.max(120, Math.min(600, dragState.current.startWidth + deltaX));
-        setFilenameColWidth(newWidth);
-      };
-
-      const handleMouseUp = () => {
-        document.body.style.cursor = originalCursor;
-        document.removeEventListener("mousemove", handleMouseMove);
-        document.removeEventListener("mouseup", handleMouseUp);
-      };
-
-      document.addEventListener("mousemove", handleMouseMove);
-      document.addEventListener("mouseup", handleMouseUp);
+  // Keyboard parity for the filename-column resize handle (WCAG 2.1.1).
+  // Drag-consistent direction: ArrowRight grows, ArrowLeft shrinks (matches
+  // the mouse handler's deltaX = clientX - startX). Step = 16px grid unit.
+  // Clamp via the shared helper so aria-valuenow stays within
+  // [FILENAME_COL_WIDTH_MIN, FILENAME_COL_WIDTH_MAX] (matches the mouse +
+  // touch handlers below).
+  const handleResizeKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const KEYBOARD_RESIZE_STEP = 16;
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        setFilenameColWidth(
+          clampFilenameColWidth(filenameColWidth + KEYBOARD_RESIZE_STEP)
+        );
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        setFilenameColWidth(
+          clampFilenameColWidth(filenameColWidth - KEYBOARD_RESIZE_STEP)
+        );
+      }
     },
     [filenameColWidth]
+  );
+
+  // Touch parity for the filename-column resize handle (WCAG 2.5.1).
+  // Document touchmove listener attached with { passive: false } so
+  // preventDefault suppresses page scroll during the drag.
+  const handleResizeTouchStart = useCallback(
+    (e: React.TouchEvent<HTMLDivElement>) => {
+      if (e.touches.length !== 1) {
+        activeResizeCleanupRef.current?.();
+        return;
+      }
+      beginResizeGesture("touch", e.touches[0].clientX, filenameColWidth);
+    },
+    [beginResizeGesture, filenameColWidth]
   );
 
   const handleSelectAll = useCallback(
@@ -691,6 +790,8 @@ export default function DocumentsPage() {
             canMutateDocuments={canMutateDocuments}
             filenameColWidth={filenameColWidth}
             onResizeMouseDown={handleResizeMouseDown}
+            onResizeKeyDown={handleResizeKeyDown}
+            onResizeTouchStart={handleResizeTouchStart}
             onSelectAll={handleSelectAll}
             onSelectOne={selectOne}
             wikiStatusMap={wikiStatusMap}

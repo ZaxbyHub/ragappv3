@@ -51,6 +51,7 @@ const CardTitle = React.forwardRef<
   HTMLParagraphElement,
   React.HTMLAttributes<HTMLHeadingElement>
 >(({ className, ...props }, ref) => (
+  // eslint-disable-next-line jsx-a11y-x/heading-has-content -- CardTitle receives its heading content through the caller-supplied props.
   <h3
     ref={ref}
     className={cn(
