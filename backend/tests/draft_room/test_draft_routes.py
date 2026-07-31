@@ -445,6 +445,31 @@ class TestDraftLifecycle(DraftRoomTestBase):
 
 
 class TestManualRevisions(DraftRoomTestBase):
+    def test_omitting_base_revision_id_is_rejected(self):
+        """SPEC section 10.2 requires the base_revision_id KEY, null only when there is
+        no current revision. Omitting it must not be read as "no base" -- that would
+        silently skip the conflict check the field exists to enforce. Guards the
+        Field(...) present-required declaration against a later "simplification" to
+        = None, which no other test would catch.
+        """
+        draft_id = self._create_draft().json()["id"]
+
+        resp = self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/revisions",
+            json={"lock_version": 1, "content_md": "v1"},
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertIn("base_revision_id", resp.text)
+
+        # Explicit null on a draft with no current revision is the accepted form.
+        resp = self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/revisions",
+            json={"base_revision_id": None, "lock_version": 1, "content_md": "v1"},
+            headers=self._owner_headers(),
+        )
+        self.assertEqual(resp.status_code, 201, resp.text)
+
     def test_manual_revisions_are_immutable_and_lock_versioned(self):
         draft_id = self._create_draft().json()["id"]
 
