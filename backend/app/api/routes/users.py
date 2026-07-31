@@ -21,6 +21,9 @@ from app.config import settings
 from app.models.database import get_pool
 from app.security import csrf_protect
 from app.services.auth_service import password_strength_check
+from app.services.draft_deletion import DraftDeletionService
+from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
+from app.services.draft_store import DraftStore
 from app.services.security_audit import safe_record_security_event
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -610,17 +613,95 @@ async def delete_user(
                 detail=f"User owns organization(s) {owned_orgs}. Transfer ownership before deleting.",
             )
 
-        if target_role == "superadmin":
-            # Atomic guard: only delete if there are other active superadmins
-            await asyncio.to_thread(cursor.execute, """DELETE FROM users
-                   WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""", (user_id,))
-            if await asyncio.to_thread(lambda: cursor.rowcount) == 0:
-                raise HTTPException(
-                    status_code=400, detail="Cannot delete the last superadmin"
+        # Prepare the Draft Room purge before the DELETE below: drafts.created_by
+        # cascades on user delete (ON DELETE CASCADE), losing the rows that
+        # name the files to remove. `prepare_purge_for_user` only tombstones
+        # input files on disk — it touches no draft rows and opens no
+        # transaction of its own, so it cannot conflict with the delete/commit
+        # below. Ordering matches vaults.py::delete_vault for consistency:
+        # tombstones are only permanently discarded (commit_purge) after the
+        # delete below COMMITS, and are restored (restore_purge) if it fails
+        # instead — see the try/except around the delete for why that guard
+        # is needed even though this handler previously had no rollback path
+        # at all. Not gated on draft_room_enabled (SPEC 9.2) — cleanup must
+        # run even if disabled.
+        draft_deletion = DraftDeletionService(
+            DraftInputStorage(settings.data_dir / "draft-room")
+        )
+        draft_purge_plan = None
+        try:
+            draft_store = DraftStore(conn)
+            draft_purge_plan = await asyncio.to_thread(
+                draft_deletion.prepare_purge_for_user, draft_store, user_id
+            )
+            logger.info(
+                "draft_room_user_purge_prepared user_id=%s draft_count=%s",
+                user_id,
+                len(draft_purge_plan.draft_owner_pairs),
+            )
+        except (sqlite3.Error, OSError, RuntimeError, DraftInputStorageError) as e:
+            # Never block the user delete on a purge failure.
+            # DraftInputStorageError is listed explicitly: it derives from
+            # Exception, not OSError, so a tombstone/resolve failure would
+            # otherwise escape and 500 the delete, contradicting this promise.
+            logger.warning(
+                "draft_room_user_purge_prepare_failed user_id=%s reason=%s",
+                user_id,
+                type(e).__name__,
+            )
+
+        try:
+            if target_role == "superadmin":
+                # Atomic guard: only delete if there are other active superadmins
+                await asyncio.to_thread(cursor.execute, """DELETE FROM users
+                       WHERE id = ? AND (SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND is_active = 1) > 1""", (user_id,))
+                if await asyncio.to_thread(lambda: cursor.rowcount) == 0:
+                    raise HTTPException(
+                        status_code=400, detail="Cannot delete the last superadmin"
+                    )
+            else:
+                await asyncio.to_thread(cursor.execute, "DELETE FROM users WHERE id = ?", (user_id,))
+            await asyncio.to_thread(conn.commit)
+        except HTTPException:
+            await asyncio.to_thread(conn.rollback)
+            if draft_purge_plan is not None:
+                try:
+                    await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
+                except Exception as restore_exc:
+                    logger.error(
+                        "draft_room_user_purge_restore_failed user_id=%s reason=%s",
+                        user_id,
+                        type(restore_exc).__name__,
+                    )
+            raise
+        except (sqlite3.Error, OSError, RuntimeError) as e:
+            await asyncio.to_thread(conn.rollback)
+            if draft_purge_plan is not None:
+                try:
+                    await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
+                except Exception as restore_exc:
+                    logger.error(
+                        "draft_room_user_purge_restore_failed user_id=%s reason=%s",
+                        user_id,
+                        type(restore_exc).__name__,
+                    )
+            logger.exception("Error deleting user %d", user_id)
+            raise HTTPException(
+                status_code=500, detail="Failed to delete user"
+            ) from e
+
+        if draft_purge_plan is not None:
+            try:
+                await asyncio.to_thread(draft_deletion.commit_purge, draft_purge_plan)
+            except Exception as e:
+                # Bytes are already tombstoned in `.trash`; failing to finish
+                # discarding them must not turn a successful user delete into
+                # an error response.
+                logger.warning(
+                    "draft_room_user_purge_commit_failed user_id=%s reason=%s",
+                    user_id,
+                    type(e).__name__,
                 )
-        else:
-            await asyncio.to_thread(cursor.execute, "DELETE FROM users WHERE id = ?", (user_id,))
-        await asyncio.to_thread(conn.commit)
 
         invalidate_active_user_cache(user_id)
 

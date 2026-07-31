@@ -27,6 +27,9 @@ from app.api.deps import (
 from app.config import settings
 from app.limiter import limiter
 from app.security import csrf_protect
+from app.services.draft_deletion import DraftDeletionService
+from app.services.draft_input_storage import DraftInputStorage, DraftInputStorageError
+from app.services.draft_store import DraftStore
 from app.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -586,6 +589,41 @@ async def delete_vault(
 
     vault_name = row[1]
 
+    # Prepare the Draft Room purge before the row deletion below: drafts.vault_id
+    # cascades on vault delete (ON DELETE CASCADE), losing the rows that name
+    # the files to remove. `prepare_purge_for_vault` only tombstones input
+    # files on disk — it touches no draft rows and opens no transaction of its
+    # own, so it cannot nest inside (or conflict with) the BEGIN IMMEDIATE
+    # below. The tombstones are only permanently discarded after that
+    # transaction COMMITS (via commit_purge); if it rolls back instead, they
+    # are restored (via restore_purge) so the vault's drafts keep their bytes.
+    # Not gated on draft_room_enabled (SPEC 9.2) — cleanup must run even if
+    # disabled.
+    draft_deletion = DraftDeletionService(
+        DraftInputStorage(settings.data_dir / "draft-room")
+    )
+    draft_purge_plan = None
+    try:
+        draft_store = DraftStore(conn)
+        draft_purge_plan = await asyncio.to_thread(
+            draft_deletion.prepare_purge_for_vault, draft_store, vault_id
+        )
+        logger.info(
+            "draft_room_vault_purge_prepared vault_id=%s draft_count=%s",
+            vault_id,
+            len(draft_purge_plan.draft_owner_pairs),
+        )
+    except (sqlite3.Error, OSError, RuntimeError, DraftInputStorageError) as e:
+        # Never block the vault delete, matching the vector-store precedent.
+        # DraftInputStorageError is listed explicitly: it derives from Exception,
+        # not OSError, so a tombstone/resolve failure would otherwise escape this
+        # handler and 500 the delete -- the opposite of what this block promises.
+        logger.warning(
+            "draft_room_vault_purge_prepare_failed vault_id=%s reason=%s",
+            vault_id,
+            type(e).__name__,
+        )
+
     try:
         # Start transaction. BEGIN IMMEDIATE acquires the write lock up front
         # so a concurrent deletion/mutation of the same vault cannot interleave
@@ -621,7 +659,11 @@ async def delete_vault(
             conn.execute, "DELETE FROM files WHERE vault_id = ?", (vault_id,)
         )
 
-        # Delete the vault itself
+        # Delete the vault itself. drafts.vault_id carries ON DELETE CASCADE
+        # to vaults(id) (see app/models/database.py _DRAFT_ROOM_CORE_DDL), and
+        # draft_inputs/draft_jobs/draft_revisions/draft_events all cascade
+        # from drafts in turn — so this one statement also removes every
+        # draft row purged above with no separate DELETE FROM drafts needed.
         await asyncio.to_thread(
             conn.execute, "DELETE FROM vaults WHERE id = ?", (vault_id,)
         )
@@ -629,15 +671,46 @@ async def delete_vault(
         # Commit transaction
         await asyncio.to_thread(conn.commit)
 
+        if draft_purge_plan is not None:
+            try:
+                await asyncio.to_thread(draft_deletion.commit_purge, draft_purge_plan)
+            except Exception as e:
+                # Bytes are already tombstoned in `.trash`; failing to finish
+                # discarding them must not turn a successful vault delete
+                # into an error response.
+                logger.warning(
+                    "draft_room_vault_purge_commit_failed vault_id=%s reason=%s",
+                    vault_id,
+                    type(e).__name__,
+                )
+
         return {
             "message": f"Vault '{vault_name}' (id: {vault_id}) deleted successfully"
         }
 
     except HTTPException:
         await asyncio.to_thread(lambda: conn.rollback())
+        if draft_purge_plan is not None:
+            try:
+                await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
+            except Exception as restore_exc:
+                logger.error(
+                    "draft_room_vault_purge_restore_failed vault_id=%s reason=%s",
+                    vault_id,
+                    type(restore_exc).__name__,
+                )
         raise
     except (sqlite3.Error, OSError, RuntimeError) as e:
         await asyncio.to_thread(lambda: conn.rollback())
+        if draft_purge_plan is not None:
+            try:
+                await asyncio.to_thread(draft_deletion.restore_purge, draft_purge_plan)
+            except Exception as restore_exc:
+                logger.error(
+                    "draft_room_vault_purge_restore_failed vault_id=%s reason=%s",
+                    vault_id,
+                    type(restore_exc).__name__,
+                )
         logger.exception("Error deleting vault %d", vault_id)
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
 

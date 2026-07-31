@@ -21,6 +21,8 @@ from app.api.routes.documents import (
 from app.api.routes.documents import (
     validation_exception_handler,
 )
+from app.api.routes.draft_room import DraftRoomHTTPError, draft_room_exception_handler
+from app.api.routes.draft_room import router as draft_room_router
 from app.api.routes.email import router as email_router
 from app.api.routes.eval import router as eval_router
 from app.api.routes.folders import router as folders_router
@@ -141,6 +143,7 @@ if settings.allowed_hosts:
     )
 
 app.include_router(health_router, prefix="/api")
+app.include_router(draft_room_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(search_router, prefix="/api")
 app.include_router(memories_router, prefix="/api")
@@ -165,6 +168,8 @@ app.include_router(prompts_router, prefix="/api")
 
 # Register exception handler for validation errors (empty filename)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
+# Register Draft Room's {detail, code, context} error contract (SPEC section 8.3).
+app.add_exception_handler(DraftRoomHTTPError, draft_room_exception_handler)
 
 
 @app.get("/health")

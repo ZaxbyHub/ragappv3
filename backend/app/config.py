@@ -439,6 +439,26 @@ class Settings(BaseSettings):
     kms_compile_on_ingest: bool = True
     """Create/refresh a KMS document entry when a document finishes indexing."""
 
+    # ── Draft Room configuration (issue #435, SPEC.md section 15) ────────
+    # Only the PR 1 subset is defined here. Compile/model-routing limits
+    # (draft_allowed_model_origins, draft_job_timeout_seconds, ...) arrive with
+    # the newsroom pipeline and are deliberately absent so no unwired setting
+    # ships ahead of the code that reads it.
+    draft_room_enabled: bool = False
+    """Master switch for Draft Room. Default False: create/edit/upload return 503 draft_room_disabled while capability discovery and owner cleanup stay available."""
+    draft_max_inputs: int = 10
+    """Maximum number of uploaded inputs per Draft Room project."""
+    draft_max_total_input_mb: int = 250
+    """Maximum total raw input bytes per project, in MB. The global per-file max_file_size_mb limit still applies to each upload."""
+    draft_max_total_parsed_chars: int = 500000
+    """Aggregate cap on normalized parsed characters across a project's ready inputs. Bounds decompression and parser amplification."""
+    draft_parse_timeout_seconds: int = 300
+    """Wall-clock limit for a single input extraction job."""
+    draft_upload_rate_limit: str = "20/minute"
+    """Rate limit for Draft Room input uploads."""
+    draft_poll_interval_seconds: float = 2.0
+    """Poll interval for the durable Draft Room job processor."""
+
     # ── Retrieval profile configuration ──────────────────────────────────
     retrieval_profile: str = "advanced"
     """Retrieval profile: 'baseline' (dense + hybrid + rerank), 'advanced' (adds enrichment)."""
