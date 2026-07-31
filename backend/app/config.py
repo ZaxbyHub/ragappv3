@@ -440,10 +440,8 @@ class Settings(BaseSettings):
     """Create/refresh a KMS document entry when a document finishes indexing."""
 
     # ── Draft Room configuration (issue #435, SPEC.md section 15) ────────
-    # Only the PR 1 subset is defined here. Compile/model-routing limits
-    # (draft_allowed_model_origins, draft_job_timeout_seconds, ...) arrive with
-    # the newsroom pipeline and are deliberately absent so no unwired setting
-    # ships ahead of the code that reads it.
+    # PR 1 subset. Compile/model-routing limits below this block (issue #436)
+    # complete the SPEC.md §15 settings table.
     draft_room_enabled: bool = False
     """Master switch for Draft Room. Default False: create/edit/upload return 503 draft_room_disabled while capability discovery and owner cleanup stay available."""
     draft_max_inputs: int = 10
@@ -458,6 +456,52 @@ class Settings(BaseSettings):
     """Rate limit for Draft Room input uploads."""
     draft_poll_interval_seconds: float = 2.0
     """Poll interval for the durable Draft Room job processor."""
+
+    # ── Draft Room pipeline (issue #436, SPEC.md section 15) ──────────────
+    draft_allowed_model_origins: Annotated[list[str], NoDecode] = []
+    """Comma-separated exact normalized origins (scheme://host:port) allowed to
+    receive ordinary-tier Draft Room model content. Empty blocks compile
+    (fail closed). Enforced before enqueue and before every model call."""
+    draft_sensitive_allowed_model_origins: Annotated[list[str], NoDecode] = []
+    """Stricter exact-origin allowlist required for the `sensitive` tier, in
+    addition to draft_allowed_model_origins. Empty blocks sensitive-tier
+    compile (fail closed)."""
+    draft_max_sections: int = 12
+    """Maximum outline sections a compile job may produce."""
+    draft_qa_retry_limit: int = 2
+    """Number of revisions allowed for each bounded editorial (lint/copy/standards) loop."""
+    draft_job_timeout_seconds: int = 1800
+    """Total wall-clock budget, in seconds, for one compile job."""
+    draft_job_max_model_calls: int = 40
+    """Hard per-job cap on model calls across every compile stage."""
+    draft_compile_rate_limit: str = "5/minute"
+    """Rate limit for Draft Room compile and retry requests, per user."""
+    draft_heartbeat_interval_seconds: float = 15.0
+    """Interval, in seconds, at which a running compile job updates its
+    heartbeat row and the SSE stream emits a heartbeat event."""
+    draft_orphan_recovery_seconds: int = 120
+    """Seconds a `running` compile job may go without a heartbeat update before
+    the worker treats it as orphaned and recovers it back to `pending`."""
+    draft_research_retrieval_limit: int = 8
+    """Maximum sources retrieved per research facet via rag_engine.retrieve_sources."""
+    draft_transient_retry_limit: int = 2
+    """Maximum automatic retries for a transient provider/retrieval error inside
+    a single compile job, with bounded backoff between attempts."""
+    draft_prompt_bundle_version: str = "1"
+    """Default Draft Room prompt bundle version snapshotted onto new compile
+    jobs. Must track draft_prompts.PROMPT_BUNDLE_VERSION."""
+    draft_boilerplate_rule_version: str = "1"
+    """Default curated-boilerplate rule version applied by the deterministic
+    lint stage and recorded on lint findings."""
+    draft_lint_rewrite_limit: int = 2
+    """Maximum automatic rewrite attempts the lint stage may apply before
+    surfacing remaining boilerplate findings unresolved."""
+    draft_default_logical_mode: str = "thinking"
+    """Default logical model mode ("instant" or "thinking") for Draft Room
+    compile stages that do not pin a specific mode."""
+    draft_max_correction_loops: int = 2
+    """Maximum number of Copy/Standards -> Fact correction loops per compile
+    job. Exceeding this cap is a terminal, non-retryable failure."""
 
     # ── Retrieval profile configuration ──────────────────────────────────
     retrieval_profile: str = "advanced"
@@ -651,6 +695,29 @@ class Settings(BaseSettings):
                 parsed = json.loads(value)
                 if not isinstance(parsed, list):
                     raise ValueError("backend_cors_origins JSON value must be a list")
+                return parsed
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return v
+
+    @field_validator(
+        "draft_allowed_model_origins",
+        "draft_sensitive_allowed_model_origins",
+        mode="before",
+    )
+    @classmethod
+    def parse_draft_allowed_model_origins(cls, v):
+        """Support JSON lists and comma-separated env values for Draft Room
+        provider-origin allowlists (same convention as backend_cors_origins)."""
+        if isinstance(v, str):
+            value = v.strip()
+            if not value:
+                return []
+            if value.startswith("["):
+                import json
+
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("draft origin allowlist JSON value must be a list")
                 return parsed
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return v
@@ -974,6 +1041,45 @@ class Settings(BaseSettings):
         """Validate default chat mode from env/defaults before startup."""
         if v not in ("instant", "thinking"):
             raise ValueError("default_chat_mode must be 'instant' or 'thinking'")
+        return v
+
+    @field_validator("draft_default_logical_mode", mode="after")
+    @classmethod
+    def validate_draft_default_logical_mode(cls, v: str) -> str:
+        """Validate draft_default_logical_mode is 'instant' or 'thinking'."""
+        return cls._validate_enum(v, {"instant", "thinking"}, "draft_default_logical_mode")
+
+    @field_validator(
+        "draft_max_sections",
+        "draft_job_timeout_seconds",
+        "draft_job_max_model_calls",
+        "draft_orphan_recovery_seconds",
+        "draft_research_retrieval_limit",
+        mode="after",
+    )
+    @classmethod
+    def validate_draft_positive_ints(cls, v: int) -> int:
+        """Validate Draft Room pipeline budget/limit settings are >= 1."""
+        return cls._validate_int_range(v, 1, None, "draft pipeline setting")
+
+    @field_validator(
+        "draft_qa_retry_limit",
+        "draft_transient_retry_limit",
+        "draft_lint_rewrite_limit",
+        "draft_max_correction_loops",
+        mode="after",
+    )
+    @classmethod
+    def validate_draft_nonnegative_ints(cls, v: int) -> int:
+        """Validate Draft Room retry/loop cap settings are >= 0."""
+        return cls._validate_int_range(v, 0, None, "draft pipeline setting")
+
+    @field_validator("draft_heartbeat_interval_seconds", mode="after")
+    @classmethod
+    def validate_draft_heartbeat_interval_seconds(cls, v: float) -> float:
+        """Validate draft_heartbeat_interval_seconds is > 0 (prevents a tight loop)."""
+        if v <= 0:
+            raise ValueError("draft_heartbeat_interval_seconds must be > 0")
         return v
 
     @field_validator(

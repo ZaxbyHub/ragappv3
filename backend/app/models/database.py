@@ -175,11 +175,9 @@ CREATE INDEX IF NOT EXISTS idx_draft_events_draft_created
     ON draft_events(draft_id, created_at DESC);
 """
 
-# Draft Room pipeline schema (issue #436, specs/draft-room/SPEC.md section 5.5-5.7).
+# Draft Room pipeline schema (issue #436, specs/draft-room/SPEC.md section 5.5-5.6).
 #
-# Compile-pipeline stage checkpoints, retrieved-evidence snapshots, and the
-# factuality tables (claims / claim sources / findings) that sit on top of
-# `_DRAFT_ROOM_CORE_DDL`.
+# Compile-pipeline stage checkpoints and retrieved-evidence snapshots.
 #
 # Defined as its own constant, appended to SCHEMA below and executed verbatim by
 # migrate_add_draft_room_pipeline(), so a fresh database and a migrated database
@@ -281,7 +279,17 @@ CREATE INDEX IF NOT EXISTS idx_draft_evidence_wiki_claim_identity
     ON draft_evidence(wiki_claim_id) WHERE wiki_claim_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_draft_evidence_kms_identity
     ON draft_evidence(kms_entry_id) WHERE source_kind = 'kms';
+"""
 
+# Draft Room factuality schema (issue #436, specs/draft-room/SPEC.md section 5.7).
+#
+# Factuality tables (claims / claim sources / findings) that sit on top of
+# `_DRAFT_ROOM_PIPELINE_DDL`.
+#
+# Defined as its own constant, appended to SCHEMA below and executed verbatim by
+# migrate_add_draft_room_factuality(), so a fresh database and a migrated database
+# cannot drift apart.
+_DRAFT_ROOM_FACTUALITY_DDL = """
 CREATE TABLE IF NOT EXISTS draft_claims (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     revision_id INTEGER NOT NULL REFERENCES draft_revisions(id) ON DELETE CASCADE,
@@ -1224,7 +1232,7 @@ CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id ON prompt_ab_ex
 # definition, shared by SCHEMA and by their respective migrate_add_* functions,
 # and therefore cannot drift apart.
 # static DDL only
-SCHEMA = _BASE_SCHEMA + _DRAFT_ROOM_CORE_DDL + _DRAFT_ROOM_PIPELINE_DDL  # nosec B608
+SCHEMA = _BASE_SCHEMA + _DRAFT_ROOM_CORE_DDL + _DRAFT_ROOM_PIPELINE_DDL + _DRAFT_ROOM_FACTUALITY_DDL  # nosec B608
 
 
 
@@ -1394,6 +1402,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_password_changed_at(sqlite_path)
     migrate_add_draft_room_core(sqlite_path)
     migrate_add_draft_room_pipeline(sqlite_path)
+    migrate_add_draft_room_factuality(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -4041,10 +4050,9 @@ def migrate_add_draft_room_core(sqlite_path: str) -> None:
 
 def migrate_add_draft_room_pipeline(sqlite_path: str) -> None:
     """
-    Migration: create the Draft Room pipeline tables (issue #436, SPEC.md 5.5-5.7).
+    Migration: create the Draft Room pipeline tables (issue #436, SPEC.md 5.5-5.6).
 
-    Creates `draft_job_stages`, `draft_evidence`, `draft_claims`,
-    `draft_claim_sources`, and `draft_findings` together with every CHECK
+    Creates `draft_job_stages` and `draft_evidence` together with every CHECK
     constraint, uniqueness rule, foreign key, and partial index in the
     specification.
 
@@ -4061,6 +4069,32 @@ def migrate_add_draft_room_pipeline(sqlite_path: str) -> None:
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_DRAFT_ROOM_PIPELINE_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_draft_room_factuality(sqlite_path: str) -> None:
+    """
+    Migration: create the Draft Room factuality tables (issue #436, SPEC.md 5.7).
+
+    Creates `draft_claims`, `draft_claim_sources`, and `draft_findings` together
+    with every CHECK constraint, uniqueness rule, foreign key, and partial index
+    in the specification.
+
+    Executes ``_DRAFT_ROOM_FACTUALITY_DDL`` — the exact same constant that is
+    appended to ``SCHEMA`` — so a database created by ``init_db`` and a legacy
+    database upgraded by this migration converge on an identical schema. Every
+    statement is ``CREATE ... IF NOT EXISTS``, so repeat execution is a no-op
+    and existing data is preserved.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript(_DRAFT_ROOM_FACTUALITY_DDL)
         conn.commit()
     finally:
         conn.close()
