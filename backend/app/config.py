@@ -499,9 +499,6 @@ class Settings(BaseSettings):
     draft_default_logical_mode: str = "thinking"
     """Default logical model mode ("instant" or "thinking") for Draft Room
     compile stages that do not pin a specific mode."""
-    draft_max_correction_loops: int = 2
-    """Maximum number of Copy/Standards -> Fact correction loops per compile
-    job. Exceeding this cap is a terminal, non-retryable failure."""
 
     # ── Retrieval profile configuration ──────────────────────────────────
     retrieval_profile: str = "advanced"
@@ -1066,7 +1063,6 @@ class Settings(BaseSettings):
         "draft_qa_retry_limit",
         "draft_transient_retry_limit",
         "draft_lint_rewrite_limit",
-        "draft_max_correction_loops",
         mode="after",
     )
     @classmethod

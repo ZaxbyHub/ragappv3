@@ -259,7 +259,6 @@ def main() -> int:
         "DRAFT_RESEARCH_RETRIEVAL_LIMIT": "draft_research_retrieval_limit",
         "DRAFT_TRANSIENT_RETRY_LIMIT": "draft_transient_retry_limit",
         "DRAFT_LINT_REWRITE_LIMIT": "draft_lint_rewrite_limit",
-        "DRAFT_MAX_CORRECTION_LOOPS": "draft_max_correction_loops",
     }
     for env_name, field_name in draft_int_settings.items():
         backend_val = backend_int_default(backend_config, field_name)

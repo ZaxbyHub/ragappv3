@@ -15,9 +15,10 @@ The law this module exists to enforce
    tuple and the correction loop re-runs them in the same order.
 3. **Any semantic edit invalidates factual approval.** Fact is the last thing
    that touches the candidate before Assemble, so a Copy/Standards edit is
-   *structurally* upstream of a fresh Fact run; the correction loop is bounded
-   by ``settings.draft_max_correction_loops`` and exceeding it is a terminal,
-   non-retryable :data:`CODE_CORRECTION_LOOP_EXCEEDED` failure.
+   *structurally* upstream of a fresh Fact run. The correction loop is bounded
+   by ``settings.draft_qa_retry_limit``; reaching that cap ends the loop and
+   leaves residual issues as visible findings (SPEC §11.8), rather than
+   discarding an otherwise complete Fact-verified draft.
 4. **Fact never mutates prose.** It receives an immutable ``str`` candidate and
    returns a report; :meth:`_CompileRun._stage_fact` re-hashes the candidate
    afterwards and hard-fails on any difference.
@@ -163,7 +164,6 @@ CODE_SECTION_BUDGET_EXCEEDED = "section_budget_exceeded"
 CODE_MODEL_CALL_BUDGET_EXCEEDED = "model_call_budget_exceeded"
 CODE_JOB_TIMEOUT = "job_timeout"
 CODE_INVALID_STAGE_OUTPUT = "invalid_stage_output"
-CODE_CORRECTION_LOOP_EXCEEDED = "correction_loop_exceeded"
 CODE_FACT_MUTATED_CANDIDATE = "fact_mutated_candidate"
 CODE_ASSEMBLE_WITHOUT_FACT = "assemble_without_fact"
 CODE_ASSEMBLE_HASH_MISMATCH = "assemble_candidate_hash_mismatch"
@@ -1374,17 +1374,34 @@ class _CompileRun:
         Every iteration runs Fact against the candidate that Copy and Standards
         have *already* finished editing, which is what makes law 3 structural:
         a semantic edit can never be the last thing that happens to the bytes.
+
+        Reaching the cap is NOT a failure. SPEC §11.8 is explicit: "The full
+        correction loop may run at most ``draft_qa_retry_limit`` times.
+        Residual issues become visible findings. An unresolved non-waivable
+        blocker prevents Ready; it does not prevent storing the output as
+        ``needs_review``." Failing here would discard an otherwise complete,
+        Fact-verified draft and leave the author with nothing to inspect,
+        which is the opposite of the findings/blockers/human-Ready design.
+
+        The loop always exits immediately after a Fact run, so the candidate
+        handed to Assemble is always Fact-verified even when findings remain
+        unresolved. Those findings persist as rows, and the non-waivable ones
+        are what the Ready endpoint refuses to approve.
         """
         while True:
             await self._stage_fact()
             if not self._fact_requires_correction():
                 return
             if self._correction_loops >= self._ctx.max_correction_loops:
-                raise CompileFailure(
-                    CODE_CORRECTION_LOOP_EXCEEDED,
-                    retryable=False,
-                    message="correction loop exceeded draft_max_correction_loops",
+                # Cap reached: stop correcting and let the residual findings
+                # speak for themselves. self._candidate is Fact-verified as of
+                # the _stage_fact() call above, so Assemble's hash gate holds.
+                logger.info(
+                    "draft_pipeline: correction loop cap reached for job %s; "
+                    "residual issues remain as findings",
+                    self._ctx.job_id,
                 )
+                return
             self._correction_loops += 1
             reason = f"correction_{self._correction_loops}"
             # Copy first, Standards second. Always.
@@ -2200,7 +2217,7 @@ def _build_context(
             else settings.draft_job_max_model_calls
         ),
         max_sections=settings.draft_max_sections,
-        max_correction_loops=settings.draft_max_correction_loops,
+        max_correction_loops=settings.draft_qa_retry_limit,
         transient_retry_limit=settings.draft_transient_retry_limit,
         retrieval_limit=settings.draft_research_retrieval_limit,
         resume_allowed=resume_allowed,
