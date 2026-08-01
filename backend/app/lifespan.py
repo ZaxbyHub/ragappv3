@@ -673,6 +673,14 @@ async def lifespan(app: FastAPI):
     )
     logger.info("RAGEngine singleton initialized with wiki retrieval")
 
+    # Hand the engine to the Draft Room worker. DraftJobProcessor is started
+    # above, before RAGEngine exists, so compile retrieval can only be wired
+    # here. Without this call the worker keeps its fail-closed retrieval stub
+    # and every compile job would end in retrieval_unavailable.
+    if getattr(app.state, "draft_job_processor", None):
+        app.state.draft_job_processor.set_rag_engine(app.state.rag_engine)
+        logger.info("DraftJobProcessor wired to RAGEngine for compile retrieval")
+
     # Start memory embedding backfill as a non-blocking background task.
     # Memories created before the embedding column existed (or with a stale model)
     # will be embedded so hybrid/semantic retrieval can use them.
