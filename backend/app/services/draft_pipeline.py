@@ -992,6 +992,42 @@ class _CompileRun:
 
     # -- stage 1: research -------------------------------------------------
 
+    def _research_brief(self) -> dict[str, Any]:
+        """Decode the frozen brief snapshot into the mapping Research expects.
+
+        ``CompileContext.brief_json`` is stored as a JSON *string* so the
+        compile fingerprint hashes exact bytes. ``draft_research.run_research``
+        documents ``brief: dict``, and its prompt builder json-dumps the value —
+        passing the raw string would emit a JSON string-of-a-string rather than
+        the brief object.
+        """
+        try:
+            decoded = json.loads(self._ctx.brief_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+    def _research_inputs(self) -> list[dict[str, Any]]:
+        """Marshal frozen ``_InputSnapshot`` rows into Research's dict contract.
+
+        ``draft_research`` reads its inputs through ``.get()`` (``input_id``,
+        ``role``, ``text``), so the dataclass snapshots cannot be handed over
+        directly. Marshalling here keeps the pinned ``run_research(brief: dict,
+        inputs: Sequence[dict], ...)`` signature intact and keeps the snapshot
+        immutable on this side of the seam.
+        """
+        return [
+            {
+                "input_id": snap.input_id,
+                "role": snap.role,
+                "authority": snap.authority,
+                "as_of_date": snap.as_of_date,
+                "text": snap.parsed_text,
+                "locked_spans": [list(span) for span in snap.locked_spans],
+            }
+            for snap in self._ctx.inputs
+        ]
+
     async def _stage_research(self) -> None:
         """Delegate to ``draft_research`` and snapshot its evidence (SPEC §11.2)."""
         ctx = self._ctx
@@ -1009,8 +1045,8 @@ class _CompileRun:
         run_research = _load_research_runner()
         try:
             outcome = await run_research(
-                brief=ctx.brief_json,
-                inputs=ctx.inputs,
+                brief=self._research_brief(),
+                inputs=self._research_inputs(),
                 vault_id=ctx.vault_id,
                 retrieve=self._deps.retrieve_sources,
                 complete=self._research_complete,
