@@ -10,9 +10,9 @@
       "SEVERITY.LOW": 70,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 56882,
+      "loc": 57921,
       "nosec": 0,
-      "skipped_tests": 19
+      "skipped_tests": 22
     },
     "backend/app/__init__.py": {
       "CONFIDENCE.HIGH": 0,
@@ -101,7 +101,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3167,
+      "loc": 3523,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -452,7 +452,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3483,
+      "loc": 3528,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -764,7 +764,20 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2331,
+      "loc": 2671,
+      "nosec": 0,
+      "skipped_tests": 3
+    },
+    "backend/app/services/draft_promotion.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 258,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -816,7 +829,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 390,
+      "loc": 411,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -829,7 +842,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3150,
+      "loc": 3169,
       "nosec": 0,
       "skipped_tests": 18
     },
@@ -3108,7 +3121,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "3878             conn.execute(\"ROLLBACK\")\n3879         except Exception:\n3880             pass\n3881         raise\n",
+      "code": "3913             conn.execute(\"ROLLBACK\")\n3914         except Exception:\n3915             pass\n3916         raise\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/models/database.py",
@@ -3119,10 +3132,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 3879,
+      "line_number": 3914,
       "line_range": [
-        3879,
-        3880
+        3914,
+        3915
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
