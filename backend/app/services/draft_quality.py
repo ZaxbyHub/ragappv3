@@ -20,9 +20,10 @@ access, and no database access. It implements the exact contract in
   deterministic, targeted rewrites of *exact* ``blocked_boilerplate`` spans.
   Advisory findings are never rewritten.
 * **Waivers** (§13.3) — a human owner may waive a specific
-  ``blocked_boilerplate`` rule/span with a non-empty reason; the waiver
-  records actor, rule version, and a hash of the exact span text, and is
-  invalidated the moment that span's text changes.
+  ``blocked_boilerplate`` rule/span with a non-empty reason. The shipped
+  implementation is independent SQL in ``app.api.routes.draft_room`` plus
+  ``app.services.draft_store.waive_finding``; this module does not implement
+  waivers.
 
 ``LintFinding`` / ``LintReport`` are defined in :mod:`app.services.draft_prompts`
 and imported here, not redefined.
@@ -30,7 +31,6 @@ and imported here, not redefined.
 
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -43,25 +43,11 @@ __all__ = [
     "BLOCKED_BOILERPLATE",
     "REVIEW_VOCABULARY",
     "MaskedText",
-    "LintWaiver",
-    "WaiverError",
     "mask_excluded_spans",
     "run_deterministic_lint",
     "restore_offsets",
     "apply_bounded_rewrites",
-    "create_waiver",
-    "is_waiver_valid",
 ]
-
-
-def _sha256_text(text: str) -> str:
-    """SHA-256 of ``text`` encoded as UTF-8, as lowercase hex.
-
-    Deliberately a private local helper (not imported from
-    ``app.services.draft_store``) so this module stays dependency-light and
-    free of any coupling to the (separately owned) persistence module.
-    """
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -758,90 +744,3 @@ def apply_bounded_rewrites(
         new_text = new_text[: finding.start] + replacement + new_text[finding.end :]
         applied += 1
     return new_text, applied
-
-
-# ---------------------------------------------------------------------------
-# Waivers (SPEC §13.3)
-# ---------------------------------------------------------------------------
-
-
-class WaiverError(ValueError):
-    """Raised when a waiver cannot be created (missing actor/reason)."""
-
-
-@dataclass(frozen=True)
-class LintWaiver:
-    """A human owner's waiver of one specific ``blocked_boilerplate`` finding.
-
-    Non-waivable blockers (factual/permission/security invariants) never
-    flow through this type -- SPEC §13.3 limits waivers to boilerplate,
-    which is the only rule class this module treats as human-waivable.
-    """
-
-    rule_id: str
-    section_id: str
-    start: int
-    end: int
-    text_sha256: str
-    rule_version: str
-    actor: str
-    reason: str
-
-
-def create_waiver(
-    finding: LintFinding,
-    current_text: str,
-    *,
-    actor: str,
-    reason: str,
-    rule_version: str,
-) -> LintWaiver:
-    """Build a :class:`LintWaiver` for ``finding`` against ``current_text``.
-
-    Args:
-        finding: the exact open ``blocked_boilerplate`` finding being waived.
-        current_text: the live text the finding's offsets refer to; the
-            waiver stores a hash of the exact span so any later edit to
-            that span invalidates it (SPEC §13.3).
-        actor: the waiving user identifier. Required, non-empty.
-        reason: a human-readable justification. Required, non-empty.
-        rule_version: the boilerplate rule-list version in effect when the
-            waiver was created.
-
-    Raises:
-        WaiverError: ``actor`` or ``reason`` is missing/blank.
-    """
-    if not actor or not actor.strip():
-        raise WaiverError("Waiver requires a non-empty actor.")
-    if not reason or not reason.strip():
-        raise WaiverError("Waiver requires a non-empty reason.")
-    span_text = current_text[finding.start : finding.end]
-    return LintWaiver(
-        rule_id=finding.rule_id,
-        section_id=finding.section_id,
-        start=finding.start,
-        end=finding.end,
-        text_sha256=_sha256_text(span_text),
-        rule_version=rule_version,
-        actor=actor,
-        reason=reason,
-    )
-
-
-def is_waiver_valid(waiver: LintWaiver, current_text: str, *, rule_version: str) -> bool:
-    """Return whether ``waiver`` still applies to ``current_text``.
-
-    A waiver is invalidated (returns ``False``) if:
-
-    * the boilerplate rule version has changed since the waiver was created, or
-    * the exact span text at ``waiver.start:waiver.end`` no longer hashes to
-      ``waiver.text_sha256`` -- i.e. any edit that changes the matching span
-      (SPEC §13.3: "any edit that changes the matching span invalidates the
-      waiver"), including the span now being out of bounds entirely.
-    """
-    if waiver.rule_version != rule_version:
-        return False
-    if waiver.start < 0 or waiver.end > len(current_text) or waiver.start > waiver.end:
-        return False
-    span_text = current_text[waiver.start : waiver.end]
-    return _sha256_text(span_text) == waiver.text_sha256

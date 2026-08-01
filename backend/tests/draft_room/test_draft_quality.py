@@ -22,10 +22,7 @@ except ImportError:  # pragma: no cover
 from app.config import settings
 from app.services.draft_quality import (
     BLOCKED_BOILERPLATE,
-    WaiverError,
     apply_bounded_rewrites,
-    create_waiver,
-    is_waiver_valid,
     mask_excluded_spans,
     run_deterministic_lint,
 )
@@ -353,70 +350,6 @@ class TestBoundedRewrites(unittest.TestCase):
         rewritten, applied = apply_bounded_rewrites(text, report, limit=0)
         self.assertEqual(applied, 0)
         self.assertEqual(rewritten, text)
-
-
-class TestWaivers(unittest.TestCase):
-    def _boilerplate_finding(self, text: str):
-        report = run_deterministic_lint(text, rule_version="v1")
-        blockers = [f for f in report.findings if f.severity == "blocker"]
-        self.assertEqual(len(blockers), 1)
-        return blockers[0]
-
-    def test_waiver_requires_actor(self) -> None:
-        text = f"{BOILERPLATE_PHRASE} stands."
-        finding = self._boilerplate_finding(text)
-        with self.assertRaises(WaiverError):
-            create_waiver(finding, text, actor="", reason="approved by editor", rule_version="v1")
-        with self.assertRaises(WaiverError):
-            create_waiver(finding, text, actor="   ", reason="approved by editor", rule_version="v1")
-
-    def test_waiver_requires_reason(self) -> None:
-        text = f"{BOILERPLATE_PHRASE} stands."
-        finding = self._boilerplate_finding(text)
-        with self.assertRaises(WaiverError):
-            create_waiver(finding, text, actor="editor-1", reason="", rule_version="v1")
-        with self.assertRaises(WaiverError):
-            create_waiver(finding, text, actor="editor-1", reason="   ", rule_version="v1")
-
-    def test_valid_waiver_records_actor_reason_rule_version_and_span_hash(self) -> None:
-        text = f"{BOILERPLATE_PHRASE} stands."
-        finding = self._boilerplate_finding(text)
-        waiver = create_waiver(
-            finding, text, actor="editor-1", reason="approved editorially", rule_version="v1"
-        )
-        self.assertEqual(waiver.actor, "editor-1")
-        self.assertEqual(waiver.reason, "approved editorially")
-        self.assertEqual(waiver.rule_version, "v1")
-        self.assertTrue(waiver.text_sha256)
-        self.assertTrue(is_waiver_valid(waiver, text, rule_version="v1"))
-
-    def test_waiver_invalidated_when_span_text_changes(self) -> None:
-        text = f"{BOILERPLATE_PHRASE} stands."
-        finding = self._boilerplate_finding(text)
-        waiver = create_waiver(
-            finding, text, actor="editor-1", reason="approved editorially", rule_version="v1"
-        )
-        edited_text = (
-            text[: finding.start] + "some other phrase entirely" + text[finding.end :]
-        )
-        self.assertFalse(is_waiver_valid(waiver, edited_text, rule_version="v1"))
-
-    def test_waiver_invalidated_when_rule_version_changes(self) -> None:
-        text = f"{BOILERPLATE_PHRASE} stands."
-        finding = self._boilerplate_finding(text)
-        waiver = create_waiver(
-            finding, text, actor="editor-1", reason="approved editorially", rule_version="v1"
-        )
-        self.assertFalse(is_waiver_valid(waiver, text, rule_version="v2"))
-
-    def test_waiver_survives_an_edit_elsewhere_in_the_document(self) -> None:
-        text = f"{BOILERPLATE_PHRASE} stands."
-        finding = self._boilerplate_finding(text)
-        waiver = create_waiver(
-            finding, text, actor="editor-1", reason="approved editorially", rule_version="v1"
-        )
-        edited_text = text + " An unrelated sentence was appended."
-        self.assertTrue(is_waiver_valid(waiver, edited_text, rule_version="v1"))
 
 
 if __name__ == "__main__":

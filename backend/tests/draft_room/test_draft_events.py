@@ -409,6 +409,9 @@ class CompileEventsTestBase(unittest.IsolatedAsyncioTestCase):
             patch.object(settings, "ollama_chat_url", PROVIDER_URL),
             patch.object(settings, "instant_chat_url", PROVIDER_URL),
             patch.object(settings, "draft_allowed_model_origins", [PROVIDER_URL]),
+            # SPEC 9.2 re-checks the kill switch before EVERY model
+            # call, so a compile cannot run with the feature off.
+            patch.object(settings, "draft_room_enabled", True),
             patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"}),
             patch.object(draft_pipeline, "_backoff_seconds", lambda attempt: 0.0),
         ]

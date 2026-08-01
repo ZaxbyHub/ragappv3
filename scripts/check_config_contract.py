@@ -53,14 +53,6 @@ def backend_int_default(config_text: str, field_name: str) -> str | None:
     return match.group(1) if match else None
 
 
-def backend_float_default(config_text: str, field_name: str) -> str | None:
-    match = re.search(
-        rf"{re.escape(field_name)}:\s*float\s*=\s*([\d.]+)",
-        config_text,
-    )
-    return match.group(1) if match else None
-
-
 def backend_str_default(config_text: str, field_name: str) -> str | None:
     match = re.search(
         rf'{re.escape(field_name)}:\s*str\s*=\s*"([^"]*)"',
@@ -255,7 +247,6 @@ def main() -> int:
         "DRAFT_QA_RETRY_LIMIT": "draft_qa_retry_limit",
         "DRAFT_JOB_TIMEOUT_SECONDS": "draft_job_timeout_seconds",
         "DRAFT_JOB_MAX_MODEL_CALLS": "draft_job_max_model_calls",
-        "DRAFT_ORPHAN_RECOVERY_SECONDS": "draft_orphan_recovery_seconds",
         "DRAFT_RESEARCH_RETRIEVAL_LIMIT": "draft_research_retrieval_limit",
         "DRAFT_TRANSIENT_RETRY_LIMIT": "draft_transient_retry_limit",
         "DRAFT_LINT_REWRITE_LIMIT": "draft_lint_rewrite_limit",
@@ -266,24 +257,6 @@ def main() -> int:
         compose_val = compose_default(compose_text, env_name)
         if backend_val is None:
             failures.append(f"backend/app/config.py {field_name} int default could not be parsed")
-        if env_val != backend_val:
-            failures.append(
-                f".env.example {env_name} default {env_val!r} does not match backend default {backend_val!r}"
-            )
-        if compose_val != backend_val:
-            failures.append(
-                f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
-            )
-
-    draft_float_settings = {
-        "DRAFT_HEARTBEAT_INTERVAL_SECONDS": "draft_heartbeat_interval_seconds",
-    }
-    for env_name, field_name in draft_float_settings.items():
-        backend_val = backend_float_default(backend_config, field_name)
-        env_val = env_value(env_text, env_name)
-        compose_val = compose_default(compose_text, env_name)
-        if backend_val is None:
-            failures.append(f"backend/app/config.py {field_name} float default could not be parsed")
         if env_val != backend_val:
             failures.append(
                 f".env.example {env_name} default {env_val!r} does not match backend default {backend_val!r}"

@@ -476,12 +476,6 @@ class Settings(BaseSettings):
     """Hard per-job cap on model calls across every compile stage."""
     draft_compile_rate_limit: str = "5/minute"
     """Rate limit for Draft Room compile and retry requests, per user."""
-    draft_heartbeat_interval_seconds: float = 15.0
-    """Interval, in seconds, at which a running compile job updates its
-    heartbeat row and the SSE stream emits a heartbeat event."""
-    draft_orphan_recovery_seconds: int = 120
-    """Seconds a `running` compile job may go without a heartbeat update before
-    the worker treats it as orphaned and recovers it back to `pending`."""
     draft_research_retrieval_limit: int = 8
     """Maximum sources retrieved per research facet via rag_engine.retrieve_sources."""
     draft_transient_retry_limit: int = 2
@@ -1047,7 +1041,6 @@ class Settings(BaseSettings):
         "draft_max_sections",
         "draft_job_timeout_seconds",
         "draft_job_max_model_calls",
-        "draft_orphan_recovery_seconds",
         "draft_research_retrieval_limit",
         mode="after",
     )
@@ -1066,14 +1059,6 @@ class Settings(BaseSettings):
     def validate_draft_nonnegative_ints(cls, v: int) -> int:
         """Validate Draft Room retry/loop cap settings are >= 0."""
         return cls._validate_int_range(v, 0, None, "draft pipeline setting")
-
-    @field_validator("draft_heartbeat_interval_seconds", mode="after")
-    @classmethod
-    def validate_draft_heartbeat_interval_seconds(cls, v: float) -> float:
-        """Validate draft_heartbeat_interval_seconds is > 0 (prevents a tight loop)."""
-        if v <= 0:
-            raise ValueError("draft_heartbeat_interval_seconds must be > 0")
-        return v
 
     @field_validator(
         "instant_initial_retrieval_top_k",

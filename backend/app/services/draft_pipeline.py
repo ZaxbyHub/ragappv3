@@ -165,6 +165,8 @@ CODE_MODEL_CALL_BUDGET_EXCEEDED = "model_call_budget_exceeded"
 CODE_JOB_TIMEOUT = "job_timeout"
 CODE_INVALID_STAGE_OUTPUT = "invalid_stage_output"
 CODE_EVIDENCE_CHANGED = "evidence_changed"
+CODE_PERMISSION_REVOKED = "permission_revoked"
+CODE_DRAFT_ROOM_DISABLED = "draft_room_disabled"
 CODE_FACT_MUTATED_CANDIDATE = "fact_mutated_candidate"
 CODE_ASSEMBLE_WITHOUT_FACT = "assemble_without_fact"
 CODE_ASSEMBLE_HASH_MISMATCH = "assemble_candidate_hash_mismatch"
@@ -301,6 +303,17 @@ class PipelineDeps:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _provider_model_name(logical_mode: str) -> str:
+    """Non-secret model identifier for the logical mode (SPEC §9.2).
+
+    Persisted on stage artifacts, which are client-visible, so this must never
+    return an endpoint, credential or configured allowlist entry.
+    """
+    if logical_mode == "instant":
+        return settings.instant_chat_model or "instant"
+    return settings.chat_model or "thinking"
 
 
 def _provider_base_url(logical_mode: str) -> str:
@@ -978,7 +991,13 @@ class _CompileRun:
             prompt_id=prompt.prompt_id,
             prompt_version=prompt.version,
             prompt_sha256=prompt.sha256,
-            model=_provider_base_url(prompt.logical_mode),
+            # The MODEL NAME, never the endpoint. This artifact is returned
+            # verbatim to any draft owner with vault read via
+            # GET /drafts/{id}/jobs/{job_id}/stages, and SPEC §9.2 forbids
+            # returning a raw endpoint to non-admin clients. Storing the base
+            # URL here disclosed the internal model host and port to every
+            # ordinary user, and put a URL in a field named "model".
+            model=_provider_model_name(prompt.logical_mode),
             temperature=prompt.temperature,
             output_sha256=sha256_text(raw or ""),
         )
@@ -993,6 +1012,16 @@ class _CompileRun:
             await self._check_cancel()
 
             base_url = _provider_base_url(prompt.logical_mode)
+            # SPEC §9.2: require draft_room_enabled before enqueue AND before
+            # EACH model call. Checking it only at the route meant disabling
+            # the feature stopped new requests while in-flight compiles kept
+            # shipping manuscript text and vault passages to the provider.
+            if not settings.draft_room_enabled:
+                raise CompileFailure(
+                    CODE_DRAFT_ROOM_DISABLED,
+                    retryable=False,
+                    message="draft room was disabled mid-job",
+                )
             # SPEC §9.2 / issue §6 law 13: the allowlist is re-checked before
             # EVERY call, so a mid-job policy revocation is honored.
             assert_provider_allowed(base_url, sensitive=self._ctx.sensitive)
@@ -1948,6 +1977,13 @@ class _CompileRun:
         # Steps 3-5: one BEGIN IMMEDIATE transaction creates the immutable
         # revision, makes it current, points the job at it and moves the draft
         # to needs_review. NEVER ready.
+        # SPEC §9.1 rule 4: re-check the owner is active and still has vault
+        # read IMMEDIATELY before the final revision is stored. Compile is the
+        # long-running, multi-model-call job where mid-job revocation is most
+        # likely, and without this it ran to completion and stored
+        # vault-derived output regardless.
+        if not await asyncio.to_thread(self._db_owner_permission_ok):
+            raise CompileFailure(CODE_PERMISSION_REVOKED, retryable=False)
         revision_id = await asyncio.to_thread(
             self._db_commit_revision,
             candidate,
@@ -2330,6 +2366,32 @@ class _CompileRun:
             retryable=False,
             message=f"evidence changed before assemble ({reason})",
         )
+
+    def _db_owner_permission_ok(self) -> bool:
+        """True when the job owner is still active and can read the vault.
+
+        Mirrors ``DraftJobProcessor._owner_permission_ok_sync`` deliberately
+        rather than importing it: the processor imports this module, so
+        reaching back would create a cycle. ``_evaluate_policy`` is the app's
+        real permission evaluator and is driven with ``asyncio.run`` inside
+        this dedicated worker thread, where no loop is running; the connection
+        is opened and closed entirely within this synchronous call.
+        """
+        from app.api.deps import _evaluate_policy
+
+        ctx = self._ctx
+        with self._pool.connection() as conn:
+            row = conn.execute(
+                "SELECT is_active, role FROM users WHERE id = ?", (ctx.owner_id,)
+            ).fetchone()
+            if row is None or not row[0]:
+                return False
+            principal = {"id": ctx.owner_id, "role": row[1]}
+            return bool(
+                asyncio.run(
+                    _evaluate_policy(conn, principal, "vault", ctx.vault_id, "read")
+                )
+            )
 
     def _db_publish_revision(self, revision_id: int) -> None:
         """Make the finished revision current, atomically (SPEC §11.9 step 3).

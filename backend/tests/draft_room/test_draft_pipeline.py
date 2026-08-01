@@ -413,6 +413,15 @@ class PipelineTestBase(unittest.IsolatedAsyncioTestCase):
             "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (?, 'V1', '')",
             (VAULT_ID,),
         )
+        # The owner must still hold vault read: SPEC 9.1 rule 4 re-checks
+        # permission immediately before the final revision is stored, so a
+        # fixture without membership is indistinguishable from a revocation
+        # mid-compile and the job correctly fails permission_revoked.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO vault_members "
+            "(vault_id, user_id, permission, granted_by) VALUES (?, ?, 'read', ?)",
+            (VAULT_ID, OWNER_ID, OWNER_ID),
+        )
         # The document the fake retriever cites must really exist in the
         # vault: SPEC 12.6 re-resolution runs before Assemble, so evidence
         # pointing at a row that was never there is indistinguishable from a
@@ -427,6 +436,9 @@ class PipelineTestBase(unittest.IsolatedAsyncioTestCase):
             patch.object(settings, "ollama_chat_url", PROVIDER_URL),
             patch.object(settings, "instant_chat_url", PROVIDER_URL),
             patch.object(settings, "draft_allowed_model_origins", [PROVIDER_URL]),
+            # SPEC 9.2 re-checks the kill switch before EVERY model
+            # call, so a compile cannot run with the feature off.
+            patch.object(settings, "draft_room_enabled", True),
             patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"}),
             # Keep bounded-backoff tests fast; the bound itself is asserted by
             # the call count, not by wall time.

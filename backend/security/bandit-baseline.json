@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 70,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 56641,
+      "loc": 56882,
       "nosec": 0,
       "skipped_tests": 19
     },
@@ -335,7 +335,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 992,
+      "loc": 978,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -725,7 +725,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 616,
+      "loc": 620,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -764,7 +764,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2116,
+      "loc": 2331,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -777,7 +777,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 485,
+      "loc": 516,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -803,7 +803,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 661,
+      "loc": 582,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -829,7 +829,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3066,
+      "loc": 3150,
       "nosec": 0,
       "skipped_tests": 18
     },
@@ -2900,7 +2900,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1127             )\n1128         if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == \"change-me-to-a-random-64-char-string\"):\n1129             raise ValueError(\n",
+      "code": "1112             )\n1113         if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == \"change-me-to-a-random-64-char-string\"):\n1114             raise ValueError(\n",
       "col_offset": 93,
       "end_col_offset": 131,
       "filename": "backend/app/config.py",
@@ -2911,9 +2911,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 1128,
+      "line_number": 1113,
       "line_range": [
-        1128
+        1113
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
