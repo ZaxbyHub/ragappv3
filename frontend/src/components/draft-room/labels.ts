@@ -47,6 +47,10 @@ export const RETRIEVAL_PARTIAL_WARNING =
 export const EVIDENCE_INVALIDATED_WARNING =
   "Sources changed after fact-checking; run the newsroom again";
 export const SOURCE_DELETED_WARNING = "Source deleted after this revision";
+export const VAULT_ACCESS_REVOKED_WARNING =
+  "You no longer have read access to this project's vault. You can still cancel runs and delete the project.";
+export const ARCHIVED_READ_ONLY_WARNING =
+  "This project is archived and read-only until restored.";
 
 /** Evidence and claim language. SPEC 16.6 forbids "verified true". */
 export const SUPPORTED_BY_EVIDENCE = "Supported by captured evidence";
