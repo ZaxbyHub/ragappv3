@@ -1956,12 +1956,12 @@ class DraftStore:
         try:
             self._locked_draft(draft_id, owner_id, None)
             row = self._db.execute(
-                "SELECT status FROM draft_jobs WHERE id = ? AND draft_id = ?",
+                "SELECT status, job_type FROM draft_jobs WHERE id = ? AND draft_id = ?",
                 (job_id, draft_id),
             ).fetchone()
             if row is None:
                 raise DraftNotFoundError("job not found")
-            status = row[0]
+            status, job_type = row[0], row[1]
             if status in ("completed", "failed", "cancelled"):
                 raise DraftConflictError("job has already finished")
             if status == "pending":
@@ -1975,6 +1975,28 @@ class DraftStore:
                     "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
                     (job_id,),
                 )
+                # A pending compile job is terminated here rather than by the
+                # worker, so nothing else will settle the draft. Enqueue moved
+                # it to 'queued', and 'queued' may only exit to running/failed/
+                # cancelled -- none of which can still happen once the job is
+                # terminal. Without this the draft is permanently stuck and no
+                # HTTP path can compile it again, because 'queued' is not a
+                # compilable status. A running job needs no equivalent: the
+                # pipeline settles the draft itself.
+                if job_type == "compile":
+                    draft_status = self._db.execute(
+                        "SELECT status FROM drafts WHERE id = ?", (draft_id,)
+                    ).fetchone()
+                    if draft_status is not None and draft_status[0] == "queued":
+                        _check_transition(
+                            "draft", "queued", "cancelled",
+                            _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS,
+                        )
+                        self._db.execute(
+                            "UPDATE drafts SET status = 'cancelled', "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (draft_id,),
+                        )
             else:
                 self._db.execute(
                     "UPDATE draft_jobs SET cancel_requested_at = CURRENT_TIMESTAMP "

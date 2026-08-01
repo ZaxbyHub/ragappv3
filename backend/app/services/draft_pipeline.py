@@ -283,11 +283,19 @@ class PipelineDeps:
             ``complete(prompt, logical_mode=..., temperature=..., sensitive=...)``
             and returns the raw response text.
         now: clock, injected so wall-clock budget tests are deterministic.
+        publish: stage-level SSE notification, called as
+            ``publish(event_type, draft_id=..., job_id=..., stage=..., ...)``
+            AFTER the stage transaction commits. SPEC §8.4 lists
+            ``stage_started``/``stage_completed`` as part of the SSE contract;
+            SSE is notification only, so a publish failure must never affect
+            the job. Defaults to a no-op so tests stay deterministic and the
+            pipeline never hard-depends on a bus.
     """
 
     retrieve_sources: Callable[..., Awaitable[Any]]
     complete: Callable[..., Awaitable[str]]
     now: Callable[[], datetime]
+    publish: Callable[..., None] = lambda *a, **k: None
 
 
 def _utcnow() -> datetime:
@@ -380,7 +388,21 @@ def default_deps(*, engine: object | None = None) -> PipelineDeps:
         retrieve_sources=retrieve or _unwired_retrieval,
         complete=_default_complete,
         now=_utcnow,
+        publish=_default_publish,
     )
+
+
+def _default_publish(event_type: str, **fields: Any) -> None:
+    """Publish one stage event on the process-wide Draft Room bus (SPEC §8.4).
+
+    ``build_event`` fails closed on its field allowlist, so an event carrying
+    anything content-bearing raises here and is swallowed by
+    ``_CompileRun._notify`` rather than reaching a subscriber.
+    """
+    from app.services.draft_events import build_event, get_draft_event_bus
+
+    draft_id = int(fields["draft_id"])
+    get_draft_event_bus().publish(draft_id, build_event(event_type, **fields))
 
 
 # ---------------------------------------------------------------------------
@@ -835,6 +857,7 @@ class _CompileRun:
             self._check_deadline()
             await self._check_cancel()
             await asyncio.to_thread(self._db_set_active_stage, stage)
+            self._notify("stage_started", stage=stage)
             await self._run_stage(stage)
 
     async def _run_stage(self, stage: str) -> None:
@@ -1987,9 +2010,47 @@ class _CompileRun:
             semantic_changed,
             prompt,
         )
+        # SPEC §8.4: notify AFTER the stage transaction commits. Content-free —
+        # ids, stage name, attempt and progress only, never manuscript text,
+        # evidence passages, prompt bodies or exception detail.
+        self._notify(
+            "stage_completed",
+            stage=stage,
+            attempt=attempt,
+            progress_percent=self._stage_progress(stage),
+        )
         return _StageOutcome(
             artifact_json=artifact_json, artifact_sha256=artifact_sha256, reused=False
         )
+
+    def _stage_progress(self, stage: str) -> float:
+        """Completion percentage after ``stage``, from its position in the order."""
+        try:
+            index = COMPILE_STAGE_ORDER.index(stage) + 1
+        except ValueError:  # pragma: no cover - stage names are a fixed tuple
+            return 0.0
+        return round(100.0 * index / len(COMPILE_STAGE_ORDER), 2)
+
+    def _notify(self, event_type: str, **fields: Any) -> None:
+        """Publish one content-free SSE notification; never raises (SPEC §8.4).
+
+        SSE is notification only — canonical status always comes from SQLite —
+        so a failing or absent subscriber must never affect the compile.
+        """
+        try:
+            self._deps.publish(
+                event_type,
+                draft_id=self._ctx.draft_id,
+                job_id=self._ctx.job_id,
+                **fields,
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "draft compile: stage event publish failed (job_id=%s event=%s)",
+                self._ctx.job_id,
+                event_type,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Synchronous DB steps. Each opens ONE pooled connection, commits, and
