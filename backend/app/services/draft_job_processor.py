@@ -1,9 +1,12 @@
 """DraftJobProcessor: asyncio background worker that drains ``draft_jobs``.
 
 PR 1 of Draft Room (issue #435, ``specs/draft-room/SPEC.md`` section 10)
-dispatches only ``parse_input`` jobs; ``compile`` dispatch arrives in a later
-issue. Modeled on :class:`app.services.wiki_compile_processor.WikiCompileProcessor`
-but async because later dispatch work awaits model calls.
+dispatched only ``parse_input`` jobs. This module (issue #436) adds ``compile``
+dispatch: it drives :func:`app.services.draft_pipeline.run_compile`, the
+single editorial-pipeline entry point, and owns the job-level policy around
+it (claim, permission recheck, bounded automatic retry, SSE notification).
+Modeled on :class:`app.services.wiki_compile_processor.WikiCompileProcessor`
+but async because dispatch work awaits model calls.
 
 Hard invariants (SPEC section 10.1):
 
@@ -11,26 +14,45 @@ Hard invariants (SPEC section 10.1):
   I/O, or an ``await``. Every DB step acquires a connection via
   ``self._pool.connection()``, does its work, and releases it before the next
   blocking or async step.
-* Claim jobs atomically through ``DraftStore.claim_next_parse_job`` (uses
-  ``BEGIN IMMEDIATE``) so two processors can never double-run a job.
+* Claim jobs atomically through ``DraftStore.claim_next_parse_job`` /
+  ``DraftStore.claim_next_compile_job`` (both use ``BEGIN IMMEDIATE``) so two
+  processors can never double-run a job.
 * Cooperative cancellation is checked before starting extraction and again
   immediately before committing parsed text; observed cancellation discards
-  the extracted text rather than persisting it.
+  the extracted text rather than persisting it. For compile jobs,
+  ``draft_pipeline.run_compile`` performs the equivalent cancellation checks
+  and discards any in-flight provider result itself (SPEC section 10.2); this
+  module never resurrects a job it settles as ``cancelled``.
 * Failure codes are drawn from a small stable set and never carry raw
   exception text, response bodies, request content, manuscript text, prompts,
   headers, or absolute paths.
 * SSE events are published only after the state-changing transaction commits,
   and a publish failure must never fail the job.
+
+Compile retry policy (SPEC section 10.2): ``run_compile`` already exhausts
+its own bounded, stage-level transient retry before ever raising
+``CompileFailure`` (see that module's law #11), and it persists the job's and
+draft's terminal state itself before raising. ``CompileFailure.retryable`` is
+therefore the *job-level* automatic-retry verdict this processor honors: it
+is never re-derived, and a job is never automatically retried when it is
+False (authorization, validation, content-size, provider-policy, and
+hard-budget failures always set it False). When it is True and the failed
+job's ``retry_count`` is still under ``settings.draft_transient_retry_limit``,
+this processor inserts a brand-new child ``compile`` job
+(``parent_job_id``/``attempt_no + 1``/``retry_count + 1``) carrying the same
+request snapshot — mirroring user-initiated retry — rather than mutating the
+terminal job back to pending, which the job state machine forbids.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from app.api.deps import _evaluate_policy
 from app.config import settings
+from app.services import draft_pipeline
 from app.services.document_extraction import DocumentExtractionError
 from app.services.draft_events import build_event, get_draft_event_bus
 from app.services.draft_store import DraftNotFoundError, DraftStore, sha256_text
@@ -45,7 +67,9 @@ logger = logging.getLogger(__name__)
 
 # Stable, machine-readable failure codes this processor may write. No other
 # string may ever reach ``set_job_status``/``set_input_parse_status`` as an
-# error code from this module.
+# error code from this module. Compile-stage failure codes come from
+# ``draft_pipeline.CompileFailure.code`` instead and are passed through
+# unchanged — this module never invents its own compile failure vocabulary.
 CODE_INPUT_PARSE_FAILED = "input_parse_failed"
 CODE_INPUT_FILE_MISSING = "input_file_missing"
 CODE_PARSED_TEXT_LIMIT_EXCEEDED = "parsed_text_limit_exceeded"
@@ -72,6 +96,7 @@ class DraftJobProcessor:
         extraction: "DocumentExtractionService",
         *,
         poll_interval: Optional[float] = None,
+        engine: Optional[Any] = None,
     ) -> None:
         self._pool = pool
         self._storage = storage
@@ -81,11 +106,30 @@ class DraftJobProcessor:
             if poll_interval is not None
             else settings.draft_poll_interval_seconds
         )
+        # The live ``RAGEngine`` singleton (``app.state.rag_engine``), used for
+        # compile dispatch. Optional because current lifespan wiring
+        # constructs ``RAGEngine`` *after* this processor: see
+        # :meth:`set_rag_engine`. While unset, compile retrieval fails closed
+        # with ``retrieval_unavailable`` via ``draft_pipeline.default_deps`` —
+        # it never silently returns an empty successful result.
+        self._engine = engine
         self._running = False
         self._task: Optional[asyncio.Task] = None
         # Strong references to detached background tasks so CPython does not
         # garbage-collect them mid-flight, mirroring WikiCompileProcessor.
         self._bg_tasks: set[asyncio.Task] = set()
+
+    def set_rag_engine(self, engine: Any) -> None:
+        """Wire the live ``RAGEngine`` singleton in after construction.
+
+        ``app.state.rag_engine`` is created after ``DraftJobProcessor`` in the
+        current lifespan startup order, so an integrator calls this once the
+        engine exists (e.g. ``app.state.draft_job_processor.set_rag_engine(
+        app.state.rag_engine)`` right after ``RAGEngine`` is constructed).
+        Safe to call at any time; it only affects the deps built for the next
+        compile dispatch.
+        """
+        self._engine = engine
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -149,6 +193,15 @@ class DraftJobProcessor:
         if reset:
             logger.warning(
                 "DraftJobProcessor: reset %d orphaned parse job(s) to pending", reset
+            )
+
+        with self._pool.connection() as conn:
+            store = DraftStore(conn)
+            compile_reset = store.recover_orphaned_compile_jobs()
+        if compile_reset:
+            logger.warning(
+                "DraftJobProcessor: reset %d orphaned compile job(s) to pending",
+                compile_reset,
             )
 
         with self._pool.connection() as conn:
@@ -250,7 +303,11 @@ class DraftJobProcessor:
 
     def _claim_next_job(self) -> Optional["DraftJobRecord"]:
         with self._pool.connection() as conn:
-            return DraftStore(conn).claim_next_parse_job()
+            store = DraftStore(conn)
+            job = store.claim_next_parse_job()
+            if job is not None:
+                return job
+            return store.claim_next_compile_job()
 
     # ------------------------------------------------------------------
     # Per-job dispatch
@@ -292,9 +349,14 @@ class DraftJobProcessor:
         """
         self._publish_event(job, "job_started", job_id=job.id, status="running")
 
+        if job.job_type == "compile":
+            await self._dispatch_compile_job(job)
+            return
+
         if job.job_type != "parse_input":
-            # PR 1 dispatches only parse_input; anything else here indicates a
-            # store/claim invariant violation, not user input.
+            # Only parse_input and compile are claimed by this processor;
+            # anything else here indicates a store/claim invariant violation,
+            # not user input.
             await self._fail_job(job, code=CODE_INTERNAL_ERROR)
             return
 
@@ -410,6 +472,207 @@ class DraftJobProcessor:
 
         logger.info("DraftJobProcessor: completed job id=%d", job.id)
         self._publish_event(job, "job_completed", job_id=job.id, status="completed")
+
+    # ------------------------------------------------------------------
+    # Per-job dispatch: compile
+    # ------------------------------------------------------------------
+
+    async def _dispatch_compile_job(self, job: "DraftJobRecord") -> None:
+        """Dispatch one claimed ``compile`` job through ``draft_pipeline.run_compile``.
+
+        ``run_compile`` is the sole editorial-pipeline entry point (owned by
+        the pipeline module). It already persists terminal job/draft state
+        (``failed``, ``cancelled``, ``completed``) itself before returning or
+        raising :class:`draft_pipeline.CompileFailure`, so this method never
+        re-derives or double-writes that state. Its only jobs are: the
+        claim-time permission recheck (SPEC section 9.1 rule 4), deciding
+        whether a retryable failure earns a bounded automatic retry (SPEC
+        section 10.2), and publishing the terminal SSE notification.
+        """
+        # Permission re-check (SPEC section 9.1 rule 4): the creating user
+        # must still be active and hold vault `read` right after the claim,
+        # mirroring the parse_input path's first recheck.
+        if not await self._owner_permission_ok(job):
+            await asyncio.to_thread(
+                self._fail_compile_job_sync, job, code=CODE_PERMISSION_REVOKED
+            )
+            self._publish_event(
+                job,
+                "job_failed",
+                job_id=job.id,
+                status="failed",
+                error_code=CODE_PERMISSION_REVOKED,
+                job_type="compile",
+            )
+            return
+
+        deps = draft_pipeline.default_deps(engine=self._engine)
+        try:
+            await draft_pipeline.run_compile(job_id=job.id, pool=self._pool, deps=deps)
+        except draft_pipeline.CompileFailure as failure:
+            if (
+                failure.retryable
+                and job.retry_count < settings.draft_transient_retry_limit
+            ):
+                try:
+                    scheduled = await asyncio.to_thread(
+                        self._schedule_compile_retry_sync, job
+                    )
+                except Exception:
+                    logger.error(
+                        "DraftJobProcessor: compile job id=%d automatic retry "
+                        "scheduling raised unexpectedly",
+                        job.id,
+                    )
+                    scheduled = False
+                if scheduled:
+                    logger.info(
+                        "DraftJobProcessor: scheduled automatic retry for compile "
+                        "job id=%d (retry %d/%d, code=%s)",
+                        job.id,
+                        job.retry_count + 1,
+                        settings.draft_transient_retry_limit,
+                        failure.code,
+                    )
+            # The failed job_id is terminal either way: a scheduled retry is a
+            # brand-new child job (state machine forbids reviving this one),
+            # and it will publish its own job_started/job_completed events
+            # organically when this processor's poll loop claims it.
+            #
+            # A cancellation observed by run_compile settles the job/draft as
+            # cancelled (not failed) and re-raises CompileFailure purely so
+            # its code/retryable are available here; it must never be
+            # retried and must surface as ``job_cancelled``, not
+            # ``job_failed``, so this is the one code that maps to a
+            # different terminal event type.
+            if failure.code == draft_pipeline.CODE_JOB_CANCELLED:
+                self._publish_event(
+                    job,
+                    "job_cancelled",
+                    job_id=job.id,
+                    status="cancelled",
+                    job_type="compile",
+                )
+            else:
+                self._publish_event(
+                    job,
+                    "job_failed",
+                    job_id=job.id,
+                    status="failed",
+                    error_code=failure.code,
+                    job_type="compile",
+                )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Defensive: run_compile's own job boundary already converts every
+            # expected failure into CompileFailure. Anything else reaching
+            # here is a bug in that boundary, not user input; _run_job's outer
+            # net will also catch this, but fail explicitly here first so the
+            # sanitized code (never str(exc)) is the one that gets persisted.
+            logger.error(
+                "DraftJobProcessor: compile job id=%d raised %s outside "
+                "CompileFailure",
+                job.id,
+                type(exc).__name__,
+            )
+            raise
+
+        logger.info("DraftJobProcessor: completed compile job id=%d", job.id)
+        self._publish_event(
+            job, "job_completed", job_id=job.id, status="completed", job_type="compile"
+        )
+
+    def _fail_compile_job_sync(self, job: "DraftJobRecord", *, code: str) -> None:
+        """Fail a compile job before ``run_compile`` ever ran (e.g. permission recheck).
+
+        Mirrors ``draft_pipeline._persist_failure``: sets the job terminal and
+        moves the draft from ``queued``/``running`` to ``failed`` (SPEC
+        section 10.3), since nothing else will settle the draft's state for a
+        job that never reached the pipeline.
+        """
+        with self._pool.connection() as conn:
+            store = DraftStore(conn)
+            try:
+                store.set_job_status(job_id=job.id, target="failed", error_code=code)
+            except Exception:
+                logger.error(
+                    "DraftJobProcessor: could not fail compile job id=%d", job.id
+                )
+            if conn.in_transaction:
+                conn.rollback()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status FROM drafts WHERE id = ?", (job.draft_id,)
+                ).fetchone()
+                if row is not None and row[0] in ("queued", "running"):
+                    conn.execute(
+                        "UPDATE drafts SET status = 'failed', "
+                        "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (job.draft_id,),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def _schedule_compile_retry_sync(self, job: "DraftJobRecord") -> bool:
+        """Insert a bounded automatic-retry child compile job (SPEC section 10.2).
+
+        Runs inside one ``BEGIN IMMEDIATE`` transaction: move the draft back
+        from ``failed`` to ``queued`` (SPEC section 10.3) and insert a new
+        ``pending`` compile job carrying ``parent_job_id``/``attempt_no + 1``/
+        ``retry_count + 1`` and the original request snapshot (``input_json``,
+        ``brief_snapshot_json``, ``model_snapshot_json``,
+        ``prompt_bundle_version``, ``compile_input_sha256``, budgets) — a
+        terminal job is never mutated back to pending, matching how
+        user-initiated retry creates a new job rather than reviving the old
+        one. A fresh child job has no stage checkpoints of its own (they are
+        recorded per ``job_id``), so it reruns the pipeline from Intake;
+        that is safe and still bounded by the same per-job budgets.
+
+        Returns:
+            True if the retry job was inserted; False if the draft was no
+            longer in the expected ``failed`` state (e.g. raced by a manual
+            retry, a delete, or an archive) and no-ops were made instead.
+        """
+        with self._pool.connection() as conn:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status FROM drafts WHERE id = ?", (job.draft_id,)
+                ).fetchone()
+                if row is None or row[0] != "failed":
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    "UPDATE drafts SET status = 'queued', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (job.draft_id,),
+                )
+                conn.execute(
+                    "INSERT INTO draft_jobs ("
+                    "draft_id, vault_id, created_by, job_type, parent_job_id, "
+                    "attempt_no, retry_count, input_json, brief_snapshot_json, "
+                    "model_snapshot_json, prompt_bundle_version, "
+                    "compile_input_sha256, max_model_calls, timeout_seconds"
+                    ") SELECT draft_id, vault_id, created_by, 'compile', id, "
+                    "attempt_no + 1, retry_count + 1, input_json, "
+                    "brief_snapshot_json, model_snapshot_json, "
+                    "prompt_bundle_version, compile_input_sha256, "
+                    "max_model_calls, timeout_seconds "
+                    "FROM draft_jobs WHERE id = ?",
+                    (job.id,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return True
 
     # ------------------------------------------------------------------
     # Synchronous DB/filesystem helpers (each run in a thread; each opens

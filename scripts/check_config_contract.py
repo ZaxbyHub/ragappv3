@@ -53,6 +53,43 @@ def backend_int_default(config_text: str, field_name: str) -> str | None:
     return match.group(1) if match else None
 
 
+def backend_bool_default(config_text: str, field_name: str) -> str | None:
+    """Backend bool default, lowercased to match .env / Compose spelling."""
+    match = re.search(
+        rf"{re.escape(field_name)}:\s*bool\s*=\s*(True|False)",
+        config_text,
+    )
+    return match.group(1).lower() if match else None
+
+
+def backend_float_default(config_text: str, field_name: str) -> str | None:
+    """Backend float default, as written, so 2.0 does not silently match 2."""
+    match = re.search(
+        rf"{re.escape(field_name)}:\s*float\s*=\s*([0-9]+\.?[0-9]*)",
+        config_text,
+    )
+    return match.group(1) if match else None
+
+
+def backend_str_default(config_text: str, field_name: str) -> str | None:
+    match = re.search(
+        rf'{re.escape(field_name)}:\s*str\s*=\s*"([^"]*)"',
+        config_text,
+    )
+    return match.group(1) if match else None
+
+
+def backend_list_default(config_text: str, field_name: str) -> list[str] | None:
+    match = re.search(
+        rf"{re.escape(field_name)}:.*?=\s*\[(?P<body>.*?)\]",
+        config_text,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    return re.findall(r'"([^"]+)"', match.group("body"))
+
+
 def schema_parser_limit_mb(schema_parser_text: str) -> str | None:
     match = re.search(
         r"MAX_FILE_SIZE\s*=\s*(\d+)\s*\*\s*1024\s*\*\s*1024",
@@ -219,6 +256,108 @@ def main() -> int:
         failures.append("frontend path helper no longer reads VITE_APP_BASENAME/BASE_URL")
     if "normalizeViteBase(appBasename)" not in vite_config:
         failures.append("Vite config no longer derives base from normalized basename")
+
+    # Draft Room pipeline settings (issue #436, SPEC.md section 15): every
+    # setting must carry the same default across backend/app/config.py,
+    # .env.example, and docker-compose.yml.
+    draft_int_settings = {
+        "DRAFT_MAX_SECTIONS": "draft_max_sections",
+        "DRAFT_QA_RETRY_LIMIT": "draft_qa_retry_limit",
+        "DRAFT_JOB_TIMEOUT_SECONDS": "draft_job_timeout_seconds",
+        "DRAFT_JOB_MAX_MODEL_CALLS": "draft_job_max_model_calls",
+        "DRAFT_RESEARCH_RETRIEVAL_LIMIT": "draft_research_retrieval_limit",
+        "DRAFT_TRANSIENT_RETRY_LIMIT": "draft_transient_retry_limit",
+        "DRAFT_LINT_REWRITE_LIMIT": "draft_lint_rewrite_limit",
+        # Ingestion/worker limits. These were previously unguarded, so a drift
+        # between config.py, .env.example and docker-compose.yml would not have
+        # failed contract CI.
+        "DRAFT_MAX_INPUTS": "draft_max_inputs",
+        "DRAFT_MAX_TOTAL_INPUT_MB": "draft_max_total_input_mb",
+        "DRAFT_MAX_TOTAL_PARSED_CHARS": "draft_max_total_parsed_chars",
+        "DRAFT_PARSE_TIMEOUT_SECONDS": "draft_parse_timeout_seconds",
+    }
+    for env_name, field_name in draft_int_settings.items():
+        backend_val = backend_int_default(backend_config, field_name)
+        env_val = env_value(env_text, env_name)
+        compose_val = compose_default(compose_text, env_name)
+        if backend_val is None:
+            failures.append(f"backend/app/config.py {field_name} int default could not be parsed")
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
+            )
+
+    # The kill switch and the worker poll interval, guarded so a drift in the
+    # feature flag itself cannot pass contract CI.
+    for env_name, field_name, reader in (
+        ("DRAFT_ROOM_ENABLED", "draft_room_enabled", backend_bool_default),
+        (
+            "DRAFT_POLL_INTERVAL_SECONDS",
+            "draft_poll_interval_seconds",
+            backend_float_default,
+        ),
+    ):
+        backend_val = reader(backend_config, field_name)
+        env_val = env_value(env_text, env_name)
+        compose_val = compose_default(compose_text, env_name)
+        if backend_val is None:
+            failures.append(
+                f"backend/app/config.py {field_name} default could not be parsed"
+            )
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match "
+                f"backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not "
+                f"match backend default {backend_val!r}"
+            )
+
+    draft_str_settings = {
+        "DRAFT_COMPILE_RATE_LIMIT": "draft_compile_rate_limit",
+        "DRAFT_UPLOAD_RATE_LIMIT": "draft_upload_rate_limit",
+        "DRAFT_BOILERPLATE_RULE_VERSION": "draft_boilerplate_rule_version",
+        "DRAFT_DEFAULT_LOGICAL_MODE": "draft_default_logical_mode",
+    }
+    for env_name, field_name in draft_str_settings.items():
+        backend_val = backend_str_default(backend_config, field_name)
+        env_val = env_value(env_text, env_name)
+        compose_val = compose_default(compose_text, env_name)
+        if backend_val is None:
+            failures.append(f"backend/app/config.py {field_name} str default could not be parsed")
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
+            )
+
+    draft_list_settings = {
+        "DRAFT_ALLOWED_MODEL_ORIGINS": "draft_allowed_model_origins",
+        "DRAFT_SENSITIVE_ALLOWED_MODEL_ORIGINS": "draft_sensitive_allowed_model_origins",
+    }
+    for env_name, field_name in draft_list_settings.items():
+        backend_val = backend_list_default(backend_config, field_name)
+        env_val = parse_origins(env_value(env_text, env_name))
+        compose_val = parse_origins(compose_default(compose_text, env_name))
+        if backend_val is None:
+            failures.append(f"backend/app/config.py {field_name} list default could not be parsed")
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
+            )
 
     for message in failures:
         fail(message)

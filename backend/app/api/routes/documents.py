@@ -2096,6 +2096,18 @@ async def _delete_file_record(
         await asyncio.to_thread(
             conn.execute, "DELETE FROM files WHERE id = ?", (file_id,)
         )
+
+        # Draft Room evidence freshness (SPEC section 12.6): a deleted document
+        # invalidates every draft_evidence row citing it. Called after the row
+        # delete and before the commit so the invalidation lands in the *same*
+        # transaction — if the delete rolls back, so does the invalidation.
+        # Best effort by construction: the hook cannot raise into this path.
+        from app.services.draft_evidence_freshness import on_document_changed
+
+        await asyncio.to_thread(
+            on_document_changed, conn, file_id=file_id, new_content_sha256=None
+        )
+
         await asyncio.to_thread(conn.commit)
         logger.info("Deleted document '%s' (id: %d)", file_name, file_id)
 

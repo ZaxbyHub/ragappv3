@@ -1,9 +1,16 @@
 """Citation validation and repair for assistant responses.
 
-Parses ``[S#]`` (document), ``[M#]`` (memory), and ``[W#]`` (wiki) citation
-labels from assistant output, validates them against the available
-source/memory/wiki labels, and repairs or strips invalid references before the
-response is streamed to the client or persisted to chat history.
+Parses ``[S#]`` (document), ``[M#]`` (memory), ``[W#]`` (wiki), ``[K#]``
+(KMS), and ``[D#]`` (Draft Room input) citation labels from assistant/draft
+output, validates them against the available source/memory/wiki/kms/draft
+labels, and repairs or strips invalid references before the response is
+streamed to the client or persisted to chat history.
+
+``[D#]`` (Draft Room project inputs) validates only when an explicit Draft
+input registry is supplied by the caller (``draft_count`` /
+``draft_inputs``); the default registry is empty, so with no registry
+supplied ``[D#]`` is treated as invalid exactly like any other unknown label
+— this preserves existing chat behavior unchanged.
 
 Design goals:
 - Never modify content during token streaming (UX guarantee).
@@ -17,11 +24,12 @@ from __future__ import annotations
 import re
 import string
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-# Match [S<digits>], [M<digits>], [W<digits>], and [K<digits>] anywhere in text.
-# Case-sensitive: S/M/W/K only — lowercase variants are treated as plain text.
-_CITATION_RE = re.compile(r"\[(S|M|W|K)(\d+)\]")
+# Match [S<digits>], [M<digits>], [W<digits>], [K<digits>], and [D<digits>]
+# anywhere in text. Case-sensitive: S/M/W/K/D only — lowercase variants are
+# treated as plain text.
+_CITATION_RE = re.compile(r"\[(S|M|W|K|D)(\d+)\]")
 
 
 @dataclass(frozen=True)
@@ -37,6 +45,9 @@ class CitationValidationResult:
     uncited_factual_warning: bool
     invalid_wiki_citations: Tuple[str, ...] = field(default=())
     invalid_kms_citations: Tuple[str, ...] = field(default=())
+    # [D#] labels rejected because no/insufficient Draft input registry was
+    # supplied (see draft_count on validate_and_repair_citations).
+    invalid_draft_citations: Tuple[str, ...] = field(default=())
     # Per-citation confidence scores [0.0, 1.0] — populated by score_citations().
     citation_confidence: Dict[str, float] = field(default_factory=dict)
     # Answer sentences that have no citation AND low overlap with all sources.
@@ -77,8 +88,9 @@ def validate_and_repair_citations(
     memory_count: int,
     wiki_count: int = 0,
     kms_count: int = 0,
+    draft_count: int = 0,
 ) -> CitationValidationResult:
-    """Validate ``[S#]``, ``[M#]``, ``[W#]``, and ``[K#]`` citations in ``content``.
+    """Validate ``[S#]``, ``[M#]``, ``[W#]``, ``[K#]``, and ``[D#]`` citations in ``content``.
 
     Args:
         content: Complete assistant response text.
@@ -90,6 +102,12 @@ def validate_and_repair_citations(
         kms_count: Number of KMS evidence items available (range K1..KN).
             Defaults to 0 for backward compatibility — K citations will be
             treated as invalid when kms_count is 0.
+        draft_count: Number of Draft Room project inputs available (range
+            D1..DN). Defaults to 0 — with no explicit Draft input registry
+            supplied, [D#] citations are treated as invalid exactly as they
+            were before Draft Room support was added. This keeps existing
+            chat behavior unchanged; only Draft Room call sites should ever
+            pass a non-zero value.
 
     Returns:
         CitationValidationResult with the repaired content, the set of valid
@@ -101,22 +119,25 @@ def validate_and_repair_citations(
             valid_citations=(),
             invalid_citations=(),
             invalid_stripped=False,
-            has_evidence=source_count > 0 or memory_count > 0 or wiki_count > 0 or kms_count > 0,
+            has_evidence=source_count > 0 or memory_count > 0 or wiki_count > 0 or kms_count > 0 or draft_count > 0,
             has_any_citation=False,
             uncited_factual_warning=False,
             invalid_wiki_citations=(),
             invalid_kms_citations=(),
+            invalid_draft_citations=(),
         )
 
     valid_s = _label_set("S", source_count)
     valid_m = _label_set("M", memory_count)
     valid_w = _label_set("W", wiki_count)
     valid_k = _label_set("K", kms_count)
+    valid_d = _label_set("D", draft_count)
 
     valid: List[str] = []
     invalid: List[str] = []
     invalid_wiki: List[str] = []
     invalid_kms: List[str] = []
+    invalid_draft: List[str] = []
 
     def _replacer(match: re.Match) -> str:
         prefix, num = match.group(1), match.group(2)
@@ -126,6 +147,7 @@ def validate_and_repair_citations(
             or (prefix == "M" and label in valid_m)
             or (prefix == "W" and label in valid_w)
             or (prefix == "K" and label in valid_k)
+            or (prefix == "D" and label in valid_d)
         )
         if is_valid:
             valid.append(label)
@@ -135,6 +157,8 @@ def validate_and_repair_citations(
             invalid_wiki.append(label)
         elif prefix == "K":
             invalid_kms.append(label)
+        elif prefix == "D":
+            invalid_draft.append(label)
         # Strip the invalid citation. Leave a single space so words don't merge.
         return ""
 
@@ -151,7 +175,11 @@ def validate_and_repair_citations(
     repaired = repaired.strip()
 
     has_evidence = (
-        source_count > 0 or memory_count > 0 or wiki_count > 0 or kms_count > 0
+        source_count > 0
+        or memory_count > 0
+        or wiki_count > 0
+        or kms_count > 0
+        or draft_count > 0
     )
     has_any_citation = bool(valid)
     uncited_factual_warning = (
@@ -170,6 +198,7 @@ def validate_and_repair_citations(
         uncited_factual_warning=uncited_factual_warning,
         invalid_wiki_citations=tuple(dict.fromkeys(invalid_wiki)),
         invalid_kms_citations=tuple(dict.fromkeys(invalid_kms)),
+        invalid_draft_citations=tuple(dict.fromkeys(invalid_draft)),
     )
 
 
@@ -178,7 +207,9 @@ def parse_citations(content: str) -> Tuple[List[str], List[str]]:
 
     Useful for tests and for trace instrumentation. Order matches first
     occurrence in ``content``. Signature unchanged for backward compatibility.
-    [W#] citations are ignored here — use parse_wiki_citations() instead.
+    [W#], [K#], and [D#] citations are ignored here — use
+    parse_wiki_citations(), parse_kms_citations(), or parse_draft_citations()
+    instead.
     """
     sources: List[str] = []
     memories: List[str] = []
@@ -211,6 +242,24 @@ def parse_kms_citations(content: str) -> List[str]:
             if label not in kms:
                 kms.append(label)
     return kms
+
+
+def parse_draft_citations(content: str) -> List[str]:
+    """Return [D#] labels found in content, deduped, in first-occurrence order.
+
+    Mirrors ``parse_wiki_citations``/``parse_kms_citations`` for symmetry.
+    [D#] labels denote Draft Room project inputs; they carry no special
+    meaning here beyond being parsed — validity still depends on the caller
+    supplying a Draft input registry to ``validate_and_repair_citations`` or
+    ``repair_against_sources_and_memories``.
+    """
+    drafts: List[str] = []
+    for m in _CITATION_RE.finditer(content or ""):
+        if m.group(1) == "D":
+            label = f"D{m.group(2)}"
+            if label not in drafts:
+                drafts.append(label)
+    return drafts
 
 
 def labels_for_sources(sources: Iterable[dict]) -> List[str]:
@@ -454,15 +503,23 @@ def repair_against_sources_and_memories(
     memories: Sequence[dict],
     wiki_evidence: Optional[Sequence[dict]] = None,
     kms_evidence: Optional[Sequence[dict]] = None,
+    draft_inputs: Optional[Sequence[dict]] = None,
 ) -> CitationValidationResult:
-    """Convenience: derive counts from source/memory/wiki/kms dicts, then validate.
+    """Convenience: derive counts from source/memory/wiki/kms/draft dicts, then validate.
 
     Sources are expected to use 1-based ``source_label`` like ``S1``.
     Memories are expected to use 1-based ``memory_label`` like ``M1``.
     Wiki evidence items are expected to use 1-based ``wiki_label`` like ``W1``.
     KMS evidence items are expected to use 1-based ``kms_label`` like ``K1``.
-    Counts default to the maximum index assigned across the inputs so
-    sparse labelings (e.g. only S2 and S4) still validate correctly.
+    ``draft_inputs`` items are expected to use 1-based ``draft_label`` like
+    ``D1``; this is an opt-in Draft Room registry. Counts default to the
+    maximum index assigned across the inputs so sparse labelings (e.g. only
+    S2 and S4) still validate correctly.
+
+    ``draft_inputs`` defaults to ``None`` (no Draft input registry), which
+    yields ``draft_count=0`` and preserves existing chat behavior — [D#]
+    citations remain invalid unless a caller explicitly supplies
+    ``draft_inputs``.
     """
 
     def _max_index(items: Sequence[dict], prefix: str, key: str) -> int:
@@ -479,6 +536,7 @@ def repair_against_sources_and_memories(
 
     wiki_count = _max_index(wiki_evidence or [], "W", "wiki_label")
     kms_count = _max_index(kms_evidence or [], "K", "kms_label")
+    draft_count = _max_index(draft_inputs or [], "D", "draft_label")
 
     return validate_and_repair_citations(
         content,
@@ -486,7 +544,55 @@ def repair_against_sources_and_memories(
         memory_count=_max_index(memories, "M", "memory_label"),
         wiki_count=wiki_count,
         kms_count=kms_count,
+        draft_count=draft_count,
     )
+
+
+def calculate_citation_lexical_overlap(
+    content: str,
+    passages_by_label: Mapping[str, str],
+) -> Dict[str, float]:
+    """Compute per-citation LEXICAL OVERLAP ONLY between claims and passages.
+
+    For each citation label present in ``passages_by_label`` (e.g. Draft Room
+    ``[D#]`` labels), this finds the first sentence in ``content`` that
+    contains that label and computes the Jaccard token overlap between that
+    sentence and the labeled passage text.
+
+    This is purely a lexical (word-overlap) measurement. It is NOT support,
+    NOT confidence, NOT correctness, and NOT entailment, and it MUST NEVER be
+    used as a claim verdict (e.g. to decide "supported"/"unsupported"/
+    "contradicted"). It only answers whether nearby claim words overlap the
+    labeled passage's words — nothing about whether the passage actually
+    substantiates the claim.
+
+    Args:
+        content: Complete text containing citation labels such as "[D1]".
+        passages_by_label: Mapping from citation label (e.g. "D1") to the
+            full passage text associated with that label.
+
+    Returns:
+        dict mapping label -> Jaccard overlap score in [0.0, 1.0], for every
+        label in ``passages_by_label`` that is actually cited in ``content``.
+        Labels with no citation in ``content`` are omitted.
+    """
+    if not content or not passages_by_label:
+        return {}
+
+    label_to_sentence: Dict[str, str] = {}
+    for sentence in _split_sentences(content):
+        for match in _CITATION_RE.finditer(sentence):
+            label = f"{match.group(1)}{match.group(2)}"
+            if label not in label_to_sentence:
+                label_to_sentence[label] = sentence
+
+    scores: Dict[str, float] = {}
+    for label, passage in passages_by_label.items():
+        claim_sentence = label_to_sentence.get(label)
+        if not claim_sentence:
+            continue
+        scores[label] = _sentence_overlap(claim_sentence, passage or "")
+    return scores
 
 
 __all__ = [
@@ -495,9 +601,11 @@ __all__ = [
     "parse_citations",
     "parse_wiki_citations",
     "parse_kms_citations",
+    "parse_draft_citations",
     "labels_for_sources",
     "labels_for_memories",
     "repair_against_sources_and_memories",
     "score_citations",
+    "calculate_citation_lexical_overlap",
     "UNVERIFIABLE_THRESHOLD",
 ]

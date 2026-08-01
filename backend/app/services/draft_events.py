@@ -13,8 +13,8 @@ Design constraints from ``specs/draft-room/SPEC.md`` section 8.4:
   refetch. Never treat delivery as proof that work completed, and never promise
   event replay.
 * Each subscriber queue is bounded at :data:`_QUEUE_MAX` events. When a slow
-  consumer fills its queue, low-value ``stage_progress``/``heartbeat`` events
-  are dropped to make room, and room is always made for a terminal event.
+  consumer fills its queue, low-value ``stage_progress`` events are dropped
+  to make room, and room is always made for a terminal event.
 * Payloads carry identifiers, stage names, progress numbers, and short
   summaries **only**. They must never carry manuscript text, evidence passages,
   prompts, draft content, storage paths, or secrets. :func:`build_event`
@@ -39,6 +39,18 @@ logger = logging.getLogger(__name__)
 _QUEUE_MAX = 100
 
 # The complete set of event types this bus may carry (SPEC section 8.4).
+#
+# ``stage_progress`` and ``finding_created`` are allowlisted but currently
+# unpublished by any producer (issue #436 reviewer finding 3): no caller emits
+# them today. ``stage_progress`` is kept because it is exercised directly
+# against the bus in tests exercising the droppable-queue contract, and
+# ``finding_created`` is kept because it is a cheap, genuinely useful signal
+# for a future publisher outside this module's ownership to wire up. Neither
+# should be read as "this fires today" — check for an actual publish call
+# before relying on either reaching a subscriber. (A previously-allowlisted
+# ``heartbeat`` type was removed together with the unused
+# ``draft_heartbeat_interval_seconds``/``draft_orphan_recovery_seconds``
+# settings, since nothing ever published it either.)
 EVENT_TYPES: frozenset[str] = frozenset(
     {
         "subscribed",
@@ -50,7 +62,6 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "job_completed",
         "job_failed",
         "job_cancelled",
-        "heartbeat",
     }
 )
 
@@ -60,10 +71,9 @@ _TERMINAL_EVENT_TYPES: frozenset[str] = frozenset(
     {"job_completed", "job_failed", "job_cancelled"}
 )
 
-# Events safe to discard first when a slow consumer's queue is full. Both are
-# purely advisory: progress is re-derivable from the database and a missed
-# heartbeat only delays liveness detection.
-_DROPPABLE_EVENT_TYPES: frozenset[str] = frozenset({"stage_progress", "heartbeat"})
+# Events safe to discard first when a slow consumer's queue is full. Purely
+# advisory: progress is re-derivable from the database.
+_DROPPABLE_EVENT_TYPES: frozenset[str] = frozenset({"stage_progress"})
 
 # Field allowlist for event payloads. Anything not named here is rejected by
 # build_event, so a future caller cannot accidentally widen the SSE surface to
@@ -78,6 +88,9 @@ _ALLOWED_PAYLOAD_FIELDS: frozenset[str] = frozenset(
         "job_type",
         "status",
         "stage",
+        # Stage retry counter. Content-free (a small integer) and needed so a
+        # subscriber can tell a first attempt from a retry of the same stage.
+        "attempt",
         "progress_percent",
         "error_code",
         "severity",
@@ -199,7 +212,7 @@ class DraftEventBus:
     ) -> None:
         """Make room in a full subscriber queue, or drop the incoming event.
 
-        A droppable (progress/heartbeat) event is simply discarded — the client
+        A droppable (progress) event is simply discarded — the client
         refetches canonical state anyway. Anything else evicts the oldest queued
         item so the newer, more meaningful event survives.
         """

@@ -611,6 +611,23 @@ async def lifespan(app: FastAPI):
     app.state.kms_retrieval = KMSRetrievalService(pool=app.state.db_pool)
     logger.info("KMSRetrievalService initialized")
 
+    # Draft Room Ready-evidence reconciler (SPEC section 12.6). Runs BEFORE any
+    # job processor starts and before HTTP traffic is served, so an out-of-band
+    # or database-only source deletion cannot leave a draft sitting in Ready on
+    # stale evidence. Bounded and paginated; never fatal to startup.
+    try:
+        from app.services.draft_evidence_freshness import reconcile_ready_evidence
+
+        await _safe_await(
+            reconcile_ready_evidence(app.state.db_pool),
+            "Draft Room Ready-evidence reconcile",
+            timeout=30,
+        )
+    except Exception as e:
+        logger.warning(
+            "Draft Room Ready-evidence reconcile failed (continuing): %s", e
+        )
+
     # Start WikiCompileProcessor (background wiki job worker)
     try:
         app.state.wiki_compile_processor = WikiCompileProcessor(pool=app.state.db_pool)
@@ -672,6 +689,14 @@ async def lifespan(app: FastAPI):
         instant_client=app.state.instant_llm_client,
     )
     logger.info("RAGEngine singleton initialized with wiki retrieval")
+
+    # Hand the engine to the Draft Room worker. DraftJobProcessor is started
+    # above, before RAGEngine exists, so compile retrieval can only be wired
+    # here. Without this call the worker keeps its fail-closed retrieval stub
+    # and every compile job would end in retrieval_unavailable.
+    if getattr(app.state, "draft_job_processor", None):
+        app.state.draft_job_processor.set_rag_engine(app.state.rag_engine)
+        logger.info("DraftJobProcessor wired to RAGEngine for compile retrieval")
 
     # Start memory embedding backfill as a non-blocking background task.
     # Memories created before the embedding column existed (or with a stale model)

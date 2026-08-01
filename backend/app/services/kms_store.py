@@ -274,6 +274,12 @@ class KMSStore:
         )
         if cur.rowcount == 0:
             return None
+        if "body" in updates:
+            # SPEC section 12.6: an entry-body change invalidates Draft Room
+            # evidence rows carrying this kms_entry_id. Best effort, cannot raise.
+            from app.services.draft_evidence_freshness import on_kms_entry_changed
+
+            on_kms_entry_changed(self._db, entry_id=entry_id, new_body=updates["body"])
         self._db.commit()
         return self.get_entry(entry_id)
 
@@ -281,6 +287,11 @@ class KMSStore:
         cur = self._db.execute(
             "DELETE FROM kms_entries WHERE id = ? AND vault_id = ?", (entry_id, vault_id)
         )
+        if cur.rowcount > 0:
+            # SPEC section 12.6 (best effort, cannot raise).
+            from app.services.draft_evidence_freshness import on_kms_entry_changed
+
+            on_kms_entry_changed(self._db, entry_id=entry_id, new_body=None)
         self._db.commit()
         return cur.rowcount > 0
 

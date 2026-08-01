@@ -1,11 +1,23 @@
 """Retrieval-augmented generation engine orchestration."""
 
 import asyncio
+import hashlib
 import logging
 import re
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    FrozenSet,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+)
 
 from app.config import settings
 from app.models.chat_mode import ChatMode
@@ -74,6 +86,64 @@ def _estimate_tokens(text: str) -> int:
 
 class RAGEngineError(Exception):
     """Raised when the RAG engine cannot complete a query."""
+
+
+# ---------------------------------------------------------------------------
+# Public multi-kind retrieval seam (SPEC §4.4, Draft Room issue #436).
+#
+# NAMING NOTE: SPEC §4.4 calls the discriminated union ``RAGSource``. That name
+# is already taken by ``document_retrieval.RAGSource`` (the document-chunk
+# dataclass used ~15x throughout this module and by context_distiller.py), so
+# reusing it here would break chat retrieval. The union below is therefore
+# named ``RetrievedSource`` — everything else in §4.4 is implemented verbatim.
+# ---------------------------------------------------------------------------
+
+RAGSourceKind = Literal["document", "wiki", "kms"]
+
+_ALL_RAG_SOURCE_KINDS: FrozenSet[RAGSourceKind] = frozenset({"document", "wiki", "kms"})
+
+
+def _sha256_text(text: str) -> str:
+    """Hex SHA-256 digest of ``text``.
+
+    Deliberately duplicated (not imported) from ``draft_store.sha256_text`` —
+    ``rag_engine`` must not import ``draft_store`` (layering inversion).
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class RetrievedSource:
+    """A single piece of retrieved evidence from ``retrieve_sources``.
+
+    Discriminated by ``kind``; exactly one identity family is populated:
+    ``document`` -> ``file_id`` + ``chunk_uid``; ``wiki`` -> ``wiki_page_id``
+    (+ optional ``wiki_claim_id``); ``kms`` -> ``kms_entry_id``.
+    """
+
+    kind: RAGSourceKind
+    title: str
+    passage: str  # exact retrieved text — never truncated/summarized
+    score: float  # retrieval score — NOT a support/confidence signal
+    content_sha256: str
+    updated_at: Optional[str]
+    file_id: Optional[int] = None
+    chunk_uid: Optional[str] = None
+    wiki_page_id: Optional[int] = None
+    wiki_claim_id: Optional[int] = None
+    kms_entry_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RAGRetrievalResult:
+    """Result of a multi-kind ``retrieve_sources`` call."""
+
+    status: Literal["ok", "partial", "unavailable"]
+    sources: Tuple[RetrievedSource, ...]
+    requested_kinds: FrozenSet[RAGSourceKind]
+    successful_kinds: FrozenSet[RAGSourceKind]
+    failed_kinds: FrozenSet[RAGSourceKind]
+    source_only: bool  # True ONLY when every requested kind succeeded AND zero sources
 
 
 _ENTITY_LOOKUP_PATTERNS = re.compile(
@@ -2819,38 +2889,23 @@ class RAGEngine:
     # Retrieval-only query (used by LiveEvalAdapter)
     # ------------------------------------------------------------------
 
-    async def query_retrieve_only(
-        self,
-        query: str,
-        vault_id: Optional[int] = None,
-        top_k: Optional[int] = None,
-    ) -> List[str]:
-        """Return the ordered list of retrieved file_ids for a query.
+    async def _build_query_embeddings(
+        self, query: str
+    ) -> Tuple[List[Tuple[str, List[float]]], List[str]]:
+        """Build (variant_type, embedding) pairs for ``query`` (shared helper).
 
-        This method short-circuits the full RAG pipeline — it performs
-        embedding, vector/keyword search, fusion, reranking, and relevance
-        filtering, but skips LLM generation, citation parsing, and distillation.
-        The result is the ranked list of file_ids the live pipeline would
-        retrieve for the given query.
-
-        Used by ``LiveEvalAdapter.run_live`` to drive retrieval-quality
-        benchmarks without requiring a full end-to-end RAG run.
-
-        Args:
-            query: Natural-language query string.
-            vault_id: Optional vault scope. When None the query is unscoped.
-            top_k: Maximum number of file_ids to return. Defaults to
-                ``self.retrieval_top_k``.
+        Genuinely shared logic factored out of ``query_retrieve_only`` so
+        ``retrieve_sources`` can reuse the exact same query-transformation /
+        embedding behavior. Preserves the original fatal/degrade split:
+        an *original*-variant embedding failure (or zero surviving variants)
+        raises ``RAGEngineError`` uncaught; other variant failures degrade
+        (logged, appended to the returned ``variants_dropped`` list).
 
         Returns:
-            Ordered list of file_ids (rank 1 = most relevant per the live
-            retrieval pipeline scoring).
+            ``(query_embeddings, variants_dropped)``.
         """
         from app.services.query_transformer import is_followup_query
 
-        effective_top_k = top_k if top_k is not None else self.retrieval_top_k
-
-        # Build query embeddings (same logic as query() but simplified)
         transformed_queries: List[Tuple[str, str]] = [("original", query)]
 
         skip_followup_rewrite = is_followup_query(query)
@@ -2896,6 +2951,43 @@ class RAGEngine:
 
         if not query_embeddings:
             raise RAGEngineError("Unable to encode any query variants")
+
+        return query_embeddings, variants_dropped
+
+    async def query_retrieve_only(
+        self,
+        query: str,
+        vault_id: Optional[int] = None,
+        top_k: Optional[int] = None,
+    ) -> List[str]:
+        """Return the ordered list of retrieved file_ids for a query.
+
+        This method short-circuits the full RAG pipeline — it performs
+        embedding, vector/keyword search, fusion, reranking, and relevance
+        filtering, but skips LLM generation, citation parsing, and distillation.
+        The result is the ranked list of file_ids the live pipeline would
+        retrieve for the given query.
+
+        Used by ``LiveEvalAdapter.run_live`` to drive retrieval-quality
+        benchmarks without requiring a full end-to-end RAG run.
+
+        Args:
+            query: Natural-language query string.
+            vault_id: Optional vault scope. When None the query is unscoped.
+            top_k: Maximum number of file_ids to return. Defaults to
+                ``self.retrieval_top_k``.
+
+        Returns:
+            Ordered list of file_ids (rank 1 = most relevant per the live
+            retrieval pipeline scoring).
+        """
+        effective_top_k = top_k if top_k is not None else self.retrieval_top_k
+
+        # Build query embeddings (shared with retrieve_sources' document
+        # adapter). An original-query embedding failure (or zero surviving
+        # variants) raises RAGEngineError here, uncaught — preserved exactly
+        # as before this method was factored apart.
+        query_embeddings, variants_dropped = await self._build_query_embeddings(query)
 
         # Execute retrieval (reuse internal method)
         effective_alpha = self.hybrid_alpha
@@ -2944,3 +3036,297 @@ class RAGEngine:
 
         # Return ordered file_ids
         return [src.file_id for src in relevant_chunks[:effective_top_k] if src.file_id]
+
+    # ------------------------------------------------------------------
+    # Public multi-kind retrieval seam (SPEC §4.4, Draft Room issue #436)
+    # ------------------------------------------------------------------
+
+    async def _retrieve_document_sources_for_kinds(
+        self, query: str, vault_id: int, limit: int
+    ) -> List[RAGSource]:
+        """Full document-retrieval flow for ``retrieve_sources``' 'document' kind.
+
+        Reuses ``_build_query_embeddings`` (the part genuinely shared with
+        ``query_retrieve_only``) then runs the same vector/hybrid search +
+        visibility filtering + relevance filtering. Unlike
+        ``query_retrieve_only``, this raises on ANY failure (embedding,
+        search, or filtering) — ``retrieve_sources`` is responsible for
+        catching that and recording the 'document' kind as failed rather
+        than silently returning an empty successful list.
+        """
+        query_embeddings, variants_dropped = await self._build_query_embeddings(query)
+
+        effective_alpha = self.hybrid_alpha
+        indexed_file_ids: Optional[Set[str]] = None
+        try:
+            indexed_file_ids = await asyncio.to_thread(
+                self._get_indexed_file_ids, vault_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "retrieve_sources: failed to fetch indexed_file_ids "
+                "(visibility filter disabled): %s",
+                exc,
+            )
+
+        vector_results, _, _, _, _, _, _, _, _, _, _ = await self._execute_retrieval(
+            query_embeddings,
+            query,
+            vault_id,
+            effective_alpha=effective_alpha,
+            variants_dropped=variants_dropped,
+        )
+
+        if indexed_file_ids is not None:
+            vector_results = [
+                r for r in vector_results
+                if r.get("file_id") in indexed_file_ids
+            ]
+
+        self._sync_document_retrieval_settings()
+        relevant_chunks = await self.document_retrieval.filter_relevant(
+            vector_results,
+            reranked=False,
+            indexed_file_ids=indexed_file_ids,
+        )
+        return relevant_chunks[:limit]
+
+    def _document_chunk_to_retrieved_source(
+        self, chunk: RAGSource
+    ) -> Optional[RetrievedSource]:
+        """Map a ``document_retrieval.RAGSource`` chunk to ``RetrievedSource``.
+
+        ``chunk_uid`` is derived exactly the way
+        ``DocumentRetrievalService.to_source_metadata`` derives its wire-facing
+        ``id`` field: prefer the persisted chunk id stored in metadata
+        (``_chunk_id`` / ``chunk_uid``), else fall back to the same
+        ``{file_id}_{chunk_scale}_{chunk_index}`` / ``{file_id}_{chunk_index}``
+        scheme. A chunk with no derivable file_id, chunk_uid, or passage text
+        is treated as unusable evidence and skipped (returns ``None``) rather
+        than inventing an identity.
+        """
+        if not chunk.file_id:
+            return None
+        try:
+            file_id = int(chunk.file_id)
+        except (TypeError, ValueError):
+            return None
+
+        metadata = chunk.metadata or {}
+        stored_chunk_id = metadata.get("_chunk_id") or metadata.get("chunk_uid")
+        if stored_chunk_id:
+            chunk_uid = str(stored_chunk_id)
+        else:
+            chunk_index = metadata.get("chunk_index", "")
+            chunk_scale = metadata.get("chunk_scale", "")
+            if chunk_scale:
+                chunk_uid = f"{chunk.file_id}_{chunk_scale}_{chunk_index}"
+            else:
+                chunk_uid = f"{chunk.file_id}_{chunk_index}"
+        if not chunk_uid:
+            return None
+
+        passage = metadata.get("raw_text") or chunk.text
+        if not passage:
+            return None
+
+        title = (
+            metadata.get("source_file")
+            or metadata.get("filename")
+            or metadata.get("section_title")
+            or "Unknown document"
+        )
+
+        return RetrievedSource(
+            kind="document",
+            title=title,
+            passage=passage,
+            score=chunk.score,
+            content_sha256=_sha256_text(passage),
+            updated_at=metadata.get("processed_at"),
+            file_id=file_id,
+            chunk_uid=chunk_uid,
+        )
+
+    def _wiki_evidence_to_retrieved_source(self, ev: Any) -> Optional[RetrievedSource]:
+        """Map a ``wiki_retrieval.WikiEvidence`` record to ``RetrievedSource``.
+
+        ``WikiEvidence`` uses ``page_id``/``claim_id`` — mapped explicitly to
+        ``wiki_page_id``/``wiki_claim_id``. Claim-level evidence uses the exact
+        claim text as the passage; page-level evidence (``claim_id is None``)
+        uses the page excerpt/summary.
+        """
+        passage = ev.claim_text if (ev.claim_id and ev.claim_text) else ev.excerpt
+        if not passage:
+            return None
+        return RetrievedSource(
+            kind="wiki",
+            title=ev.title,
+            passage=passage,
+            score=ev.score,
+            content_sha256=_sha256_text(passage),
+            updated_at=ev.freshness,
+            wiki_page_id=ev.page_id,
+            wiki_claim_id=ev.claim_id,
+        )
+
+    def _kms_evidence_to_retrieved_source(self, ev: Any) -> Optional[RetrievedSource]:
+        """Map a ``kms_retrieval.KMSEvidence`` record to ``RetrievedSource``.
+
+        ``KMSEvidence`` uses ``entry_id`` — mapped explicitly to
+        ``kms_entry_id``. ``KMSEvidence`` carries no update/freshness
+        timestamp field today, so ``updated_at`` is honestly ``None`` rather
+        than a fabricated value.
+        """
+        passage = ev.excerpt or ev.summary
+        if not passage:
+            return None
+        return RetrievedSource(
+            kind="kms",
+            title=ev.title,
+            passage=passage,
+            score=ev.score,
+            content_sha256=_sha256_text(passage),
+            updated_at=None,
+            kms_entry_id=ev.entry_id,
+        )
+
+    async def retrieve_sources(
+        self,
+        query: str,
+        vault_id: int,
+        *,
+        limit: int,
+        source_kinds: Optional[Set[RAGSourceKind]] = None,
+    ) -> RAGRetrievalResult:
+        """Public multi-kind retrieval seam for Draft Room (SPEC §4.4).
+
+        Retrieves document, wiki, and/or KMS evidence for ``query`` within
+        ``vault_id``. Never includes chat memory, Draft inputs, deleted
+        sources, unauthorized sources, or other vaults — those exclusions
+        hold structurally: memory retrieval is a separate code path never
+        invoked here, Draft inputs are a Draft Room-only concept this engine
+        has no access to, and document/wiki/KMS adapters are already
+        vault-scoped by construction (see ``_execute_retrieval``,
+        ``WikiRetrievalService.retrieve``, ``KMSRetrievalService.retrieve``).
+
+        Each requested kind is attempted independently. A failure (exception,
+        timeout, missing index/adapter) for a kind is recorded in
+        ``failed_kinds`` — it is NEVER converted into an empty successful
+        result for that kind.
+
+        ``source_only=True`` is only set when every requested kind succeeded
+        and zero authorized sources were returned across all of them.
+
+        Raises:
+            ValueError: if ``source_kinds`` is empty or contains a value
+                outside ``{"document", "wiki", "kms"}``.
+        """
+        requested: FrozenSet[RAGSourceKind] = (
+            frozenset(source_kinds) if source_kinds is not None else _ALL_RAG_SOURCE_KINDS
+        )
+        if not requested or not requested <= _ALL_RAG_SOURCE_KINDS:
+            raise ValueError(
+                f"retrieve_sources: source_kinds must be a non-empty subset of "
+                f"{sorted(_ALL_RAG_SOURCE_KINDS)}, got {source_kinds!r}"
+            )
+
+        successful_kinds: Set[RAGSourceKind] = set()
+        failed_kinds: Set[RAGSourceKind] = set()
+        sources: List[RetrievedSource] = []
+
+        if "document" in requested:
+            try:
+                doc_chunks = await self._retrieve_document_sources_for_kinds(
+                    query, vault_id, limit
+                )
+            except Exception as exc:
+                logger.warning("retrieve_sources: document retrieval failed: %s", exc)
+                failed_kinds.add("document")
+            else:
+                successful_kinds.add("document")
+                for chunk in doc_chunks:
+                    mapped = self._document_chunk_to_retrieved_source(chunk)
+                    if mapped is not None:
+                        sources.append(mapped)
+
+        if "wiki" in requested:
+            if self._wiki_retrieval is None or vault_id is None:
+                logger.warning("retrieve_sources: wiki adapter not configured")
+                failed_kinds.add("wiki")
+            else:
+                try:
+                    wiki_evidence = await asyncio.to_thread(
+                        self._wiki_retrieval.retrieve, query, vault_id
+                    )
+                except Exception as exc:
+                    logger.warning("retrieve_sources: wiki retrieval failed: %s", exc)
+                    failed_kinds.add("wiki")
+                else:
+                    successful_kinds.add("wiki")
+                    for ev in wiki_evidence[:limit]:
+                        mapped = self._wiki_evidence_to_retrieved_source(ev)
+                        if mapped is not None:
+                            sources.append(mapped)
+
+        if "kms" in requested:
+            if (
+                self._kms_retrieval is None
+                or vault_id is None
+                or not settings.kms_enabled
+            ):
+                logger.warning("retrieve_sources: kms adapter not configured/enabled")
+                failed_kinds.add("kms")
+            else:
+                try:
+                    kms_evidence = await asyncio.to_thread(
+                        self._kms_retrieval.retrieve, query, vault_id
+                    )
+                except Exception as exc:
+                    logger.warning("retrieve_sources: kms retrieval failed: %s", exc)
+                    failed_kinds.add("kms")
+                else:
+                    successful_kinds.add("kms")
+                    for ev in kms_evidence[:limit]:
+                        mapped = self._kms_evidence_to_retrieved_source(ev)
+                        if mapped is not None:
+                            sources.append(mapped)
+
+        if failed_kinds == requested:
+            status: Literal["ok", "partial", "unavailable"] = "unavailable"
+        elif failed_kinds:
+            status = "partial"
+        else:
+            status = "ok"
+
+        source_only = not failed_kinds and not sources
+
+        return RAGRetrievalResult(
+            status=status,
+            sources=tuple(sources),
+            requested_kinds=requested,
+            successful_kinds=frozenset(successful_kinds),
+            failed_kinds=frozenset(failed_kinds),
+            source_only=source_only,
+        )
+
+
+# ---------------------------------------------------------------------------
+# ``retrieve_sources`` is deliberately NOT re-exported as a module-level
+# function. The implementation needs engine-scoped state (vector_store,
+# embedding_service, document/wiki/KMS adapters), and the live engine is
+# owned by the application at ``app.state.rag_engine`` (see
+# ``app/api/deps.py::get_rag_engine``), so a module-level function could not
+# reach it without constructing a second, independent RAG engine — which
+# SPEC §4.3 prohibits.
+#
+# A bare ``retrieve_sources = RAGEngine.retrieve_sources`` alias would be
+# actively misleading: it is an *unbound* function, so a caller following the
+# SPEC §4.4 signature (``retrieve_sources(query, vault_id, limit=...)``)
+# would silently bind ``query`` to ``self``.
+#
+# Draft Room therefore consumes the BOUND method through injection:
+# ``PipelineDeps.retrieve_sources = engine.retrieve_sources``, which has
+# exactly the SPEC §4.4 signature and lets tests substitute a deterministic
+# fake without touching the engine.
+# ---------------------------------------------------------------------------
