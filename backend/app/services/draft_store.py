@@ -3455,6 +3455,29 @@ class DraftStore:
             self._db.rollback()
             raise
 
+    def _settle_draft_after_lost_compile_locked(
+        self, draft_id: int, target: str
+    ) -> None:
+        """Move a draft off ``queued``/``running`` when its compile is gone.
+
+        Caller must already hold the transaction. Only acts when the draft is
+        actually parked on a compile-lifecycle status, so a draft that has
+        already moved on is left untouched.
+        """
+        row = self._db.execute(
+            "SELECT status FROM drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if row is None or row[0] not in ("queued", "running"):
+            return
+        _check_transition(
+            "draft", row[0], target, _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS
+        )
+        self._db.execute(
+            "UPDATE drafts SET status = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = ?",
+            (target, draft_id),
+        )
+
     def recover_orphaned_compile_jobs(self) -> int:
         """Return crashed ``running`` compile jobs to ``pending`` at startup.
 
@@ -3469,18 +3492,28 @@ class DraftStore:
         self._begin_immediate()
         try:
             rows = self._db.execute(
-                "SELECT id, cancel_requested_at FROM draft_jobs "
+                "SELECT id, draft_id, cancel_requested_at FROM draft_jobs "
                 "WHERE status = 'running' AND job_type = 'compile'"
             ).fetchall()
             reset = 0
             for row in rows:
-                job_id, cancel_requested_at = int(row[0]), row[1]
+                job_id, draft_id = int(row[0]), int(row[1])
+                cancel_requested_at = row[2]
                 self._mark_abandoned_stages_worker_restart_locked(job_id)
                 if cancel_requested_at is not None:
                     self._db.execute(
                         "UPDATE draft_jobs SET status = 'cancelled', "
                         "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
                         (job_id,),
+                    )
+                    # The worker died before it could observe the cancellation,
+                    # so the pipeline never settled the draft. Without this the
+                    # draft stays on 'queued', whose only exits are
+                    # running/failed/cancelled -- none of which can still
+                    # happen -- leaving it permanently uncompilable and
+                    # unarchivable. Same dead end as the pending-cancel case.
+                    self._settle_draft_after_lost_compile_locked(
+                        draft_id, "cancelled"
                     )
                     continue
                 self._db.execute(

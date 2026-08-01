@@ -299,8 +299,27 @@ def _classify(conn: sqlite3.Connection, ev: DraftEvidenceIdentity) -> Optional[s
     live = resolver(conn, ev)
     if not live.exists:
         return SOURCE_DELETED
-    if live.content_sha256 is not None and live.content_sha256 != ev.source_content_sha256:
-        return EVIDENCE_CHANGED
+    if live.content_sha256 is not None:
+        # The canonical content hash is the authoritative change signal. When
+        # it matches, the source text is byte-identical and the evidence is
+        # current by definition — a differing timestamp then means the row was
+        # merely touched, not that what it says changed.
+        #
+        # The timestamps are deliberately NOT compared in that case. They come
+        # from two different places: source_updated_at is captured at retrieval
+        # time from index metadata, while live.updated_at is a database column,
+        # so they can disagree in value and format while the content is
+        # identical. Treating that as a change would raise a permanent,
+        # non-waivable evidence_changed blocker on unmodified sources and make
+        # Ready unreachable — the same false-positive failure mode that the
+        # passage-versus-whole-source hash bug produced.
+        return (
+            EVIDENCE_CHANGED
+            if live.content_sha256 != ev.source_content_sha256
+            else None
+        )
+    # No derivable content hash: update metadata is the only available signal,
+    # so fall back to it and fail closed on any difference.
     if (
         ev.source_updated_at is not None
         and live.updated_at is not None

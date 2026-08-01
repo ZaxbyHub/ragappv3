@@ -164,6 +164,7 @@ CODE_SECTION_BUDGET_EXCEEDED = "section_budget_exceeded"
 CODE_MODEL_CALL_BUDGET_EXCEEDED = "model_call_budget_exceeded"
 CODE_JOB_TIMEOUT = "job_timeout"
 CODE_INVALID_STAGE_OUTPUT = "invalid_stage_output"
+CODE_EVIDENCE_CHANGED = "evidence_changed"
 CODE_FACT_MUTATED_CANDIDATE = "fact_mutated_candidate"
 CODE_ASSEMBLE_WITHOUT_FACT = "assemble_without_fact"
 CODE_ASSEMBLE_HASH_MISMATCH = "assemble_candidate_hash_mismatch"
@@ -1890,6 +1891,14 @@ class _CompileRun:
 
         candidate = self._candidate
         candidate_sha = sha256_text(candidate)
+        # SPEC §12.6: the evidence re-resolution runs BEFORE Assemble as well
+        # as inside Ready — "mandatory defense in depth even when a mutation
+        # hook ran". The hooks cannot cover an in-flight compile: they look up
+        # the draft's CURRENT revision, and a running job has none yet, so a
+        # source deleted or edited between Research and Assemble would
+        # otherwise be stored as fact-current and labelled "passed" in every
+        # export until someone tried to mark it Ready.
+        await asyncio.to_thread(self._db_assert_evidence_current)
         if candidate_sha != self._fact_candidate_sha256:
             raise CompileFailure(
                 CODE_ASSEMBLE_HASH_MISMATCH,
@@ -1946,9 +1955,12 @@ class _CompileRun:
             fact_status,
             canonical_json(qa_summary),
         )
-        # Step 4 (continued): claims, source links and findings hang off the
-        # committed revision.
+        # Ledger first, publication last. Until _db_publish_revision runs the
+        # revision is is_current = 0 and the Ready gate cannot see it, so a
+        # crash in between cannot leave an approvable revision with no claims
+        # or blockers.
         await asyncio.to_thread(self._db_write_ledger, revision_id, candidate)
+        await asyncio.to_thread(self._db_publish_revision, revision_id)
 
         input_sha = _stage_input_hash(
             "assemble",
@@ -2263,7 +2275,10 @@ class _CompileRun:
                     "job_id, revision_no, source, content_md, content_sha256, "
                     "sections_json, citations_json, qa_summary_json, fact_status, "
                     "is_current, created_by) "
-                    "VALUES (?, ?, ?, ?, 'pipeline', ?, ?, ?, ?, ?, ?, 1, ?)",
+                    # is_current = 0: the revision is INVISIBLE to the Ready
+                    # gate until its ledger is committed. See
+                    # _db_publish_revision.
+                    "VALUES (?, ?, ?, ?, 'pipeline', ?, ?, ?, ?, ?, ?, 0, ?)",
                     (
                         ctx.draft_id,
                         current_id,
@@ -2288,6 +2303,58 @@ class _CompileRun:
                     ),
                 )
                 revision_id = int(cur.lastrowid)
+                self._revision_no = next_no
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return revision_id
+
+    def _db_assert_evidence_current(self) -> None:
+        """Fail the compile when snapshotted evidence is no longer current.
+
+        Read-only: ``check_evidence_freshness`` re-resolves each typed identity
+        without mutating a revision that does not exist yet. Storing the
+        candidate as fact-current would violate SPEC §12.6.1, so a stale
+        source fails the job with a stable non-retryable code instead.
+        """
+        from app.services.draft_evidence_freshness import check_evidence_freshness
+
+        with self._pool.connection() as conn:
+            result = check_evidence_freshness(conn, job_id=self._ctx.job_id)
+        if result.is_current:
+            return
+        reason = result.reasons[0] if result.reasons else CODE_EVIDENCE_CHANGED
+        raise CompileFailure(
+            CODE_EVIDENCE_CHANGED,
+            retryable=False,
+            message=f"evidence changed before assemble ({reason})",
+        )
+
+    def _db_publish_revision(self, revision_id: int) -> None:
+        """Make the finished revision current, atomically (SPEC §11.9 step 3).
+
+        This is the last write of a compile and the ONLY point at which the
+        revision becomes visible to the Ready gate. Splitting it from creation
+        is what makes the ledger safe: creation and ledger writes happen while
+        ``is_current = 0``, so a crash anywhere before this call leaves an
+        unpublished revision rather than a fact-current revision whose claims
+        and non-waivable blockers were lost — a row the Ready gate would
+        otherwise approve precisely because it finds nothing against it.
+        """
+        ctx = self._ctx
+        with self._pool.connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE draft_revisions SET is_current = 0 "
+                    "WHERE draft_id = ? AND is_current = 1",
+                    (ctx.draft_id,),
+                )
+                conn.execute(
+                    "UPDATE draft_revisions SET is_current = 1 WHERE id = ?",
+                    (revision_id,),
+                )
                 conn.execute(
                     "UPDATE drafts SET status = 'needs_review', "
                     "ready_revision_id = NULL, ready_by = NULL, ready_at = NULL, "
@@ -2308,17 +2375,26 @@ class _CompileRun:
                         ctx.job_id,
                         revision_id,
                         ctx.owner_id,
-                        canonical_json({"source": "pipeline", "revision_no": next_no}),
+                        canonical_json(
+                            {
+                                "source": "pipeline",
+                                "revision_no": getattr(self, "_revision_no", 0),
+                            }
+                        ),
                     ),
                 )
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
-        return revision_id
 
     def _db_write_ledger(self, revision_id: int, candidate: str) -> None:
-        """Persist claims, claim/source links and findings for the revision."""
+        """Persist claims, claim/source links and findings for the revision.
+
+        Runs while the revision is still ``is_current = 0``, so a crash here
+        leaves an unpublished revision the Ready gate cannot see rather than a
+        fact-current revision with an empty ledger.
+        """
         with self._pool.connection() as conn:
             store = DraftStore(conn)
             for row in self._claims:

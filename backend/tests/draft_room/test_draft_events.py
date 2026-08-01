@@ -16,12 +16,11 @@ KNOWN GAP (found while writing this file, NOT fixed here per scope): SPEC
 section 8.4 lists ``stage_started``, ``stage_progress``, ``stage_completed``
 and ``finding_created`` as part of the SSE contract, and ``draft_events.py``'s
 ``EVENT_TYPES``/``_ALLOWED_PAYLOAD_FIELDS`` allowlists both support them, but
-nothing in the shipped code (``draft_pipeline.py``, ``draft_job_processor.py``)
-ever calls ``build_event`` with any of those four types for a compile job --
-only ``job_started``/``job_completed``/``job_failed``/``job_cancelled`` are
-published. ``test_compile_lifecycle_publishes_only_job_level_events`` below
-asserts and documents this as the actual current behavior rather than
-asserting the richer contract the SPEC describes and silently passing.
+Stage events ARE published: the pipeline emits stage_started before each
+stage and stage_completed after the stage row commits. This harness injects
+the REAL publisher so the suite sees exactly what production emits.
+stage_progress, finding_created and heartbeat remain allowlisted but
+unpublished, asserted explicitly in TestStageEventsArePublished.
 """
 
 import asyncio
@@ -378,6 +377,26 @@ class CompileEventsTestBase(unittest.IsolatedAsyncioTestCase):
             "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (?, 'V1', '')",
             (VAULT_ID,),
         )
+        # The cited document must exist: SPEC 12.6 re-resolution runs before
+        # Assemble, so evidence pointing at a non-existent row reads as a
+        # source deleted mid-compile and the compile correctly fails closed.
+        _info = list(self.conn.execute("PRAGMA table_info(files)"))
+        _row = {}
+        for _cid, _name, _ctype, _notnull, _dflt, _pk in _info:
+            if _name == "id":
+                _row[_name] = DOC_SOURCE.file_id
+            elif _name == "vault_id":
+                _row[_name] = VAULT_ID
+            elif _name == "file_hash":
+                _row[_name] = DOC_SOURCE.content_sha256
+            elif _notnull and _dflt is None:
+                _row[_name] = 0 if "INT" in (_ctype or "").upper() else "x"
+        self.conn.execute(
+            "INSERT OR IGNORE INTO files ({}) VALUES ({})".format(  # nosec B608
+                ", ".join(_row), ", ".join("?" * len(_row))
+            ),
+            tuple(_row.values()),
+        )
         self.conn.execute(
             "INSERT OR IGNORE INTO vault_members (vault_id, user_id, permission, granted_by) "
             "VALUES (?, ?, 'read', ?)",
@@ -457,6 +476,11 @@ class CompileEventsTestBase(unittest.IsolatedAsyncioTestCase):
         return PipelineDeps(
             retrieve_sources=self.retriever, complete=self.model,
             now=lambda: datetime(2026, 8, 1, tzinfo=timezone.utc),
+            # The REAL publisher. PipelineDeps.publish defaults to a no-op, so
+            # omitting it would send every stage event into a black hole and
+            # let this suite certify behaviour production does not have -- which
+            # is exactly how a dropped stage_completed went unnoticed.
+            publish=draft_pipeline._default_publish,
         )
 
     async def _dispatch(self, job_id, *, deps=None):
@@ -487,7 +511,12 @@ class TestCompileLifecycleEvents(CompileEventsTestBase):
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
-        self.assertEqual([e["type"] for e in events], ["job_started", "job_completed"])
+        types = [e["type"] for e in events]
+        self.assertEqual(types[0], "job_started")
+        self.assertEqual(types[-1], "job_completed")
+        self.assertLess(
+            types.index("job_started"), types.index("stage_started")
+        )
         self.assertEqual(events[0]["status"], "running")
         self.assertEqual(events[-1]["status"], "completed")
         for event in events:
@@ -515,7 +544,12 @@ class TestCompileLifecycleEvents(CompileEventsTestBase):
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
-        self.assertEqual([e["type"] for e in events], ["job_started", "job_failed"])
+        # Stage events now interleave; assert the job-level ORDER rather than
+        # an exhaustive sequence so adding a stage event is not a false failure.
+        types = [e["type"] for e in events]
+        self.assertEqual(types[0], "job_started")
+        self.assertEqual(types[-1], "job_failed")
+        self.assertNotIn("job_completed", types)
         failed = events[-1]
         self.assertEqual(failed["error_code"], "invalid_stage_output")
         # No exception text, traceback, or model output ever reaches the
@@ -595,27 +629,60 @@ class TestCompileLifecycleEvents(CompileEventsTestBase):
         self.assertIn("job_completed", [e["type"] for e in drained])
 
 
-class TestNoStageOrFindingEventsPublishedYet(CompileEventsTestBase):
-    """Documents the KNOWN GAP in this module's docstring: SPEC section 8.4
-    lists ``stage_started``/``stage_progress``/``stage_completed``/
-    ``finding_created`` as part of the contract, and the allowlist supports
-    them, but nothing in the shipped compile path publishes any of the four
-    for a real run. This is a characterization test of current behavior, not
-    an endorsement -- if a future change starts publishing one of these, this
-    test's failure is the expected signal to update it deliberately."""
+class TestStageEventsArePublished(CompileEventsTestBase):
+    """SPEC section 8.4 stage events must actually reach subscribers.
 
-    async def test_only_job_level_events_are_observed_across_a_full_compile(self):
+    This previously asserted the opposite -- that only job-level events were
+    ever observed -- and passed for two reasons that were both wrong: the
+    pipeline published nothing, and the harness injected a no-op publisher so
+    it could not have seen the events anyway. Both are fixed; the assertions
+    are inverted accordingly.
+
+    ``stage_progress``, ``finding_created`` and ``heartbeat`` remain
+    allowlisted but unpublished, which is asserted explicitly below so that
+    starting to publish one is a deliberate change rather than a silent one.
+    """
+
+    async def test_stage_events_reach_the_bus_across_a_full_compile(self):
         job_id = self._make_compile_job()
         queue = self.bus.subscribe(self.draft_id)
         await self._dispatch(job_id)
 
         seen_types = set()
+        stages_started = []
         while not queue.empty():
-            seen_types.add(queue.get_nowait()["type"])
+            event = queue.get_nowait()
+            seen_types.add(event["type"])
+            if event["type"] == "stage_started":
+                stages_started.append(event["stage"])
 
-        self.assertEqual(seen_types, {"job_started", "job_completed"})
-        for absent in ("stage_started", "stage_progress", "stage_completed", "finding_created"):
-            self.assertNotIn(absent, seen_types)
+        self.assertIn("job_started", seen_types)
+        self.assertIn("stage_started", seen_types)
+        self.assertIn("stage_completed", seen_types)
+        self.assertIn("job_completed", seen_types)
+        # Stage events arrive in canonical pipeline order.
+        self.assertEqual(stages_started, list(draft_pipeline.COMPILE_STAGE_ORDER))
+
+    async def test_still_unpublished_event_types_are_asserted_explicitly(self):
+        job_id = self._make_compile_job()
+        queue = self.bus.subscribe(self.draft_id)
+        await self._dispatch(job_id)
+        seen = set()
+        while not queue.empty():
+            seen.add(queue.get_nowait()["type"])
+        for absent in ("stage_progress", "finding_created", "heartbeat"):
+            self.assertNotIn(absent, seen)
+
+    async def test_no_event_carries_content(self):
+        job_id = self._make_compile_job()
+        queue = self.bus.subscribe(self.draft_id)
+        await self._dispatch(job_id)
+        while not queue.empty():
+            event = queue.get_nowait()
+            blob = " ".join(str(v) for v in event.values()).lower()
+            for leak in ("manuscript", "passage", "prompt_id:", "traceback"):
+                self.assertNotIn(leak, blob, event)
+
 
 
 if __name__ == "__main__":

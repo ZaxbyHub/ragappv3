@@ -413,6 +413,12 @@ class PipelineTestBase(unittest.IsolatedAsyncioTestCase):
             "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (?, 'V1', '')",
             (VAULT_ID,),
         )
+        # The document the fake retriever cites must really exist in the
+        # vault: SPEC 12.6 re-resolution runs before Assemble, so evidence
+        # pointing at a row that was never there is indistinguishable from a
+        # source deleted mid-compile, and the compile correctly fails closed.
+        # Seeding it keeps the fixture honest rather than weakening the gate.
+        self._seed_source_document()
         self.conn.commit()
         self.store = DraftStore(self.conn)
 
@@ -432,6 +438,33 @@ class PipelineTestBase(unittest.IsolatedAsyncioTestCase):
 
         self.draft_id, self.input_id = self._make_draft_with_input()
         self.job_id = self._make_compile_job()
+
+    def _seed_source_document(self):
+        """Insert the ``files`` row DOC_SOURCE claims to come from.
+
+        ``file_hash`` is set to the canonical whole-source hash the pipeline
+        stores on the evidence row, so freshness re-resolution finds the source
+        unchanged.
+        """
+        info = list(self.conn.execute("PRAGMA table_info(files)"))
+        row = {}
+        for _cid, name, ctype, notnull, dflt, _pk in info:
+            if name == "id":
+                row[name] = DOC_SOURCE.file_id
+            elif name == "vault_id":
+                row[name] = VAULT_ID
+            elif name == "file_hash":
+                row[name] = DOC_SOURCE.content_sha256
+            elif name == "filename":
+                row[name] = EVIDENCE_TITLE
+            elif notnull and dflt is None:
+                row[name] = 0 if "INT" in (ctype or "").upper() else "x"
+        cols = ", ".join(row)
+        marks = ", ".join("?" * len(row))
+        self.conn.execute(
+            f"INSERT OR IGNORE INTO files ({cols}) VALUES ({marks})",  # nosec B608
+            tuple(row.values()),
+        )
 
     def tearDown(self):
         self.pool.release_connection(self.conn)
