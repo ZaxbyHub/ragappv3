@@ -584,6 +584,16 @@ class DraftSummary(BaseModel):
     created_at: str
     updated_at: str
     ready_at: Optional[str]
+    # Additive, backward-compatible fields beyond SPEC section 8.1's
+    # DraftSummary list — required by issue #437's Ready acceptance
+    # criterion ("show Ready actor/time"), which SPEC 8.1 predates.
+    # ``ready_by`` is the existing `drafts.ready_by` column (already written
+    # by `_sync_mark_ready`); ``ready_by_username`` is resolved best-effort
+    # from the users table and is ``None`` both when the draft was never
+    # marked Ready and when the approving user record no longer exists (a
+    # deleted user is never given a fabricated placeholder name).
+    ready_by: Optional[int]
+    ready_by_username: Optional[str]
 
 
 class DraftInput(BaseModel):
@@ -1162,6 +1172,22 @@ def _sync_ledger_counts(
     }
 
 
+def _sync_resolve_username(conn: sqlite3.Connection, user_id: Optional[int]) -> Optional[str]:
+    """Best-effort ``users.id -> users.username`` lookup for display only.
+
+    Returns ``None`` when ``user_id`` is ``None`` (nothing to resolve) or when
+    no such user row exists (the account was deleted since) — never a
+    fabricated placeholder. Mirrors the plain ``SELECT username FROM users
+    WHERE id = ?`` pattern already used for this exact lookup elsewhere in
+    the codebase (e.g. ``app.api.routes.organizations``); no shared
+    id-to-username helper exists in this repo to reuse instead.
+    """
+    if user_id is None:
+        return None
+    row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    return None if row is None else str(row["username"])
+
+
 def _sync_summary_extras(
     conn: sqlite3.Connection, store: DraftStore, draft: DraftRecord
 ) -> dict[str, Any]:
@@ -1205,6 +1231,14 @@ def _sync_detail_extras(
             draft_id=draft.id,
             current_revision_id=current.id if current else None,
         ),
+        # Resolved only here (the single-draft detail fetch), never in
+        # `_sync_summary_extras` — that one backs `list_drafts`, which calls
+        # `_build_summary` once per row, so joining/looking up a username
+        # there would be an N+1 query against `users` for every listed
+        # draft. The list endpoint still reports `ready_by` (already on the
+        # loaded `DraftRecord`, no extra query) and leaves the display name
+        # `None`.
+        "ready_by_username": _sync_resolve_username(conn, draft.ready_by),
     }
 
 
@@ -1233,6 +1267,12 @@ async def _build_summary(
         created_at=draft.created_at,
         updated_at=draft.updated_at,
         ready_at=draft.ready_at,
+        ready_by=draft.ready_by,
+        # Not resolved here: this backs `list_drafts`, which calls
+        # `_build_summary` once per row — resolving a username here would be
+        # an N+1 `users` lookup. See `_build_detail` for the single-draft
+        # fetch where the join cost is fine.
+        ready_by_username=None,
     )
 
 
@@ -1263,6 +1303,8 @@ async def _build_detail(
         created_at=draft.created_at,
         updated_at=draft.updated_at,
         ready_at=draft.ready_at,
+        ready_by=draft.ready_by,
+        ready_by_username=extras["ready_by_username"],
     )
     active_compile = extras["active_compile_job"]
     ledger = extras["ledger"]
