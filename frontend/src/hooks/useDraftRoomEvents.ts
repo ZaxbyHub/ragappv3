@@ -55,7 +55,12 @@ const RECONNECT_MAX_MS = 30000;
 // the 30s cap and leaves it there. 20s — just past one keepalive interval —
 // is enough to distinguish "this connection was genuinely up and receiving
 // server traffic" from a fast-failing connection (immediate auth/network
-// error) that should NOT reset backoff.
+// error) that should NOT reset backoff. The clock starts at the FIRST BYTE
+// actually read from the body, never at connect time: a 200 OK that never
+// sends anything (a proxy that accepts the connection and then hangs) must
+// not be treated as healthy just because time passed with the socket open —
+// that would silently defeat both backoff escalation and the polling
+// fallback below, leaving the user with no data and no recovery.
 const STREAM_HEALTHY_MS = 20000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -118,7 +123,7 @@ export function useDraftRoomEvents(
     const encoder = new TextEncoder();
     let failureCount = 0;
     let lastStageProgressInvalidateAt = 0;
-    let connectedAt: number | null = null;
+    let firstByteAt: number | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
     const stopPolling = () => {
@@ -171,11 +176,15 @@ export function useDraftRoomEvents(
         case "stage_progress": {
           // No known publisher emits this today (see finding_created below) —
           // kept for the same reason: cheap, correct, and allowlisted by the
-          // backend event bus (app/services/draft_events.py).
+          // backend event bus (app/services/draft_events.py). Invalidates
+          // detail(id) for the same reason as stage_started/stage_completed
+          // above (a per-job jobs(id)-only invalidation would not reach the
+          // live stages(...)/evidence(...) consumers) — kept consistent with
+          // its siblings even though no live publisher exercises this path.
           const now = Date.now();
           if (now - lastStageProgressInvalidateAt < STAGE_PROGRESS_COALESCE_MS) return;
           lastStageProgressInvalidateAt = now;
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
+          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
           return;
         }
         case "finding_created":
@@ -296,20 +305,29 @@ export function useDraftRoomEvents(
       const reader = response.body?.getReader();
       if (!reader) return controller.signal.aborted ? "stop" : "error";
 
-      failureCount = 0;
-      connectedAt = Date.now();
       stopPolling();
       setConnected(true);
 
       const decoder = new TextDecoder();
       let buffer = "";
       let cleanEnd = false;
+      let receivedBytes = false;
       try {
         for (;;) {
           const { value, done } = await reader.read();
           if (done) {
             cleanEnd = true;
             break;
+          }
+          if (!receivedBytes) {
+            // The health marker (and failure-count reset) fires on the FIRST
+            // byte actually read, not on connect — a keepalive comment counts
+            // (the server sends one every 15s), but a 200 OK that never
+            // yields anything must keep counting toward both backoff
+            // escalation and the polling fallback.
+            receivedBytes = true;
+            failureCount = 0;
+            firstByteAt = Date.now();
           }
           buffer += decoder.decode(value, { stream: true });
           buffer = drainBuffer(buffer);
@@ -325,11 +343,11 @@ export function useDraftRoomEvents(
     void (async () => {
       let backoff = RECONNECT_BASE_MS;
       while (!controller.signal.aborted) {
-        connectedAt = null;
+        firstByteAt = null;
         const result = await connectOnce();
         if (result === "stop" || controller.signal.aborted) break;
         const streamedHealthily =
-          connectedAt != null && Date.now() - connectedAt >= STREAM_HEALTHY_MS;
+          firstByteAt != null && Date.now() - firstByteAt >= STREAM_HEALTHY_MS;
         if (result === "clean" || streamedHealthily) {
           backoff = RECONNECT_BASE_MS;
         } else {

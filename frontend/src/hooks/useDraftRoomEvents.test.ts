@@ -323,7 +323,7 @@ describe("useDraftRoomEvents", () => {
     });
   });
 
-  it("coalesces stage_progress bursts to at most one jobs invalidation per second", async () => {
+  it("coalesces stage_progress bursts to at most one detail invalidation per second", async () => {
     vi.useFakeTimers();
     const { response, emit } = controllableSse();
     fetchMock.mockResolvedValue(response);
@@ -335,10 +335,10 @@ describe("useDraftRoomEvents", () => {
     emit('data: {"type":"stage_progress","progress_percent":20}\n\n');
     emit('data: {"type":"stage_progress","progress_percent":30}\n\n');
     await vi.waitFor(() =>
-      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.jobs(DRAFT_ID) })
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.detail(DRAFT_ID) })
     );
     const callsAfterBurst = invalidateSpy.mock.calls.filter(
-      (call) => JSON.stringify(call[0]) === JSON.stringify({ queryKey: draftRoomKeys.jobs(DRAFT_ID) })
+      (call) => JSON.stringify(call[0]) === JSON.stringify({ queryKey: draftRoomKeys.detail(DRAFT_ID) })
     ).length;
     expect(callsAfterBurst).toBe(1);
 
@@ -347,7 +347,7 @@ describe("useDraftRoomEvents", () => {
     emit('data: {"type":"stage_progress","progress_percent":40}\n\n');
     await vi.waitFor(() => {
       const count = invalidateSpy.mock.calls.filter(
-        (call) => JSON.stringify(call[0]) === JSON.stringify({ queryKey: draftRoomKeys.jobs(DRAFT_ID) })
+        (call) => JSON.stringify(call[0]) === JSON.stringify({ queryKey: draftRoomKeys.detail(DRAFT_ID) })
       ).length;
       expect(count).toBe(2);
     });
@@ -438,7 +438,13 @@ describe("useDraftRoomEvents", () => {
     await advance(1100);
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
-    await advance(25000); // well over STREAM_HEALTHY_MS (20s)
+    // The health clock starts at the first byte actually received (a
+    // keepalive comment counts), never at connect time — so this stream must
+    // actually emit something before the healthy-duration clock can run.
+    await act(async () => {
+      healthy.emit(": keepalive\n\n");
+    });
+    await advance(25000); // well over STREAM_HEALTHY_MS (20s) since that byte
     await act(async () => {
       healthy.fail(new Error("network drop"));
     });
@@ -451,6 +457,66 @@ describe("useDraftRoomEvents", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2); // not yet — still short of 1000ms
     await advance(200);
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+  });
+
+  // Regression test for the critic-overturned version of finding 3: a
+  // connection that returns 200 OK but never delivers a single byte (e.g. a
+  // proxy that accepts the connection and then hangs) must NOT be treated as
+  // healthy just because wall-clock time passed with the socket open. It must
+  // count toward both backoff escalation and the polling fallback exactly
+  // like a fast connection error would.
+  it("escalates backoff and engages polling fallback for connections that open but never deliver a byte", async () => {
+    vi.useFakeTimers();
+    queryClient.setQueryData(
+      draftRoomKeys.detail(DRAFT_ID),
+      { active_compile_job: { id: 1 } } as unknown as DraftDetail
+    );
+    const hung1 = controllableSse();
+    const hung2 = controllableSse();
+    const hung3 = controllableSse();
+    fetchMock
+      .mockResolvedValueOnce(hung1.response)
+      .mockResolvedValueOnce(hung2.response)
+      .mockResolvedValueOnce(hung3.response)
+      .mockImplementation(() => new Promise<Response>(() => {}));
+
+    const { result, unmount } = renderEvents();
+
+    // Connection 1: 200 OK, never emits a byte, then well past
+    // STREAM_HEALTHY_MS (20s) the connection drops. If this were wrongly
+    // classified healthy, backoff would reset and polling would never engage.
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await advance(25000);
+    await act(async () => {
+      hung1.fail(new Error("network drop"));
+    });
+
+    // Reconnect fires at the base delay (1000ms) since nothing has reset yet.
+    await advance(1100);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    // Connection 2: same hung pattern. Backoff must be escalating (doubled to
+    // 2000ms), not still at base — proof that 25s of silence did not count as
+    // healthy.
+    await advance(25000);
+    await act(async () => {
+      hung2.fail(new Error("network drop"));
+    });
+    await advance(1900);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // not yet — needs ~2000ms, not 1000ms
+    await advance(200);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+    // Connection 3: third consecutive failure with no byte ever received —
+    // the polling fallback must engage, exactly as it would for three fast
+    // 500 responses.
+    await advance(25000);
+    await act(async () => {
+      hung3.fail(new Error("network drop"));
+    });
+    await vi.waitFor(() => expect(result.current.pollingFallback).toBe(true));
+
+    unmount();
   });
 
   it("aborts the controller and stops fetching on unmount", async () => {
