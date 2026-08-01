@@ -46,6 +46,17 @@ export interface UseDraftRoomEventsResult {
 
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
+// The server's idle keepalive fires every 15s (see draft_room_events_stream's
+// `asyncio.wait_for(..., timeout=15.0)`), and the generator is `while True` —
+// it essentially never closes cleanly, so a real connection almost always
+// ends in the "error" branch even after streaming healthily for hours (an
+// ordinary proxy idle-kill, laptop sleep, or wifi flap). Resetting backoff
+// only on a clean `done: true` therefore ratchets every long-lived session to
+// the 30s cap and leaves it there. 20s — just past one keepalive interval —
+// is enough to distinguish "this connection was genuinely up and receiving
+// server traffic" from a fast-failing connection (immediate auth/network
+// error) that should NOT reset backoff.
+const STREAM_HEALTHY_MS = 20000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const DEFAULT_POLL_INTERVAL_SECONDS = 2;
@@ -107,6 +118,7 @@ export function useDraftRoomEvents(
     const encoder = new TextEncoder();
     let failureCount = 0;
     let lastStageProgressInvalidateAt = 0;
+    let connectedAt: number | null = null;
     let pollTimer: ReturnType<typeof setInterval> | null = null;
 
     const stopPolling = () => {
@@ -146,9 +158,20 @@ export function useDraftRoomEvents(
           return;
         case "stage_started":
         case "stage_completed":
-          queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
+          // Must reach draftRoomKeys.stages(...) and draftRoomKeys.evidence(...)
+          // (live consumers: DraftWorkspace's stage rail, the Evidence tab) as
+          // well as jobs(...). Those keys' 4th segment is "job"/"evidence", not
+          // "jobs", so invalidating jobs(id) alone does not prefix-match them.
+          // detail(id) = ["draft-room","draft",id] prefix-matches every one of
+          // jobs/job/stages/evidence/findings/claims/revisions under this draft,
+          // matching every other branch below and every mutation onSuccess in
+          // DraftWorkspace.tsx.
+          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
           return;
         case "stage_progress": {
+          // No known publisher emits this today (see finding_created below) —
+          // kept for the same reason: cheap, correct, and allowlisted by the
+          // backend event bus (app/services/draft_events.py).
           const now = Date.now();
           if (now - lastStageProgressInvalidateAt < STAGE_PROGRESS_COALESCE_MS) return;
           lastStageProgressInvalidateAt = now;
@@ -156,6 +179,14 @@ export function useDraftRoomEvents(
           return;
         }
         case "finding_created":
+          // DraftSummary.open_blocker_count is computed server-side, so a new
+          // finding leaves the blocker badge stale without this. NOTE: as of
+          // this writing no backend caller publishes "finding_created" —
+          // app/services/draft_events.py documents it as allowlisted but
+          // unpublished (issue #436 reviewer finding 3) — so this branch is
+          // presently untested-in-production; verify a live publisher exists
+          // before assuming this path is exercised.
+          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
           queryClient.invalidateQueries({ queryKey: draftRoomKeys.findings(id) });
           return;
         case "job_completed":
@@ -252,6 +283,13 @@ export function useDraftRoomEvents(
             return newToken && !controller.signal.aborted ? "error" : "stop";
           }
         }
+        if (response.status === 403) {
+          // The only 403 this route raises is "vault_access_revoked" (a
+          // permanently revoked read grant) — access can't come back without
+          // the user re-navigating, so retrying forever at the 30s cap is
+          // pure waste. Fatal, like token_invalid/user_inactive above.
+          return "stop";
+        }
         return controller.signal.aborted ? "stop" : "error";
       }
 
@@ -259,6 +297,7 @@ export function useDraftRoomEvents(
       if (!reader) return controller.signal.aborted ? "stop" : "error";
 
       failureCount = 0;
+      connectedAt = Date.now();
       stopPolling();
       setConnected(true);
 
@@ -286,9 +325,12 @@ export function useDraftRoomEvents(
     void (async () => {
       let backoff = RECONNECT_BASE_MS;
       while (!controller.signal.aborted) {
+        connectedAt = null;
         const result = await connectOnce();
         if (result === "stop" || controller.signal.aborted) break;
-        if (result === "clean") {
+        const streamedHealthily =
+          connectedAt != null && Date.now() - connectedAt >= STREAM_HEALTHY_MS;
+        if (result === "clean" || streamedHealthily) {
           backoff = RECONNECT_BASE_MS;
         } else {
           failureCount += 1;

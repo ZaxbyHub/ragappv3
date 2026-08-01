@@ -17,18 +17,28 @@ const DRAFT_ID = 42;
 // A controllable SSE body: `emit` pushes a chunk to the reader; reads pend
 // until a chunk is available or the stream is cancelled. Mirrors
 // useWikiEventStream.test.ts's helper.
+type SseReadResult = { value?: Uint8Array; done: boolean };
+type SseQueueEntry = { kind: "value"; item: SseReadResult } | { kind: "error"; error: unknown };
+
 function controllableSse() {
   const encoder = new TextEncoder();
-  let pending: ((r: { value?: Uint8Array; done: boolean }) => void) | null = null;
-  const queue: Array<{ value?: Uint8Array; done: boolean }> = [];
+  let pending: ((r: SseReadResult) => void) | null = null;
+  let pendingReject: ((e: unknown) => void) | null = null;
+  const queue: SseQueueEntry[] = [];
   let closed = false;
   const reader = {
     read: vi.fn(
       () =>
-        new Promise<{ value?: Uint8Array; done: boolean }>((resolve) => {
-          if (queue.length) resolve(queue.shift()!);
-          else if (closed) resolve({ done: true });
-          else pending = resolve;
+        new Promise<SseReadResult>((resolve, reject) => {
+          if (queue.length) {
+            const next = queue.shift()!;
+            if (next.kind === "error") reject(next.error);
+            else resolve(next.item);
+          } else if (closed) resolve({ done: true });
+          else {
+            pending = resolve;
+            pendingReject = reject;
+          }
         })
     ),
     cancel: vi.fn(),
@@ -38,9 +48,10 @@ function controllableSse() {
     if (pending) {
       const r = pending;
       pending = null;
+      pendingReject = null;
       r(item);
     } else {
-      queue.push(item);
+      queue.push({ kind: "value", item });
     }
   };
   const close = () => {
@@ -49,9 +60,23 @@ function controllableSse() {
     if (pending) {
       const r = pending;
       pending = null;
+      pendingReject = null;
       r(doneItem);
     } else {
-      queue.push(doneItem);
+      queue.push({ kind: "value", item: doneItem });
+    }
+  };
+  // Reject the in-flight (or next) read — an ordinary mid-stream disconnect
+  // (proxy idle-kill, sleep, wifi flap), as opposed to `close()`'s clean
+  // `done: true` end.
+  const fail = (error: unknown = new Error("stream error")) => {
+    if (pendingReject) {
+      const rej = pendingReject;
+      pending = null;
+      pendingReject = null;
+      rej(error);
+    } else {
+      queue.push({ kind: "error", error });
     }
   };
   const response = {
@@ -59,7 +84,7 @@ function controllableSse() {
     status: 200,
     body: { getReader: () => reader },
   } as unknown as Response;
-  return { response, emit, close, reader };
+  return { response, emit, close, fail, reader };
 }
 
 function errorResponse(status: number, detail: string): Response {
@@ -234,7 +259,7 @@ describe("useDraftRoomEvents", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.claims(DRAFT_ID) });
   });
 
-  it("invalidates only findings on finding_created", async () => {
+  it("invalidates detail and findings on finding_created", async () => {
     const { response, emit } = controllableSse();
     fetchMock.mockResolvedValue(response);
     renderEvents();
@@ -245,8 +270,57 @@ describe("useDraftRoomEvents", () => {
     await waitFor(() =>
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.findings(DRAFT_ID) })
     );
+    // detail(id) must also be invalidated: DraftSummary.open_blocker_count is
+    // computed server-side, so a new finding leaves the blocker badge stale
+    // without it.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.detail(DRAFT_ID) });
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: draftRoomKeys.claims(DRAFT_ID) });
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: draftRoomKeys.revisions(DRAFT_ID) });
+  });
+
+  // Regression test for issue #437 finding 1: stage_started/stage_completed
+  // must invalidate a query registered under draftRoomKeys.stages(...) (the
+  // live stage rail) and draftRoomKeys.evidence(...) (the live Evidence tab).
+  // Asserting only that invalidateQueries was called with *some* key is
+  // exactly how the gap shipped unnoticed, so this drives real queries
+  // through the real query-core prefix matcher instead.
+  it("actually invalidates a registered stages(...) query on stage_completed", async () => {
+    const jobId = 7;
+    const stagesKey = draftRoomKeys.stages(DRAFT_ID, jobId, false);
+    queryClient.setQueryData(stagesKey, { stages: [] });
+    const stagesQuery = queryClient.getQueryCache().find({ queryKey: stagesKey });
+    expect(stagesQuery).toBeDefined();
+    const isInvalidatedBefore = stagesQuery!.state.isInvalidated;
+    expect(isInvalidatedBefore).toBe(false);
+
+    const { response, emit } = controllableSse();
+    fetchMock.mockResolvedValue(response);
+    renderEvents();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    emit(`data: {"type":"stage_completed","job_id":${jobId},"stage":"research"}\n\n`);
+
+    await waitFor(() => {
+      const updated = queryClient.getQueryCache().find({ queryKey: stagesKey });
+      expect(updated!.state.isInvalidated).toBe(true);
+    });
+  });
+
+  it("actually invalidates a registered evidence(...) query on stage_started", async () => {
+    const evidenceKey = draftRoomKeys.evidence(DRAFT_ID, { job_id: 7 });
+    queryClient.setQueryData(evidenceKey, { items: [] });
+
+    const { response, emit } = controllableSse();
+    fetchMock.mockResolvedValue(response);
+    renderEvents();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    emit('data: {"type":"stage_started","job_id":7,"stage":"research"}\n\n');
+
+    await waitFor(() => {
+      const updated = queryClient.getQueryCache().find({ queryKey: evidenceKey });
+      expect(updated!.state.isInvalidated).toBe(true);
+    });
   });
 
   it("coalesces stage_progress bursts to at most one jobs invalidation per second", async () => {
@@ -326,6 +400,57 @@ describe("useDraftRoomEvents", () => {
     // The clean disconnect resets backoff to 1000 ms rather than doubling to 2000 ms.
     await advance(1100);
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("stops permanently on a 403 vault_access_revoked response without retrying", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(errorResponse(403, "no read access to this vault"));
+
+    renderEvents();
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await advance(35000); // well past the 30s backoff cap
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // Regression test for issue #437 finding 3: an ordinary drop after a long,
+  // healthy stream (proxy idle-kill, sleep, wifi flap) must retry at the base
+  // delay, not the backoff cap. The server generator is `while True` and
+  // essentially never sends `done: true`, so every real disconnect lands in
+  // the "error" branch — a naive "only reset on clean close" implementation
+  // ratchets to 30s and stays there for the rest of the session.
+  it("resets backoff to the base delay after a connection streams well past the healthy threshold then errors", async () => {
+    vi.useFakeTimers();
+    const healthy = controllableSse();
+    fetchMock
+      // call 1: fails immediately, escalating backoff 1000ms -> 2000ms.
+      .mockResolvedValueOnce(errorResponse(500, "e1"))
+      // call 2: connects, streams well past STREAM_HEALTHY_MS, then a plain
+      // read-loop error (no `done: true`) — an ordinary mid-stream disconnect
+      // (proxy idle-kill, sleep, wifi flap), not a clean server close.
+      .mockResolvedValueOnce(healthy.response)
+      // call 3+: further connections just hang; only their timing matters.
+      .mockResolvedValue(controllableSse().response);
+
+    renderEvents();
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await advance(1100);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    await advance(25000); // well over STREAM_HEALTHY_MS (20s)
+    await act(async () => {
+      healthy.fail(new Error("network drop"));
+    });
+
+    // Without the fix, backoff would already be doubled to 2000ms by call 1's
+    // failure and would stay there since this disconnect isn't a clean
+    // `done: true` close. With the fix, streaming healthily resets backoff to
+    // the base 1000ms even though the disconnect is classified "error".
+    await advance(900);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // not yet — still short of 1000ms
+    await advance(200);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
   });
 
   it("aborts the controller and stops fetching on unmount", async () => {
