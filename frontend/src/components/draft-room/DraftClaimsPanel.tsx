@@ -12,6 +12,7 @@ import {
   draftRoomKeys,
   listDraftClaims,
   listDraftEvidence,
+  listDraftRevisions,
   parseDraftRoomError,
   type DraftClaim,
   type DraftClaimSource,
@@ -33,7 +34,15 @@ export interface DraftClaimsPanelProps {
 }
 
 const DEFAULT_PER_PAGE = 20;
-const EVIDENCE_LOOKUP_PER_PAGE = 100;
+// The documented API maximum per_page (§8.1 `limits.max_page_size`).
+const EVIDENCE_LOOKUP_PAGE_SIZE = 100;
+// Bound on how many evidence pages we'll scan per revision before giving up
+// and showing an honest "could not resolve every source" note instead of
+// silently mislabeling sources as "Unknown". 5 pages * 100 rows = 500 rows,
+// comfortably above what a single compile job's Research stage produces in
+// ordinary use.
+const MAX_EVIDENCE_LOOKUP_PAGES = 5;
+const REVISION_LOOKUP_PAGE_SIZE = 100;
 
 const SOURCE_KIND_LABELS: Record<string, string> = {
   draft_input: "Project input",
@@ -49,6 +58,41 @@ const SEVERITY_BADGE_CLASS: Record<string, string> = {
 
 function isUnsupportedOrBlocker(claim: DraftClaim): boolean {
   return claim.status === "unsupported" || claim.severity === "blocker";
+}
+
+interface EvidenceLookupResult {
+  items: DraftEvidence[];
+  /** True if the page bound was hit before every evidence row was fetched. */
+  truncated: boolean;
+}
+
+/**
+ * Pages through a draft's evidence — scoped to `jobId` when known — until
+ * every row is fetched (per the paginated envelope's `total`) or `maxPages`
+ * is hit. Never silently stops early without reporting it: callers use
+ * `truncated` to render an honest note instead of guessing "Unknown" for
+ * every source past the bound.
+ */
+async function fetchEvidenceForLookup(
+  draftId: number,
+  jobId: number | undefined,
+  maxPages: number
+): Promise<EvidenceLookupResult> {
+  const items: DraftEvidence[] = [];
+  let page = 1;
+  let total = Number.POSITIVE_INFINITY;
+  while (page <= maxPages && items.length < total) {
+    const response = await listDraftEvidence(draftId, {
+      job_id: jobId,
+      page,
+      per_page: EVIDENCE_LOOKUP_PAGE_SIZE,
+    });
+    items.push(...response.items);
+    total = response.total;
+    if (response.items.length === 0) break;
+    page += 1;
+  }
+  return { items, truncated: items.length < total };
 }
 
 function safeJsonStringify(value: unknown): string {
@@ -160,41 +204,51 @@ export function DraftClaimsPanel({ draftId, revisionId }: DraftClaimsPanelProps)
     setPage(1);
   }, [statusFilter, revisionId]);
 
-  // `listDraftClaims`'s params type does not declare `revision_id`, though the
-  // backend endpoint accepts it and this panel is revision-scoped. See the
-  // worker report for the same gap noted against DraftFindingsPanel.
-  const queryParams = useMemo(() => {
-    const params: { status?: DraftClaimStatus; page: number; per_page: number; revision_id?: number } = {
-      page,
-      per_page: perPage,
-    };
-    if (statusFilter) params.status = statusFilter;
-    if (revisionId != null) params.revision_id = revisionId;
-    return params;
-  }, [statusFilter, page, perPage, revisionId]);
+  const claimsParams = {
+    status: statusFilter ?? undefined,
+    revision_id: revisionId ?? undefined,
+    page,
+    per_page: perPage,
+  };
 
   const claimsQuery = useQuery({
-    queryKey: draftRoomKeys.claims(draftId, queryParams),
-    queryFn: () => listDraftClaims(draftId, queryParams),
+    queryKey: draftRoomKeys.claims(draftId, claimsParams),
+    queryFn: () => listDraftClaims(draftId, claimsParams),
   });
 
+  // Resolve the job that produced `revisionId`'s claims (via its lightweight
+  // DraftRevisionSummary — no manuscript content) so the evidence lookup
+  // below can be scoped to that job instead of the draft's entire history.
+  const revisionsQuery = useQuery({
+    queryKey: draftRoomKeys.revisions(draftId, { per_page: REVISION_LOOKUP_PAGE_SIZE }),
+    queryFn: () => listDraftRevisions(draftId, { per_page: REVISION_LOOKUP_PAGE_SIZE }),
+    enabled: revisionId != null,
+  });
+  const waitingForRevisionJob = revisionId != null && revisionsQuery.isPending;
+  const scopedJobId =
+    revisionId != null
+      ? (revisionsQuery.data?.items.find((revision) => revision.id === revisionId)?.job_id ?? undefined)
+      : undefined;
+
   // Best-effort evidence lookup for source title/kind/authority — the claims
-  // endpoint only returns `evidence_id` on each source. Fetches the first
-  // page (the documented max per_page) of the draft's evidence; a draft with
-  // more evidence rows than that will fall back to the evidence_id label for
-  // the excess (see ClaimSourceRow), never a crash.
-  const evidenceQuery = useQuery({
-    queryKey: draftRoomKeys.evidence(draftId, { per_page: EVIDENCE_LOOKUP_PER_PAGE }),
-    queryFn: () => listDraftEvidence(draftId, { per_page: EVIDENCE_LOOKUP_PER_PAGE }),
+  // endpoint only returns `evidence_id` on each source. Pages through every
+  // evidence row for the resolved job (bounded — see
+  // `fetchEvidenceForLookup`); `evidenceLookupTruncated` below drives an
+  // honest note rather than silently mislabeling sources as "Unknown".
+  const evidenceLookupQuery = useQuery({
+    queryKey: [...draftRoomKeys.evidence(draftId, { job_id: scopedJobId ?? null }), "claims-lookup"] as const,
+    queryFn: () => fetchEvidenceForLookup(draftId, scopedJobId, MAX_EVIDENCE_LOOKUP_PAGES),
+    enabled: !waitingForRevisionJob,
   });
 
   const evidenceById = useMemo(() => {
     const map = new Map<number, DraftEvidence>();
-    for (const evidence of evidenceQuery.data?.items ?? []) {
+    for (const evidence of evidenceLookupQuery.data?.items ?? []) {
       map.set(evidence.id, evidence);
     }
     return map;
-  }, [evidenceQuery.data]);
+  }, [evidenceLookupQuery.data]);
+  const evidenceLookupTruncated = evidenceLookupQuery.data?.truncated === true;
 
   const items = claimsQuery.data?.items ?? [];
   const total = claimsQuery.data?.total ?? 0;
@@ -243,6 +297,16 @@ export function DraftClaimsPanel({ draftId, revisionId }: DraftClaimsPanelProps)
       )}
       {claimsQuery.isSuccess && items.length === 0 && (
         <p className="text-sm text-muted-foreground">No claims match the current filters.</p>
+      )}
+
+      {items.length > 0 && evidenceLookupTruncated && (
+        <Alert variant="warning">
+          <AlertTitle>Some source details could not be resolved</AlertTitle>
+          <AlertDescription>
+            This draft has more evidence than could be checked. Some claim sources below show only an
+            evidence identifier instead of the source&apos;s title, kind, and authority.
+          </AlertDescription>
+        </Alert>
       )}
 
       {factual.length > 0 && (

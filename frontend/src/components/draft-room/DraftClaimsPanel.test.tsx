@@ -1,11 +1,18 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { DraftClaim, DraftClaimStatus, DraftEvidence, DraftPaginated } from "@/lib/api/draftRoom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type {
+  DraftClaim,
+  DraftClaimStatus,
+  DraftEvidence,
+  DraftPaginated,
+  DraftRevisionSummary,
+} from "@/lib/api/draftRoom";
 import { DRAFT_CLAIM_STATUSES } from "@/lib/api/draftRoom";
 
 const listDraftClaimsMock = vi.hoisted(() => vi.fn());
 const listDraftEvidenceMock = vi.hoisted(() => vi.fn());
+const listDraftRevisionsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/api/draftRoom", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api/draftRoom")>("@/lib/api/draftRoom");
@@ -13,6 +20,7 @@ vi.mock("@/lib/api/draftRoom", async () => {
     ...actual,
     listDraftClaims: listDraftClaimsMock,
     listDraftEvidence: listDraftEvidenceMock,
+    listDraftRevisions: listDraftRevisionsMock,
   };
 });
 
@@ -70,6 +78,22 @@ function makeEvidence(overrides: Partial<DraftEvidence> = {}): DraftEvidence {
   };
 }
 
+function makeRevisionSummary(overrides: Partial<DraftRevisionSummary> = {}): DraftRevisionSummary {
+  return {
+    id: 7,
+    revision_no: 1,
+    parent_revision_id: null,
+    job_id: 5,
+    source: "pipeline",
+    content_sha256: "a".repeat(64),
+    fact_status: "passed",
+    is_current: true,
+    created_by: 1,
+    created_at: "2026-01-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
 function paginated<T>(items: T[]): DraftPaginated<T> {
   return { items, total: items.length, page: 1, per_page: 20 };
 }
@@ -80,10 +104,18 @@ function wrapper({ children }: { children: React.ReactNode }) {
 }
 
 describe("DraftClaimsPanel", () => {
+  beforeEach(() => {
+    // Every test's claims/evidence live on revision 7, produced by job 5 —
+    // override per test only when the job-resolution behavior itself is
+    // under test.
+    listDraftRevisionsMock.mockResolvedValue(paginated([makeRevisionSummary()]));
+  });
+
   afterEach(() => {
     cleanup();
     listDraftClaimsMock.mockReset();
     listDraftEvidenceMock.mockReset();
+    listDraftRevisionsMock.mockReset();
     useDraftRoomUiStore.getState().resetForDraft(0);
   });
 
@@ -191,5 +223,82 @@ describe("DraftClaimsPanel", () => {
     await screen.findByRole("button", { name: "Edit draft" });
     expect(screen.getAllByRole("button", { name: "Edit draft" })).toHaveLength(1);
     expect(screen.getByText("View retrieval audit")).toBeInTheDocument();
+  });
+
+  it("resolves a claim source to its real title even when it lives past the first evidence page", async () => {
+    const page1Items = Array.from({ length: 100 }, (_, i) => makeEvidence({ id: i + 1, title: `Doc ${i + 1}` }));
+    const page2Items = [
+      makeEvidence({ id: 150, title: "Late-page Source", source_kind: "wiki", authority: "primary" }),
+    ];
+    listDraftEvidenceMock.mockImplementation(
+      (_draftId: number, params: { job_id?: number; page?: number; per_page?: number } = {}) => {
+        expect(params.job_id).toBe(5); // scoped to the resolved job, not the whole draft.
+        const page = params.page ?? 1;
+        if (page === 1) {
+          return Promise.resolve({ items: page1Items, total: 101, page: 1, per_page: 100 });
+        }
+        return Promise.resolve({ items: page2Items, total: 101, page: 2, per_page: 100 });
+      }
+    );
+    listDraftClaimsMock.mockResolvedValue(
+      paginated([
+        makeClaim({
+          id: 1,
+          sources: [
+            {
+              id: 1,
+              claim_id: 1,
+              evidence_id: 150,
+              relationship: "supports",
+              exact_quote: "late page quote",
+              passage_start: 0,
+              passage_end: 10,
+              lexical_overlap_score: 0.5,
+            },
+          ],
+        }),
+      ])
+    );
+
+    render(<DraftClaimsPanel draftId={42} revisionId={7} />, { wrapper });
+
+    expect(await screen.findByText("Late-page Source")).toBeInTheDocument();
+    expect(screen.queryByText("Evidence #150")).not.toBeInTheDocument();
+    expect(screen.queryByText(/some source details could not be resolved/i)).not.toBeInTheDocument();
+  });
+
+  it("shows a visible note (not silent Unknowns) when the evidence lookup hits its page bound", async () => {
+    listDraftEvidenceMock.mockImplementation(
+      (_draftId: number, params: { page?: number; per_page?: number } = {}) => {
+        const page = params.page ?? 1;
+        const items = Array.from({ length: 100 }, (_, i) => makeEvidence({ id: (page - 1) * 100 + i + 1 }));
+        return Promise.resolve({ items, total: 1000, page, per_page: 100 });
+      }
+    );
+    listDraftClaimsMock.mockResolvedValue(
+      paginated([
+        makeClaim({
+          id: 1,
+          sources: [
+            {
+              id: 1,
+              claim_id: 1,
+              evidence_id: 999, // beyond the 5-page (500-row) bound.
+              relationship: "supports",
+              exact_quote: "unresolvable quote",
+              passage_start: 0,
+              passage_end: 10,
+              lexical_overlap_score: 0.3,
+            },
+          ],
+        }),
+      ])
+    );
+
+    render(<DraftClaimsPanel draftId={42} revisionId={7} />, { wrapper });
+
+    expect(await screen.findByText(/some source details could not be resolved/i)).toBeInTheDocument();
+    // The fallback is the honest exception here, not a silently mislabeled "Unknown".
+    expect(screen.getByText("Evidence #999")).toBeInTheDocument();
   });
 });

@@ -82,16 +82,11 @@ export function DraftEvidencePanel({ draftId, jobId }: DraftEvidencePanelProps) 
     setPage(1);
   }, [jobId]);
 
-  // `listDraftEvidence`'s params type does not declare `job_id`, though the
-  // backend endpoint accepts it and this panel is job-scoped. Building a
-  // separately-typed variable (rather than an inline object literal) avoids
-  // TypeScript's excess-property check while still sending the filter at
-  // runtime. Reported as a contract gap alongside the findings/claims panels.
-  const queryParams = { page, per_page: perPage, job_id: jobId ?? undefined };
+  const evidenceParams = { page, per_page: perPage, job_id: jobId ?? undefined };
 
   const evidenceQuery = useQuery({
-    queryKey: draftRoomKeys.evidence(draftId, queryParams),
-    queryFn: () => listDraftEvidence(draftId, queryParams),
+    queryKey: draftRoomKeys.evidence(draftId, evidenceParams),
+    queryFn: () => listDraftEvidence(draftId, evidenceParams),
     enabled: jobId != null,
   });
 

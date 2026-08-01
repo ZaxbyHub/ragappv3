@@ -70,6 +70,7 @@ const defaultProps = {
   lockVersion: 3,
   baseRevisionId: 6,
   canDispose: true,
+  tier: "standard" as const,
 };
 
 describe("DraftFindingsPanel", () => {
@@ -134,6 +135,23 @@ describe("DraftFindingsPanel", () => {
 
     fireEvent.change(textarea, { target: { value: "Sole source is the official record." } });
     expect(confirmButton).not.toBeDisabled();
+  });
+
+  it("renders a tier-specific waive consequence that differs between standard and sensitive", async () => {
+    listDraftFindingsMock.mockResolvedValue(paginated([makeFinding({ id: 9, can_waive: true })]));
+
+    const { unmount } = render(<DraftFindingsPanel {...defaultProps} tier="standard" />, { wrapper });
+    fireEvent.click(await screen.findByRole("button", { name: "Waive" }));
+    const standardText = screen.getByText(/single-source high-stakes claim/i).textContent ?? "";
+    unmount();
+
+    render(<DraftFindingsPanel {...defaultProps} tier="sensitive" />, { wrapper });
+    fireEvent.click(await screen.findByRole("button", { name: "Waive" }));
+    const sensitiveText = screen.getByText(/single-source high-stakes claim/i).textContent ?? "";
+
+    expect(standardText).not.toEqual(sensitiveText);
+    expect(sensitiveText).toMatch(/primary official authority/i);
+    expect(standardText).toMatch(/recorded as a warning/i);
   });
 
   it("posts the exact disposition payload and invalidates detail/revisions/findings/claims", async () => {

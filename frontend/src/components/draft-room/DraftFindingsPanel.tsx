@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { AlertTriangle, Info, Loader2, RotateCcw, XCircle } from "lucide-react";
@@ -21,12 +21,14 @@ import {
   type DraftFindingSeverity,
   type DraftFindingStatus,
   type DraftRevisionSummary,
+  type DraftTier,
   type FindingDispositionRequest,
 } from "@/lib/api/draftRoom";
 import {
   ARCHIVED_READ_ONLY_WARNING,
   READY_BLOCKER_LABELS,
   STAGE_LABELS,
+  TIER_DESCRIPTIONS,
   VAULT_ACCESS_REVOKED_WARNING,
 } from "@/components/draft-room/labels";
 import { useDraftRoomUiStore } from "@/stores/useDraftRoomUiStore";
@@ -39,6 +41,8 @@ export interface DraftFindingsPanelProps {
   baseRevisionId: number | null;
   /** False when archived, vault revoked, or a job is active. */
   canDispose: boolean;
+  /** Drives the tier-specific consequence shown before confirming a waiver. */
+  tier: DraftTier;
   onRevisionCreated?(revision: DraftRevisionSummary): void;
 }
 
@@ -70,10 +74,10 @@ const STATUS_LABEL: Record<DraftFindingStatus, string> = {
 };
 
 /**
- * Composed entirely from already-normative `labels.ts` strings — this panel
- * receives no `tier`/`draft` prop, so it cannot show a tier-specific Ready
- * consequence. The waiver-invalidation consequence (SPEC 12.5 rule 6) is the
- * one honest, tier-independent thing we can say before confirming.
+ * Tier-independent part of the waiver consequence (SPEC 12.5 rule 6 —
+ * waivers become invalid if the flagged text or rule version changes).
+ * Rendered alongside `TIER_DESCRIPTIONS[tier]`, which states what a
+ * single-source high-stakes claim actually costs at this project's tier.
  */
 const WAIVE_CONSEQUENCE =
   `Waiving records that a human accepted this finding without changing the text. ` +
@@ -123,6 +127,7 @@ function FilterGroup<T extends string>({ label, options, value, onChange }: Filt
 
 interface FindingRowProps {
   finding: DraftFinding;
+  tier: DraftTier;
   canDispose: boolean;
   conflict: boolean;
   isMutating: boolean;
@@ -138,6 +143,7 @@ interface FindingRowProps {
 
 function FindingRow({
   finding,
+  tier,
   canDispose,
   conflict,
   isMutating,
@@ -247,7 +253,7 @@ function FindingRow({
             rows={2}
           />
           <p id={reasonHintId} className="text-xs text-muted-foreground">
-            {WAIVE_CONSEQUENCE}
+            {WAIVE_CONSEQUENCE} {TIER_DESCRIPTIONS[tier]}
           </p>
           <div className="flex gap-2">
             <Button
@@ -276,6 +282,7 @@ export function DraftFindingsPanel({
   lockVersion,
   baseRevisionId,
   canDispose,
+  tier,
   onRevisionCreated,
 }: DraftFindingsPanelProps) {
   const queryClient = useQueryClient();
@@ -294,29 +301,17 @@ export function DraftFindingsPanel({
     setPage(1);
   }, [severityFilter, statusFilter, revisionId]);
 
-  // The generated `listDraftFindings` params type does not declare
-  // `revision_id`, though the backend endpoint accepts it and this panel's
-  // props are revision-scoped. Building a separately-typed variable (rather
-  // than an inline object literal) avoids TypeScript's excess-property check
-  // while still sending the filter at runtime. Reported as a contract gap —
-  // see the worker report.
-  const queryParams = useMemo(() => {
-    const params: {
-      status?: DraftFindingStatus;
-      severity?: DraftFindingSeverity;
-      page: number;
-      per_page: number;
-      revision_id?: number;
-    } = { page, per_page: perPage };
-    if (statusFilter) params.status = statusFilter;
-    if (severityFilter) params.severity = severityFilter;
-    if (revisionId != null) params.revision_id = revisionId;
-    return params;
-  }, [statusFilter, severityFilter, page, perPage, revisionId]);
+  const findingsParams = {
+    status: statusFilter ?? undefined,
+    severity: severityFilter ?? undefined,
+    revision_id: revisionId ?? undefined,
+    page,
+    per_page: perPage,
+  };
 
   const findingsQuery = useQuery({
-    queryKey: draftRoomKeys.findings(draftId, queryParams),
-    queryFn: () => listDraftFindings(draftId, queryParams),
+    queryKey: draftRoomKeys.findings(draftId, findingsParams),
+    queryFn: () => listDraftFindings(draftId, findingsParams),
   });
 
   const dispositionMutation = useMutation({
@@ -438,6 +433,7 @@ export function DraftFindingsPanel({
             <FindingRow
               key={finding.id}
               finding={finding}
+              tier={tier}
               canDispose={canDispose}
               conflict={conflict}
               isMutating={
