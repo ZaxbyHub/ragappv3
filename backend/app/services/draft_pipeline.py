@@ -2031,18 +2031,33 @@ class _CompileRun:
             return 0.0
         return round(100.0 * index / len(COMPILE_STAGE_ORDER), 2)
 
-    def _notify(self, event_type: str, **fields: Any) -> None:
+    def _notify(self, event_type: str, **fields: Any) -> None:  # noqa: D401
         """Publish one content-free SSE notification; never raises (SPEC §8.4).
 
         SSE is notification only — canonical status always comes from SQLite —
         so a failing or absent subscriber must never affect the compile.
         """
+        from app.services.draft_events import (
+            DraftEventPayloadError as _DraftEventPayloadError,
+        )
+
         try:
             self._deps.publish(
                 event_type,
                 draft_id=self._ctx.draft_id,
                 job_id=self._ctx.job_id,
                 **fields,
+            )
+        except _DraftEventPayloadError:
+            # A payload-contract violation is a BUG, not a transient: the event
+            # is silently lost for every subscriber. Log at error so it cannot
+            # hide in warning noise the way an unallowlisted field once did.
+            logger.error(
+                "draft compile: stage event REJECTED by the payload allowlist "
+                "(job_id=%s event=%s) — the event was not delivered",
+                self._ctx.job_id,
+                event_type,
+                exc_info=True,
             )
         except Exception:  # pragma: no cover - defensive
             logger.warning(

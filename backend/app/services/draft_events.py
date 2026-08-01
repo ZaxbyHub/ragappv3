@@ -78,6 +78,9 @@ _ALLOWED_PAYLOAD_FIELDS: frozenset[str] = frozenset(
         "job_type",
         "status",
         "stage",
+        # Stage retry counter. Content-free (a small integer) and needed so a
+        # subscriber can tell a first attempt from a retry of the same stage.
+        "attempt",
         "progress_percent",
         "error_code",
         "severity",
