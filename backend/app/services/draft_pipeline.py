@@ -1081,7 +1081,8 @@ class _CompileRun:
     async def _stage_research(self) -> None:
         """Delegate to ``draft_research`` and snapshot its evidence (SPEC §11.2)."""
         ctx = self._ctx
-        assert self._manifest is not None
+        if self._manifest is None:  # pragma: no cover - stage order guarantees this
+            raise CompileFailure(CODE_INTERNAL_ERROR, retryable=False)
         input_sha = _stage_input_hash(
             "research", ctx, {"manifest": _artifact_json(self._manifest)}
         )
@@ -1179,7 +1180,8 @@ class _CompileRun:
     async def _stage_outline(self) -> None:
         """Plan the sections and run the plan critic gate (SPEC §11.3)."""
         ctx = self._ctx
-        assert self._packet is not None
+        if self._packet is None:  # pragma: no cover - stage order guarantees this
+            raise CompileFailure(CODE_INTERNAL_ERROR, retryable=False)
         input_sha = _stage_input_hash(
             "outline",
             ctx,
@@ -1214,7 +1216,8 @@ class _CompileRun:
                 )
             if outline.critic.verdict == "approved":
                 break
-        assert outline is not None
+        if outline is None:  # pragma: no cover - the loop runs at least once
+            raise CompileFailure(CODE_INTERNAL_ERROR, retryable=False)
         if outline.critic.verdict != "approved":
             raise CompileFailure(
                 CODE_OUTLINE_REJECTED,
@@ -1251,7 +1254,8 @@ class _CompileRun:
         """Generate one section at a time, in outline order (SPEC §11.4)."""
         ctx = self._ctx
         outline = self._outline
-        assert outline is not None
+        if outline is None:  # pragma: no cover - stage order guarantees this
+            raise CompileFailure(CODE_INTERNAL_ERROR, retryable=False)
         input_sha = _stage_input_hash(
             "draft",
             ctx,
@@ -1759,7 +1763,8 @@ class _CompileRun:
             for quoted in _quoted_spans(claim.proposition) or _quoted_spans(candidate):
                 try:
                     validate_exact_quote(passage, quoted)
-                except Exception:
+                except DraftValidationError:
+                    # This candidate span is not a verbatim match; try the next.
                     continue
                 return quoted
             return None
