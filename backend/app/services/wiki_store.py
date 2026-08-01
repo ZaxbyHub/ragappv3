@@ -555,6 +555,15 @@ class WikiStore:
         # same transaction so the save stays atomic.
         if "markdown" in updates:
             self.sync_page_links(page_id, vault_id, updates["markdown"], commit=False)
+            # SPEC section 12.6: a page-body change invalidates every Draft Room
+            # evidence row carrying this wiki_page_id. Best effort — the hook
+            # cannot raise, and the Draft Room re-resolves evidence again before
+            # Assemble/Ready regardless.
+            from app.services.draft_evidence_freshness import on_wiki_page_changed
+
+            on_wiki_page_changed(
+                self._db, page_id=page_id, new_markdown=updates["markdown"]
+            )
         if commit:
             self._db.commit()
         return self.get_page(page_id)
@@ -566,6 +575,10 @@ class WikiStore:
         deleted = cur.rowcount > 0
         if deleted:
             self.log_activity(vault_id, "page_deleted", "page", page_id, commit=False)
+            # SPEC section 12.6 (best effort, cannot raise).
+            from app.services.draft_evidence_freshness import on_wiki_page_changed
+
+            on_wiki_page_changed(self._db, page_id=page_id, new_markdown=None)
         if commit:
             self._db.commit()
         return deleted
@@ -791,6 +804,14 @@ class WikiStore:
         self._db.execute(
             f"UPDATE wiki_claims SET {set_clause} WHERE id = ? AND vault_id = ?", values
         )
+        if "claim_text" in updates:
+            # SPEC section 12.6: a claim change invalidates evidence rows
+            # carrying this wiki_claim_id. Best effort, cannot raise.
+            from app.services.draft_evidence_freshness import on_wiki_claim_changed
+
+            on_wiki_claim_changed(
+                self._db, claim_id=claim_id, new_claim_text=updates["claim_text"]
+            )
         self._db.commit()
         return self.get_claim(claim_id)
 
@@ -798,6 +819,11 @@ class WikiStore:
         cur = self._db.execute(
             "DELETE FROM wiki_claims WHERE id = ? AND vault_id = ?", (claim_id, vault_id)
         )
+        if cur.rowcount > 0:
+            # SPEC section 12.6 (best effort, cannot raise).
+            from app.services.draft_evidence_freshness import on_wiki_claim_changed
+
+            on_wiki_claim_changed(self._db, claim_id=claim_id, new_claim_text=None)
         self._db.commit()
         return cur.rowcount > 0
 

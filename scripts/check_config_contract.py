@@ -295,7 +295,6 @@ def main() -> int:
 
     draft_str_settings = {
         "DRAFT_COMPILE_RATE_LIMIT": "draft_compile_rate_limit",
-        "DRAFT_PROMPT_BUNDLE_VERSION": "draft_prompt_bundle_version",
         "DRAFT_BOILERPLATE_RULE_VERSION": "draft_boilerplate_rule_version",
         "DRAFT_DEFAULT_LOGICAL_MODE": "draft_default_logical_mode",
     }

@@ -611,6 +611,23 @@ async def lifespan(app: FastAPI):
     app.state.kms_retrieval = KMSRetrievalService(pool=app.state.db_pool)
     logger.info("KMSRetrievalService initialized")
 
+    # Draft Room Ready-evidence reconciler (SPEC section 12.6). Runs BEFORE any
+    # job processor starts and before HTTP traffic is served, so an out-of-band
+    # or database-only source deletion cannot leave a draft sitting in Ready on
+    # stale evidence. Bounded and paginated; never fatal to startup.
+    try:
+        from app.services.draft_evidence_freshness import reconcile_ready_evidence
+
+        await _safe_await(
+            reconcile_ready_evidence(app.state.db_pool),
+            "Draft Room Ready-evidence reconcile",
+            timeout=30,
+        )
+    except Exception as e:
+        logger.warning(
+            "Draft Room Ready-evidence reconcile failed (continuing): %s", e
+        )
+
     # Start WikiCompileProcessor (background wiki job worker)
     try:
         app.state.wiki_compile_processor = WikiCompileProcessor(pool=app.state.db_pool)

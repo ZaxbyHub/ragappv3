@@ -2067,6 +2067,16 @@ async def _purge_file_derived_data(
     except Exception as e:
         logger.warning("mark_claims_stale_by_file(%d) failed: %s", file_id, e)
 
+    # Draft Room evidence freshness (SPEC section 12.6): a deleted document
+    # invalidates every draft_evidence row citing it. Runs on the caller's
+    # connection so it lands in the same transaction as the files-row delete.
+    # Best effort by construction — the hook cannot raise into this path.
+    from app.services.draft_evidence_freshness import on_document_changed
+
+    await asyncio.to_thread(
+        on_document_changed, conn, file_id=file_id, new_content_sha256=None
+    )
+
     return stored_path, vector_delete_failed
 
 

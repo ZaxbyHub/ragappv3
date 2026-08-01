@@ -743,6 +743,7 @@ class DraftRoomCapabilities(BaseModel):
     default_logical_mode: str
     compile_start_stages: list[str]
     compile_stage_order: list[str]
+    prompt_bundle_version: str
     editorial_gates_installed: bool
     compile_available: bool
     findings_available: bool
@@ -2236,6 +2237,11 @@ async def get_capabilities(
         default_logical_mode=settings.draft_default_logical_mode,
         compile_start_stages=list(_START_STAGES),
         compile_stage_order=list(COMPILE_STAGE_ORDER),
+        # Read-only. The bundle version is owned by draft_prompts, which
+        # defines the prompts it names; it is deliberately not an operator
+        # setting, because pinning it would let a stale value satisfy the
+        # resume gate and reuse checkpoints built from different prompts.
+        prompt_bundle_version=PROMPT_BUNDLE_VERSION,
         # "Full editorial gates" means Copy, Standards and Fact are all
         # installed in the orchestrator's canonical order, so no compile can
         # reach Assemble without them.

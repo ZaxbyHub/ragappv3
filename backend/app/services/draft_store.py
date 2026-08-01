@@ -221,6 +221,42 @@ FINDING_STATUSES: frozenset[str] = frozenset(
     {"open", "applied", "dismissed", "waived", "resolved_by_revision"}
 )
 
+# ── Evidence freshness / invalidation vocabulary (SPEC section 12.6) ─────────
+#
+# The two reasons a snapshotted evidence identity can stop being current. Both
+# open a NON-WAIVABLE blocker: SPEC 12.6 requires the text to be revised, not
+# waived, once the evidence under it moved.
+EVIDENCE_INVALIDATION_REASONS: frozenset[str] = frozenset(
+    {"evidence_changed", "source_deleted"}
+)
+EVIDENCE_INVALIDATION_RULE_VERSION: str = "1"
+_EVIDENCE_INVALIDATION_MESSAGES: dict[str, str] = {
+    "evidence_changed": (
+        "A source this revision cites changed after it was researched. The "
+        "revision must be re-compiled against fresh evidence before it can be "
+        "approved."
+    ),
+    "source_deleted": (
+        "A source this revision cites no longer exists in the vault. The "
+        "revision must be re-compiled against fresh evidence before it can be "
+        "approved."
+    ),
+}
+
+# Identity predicates for ``list_evidence_identities_for_source``. Each is
+# written against exactly one of the partial identity indexes shipped in
+# ``_DRAFT_ROOM_PIPELINE_DDL``. Wiki appears twice on purpose: a page change
+# invalidates every row with that ``wiki_page_id`` (including page-level rows
+# where ``wiki_claim_id IS NULL``), while a claim change invalidates only rows
+# carrying that ``wiki_claim_id``.
+EVIDENCE_SOURCE_FILTERS: dict[str, str] = {
+    "draft_input": "e.source_kind = 'draft_input' AND e.draft_input_id = ?",
+    "document": "e.source_kind = 'document' AND e.file_id = ?",
+    "wiki_page": "e.source_kind = 'wiki' AND e.wiki_page_id = ?",
+    "wiki_claim": "e.wiki_claim_id = ?",
+    "kms": "e.source_kind = 'kms' AND e.kms_entry_id = ?",
+}
+
 _STAGE_TRANSITIONS: dict[str, frozenset[str]] = {
     "pending": frozenset({"running", "cancelled"}),
     "running": frozenset({"completed", "failed", "skipped", "cancelled"}),
@@ -547,6 +583,33 @@ class DraftEvidenceRecord:
 
 
 @dataclass
+class DraftEvidenceIdentity:
+    """The freshness-relevant projection of one ``draft_evidence`` row.
+
+    Deliberately excludes ``passage``/``title``: SPEC 12.6 re-resolution
+    compares identity, hash, and update/delete metadata only, and a bounded
+    pass must not drag every snapshotted passage through memory. ``draft_id``
+    and ``vault_id`` come from the owning job so a resolver can scope the
+    lookup to the draft's vault without a second query.
+    """
+
+    id: int
+    job_id: int
+    draft_id: int
+    vault_id: int
+    label: str
+    source_kind: str
+    draft_input_id: Optional[int]
+    file_id: Optional[int]
+    wiki_page_id: Optional[int]
+    wiki_claim_id: Optional[int]
+    kms_entry_id: Optional[int]
+    source_content_sha256: str
+    source_updated_at: Optional[str]
+    source_deleted_at: Optional[str]
+
+
+@dataclass
 class DraftClaimRecord:
     """One factual claim extracted from a revision's text."""
 
@@ -667,6 +730,12 @@ _EVIDENCE_COLUMNS = (
     "source_content_sha256, page_number, section, retrieval_score, authority, "
     "as_of_date, source_updated_at, source_deleted_at, created_at"
 )
+_EVIDENCE_IDENTITY_COLUMNS = (
+    "e.id, e.job_id, j.draft_id, j.vault_id, e.label, e.source_kind, "
+    "e.draft_input_id, e.file_id, e.wiki_page_id, e.wiki_claim_id, "
+    "e.kms_entry_id, e.source_content_sha256, e.source_updated_at, "
+    "e.source_deleted_at"
+)
 _CLAIM_COLUMNS = (
     "id, revision_id, ordinal, claim_text, claim_sha256, span_start, span_end, "
     "claim_type, status, severity, rationale, retrieval_audit_json, resolution, "
@@ -706,6 +775,10 @@ def _row_to_stage(row: sqlite3.Row) -> DraftStageRecord:
 
 def _row_to_evidence(row: sqlite3.Row) -> DraftEvidenceRecord:
     return DraftEvidenceRecord(*row)
+
+
+def _row_to_evidence_identity(row: sqlite3.Row) -> DraftEvidenceIdentity:
+    return DraftEvidenceIdentity(*row)
 
 
 def _row_to_claim(row: sqlite3.Row) -> DraftClaimRecord:
@@ -2531,6 +2604,210 @@ class DraftStore:
             (resolved_job_id, limit, offset),
         ).fetchall()
         return [_row_to_evidence(r) for r in rows]
+
+    # ── evidence freshness (SPEC section 12.6) ───────────────────────────
+
+    def list_evidence_identities(
+        self, *, job_id: int, limit: int = 200, offset: int = 0
+    ) -> list[DraftEvidenceIdentity]:
+        """Page through one job's evidence *identities* (no passages).
+
+        The freshness re-resolution in
+        :mod:`app.services.draft_evidence_freshness` only needs identity,
+        hashes, and update/delete metadata. Selecting the (potentially large)
+        ``passage`` column for every row would make a bounded re-resolution
+        pass unboundedly expensive, so it is deliberately excluded here.
+        """
+        rows = self._db.execute(
+            f"SELECT {_EVIDENCE_IDENTITY_COLUMNS} "  # nosec B608
+            "FROM draft_evidence e JOIN draft_jobs j ON j.id = e.job_id "
+            "WHERE e.job_id = ? ORDER BY e.id ASC LIMIT ? OFFSET ?",
+            (job_id, limit, offset),
+        ).fetchall()
+        return [_row_to_evidence_identity(r) for r in rows]
+
+    def list_evidence_identities_for_source(
+        self, *, source_kind: str, source_id: int, limit: int = 200, offset: int = 0
+    ) -> list[DraftEvidenceIdentity]:
+        """Find every evidence row pointing at one external source.
+
+        ``source_kind`` is one of :data:`EVIDENCE_SOURCE_FILTERS` — note that
+        Wiki has *two* identities (``wiki_page`` and ``wiki_claim``) because a
+        page change invalidates every row with that ``wiki_page_id`` while a
+        claim change invalidates only rows carrying that ``wiki_claim_id``
+        (SPEC 12.6). Each filter is written to hit one of the partial identity
+        indexes created in ``_DRAFT_ROOM_PIPELINE_DDL``.
+
+        Raises:
+            DraftValidationError: ``source_kind`` is not a known identity.
+        """
+        predicate = EVIDENCE_SOURCE_FILTERS.get(source_kind)
+        if predicate is None:
+            raise DraftValidationError(
+                f"unknown evidence source identity: {source_kind!r}"
+            )
+        rows = self._db.execute(
+            f"SELECT {_EVIDENCE_IDENTITY_COLUMNS} "  # nosec B608
+            "FROM draft_evidence e JOIN draft_jobs j ON j.id = e.job_id "
+            f"WHERE {predicate} ORDER BY e.id ASC LIMIT ? OFFSET ?",
+            (source_id, limit, offset),
+        ).fetchall()
+        return [_row_to_evidence_identity(r) for r in rows]
+
+    def mark_evidence_source_deleted(
+        self, *, evidence_ids: Iterable[int], commit: bool = True
+    ) -> int:
+        """Stamp ``source_deleted_at`` on evidence whose source disappeared.
+
+        The row itself is *never* deleted: SPEC 5.6 requires the historical
+        passage to survive until the whole draft is deleted, and SPEC 12.6
+        requires it to be clearly marked so it is never reused. Already-marked
+        rows keep their original timestamp, which makes repeated hook/reconciler
+        passes idempotent.
+        """
+        ids = [int(v) for v in evidence_ids]
+        if not ids:
+            return 0
+        marked = 0
+        for chunk in iter_chunks(ids, 500):
+            placeholders = ",".join("?" for _ in chunk)
+            cur = self._db.execute(
+                "UPDATE draft_evidence SET source_deleted_at = CURRENT_TIMESTAMP "  # nosec B608
+                f"WHERE id IN ({placeholders}) AND source_deleted_at IS NULL",
+                tuple(chunk),
+            )
+            marked += cur.rowcount
+        if commit:
+            self._db.commit()
+        return marked
+
+    def apply_evidence_invalidation(
+        self,
+        *,
+        draft_id: int,
+        revision_id: int,
+        job_id: Optional[int],
+        reason: str,
+        evidence_ids: Iterable[int],
+        actor_user_id: Optional[int] = None,
+    ) -> bool:
+        """Record a SPEC 12.6 invalidation **inside the caller's transaction**.
+
+        Deliberately does not begin or commit a transaction: it is called both
+        from the Ready transaction (already holding ``BEGIN IMMEDIATE``) and
+        from the mutation hooks/reconciler, and either way the invalidation
+        must land atomically with whatever else the caller is doing.
+
+        Performs the three mandated effects:
+
+        1. the affected current revision becomes ``fact_status='invalidated'``;
+        2. a **non-waivable** ``blocker`` finding (``evidence_changed`` or
+           ``source_deleted``) is opened — one per rule per revision, so a
+           repeated pass does not pile up duplicates;
+        3. a ``ready`` draft moves back to ``needs_review`` through the normal
+           transition table.
+
+        Returns:
+            True when anything changed (first invalidation), False when the
+            revision was already invalidated with this rule's blocker open.
+
+        Raises:
+            DraftValidationError: ``reason`` is not a known invalidation reason.
+        """
+        if reason not in EVIDENCE_INVALIDATION_REASONS:
+            raise DraftValidationError(f"unknown invalidation reason: {reason!r}")
+        ids = sorted({int(v) for v in evidence_ids})
+        changed = False
+
+        cur = self._db.execute(
+            "UPDATE draft_revisions SET fact_status = 'invalidated' "
+            "WHERE id = ? AND draft_id = ? AND fact_status != 'invalidated'",
+            (revision_id, draft_id),
+        )
+        changed = changed or cur.rowcount > 0
+
+        existing = self._db.execute(
+            "SELECT id FROM draft_findings WHERE draft_id = ? AND revision_id = ? "
+            "AND rule_id = ? AND status = 'open' LIMIT 1",
+            (draft_id, revision_id, reason),
+        ).fetchone()
+        if existing is None:
+            self._db.execute(
+                "INSERT INTO draft_findings (draft_id, revision_id, job_id, stage, "
+                "rule_id, rule_version, category, severity, waivable, message) "
+                "VALUES (?, ?, ?, 'fact', ?, ?, 'factuality', 'blocker', 0, ?)",
+                (
+                    draft_id,
+                    revision_id,
+                    job_id,
+                    reason,
+                    EVIDENCE_INVALIDATION_RULE_VERSION,
+                    _EVIDENCE_INVALIDATION_MESSAGES[reason],
+                ),
+            )
+            changed = True
+
+        draft_row = self._db.execute(
+            "SELECT status FROM drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if draft_row is not None and str(draft_row[0]) == "ready":
+            _check_transition(
+                "draft",
+                "ready",
+                "needs_review",
+                _DRAFT_TRANSITIONS,
+                _DRAFT_RECOVERY_TRANSITIONS,
+            )
+            self._db.execute(
+                "UPDATE drafts SET status = 'needs_review', ready_revision_id = NULL, "
+                "ready_by = NULL, ready_at = NULL, lock_version = lock_version + 1, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'ready'",
+                (draft_id,),
+            )
+            changed = True
+
+        if changed:
+            # IDs and reason codes only — never passages, titles, or paths.
+            self._insert_event(
+                draft_id=draft_id,
+                event_type="evidence_invalidated",
+                actor_user_id=actor_user_id,
+                job_id=job_id,
+                revision_id=revision_id,
+                payload={"reason": reason, "evidence_count": len(ids)},
+            )
+        return changed
+
+    def list_ready_drafts_page(
+        self, *, after_id: int = 0, limit: int = 50
+    ) -> list[tuple[int, int, int, int, Optional[int]]]:
+        """Keyset page of Ready drafts joined to their current revision.
+
+        Used by the startup reconciler. Keyset (``id > after_id``) rather than
+        OFFSET so a page cannot be skipped when an earlier draft leaves Ready
+        mid-pass.
+
+        Returns:
+            ``(draft_id, owner_id, vault_id, revision_id, revision_job_id)``
+            tuples ordered by draft id.
+        """
+        rows = self._db.execute(
+            "SELECT d.id, d.created_by, d.vault_id, r.id, r.job_id "
+            "FROM drafts d JOIN draft_revisions r "
+            "ON r.draft_id = d.id AND r.is_current = 1 "
+            "WHERE d.status = 'ready' AND d.id > ? ORDER BY d.id ASC LIMIT ?",
+            (int(after_id), int(limit)),
+        ).fetchall()
+        return [
+            (
+                int(r[0]),
+                int(r[1]),
+                int(r[2]),
+                int(r[3]),
+                None if r[4] is None else int(r[4]),
+            )
+            for r in rows
+        ]
 
     # ── claims ───────────────────────────────────────────────────────────
 

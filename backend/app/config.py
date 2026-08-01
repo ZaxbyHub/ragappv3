@@ -487,9 +487,6 @@ class Settings(BaseSettings):
     draft_transient_retry_limit: int = 2
     """Maximum automatic retries for a transient provider/retrieval error inside
     a single compile job, with bounded backoff between attempts."""
-    draft_prompt_bundle_version: str = "1"
-    """Default Draft Room prompt bundle version snapshotted onto new compile
-    jobs. Must track draft_prompts.PROMPT_BUNDLE_VERSION."""
     draft_boilerplate_rule_version: str = "1"
     """Default curated-boilerplate rule version applied by the deterministic
     lint stage and recorded on lint findings."""
