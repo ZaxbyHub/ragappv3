@@ -679,6 +679,56 @@ def _evidence_kwargs(snapshot: object) -> dict[str, Any]:
     return kwargs
 
 
+def _canonical_source_sha256_for(
+    conn: "sqlite3.Connection",
+    kwargs: dict[str, Any],
+    *,
+    draft_id: int,
+    vault_id: int,
+) -> Optional[str]:
+    """Resolve the canonical whole-source hash for a pending evidence insert.
+
+    ``draft_evidence_freshness.canonical_source_sha256`` takes a
+    :class:`DraftEvidenceIdentity`, which normally comes from a persisted row.
+    Here the row does not exist yet, so build the same projection from the
+    insert kwargs. ``draft_id``/``vault_id`` MUST be the real values: the
+    resolvers scope every lookup to the draft's vault, so a placeholder would
+    resolve nothing and silently leave the passage hash in place. Only
+    ``id``/``job_id`` are unused placeholders.
+
+    Returns ``None`` when the source cannot be resolved, which the caller
+    treats as "keep the snapshot value" rather than "changed" — deciding
+    changed-versus-missing is
+    :func:`draft_evidence_freshness.check_evidence_freshness`'s job.
+    """
+    from app.services.draft_evidence_freshness import canonical_source_sha256
+    from app.services.draft_store import DraftEvidenceIdentity
+
+    try:
+        identity = DraftEvidenceIdentity(
+            id=0,
+            job_id=0,
+            draft_id=draft_id,
+            vault_id=vault_id,
+            label=str(kwargs.get("label") or ""),
+            source_kind=str(kwargs.get("source_kind") or ""),
+            draft_input_id=kwargs.get("draft_input_id"),
+            file_id=kwargs.get("file_id"),
+            wiki_page_id=kwargs.get("wiki_page_id"),
+            wiki_claim_id=kwargs.get("wiki_claim_id"),
+            kms_entry_id=kwargs.get("kms_entry_id"),
+            source_content_sha256=str(kwargs.get("source_content_sha256") or ""),
+            source_updated_at=kwargs.get("source_updated_at"),
+            source_deleted_at=None,
+        )
+        return canonical_source_sha256(conn, identity)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "draft compile: canonical source hash unresolved (%s)", type(exc).__name__
+        )
+        return None
+
+
 def _load_research_runner() -> Callable[..., Awaitable[Any]]:
     """Resolve ``draft_research.run_research`` lazily.
 
@@ -1975,10 +2025,30 @@ class _CompileRun:
             )
 
     def _db_snapshot_evidence(self, snapshots: tuple[object, ...]) -> None:
+        """Persist the research evidence snapshot for this job.
+
+        ``source_content_sha256`` must be the CANONICAL WHOLE-SOURCE hash
+        (SPEC §12.6), because that is what evidence-freshness re-resolution
+        compares against. The retrieval seam only knows the passage it
+        returned, so ``draft_research`` fills the field with a passage hash;
+        left as-is, every freshness check on a document, KMS entry or
+        page-level Wiki row would report a spurious ``evidence_changed`` and
+        Ready would be permanently unreachable. Resolve the real source hash
+        here, where a connection is already open, and fall back to the
+        snapshot value only when the source cannot be resolved.
+        """
         with self._pool.connection() as conn:
             store = DraftStore(conn)
             for snapshot in snapshots:
                 kwargs = _evidence_kwargs(snapshot)
+                canonical = _canonical_source_sha256_for(
+                    conn,
+                    kwargs,
+                    draft_id=self._ctx.draft_id,
+                    vault_id=self._ctx.vault_id,
+                )
+                if canonical:
+                    kwargs["source_content_sha256"] = canonical
                 evidence_id = store.insert_evidence(job_id=self._ctx.job_id, **kwargs)
                 self._evidence_ids[kwargs["label"]] = evidence_id
                 self._evidence_passages[kwargs["label"]] = kwargs["passage"]

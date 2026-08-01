@@ -94,6 +94,7 @@ from app.limiter import limiter
 from app.security import csrf_protect
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_events import build_event, get_draft_event_bus
+from app.services.draft_evidence_freshness import enforce_evidence_freshness
 from app.services.draft_input_storage import (
     DraftInputStorage,
     DraftInputStorageError,
@@ -2080,32 +2081,27 @@ def _sync_mark_ready(
             )
 
         # SPEC section 12.6: evidence must still be current inside the Ready
-        # transaction. The snapshot records source deletion/update metadata; a
-        # source that disappeared after Research invalidates the candidate.
-        stale_evidence = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM draft_evidence WHERE job_id = ? "
-                "AND source_deleted_at IS NOT NULL",
-                (int(job_id),),
-            ).fetchone()[0]
+        # transaction. This re-resolves every typed evidence identity against
+        # the live source in the draft's owner/vault scope and compares
+        # existence, canonical content hash and update/delete metadata, rather
+        # than trusting the source_deleted_at flag the hooks may not have
+        # reached. On staleness it stamps source_deleted_at, marks the revision
+        # invalidated, opens non-waivable blockers, returns a Ready draft to
+        # needs_review and records the event -- committing that before the 409
+        # so the invalidation survives the refusal.
+        freshness = enforce_evidence_freshness(
+            conn,
+            draft_id=draft_id,
+            revision_id=revision_id,
+            job_id=int(job_id),
+            actor_user_id=owner_id,
         )
-        if stale_evidence:
-            conn.execute(
-                "UPDATE draft_revisions SET fact_status = 'invalidated' WHERE id = ?",
-                (revision_id,),
-            )
-            store._insert_event(  # noqa: SLF001 - see MODULE-OWNERSHIP NOTE
-                draft_id=draft_id,
-                event_type="evidence_invalidated",
-                actor_user_id=owner_id,
-                revision_id=revision_id,
-                payload={"reason": "source_deleted", "count": stale_evidence},
-            )
+        if not freshness.is_current:
             conn.commit()
             raise _conflict(
                 "evidence this revision depends on changed or was deleted",
-                "evidence_changed",
-                evidence_count=stale_evidence,
+                freshness.reasons[0] if freshness.reasons else "evidence_changed",
+                evidence_count=len(freshness.issues),
             )
 
         # Rule 7: a source-only run needs an explicit acknowledgement.

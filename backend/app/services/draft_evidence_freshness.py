@@ -401,7 +401,11 @@ def enforce_evidence_freshness(
     Args:
         conn: Open SQLite connection. May already be inside the caller's
             ``BEGIN IMMEDIATE`` (the Ready path is); this function joins that
-            transaction rather than starting a competing one.
+            transaction rather than starting a competing one. Because a stale
+            result commits, the caller must run this check **before** it makes
+            any writes it might still want to abandon — in the Ready path that
+            means before ``drafts`` is touched, which is where SPEC 12.6 puts
+            it anyway.
         draft_id: Owning draft.
         revision_id: The current revision the candidate belongs to.
         job_id: The compile job whose evidence backs that revision.
