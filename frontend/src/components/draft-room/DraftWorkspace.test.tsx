@@ -660,4 +660,40 @@ describe("DraftWorkspace", () => {
       })
     );
   });
+
+  it("shows the approver's name and time for a Ready draft (name present)", async () => {
+    renderWorkspace({
+      draft: makeDraft({
+        status: "ready",
+        ready_at: "2026-02-01T12:00:00Z",
+        ready_by: 5,
+        ready_by_username: "jordan",
+      }),
+    });
+
+    const message = await screen.findByTestId("ready-approval");
+    expect(message).toHaveTextContent("Approved by jordan on");
+    expect(message).not.toHaveTextContent(/\b5\b/);
+  });
+
+  it("falls back to an honest message, never a bare id, when the approver's account was deleted", async () => {
+    renderWorkspace({
+      draft: makeDraft({
+        status: "ready",
+        ready_at: "2026-02-01T12:00:00Z",
+        ready_by: 5,
+        ready_by_username: null,
+      }),
+    });
+
+    const message = await screen.findByTestId("ready-approval");
+    expect(message).toHaveTextContent("Approved by a user who no longer has an account on");
+    expect(message).not.toHaveTextContent(/\b5\b/);
+  });
+
+  it("shows no approval message for a draft that has never been marked Ready", async () => {
+    renderWorkspace({ draft: makeDraft({ status: "draft", ready_at: null, ready_by: null, ready_by_username: null }) });
+    await screen.findByTestId("stage-rail");
+    expect(screen.queryByTestId("ready-approval")).not.toBeInTheDocument();
+  });
 });

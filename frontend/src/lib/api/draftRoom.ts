@@ -184,6 +184,19 @@ export interface DraftSummary {
   created_at: string;
   updated_at: string;
   ready_at: string | null;
+  /**
+   * Optional-nullable rather than required: `GET /drafts/{id}` (the detail
+   * endpoint) always populates both, but the list endpoint always leaves
+   * `ready_by_username` `null` (resolving it per row would be an N+1 query
+   * for a field the list doesn't show), and older fixtures across the
+   * codebase predate these fields entirely. Never render a bare id as a
+   * person's name — a `null` username with a present `ready_by` means either
+   * "the list didn't resolve it" (list endpoint) or "that account no longer
+   * exists" (detail endpoint); callers must know which endpoint they're
+   * reading from to tell those apart.
+   */
+  ready_by?: number | null;
+  ready_by_username?: string | null;
 }
 
 export interface DraftInput {

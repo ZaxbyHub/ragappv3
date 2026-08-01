@@ -163,6 +163,24 @@ function summarizeRoles(inputs: DraftInput[]): string {
     .join(", ");
 }
 
+/**
+ * "Actor/time" for the Ready state (SPEC row: Ready). `draft` here always
+ * comes from `getDraft()` (the detail endpoint), which resolves
+ * `ready_by_username` whenever `ready_by` is set — a `null` username with a
+ * present `ready_by` on *this* endpoint specifically means the approver's
+ * account was later deleted, never "unresolved". Never renders the bare
+ * numeric id as if it were a person's name. Returns `null` for a draft that
+ * has never been marked Ready.
+ */
+function readyApprovalText(draft: DraftSummary): string | null {
+  if (draft.status !== "ready") return null;
+  const when = draft.ready_at ? new Date(draft.ready_at).toLocaleString() : null;
+  const suffix = when ? ` on ${when}` : "";
+  if (draft.ready_by_username) return `Approved by ${draft.ready_by_username}${suffix}`;
+  if (draft.ready_by != null) return `Approved by a user who no longer has an account${suffix}`;
+  return `Approved${suffix}`;
+}
+
 function generateIdempotencyKey(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -720,8 +738,16 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     );
   }
 
+  const readyApprovalMessage = readyApprovalText(draft);
+
   const runControls = (
     <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+      {readyApprovalMessage && currentRevisionSummary && (
+        <p className="text-sm text-success" data-testid="ready-approval">
+          {readyApprovalMessage} &middot; Revision {currentRevisionSummary.revision_no} &middot;{" "}
+          {currentRevisionSummary.content_sha256.slice(0, 12)}
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <Button
           type="button"
