@@ -237,7 +237,31 @@ def _aggregate_kinds(
 def _label_evidence(
     facet_results: Sequence[_FacetRetrieval],
 ) -> list[EvidenceSnapshot]:
-    """Assign stable S#/W#/K# labels in facet order (SPEC §12.2)."""
+    """Assign stable S#/W#/K# labels in facet order (SPEC §12.2).
+
+    KNOWN LIMITATION -- ``[D#]`` project-input labels are NOT minted here.
+
+    Issue #436 §5 requires citation validation to *support* ``[D#]`` only when
+    an explicit Draft registry is supplied, with an empty default so chat is
+    unaffected; that is implemented and tested in
+    ``citation_validator.calculate_citation_lexical_overlap`` /
+    ``parse_draft_citations``. SPEC §12.2 additionally describes ``[D#]`` as
+    part of the job's immutable evidence snapshot, and the supporting
+    plumbing exists (the ``draft_input`` source kind, the
+    ``draft_evidence.draft_input_id`` column, the freshness resolver for that
+    family, and the ``D`` branch of the citation regex).
+
+    Minting the labels here was implemented and then reverted: project inputs
+    are always present, so counting them as evidence made ``source_only``
+    permanently False and masked the genuine empty-vault state that SPEC §12.5
+    rule 7 requires a human to acknowledge. Separating "vault evidence" from
+    "input evidence" through the status logic, the prompts, the ledger and the
+    Ready gate is a coherent change, but it is a broad semantic one and is not
+    required by this issue's acceptance criteria. Until it is made, a model
+    emitting ``[D1]`` has that label removed by the pre-Fact sanitation pass
+    and surfaced as a finding, rather than silently presenting provenance the
+    ledger cannot back.
+    """
     doc_n = wiki_n = kms_n = 0
     evidence: list[EvidenceSnapshot] = []
     for result in facet_results:
