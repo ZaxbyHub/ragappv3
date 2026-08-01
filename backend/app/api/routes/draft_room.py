@@ -99,7 +99,11 @@ from app.services.draft_input_storage import (
     DraftInputStorage,
     DraftInputStorageError,
 )
-from app.services.draft_pipeline import COMPILE_STAGE_ORDER
+from app.services.draft_pipeline import (
+    COMPILE_STAGE_ORDER,
+    compile_fingerprint,
+    compile_fingerprint_payload,
+)
 from app.services.draft_prompts import PROMPT_BUNDLE_VERSION
 from app.services.draft_provider_policy import (
     ProviderPolicyError,
@@ -1357,7 +1361,9 @@ def _request_fingerprint(
     )
 
 
-def _sync_compile_fingerprint(store: DraftStore, draft: DraftRecord) -> str:
+def _sync_compile_fingerprint(
+    store: DraftStore, draft: DraftRecord, *, start_stage: str
+) -> str:
     """Recompute the orchestrator's canonical compile fingerprint.
 
     Must stay byte-identical to ``draft_pipeline._build_context``'s
@@ -1365,8 +1371,17 @@ def _sync_compile_fingerprint(store: DraftStore, draft: DraftRecord) -> str:
     ``draft_jobs.compile_input_sha256`` against to decide whether stage
     checkpoints may be resumed (SPEC section 10.1 item 6). If the two ever
     drift, the only consequence is that resume is refused and every stage is
-    re-run — the safe direction. A temporary equality test against
-    ``_build_context`` was run when this was written.
+    re-run — the safe direction. ``TestCompileFingerprintParity`` in
+    ``tests/draft_room/test_draft_compile_routes.py`` pins the equality
+    permanently, for every selectable ``start_stage``.
+
+    The payload itself lives in ``draft_pipeline.compile_fingerprint_payload``
+    so the two sides cannot drift field-by-field; only the *sourcing* of the
+    values differs (this side reads the route's ``DraftStore``, the pipeline
+    side reads its already-built input snapshots). ``start_stage`` is hashed in
+    per SPEC section 5.4, so it must be the NORMALIZED value that will be
+    written to ``draft_jobs.start_stage`` — the pipeline hashes
+    ``job.start_stage``.
     """
     inputs = store.list_inputs(draft_id=draft.id, owner_id=draft.created_by)
     snapshot: list[list[Any]] = []
@@ -1385,22 +1400,23 @@ def _sync_compile_fingerprint(store: DraftStore, draft: DraftRecord) -> str:
                 record.id,
                 record.role,
                 record.authority,
+                record.as_of_date,
                 record.content_sha256,
                 parsed_sha,
             ]
         )
     prior = store.get_current_revision(draft_id=draft.id, owner_id=draft.created_by)
-    return sha256_text(
-        canonical_json(
-            {
-                "brief_hash": sha256_text(draft.brief_json or ""),
-                "mode": draft.mode,
-                "tier": draft.tier,
-                "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
-                "prior_revision_sha256": prior.content_sha256 if prior else "",
-                "inputs": snapshot,
-            }
-        )
+    return compile_fingerprint(
+        compile_fingerprint_payload(
+            draft_id=draft.id,
+            vault_id=draft.vault_id,
+            brief_hash=sha256_text(draft.brief_json or ""),
+            mode=draft.mode,
+            tier=draft.tier,
+            prior_revision_sha256=prior.content_sha256 if prior else "",
+            inputs=snapshot,
+        ),
+        start_stage,
     )
 
 
@@ -2856,18 +2872,23 @@ async def retry_draft_job(
         requested = _DEFAULT_START_STAGE
 
     idempotency_key = _validate_idempotency_key(request.headers.get(_IDEMPOTENCY_HEADER))
-    prepared = await _run_store(
-        lambda: {
+
+    def _prepare_retry() -> dict[str, Any]:
+        # ``start_stage`` is part of the compile fingerprint (SPEC section
+        # 5.4), so the NORMALIZED value must be resolved first.
+        normalized = _sync_normalize_start_stage(db, job_id=job_id, requested=requested)
+        return {
             "input_snapshot": _sync_input_snapshot(store, draft),
-            "compile_fingerprint": _sync_compile_fingerprint(store, draft),
+            "compile_fingerprint": _sync_compile_fingerprint(
+                store, draft, start_stage=normalized
+            ),
             "current_revision": store.get_current_revision(
                 draft_id=draft_id, owner_id=owner_id
             ),
-            "normalized": _sync_normalize_start_stage(
-                db, job_id=job_id, requested=requested
-            ),
+            "normalized": normalized,
         }
-    )
+
+    prepared = await _run_store(_prepare_retry)
     current_revision = prepared["current_revision"]
     base_revision_id = current_revision.id if current_revision else None
     fingerprint = _request_fingerprint(
@@ -2950,15 +2971,22 @@ async def compile_draft(
     _assert_provider_policy(sensitive=draft.tier == "sensitive")
 
     idempotency_key = _validate_idempotency_key(request.headers.get(_IDEMPOTENCY_HEADER))
-    prepared = await _run_store(
-        lambda: {
+
+    def _prepare_compile() -> dict[str, Any]:
+        # ``start_stage`` is part of the compile fingerprint (SPEC section
+        # 5.4), so the NORMALIZED value must be resolved first.
+        normalized = _sync_normalize_start_stage(
+            db, job_id=None, requested=body.start_stage
+        )
+        return {
             "input_snapshot": _sync_input_snapshot(store, draft),
-            "compile_fingerprint": _sync_compile_fingerprint(store, draft),
-            "normalized": _sync_normalize_start_stage(
-                db, job_id=None, requested=body.start_stage
+            "compile_fingerprint": _sync_compile_fingerprint(
+                store, draft, start_stage=normalized
             ),
+            "normalized": normalized,
         }
-    )
+
+    prepared = await _run_store(_prepare_compile)
     fingerprint = _request_fingerprint(
         operation="compile",
         draft=draft,

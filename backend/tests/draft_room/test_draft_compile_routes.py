@@ -43,6 +43,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from queue import Empty, Queue
 from unittest.mock import AsyncMock, MagicMock
 
@@ -58,11 +59,16 @@ except ImportError:
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_db, get_vector_store
+from app.api.routes.draft_room import _sync_compile_fingerprint
 from app.config import settings
 from app.main import app
 from app.security import CSRFManager, csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
-from app.services.draft_pipeline import COMPILE_STAGE_ORDER
+from app.services.draft_pipeline import (
+    COMPILE_STAGE_ORDER,
+    _build_context,
+    compile_fingerprint_payload,
+)
 from app.services.draft_store import DraftStore, sha256_text
 
 
@@ -1388,6 +1394,135 @@ class TestAuditMetadataNoContent(CompileRouteTestBase):
         )
         self.assertEqual(export_resp.status_code, 200, export_resp.text)
         self._assert_metadata_clean(self._audit_metadata("draft_exported"))
+
+
+# ── compile fingerprint parity (SPEC 5.4 / 10.1 item 6) ─────────────────────
+
+
+class TestCompileFingerprintParity(CompileRouteTestBase):
+    """``draft_room`` recomputes the orchestrator's compile fingerprint.
+
+    The route stores it as ``draft_jobs.compile_input_sha256``; the pipeline
+    recomputes it from its own snapshots and refuses to resume any checkpoint
+    unless the two are byte-equal. Two implementations, one contract -- so the
+    equality is pinned here rather than left to a one-off manual check.
+    """
+
+    CLOCK = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+    def _stored_fingerprint(self, job_id):
+        conn = self._connection_pool.get_connection()
+        try:
+            return conn.execute(
+                "SELECT compile_input_sha256 FROM draft_jobs WHERE id = ?", (job_id,)
+            ).fetchone()[0]
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _set_start_stage(self, job_id, start_stage):
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE draft_jobs SET start_stage = ? WHERE id = ?",
+                (start_stage, job_id),
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _pipeline_context(self, draft_id, job_id):
+        conn = self._connection_pool.get_connection()
+        try:
+            job = DraftStore(conn).get_job(
+                draft_id=draft_id, owner_id=self.OWNER_ID, job_id=job_id
+            )
+            return _build_context(conn, job, self.CLOCK)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _route_fingerprint(self, draft_id, start_stage):
+        conn = self._connection_pool.get_connection()
+        try:
+            store = DraftStore(conn)
+            draft = store.get_draft(draft_id, self.OWNER_ID)
+            return _sync_compile_fingerprint(store, draft, start_stage=start_stage)
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _enqueue(self, start_stage="research"):
+        draft_id = self._draft_with_ready_input()
+        resp = self._compile(draft_id, start_stage=start_stage)
+        self.assertEqual(resp.status_code, 202, resp.text)
+        return draft_id, int(resp.json()["id"])
+
+    def test_the_stored_fingerprint_is_byte_equal_to_the_pipelines(self):
+        draft_id, job_id = self._enqueue()
+        self.assertEqual(
+            self._stored_fingerprint(job_id),
+            self._pipeline_context(draft_id, job_id).compile_fingerprint,
+        )
+        self.assertTrue(self._pipeline_context(draft_id, job_id).resume_allowed)
+
+    def test_parity_holds_for_every_selectable_start_stage(self):
+        draft_id, job_id = self._enqueue()
+        seen = set()
+        for stage in COMPILE_STAGE_ORDER:
+            if stage in ("intake", "assemble"):
+                continue  # machine-only: never a selectable start stage
+            with self.subTest(start_stage=stage):
+                self._set_start_stage(job_id, stage)
+                route = self._route_fingerprint(draft_id, stage)
+                pipeline = self._pipeline_context(draft_id, job_id).compile_fingerprint
+                self.assertEqual(route, pipeline)
+                self.assertNotIn(
+                    route, seen, "start_stage must change the fingerprint"
+                )
+                seen.add(route)
+
+    def test_changing_the_model_identity_changes_both_and_blocks_resume(self):
+        draft_id, job_id = self._enqueue()
+        original = self._stored_fingerprint(job_id)
+
+        previous_model = settings.chat_model
+        settings.chat_model = "a-completely-different-model:70b"
+        try:
+            route = self._route_fingerprint(draft_id, "research")
+            ctx = self._pipeline_context(draft_id, job_id)
+            self.assertEqual(route, ctx.compile_fingerprint)
+            self.assertNotEqual(original, ctx.compile_fingerprint)
+            self.assertFalse(
+                ctx.resume_allowed,
+                "a model swap must invalidate every checkpoint the previous "
+                "model produced (SPEC 5.4)",
+            )
+        finally:
+            settings.chat_model = previous_model
+
+    def test_the_fingerprint_covers_the_draft_and_vault_identity(self):
+        draft_id, job_id = self._enqueue()
+        mine = self._route_fingerprint(draft_id, "research")
+        other_draft_id = self._draft_with_ready_input(title="Another Draft")
+        self.assertNotEqual(mine, self._route_fingerprint(other_draft_id, "research"))
+
+    def test_the_fingerprint_never_embeds_the_provider_endpoint(self):
+        """SPEC 9.2: the endpoint must not reach a client-visible field.
+
+        ``compile_input_sha256`` is returned by the job API, so assert against
+        the pre-hash payload -- a hash would hide the mistake.
+        """
+        payload = compile_fingerprint_payload(
+            draft_id=1,
+            vault_id=2,
+            brief_hash="h",
+            mode="rewrite",
+            tier="standard",
+            prior_revision_sha256="",
+            inputs=[],
+        )
+        blob = json.dumps(payload)
+        self.assertNotIn(settings.ollama_chat_url, blob)
+        self.assertNotIn("127.0.0.1", blob)
+        self.assertNotIn("http", blob)
 
 
 if __name__ == "__main__":

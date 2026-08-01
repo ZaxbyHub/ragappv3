@@ -525,12 +525,19 @@ class PipelineTestBase(unittest.IsolatedAsyncioTestCase):
         return draft.id, record.id
 
     def _make_compile_job(self, *, max_model_calls=40, timeout_seconds=1800,
-                          fingerprint=None, bundle=PROMPT_BUNDLE_VERSION):
+                          fingerprint=None, bundle=PROMPT_BUNDLE_VERSION,
+                          parent_job_id=None, start_stage=None, attempt_no=1):
+        """Insert a claimed compile job.
+
+        ``parent_job_id``/``start_stage``/``attempt_no`` mirror what
+        ``draft_room._sync_enqueue_compile`` writes for a retry; they default to
+        the fresh-compile shape so existing callers are unaffected.
+        """
         cur = self.conn.execute(
             "INSERT INTO draft_jobs (draft_id, vault_id, created_by, job_type, "
             "status, max_model_calls, timeout_seconds, prompt_bundle_version, "
-            "compile_input_sha256) "
-            "VALUES (?, ?, ?, 'compile', 'running', ?, ?, ?, ?)",
+            "compile_input_sha256, parent_job_id, start_stage, attempt_no) "
+            "VALUES (?, ?, ?, 'compile', 'running', ?, ?, ?, ?, ?, ?, ?)",
             (
                 self.draft_id,
                 VAULT_ID,
@@ -539,6 +546,9 @@ class PipelineTestBase(unittest.IsolatedAsyncioTestCase):
                 timeout_seconds,
                 bundle,
                 fingerprint,
+                parent_job_id,
+                start_stage,
+                attempt_no,
             ),
         )
         self.conn.commit()
@@ -1125,6 +1135,329 @@ class TestResume(PipelineTestBase):
 
         intake_rows = [r for r in self._stages() if r.stage == "intake"]
         self.assertEqual(len(intake_rows), 2, "a stale fingerprint must re-run")
+
+
+# ── 14b. start_stage / retry checkpoint inheritance ──────────────────────────
+
+
+class TestRetryStartStageInheritance(PipelineTestBase):
+    """SPEC 8.1 / 10.1.6: ``start_stage`` is honoured by the orchestrator.
+
+    A retry is a NEW ``draft_jobs`` row, so before this it had no checkpoints
+    of its own and every stage re-ran at full model cost -- a user asking to
+    re-run from ``copy`` silently got a fresh Outline and Draft. These tests
+    pin the fix and, just as importantly, the limits of the fix: the hash gates
+    still apply, and Fact and Assemble are never skippable.
+    """
+
+    CLOCK = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    PREFIX = ["intake", "research", "outline", "draft", "lint"]
+
+    # -- helpers --
+
+    def _context_for(self, job_id):
+        with self.pool.connection() as conn:
+            job = DraftStore(conn).get_job(
+                draft_id=self.draft_id, owner_id=OWNER_ID, job_id=job_id
+            )
+            return _build_context(conn, job, self.CLOCK)
+
+    def _seal(self, job_id, start_stage):
+        """Write the fingerprint the route would have stored for this job.
+
+        ``start_stage`` is part of the fingerprint (SPEC 5.4), so it must be
+        written BEFORE the fingerprint is computed -- exactly the ordering
+        ``draft_room._prepare_compile`` / ``_prepare_retry`` use.
+        """
+        self.conn.execute(
+            "UPDATE draft_jobs SET start_stage = ? WHERE id = ?",
+            (start_stage, job_id),
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "UPDATE draft_jobs SET compile_input_sha256 = ?, "
+            "prompt_bundle_version = ? WHERE id = ?",
+            (self._context_for(job_id).compile_fingerprint, PROMPT_BUNDLE_VERSION,
+             job_id),
+        )
+        self.conn.commit()
+
+    async def _seed_failed_parent(self):
+        """Run ``self.job_id`` to a real failure at Copy.
+
+        Everything before Copy really ran and really committed checkpoints, so
+        the parent is a genuine artifact of the pipeline rather than hand-
+        written fixture rows.
+        """
+        self._seal(self.job_id, "research")
+        model = FakeModel(happy_responses(copy=["not json at all"]))
+        failure = await self._run_expect_failure(model=model)
+        self.assertEqual(failure.code, CODE_INVALID_STAGE_OUTPUT)
+        self.assertEqual(self._completed_stage_names(), self.PREFIX)
+        self.assertIsNone(self._current_revision())
+        return model
+
+    def _make_retry(self, start_stage):
+        job_id = self._make_compile_job(
+            parent_job_id=self.job_id, start_stage=start_stage, attempt_no=2
+        )
+        self._seal(job_id, start_stage)
+        # The retry route puts the draft back into a compilable state before
+        # the worker claims the job; without it Assemble refuses on a 'failed'
+        # draft and the test would be measuring the wrong gate.
+        self.conn.execute(
+            "UPDATE drafts SET status = 'running' WHERE id = ?", (self.draft_id,)
+        )
+        self.conn.commit()
+        return job_id
+
+    async def _run_job(self, job_id, model=None):
+        model = model or FakeModel(happy_responses())
+        await run_compile(
+            job_id=job_id,
+            pool=self.pool,
+            deps=PipelineDeps(
+                retrieve_sources=FakeRetriever(),
+                complete=model,
+                now=FakeClock(self.CLOCK),
+            ),
+        )
+        return model
+
+    def _completed_for(self, job_id):
+        return [
+            row[0]
+            for row in self.conn.execute(
+                "SELECT stage FROM draft_job_stages WHERE job_id = ? AND "
+                "status = 'completed' ORDER BY id",
+                (job_id,),
+            ).fetchall()
+        ]
+
+    def _evidence_count(self, job_id):
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM draft_evidence WHERE job_id = ?", (job_id,)
+            ).fetchone()[0]
+        )
+
+    def _corrupt_parent_stage(self, stage, **columns):
+        assign = ", ".join(f"{name} = ?" for name in columns)
+        self.conn.execute(
+            f"UPDATE draft_job_stages SET {assign} WHERE job_id = ? AND stage = ?",
+            (*columns.values(), self.job_id, stage),
+        )
+        self.conn.commit()
+
+    # -- tests --
+
+    async def test_retry_from_copy_reuses_the_parent_prefix_without_the_model(self):
+        await self._seed_failed_parent()
+        retry_id = self._make_retry("copy")
+
+        model = await self._run_job(retry_id)
+
+        for stage in ("research", "outline", "draft"):
+            self.assertEqual(
+                model.count(stage),
+                0,
+                f"{stage} was re-run despite start_stage='copy'",
+            )
+        for stage in ("copy", "standards", "fact"):
+            self.assertGreaterEqual(
+                model.count(stage), 1, f"{stage} must run on a retry from copy"
+            )
+        # The inherited rows land on the RETRY job, so its ledger is complete
+        # and a retry-of-this-retry can normalize against it.
+        self.assertEqual(self._completed_for(retry_id), list(COMPILE_STAGE_ORDER))
+        # Evidence is job-scoped: a reused Research packet is useless unless its
+        # labels resolve to rows on this job.
+        self.assertEqual(
+            self._evidence_count(retry_id), self._evidence_count(self.job_id)
+        )
+        self.assertGreater(self._evidence_count(retry_id), 0)
+        # And the retry really did produce a revision.
+        revision = self._current_revision()
+        self.assertIsNotNone(revision)
+        self.assertEqual(revision["content_md"], CANDIDATE)
+
+    async def test_an_inherited_row_whose_artifact_hash_drifted_is_not_reused(self):
+        await self._seed_failed_parent()
+        self._corrupt_parent_stage(
+            "draft", artifact_sha256=sha256_text("not this artifact")
+        )
+        retry_id = self._make_retry("copy")
+
+        model = await self._run_job(retry_id)
+
+        self.assertGreaterEqual(
+            model.count("draft"),
+            1,
+            "a checkpoint whose stored hash does not match its stored JSON "
+            "must never be trusted, whatever start_stage says",
+        )
+
+    async def test_an_inherited_row_whose_input_hash_drifted_is_not_reused(self):
+        await self._seed_failed_parent()
+        self._corrupt_parent_stage(
+            "outline", input_sha256=sha256_text("a stale stage input")
+        )
+        retry_id = self._make_retry("copy")
+
+        model = await self._run_job(retry_id)
+
+        self.assertGreaterEqual(
+            model.count("outline"), 1, "a stale stage input must force a re-run"
+        )
+
+    async def test_fact_and_assemble_always_run_whatever_the_start_stage(self):
+        await self._seed_failed_parent()
+        # Hand the parent a completed Fact row so "not inherited" is a real
+        # refusal rather than an absence.
+        artifact = fact_json()
+        store = DraftStore(self.conn)
+        row_id = store.record_stage_start(
+            job_id=self.job_id, stage="fact", attempt=1, input_sha256=sha256_text("x")
+        )
+        store.record_stage_success(
+            stage_row_id=row_id,
+            artifact_json=artifact,
+            artifact_sha256=sha256_text(artifact),
+        )
+        retry_id = self._make_retry("fact")
+
+        ctx = self._context_for(retry_id)
+        self.assertTrue(ctx.inherit_allowed)
+        self.assertNotIn("fact", ctx.inheritable_stages)
+        self.assertNotIn("assemble", ctx.inheritable_stages)
+        self.assertEqual(
+            ctx.inheritable_stages,
+            ("intake", "research", "outline", "draft", "lint", "copy", "standards"),
+        )
+
+        model = await self._run_job(retry_id)
+
+        self.assertGreaterEqual(
+            model.count("fact"), 1, "Fact is never skippable (SPEC 8.1)"
+        )
+        self.assertEqual(self._completed_for(retry_id), list(COMPILE_STAGE_ORDER))
+        self.assertIsNotNone(self._current_revision())
+
+    def test_the_never_inherited_set_is_exactly_fact_and_assemble(self):
+        self.assertEqual(
+            draft_pipeline.NEVER_INHERITED_STAGES, frozenset({"fact", "assemble"})
+        )
+
+    async def test_start_stage_research_inherits_only_the_machine_only_intake(self):
+        """The default retry start stage re-runs everything a user can pick.
+
+        ``intake`` is machine-only (it precedes the earliest user-selectable
+        stage), costs no model call, and is a pure function of the input
+        manifest, so inheriting it changes nothing observable.
+        """
+        await self._seed_failed_parent()
+        retry_id = self._make_retry("research")
+
+        self.assertEqual(self._context_for(retry_id).inheritable_stages, ("intake",))
+        model = await self._run_job(retry_id)
+
+        self.assertGreaterEqual(model.count("research"), 1)
+        self.assertGreaterEqual(model.count("outline"), 1)
+        self.assertGreaterEqual(model.count("draft"), 1)
+
+    async def test_a_changed_model_identity_blocks_inheritance_and_resume(self):
+        await self._seed_failed_parent()
+        retry_id = self._make_retry("copy")
+
+        # Swap the non-secret model identity AFTER both fingerprints were
+        # sealed: SPEC 5.4 folds it in, so every checkpoint the previous model
+        # produced is now invalid.
+        with patch.object(settings, "chat_model", "some-other-model:70b"):
+            ctx = self._context_for(retry_id)
+            self.assertFalse(ctx.resume_allowed)
+            self.assertFalse(ctx.inherit_allowed)
+            model = await self._run_job(retry_id)
+
+        self.assertGreaterEqual(
+            model.count("outline"), 1, "a model swap must invalidate checkpoints"
+        )
+        self.assertGreaterEqual(model.count("draft"), 1)
+        self.assertEqual(self._evidence_count(retry_id), 1)
+
+    def test_the_model_identity_is_part_of_the_fingerprint(self):
+        self._seal(self.job_id, "research")
+        base = self._context_for(self.job_id).compile_fingerprint
+        with patch.object(settings, "chat_model", "some-other-model:70b"):
+            swapped = self._context_for(self.job_id).compile_fingerprint
+        with patch.object(settings, "instant_chat_model", "some-other-instant:3b"):
+            swapped_instant = self._context_for(self.job_id).compile_fingerprint
+        self.assertNotEqual(base, swapped)
+        self.assertNotEqual(base, swapped_instant)
+
+    def test_the_start_stage_is_part_of_the_fingerprint(self):
+        self.conn.execute(
+            "UPDATE draft_jobs SET start_stage = 'research' WHERE id = ?",
+            (self.job_id,),
+        )
+        self.conn.commit()
+        research = self._context_for(self.job_id).compile_fingerprint
+        self.conn.execute(
+            "UPDATE draft_jobs SET start_stage = 'copy' WHERE id = ?", (self.job_id,)
+        )
+        self.conn.commit()
+        copy = self._context_for(self.job_id).compile_fingerprint
+        self.assertNotEqual(research, copy)
+
+    def test_the_fingerprint_never_carries_the_provider_endpoint(self):
+        """SPEC 9.2: the endpoint must never reach a client-visible field.
+
+        ``compile_input_sha256`` is returned by the job API, and the payload it
+        hashes is reachable from here, so assert on the payload itself rather
+        than trusting the hash to hide a mistake.
+        """
+        payload = draft_pipeline.compile_fingerprint_payload(
+            draft_id=self.draft_id,
+            vault_id=VAULT_ID,
+            brief_hash="h",
+            mode="rewrite",
+            tier="standard",
+            prior_revision_sha256="",
+            inputs=[],
+        )
+        blob = canonical_json(payload)
+        self.assertNotIn(PROVIDER_URL, blob)
+        self.assertNotIn("127.0.0.1", blob)
+        self.assertNotIn("http", blob)
+        self.assertEqual(
+            set(payload["models"]), {"thinking", "instant"}
+        )
+
+    async def test_a_parent_of_a_different_draft_is_never_inherited(self):
+        await self._seed_failed_parent()
+        other_draft_id, _ = self._make_draft_with_input()
+        cur = self.conn.execute(
+            "INSERT INTO draft_jobs (draft_id, vault_id, created_by, job_type, "
+            "status, max_model_calls, timeout_seconds, prompt_bundle_version, "
+            "compile_input_sha256, start_stage) "
+            "VALUES (?, ?, ?, 'compile', 'failed', 40, 1800, ?, ?, 'research')",
+            (
+                other_draft_id,
+                VAULT_ID,
+                OWNER_ID,
+                PROMPT_BUNDLE_VERSION,
+                self._context_for(self.job_id).compile_fingerprint,
+            ),
+        )
+        self.conn.commit()
+        foreign_parent = int(cur.lastrowid)
+
+        retry_id = self._make_compile_job(
+            parent_job_id=foreign_parent, start_stage="copy", attempt_no=2
+        )
+        self._seal(retry_id, "copy")
+
+        self.assertFalse(self._context_for(retry_id).inherit_allowed)
+        self.assertEqual(self._context_for(retry_id).inheritable_stages, ())
 
 
 # ── 15. Fact ledger integrity ────────────────────────────────────────────────

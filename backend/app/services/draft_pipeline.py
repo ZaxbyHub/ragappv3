@@ -147,6 +147,35 @@ COMPILE_STAGE_ORDER: tuple[str, ...] = (
 #: written by PR 2 remain readable; nothing here can produce a new one.
 PROVISIONAL_ASSEMBLY_ENABLED: bool = False
 
+#: SPEC §8.1: a user may ask a retry to start at a later stage, but Fact and
+#: Assemble are never skippable — every revision this module writes must be
+#: fact-checked and assembled by *this* job. These two stages are therefore
+#: excluded from parent-checkpoint inheritance no matter what ``start_stage``
+#: says. (``_START_STAGES`` in the route already refuses ``assemble``; this is
+#: the orchestrator-side guarantee, enforced rather than assumed.)
+NEVER_INHERITED_STAGES: frozenset[str] = frozenset({"fact", "assemble"})
+
+#: ``draft_job_stages`` columns copied verbatim when a retry inherits a parent
+#: checkpoint. ``id``/``job_id`` are re-assigned; ``error_code``/
+#: ``error_message`` are omitted because only ``completed`` rows are ever
+#: inherited.
+_INHERITED_STAGE_COLUMNS = (
+    "stage, attempt, status, input_sha256, artifact_json, artifact_sha256, "
+    "content_md, candidate_sha256, semantic_changed, prompt_id, prompt_version, "
+    "prompt_sha256, model_name, temperature, input_tokens, output_tokens, "
+    "started_at, completed_at"
+)
+
+#: ``draft_evidence`` columns copied verbatim when a retry inherits the parent's
+#: Research checkpoint. Evidence is scoped by ``job_id``, so without this copy a
+#: reused Research packet would reference labels this job has no rows for.
+_INHERITED_EVIDENCE_COLUMNS = (
+    "label, source_kind, draft_input_id, file_id, wiki_page_id, wiki_claim_id, "
+    "kms_entry_id, chunk_uid, title, passage, passage_sha256, "
+    "source_content_sha256, page_number, section, retrieval_score, authority, "
+    "as_of_date, source_updated_at, source_deleted_at"
+)
+
 
 # ---------------------------------------------------------------------------
 # Stable failure codes. Nothing else may reach ``set_job_status``.
@@ -459,7 +488,13 @@ class CompileContext:
     inputs: tuple[_InputSnapshot, ...]
     prompt_bundle_version: str
     compile_fingerprint: str
+    #: The same payload hashed WITHOUT ``start_stage``. This is what binds a
+    #: stage checkpoint to the world it was produced in, so a retry asking for
+    #: a different tail can still inherit the prefix (see ``_stage_input_hash``).
+    compile_world_sha256: str
     start_stage: Optional[str]
+    parent_job_id: Optional[int]
+    inherit_allowed: bool
     started_at: datetime
     deadline: datetime
     max_model_calls: int
@@ -477,6 +512,26 @@ class CompileContext:
     @property
     def manuscript_inputs(self) -> tuple[_InputSnapshot, ...]:
         return tuple(i for i in self.inputs if i.role == "manuscript")
+
+    @property
+    def inheritable_stages(self) -> tuple[str, ...]:
+        """Stages this retry may inherit from its parent job (SPEC §8.1).
+
+        Strictly BEFORE ``start_stage`` — the whole point of asking to start at
+        ``copy`` is that Copy and everything after it re-runs — and never Fact
+        or Assemble. An unknown or absent ``start_stage`` inherits nothing, so
+        the unsafe direction is always "re-run everything".
+        """
+        if not self.inherit_allowed or self.parent_job_id is None:
+            return ()
+        if self.start_stage not in COMPILE_STAGE_ORDER:
+            return ()
+        cutoff = COMPILE_STAGE_ORDER.index(self.start_stage)
+        return tuple(
+            stage
+            for stage in COMPILE_STAGE_ORDER[:cutoff]
+            if stage not in NEVER_INHERITED_STAGES
+        )
 
 
 @dataclass
@@ -554,15 +609,22 @@ def _stage_input_hash(stage: str, ctx: CompileContext, payload: dict[str, Any]) 
     """Hash the *exact* inputs of one stage.
 
     Resume correctness (SPEC §10.1 item 6) rides entirely on this: the hash
-    folds in the compile fingerprint, the prompt bundle, the rendered prompt's
-    own SHA-256 and every upstream artifact/candidate hash the stage consumes.
-    A change anywhere upstream therefore changes this hash, and the stored
+    folds in the compile *world*, the prompt bundle, the rendered prompt's own
+    SHA-256 and every upstream artifact/candidate hash the stage consumes. A
+    change anywhere upstream therefore changes this hash, and the stored
     checkpoint stops matching, so the stage re-runs.
+
+    Deliberately the world hash and NOT ``ctx.compile_fingerprint``: the
+    fingerprint additionally carries the requested ``start_stage`` (SPEC §5.4),
+    which is a routing choice and changes no stage's actual inputs. Folding it
+    in here would give a retry from ``copy`` a different input hash for every
+    stage than its parent recorded, so no checkpoint could ever be inherited
+    and ``start_stage`` would stay inert.
     """
     prompt = PROMPTS.get(stage)
     body = {
         "stage": stage,
-        "compile_fingerprint": ctx.compile_fingerprint,
+        "compile_world_sha256": ctx.compile_world_sha256,
         "prompt_bundle_version": ctx.prompt_bundle_version,
         "prompt_sha256": prompt.sha256 if prompt else "",
         "brief_hash": ctx.brief_hash,
@@ -2237,6 +2299,7 @@ class _CompileRun:
 
     def _db_load_checkpoints(self) -> None:
         with self._pool.connection() as conn:
+            self._inherit_parent_checkpoints(conn)
             stages = DraftStore(conn).list_stages(job_id=self._ctx.job_id, limit=500)
         for record in stages:
             self._attempts[record.stage] = max(
@@ -2244,6 +2307,97 @@ class _CompileRun:
             )
             if record.status == "completed":
                 self._checkpoints[record.stage] = record
+
+    def _inherit_parent_checkpoints(self, conn: sqlite3.Connection) -> None:
+        """Copy a retry's reusable parent checkpoints onto THIS job (SPEC §8.1).
+
+        A retry is a NEW ``draft_jobs`` row, so ``start_stage`` was previously
+        inert: the job had no stage rows of its own and every stage re-ran at
+        full model cost, silently producing a different Outline and Draft than
+        the one the user asked to keep. SPEC §8.1/§10.1.6 want the opposite —
+        the prerequisite checkpoints are reused and only the requested tail
+        re-runs.
+
+        Copying the rows (rather than reading the parent's rows through a
+        second lookup) keeps every later gate untouched: ``_reusable`` still
+        re-hashes the artifact and still compares ``input_sha256``, so an
+        inherited row that does not genuinely match this job's stage input is
+        discarded exactly like a stale same-job checkpoint. The job's own
+        ledger, ``GET /jobs/{id}/stages`` and a retry *of this retry* also stay
+        coherent.
+
+        Gates, all of which must hold:
+
+        * ``inherit_allowed`` — the parent's stored compile fingerprint equals
+          this job's, recomputed with the PARENT's ``start_stage`` (see
+          :func:`_build_context`), and the parent ran the same prompt bundle.
+        * ``resume_allowed`` — this job's own fingerprint is still current.
+        * the stage is strictly before ``start_stage`` and is neither Fact nor
+          Assemble (:attr:`CompileContext.inheritable_stages`).
+        * this job has no row for that stage yet (a crashed retry resuming
+          itself must keep its own rows).
+        """
+        ctx = self._ctx
+        if not ctx.resume_allowed:
+            return
+        if not ctx.inheritable_stages:
+            return
+        own = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT DISTINCT stage FROM draft_job_stages WHERE job_id = ?",
+                (ctx.job_id,),
+            ).fetchall()
+        }
+        wanted = [stage for stage in ctx.inheritable_stages if stage not in own]
+        if not wanted:
+            return
+        marks = ", ".join("?" * len(wanted))
+        rows = conn.execute(
+            f"SELECT {_INHERITED_STAGE_COLUMNS} FROM draft_job_stages "  # nosec B608
+            f"WHERE job_id = ? AND status = 'completed' "
+            f"AND artifact_sha256 IS NOT NULL AND stage IN ({marks}) "
+            f"ORDER BY id ASC",
+            (ctx.parent_job_id, *wanted),
+        ).fetchall()
+        # Latest completed attempt wins when the parent retried a stage.
+        latest: dict[str, tuple[Any, ...]] = {str(row[0]): tuple(row) for row in rows}
+        if not latest:
+            return
+        placeholders = ", ".join("?" * (len(_INHERITED_STAGE_COLUMNS.split(",")) + 1))
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for stage, values in latest.items():
+                conn.execute(
+                    f"INSERT INTO draft_job_stages "  # nosec B608
+                    f"(job_id, {_INHERITED_STAGE_COLUMNS}) VALUES ({placeholders})",
+                    (ctx.job_id, *values),
+                )
+            if "research" in latest:
+                # Evidence is scoped by job_id and the Research packet's labels
+                # must resolve to rows on THIS job, or Fact, the citation
+                # repair pass and the pre-Assemble freshness re-resolution all
+                # see an empty registry.
+                conn.execute(
+                    "DELETE FROM draft_evidence WHERE job_id = ?", (ctx.job_id,)
+                )
+                conn.execute(
+                    f"INSERT INTO draft_evidence "  # nosec B608
+                    f"(job_id, {_INHERITED_EVIDENCE_COLUMNS}) "
+                    f"SELECT ?, {_INHERITED_EVIDENCE_COLUMNS} FROM draft_evidence "
+                    f"WHERE job_id = ? ORDER BY id ASC",
+                    (ctx.job_id, ctx.parent_job_id),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        logger.info(
+            "draft compile: job %s inherited %s from parent job %s",
+            ctx.job_id,
+            sorted(latest),
+            ctx.parent_job_id,
+        )
 
     def _db_set_active_stage(self, stage: str) -> None:
         with self._pool.connection() as conn:
@@ -2684,6 +2838,100 @@ class _CompileRun:
 # ---------------------------------------------------------------------------
 
 
+def compile_fingerprint_payload(
+    *,
+    draft_id: int,
+    vault_id: int,
+    brief_hash: str,
+    mode: str,
+    tier: str,
+    prior_revision_sha256: str,
+    inputs: list[list[Any]],
+) -> dict[str, Any]:
+    """The compile world every checkpoint is bound to (SPEC §5.4, §10.1 item 6).
+
+    Everything a stage artifact could depend on and that a resume must not
+    silently change. Beyond the original brief/mode/tier/bundle/prior-revision/
+    input set this now also carries:
+
+    * ``draft_id`` and ``vault_id`` — the identity of what is being compiled;
+    * each input's ``as_of_date`` — part of the evidence-authority contract;
+    * the non-secret model identity for both logical modes, so a provider or
+      model swap between a crash and a resume invalidates every checkpoint the
+      previous model produced.
+
+    The model identity comes from :func:`_provider_model_name`, never from a
+    base URL: SPEC §9.2 forbids exposing the endpoint, and the fingerprint is
+    echoed to clients as ``compile_input_sha256``.
+
+    ``start_stage`` is deliberately NOT part of this payload — see
+    :func:`compile_fingerprint`.
+    """
+    return {
+        "draft_id": draft_id,
+        "vault_id": vault_id,
+        "brief_hash": brief_hash,
+        "mode": mode,
+        "tier": tier,
+        "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
+        "prior_revision_sha256": prior_revision_sha256,
+        "models": {
+            "thinking": _provider_model_name("thinking"),
+            "instant": _provider_model_name("instant"),
+        },
+        "inputs": inputs,
+    }
+
+
+def compile_fingerprint(payload: dict[str, Any], start_stage: Optional[str]) -> str:
+    """Hash ``payload`` together with the requested ``start_stage``.
+
+    SPEC §5.4 lists the requested start stage as a fingerprint field, so two
+    jobs asking for different tails are not interchangeable. Keeping it as a
+    separate argument on top of a start-stage-free payload is what makes retry
+    inheritance possible at all: a retry from ``copy`` necessarily has a
+    different fingerprint than its parent, so the parent's fingerprint is
+    verified by recomputing it with the PARENT's own ``start_stage`` (see
+    ``inherit_allowed`` below). Every other field must still match exactly.
+    """
+    return sha256_text(canonical_json({**payload, "start_stage": start_stage or ""}))
+
+
+def _parent_inheritance_allowed(
+    conn: sqlite3.Connection, job: "DraftJobRecord", payload: dict[str, Any]
+) -> bool:
+    """May this retry reuse its parent job's completed checkpoints?
+
+    Only when the parent compiled the SAME draft for the same owner, under the
+    same prompt bundle, against the same compile world — proven by recomputing
+    the fingerprint with the parent's own ``start_stage`` and comparing it to
+    the value the parent actually stored. Every difference except the requested
+    start stage therefore still refuses inheritance, including a model or
+    provider swap (now folded into ``payload``).
+    """
+    if not job.parent_job_id:
+        return False
+    row = conn.execute(
+        "SELECT draft_id, created_by, start_stage, compile_input_sha256, "
+        "prompt_bundle_version FROM draft_jobs WHERE id = ? AND job_type = 'compile'",
+        (job.parent_job_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    parent_draft_id, parent_owner, parent_start, parent_fp, parent_bundle = (
+        row[0],
+        row[1],
+        row[2],
+        row[3],
+        row[4],
+    )
+    if parent_draft_id != job.draft_id or parent_owner != job.created_by:
+        return False
+    if parent_bundle != PROMPT_BUNDLE_VERSION:
+        return False
+    return bool(parent_fp) and parent_fp == compile_fingerprint(payload, parent_start)
+
+
 def _build_context(
     conn: sqlite3.Connection, job: "DraftJobRecord", now: datetime
 ) -> CompileContext:
@@ -2729,26 +2977,32 @@ def _build_context(
     prior = store.get_current_revision(draft_id=job.draft_id, owner_id=job.created_by)
     # SPEC §10.1 item 6: the canonical compile fingerprint. Resume is permitted
     # only when the saved fingerprint still equals this value.
-    fingerprint = sha256_text(
-        canonical_json(
-            {
-                "brief_hash": brief_hash,
-                "mode": draft.mode,
-                "tier": draft.tier,
-                "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
-                "prior_revision_sha256": prior.content_sha256 if prior else "",
-                "inputs": [
-                    [s.input_id, s.role, s.authority, s.raw_sha256, s.parsed_sha256]
-                    for s in snapshots
-                ],
-            }
-        )
+    payload = compile_fingerprint_payload(
+        draft_id=draft.id,
+        vault_id=draft.vault_id,
+        brief_hash=brief_hash,
+        mode=draft.mode,
+        tier=draft.tier,
+        prior_revision_sha256=prior.content_sha256 if prior else "",
+        inputs=[
+            [
+                s.input_id,
+                s.role,
+                s.authority,
+                s.as_of_date,
+                s.raw_sha256,
+                s.parsed_sha256,
+            ]
+            for s in snapshots
+        ],
     )
+    fingerprint = compile_fingerprint(payload, job.start_stage)
     timeout = job.timeout_seconds or settings.draft_job_timeout_seconds
     resume_allowed = bool(
         job.compile_input_sha256 == fingerprint
         and job.prompt_bundle_version == PROMPT_BUNDLE_VERSION
     )
+    inherit_allowed = _parent_inheritance_allowed(conn, job, payload)
     return CompileContext(
         job_id=job.id,
         draft_id=job.draft_id,
@@ -2761,7 +3015,10 @@ def _build_context(
         inputs=tuple(snapshots),
         prompt_bundle_version=PROMPT_BUNDLE_VERSION,
         compile_fingerprint=fingerprint,
+        compile_world_sha256=sha256_text(canonical_json(payload)),
         start_stage=job.start_stage,
+        parent_job_id=job.parent_job_id,
+        inherit_allowed=inherit_allowed,
         started_at=now,
         deadline=now + timedelta(seconds=timeout),
         max_model_calls=(
