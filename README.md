@@ -783,6 +783,7 @@ docker compose -f docker-compose.yml up -d
 ### Feature Guides
 
 - **[Email Ingestion](docs/email-ingestion.md)** - Ingest documents via email with IMAP polling and automatic vault routing
+- **[Draft Room](docs/draft-room.md)** - Private, vault-grounded drafting workspace with a fact-checked review gate and promotion into the vault
 
 ### Administration
 
