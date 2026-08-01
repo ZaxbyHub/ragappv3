@@ -69,9 +69,22 @@ _MAX_FILENAME_STEM_CHARS = 200
 
 
 class DraftPromotionError(Exception):
-    """Base class for promotion-service failures."""
+    """Base class for promotion-service failures.
+
+    ``cleanup_incomplete`` is set by :func:`_promote`'s compensation block
+    when this failure occurred *after* the ``files`` row (and/or the
+    ``draft_promotions`` row) had already been created, but the attempt to
+    delete it back out again itself failed (e.g. ``database is locked``).
+    That combination means an orphan may genuinely still exist — callers
+    must record it somewhere an operator can find it and must not report it
+    with the same, indistinguishable error as an ordinary clean failure.
+    """
 
     code = "internal_error"
+
+    def __init__(self, message: str, *, cleanup_incomplete: bool = False) -> None:
+        super().__init__(message)
+        self.cleanup_incomplete = cleanup_incomplete
 
 
 class DraftPromotionDuplicateError(DraftPromotionError):
@@ -187,8 +200,20 @@ def _enforce_size_limit(dest_path: Path) -> None:
 
 def _register_file(
     db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: str, vault_id: int
-) -> int:
+) -> tuple[int, bool]:
     """Duplicate-check + ``files`` row creation, exactly like a normal upload.
+
+    Returns ``(file_id, created)``. ``DocumentProcessor._insert_or_get_file_record``
+    is an upsert keyed on ``file_path`` (not an insert-only call): if a
+    ``files`` row already exists for this exact path — reachable, per
+    ``_do_upload``'s own known behavior, when an earlier row's bytes went
+    missing without the row itself being cleaned up — it *adopts* that row
+    (updating it in place) and returns its existing id rather than creating
+    a new one. ``created`` distinguishes the two so the caller's failure
+    compensation can delete a row it just inserted, but must never delete an
+    adopted row that predates this attempt and may be referenced elsewhere
+    (chunks, wiki pages, tags — every FK to ``files(id)`` is CASCADE/SET
+    NULL).
 
     ``DocumentProcessor._insert_or_get_file_record`` commits its own
     transaction internally, so this function's write is already durable by
@@ -207,6 +232,10 @@ def _register_file(
                 f"(status={duplicate['status']}, file_id={duplicate['id']})",
                 existing_file_id=int(duplicate["id"]),
             )
+        existing_row = conn.execute(
+            "SELECT id FROM files WHERE file_path = ?", (str(dest_path),)
+        ).fetchone()
+        created = existing_row is None
         try:
             file_id = processor._insert_or_get_file_record(
                 str(dest_path), file_hash, conn, vault_id, PROMOTE_SOURCE, None, None
@@ -219,7 +248,7 @@ def _register_file(
             existing_id = int(conflict["id"]) if conflict is not None else None
             raise DraftPromotionDuplicateError(str(exc), existing_file_id=existing_id) from exc
         conn.commit()
-        return file_id
+        return file_id, created
     finally:
         db_pool.release_connection(conn)
 
@@ -236,76 +265,108 @@ def _insert_promotion_row(
     filename: str,
     promoted_by: int,
 ) -> tuple[int, str]:
+    """Insert the provenance row and return ``(promotion_id, created_at)``.
+
+    The insert-and-commit is isolated in its own inner ``try`` so that once
+    it succeeds, ``promotion_id`` is guaranteed to reach the caller — a
+    failure in the follow-up read-back of ``created_at`` (effectively
+    unreachable in practice: it is the same row, on the same connection,
+    immediately after commit) falls back to an empty string rather than
+    raising, so the caller can never end up believing a row was never
+    created when it actually committed. Without this, the caller's
+    compensation logic would skip deleting a row that genuinely exists,
+    leaving a permanent orphan with nothing left to reap it now that
+    ``file_id`` is not a foreign key.
+    """
     conn = db_pool.get_connection()
     try:
-        cursor = conn.execute(
-            "INSERT INTO draft_promotions "
-            "(draft_id, source_type, source_id, source_sha256, vault_id, "
-            "file_id, filename, promoted_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                draft_id,
-                source_type,
-                source_id,
-                source_sha256,
-                vault_id,
-                file_id,
-                filename,
-                promoted_by,
-            ),
-        )
-        promotion_id = int(cursor.lastrowid)
-        row = conn.execute(
-            "SELECT created_at FROM draft_promotions WHERE id = ?", (promotion_id,)
-        ).fetchone()
-        conn.commit()
-        return promotion_id, str(row["created_at"])
-    except BaseException:
-        conn.rollback()
-        raise
+        try:
+            cursor = conn.execute(
+                "INSERT INTO draft_promotions "
+                "(draft_id, source_type, source_id, source_sha256, vault_id, "
+                "file_id, filename, promoted_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    draft_id,
+                    source_type,
+                    source_id,
+                    source_sha256,
+                    vault_id,
+                    file_id,
+                    filename,
+                    promoted_by,
+                ),
+            )
+            promotion_id = int(cursor.lastrowid)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        try:
+            row = conn.execute(
+                "SELECT created_at FROM draft_promotions WHERE id = ?", (promotion_id,)
+            ).fetchone()
+            created_at = str(row["created_at"]) if row is not None else ""
+        except Exception:
+            created_at = ""
+        return promotion_id, created_at
     finally:
         db_pool.release_connection(conn)
 
 
-def _delete_file_row(db_pool: SQLiteConnectionPool, file_id: int) -> None:
-    """Compensation: remove a just-created ``files`` row when a later step in
-    the same promotion attempt failed.
+def _delete_file_row(db_pool: SQLiteConnectionPool, file_id: int) -> bool:
+    """Compensation: remove a ``files`` row *this attempt itself created* (never
+    an adopted pre-existing one — see :func:`_register_file`) when a later
+    step in the same promotion attempt failed.
 
     Without this, a promotion that fails after the ``files`` row commits
     (provenance insert, phase update, or enqueue) leaves a permanently
     'pending' phantom document in the vault — the bytes get deleted by
-    :func:`_discard` but the row never transitions, since nothing will ever
-    enqueue it. (``_do_upload`` has this exact hole for the same reason and
-    is not changed here — this module can only close it for promotion.)
+    :func:`_discard_safe` but the row never transitions, since nothing will
+    ever enqueue it. (``_do_upload`` has this exact hole for the same reason
+    and is not changed here — this module can only close it for promotion.)
+
+    Returns ``True`` on success, ``False`` if the delete itself failed —
+    the caller must treat ``False`` as "an orphan may now exist" and record
+    it somewhere an operator can find it, never silently swallow it.
     """
     conn = db_pool.get_connection()
     try:
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
         conn.commit()
+        return True
     except Exception:
         conn.rollback()
         logger.warning(
             "draft_room_promote: failed to compensate files row id=%s after a "
-            "later promotion step failed",
+            "later promotion step failed — an orphan files row may now exist",
             file_id,
         )
+        return False
     finally:
         db_pool.release_connection(conn)
 
 
-def _delete_promotion_row(db_pool: SQLiteConnectionPool, promotion_id: int) -> None:
+def _delete_promotion_row(db_pool: SQLiteConnectionPool, promotion_id: int) -> bool:
     """Compensation: remove a just-created ``draft_promotions`` row when a
-    later step (phase update or enqueue) in the same attempt failed."""
+    later step (phase update or enqueue) in the same attempt failed.
+
+    Returns ``True`` on success, ``False`` if the delete itself failed — see
+    :func:`_delete_file_row`.
+    """
     conn = db_pool.get_connection()
     try:
         conn.execute("DELETE FROM draft_promotions WHERE id = ?", (promotion_id,))
         conn.commit()
+        return True
     except Exception:
         conn.rollback()
         logger.warning(
             "draft_room_promote: failed to compensate draft_promotions row "
-            "id=%s after a later promotion step failed",
+            "id=%s after a later promotion step failed — an orphan "
+            "draft_promotions row may now exist",
             promotion_id,
         )
+        return False
     finally:
         db_pool.release_connection(conn)
 
@@ -383,12 +444,15 @@ async def _promote(
     dest_path = await asyncio.to_thread(_reserve_destination_path, upload_dir, file_name)
 
     file_id: Optional[int] = None
+    file_row_created = False
     promotion_id: Optional[int] = None
     try:
         await asyncio.to_thread(write_bytes, dest_path)
         await asyncio.to_thread(_enforce_size_limit, dest_path)
         source_sha256 = await asyncio.to_thread(compute_file_hash, str(dest_path))
-        file_id = await asyncio.to_thread(_register_file, db_pool, dest_path, source_sha256, vault_id)
+        file_id, file_row_created = await asyncio.to_thread(
+            _register_file, db_pool, dest_path, source_sha256, vault_id
+        )
         promotion_id, created_at = await asyncio.to_thread(
             _insert_promotion_row,
             db_pool,
@@ -415,26 +479,47 @@ async def _promote(
             file_id=file_id,
         )
     except BaseException as exc:
+        # Cancellation/interrupt must unwind as itself, never be reported as
+        # a promotion failure — but compensation still runs first, the same
+        # as for any other failure here.
+        is_control_flow = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit))
+
         # Full rollback of everything this attempt created, in reverse order:
         # a promotion either fully happened or did not happen at all. Never
         # report failure while leaving the document, its provenance row, or
         # its bytes behind — a client retry must be safe, and the audit
-        # trail must never lie about what exists.
+        # trail must never lie about what exists. `file_id` is only ever
+        # deleted when this attempt actually created that row itself
+        # (`file_row_created`) — `_insert_or_get_file_record` is an upsert
+        # keyed on path, so an unrelated pre-existing (adopted) row must
+        # never be destroyed by a failure in *this* attempt.
+        cleanup_ok = True
         if promotion_id is not None:
-            await asyncio.to_thread(_delete_promotion_row, db_pool, promotion_id)
-        if file_id is not None:
-            await asyncio.to_thread(_delete_file_row, db_pool, file_id)
-        await asyncio.to_thread(_discard, dest_path)
+            if not await asyncio.to_thread(_delete_promotion_row, db_pool, promotion_id):
+                cleanup_ok = False
+        if file_id is not None and file_row_created:
+            if not await asyncio.to_thread(_delete_file_row, db_pool, file_id):
+                cleanup_ok = False
+        if not await asyncio.to_thread(_discard_safe, dest_path):
+            cleanup_ok = False
+
+        if is_control_flow:
+            raise
+
         # Recognized domain errors (duplicate / too-large) carry a specific
         # meaning the route maps to a specific status code and must pass
-        # through unchanged. Anything else — a bare `sqlite3.IntegrityError`
-        # from a concurrently deleted draft, an `OSError`, etc. — is wrapped
-        # into a generic `DraftPromotionError` so the route's catch-all
-        # handler returns the same clean error envelope every other failure
-        # here does, instead of leaking a raw, unhandled exception type.
+        # through unchanged (with `cleanup_incomplete` updated). Anything
+        # else — a bare `sqlite3.IntegrityError` from a concurrently deleted
+        # draft, an `OSError`, etc. — is wrapped into a generic
+        # `DraftPromotionError` so the route's catch-all handler returns the
+        # same clean error envelope every other failure here does, instead
+        # of leaking a raw, unhandled exception type.
         if isinstance(exc, DraftPromotionError):
+            exc.cleanup_incomplete = not cleanup_ok
             raise
-        raise DraftPromotionError(f"promotion failed: {exc}") from exc
+        raise DraftPromotionError(
+            f"promotion failed: {exc}", cleanup_incomplete=not cleanup_ok
+        ) from exc
 
     return DraftPromotionResult(
         promotion_id=promotion_id,
@@ -449,5 +534,19 @@ async def _promote(
     )
 
 
-def _discard(path: Path) -> None:
-    path.unlink(missing_ok=True)
+def _discard_safe(path: Path) -> bool:
+    """Remove copied bytes on a failed promotion. Returns ``True`` on success
+    (including "already gone"), ``False`` if the removal itself raised —
+    guarded so an ``OSError`` here (e.g. a permissions change mid-request)
+    can never escape past the typed exception handling in :func:`_promote`
+    and leave the caller without having run the rest of its compensation."""
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        logger.warning(
+            "draft_room_promote: failed to remove copied bytes at %s — an "
+            "orphan file may now exist on disk",
+            path,
+        )
+        return False

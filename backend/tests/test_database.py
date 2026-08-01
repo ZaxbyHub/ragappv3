@@ -277,8 +277,10 @@ class TestDatabaseSchema(unittest.TestCase):
                 "VALUES (101,101,'/tmp/x.txt','x.txt',10)"
             )
             # Replace the current (already-fixed) table with the OLD,
-            # FK-having shape, as if this database had run an earlier
-            # revision of the migration.
+            # FK-having shape -- including its index, exactly as the
+            # original migration created both together -- as if this
+            # database had run an earlier revision of the migration.
+            conn.execute("DROP INDEX IF EXISTS idx_draft_promotions_draft")
             conn.execute("DROP TABLE draft_promotions")
             conn.executescript("""
                 CREATE TABLE draft_promotions (
@@ -293,6 +295,8 @@ class TestDatabaseSchema(unittest.TestCase):
                     promoted_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE INDEX idx_draft_promotions_draft
+                    ON draft_promotions(draft_id);
             """)
             conn.execute(
                 "INSERT INTO draft_promotions "
@@ -301,6 +305,18 @@ class TestDatabaseSchema(unittest.TestCase):
                 "VALUES (101,101,'input',101,'deadbeef',101,101,'x.txt',101)"
             )
             conn.commit()
+
+            # Confirm the simulated legacy shape actually has the index,
+            # otherwise the assertion below would trivially pass without
+            # ever exercising the bug it exists to catch.
+            before_indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name = 'draft_promotions'"
+                ).fetchall()
+            }
+            self.assertIn("idx_draft_promotions_draft", before_indexes)
         finally:
             conn.close()
 
@@ -314,6 +330,22 @@ class TestDatabaseSchema(unittest.TestCase):
             self.assertFalse(
                 any(row["table"] == "files" for row in fk_rows),
                 "file_id must no longer be a foreign key on files(id)",
+            )
+
+            # The index must survive the rebuild -- `ALTER TABLE ... RENAME`
+            # does not rename the index bound to the old table, so a naive
+            # rebuild silently loses it (issue #437 review finding).
+            after_indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name = 'draft_promotions'"
+                ).fetchall()
+            }
+            self.assertIn(
+                "idx_draft_promotions_draft",
+                after_indexes,
+                "the rebuild must not silently drop the draft_id index",
             )
 
             row = conn.execute(

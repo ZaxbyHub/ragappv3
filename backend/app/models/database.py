@@ -4184,6 +4184,17 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
                 conn.execute(
                     "ALTER TABLE draft_promotions RENAME TO draft_promotions_legacy_fk"
                 )
+                # SQLite index names are global, not scoped per-table:
+                # `ALTER TABLE RENAME` does NOT rename the index bound to it,
+                # so `idx_draft_promotions_draft` now belongs to
+                # `draft_promotions_legacy_fk`. Left alone, the DDL's own
+                # `CREATE INDEX IF NOT EXISTS idx_draft_promotions_draft`
+                # below would silently no-op (the name is still taken), and
+                # then `DROP TABLE draft_promotions_legacy_fk` would take
+                # that index away entirely, leaving the new table with none.
+                # Drop it explicitly first so the DDL's CREATE INDEX actually
+                # runs against the new table.
+                conn.execute("DROP INDEX IF EXISTS idx_draft_promotions_draft")
                 conn.executescript(_DRAFT_ROOM_PROMOTIONS_DDL)
                 conn.execute(
                     "INSERT INTO draft_promotions "

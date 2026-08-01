@@ -3598,6 +3598,66 @@ def _duplicate_context(exc: DraftPromotionDuplicateError) -> dict[str, Any]:
     return {"existing_file_id": exc.existing_file_id}
 
 
+async def _run_promotion(
+    coro,
+    *,
+    db: sqlite3.Connection,
+    request: Request,
+    user: dict,
+    draft_id: int,
+):
+    """Await a ``promote_input``/``promote_revision`` call and translate its
+    domain errors, shared by both the input and revision branches below.
+
+    When ``exc.cleanup_incomplete`` is set — the promotion service's own
+    compensation (delete the just-created ``files``/``draft_promotions`` rows
+    and the bytes) itself failed after a later step in the same attempt
+    failed — an orphan may genuinely exist. That is recorded as its own
+    security-audit event so an operator can find it, and surfaced with a
+    status/code distinguishable from an ordinary clean failure.
+    """
+    try:
+        return await coro
+    except DraftPromotionDuplicateError as exc:
+        if exc.cleanup_incomplete:
+            await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
+        raise DraftRoomHTTPError(
+            409, str(exc), "duplicate_document", _duplicate_context(exc)
+        ) from exc
+    except DraftPromotionTooLargeError as exc:
+        if exc.cleanup_incomplete:
+            await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
+        raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
+    except DraftPromotionError as exc:
+        if exc.cleanup_incomplete:
+            await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
+            raise DraftRoomHTTPError(
+                500, str(exc), "promotion_failed_incomplete_cleanup"
+            ) from exc
+        raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
+
+
+async def _record_promotion_cleanup_failure(
+    db: sqlite3.Connection,
+    request: Request,
+    user: dict,
+    draft_id: int,
+    exc: DraftPromotionError,
+) -> None:
+    """Best-effort audit trail for the rare case where a failed promotion's
+    own compensating deletes also failed, so an orphan ``files`` row,
+    ``draft_promotions`` row, or on-disk file may still exist. Distinct
+    ``event_type`` from ``draft_promoted`` so operators can search for it
+    specifically."""
+    await safe_record_security_event(
+        db,
+        event_type="draft_promotion_cleanup_failed",
+        actor=user,
+        request=request,
+        metadata={"draft_id": draft_id, "detail": str(exc)},
+    )
+
+
 def _apply_promotion_organization(
     db: sqlite3.Connection,
     *,
@@ -3694,8 +3754,8 @@ async def promote_draft_source(
             raise DraftRoomHTTPError(
                 409, "input is not ready for promotion", "input_not_ready"
             )
-        try:
-            result = await promote_input(
+        result = await _run_promotion(
+            promote_input(
                 storage=storage,
                 db_pool=db_pool,
                 background_processor=background_processor,
@@ -3704,18 +3764,12 @@ async def promote_draft_source(
                 title=body.title,
                 promoted_by=owner_id,
                 input_record=input_record,
-            )
-        except DraftPromotionDuplicateError as exc:
-            raise DraftRoomHTTPError(
-                409,
-                str(exc),
-                "duplicate_document",
-                _duplicate_context(exc),
-            ) from exc
-        except DraftPromotionTooLargeError as exc:
-            raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
-        except DraftPromotionError as exc:
-            raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
+            ),
+            db=db,
+            request=request,
+            user=user,
+            draft_id=draft_id,
+        )
     else:
         revision_record = await _run_store(
             lambda: store.get_revision(
@@ -3727,8 +3781,8 @@ async def promote_draft_source(
         )
         revision_fact_status = revision_record.fact_status
         was_ready_revision = bool(draft.ready_revision_id == revision_record.id)
-        try:
-            result = await promote_revision(
+        result = await _run_promotion(
+            promote_revision(
                 storage=storage,
                 db_pool=db_pool,
                 background_processor=background_processor,
@@ -3737,18 +3791,12 @@ async def promote_draft_source(
                 title=body.title,
                 promoted_by=owner_id,
                 revision_record=revision_record,
-            )
-        except DraftPromotionDuplicateError as exc:
-            raise DraftRoomHTTPError(
-                409,
-                str(exc),
-                "duplicate_document",
-                _duplicate_context(exc),
-            ) from exc
-        except DraftPromotionTooLargeError as exc:
-            raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
-        except DraftPromotionError as exc:
-            raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
+            ),
+            db=db,
+            request=request,
+            user=user,
+            draft_id=draft_id,
+        )
 
     # The promotion itself has now genuinely happened (`files` and
     # `draft_promotions` rows exist, ingestion is enqueued) — organization
@@ -3778,21 +3826,41 @@ async def promote_draft_source(
                 exc,
             )
 
-    await _run_store(
-        lambda: store.record_event(
-            draft_id=draft_id,
-            owner_id=owner_id,
-            event_type="promoted",
-            actor_user_id=owner_id,
-            revision_id=result.source_id if body.source_type == "revision" else None,
-            payload={
-                "source_type": result.source_type,
-                "source_id": result.source_id,
-                "vault_id": result.vault_id,
-                "file_id": result.file_id,
-            },
+    # The promotion has genuinely happened (files/draft_promotions rows
+    # exist, ingestion is enqueued) -- exactly like `organization_error`
+    # above, nothing from this point on may turn the response into a
+    # failure. `record_event` starts with `DraftStore.get_draft`, which 404s
+    # if the draft was deleted between enqueue and here; that must be
+    # recorded and logged, never allowed to make the client believe the
+    # promotion it can already see evidence of (a real, enqueued document)
+    # never happened.
+    draft_event_error: Optional[str] = None
+    try:
+        await _run_store(
+            lambda: store.record_event(
+                draft_id=draft_id,
+                owner_id=owner_id,
+                event_type="promoted",
+                actor_user_id=owner_id,
+                revision_id=result.source_id if body.source_type == "revision" else None,
+                payload={
+                    "source_type": result.source_type,
+                    "source_id": result.source_id,
+                    "vault_id": result.vault_id,
+                    "file_id": result.file_id,
+                },
+            )
         )
-    )
+    except Exception as exc:  # noqa: BLE001 — must not turn a real success into a reported failure
+        draft_event_error = str(exc)
+        logger.warning(
+            "draft_room: failed to record draft_events row after promotion "
+            "succeeded (draft_id=%s file_id=%s): %s",
+            draft_id,
+            result.file_id,
+            exc,
+        )
+
     await safe_record_security_event(
         db,
         event_type="draft_promoted",
@@ -3809,6 +3877,7 @@ async def promote_draft_source(
             "revision_fact_status": revision_fact_status,
             "was_ready_revision": was_ready_revision,
             "organization_error": organization_error,
+            "draft_event_error": draft_event_error,
         },
     )
 

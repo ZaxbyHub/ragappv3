@@ -11,6 +11,7 @@ package's convention of duplicating rather than importing across test files;
 see ``test_draft_compile_routes.py``'s own harness docstring).
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -40,6 +41,9 @@ from app.config import settings
 from app.main import app
 from app.security import CSRFManager, csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
+from app.services.draft_input_storage import DraftInputStorage
+from app.services.draft_promotion import promote_input
+from app.services.draft_store import DraftStore
 
 
 class _PoolWithConnectionCM:
@@ -980,14 +984,14 @@ class TestPromoteAtomicity(DraftPromoteTestBase):
         real_register_file = draft_promotion_module._register_file
 
         def _register_then_delete_draft(db_pool, dest_path, file_hash, vault_id):
-            created_file_id = real_register_file(db_pool, dest_path, file_hash, vault_id)
+            created_file_id, created = real_register_file(db_pool, dest_path, file_hash, vault_id)
             conn = self._connection_pool.get_connection()
             try:
                 conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
                 conn.commit()
             finally:
                 self._connection_pool.release_connection(conn)
-            return created_file_id
+            return created_file_id, created
 
         with patch.object(
             draft_promotion_module, "_register_file", side_effect=_register_then_delete_draft
@@ -1063,6 +1067,206 @@ class TestPromoteInputSourcePreserved(DraftPromoteTestBase):
             "the private draft-room source file must not be moved or deleted",
         )
         self.assertEqual(source_path.read_bytes(), b"private manuscript bytes")
+
+
+class TestPromoteAuditWritesAreBestEffort(DraftPromoteTestBase):
+    """HIGH review finding: the promotion itself (bytes, `files` row,
+    `draft_promotions` row, enqueue) must not be reported as a failure by
+    something that happens strictly *after* it already succeeded — the
+    `draft_events`/`security_audit_log` writes are bookkeeping, not part of
+    the promotion's own atomicity contract."""
+
+    def _ready_input(self, draft_id, content=b"body"):
+        upload = self._upload_input(draft_id, content=content)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+        return input_id
+
+    def test_draft_deleted_before_draft_events_write_still_returns_202(self):
+        """Simulates the draft being deleted between the enqueue call and
+        the `draft_events` write: `DraftStore.record_event` starts with
+        `get_draft`, which 404s once the draft is gone. That must be
+        recorded and logged, never allowed to turn an already-real,
+        already-enqueued promotion into a reported failure."""
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        real_record_event = DraftStore.record_event
+
+        def _delete_draft_then_record_event(store_self, **kwargs):
+            conn = self._connection_pool.get_connection()
+            try:
+                conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
+                conn.commit()
+            finally:
+                self._connection_pool.release_connection(conn)
+            return real_record_event(store_self, **kwargs)
+
+        with patch.object(DraftStore, "record_event", _delete_draft_then_record_event):
+            resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        self.assertEqual(resp.status_code, 202, resp.text)
+        body = resp.json()
+        file_id = body["file_id"]
+
+        # The promotion genuinely happened and is reported as such.
+        files = self._files_rows()
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0]["id"], file_id)
+        self._mock_background_processor.enqueue.assert_awaited_once()
+
+        # The provenance row is gone too -- correctly cascade-deleted with
+        # the draft (`draft_id` is `ON DELETE CASCADE`) -- but that is a
+        # consequence of the draft's own deletion, not something the route
+        # needed to succeed at recording for the response to be honest.
+        conn = self._connection_pool.get_connection()
+        try:
+            promotions = conn.execute(
+                "SELECT id FROM draft_promotions WHERE file_id = ?", (file_id,)
+            ).fetchall()
+        finally:
+            self._connection_pool.release_connection(conn)
+        self.assertEqual(promotions, [])
+
+        # The failure to record it is itself recorded, not silently dropped.
+        rows = self._security_audit_rows("draft_promoted")
+        self.assertEqual(len(rows), 1)
+        metadata = json.loads(rows[0]["metadata_json"])
+        self.assertIsNotNone(metadata["draft_event_error"])
+
+
+class TestPromoteAdoptedFileProtection(DraftPromoteTestBase):
+    """HIGH review finding: `_insert_or_get_file_record` is an upsert keyed
+    on `file_path`. If a `files` row already exists for the exact
+    destination path — reachable when an earlier row's bytes went missing
+    without the row itself being cleaned up — promotion adopts that row
+    rather than creating a new one, and a later failure in the same attempt
+    must never delete it: every FK to `files(id)` is CASCADE/SET NULL, so
+    destroying an adopted, unrelated document would take everything hanging
+    off it with it."""
+
+    def _ready_input(self, draft_id, content=b"body"):
+        upload = self._upload_input(draft_id, content=content)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+        return input_id
+
+    def test_preexisting_file_row_survives_later_promotion_failure(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        title = "Existing Document"
+        expected_filename = "Existing_Document.txt"
+        upload_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
+        dest_path = upload_dir / expected_filename
+
+        conn = self._connection_pool.get_connection()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO files (vault_id, file_path, file_name, file_size, status) "
+                "VALUES (?, ?, ?, ?, 'indexed')",
+                (self.READ_VAULT_ID, str(dest_path), expected_filename, 999),
+            )
+            preexisting_file_id = cursor.lastrowid
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # Force a failure strictly after `_register_file` has already
+        # adopted the pre-existing row.
+        self._mock_background_processor.enqueue = AsyncMock(
+            side_effect=RuntimeError("queue unavailable")
+        )
+        resp = self._promote(
+            draft_id, source_type="input", source_id=input_id, title=title
+        )
+        self.assertEqual(resp.status_code, 500, resp.text)
+
+        files = self._files_rows()
+        self.assertEqual(
+            len(files), 1, "the pre-existing row must not be deleted by compensation"
+        )
+        self.assertEqual(files[0]["id"], preexisting_file_id)
+
+
+class TestPromoteCleanupFailureIsRecorded(DraftPromoteTestBase):
+    """MEDIUM review finding: if a compensating delete itself fails after a
+    later promotion step already failed, that must not be silent — it is
+    recorded as its own audit event and surfaced with a status
+    distinguishable from an ordinary clean failure."""
+
+    def _ready_input(self, draft_id, content=b"body"):
+        upload = self._upload_input(draft_id, content=content)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+        return input_id
+
+    def test_compensation_failure_is_recorded_and_distinguishable(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        self._mock_background_processor.enqueue = AsyncMock(
+            side_effect=RuntimeError("queue unavailable")
+        )
+        with patch.object(draft_promotion_module, "_delete_file_row", return_value=False):
+            resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertEqual(resp.json()["code"], "promotion_failed_incomplete_cleanup")
+
+        rows = self._security_audit_rows("draft_promotion_cleanup_failed")
+        self.assertEqual(len(rows), 1)
+        metadata = json.loads(rows[0]["metadata_json"])
+        self.assertEqual(metadata["draft_id"], draft_id)
+
+
+class TestPromoteCancellation(DraftPromoteTestBase):
+    """MEDIUM review finding: a client disconnect (`asyncio.CancelledError`)
+    or interpreter shutdown signal during promotion must unwind as itself —
+    not be converted into a `DraftPromotionError` reported as an ordinary
+    500 — even though compensation must still run first. Exercised directly
+    against the service function: an HTTP-level TestClient request cannot
+    reliably simulate genuine mid-request task cancellation."""
+
+    def test_cancelled_error_propagates_unwrapped_after_compensation(self):
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id, content=b"cancel me")
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+
+        conn = self._connection_pool.get_connection()
+        try:
+            store = DraftStore(conn)
+            draft = store.get_draft(draft_id, self.OWNER_ID)
+            input_record = store.get_input(
+                draft_id=draft_id, owner_id=self.OWNER_ID, input_id=input_id
+            )
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        storage = DraftInputStorage(Path(settings.data_dir) / "draft-room")
+        cancelling_processor = MagicMock()
+        cancelling_processor.enqueue = AsyncMock(side_effect=asyncio.CancelledError())
+
+        async def _run():
+            return await promote_input(
+                storage=storage,
+                db_pool=self._connection_pool,
+                background_processor=cancelling_processor,
+                draft_id=draft_id,
+                vault_id=draft.vault_id,
+                title="Cancelled Title",
+                promoted_by=self.OWNER_ID,
+                input_record=input_record,
+            )
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(_run())
+
+        # Compensation still ran despite the cancellation propagating unwrapped.
+        self.assertEqual(self._files_rows(), [])
+        uploads_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
+        self.assertEqual(list(uploads_dir.glob("*")), [])
 
 
 if __name__ == "__main__":
