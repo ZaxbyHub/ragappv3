@@ -116,8 +116,6 @@ export function DraftPromoteDialog({
     setSubmitting(false);
     setError(null);
     setResult(null);
-    const frame = requestAnimationFrame(() => headingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
     // Re-initialize only when the dialog opens for this draft.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, draft.id]);
@@ -195,7 +193,13 @@ export function DraftPromoteDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent aria-describedby="draft-promote-description">
+      <DialogContent
+        aria-describedby="draft-promote-description"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          headingRef.current?.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle ref={headingRef} tabIndex={-1}>
             {PROMOTE_TO_VAULT_CTA}

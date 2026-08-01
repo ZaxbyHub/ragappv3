@@ -432,12 +432,6 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   } | null>(null);
   const compileHeadingRef = useRef<HTMLHeadingElement>(null);
 
-  useEffect(() => {
-    if (!compileDialog) return;
-    const frame = requestAnimationFrame(() => compileHeadingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [compileDialog]);
-
   function openCompileDialog(startStage?: DraftCompileStartStage) {
     setCompileDialog({ startStage, idempotencyKey: generateIdempotencyKey() });
   }
@@ -479,11 +473,6 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // ---- Cancel ---------------------------------------------------------------
   const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
   const cancelHeadingRef = useRef<HTMLHeadingElement>(null);
-  useEffect(() => {
-    if (!cancelConfirmOpen) return;
-    const frame = requestAnimationFrame(() => cancelHeadingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [cancelConfirmOpen]);
   const cancelMutation = useMutation({
     mutationFn: () => cancelDraftJob(draftId, (activeJob as DraftJob).id),
     onSuccess: () => {
@@ -526,11 +515,6 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
   const [saveConflict, setSaveConflict] = useState(false);
   const saveHeadingRef = useRef<HTMLHeadingElement>(null);
-  useEffect(() => {
-    if (!saveConfirmOpen) return;
-    const frame = requestAnimationFrame(() => saveHeadingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [saveConfirmOpen]);
   const saveRevisionMutation = useMutation({
     mutationFn: () =>
       createDraftRevision(draftId, {
@@ -623,11 +607,6 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // ---- Delete / Restore ---------------------------------------------------
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const deleteHeadingRef = useRef<HTMLHeadingElement>(null);
-  useEffect(() => {
-    if (!deleteConfirmOpen) return;
-    const frame = requestAnimationFrame(() => deleteHeadingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [deleteConfirmOpen]);
   const deleteMutation = useMutation({
     mutationFn: () => deleteDraft(draftId),
     onSuccess: () => {
@@ -648,11 +627,6 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
 
   const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
   const archiveHeadingRef = useRef<HTMLHeadingElement>(null);
-  useEffect(() => {
-    if (!archiveConfirmOpen) return;
-    const frame = requestAnimationFrame(() => archiveHeadingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [archiveConfirmOpen]);
   const archiveBlockedReason = hasActiveJob
     ? "Archiving is unavailable while a newsroom run is active."
     : null;
@@ -983,7 +957,13 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
 
       {/* ---- Compile confirmation ---- */}
       <Dialog open={compileDialog != null} onOpenChange={(open) => !open && setCompileDialog(null)}>
-        <DialogContent aria-describedby="draft-compile-description">
+        <DialogContent
+          aria-describedby="draft-compile-description"
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            compileHeadingRef.current?.focus();
+          }}
+        >
           <DialogHeader>
             <DialogTitle ref={compileHeadingRef} tabIndex={-1}>
               {compileCtaLabel(draft.mode)}
@@ -1023,7 +1003,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
 
       {/* ---- Cancel confirmation ---- */}
       <Dialog open={cancelConfirmOpen} onOpenChange={setCancelConfirmOpen}>
-        <DialogContent>
+        <DialogContent
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            cancelHeadingRef.current?.focus();
+          }}
+        >
           <DialogHeader>
             <DialogTitle ref={cancelHeadingRef} tabIndex={-1}>
               Cancel this run?
@@ -1057,7 +1042,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           if (!open) setSaveConflict(false);
         }}
       >
-        <DialogContent>
+        <DialogContent
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            saveHeadingRef.current?.focus();
+          }}
+        >
           <DialogHeader>
             <DialogTitle ref={saveHeadingRef} tabIndex={-1}>
               Save a new revision?
@@ -1102,7 +1092,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
 
       {/* ---- Delete confirmation ---- */}
       <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
-        <DialogContent>
+        <DialogContent
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            deleteHeadingRef.current?.focus();
+          }}
+        >
           <DialogHeader>
             <DialogTitle ref={deleteHeadingRef} tabIndex={-1}>
               Delete this project?
@@ -1130,7 +1125,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
 
       {/* ---- Archive confirmation ---- */}
       <Dialog open={archiveConfirmOpen} onOpenChange={setArchiveConfirmOpen}>
-        <DialogContent>
+        <DialogContent
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            archiveHeadingRef.current?.focus();
+          }}
+        >
           <DialogHeader>
             <DialogTitle ref={archiveHeadingRef} tabIndex={-1}>
               Archive this project?

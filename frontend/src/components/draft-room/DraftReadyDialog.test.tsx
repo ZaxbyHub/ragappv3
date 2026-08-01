@@ -122,6 +122,32 @@ describe("DraftReadyDialog", () => {
     });
   });
 
+  it("focuses the heading FIRST — no other control receives focus on the way there", async () => {
+    // Capturing focusin listener records every element that receives focus, in
+    // order, from the moment the dialog mounts. A rAF-deferred focus() lets
+    // Radix's own FocusScope focus the Cancel button first (a real focus/focusin
+    // event assistive tech would announce) before the rAF steals focus a frame
+    // later — this test catches that even though the terminal activeElement
+    // assertion above does not.
+    const focusedTags: string[] = [];
+    const onFocusIn = (event: FocusEvent) => {
+      const target = event.target as HTMLElement;
+      focusedTags.push(`${target.tagName}:${target.textContent?.trim() ?? ""}`);
+    };
+    document.addEventListener("focusin", onFocusIn, true);
+
+    try {
+      renderDialog();
+      await waitFor(() => {
+        expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Mark Ready" }));
+      });
+      expect(focusedTags[0]).toBe("H2:Mark Ready");
+      expect(focusedTags).toHaveLength(1);
+    } finally {
+      document.removeEventListener("focusin", onFocusIn, true);
+    }
+  });
+
   it("renders one checklist row per eligibility condition with pass/fail as icon + text", () => {
     renderDialog({ eligibility: { ok: false, blockers: ["fact_not_current", "evidence_changed"] } });
 

@@ -118,6 +118,31 @@ describe("DraftExportDialog", () => {
     });
   });
 
+  it("focuses the heading FIRST — no other control receives focus on the way there", async () => {
+    // A capturing focusin listener records every element focused from mount
+    // onward. A rAF-deferred focus() lets Radix's FocusScope focus the Cancel
+    // button first (a real focus/focusin event a screen reader would announce)
+    // before the rAF steals focus a frame later; the terminal activeElement
+    // check above alone does not catch that.
+    const focusedTags: string[] = [];
+    const onFocusIn = (event: FocusEvent) => {
+      const target = event.target as HTMLElement;
+      focusedTags.push(`${target.tagName}:${target.textContent?.trim() ?? ""}`);
+    };
+    document.addEventListener("focusin", onFocusIn, true);
+
+    try {
+      renderDialog();
+      await waitFor(() => {
+        expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Export" }));
+      });
+      expect(focusedTags[0]).toBe("H2:Export");
+      expect(focusedTags).toHaveLength(1);
+    } finally {
+      document.removeEventListener("focusin", onFocusIn, true);
+    }
+  });
+
   it("shows fact status and approval status before download", async () => {
     renderDialog({
       revision: makeRevision({ fact_status: "findings" }),

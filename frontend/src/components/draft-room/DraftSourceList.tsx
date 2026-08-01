@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { CheckCircle2, Clock, FileText, Loader2, Pencil, Trash2, XCircle } from "lucide-react";
@@ -151,12 +151,6 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
   const [editAuthority, setEditAuthority] = useState<DraftInputAuthority>(input.authority);
   const [editAsOfDate, setEditAsOfDate] = useState(input.as_of_date ?? "");
   const deleteHeadingRef = useRef<HTMLHeadingElement>(null);
-
-  useEffect(() => {
-    if (!confirmDeleteOpen) return;
-    const frame = requestAnimationFrame(() => deleteHeadingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [confirmDeleteOpen]);
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
@@ -333,7 +327,12 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
       )}
 
       <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
-        <DialogContent>
+        <DialogContent
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            deleteHeadingRef.current?.focus();
+          }}
+        >
           <DialogHeader>
             <DialogTitle ref={deleteHeadingRef} tabIndex={-1}>
               Remove {input.original_name}?

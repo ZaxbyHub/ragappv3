@@ -52,8 +52,6 @@ export function DraftCreateDialog(props: DraftCreateDialogProps): JSX.Element {
     setValue(createDefaultDraftAssignmentFormValue(defaultVaultId));
     setErrors({});
     setSubmitError(null);
-    const frame = requestAnimationFrame(() => titleRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset only on open transition, not on every defaultVaultId identity change
   }, [open]);
 
@@ -94,7 +92,13 @@ export function DraftCreateDialog(props: DraftCreateDialogProps): JSX.Element {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
+      <DialogContent
+        className="max-h-[85vh] overflow-y-auto sm:max-w-xl"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          titleRef.current?.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle ref={titleRef} tabIndex={-1}>
             {CREATE_PROJECT_HEADING}

@@ -244,6 +244,31 @@ describe("DraftPromoteDialog", () => {
     });
   });
 
+  it("focuses the heading FIRST — no other control (e.g. the title input) receives focus on the way there", async () => {
+    // A capturing focusin listener records every element focused from mount
+    // onward. A rAF-deferred focus() lets Radix's FocusScope run focusFirst()
+    // — including a `.select()` on the pre-filled title input — before the
+    // rAF steals focus a frame later; the terminal activeElement check above
+    // alone does not catch that intermediate focus/select.
+    const focusedTags: string[] = [];
+    const onFocusIn = (event: FocusEvent) => {
+      const target = event.target as HTMLElement;
+      focusedTags.push(`${target.tagName}:${target.textContent?.trim() ?? ""}`);
+    };
+    document.addEventListener("focusin", onFocusIn, true);
+
+    try {
+      renderDialog();
+      await waitFor(() => {
+        expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Promote to vault" }));
+      });
+      expect(focusedTags[0]).toBe("H2:Promote to vault");
+      expect(focusedTags).toHaveLength(1);
+    } finally {
+      document.removeEventListener("focusin", onFocusIn, true);
+    }
+  });
+
   it("disables the action and explains why when canWrite is false", async () => {
     renderDialog({ canWrite: false });
     expect(await screen.findByText(/read-only access/i)).toBeInTheDocument();

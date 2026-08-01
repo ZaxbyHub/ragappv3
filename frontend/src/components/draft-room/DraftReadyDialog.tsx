@@ -78,10 +78,7 @@ export function DraftReadyDialog({
       setAck(false);
       setSubmitting(false);
       setServerError(null);
-      return;
     }
-    const frame = requestAnimationFrame(() => headingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
   }, [open]);
 
   const blockers = serverError
@@ -117,7 +114,13 @@ export function DraftReadyDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent aria-describedby="draft-ready-meaning">
+      <DialogContent
+        aria-describedby="draft-ready-meaning"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          headingRef.current?.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle ref={headingRef} tabIndex={-1}>
             {MARK_READY_CTA}

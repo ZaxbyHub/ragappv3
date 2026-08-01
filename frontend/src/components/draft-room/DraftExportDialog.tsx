@@ -94,10 +94,7 @@ export function DraftExportDialog({
       setAck(false);
       setExporting(false);
       setError(null);
-      return;
     }
-    const frame = requestAnimationFrame(() => headingRef.current?.focus());
-    return () => cancelAnimationFrame(frame);
   }, [open]);
 
   const canExport = !exporting && (!ackRequired || ack);
@@ -122,7 +119,13 @@ export function DraftExportDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent aria-describedby="draft-export-description">
+      <DialogContent
+        aria-describedby="draft-export-description"
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          headingRef.current?.focus();
+        }}
+      >
         <DialogHeader>
           <DialogTitle ref={headingRef} tabIndex={-1}>
             {EXPORT_CTA}

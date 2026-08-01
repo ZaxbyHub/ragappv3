@@ -668,6 +668,20 @@ describe("DraftWorkspace", () => {
     ).toBeInTheDocument();
   });
 
+  it("focuses the archive confirmation's heading on open, not the Cancel button", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+
+    await user.click(await screen.findByRole("button", { name: "Archive project" }));
+    const dialog = await screen.findByRole("dialog");
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("heading", { name: "Archive this project?" })
+      );
+    });
+  });
+
   it("requires confirmation, archives with the draft's lock_version, and invalidates detail and list queries", async () => {
     const user = userEvent.setup();
     mockArchiveDraft.mockResolvedValue(makeDraft({ status: "archived" }));
