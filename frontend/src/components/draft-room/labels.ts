@@ -162,6 +162,33 @@ export const TIER_DESCRIPTIONS: Record<string, string> = {
     "A single-source high-stakes claim blocks Ready unless the sole source is the primary official authority for that exact statement.",
 };
 
+/** Target-format display names, keyed by the backend `piece_type` values. */
+export const PIECE_TYPE_LABELS: Record<string, string> = {
+  article: "News article",
+  report: "Report",
+  brief: "Brief",
+  press_release: "Press release",
+  other: "Other",
+};
+
+/** How far the rewrite may move from the source manuscript. */
+export const TRANSFORMATION_STRENGTH_LABELS: Record<string, string> = {
+  light: "Light — tighten wording, keep structure",
+  moderate: "Moderate — restructure sections, keep every claim",
+  substantial: "Substantial — reorganise and rewrite throughout",
+};
+
+/** Which source wins when the manuscript and the vault disagree. */
+export const DRAFTING_PRIORITY_LABELS: Record<string, string> = {
+  manuscript: "Prefer the manuscript",
+  vault: "Prefer vault sources",
+  balanced: "Balance manuscript and vault",
+};
+
+/** Shown when the server reports 503 draft_room_disabled. */
+export const DRAFT_ROOM_DISABLED_MESSAGE =
+  "Draft Room is not enabled on this deployment. An administrator can turn it on; existing projects stay readable and exportable in the meantime.";
+
 /** Project mode display names and help text. */
 export const MODE_LABELS: Record<string, string> = {
   rewrite: "Rewrite existing material",
