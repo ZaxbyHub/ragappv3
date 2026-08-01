@@ -7,7 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { DraftSourceUpload } from "./DraftSourceUpload";
 import { ADD_SOURCE_FILES_CTA } from "./labels";
-import type { DraftInputUploadResponse } from "@/lib/api/draftRoom";
+import { draftRoomKeys, type DraftDetail, type DraftInput, type DraftInputUploadResponse } from "@/lib/api/draftRoom";
 
 vi.mock("react-dropzone", () => ({
   useDropzone: () => ({
@@ -23,6 +23,9 @@ vi.mock("@/lib/api/draftRoom", async () => {
   return {
     ...actual,
     uploadDraftInput: vi.fn(),
+    getDraft: vi.fn(),
+    // Kept mocked (but never expected to be called) so tests can assert the
+    // heavy per-input content endpoint is never used as a status probe.
     getDraftInputContent: vi.fn(),
   };
 });
@@ -75,9 +78,10 @@ vi.mock("@/components/ui/select", async () => {
   return { Select, SelectTrigger, SelectValue, SelectContent, SelectItem };
 });
 
-import { uploadDraftInput, getDraftInputContent } from "@/lib/api/draftRoom";
+import { uploadDraftInput, getDraft, getDraftInputContent } from "@/lib/api/draftRoom";
 
 const mockUploadDraftInput = vi.mocked(uploadDraftInput);
+const mockGetDraft = vi.mocked(getDraft);
 const mockGetDraftInputContent = vi.mocked(getDraftInputContent);
 
 function makeApiError(status: number, code: string, detail: string, context: Record<string, unknown> = {}) {
@@ -89,8 +93,18 @@ function makeApiError(status: number, code: string, detail: string, context: Rec
   };
 }
 
-function renderComponent(props: Partial<ComponentProps<typeof DraftSourceUpload>> = {}) {
+function renderComponent(
+  props: Partial<ComponentProps<typeof DraftSourceUpload>> = {},
+  options: { pollIntervalSeconds?: number } = {}
+) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  if (options.pollIntervalSeconds != null) {
+    // Seeds the capabilities cache the component opportunistically reads
+    // from, without this test ever fetching capabilities itself.
+    queryClient.setQueryData(draftRoomKeys.capabilities(), {
+      limits: { poll_interval_seconds: options.pollIntervalSeconds },
+    });
+  }
   const utils = render(
     <QueryClientProvider client={queryClient}>
       <DraftSourceUpload draftId={1} maxInputs={10} currentInputCount={0} {...props} />
@@ -99,26 +113,30 @@ function renderComponent(props: Partial<ComponentProps<typeof DraftSourceUpload>
   return { queryClient, ...utils };
 }
 
-function makeUploadResponse(overrides: Partial<DraftInputUploadResponse["input"]> = {}): DraftInputUploadResponse {
+function makeDraftInputRecord(overrides: Partial<DraftInput> = {}): DraftInput {
   return {
-    input: {
-      id: 42,
-      role: "reference",
-      authority: "unknown",
-      as_of_date: null,
-      original_name: "notes.txt",
-      extension: ".txt",
-      media_type: "text/plain",
-      size_bytes: 123,
-      content_sha256: "abc",
-      parse_status: "pending",
-      parse_error: null,
-      parsed_char_count: null,
-      active_parse_job_id: 7,
-      last_parse_job_id: 7,
-      created_at: "2026-01-01T00:00:00Z",
-      ...overrides,
-    },
+    id: 42,
+    role: "reference",
+    authority: "unknown",
+    as_of_date: null,
+    original_name: "notes.txt",
+    extension: ".txt",
+    media_type: "text/plain",
+    size_bytes: 123,
+    content_sha256: "abc",
+    parse_status: "pending",
+    parse_error: null,
+    parsed_char_count: null,
+    active_parse_job_id: 7,
+    last_parse_job_id: 7,
+    created_at: "2026-01-01T00:00:00Z",
+    ...overrides,
+  };
+}
+
+function makeUploadResponse(overrides: Partial<DraftInput> = {}): DraftInputUploadResponse {
+  return {
+    input: makeDraftInputRecord(overrides),
     job: {
       id: 7,
       draft_id: 1,
@@ -146,17 +164,59 @@ function makeUploadResponse(overrides: Partial<DraftInputUploadResponse["input"]
   };
 }
 
+/** Minimal `DraftDetail` — only `inputs` matters to the component's poll reconciliation. */
+function makeDraftDetail(inputs: DraftInput[]): DraftDetail {
+  return {
+    summary: {
+      id: 1,
+      vault_id: 1,
+      vault_access: "write",
+      title: "Test draft",
+      mode: "compose",
+      status: "draft",
+      tier: "standard",
+      lock_version: 1,
+      current_revision_id: null,
+      active_job_id: null,
+      input_count: inputs.length,
+      open_blocker_count: 0,
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      ready_at: null,
+    },
+    brief: {
+      piece_type: "article",
+      audience: "general",
+      purpose: "inform",
+      tone: "neutral",
+      target_words: 500,
+      transformation_strength: "moderate",
+      primary_input_id: null,
+      must_include: [],
+      must_avoid: [],
+      preserve_quotes: false,
+      preserve_numbers: false,
+      preserve_uncertainty: false,
+      drafting_priority: "accuracy",
+      additional_instructions: "",
+    },
+    inputs,
+    current_revision_summary: null,
+    active_compile_job: null,
+    revision_count: 0,
+    evidence_count: 0,
+    claim_counts_by_status: {},
+    finding_counts_by_severity: {},
+  };
+}
+
 function makeFile(name = "notes.txt") {
   return new File(["hello world"], name, { type: "text/plain" });
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockGetDraftInputContent.mockResolvedValue({
-    input_id: 42,
-    parse_status: "ready",
-    parsed_text: "hello",
-  });
+  mockGetDraft.mockResolvedValue(makeDraftDetail([makeDraftInputRecord({ parse_status: "ready" })]));
 });
 
 describe("DraftSourceUpload", () => {
@@ -203,15 +263,11 @@ describe("DraftSourceUpload", () => {
           resolveUpload = resolve;
         })
     );
-    let resolveParsed: (value: { input_id: number; parse_status: "ready"; parsed_text: string }) => void;
-    mockGetDraftInputContent.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveParsed = resolve;
-        })
-    );
+    mockGetDraft
+      .mockResolvedValueOnce(makeDraftDetail([makeDraftInputRecord({ parse_status: "pending" })]))
+      .mockResolvedValueOnce(makeDraftDetail([makeDraftInputRecord({ parse_status: "ready" })]));
 
-    renderComponent();
+    renderComponent({}, { pollIntervalSeconds: 0.02 });
     const fileInput = screen.getByLabelText(ADD_SOURCE_FILES_CTA);
     await user.upload(fileInput, makeFile());
 
@@ -222,9 +278,60 @@ describe("DraftSourceUpload", () => {
     resolveUpload!(makeUploadResponse());
     await waitFor(() => expect(screen.getByText("Parsing")).toBeInTheDocument());
 
-    resolveParsed!({ input_id: 42, parse_status: "ready", parsed_text: "hello" });
     await waitFor(() => expect(screen.getByText("Parsed")).toBeInTheDocument());
-    expect(mockGetDraftInputContent).toHaveBeenCalledWith(1, 42);
+    expect(mockGetDraft).toHaveBeenCalledWith(1);
+  });
+
+  it("polls the canonical draft detail to resolve parse state, never the per-input content endpoint", async () => {
+    const user = userEvent.setup();
+    mockUploadDraftInput.mockResolvedValue(makeUploadResponse());
+    mockGetDraft.mockResolvedValue(makeDraftDetail([makeDraftInputRecord({ parse_status: "ready" })]));
+
+    renderComponent({}, { pollIntervalSeconds: 0.02 });
+    await user.upload(screen.getByLabelText(ADD_SOURCE_FILES_CTA), makeFile());
+
+    await waitFor(() => expect(screen.getByText("Parsed")).toBeInTheDocument());
+    expect(mockGetDraft).toHaveBeenCalledWith(1);
+    expect(mockGetDraftInputContent).not.toHaveBeenCalled();
+  });
+
+  it("stops polling once every tracked input reaches a terminal parse state", async () => {
+    const user = userEvent.setup();
+    mockUploadDraftInput.mockResolvedValue(makeUploadResponse());
+    mockGetDraft.mockResolvedValue(makeDraftDetail([makeDraftInputRecord({ parse_status: "ready" })]));
+
+    renderComponent({}, { pollIntervalSeconds: 0.02 });
+    await user.upload(screen.getByLabelText(ADD_SOURCE_FILES_CTA), makeFile());
+
+    await waitFor(() => expect(screen.getByText("Parsed")).toBeInTheDocument());
+    const callsAtTerminal = mockGetDraft.mock.calls.length;
+    expect(callsAtTerminal).toBeGreaterThan(0);
+
+    // Wait several poll intervals' worth of real time — no further polling
+    // should have happened once the tracked input reached a terminal state.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(mockGetDraft.mock.calls.length).toBe(callsAtTerminal);
+  });
+
+  it("surfaces the server's parse_error verbatim when the detail poll reports a failed parse", async () => {
+    const user = userEvent.setup();
+    mockUploadDraftInput.mockResolvedValue(makeUploadResponse());
+    mockGetDraft.mockResolvedValue(
+      makeDraftDetail([
+        makeDraftInputRecord({
+          parse_status: "failed",
+          parse_error: "Could not extract text: corrupt PDF",
+        }),
+      ])
+    );
+
+    renderComponent({}, { pollIntervalSeconds: 0.02 });
+    await user.upload(screen.getByLabelText(ADD_SOURCE_FILES_CTA), makeFile());
+
+    await waitFor(() =>
+      expect(screen.getByText("Could not extract text: corrupt PDF")).toBeInTheDocument()
+    );
+    expect(mockGetDraftInputContent).not.toHaveBeenCalled();
   });
 
   it("shows a distinct message for duplicate_input (409) mentioning the existing input, with no Retry", async () => {
@@ -321,13 +428,15 @@ describe("DraftSourceUpload", () => {
     expect(fileInput).toBeDisabled();
   });
 
-  it("does not import useUploadStore or the documents UploadDropzone", () => {
+  it("does not import useUploadStore or the documents UploadDropzone, and never uses getDraftInputContent for status", () => {
     const source = readFileSync(
       resolve(process.cwd(), "src/components/draft-room/DraftSourceUpload.tsx"),
       "utf-8"
     );
     expect(source).not.toMatch(/useUploadStore/);
     expect(source).not.toMatch(/documents\/UploadDropzone/);
+    expect(source).not.toMatch(/getDraftInputContent\(/);
+    expect(source).not.toMatch(/import\s*\{[^}]*getDraftInputContent/);
   });
 });
 

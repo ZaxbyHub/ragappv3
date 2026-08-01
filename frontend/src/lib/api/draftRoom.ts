@@ -878,7 +878,7 @@ export async function exportDraftRevision(
 
 export async function listDraftEvidence(
   draftId: number,
-  params: { page?: number; per_page?: number } = {}
+  params: { job_id?: number; page?: number; per_page?: number } = {}
 ): Promise<DraftPaginated<DraftEvidence>> {
   const response = await apiClient.get<DraftPaginated<DraftEvidence>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/evidence`,
@@ -889,7 +889,7 @@ export async function listDraftEvidence(
 
 export async function listDraftClaims(
   draftId: number,
-  params: { status?: DraftClaimStatus; page?: number; per_page?: number } = {}
+  params: { revision_id?: number; status?: DraftClaimStatus; page?: number; per_page?: number } = {}
 ): Promise<DraftPaginated<DraftClaim>> {
   const response = await apiClient.get<DraftPaginated<DraftClaim>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/claims`,
@@ -900,7 +900,13 @@ export async function listDraftClaims(
 
 export async function listDraftFindings(
   draftId: number,
-  params: { status?: DraftFindingStatus; severity?: DraftFindingSeverity; page?: number; per_page?: number } = {}
+  params: {
+    revision_id?: number;
+    status?: DraftFindingStatus;
+    severity?: DraftFindingSeverity;
+    page?: number;
+    per_page?: number;
+  } = {}
 ): Promise<DraftPaginated<DraftFinding>> {
   const response = await apiClient.get<DraftPaginated<DraftFinding>>(
     `${DRAFT_ROOM_BASE}/drafts/${draftId}/findings`,

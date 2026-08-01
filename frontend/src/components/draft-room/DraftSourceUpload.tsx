@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import type { ChangeEvent } from "react";
 import { useDropzone } from "react-dropzone";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -20,15 +20,18 @@ import {
   DRAFT_INPUT_AUTHORITIES,
   DRAFT_INPUT_ROLES,
   draftRoomKeys,
-  getDraftInputContent,
+  getDraft,
   parseDraftRoomError,
   uploadDraftInput,
   type DraftInputAuthority,
-  type DraftInputParseStatus,
   type DraftInputRole,
   type DraftInputUploadResponse,
+  type DraftRoomCapabilities,
   type DraftRoomErrorInfo,
 } from "@/lib/api/draftRoom";
+
+/** Default poll cadence when `capabilities.limits.poll_interval_seconds` isn't cached yet. */
+const DEFAULT_POLL_INTERVAL_MS = 2000;
 
 export interface DraftSourceUploadProps {
   draftId: number;
@@ -128,40 +131,6 @@ function StatusIndicator({ status }: { status: UploadItemStatus }) {
   }
 }
 
-/**
- * Invisible per-row watcher: once an input row exists, polls its parse status
- * until it leaves pending/parsing, then reports the terminal status exactly once.
- */
-function ParsingWatcher({
-  draftId,
-  inputId,
-  onResolved,
-}: {
-  draftId: number;
-  inputId: number;
-  onResolved: (status: DraftInputParseStatus) => void;
-}) {
-  const resolvedRef = useRef(false);
-  const { data } = useQuery({
-    queryKey: ["draft-room-source-upload-watch", draftId, inputId],
-    queryFn: () => getDraftInputContent(draftId, inputId),
-    refetchInterval: (query) => {
-      const status = query.state.data?.parse_status;
-      return status && status !== "pending" && status !== "parsing" ? false : 2000;
-    },
-  });
-
-  useEffect(() => {
-    if (!data || resolvedRef.current) return;
-    if (data.parse_status !== "pending" && data.parse_status !== "parsing") {
-      resolvedRef.current = true;
-      onResolved(data.parse_status);
-    }
-  }, [data, onResolved]);
-
-  return null;
-}
-
 export function DraftSourceUpload({
   draftId,
   disabled = false,
@@ -179,6 +148,58 @@ export function DraftSourceUpload({
 
   const capReached = currentInputCount >= maxInputs;
   const isUploadDisabled = disabled || capReached;
+
+  // Any locally-tracked upload still waiting on the server's async parse job.
+  const hasParsingItems = items.some((it) => it.status === "parsing");
+
+  // Reuse the capabilities cache's configured interval if another query has
+  // already populated it (matches useDraftRoomEvents' fallback poll); this
+  // never triggers its own capabilities fetch.
+  const cachedCapabilities = queryClient.getQueryData<DraftRoomCapabilities>(
+    draftRoomKeys.capabilities()
+  );
+  const rawPollSeconds = cachedCapabilities?.limits?.poll_interval_seconds;
+  const pollIntervalMs =
+    typeof rawPollSeconds === "number" && rawPollSeconds > 0
+      ? rawPollSeconds * 1000
+      : DEFAULT_POLL_INTERVAL_MS;
+
+  // Polls the canonical draft detail (shared cache key — no second source of
+  // truth) only while a locally-tracked upload is still parsing; stops the
+  // instant every tracked input reaches a terminal parse status. Deliberately
+  // NOT `getDraftInputContent`: that endpoint returns the full parsed text
+  // (up to `draft_max_total_parsed_chars`) and would be far too heavy to use
+  // purely as a status probe.
+  const detailQuery = useQuery({
+    queryKey: draftRoomKeys.detail(draftId),
+    queryFn: () => getDraft(draftId),
+    enabled: hasParsingItems,
+    refetchInterval: hasParsingItems ? pollIntervalMs : false,
+  });
+
+  useEffect(() => {
+    const detail = detailQuery.data;
+    if (!detail) return;
+    setItems((prev) => {
+      let changed = false;
+      const next = prev.map((it): UploadItem => {
+        if (it.status !== "parsing" || it.inputId == null) return it;
+        const match = detail.inputs.find((candidate) => candidate.id === it.inputId);
+        if (!match || match.parse_status === "pending" || match.parse_status === "parsing") {
+          return it;
+        }
+        changed = true;
+        const failed = match.parse_status === "failed" || match.parse_status === "cancelled";
+        return {
+          ...it,
+          status: failed ? "failed" : "ready",
+          errorDetail: failed ? (match.parse_error ?? PARSE_FAILED_GUIDANCE) : null,
+          canRetry: false,
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, [detailQuery.data]);
 
   const invalidateDraft = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
@@ -250,25 +271,6 @@ export function DraftSourceUpload({
         void startUpload(it);
       });
   }, [items, startUpload]);
-
-  const handleParseResolved = useCallback(
-    (itemId: string, status: DraftInputParseStatus) => {
-      setItems((prev) =>
-        prev.map((it) => {
-          if (it.id !== itemId || it.status !== "parsing") return it;
-          const failed = status === "failed" || status === "cancelled";
-          return {
-            ...it,
-            status: failed ? "failed" : "ready",
-            errorDetail: failed ? PARSE_FAILED_GUIDANCE : null,
-            canRetry: false,
-          };
-        })
-      );
-      invalidateDraft();
-    },
-    [invalidateDraft]
-  );
 
   const addFiles = useCallback(
     (files: File[]) => {
@@ -449,13 +451,6 @@ export function DraftSourceUpload({
                     </Button>
                   </div>
                 </div>
-              )}
-              {item.status === "parsing" && item.inputId != null && (
-                <ParsingWatcher
-                  draftId={draftId}
-                  inputId={item.inputId}
-                  onResolved={(status) => handleParseResolved(item.id, status)}
-                />
               )}
             </li>
           ))}
