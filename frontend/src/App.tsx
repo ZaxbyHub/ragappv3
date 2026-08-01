@@ -36,6 +36,8 @@ const NotFoundPage = lazy(() => import("@/pages/NotFoundPage"));
 const WikiPage = lazy(() => import("@/pages/WikiPage"));
 const KMSPage = lazy(() => import("@/pages/KMSPage"));
 const KMSDetailPage = lazy(() => import("@/pages/KMSDetailPage"));
+const DraftRoomPage = lazy(() => import("@/pages/DraftRoomPage"));
+const DraftRoomDetailPage = lazy(() => import("@/pages/DraftRoomDetailPage"));
 
 function PageLoader() {
   return (
@@ -58,6 +60,7 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
     if (pathname.startsWith("/memory")) return "memory";
     if (pathname.startsWith("/wiki")) return "wiki";
     if (pathname.startsWith("/kms")) return "kms";
+    if (pathname.startsWith("/draft-room")) return "draftRoom";
     if (pathname.startsWith("/vaults")) return "vaults";
     if (pathname.startsWith("/settings")) return "settings";
     if (pathname.startsWith("/admin/groups")) return "groups";
@@ -88,6 +91,9 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
         break;
       case "kms":
         navigate("/kms");
+        break;
+      case "draftRoom":
+        navigate("/draft-room");
         break;
       case "vaults":
         navigate("/vaults");
@@ -299,6 +305,30 @@ function App() {
                   <ProtectedRoute>
                     <MainAppShell>
                       <KMSDetailPage />
+                    </MainAppShell>
+                  </ProtectedRoute>
+                }
+              />
+
+              {/* Registered unconditionally — a direct visit while the capability is
+                  disabled must render the page's own honest disabled state, never a
+                  silent redirect or a 404 (issue #437). Only the nav entry is gated. */}
+              <Route
+                path="/draft-room"
+                element={
+                  <ProtectedRoute testMode={TEST_MODE}>
+                    <MainAppShell testMode={TEST_MODE}>
+                      <DraftRoomPage />
+                    </MainAppShell>
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/draft-room/:draftId"
+                element={
+                  <ProtectedRoute testMode={TEST_MODE}>
+                    <MainAppShell testMode={TEST_MODE}>
+                      <DraftRoomDetailPage />
                     </MainAppShell>
                   </ProtectedRoute>
                 }

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, X, User, Building2, UserCog, BookOpen, Library, LogOut } from "lucide-react";
+import { MessageSquare, FileText, Brain, MoreHorizontal, Database, Settings, Users, X, User, Building2, UserCog, BookOpen, Library, LogOut, PenLine } from "lucide-react";
 import {
   Sheet,
   SheetContent,
@@ -12,6 +12,8 @@ import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { useNavigate } from "react-router-dom";
 import type { NavItemId } from "./navigationTypes";
+import { useDraftRoomVisible } from "@/hooks/useDraftRoomCapabilities";
+import { DRAFT_ROOM_NAV_LABEL } from "@/components/draft-room/labels";
 
 interface MobileBottomNavProps {
   activeItem: NavItemId;
@@ -26,9 +28,10 @@ const primaryNavItems = [
 ];
 
 // Secondary items shown in "More" drawer
-const moreNavItems: { id: NavItemId; label: string; icon: React.ComponentType<{ className?: string }>; adminOnly?: boolean }[] = [
+const moreNavItems: { id: NavItemId; label: string; icon: React.ComponentType<{ className?: string }>; adminOnly?: boolean; capabilityGated?: boolean }[] = [
   { id: "wiki", label: "Wiki", icon: BookOpen },
   { id: "kms" as const, label: "KMS", icon: Library },
+  { id: "draftRoom", label: DRAFT_ROOM_NAV_LABEL, icon: PenLine, capabilityGated: true },
   { id: "vaults", label: "Vaults", icon: Database },
   { id: "settings", label: "Settings", icon: Settings },
   { id: "groups", label: "Groups", icon: Users, adminOnly: true },
@@ -43,6 +46,7 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
   const userRole = useAuthStore((state) => state.user?.role);
   const logout = useAuthStore((state) => state.logout);
   const isAdmin = userRole === "admin" || userRole === "superadmin";
+  const draftRoomVisible = useDraftRoomVisible();
 
   const handleLogout = async () => {
     setMoreOpen(false);
@@ -133,7 +137,9 @@ export function MobileBottomNav({ activeItem, onItemSelect }: MobileBottomNavPro
             </SheetHeader>
 
             <div className="grid grid-cols-2 gap-3">
-              {moreNavItems.filter((item) => !item.adminOnly || isAdmin).map((item) => {
+              {moreNavItems
+                .filter((item) => (!item.adminOnly || isAdmin) && (!item.capabilityGated || draftRoomVisible))
+                .map((item) => {
                 const Icon = item.icon;
                 const isActive = activeItem === item.id;
 
