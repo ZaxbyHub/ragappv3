@@ -651,6 +651,20 @@ class TestUploadValidation(DraftRoomTestBase):
 
 class TestCapabilitiesAndPagination(DraftRoomTestBase):
     def test_capabilities_advertises_unavailable_future_features(self):
+        """Capability reporting must be honest about what is actually wired.
+
+        SUPERSEDED ASSERTION (issue #436): this test previously asserted that
+        ALL SIX capability flags were False, which was correct while the route
+        module shipped project/input/job/revision CRUD only. Compile, evidence,
+        claims, findings and Ready are now genuinely wired end to end — the
+        routes exist in ``draft_room.py``, their store accessors shipped in
+        ``draft_store.py``, and the orchestrator that populates the ledgers
+        shipped in ``draft_pipeline.py`` — so advertising them as False would
+        now be the dishonest answer. The assertion is therefore inverted for
+        those five, and NOT weakened: each flag is still asserted explicitly,
+        and ``promote_available`` must remain False because promotion is issue
+        #437 / SPEC PR 4 and no ``POST /drafts/{id}/promote`` route exists.
+        """
         resp = self.client.get("/api/draft-room/capabilities", headers=self._owner_headers())
         self.assertEqual(resp.status_code, 200, resp.text)
         caps = resp.json()
@@ -662,9 +676,42 @@ class TestCapabilitiesAndPagination(DraftRoomTestBase):
             "claims_available",
             "evidence_available",
             "ready_available",
-            "promote_available",
         ):
-            self.assertFalse(caps[key], key)
+            self.assertTrue(caps[key], key)
+        self.assertFalse(caps["promote_available"])
+
+        # The wiring the flags above claim, asserted structurally rather than
+        # taken on trust from the capability payload itself.
+        from app.api.routes.draft_room import router as draft_room_router
+
+        routes = {
+            (method, route.path)
+            for route in draft_room_router.routes
+            for method in getattr(route, "methods", set())
+        }
+        self.assertIn(("POST", "/draft-room/drafts/{draft_id}/compile"), routes)
+        self.assertIn(("GET", "/draft-room/drafts/{draft_id}/jobs/{job_id}/stages"), routes)
+        self.assertIn(("GET", "/draft-room/drafts/{draft_id}/evidence"), routes)
+        self.assertIn(("GET", "/draft-room/drafts/{draft_id}/claims"), routes)
+        self.assertIn(("GET", "/draft-room/drafts/{draft_id}/findings"), routes)
+        self.assertIn(
+            ("POST", "/draft-room/drafts/{draft_id}/findings/{finding_id}/disposition"),
+            routes,
+        )
+        self.assertIn(
+            ("POST", "/draft-room/drafts/{draft_id}/revisions/{revision_id}/ready"),
+            routes,
+        )
+        self.assertNotIn(("POST", "/draft-room/drafts/{draft_id}/promote"), routes)
+
+        # SPEC section 8.1: `assemble` is never exposed as a selectable start.
+        self.assertEqual(
+            caps["compile_start_stages"],
+            ["research", "outline", "draft", "lint", "copy", "standards", "fact"],
+        )
+        self.assertNotIn("assemble", caps["compile_start_stages"])
+        self.assertTrue(caps["editorial_gates_installed"])
+        self.assertEqual(sorted(caps["logical_model_modes"]), ["instant", "thinking"])
 
     def test_list_pagination_shape_and_stable_ordering(self):
         for i in range(3):
