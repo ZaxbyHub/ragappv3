@@ -111,6 +111,13 @@ beforeEach(() => {
 });
 
 describe("DraftExportDialog", () => {
+  it("focuses the dialog heading on open, not the format select", async () => {
+    renderDialog();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Export" }));
+    });
+  });
+
   it("shows fact status and approval status before download", async () => {
     renderDialog({
       revision: makeRevision({ fact_status: "findings" }),

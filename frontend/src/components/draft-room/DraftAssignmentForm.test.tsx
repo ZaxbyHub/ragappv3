@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Vault } from "@/lib/api";
@@ -168,13 +168,17 @@ describe("DraftAssignmentForm", () => {
   });
 
   it("caps must_avoid at 50 items and shows the cap message", async () => {
-    const user = userEvent.setup();
     const { onChange } = renderForm();
     await screen.findByLabelText("Vault");
 
-    const lines = Array.from({ length: 55 }, (_, i) => `line ${i}`).join("{enter}");
+    // Sets the value directly instead of typing 55 lines character by
+    // character: the textarea is a plain controlled input (see its onChange
+    // in DraftAssignmentForm.tsx), so a single change event exercises the
+    // same cap logic without the per-keystroke overhead that made this test
+    // flaky under full-suite load (timed out at 5000ms, ~2.9s in isolation).
+    const lines = Array.from({ length: 55 }, (_, i) => `line ${i}`).join("\n");
     const textarea = screen.getByLabelText("Must avoid (one per line)");
-    await user.type(textarea, lines);
+    fireEvent.change(textarea, { target: { value: lines } });
 
     expect(screen.getByText(/only the first 50 are kept/i)).toBeInTheDocument();
     const lastCall = onChange.mock.calls.at(-1)?.[0] as DraftAssignmentFormValue;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import { useDropzone } from "react-dropzone";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -101,14 +101,14 @@ function StatusIndicator({ status }: { status: UploadItemStatus }) {
     case "uploading":
       return (
         <span className="flex items-center gap-1 text-xs text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
           Uploading
         </span>
       );
     case "parsing":
       return (
         <span className="flex items-center gap-1 text-xs text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
           Parsing
         </span>
       );
@@ -145,6 +145,26 @@ export function DraftSourceUpload({
   const [authority, setAuthority] = useState<DraftInputAuthority>("unknown");
   const [asOfDate, setAsOfDate] = useState("");
   const [items, setItems] = useState<UploadItem[]>([]);
+
+  // Announce only per-item terminal transitions (ready/failed) — never on
+  // every progress tick or poll — mirroring DraftEditor's dirty-state and
+  // DraftStageRail's stage-transition live regions.
+  const [statusAnnouncement, setStatusAnnouncement] = useState("");
+  const lastTerminalStatusRef = useRef<Map<string, UploadItemStatus>>(new Map());
+  useEffect(() => {
+    const lastTerminalStatus = lastTerminalStatusRef.current;
+    const messages: string[] = [];
+    for (const item of items) {
+      const isTerminal = item.status === "ready" || item.status === "failed";
+      if (isTerminal && lastTerminalStatus.get(item.id) !== item.status) {
+        lastTerminalStatus.set(item.id, item.status);
+        messages.push(
+          item.status === "ready" ? `${item.file.name}: parsed.` : `${item.file.name}: parse failed.`
+        );
+      }
+    }
+    if (messages.length > 0) setStatusAnnouncement(messages.join(" "));
+  }, [items]);
 
   const capReached = currentInputCount >= maxInputs;
   const isUploadDisabled = disabled || capReached;
@@ -419,6 +439,10 @@ export function DraftSourceUpload({
           {capMessage}
         </p>
       )}
+
+      <div aria-live="polite" className="sr-only">
+        {statusAnnouncement}
+      </div>
 
       {items.length > 0 && (
         <ul className="space-y-2">

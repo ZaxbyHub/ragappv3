@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { CheckCircle2, Clock, FileText, Loader2, Pencil, Trash2, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -27,6 +27,7 @@ import {
   DRAFT_INPUT_ROLES,
   deleteDraftInput,
   draftRoomKeys,
+  getDraftInputContent,
   parseDraftRoomError,
   updateDraftInput,
   type DraftInput,
@@ -74,7 +75,7 @@ function ParseStatusIndicator({ status }: { status: DraftInputParseStatus }) {
     case "parsing":
       return (
         <span className="flex items-center gap-1 text-xs text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          <Loader2 className="h-3.5 w-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
           {text}
         </span>
       );
@@ -86,6 +87,52 @@ function ParseStatusIndicator({ status }: { status: DraftInputParseStatus }) {
         </span>
       );
   }
+}
+
+/**
+ * Read-only disclosure for what the pipeline actually extracted from an
+ * upload. Fetches lazily on open (the payload can be very large) rather than
+ * on list render, and never on inputs whose parse hasn't produced text yet.
+ */
+function DraftParsedTextViewer({ draftId, input }: { draftId: number; input: DraftInput }) {
+  const [open, setOpen] = useState(false);
+  const panelId = `draft-source-${input.id}-parsed-text`;
+
+  const contentQuery = useQuery({
+    queryKey: draftRoomKeys.inputContent(draftId, input.id),
+    queryFn: () => getDraftInputContent(draftId, input.id),
+    enabled: open,
+  });
+
+  return (
+    <div className="mt-2">
+      <Button
+        type="button"
+        size="sm"
+        variant="ghost"
+        onClick={() => setOpen((prev) => !prev)}
+        aria-expanded={open}
+        aria-controls={panelId}
+      >
+        {open ? "Hide parsed text" : "View parsed text"}
+      </Button>
+      {open && (
+        <div id={panelId} className="mt-2 min-w-0">
+          {contentQuery.isLoading && (
+            <p className="text-sm text-muted-foreground">Loading parsed text…</p>
+          )}
+          {contentQuery.isError && (
+            <p className="text-sm text-destructive">{parseDraftRoomError(contentQuery.error).detail}</p>
+          )}
+          {contentQuery.data && (
+            <pre className="max-h-64 min-w-0 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-2 text-xs">
+              {contentQuery.data.parsed_text ?? "No parsed text available."}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface DraftSourceRowProps {
@@ -103,6 +150,13 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
   const [editRole, setEditRole] = useState<DraftInputRole>(input.role);
   const [editAuthority, setEditAuthority] = useState<DraftInputAuthority>(input.authority);
   const [editAsOfDate, setEditAsOfDate] = useState(input.as_of_date ?? "");
+  const deleteHeadingRef = useRef<HTMLHeadingElement>(null);
+
+  useEffect(() => {
+    if (!confirmDeleteOpen) return;
+    const frame = requestAnimationFrame(() => deleteHeadingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [confirmDeleteOpen]);
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
@@ -218,6 +272,8 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
         </div>
       )}
 
+      {input.parse_status === "ready" && <DraftParsedTextViewer draftId={draftId} input={input} />}
+
       {canEdit && isEditing && (
         <div className="mt-3 space-y-3 border-t border-border pt-3">
           <div className="flex flex-wrap items-end gap-3">
@@ -279,7 +335,9 @@ function DraftSourceRow({ draftId, input, locked, lockedReason, canEdit }: Draft
       <Dialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Remove {input.original_name}?</DialogTitle>
+            <DialogTitle ref={deleteHeadingRef} tabIndex={-1}>
+              Remove {input.original_name}?
+            </DialogTitle>
             <DialogDescription>
               This permanently deletes the source file from this project. This cannot be undone.
             </DialogDescription>

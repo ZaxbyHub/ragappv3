@@ -187,7 +187,7 @@ export default function DraftRoomDetailPage() {
   const capabilityDisabled = !capabilitiesQuery.isLoading && capabilitiesQuery.data?.enabled === false;
 
   return (
-    <main className="animate-in fade-in space-y-4 pb-12 duration-300" aria-labelledby="draft-room-detail-heading">
+    <section className="animate-in fade-in space-y-4 pb-12 duration-300" aria-labelledby="draft-room-detail-heading">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <Link to="/draft-room" className="text-sm text-muted-foreground hover:underline">
@@ -226,6 +226,6 @@ export default function DraftRoomDetailPage() {
         vaultAccess={draft.vault_access}
         onDerivedStatus={handleDerivedStatus}
       />
-    </main>
+    </section>
   );
 }

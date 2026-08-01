@@ -19,6 +19,7 @@ vi.mock("@/lib/api/draftRoom", async () => {
     ...actual,
     updateDraftInput: vi.fn(),
     deleteDraftInput: vi.fn(),
+    getDraftInputContent: vi.fn(),
   };
 });
 
@@ -65,10 +66,11 @@ vi.mock("@/components/ui/select", async () => {
   return { Select, SelectTrigger, SelectValue, SelectContent, SelectItem };
 });
 
-import { updateDraftInput, deleteDraftInput } from "@/lib/api/draftRoom";
+import { updateDraftInput, deleteDraftInput, getDraftInputContent } from "@/lib/api/draftRoom";
 
 const mockUpdateDraftInput = vi.mocked(updateDraftInput);
 const mockDeleteDraftInput = vi.mocked(deleteDraftInput);
+const mockGetDraftInputContent = vi.mocked(getDraftInputContent);
 
 function makeInput(overrides: Partial<DraftInput> = {}): DraftInput {
   return {
@@ -201,6 +203,52 @@ describe("DraftSourceList", () => {
     await user.click(confirmButton);
 
     await waitFor(() => expect(mockDeleteDraftInput).toHaveBeenCalledWith(7, 9));
+  });
+
+  it("focuses the remove-source confirmation's heading on open, not the Cancel button", async () => {
+    const user = userEvent.setup();
+    renderList([makeInput({ id: 9, original_name: "old-notes.txt" })]);
+
+    await user.click(screen.getByRole("button", { name: /remove/i }));
+    const dialog = await screen.findByRole("dialog");
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("heading", { name: "Remove old-notes.txt?" })
+      );
+    });
+  });
+
+  it("shows the parsed-text control only for a ready input, never for one still parsing", () => {
+    renderList([makeInput({ id: 1, parse_status: "ready" }), makeInput({ id: 2, parse_status: "parsing" })]);
+    expect(screen.getAllByRole("button", { name: "View parsed text" })).toHaveLength(1);
+  });
+
+  it("fetches the parsed text only when opened, not on render, and shows it", async () => {
+    const user = userEvent.setup();
+    mockGetDraftInputContent.mockResolvedValue({
+      input_id: 1,
+      parse_status: "ready",
+      parsed_text: "Extracted body text.",
+    });
+    renderList([makeInput({ id: 1 })]);
+
+    expect(mockGetDraftInputContent).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "View parsed text" }));
+
+    await waitFor(() => expect(mockGetDraftInputContent).toHaveBeenCalledWith(7, 1));
+    expect(await screen.findByText("Extracted body text.")).toBeInTheDocument();
+  });
+
+  it("renders an error state when the parsed text fails to load", async () => {
+    const user = userEvent.setup();
+    mockGetDraftInputContent.mockRejectedValue(Object.assign(new Error("Could not load parsed text."), { status: 500 }));
+    renderList([makeInput({ id: 1 })]);
+
+    await user.click(screen.getByRole("button", { name: "View parsed text" }));
+
+    expect(await screen.findByText("Could not load parsed text.")).toBeInTheDocument();
   });
 
   it("does not import useUploadStore or the documents UploadDropzone", () => {

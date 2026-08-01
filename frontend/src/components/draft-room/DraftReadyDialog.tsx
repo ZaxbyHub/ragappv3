@@ -74,13 +74,14 @@ export function DraftReadyDialog({
   const [serverError, setServerError] = useState<{ code: string; detail: string } | null>(null);
 
   useEffect(() => {
-    if (open) {
-      headingRef.current?.focus();
-    } else {
+    if (!open) {
       setAck(false);
       setSubmitting(false);
       setServerError(null);
+      return;
     }
+    const frame = requestAnimationFrame(() => headingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
   }, [open]);
 
   const blockers = serverError
@@ -180,7 +181,7 @@ export function DraftReadyDialog({
           <Button type="button" onClick={handleSubmit} disabled={!canSubmit}>
             {submitting ? (
               <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+                <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
                 {MARK_READY_CTA}
               </>
             ) : (

@@ -208,6 +208,24 @@ describe("DraftRoomPage", () => {
     await user.click(screen.getByRole("button", { name: "simulate-created" }));
     expect(mockNavigate).toHaveBeenCalledWith("/draft-room/99");
   });
+
+  it("renders exactly one main landmark when nested inside the app shell's main region", async () => {
+    mockListAccessibleVaults.mockResolvedValue({ vaults: [{ id: 7, name: "Research vault" }] });
+    mockListDrafts.mockResolvedValue({ items: [makeDraft()], total: 1, page: 1, per_page: 20 });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <main id="main-content">
+            <DraftRoomPage />
+          </main>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await screen.findByText("Q3 press release");
+    expect(screen.getAllByRole("main")).toHaveLength(1);
+  });
 });
 
 const NEW_DRAFT_CTA_TEXT = "New draft";

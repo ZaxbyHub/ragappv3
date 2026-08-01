@@ -90,13 +90,14 @@ export function DraftExportDialog({
       : "review";
 
   useEffect(() => {
-    if (open) {
-      headingRef.current?.focus();
-    } else {
+    if (!open) {
       setAck(false);
       setExporting(false);
       setError(null);
+      return;
     }
+    const frame = requestAnimationFrame(() => headingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
   }, [open]);
 
   const canExport = !exporting && (!ackRequired || ack);
@@ -198,7 +199,7 @@ export function DraftExportDialog({
           <Button type="button" onClick={handleExport} disabled={!canExport}>
             {exporting ? (
               <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+                <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
                 {EXPORT_CTA}
               </>
             ) : (

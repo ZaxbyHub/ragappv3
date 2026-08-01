@@ -100,7 +100,6 @@ export function DraftPromoteDialog({
 
   useEffect(() => {
     if (!open) return;
-    headingRef.current?.focus();
     setSourceType(inputs.length > 0 ? "input" : "revision");
     setTitle(draft.title);
     setTitleError(null);
@@ -110,6 +109,8 @@ export function DraftPromoteDialog({
     setSubmitting(false);
     setError(null);
     setResult(null);
+    const frame = requestAnimationFrame(() => headingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
     // Re-initialize only when the dialog opens for this draft.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, draft.id]);
@@ -385,7 +386,7 @@ export function DraftPromoteDialog({
               <Button type="button" onClick={handleSubmit} disabled={!canSubmit}>
                 {submitting ? (
                   <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
                     {PROMOTE_TO_VAULT_CTA}
                   </>
                 ) : (

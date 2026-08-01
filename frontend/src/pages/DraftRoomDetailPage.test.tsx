@@ -318,4 +318,23 @@ describe("DraftRoomDetailPage", () => {
     expect(window.confirm).toHaveBeenCalled();
     expect(await screen.findByText("Draft Room List")).toBeInTheDocument();
   });
+
+  it("renders exactly one main landmark when nested inside the app shell's main region", async () => {
+    mockGetDraft.mockResolvedValue(makeDetail());
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/draft-room/42"]}>
+          <main id="main-content">
+            <Routes>
+              <Route path="/draft-room/:draftId" element={<DraftRoomDetailPage />} />
+            </Routes>
+          </main>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await screen.findByTestId("workspace");
+    expect(screen.getAllByRole("main")).toHaveLength(1);
+  });
 });

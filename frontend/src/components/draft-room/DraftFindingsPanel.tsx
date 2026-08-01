@@ -263,7 +263,7 @@ function FindingRow({
               disabled={actionsDisabled || waiveReason.trim().length === 0}
               onClick={onConfirmWaive}
             >
-              {isMutating ? <Loader2 className="mr-1 h-3 w-3 animate-spin" aria-hidden="true" /> : null}
+              {isMutating ? <Loader2 className="mr-1 h-3 w-3 animate-spin motion-reduce:animate-none" aria-hidden="true" /> : null}
               Confirm waiver
             </Button>
             <Button type="button" size="sm" variant="ghost" onClick={onCancelWaive}>

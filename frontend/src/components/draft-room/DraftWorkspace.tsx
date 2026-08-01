@@ -70,6 +70,7 @@ import {
 import {
   BLOCKING_CLAIM_STATUSES,
   FACT_CURRENT_STATUSES,
+  archiveDraft,
   cancelDraftJob,
   compileDraft,
   createDraftRevision,
@@ -432,7 +433,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const compileHeadingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
-    if (compileDialog) compileHeadingRef.current?.focus();
+    if (!compileDialog) return;
+    const frame = requestAnimationFrame(() => compileHeadingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
   }, [compileDialog]);
 
   function openCompileDialog(startStage?: DraftCompileStartStage) {
@@ -475,6 +478,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
 
   // ---- Cancel ---------------------------------------------------------------
   const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
+  const cancelHeadingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (!cancelConfirmOpen) return;
+    const frame = requestAnimationFrame(() => cancelHeadingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [cancelConfirmOpen]);
   const cancelMutation = useMutation({
     mutationFn: () => cancelDraftJob(draftId, (activeJob as DraftJob).id),
     onSuccess: () => {
@@ -516,6 +525,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // ---- Save revision -------------------------------------------------------
   const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
   const [saveConflict, setSaveConflict] = useState(false);
+  const saveHeadingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (!saveConfirmOpen) return;
+    const frame = requestAnimationFrame(() => saveHeadingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [saveConfirmOpen]);
   const saveRevisionMutation = useMutation({
     mutationFn: () =>
       createDraftRevision(draftId, {
@@ -598,6 +613,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
 
   // ---- Delete / Restore ---------------------------------------------------
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const deleteHeadingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (!deleteConfirmOpen) return;
+    const frame = requestAnimationFrame(() => deleteHeadingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [deleteConfirmOpen]);
   const deleteMutation = useMutation({
     mutationFn: () => deleteDraft(draftId),
     onSuccess: () => {
@@ -612,6 +633,27 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     onSuccess: () => {
       toast.success("Project restored.");
       queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+    },
+    onError: (err) => toast.error(parseDraftRoomError(err).detail),
+  });
+
+  const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
+  const archiveHeadingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (!archiveConfirmOpen) return;
+    const frame = requestAnimationFrame(() => archiveHeadingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [archiveConfirmOpen]);
+  const archiveBlockedReason = hasActiveJob
+    ? "Archiving is unavailable while a newsroom run is active."
+    : null;
+  const archiveMutation = useMutation({
+    mutationFn: () => archiveDraft(draftId, draft.lock_version),
+    onSuccess: () => {
+      toast.success("Project archived.");
+      setArchiveConfirmOpen(false);
+      queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
+      queryClient.invalidateQueries({ queryKey: draftRoomKeys.lists() });
     },
     onError: (err) => toast.error(parseDraftRoomError(err).detail),
   });
@@ -645,7 +687,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       )}
       {canManageContent && (
         <Button type="button" onClick={handleSaveAssignment} disabled={updateBriefMutation.isPending}>
-          {updateBriefMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
+          {updateBriefMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
           Save brief
         </Button>
       )}
@@ -763,8 +805,18 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
         )}
         {archived && vaultAccess === "write" && (
           <Button type="button" variant="outline" onClick={() => restoreMutation.mutate()} disabled={restoreMutation.isPending}>
-            {restoreMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
+            {restoreMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
             Restore project
+          </Button>
+        )}
+        {!archived && (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setArchiveConfirmOpen(true)}
+            disabled={archiveBlockedReason != null}
+          >
+            Archive project
           </Button>
         )}
         {currentRevisionSummary && canCompileOrPromote && (
@@ -787,6 +839,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
         </Button>
       </div>
       {blockedReason != null && <p className="text-sm text-muted-foreground">{blockedReason}</p>}
+      {archiveBlockedReason != null && (
+        <p className="text-sm text-muted-foreground">{archiveBlockedReason}</p>
+      )}
 
       {canRetry && (
         <div className="flex flex-wrap items-center gap-2 border-t border-border pt-2">
@@ -811,7 +866,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             onClick={() => retryStage && retryMutation.mutate(retryStage)}
             disabled={!retryStage || retryMutation.isPending}
           >
-            {retryMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
+            {retryMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
             Retry
           </Button>
         </div>
@@ -940,7 +995,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               Cancel
             </Button>
             <Button type="button" onClick={submitCompile} disabled={compileMutation.isPending}>
-              {compileMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
+              {compileMutation.isPending && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+              )}
               {compileCtaLabel(draft.mode)}
             </Button>
           </DialogFooter>
@@ -951,7 +1008,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       <Dialog open={cancelConfirmOpen} onOpenChange={setCancelConfirmOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Cancel this run?</DialogTitle>
+            <DialogTitle ref={cancelHeadingRef} tabIndex={-1}>
+              Cancel this run?
+            </DialogTitle>
             <DialogDescription>{CANCEL_CONSEQUENCE}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -964,7 +1023,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               onClick={() => cancelMutation.mutate()}
               disabled={cancelMutation.isPending}
             >
-              {cancelMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
+              {cancelMutation.isPending && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+              )}
               Cancel run
             </Button>
           </DialogFooter>
@@ -981,7 +1042,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Save a new revision?</DialogTitle>
+            <DialogTitle ref={saveHeadingRef} tabIndex={-1}>
+              Save a new revision?
+            </DialogTitle>
             <DialogDescription>{SAVE_REVISION_CONSEQUENCE}</DialogDescription>
           </DialogHeader>
           {saveConflict ? (
@@ -1011,7 +1074,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
                 disabled={saveRevisionMutation.isPending}
               >
                 {saveRevisionMutation.isPending && (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
                 )}
                 {SAVE_REVISION_CTA}
               </Button>
@@ -1024,7 +1087,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete this project?</DialogTitle>
+            <DialogTitle ref={deleteHeadingRef} tabIndex={-1}>
+              Delete this project?
+            </DialogTitle>
             <DialogDescription>
               This permanently deletes the project, its sources, and its revisions. This cannot be undone.
             </DialogDescription>
@@ -1039,8 +1104,39 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               onClick={() => deleteMutation.mutate()}
               disabled={deleteMutation.isPending}
             >
-              {deleteMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
+              {deleteMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
               Delete project
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ---- Archive confirmation ---- */}
+      <Dialog open={archiveConfirmOpen} onOpenChange={setArchiveConfirmOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle ref={archiveHeadingRef} tabIndex={-1}>
+              Archive this project?
+            </DialogTitle>
+            <DialogDescription>
+              Archiving makes this project read-only until it is restored. Its sources and revisions
+              are kept.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => setArchiveConfirmOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => archiveMutation.mutate()}
+              disabled={archiveMutation.isPending}
+            >
+              {archiveMutation.isPending && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+              )}
+              Archive project
             </Button>
           </DialogFooter>
         </DialogContent>

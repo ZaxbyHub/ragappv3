@@ -115,6 +115,13 @@ beforeEach(() => {
 });
 
 describe("DraftReadyDialog", () => {
+  it("focuses the dialog heading on open, not the first focusable control", async () => {
+    renderDialog();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Mark Ready" }));
+    });
+  });
+
   it("renders one checklist row per eligibility condition with pass/fail as icon + text", () => {
     renderDialog({ eligibility: { ok: false, blockers: ["fact_not_current", "evidence_changed"] } });
 

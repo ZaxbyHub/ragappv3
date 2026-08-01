@@ -237,6 +237,13 @@ beforeEach(() => {
 });
 
 describe("DraftPromoteDialog", () => {
+  it("focuses the dialog heading on open, not the title input", async () => {
+    renderDialog();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Promote to vault" }));
+    });
+  });
+
   it("disables the action and explains why when canWrite is false", async () => {
     renderDialog({ canWrite: false });
     expect(await screen.findByText(/read-only access/i)).toBeInTheDocument();

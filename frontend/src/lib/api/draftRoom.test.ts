@@ -581,6 +581,7 @@ describe("draftRoomKeys", () => {
     expect(draftRoomKeys.list({ page: 1 })).toEqual(["draft-room", "drafts", { page: 1 }]);
     expect(draftRoomKeys.detail(5)).toEqual(["draft-room", "draft", 5]);
     expect(draftRoomKeys.inputs(5)).toEqual(["draft-room", "draft", 5, "inputs"]);
+    expect(draftRoomKeys.inputContent(5, 9)).toEqual(["draft-room", "draft", 5, "input", 9, "content"]);
     expect(draftRoomKeys.jobs(5)).toEqual(["draft-room", "draft", 5, "jobs", {}]);
     expect(draftRoomKeys.jobs(5, { page: 2 })).toEqual(["draft-room", "draft", 5, "jobs", { page: 2 }]);
     expect(draftRoomKeys.job(5, 9)).toEqual(["draft-room", "draft", 5, "job", 9]);

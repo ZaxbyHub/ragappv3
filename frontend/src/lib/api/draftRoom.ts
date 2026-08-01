@@ -584,6 +584,8 @@ export const draftRoomKeys = {
   list: (params: Record<string, unknown>) => [...draftRoomKeys.lists(), params] as const,
   detail: (id: number) => [...draftRoomKeys.all, "draft", id] as const,
   inputs: (id: number) => [...draftRoomKeys.detail(id), "inputs"] as const,
+  inputContent: (id: number, inputId: number) =>
+    [...draftRoomKeys.detail(id), "input", inputId, "content"] as const,
   jobs: (id: number, params?: Record<string, unknown>) =>
     [...draftRoomKeys.detail(id), "jobs", params ?? {}] as const,
   job: (id: number, jobId: number) => [...draftRoomKeys.detail(id), "job", jobId] as const,

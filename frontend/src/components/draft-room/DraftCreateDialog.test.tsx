@@ -84,6 +84,13 @@ beforeEach(() => {
 });
 
 describe("DraftCreateDialog", () => {
+  it("focuses the dialog heading on open (positive control for the rAF focus pattern)", async () => {
+    renderDialog();
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByRole("heading", { name: "Create a drafting project" }));
+    });
+  });
+
   it("shows inline errors and focuses the first invalid field on submit", async () => {
     const user = userEvent.setup();
     mockListAccessibleVaults.mockResolvedValue({

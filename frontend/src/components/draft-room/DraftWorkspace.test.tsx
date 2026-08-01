@@ -12,6 +12,7 @@ import {
   CANCEL_CONSEQUENCE,
   READY_BLOCKER_LABELS,
 } from "./labels";
+import { draftRoomKeys } from "@/lib/api/draftRoom";
 import type {
   DraftDetail,
   DraftInput,
@@ -174,6 +175,7 @@ const {
   mockCreateDraftRevision,
   mockDeleteDraft,
   mockRestoreDraft,
+  mockArchiveDraft,
 } = vi.hoisted(() => ({
   mockListDraftJobs: vi.fn(),
   mockGetDraftStages: vi.fn(),
@@ -187,6 +189,7 @@ const {
   mockCreateDraftRevision: vi.fn(),
   mockDeleteDraft: vi.fn(),
   mockRestoreDraft: vi.fn(),
+  mockArchiveDraft: vi.fn(),
 }));
 
 vi.mock("@/lib/api/draftRoom", async () => {
@@ -205,6 +208,7 @@ vi.mock("@/lib/api/draftRoom", async () => {
     createDraftRevision: mockCreateDraftRevision,
     deleteDraft: mockDeleteDraft,
     restoreDraft: mockRestoreDraft,
+    archiveDraft: mockArchiveDraft,
   };
 });
 
@@ -444,6 +448,7 @@ beforeEach(() => {
   mockCreateDraftRevision.mockReset();
   mockDeleteDraft.mockReset();
   mockRestoreDraft.mockReset();
+  mockArchiveDraft.mockReset();
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
   vi.mocked(toast.info).mockClear();
@@ -482,6 +487,18 @@ describe("DraftWorkspace", () => {
     expect(idempotencyKey.length).toBeGreaterThan(0);
   });
 
+  it("focuses the compile confirmation's heading on open, not the Cancel button", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+
+    await user.click(await screen.findByRole("button", { name: "Create draft" }));
+    const dialog = await screen.findByRole("dialog");
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Create draft" }));
+    });
+  });
+
   it("shows the cancel confirmation with CANCEL_CONSEQUENCE and calls cancelDraftJob", async () => {
     const user = userEvent.setup();
     mockCancelDraftJob.mockResolvedValue(makeJob({ status: "cancelled" }));
@@ -497,6 +514,22 @@ describe("DraftWorkspace", () => {
 
     await user.click(within(dialog).getByRole("button", { name: "Cancel run" }));
     await waitFor(() => expect(mockCancelDraftJob).toHaveBeenCalledWith(42, 55));
+  });
+
+  it("focuses the cancel confirmation's heading on open, not the Keep running button", async () => {
+    const user = userEvent.setup();
+    renderWorkspace({
+      detail: makeDetail({
+        active_compile_job: makeJob({ id: 55, status: "running", active_stage: "research" }),
+      }),
+    });
+
+    await user.click(await screen.findByRole("button", { name: "Cancel run" }));
+    const dialog = await screen.findByRole("dialog");
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(within(dialog).getByRole("heading", { name: "Cancel this run?" }));
+    });
   });
 
   it("only offers server-advertised retry stages, never assemble or intake, and surfaces backward normalisation", async () => {
@@ -545,6 +578,38 @@ describe("DraftWorkspace", () => {
     expect(mockCreateDraftRevision).toHaveBeenCalledTimes(1);
   });
 
+  it("focuses the save-revision confirmation's heading on open, not the Cancel button", async () => {
+    const user = userEvent.setup();
+    useDraftRoomUiStore.setState({ workspaceTab: "draft" });
+    renderWorkspace();
+
+    const textarea = await screen.findByLabelText("Draft content");
+    await user.type(textarea, " More.");
+
+    await user.click(screen.getByRole("button", { name: "Save new revision" }));
+    const dialog = await screen.findByRole("dialog");
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("heading", { name: "Save a new revision?" })
+      );
+    });
+  });
+
+  it("focuses the delete confirmation's heading on open, not the Cancel button", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+
+    await user.click(await screen.findByRole("button", { name: "Delete project" }));
+    const dialog = await screen.findByRole("dialog");
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        within(dialog).getByRole("heading", { name: "Delete this project?" })
+      );
+    });
+  });
+
   it("gates content actions and explains the permission when vault access is revoked, but keeps Cancel and Delete available", async () => {
     useDraftRoomUiStore.setState({ workspaceTab: "sources" });
     renderWorkspace({
@@ -565,6 +630,68 @@ describe("DraftWorkspace", () => {
 
     expect(await screen.findByText("This project is archived. Restore it before compiling.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Restore project" })).toBeInTheDocument();
+  });
+
+  it("offers Archive for an active project", async () => {
+    renderWorkspace();
+    expect(await screen.findByRole("button", { name: "Archive project" })).toBeEnabled();
+  });
+
+  it("does not offer Archive for an already-archived project", async () => {
+    renderWorkspace({ draft: makeDraft({ status: "archived" }), detail: makeDetail({ summary: makeDraft({ status: "archived" }) }) });
+    await screen.findByRole("button", { name: "Restore project" });
+    expect(screen.queryByRole("button", { name: "Archive project" })).not.toBeInTheDocument();
+  });
+
+  it("disables Archive with a stated reason while a job is active", async () => {
+    renderWorkspace({
+      detail: makeDetail({ active_compile_job: makeJob({ id: 77, status: "running" }) }),
+    });
+
+    expect(await screen.findByRole("button", { name: "Archive project" })).toBeDisabled();
+    expect(
+      screen.getByText("Archiving is unavailable while a newsroom run is active.")
+    ).toBeInTheDocument();
+  });
+
+  it("requires confirmation, archives with the draft's lock_version, and invalidates detail and list queries", async () => {
+    const user = userEvent.setup();
+    mockArchiveDraft.mockResolvedValue(makeDraft({ status: "archived" }));
+    const { queryClient } = renderWorkspace();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+    await user.click(await screen.findByRole("button", { name: "Archive project" }));
+    expect(mockArchiveDraft).not.toHaveBeenCalled();
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/read-only until it is restored/i)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Archive project" }));
+
+    await waitFor(() => expect(mockArchiveDraft).toHaveBeenCalledWith(42, 3));
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.detail(42) });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.lists() });
+  });
+
+  it("surfaces the server detail via toast on a 409 while archiving", async () => {
+    const user = userEvent.setup();
+    const conflictError = Object.assign(new Error("conflict"), {
+      status: 409,
+      originalError: {
+        response: {
+          data: { detail: "A newsroom run is already active for this project.", code: "active_job" },
+        },
+      },
+    });
+    mockArchiveDraft.mockRejectedValue(conflictError);
+    renderWorkspace();
+
+    await user.click(await screen.findByRole("button", { name: "Archive project" }));
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Archive project" }));
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("A newsroom run is already active for this project.")
+    );
   });
 
   it("selecting a stage in the rail feeds the inspector's stage artifact", async () => {

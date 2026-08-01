@@ -282,6 +282,57 @@ describe("DraftSourceUpload", () => {
     expect(mockGetDraft).toHaveBeenCalledWith(1);
   });
 
+  it("announces only the terminal ready transition to screen readers, never a progress tick", async () => {
+    const user = userEvent.setup();
+    let capturedProgress: ((pct: number) => void) | undefined;
+    let resolveUpload: (value: DraftInputUploadResponse) => void;
+    mockUploadDraftInput.mockImplementation(
+      (_draftId, _params, onProgress) =>
+        new Promise((resolve) => {
+          capturedProgress = onProgress;
+          resolveUpload = resolve;
+        })
+    );
+    mockGetDraft
+      .mockResolvedValueOnce(makeDraftDetail([makeDraftInputRecord({ parse_status: "pending" })]))
+      .mockResolvedValueOnce(makeDraftDetail([makeDraftInputRecord({ parse_status: "ready" })]));
+
+    renderComponent({}, { pollIntervalSeconds: 0.02 });
+    const liveRegion = document.querySelector('[aria-live="polite"]') as HTMLElement;
+    await user.upload(screen.getByLabelText(ADD_SOURCE_FILES_CTA), makeFile("notes.txt"));
+
+    await waitFor(() => expect(screen.getByText("Uploading")).toBeInTheDocument());
+    expect(liveRegion.textContent).toBe("");
+
+    capturedProgress?.(55);
+    await waitFor(() => expect(screen.getByRole("progressbar")).toBeInTheDocument());
+    expect(liveRegion.textContent).toBe("");
+
+    resolveUpload!(makeUploadResponse());
+    await waitFor(() => expect(screen.getByText("Parsing")).toBeInTheDocument());
+    expect(liveRegion.textContent).toBe("");
+
+    await waitFor(() => expect(screen.getByText("Parsed")).toBeInTheDocument());
+    await waitFor(() => expect(liveRegion.textContent).toBe("notes.txt: parsed."));
+  });
+
+  it("announces a terminal parse failure to screen readers", async () => {
+    const user = userEvent.setup();
+    mockUploadDraftInput.mockResolvedValue(makeUploadResponse());
+    mockGetDraft.mockResolvedValue(
+      makeDraftDetail([
+        makeDraftInputRecord({ parse_status: "failed", parse_error: "Could not extract text: corrupt PDF" }),
+      ])
+    );
+
+    renderComponent({}, { pollIntervalSeconds: 0.02 });
+    const liveRegion = document.querySelector('[aria-live="polite"]') as HTMLElement;
+    await user.upload(screen.getByLabelText(ADD_SOURCE_FILES_CTA), makeFile("bad.pdf"));
+
+    await waitFor(() => expect(screen.getByText("Failed")).toBeInTheDocument());
+    await waitFor(() => expect(liveRegion.textContent).toBe("bad.pdf: parse failed."));
+  });
+
   it("polls the canonical draft detail to resolve parse state, never the per-input content endpoint", async () => {
     const user = userEvent.setup();
     mockUploadDraftInput.mockResolvedValue(makeUploadResponse());
