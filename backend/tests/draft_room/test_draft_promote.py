@@ -721,17 +721,123 @@ class TestPromoteAuditAndCapabilities(DraftPromoteTestBase):
 
 
 class TestPromoteFolderAndTags(DraftPromoteTestBase):
-    def test_folder_id_moves_promoted_file(self):
-        draft_id = self._create_draft().json()["id"]
-        upload = self._upload_input(draft_id)
+    def _ready_input(self, draft_id, content=b"body"):
+        upload = self._upload_input(draft_id, content=content)
         input_id = upload.json()["input"]["id"]
         self._mark_input_ready(input_id)
+        return input_id
+
+    def _insert_folder(self, folder_id, vault_id, name="Target"):
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO folders (id, vault_id, name) VALUES (?, ?, ?)",
+                (folder_id, vault_id, name),
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _insert_tag(self, tag_id, vault_id, name="Tag"):
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO tags (id, vault_id, name) VALUES (?, ?, ?)",
+                (tag_id, vault_id, name),
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _document_tag_ids(self, file_id):
+        conn = self._connection_pool.get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT tag_id FROM document_tags WHERE file_id = ? ORDER BY tag_id",
+                (file_id,),
+            ).fetchall()
+        finally:
+            self._connection_pool.release_connection(conn)
+        return [r["tag_id"] for r in rows]
+
+    def test_folder_id_moves_promoted_file(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+        self._insert_folder(1, self.READ_VAULT_ID)
+
+        resp = self._promote(
+            draft_id, source_type="input", source_id=input_id, folder_id=1
+        )
+        self.assertEqual(resp.status_code, 202, resp.text)
+        self.assertEqual(self._files_rows()[0]["folder_id"], 1)
+
+    def test_tag_ids_assigns_tags(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+        self._insert_tag(1, self.READ_VAULT_ID, "Alpha")
+        self._insert_tag(2, self.READ_VAULT_ID, "Beta")
+
+        resp = self._promote(
+            draft_id, source_type="input", source_id=input_id, tag_ids=[1, 2]
+        )
+        self.assertEqual(resp.status_code, 202, resp.text)
+        file_id = resp.json()["file_id"]
+        self.assertEqual(self._document_tag_ids(file_id), [1, 2])
+
+
+class TestPromoteOrganizationValidation(DraftPromoteTestBase):
+    """Issue #437 follow-up: an invalid organization target must be rejected
+    before any promotion side effect — no copied bytes, no `files` row, no
+    `draft_promotions` row, no enqueue — so a failed promotion never actually
+    happened underneath the error the client sees."""
+
+    def _ready_input(self, draft_id, content=b"body"):
+        upload = self._upload_input(draft_id, content=content)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+        return input_id
+
+    def _assert_no_promotion_side_effects(self, draft_id):
+        self.assertEqual(self._files_rows(), [])
+        self.assertEqual(self._promotion_rows(draft_id), [])
+        self._mock_background_processor.enqueue.assert_not_awaited()
+        uploads_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
+        self.assertEqual(list(uploads_dir.glob("*")), [])
+
+    def test_unknown_folder_id_rejected_with_no_side_effects(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        resp = self._promote(
+            draft_id, source_type="input", source_id=input_id, folder_id=999999
+        )
+        self.assertEqual(resp.status_code, 404, resp.text)
+        self.assertEqual(resp.json()["code"], "folder_not_found")
+        self.assertEqual(resp.json()["context"]["folder_id"], 999999)
+        self._assert_no_promotion_side_effects(draft_id)
+
+    def test_unknown_tag_id_rejected_with_no_side_effects(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        resp = self._promote(
+            draft_id, source_type="input", source_id=input_id, tag_ids=[999999]
+        )
+        self.assertEqual(resp.status_code, 404, resp.text)
+        self.assertEqual(resp.json()["code"], "tag_not_found")
+        self.assertEqual(resp.json()["context"]["tag_id"], 999999)
+        self._assert_no_promotion_side_effects(draft_id)
+
+    def test_folder_in_different_vault_rejected(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+        other_vault_id = self._make_read_only_vault(vault_id=6)
 
         conn = self._connection_pool.get_connection()
         try:
             conn.execute(
-                "INSERT INTO folders (id, vault_id, name) VALUES (1, ?, 'Target')",
-                (self.READ_VAULT_ID,),
+                "INSERT INTO folders (id, vault_id, name) VALUES (1, ?, 'Elsewhere')",
+                (other_vault_id,),
             )
             conn.commit()
         finally:
@@ -740,8 +846,46 @@ class TestPromoteFolderAndTags(DraftPromoteTestBase):
         resp = self._promote(
             draft_id, source_type="input", source_id=input_id, folder_id=1
         )
-        self.assertEqual(resp.status_code, 202, resp.text)
-        self.assertEqual(self._files_rows()[0]["folder_id"], 1)
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["code"], "folder_wrong_vault")
+        self.assertEqual(resp.json()["context"]["folder_id"], 1)
+        self._assert_no_promotion_side_effects(draft_id)
+
+    def test_tag_in_different_vault_rejected(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+        other_vault_id = self._make_read_only_vault(vault_id=7)
+
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO tags (id, vault_id, name) VALUES (1, ?, 'Elsewhere')",
+                (other_vault_id,),
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        resp = self._promote(
+            draft_id, source_type="input", source_id=input_id, tag_ids=[1]
+        )
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["code"], "tag_wrong_vault")
+        self.assertEqual(resp.json()["context"]["tag_id"], 1)
+        self._assert_no_promotion_side_effects(draft_id)
+
+    def test_tag_ids_over_fifty_rejected_by_schema(self):
+        """Confirms `tag_ids` is bounded (SPEC: max 50) at the pydantic layer,
+        before the route body ever runs."""
+        draft_id = self._create_draft().json()["id"]
+        resp = self._promote(
+            draft_id,
+            source_type="input",
+            source_id=1,
+            tag_ids=list(range(1, 52)),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self._assert_no_promotion_side_effects(draft_id)
 
 
 if __name__ == "__main__":

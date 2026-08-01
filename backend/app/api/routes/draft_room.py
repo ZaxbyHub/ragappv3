@@ -147,7 +147,7 @@ from app.services.draft_store import (
     canonical_json,
     sha256_text,
 )
-from app.services.folder_store import FolderNotFoundError, FolderStore
+from app.services.folder_store import FolderStore
 from app.services.security_audit import safe_record_security_event
 from app.services.tag_store import TagStore
 from app.services.upload_validation import secure_filename
@@ -3475,6 +3475,50 @@ async def export_draft_revision(
     )
 
 
+def _validate_promotion_organization(
+    db: sqlite3.Connection,
+    *,
+    vault_id: int,
+    folder_id: Optional[int],
+    tag_ids: list[int],
+) -> None:
+    """Reject an unusable ``folder_id``/``tag_ids`` *before any promotion side
+    effect runs* — no copied bytes, no ``files`` row, no ``draft_promotions``
+    row, no enqueue. A promotion that reports failure after already writing
+    the document would make the audit trail lie and turn a client retry into
+    a duplicate, so every id here must be confirmed to exist and belong to
+    ``vault_id`` up front, never discovered as a failure afterward.
+    """
+    if folder_id is not None:
+        row = db.execute(
+            "SELECT vault_id FROM folders WHERE id = ?", (folder_id,)
+        ).fetchone()
+        if row is None:
+            raise DraftRoomHTTPError(
+                404, "folder not found", "folder_not_found", {"folder_id": folder_id}
+            )
+        if int(row["vault_id"]) != vault_id:
+            raise DraftRoomHTTPError(
+                409,
+                "folder belongs to a different vault",
+                "folder_wrong_vault",
+                {"folder_id": folder_id},
+            )
+    for tag_id in tag_ids:
+        row = db.execute("SELECT vault_id FROM tags WHERE id = ?", (tag_id,)).fetchone()
+        if row is None:
+            raise DraftRoomHTTPError(
+                404, "tag not found", "tag_not_found", {"tag_id": tag_id}
+            )
+        if int(row["vault_id"]) != vault_id:
+            raise DraftRoomHTTPError(
+                409,
+                "tag belongs to a different vault",
+                "tag_wrong_vault",
+                {"tag_id": tag_id},
+            )
+
+
 def _apply_promotion_organization(
     db: sqlite3.Connection,
     *,
@@ -3483,13 +3527,15 @@ def _apply_promotion_organization(
     folder_id: Optional[int],
     tag_ids: list[int],
 ) -> None:
-    """Best-effort, vault-scoped folder/tag assignment for a just-promoted file.
+    """Apply an already-validated folder/tag assignment to a just-promoted file.
 
     Reuses the exact stores the folders/tags surface already uses (never
-    duplicated logic): invalid tag IDs are silently dropped by
-    :meth:`TagStore.assign_tags` (matches its documented cross-vault
-    behavior); a ``folder_id`` naming a folder outside this vault raises
-    :class:`FolderNotFoundError`, translated by the caller.
+    duplicated logic). Callers must run :func:`_validate_promotion_organization`
+    first — by the time this runs, the promotion itself has already happened
+    (the ``files``/``draft_promotions`` rows exist and ingestion is enqueued),
+    so a failure here (e.g. a concurrent delete of the folder/tag between
+    validation and this call) must never be reported as a promotion failure;
+    see the caller for how that is surfaced instead.
     """
     if folder_id is not None:
         FolderStore(db).move_documents(vault_id, [file_id], folder_id)
@@ -3541,6 +3587,18 @@ async def promote_draft_source(
     if draft.status == "archived":
         raise DraftRoomHTTPError(
             409, "an archived draft cannot be promoted", "invalid_state"
+        )
+
+    # Validate the organization target(s) up front, before any promotion side
+    # effect (copied bytes, `files` row, `draft_promotions` row, enqueue) —
+    # see `_validate_promotion_organization` for why this must run first.
+    if body.folder_id is not None or body.tag_ids:
+        await asyncio.to_thread(
+            _validate_promotion_organization,
+            db,
+            vault_id=draft.vault_id,
+            folder_id=body.folder_id,
+            tag_ids=body.tag_ids,
         )
 
     revision_fact_status: Optional[str] = None
@@ -3604,6 +3662,14 @@ async def promote_draft_source(
                 {"existing_file_id": exc.existing_file_id},
             ) from exc
 
+    # The promotion itself has now genuinely happened (`files` and
+    # `draft_promotions` rows exist, ingestion is enqueued) — organization
+    # (folder/tags) was already validated to exist in this vault above, but a
+    # race (e.g. concurrent delete) could still make the assignment itself
+    # fail. That must never be reported as a promotion failure: the document
+    # exists and a client retry would create a duplicate. Record it in the
+    # audit payload instead of raising.
+    organization_error: Optional[str] = None
     if body.folder_id is not None or body.tag_ids:
         try:
             await asyncio.to_thread(
@@ -3614,8 +3680,15 @@ async def promote_draft_source(
                 folder_id=body.folder_id,
                 tag_ids=body.tag_ids,
             )
-        except FolderNotFoundError as exc:
-            raise DraftRoomHTTPError(404, str(exc), "not_found") from exc
+        except Exception as exc:  # noqa: BLE001 — must not turn a real success into a reported failure
+            organization_error = str(exc)
+            logger.warning(
+                "draft_room: promotion organization step failed after promotion "
+                "succeeded (draft_id=%s file_id=%s): %s",
+                draft_id,
+                result.file_id,
+                exc,
+            )
 
     await _run_store(
         lambda: store.record_event(
@@ -3647,6 +3720,7 @@ async def promote_draft_source(
             "filename": result.filename,
             "revision_fact_status": revision_fact_status,
             "was_ready_revision": was_ready_revision,
+            "organization_error": organization_error,
         },
     )
 
