@@ -632,6 +632,20 @@ describe("DraftWorkspace", () => {
     expect(screen.getByRole("button", { name: "Restore project" })).toBeInTheDocument();
   });
 
+  it("enables Promote when the caller has vault write and the server reports promotion available", async () => {
+    renderWorkspace({ capabilities: makeCapabilities({ promote_available: true }) });
+
+    expect(await screen.findByRole("button", { name: "Promote to vault" })).toBeEnabled();
+    expect(screen.queryByText("Promotion is currently unavailable.")).not.toBeInTheDocument();
+  });
+
+  it("disables Promote with a reason when the server reports promotion unavailable, even with vault write", async () => {
+    renderWorkspace({ capabilities: makeCapabilities({ promote_available: false }) });
+
+    expect(await screen.findByRole("button", { name: "Promote to vault" })).toBeDisabled();
+    expect(screen.getByText("Promotion is currently unavailable.")).toBeInTheDocument();
+  });
+
   it("offers Archive for an active project", async () => {
     renderWorkspace();
     expect(await screen.findByRole("button", { name: "Archive project" })).toBeEnabled();

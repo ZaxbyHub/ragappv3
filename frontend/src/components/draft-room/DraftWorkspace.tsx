@@ -578,6 +578,15 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [promoteDialogOpen, setPromoteDialogOpen] = useState(false);
 
+  // The server can disable promotion independently of vault-write access
+  // (`capabilities.promote_available`); fail closed while capabilities are
+  // still loading, matching `compileBlockedReason`'s convention.
+  const promoteDisabled = !capabilities || capabilities.promote_available === false;
+  const promoteUnavailableReason =
+    capabilities && capabilities.promote_available === false
+      ? "Promotion is currently unavailable."
+      : null;
+
   const currentRevisionSummary = detail.current_revision_summary;
   const factStatusCurrent = currentRevisionSummary != null && FACT_CURRENT.has(currentRevisionSummary.fact_status);
   const isReadyRevision = draft.status === "ready" && currentRevisionSummary != null;
@@ -830,7 +839,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           </Button>
         )}
         {canCompileOrPromote && (
-          <Button type="button" variant="outline" onClick={() => setPromoteDialogOpen(true)}>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setPromoteDialogOpen(true)}
+            disabled={promoteDisabled}
+          >
             {PROMOTE_TO_VAULT_CTA}
           </Button>
         )}
@@ -841,6 +855,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       {blockedReason != null && <p className="text-sm text-muted-foreground">{blockedReason}</p>}
       {archiveBlockedReason != null && (
         <p className="text-sm text-muted-foreground">{archiveBlockedReason}</p>
+      )}
+      {canCompileOrPromote && promoteUnavailableReason != null && (
+        <p className="text-sm text-muted-foreground">{promoteUnavailableReason}</p>
       )}
 
       {canRetry && (

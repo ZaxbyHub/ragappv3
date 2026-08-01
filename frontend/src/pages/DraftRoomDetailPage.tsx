@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ShieldAlert, TriangleAlert } from "lucide-react";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/EmptyState";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -54,14 +55,25 @@ export default function DraftRoomDetailPage() {
     retry: false,
   });
 
-  const { connected: eventsConnected } = useDraftRoomEvents(isValidId ? draftIdNum : null, {
+  const { pollingFallback } = useDraftRoomEvents(isValidId ? draftIdNum : null, {
     enabled: isValidId && detailQuery.isSuccess,
   });
-  // The connection status is not surfaced with its own UI yet; referencing it
-  // here keeps the subscription's return value from being flagged as unused
-  // while leaving room for a "reconnecting" indicator without a signature
-  // change.
-  void eventsConnected;
+
+  // Announce the polling-fallback state politely, but only on the transition
+  // into or out of it — never on every render — matching DraftEditor's
+  // dirty-state announcement pattern.
+  const [pollingAnnouncement, setPollingAnnouncement] = useState("");
+  const previousPollingFallbackRef = useRef(pollingFallback);
+  useEffect(() => {
+    if (previousPollingFallbackRef.current !== pollingFallback) {
+      previousPollingFallbackRef.current = pollingFallback;
+      setPollingAnnouncement(
+        pollingFallback
+          ? "Live updates are unavailable. Checking for changes periodically."
+          : "Live updates restored."
+      );
+    }
+  }, [pollingFallback]);
 
   const resetForDraft = useDraftRoomUiStore((s) => s.resetForDraft);
   const storedDraftText = useDraftRoomUiStore((s) =>
@@ -188,6 +200,9 @@ export default function DraftRoomDetailPage() {
 
   return (
     <section className="animate-in fade-in space-y-4 pb-12 duration-300" aria-labelledby="draft-room-detail-heading">
+      <div aria-live="polite" className="sr-only">
+        {pollingAnnouncement}
+      </div>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <Link to="/draft-room" className="text-sm text-muted-foreground hover:underline">
@@ -197,6 +212,14 @@ export default function DraftRoomDetailPage() {
             {draft.title}
           </h1>
         </div>
+        {pollingFallback && (
+          <Badge
+            variant="outline"
+            title="Live updates are unavailable. This page is polling for changes instead."
+          >
+            Polling for updates
+          </Badge>
+        )}
       </div>
 
       {capabilityDisabled && (

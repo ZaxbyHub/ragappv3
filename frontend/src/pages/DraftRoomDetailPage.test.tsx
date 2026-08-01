@@ -13,11 +13,13 @@ const {
   mockGetDraft,
   mockGetDraftRevision,
   mockUseDraftRoomCapabilities,
+  mockUseDraftRoomEvents,
   mockRequestCompile,
 } = vi.hoisted(() => ({
   mockGetDraft: vi.fn(),
   mockGetDraftRevision: vi.fn(),
   mockUseDraftRoomCapabilities: vi.fn(),
+  mockUseDraftRoomEvents: vi.fn(),
   mockRequestCompile: vi.fn(),
 }));
 
@@ -31,7 +33,7 @@ vi.mock("@/hooks/useDraftRoomCapabilities", () => ({
 }));
 
 vi.mock("@/hooks/useDraftRoomEvents", () => ({
-  useDraftRoomEvents: () => ({ connected: false, pollingFallback: false, lastEvent: null }),
+  useDraftRoomEvents: mockUseDraftRoomEvents,
 }));
 
 vi.mock("@/components/draft-room/DraftStatusBanner", () => ({
@@ -208,6 +210,7 @@ beforeEach(() => {
     isLoading: false,
     isError: false,
   });
+  mockUseDraftRoomEvents.mockReset().mockReturnValue({ connected: true, pollingFallback: false, lastEvent: null });
   mockRequestCompile.mockReset();
   vi.mocked(window.confirm).mockReset().mockReturnValue(true);
 });
@@ -250,6 +253,23 @@ describe("DraftRoomDetailPage", () => {
 
     expect(await screen.findByText(DRAFT_ROOM_DISABLED_MESSAGE)).toBeInTheDocument();
     expect(screen.getByTestId("workspace")).toBeInTheDocument();
+  });
+
+  it("shows no polling indicator while the live stream is connected", async () => {
+    mockGetDraft.mockResolvedValue(makeDetail());
+    mockUseDraftRoomEvents.mockReturnValue({ connected: true, pollingFallback: false, lastEvent: null });
+    renderDetailPage("42");
+
+    await screen.findByTestId("workspace");
+    expect(screen.queryByText("Polling for updates")).not.toBeInTheDocument();
+  });
+
+  it("shows the polling indicator when the live stream has degraded to bounded polling", async () => {
+    mockGetDraft.mockResolvedValue(makeDetail());
+    mockUseDraftRoomEvents.mockReturnValue({ connected: false, pollingFallback: true, lastEvent: null });
+    renderDetailPage("42");
+
+    expect(await screen.findByText("Polling for updates")).toBeInTheDocument();
   });
 
   it("feeds the workspace's derived status and current fact status into the status banner", async () => {

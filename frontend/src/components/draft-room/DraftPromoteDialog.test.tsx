@@ -409,4 +409,63 @@ describe("DraftPromoteDialog", () => {
 
     expect(await screen.findByText(/already been promoted/i)).toBeInTheDocument();
   });
+
+  it("excludes a non-ready input from the source options", async () => {
+    renderDialog({
+      inputs: [
+        makeInput({ id: 900, original_name: "manuscript.docx", parse_status: "ready" }),
+        makeInput({ id: 901, original_name: "still-parsing.pdf", parse_status: "parsing" }),
+      ],
+    });
+
+    expect(screen.getByRole("button", { name: "manuscript.docx" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "still-parsing.pdf" })).not.toBeInTheDocument();
+  });
+
+  it("shows the explanatory note only when a non-ready input was excluded", async () => {
+    const { rerender } = renderDialog({
+      inputs: [makeInput({ id: 900, original_name: "manuscript.docx", parse_status: "ready" })],
+    });
+    expect(screen.queryByText(/cannot be promoted/i)).not.toBeInTheDocument();
+
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <DraftPromoteDialog
+            open
+            onOpenChange={vi.fn()}
+            draft={makeDraft()}
+            inputs={[
+              makeInput({ id: 900, original_name: "manuscript.docx", parse_status: "ready" }),
+              makeInput({ id: 901, original_name: "still-parsing.pdf", parse_status: "parsing" }),
+            ]}
+            revisions={[makeRevision()]}
+            currentRevisionId={501}
+            canWrite
+            onPromoted={vi.fn()}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByText(/1 input is still parsing or failed and cannot be promoted/i)).toBeInTheDocument();
+  });
+
+  it("makes the input source type unselectable with a reason when nothing is ready", async () => {
+    renderDialog({
+      inputs: [makeInput({ id: 900, original_name: "still-parsing.pdf", parse_status: "parsing" })],
+      revisions: [makeRevision()],
+    });
+
+    // The "A source file" radio's accessible name is prefixed by the
+    // section's own "Source" label (same htmlFor, pre-existing), so match
+    // loosely rather than by exact string.
+    expect(screen.getByRole("radio", { name: /A source file/ })).toBeDisabled();
+    expect(
+      await screen.findByText(/no source files have finished parsing yet/i)
+    ).toBeInTheDocument();
+    // Falls back to revision selection.
+    expect(screen.getByRole("radio", { name: "A draft revision" })).toBeChecked();
+  });
 });

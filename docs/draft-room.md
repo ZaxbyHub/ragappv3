@@ -367,6 +367,7 @@ Stable error codes an operator or user is most likely to see, and what they mean
 | `export_ack_required` | 422 | Exporting a not-fact-current revision without `acknowledge_not_fact_checked=true`. |
 | `duplicate_document` | 409 | Promotion found identical content already present in the destination vault; the conflicting `file_id` is included. |
 | `input_not_ready` | 409 | Attempted to promote an input whose parse job hasn't reached `ready`. |
+| `promotion_too_large` | 413 | The promoted document exceeded the global `MAX_FILE_SIZE_MB` cap; only reachable via the revision path, since an input's bytes are already capped at upload time. |
 | `folder_not_found` / `tag_not_found` / `folder_wrong_vault` / `tag_wrong_vault` | 404 / 409 | The `folder_id`/`tag_ids` supplied to promotion don't exist or belong to a different vault. |
 
 For rate limits (`DRAFT_UPLOAD_RATE_LIMIT`, `DRAFT_COMPILE_RATE_LIMIT`), a request

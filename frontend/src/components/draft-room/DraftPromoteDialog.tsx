@@ -69,8 +69,15 @@ export function DraftPromoteDialog({
   const titleInputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
 
+  const readyInputs = inputs.filter((input) => input.parse_status === "ready");
+  const excludedInputCount = inputs.length - readyInputs.length;
+  const noReadyInputsReason =
+    inputs.length > 0 && readyInputs.length === 0
+      ? "No source files have finished parsing yet, so none can be promoted."
+      : null;
+
   const [sourceType, setSourceType] = useState<DraftPromoteSourceType>(
-    inputs.length > 0 ? "input" : "revision"
+    readyInputs.length > 0 ? "input" : "revision"
   );
   const [sourceId, setSourceId] = useState<number | null>(null);
   const [title, setTitle] = useState(draft.title);
@@ -100,7 +107,7 @@ export function DraftPromoteDialog({
 
   useEffect(() => {
     if (!open) return;
-    setSourceType(inputs.length > 0 ? "input" : "revision");
+    setSourceType(readyInputs.length > 0 ? "input" : "revision");
     setTitle(draft.title);
     setTitleError(null);
     setConfirmed(false);
@@ -124,7 +131,7 @@ export function DraftPromoteDialog({
           : (revisions[0]?.id ?? null);
       setSourceId(defaultId);
     } else {
-      setSourceId(inputs[0]?.id ?? null);
+      setSourceId(readyInputs[0]?.id ?? null);
     }
     // Only re-derive the default when the source type (or the dialog) changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -235,12 +242,18 @@ export function DraftPromoteDialog({
                     <RadioGroupItem
                       id="promote-source-type-input"
                       value="input"
-                      disabled={inputs.length === 0}
+                      disabled={readyInputs.length === 0}
+                      aria-describedby={noReadyInputsReason ? "promote-source-type-input-reason" : undefined}
                     />
                     <Label htmlFor="promote-source-type-input" className="mb-0 font-normal">
                       A source file
                     </Label>
                   </div>
+                  {noReadyInputsReason ? (
+                    <p id="promote-source-type-input-reason" className="ml-6 text-sm text-muted-foreground">
+                      {noReadyInputsReason}
+                    </p>
+                  ) : null}
                   <div className="flex items-center gap-2">
                     <RadioGroupItem
                       id="promote-source-type-revision"
@@ -267,7 +280,7 @@ export function DraftPromoteDialog({
                   </SelectTrigger>
                   <SelectContent>
                     {sourceType === "input"
-                      ? inputs.map((input) => (
+                      ? readyInputs.map((input) => (
                           <SelectItem key={input.id} value={String(input.id)}>
                             {input.original_name}
                           </SelectItem>
@@ -281,6 +294,13 @@ export function DraftPromoteDialog({
                         ))}
                   </SelectContent>
                 </Select>
+                {sourceType === "input" && excludedInputCount > 0 ? (
+                  <p className="text-sm text-muted-foreground">
+                    {excludedInputCount === 1
+                      ? "1 input is still parsing or failed and cannot be promoted."
+                      : `${excludedInputCount} inputs are still parsing or failed and cannot be promoted.`}
+                  </p>
+                ) : null}
               </div>
 
               <div className="space-y-2">
