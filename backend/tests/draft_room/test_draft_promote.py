@@ -21,7 +21,7 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from queue import Empty, Queue
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -34,6 +34,7 @@ except ImportError:
 
 from fastapi.testclient import TestClient
 
+import app.services.draft_promotion as draft_promotion_module
 from app.api.deps import get_background_processor, get_db, get_vector_store
 from app.config import settings
 from app.main import app
@@ -642,6 +643,13 @@ class TestPromoteValidation(DraftPromoteTestBase):
 
 class TestPromoteDuplicate(DraftPromoteTestBase):
     def test_duplicate_content_in_vault_returns_409(self):
+        """Covers only the SEQUENTIAL case: the second promotion is issued
+        strictly after the first has already committed its `files` row. Two
+        truly concurrent promotions racing each other can both land — that
+        race is inherited from `_do_upload`'s own documented window
+        (`_check_duplicate_in_flight` then `_insert_or_get_file_record` is
+        not one atomic check-and-insert) and is out of scope here; this test
+        does not exercise or assert anything about that race."""
         content = b"Identical bytes across two different drafts."
 
         draft_1 = self._create_draft(title="First").json()["id"]
@@ -713,11 +721,23 @@ class TestPromoteAuditAndCapabilities(DraftPromoteTestBase):
         self.assertEqual(len(events), 1)
 
     def test_capabilities_reports_promote_available(self):
+        """Proves the route actually exists, not just that the capability
+        flag is hardcoded True — the flag alone would still pass even if the
+        route were deleted."""
         resp = self.client.get(
             "/api/draft-room/capabilities", headers=self._owner_headers()
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(resp.json()["promote_available"])
+
+        from app.api.routes.draft_room import router as draft_room_router
+
+        routes = {
+            (method, route.path)
+            for route in draft_room_router.routes
+            for method in getattr(route, "methods", set())
+        }
+        self.assertIn(("POST", "/draft-room/drafts/{draft_id}/promote"), routes)
 
 
 class TestPromoteFolderAndTags(DraftPromoteTestBase):
@@ -886,6 +906,163 @@ class TestPromoteOrganizationValidation(DraftPromoteTestBase):
         )
         self.assertEqual(resp.status_code, 422, resp.text)
         self._assert_no_promotion_side_effects(draft_id)
+
+
+class TestPromoteFilenameSafety(DraftPromoteTestBase):
+    def test_long_title_is_clamped_not_500(self):
+        """A 252-character title used to make the sanitized filename exceed
+        typical filesystem NAME_MAX, so `os.open` raised
+        `OSError: [Errno 36] File name too long` -> an unhandled 500. The
+        sanitized stem is now clamped well under that limit."""
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+
+        long_title = "A" * 252
+        resp = self._promote(
+            draft_id, source_type="input", source_id=input_id, title=long_title
+        )
+        self.assertEqual(resp.status_code, 202, resp.text)
+        self.assertLess(len(resp.json()["filename"]), 255)
+
+
+class TestPromoteAtomicity(DraftPromoteTestBase):
+    """Issue #437 review follow-up: a promotion must never be left half-done
+    -- either everything it creates (bytes, `files` row, `draft_promotions`
+    row, enqueued job) exists, or none of it does."""
+
+    def _ready_input(self, draft_id, content=b"body"):
+        upload = self._upload_input(draft_id, content=content)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+        return input_id
+
+    def test_enqueue_failure_leaves_no_orphan_files_row(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        self._mock_background_processor.enqueue = AsyncMock(
+            side_effect=RuntimeError("queue unavailable")
+        )
+        resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertEqual(resp.json()["code"], "internal_error")
+        self.assertEqual(self._files_rows(), [])
+        self.assertEqual(self._promotion_rows(draft_id), [])
+        uploads_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
+        self.assertEqual(list(uploads_dir.glob("*")), [])
+
+    def test_set_phase_failure_leaves_no_orphan_files_row(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        with patch.object(
+            draft_promotion_module, "set_phase", side_effect=RuntimeError("db unavailable")
+        ):
+            resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertEqual(self._files_rows(), [])
+        self.assertEqual(self._promotion_rows(draft_id), [])
+        self._mock_background_processor.enqueue.assert_not_awaited()
+
+    def test_promotion_row_insert_failure_leaves_no_orphan_document(self):
+        """Simulates the exact race from the review finding: the draft is
+        deleted between the `files` INSERT and the `draft_promotions`
+        INSERT, so the provenance insert fails on its `draft_id` foreign
+        key. Nothing this attempt created may survive -- not the `files`
+        row, not the bytes, and enqueue must never have been reached."""
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        real_register_file = draft_promotion_module._register_file
+
+        def _register_then_delete_draft(db_pool, dest_path, file_hash, vault_id):
+            created_file_id = real_register_file(db_pool, dest_path, file_hash, vault_id)
+            conn = self._connection_pool.get_connection()
+            try:
+                conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
+                conn.commit()
+            finally:
+                self._connection_pool.release_connection(conn)
+            return created_file_id
+
+        with patch.object(
+            draft_promotion_module, "_register_file", side_effect=_register_then_delete_draft
+        ):
+            resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertEqual(self._files_rows(), [])
+        self._mock_background_processor.enqueue.assert_not_awaited()
+
+
+class TestPromoteRevisionSizeLimit(DraftPromoteTestBase):
+    def test_oversized_revision_is_413(self):
+        """Probe scenario from the review finding: `max_file_size_mb=1` and a
+        2 MiB revision. The input path is already safe (`stage_upload` caps
+        it at upload time) -- this is the revision path only."""
+        draft_id = self._create_draft().json()["id"]
+        content_md = "x" * (2 * 1024 * 1024)  # 2 MiB
+
+        original_max_chars = settings.draft_max_total_parsed_chars
+        original_limit = settings.max_file_size_mb
+        # Raise the content_md length guard out of the way first -- that
+        # guard is a separate, earlier defense this fix also adds, and
+        # without raising it here a 2 MiB revision could never be *created*
+        # to promote in the first place.
+        settings.draft_max_total_parsed_chars = len(content_md) + 10
+        try:
+            revision_id = self._create_revision(
+                draft_id, content_md=content_md
+            ).json()["summary"]["id"]
+
+            settings.max_file_size_mb = 1
+            resp = self._promote(draft_id, source_type="revision", source_id=revision_id)
+        finally:
+            settings.draft_max_total_parsed_chars = original_max_chars
+            settings.max_file_size_mb = original_limit
+
+        self.assertEqual(resp.status_code, 413, resp.text)
+        self.assertEqual(resp.json()["code"], "promotion_too_large")
+        self.assertEqual(self._files_rows(), [])
+        uploads_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
+        self.assertEqual(list(uploads_dir.glob("*")), [])
+
+    def test_content_md_over_configured_limit_rejected_at_creation(self):
+        draft_id = self._create_draft().json()["id"]
+        original_max_chars = settings.draft_max_total_parsed_chars
+        settings.draft_max_total_parsed_chars = 100
+        try:
+            resp = self._create_revision(draft_id, content_md="x" * 101)
+        finally:
+            settings.draft_max_total_parsed_chars = original_max_chars
+        self.assertEqual(resp.status_code, 422, resp.text)
+
+
+class TestPromoteInputSourcePreserved(DraftPromoteTestBase):
+    def test_private_input_bytes_survive_promotion_on_disk(self):
+        """Promotion COPIES the input's bytes; the private draft-room source
+        file must still exist, unmodified, afterward (never moved/deleted)."""
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id, content=b"private manuscript bytes")
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+
+        storage_relpath = self._input_row(input_id)["storage_relpath"]
+        source_path = Path(settings.data_dir) / "draft-room" / storage_relpath
+        self.assertTrue(source_path.is_file())
+
+        resp = self._promote(draft_id, source_type="input", source_id=input_id)
+        self.assertEqual(resp.status_code, 202, resp.text)
+
+        self.assertTrue(
+            source_path.is_file(),
+            "the private draft-room source file must not be moved or deleted",
+        )
+        self.assertEqual(source_path.read_bytes(), b"private manuscript bytes")
 
 
 if __name__ == "__main__":

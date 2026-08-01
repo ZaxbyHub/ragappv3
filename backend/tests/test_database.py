@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from app.models.database import (
     init_db,
+    migrate_add_draft_room_promotions,
     migrate_add_files_search_fts,
     migrate_add_fork_columns,
     run_migrations,
@@ -246,6 +247,96 @@ class TestDatabaseSchema(unittest.TestCase):
         self.assertIn("forked_from_session_id", columns)
         self.assertIn("fork_message_index", columns)
         self.assertEqual(row, ("Legacy", None, None))
+
+    def test_migrate_draft_room_promotions_rebuilds_legacy_fk_shape(self):
+        """An earlier revision of this migration shipped `draft_promotions.file_id`
+        as `REFERENCES files(id) ON DELETE CASCADE`, which erases a promotion's
+        provenance the moment the promoted document is deleted. Simulate a
+        database that already ran that shape and confirm the current migration
+        detects and rebuilds it -- preserving existing rows -- rather than
+        `CREATE TABLE IF NOT EXISTS` silently leaving the old, cascading shape
+        in place (issue #437 review finding)."""
+        init_db(self.temp_db_path)
+        run_migrations(self.temp_db_path)
+
+        # IDs pinned at 101+ so they never collide with any default rows
+        # `init_db`/`run_migrations` themselves seed.
+        conn = sqlite3.connect(self.temp_db_path)
+        try:
+            conn.execute(
+                "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (101,'promo-owner','x','Owner','member',1)"
+            )
+            conn.execute("INSERT INTO vaults (id, name) VALUES (101,'Promo Vault')")
+            conn.execute(
+                "INSERT INTO drafts (id, vault_id, created_by, title, mode) "
+                "VALUES (101,101,101,'D','rewrite')"
+            )
+            conn.execute(
+                "INSERT INTO files (id, vault_id, file_path, file_name, file_size) "
+                "VALUES (101,101,'/tmp/x.txt','x.txt',10)"
+            )
+            # Replace the current (already-fixed) table with the OLD,
+            # FK-having shape, as if this database had run an earlier
+            # revision of the migration.
+            conn.execute("DROP TABLE draft_promotions")
+            conn.executescript("""
+                CREATE TABLE draft_promotions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+                    source_type TEXT NOT NULL CHECK (source_type IN ('input','revision')),
+                    source_id INTEGER NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    vault_id INTEGER NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    promoted_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.execute(
+                "INSERT INTO draft_promotions "
+                "(id, draft_id, source_type, source_id, source_sha256, vault_id, "
+                "file_id, filename, promoted_by) "
+                "VALUES (101,101,'input',101,'deadbeef',101,101,'x.txt',101)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Re-run the migration: it must detect the legacy FK shape and rebuild.
+        migrate_add_draft_room_promotions(self.temp_db_path)
+
+        conn = sqlite3.connect(self.temp_db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            fk_rows = conn.execute("PRAGMA foreign_key_list(draft_promotions)").fetchall()
+            self.assertFalse(
+                any(row["table"] == "files" for row in fk_rows),
+                "file_id must no longer be a foreign key on files(id)",
+            )
+
+            row = conn.execute(
+                "SELECT * FROM draft_promotions WHERE id = 101"
+            ).fetchone()
+            self.assertIsNotNone(row, "existing promotion row must survive the rebuild")
+            self.assertEqual(row["file_id"], 101)
+            self.assertEqual(row["source_sha256"], "deadbeef")
+
+            # The actual behavior this exists to guarantee: deleting the
+            # promoted file must not erase its provenance row.
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("DELETE FROM files WHERE id = 101")
+            conn.commit()
+            survivor = conn.execute(
+                "SELECT id FROM draft_promotions WHERE id = 101"
+            ).fetchone()
+            self.assertIsNotNone(survivor, "provenance row must survive file deletion")
+        finally:
+            conn.close()
+
+        # Idempotent: re-running the (now up to date) migration again is a no-op.
+        migrate_add_draft_room_promotions(self.temp_db_path)
 
 
 if __name__ == '__main__':

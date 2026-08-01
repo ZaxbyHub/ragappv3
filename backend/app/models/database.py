@@ -367,8 +367,14 @@ CREATE INDEX IF NOT EXISTS idx_draft_findings_open
 #
 # Records that a draft input or revision was promoted into a normal vault
 # document, without ever mutating the source input/revision row itself.
-# `file_id` is the `files` row created by the shared internal ingestion
-# service (never the draft's private storage path).
+# `file_id` is intentionally a plain snapshot column, NOT a foreign key —
+# matching the documented `draft_evidence.file_id` precedent above ("plain
+# snapshot columns, NOT foreign keys ... deleting or mutating the source
+# file/wiki/KMS row later must never cascade-delete or null out the
+# [row]'s recorded identity"): deleting the promoted document later must
+# never erase the provenance record of the promotion that created it. A
+# provenance table that disappears when the thing it documents is deleted is
+# not provenance.
 #
 # Defined as its own constant, appended to SCHEMA below and executed verbatim by
 # migrate_add_draft_room_promotions(), so a fresh database and a migrated
@@ -381,7 +387,7 @@ CREATE TABLE IF NOT EXISTS draft_promotions (
     source_id INTEGER NOT NULL,
     source_sha256 TEXT NOT NULL,
     vault_id INTEGER NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
-    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    file_id INTEGER NOT NULL,
     filename TEXT NOT NULL,
     promoted_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -4143,20 +4149,59 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
     Creates `draft_promotions`, recording that a draft input or revision was
     promoted into a normal vault document (the new `files` row), together
     with every CHECK constraint, foreign key, and index in the specification.
+    `file_id` is a plain snapshot column (see `_DRAFT_ROOM_PROMOTIONS_DDL`'s
+    comment) — NOT a foreign key on `files(id)` — so deleting the promoted
+    document later can never erase the provenance record of the promotion
+    that created it.
 
-    Executes ``_DRAFT_ROOM_PROMOTIONS_DDL`` — the exact same constant that is
-    appended to ``SCHEMA`` — so a database created by ``init_db`` and a legacy
-    database upgraded by this migration converge on an identical schema. Every
-    statement is ``CREATE ... IF NOT EXISTS``, so repeat execution is a no-op
-    and existing data is preserved.
+    An earlier revision of this migration shipped `file_id` as `REFERENCES
+    files(id) ON DELETE CASCADE`. SQLite has no `ALTER TABLE ... DROP
+    CONSTRAINT`, so `CREATE TABLE IF NOT EXISTS` alone would silently leave
+    that old, cascading shape in place on any database that already ran it.
+    This function detects that shape via `PRAGMA foreign_key_list` and
+    rebuilds the table (copying every existing row across) before falling
+    through to the idempotent `CREATE TABLE IF NOT EXISTS` path used by
+    every other case, so a fresh database, a never-migrated legacy database,
+    and a database that already ran the old FK-having shape all converge on
+    the identical current schema.
 
     Args:
         sqlite_path: Path to the SQLite database file.
     """
     conn = sqlite3.connect(sqlite_path)
     try:
-        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA foreign_keys = OFF;")
+        table_row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'draft_promotions'"
+        ).fetchone()
+        if table_row is not None:
+            fk_rows = conn.execute("PRAGMA foreign_key_list(draft_promotions)").fetchall()
+            has_file_id_fk = any(
+                fk_row[2] == "files" and fk_row[3] == "file_id" for fk_row in fk_rows
+            )
+            if has_file_id_fk:
+                conn.execute(
+                    "ALTER TABLE draft_promotions RENAME TO draft_promotions_legacy_fk"
+                )
+                conn.executescript(_DRAFT_ROOM_PROMOTIONS_DDL)
+                conn.execute(
+                    "INSERT INTO draft_promotions "
+                    "(id, draft_id, source_type, source_id, source_sha256, vault_id, "
+                    "file_id, filename, promoted_by, created_at) "
+                    "SELECT id, draft_id, source_type, source_id, source_sha256, "
+                    "vault_id, file_id, filename, promoted_by, created_at "
+                    "FROM draft_promotions_legacy_fk"
+                )
+                conn.execute("DROP TABLE draft_promotions_legacy_fk")
+                conn.commit()
+                conn.execute("PRAGMA foreign_keys = ON;")
+                return
         conn.executescript(_DRAFT_ROOM_PROMOTIONS_DDL)
         conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON;")
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()

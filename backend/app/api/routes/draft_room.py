@@ -115,6 +115,8 @@ from app.services.draft_pipeline import (
 )
 from app.services.draft_promotion import (
     DraftPromotionDuplicateError,
+    DraftPromotionError,
+    DraftPromotionTooLargeError,
     promote_input,
     promote_revision,
 )
@@ -479,6 +481,22 @@ class RevisionCreateRequest(BaseModel):
     lock_version: int
     content_md: str = Field(..., min_length=1)
 
+    @field_validator("content_md")
+    @classmethod
+    def _check_content_md_length(cls, v: str) -> str:
+        # Checked dynamically against the live setting (not baked into a
+        # `Field(max_length=...)` at import time) so a test or operator
+        # change to the setting takes effect immediately. Reuses the
+        # existing Draft Room content-size ceiling rather than inventing a
+        # new config knob; this is a defense-in-depth cap at creation time —
+        # the promotion path enforces the vault's actual byte-size limit
+        # (`settings.max_file_size_mb`) against the rendered `.md` bytes
+        # regardless of how the revision was created (manual or pipeline).
+        max_chars = settings.draft_max_total_parsed_chars
+        if len(v) > max_chars:
+            raise ValueError(f"content_md must not exceed {max_chars} characters")
+        return v
+
 
 def _validate_start_stage(value: Optional[str]) -> Optional[str]:
     """Reject any stage a user may not select — ``assemble`` above all."""
@@ -588,10 +606,19 @@ class DraftSummary(BaseModel):
     # DraftSummary list — required by issue #437's Ready acceptance
     # criterion ("show Ready actor/time"), which SPEC 8.1 predates.
     # ``ready_by`` is the existing `drafts.ready_by` column (already written
-    # by `_sync_mark_ready`); ``ready_by_username`` is resolved best-effort
-    # from the users table and is ``None`` both when the draft was never
-    # marked Ready and when the approving user record no longer exists (a
-    # deleted user is never given a fabricated placeholder name).
+    # by `_sync_mark_ready`), populated on every DraftSummary the draft was
+    # ever marked Ready on. ``ready_by_username`` is resolved best-effort
+    # from the users table, but ONLY on the single-draft detail fetch
+    # (`_build_detail`) — it is always ``None`` on every `_build_summary`
+    # construction (list rows and every other mutation response: create,
+    # patch, archive, restore, ready), because `list_drafts` calls
+    # `_build_summary` once per row and resolving a username there would be
+    # an N+1 query against `users` for every listed draft. It is also
+    # ``None`` when the draft was never marked Ready, and when the approving
+    # user record no longer exists (a deleted user is never given a
+    # fabricated placeholder name) — but the dominant reason a caller sees
+    # ``None`` here in practice is simply "this was a list/summary response,
+    # not the detail endpoint".
     ready_by: Optional[int]
     ready_by_username: Optional[str]
 
@@ -3561,6 +3588,16 @@ def _validate_promotion_organization(
             )
 
 
+def _duplicate_context(exc: DraftPromotionDuplicateError) -> dict[str, Any]:
+    """``{"existing_file_id": <id>}`` when the conflicting file id is known,
+    else ``{}`` (never a fabricated placeholder like ``-1``). ``context`` is
+    itself omitted from the response entirely when empty (see
+    ``DraftRoomHTTPError``/``draft_room_exception_handler``)."""
+    if exc.existing_file_id is None:
+        return {}
+    return {"existing_file_id": exc.existing_file_id}
+
+
 def _apply_promotion_organization(
     db: sqlite3.Connection,
     *,
@@ -3588,6 +3625,7 @@ def _apply_promotion_organization(
 @router.post(
     "/drafts/{draft_id}/promote", status_code=202, response_model=PromoteResponse
 )
+@limiter.limit(settings.draft_upload_rate_limit)
 async def promote_draft_source(
     request: Request,
     draft_id: int,
@@ -3672,8 +3710,12 @@ async def promote_draft_source(
                 409,
                 str(exc),
                 "duplicate_document",
-                {"existing_file_id": exc.existing_file_id},
+                _duplicate_context(exc),
             ) from exc
+        except DraftPromotionTooLargeError as exc:
+            raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
+        except DraftPromotionError as exc:
+            raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
     else:
         revision_record = await _run_store(
             lambda: store.get_revision(
@@ -3701,8 +3743,12 @@ async def promote_draft_source(
                 409,
                 str(exc),
                 "duplicate_document",
-                {"existing_file_id": exc.existing_file_id},
+                _duplicate_context(exc),
             ) from exc
+        except DraftPromotionTooLargeError as exc:
+            raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
+        except DraftPromotionError as exc:
+            raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
 
     # The promotion itself has now genuinely happened (`files` and
     # `draft_promotions` rows exist, ingestion is enqueued) — organization
