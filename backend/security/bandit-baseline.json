@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 70,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 57921,
+      "loc": 58098,
       "nosec": 0,
       "skipped_tests": 22
     },
@@ -101,7 +101,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3523,
+      "loc": 3549,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -452,7 +452,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3528,
+      "loc": 3567,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -777,7 +777,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 258,
+      "loc": 370,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3121,7 +3121,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "3913             conn.execute(\"ROLLBACK\")\n3914         except Exception:\n3915             pass\n3916         raise\n",
+      "code": "3919             conn.execute(\"ROLLBACK\")\n3920         except Exception:\n3921             pass\n3922         raise\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/models/database.py",
@@ -3132,10 +3132,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 3914,
+      "line_number": 3920,
       "line_range": [
-        3914,
-        3915
+        3920,
+        3921
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
