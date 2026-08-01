@@ -4,12 +4,17 @@ Private, owner-scoped drafting projects: project/brief CRUD, raw-input upload
 and metadata (never `files`/LanceDB/Wiki/KMS), the durable parse-job lifecycle,
 the compile pipeline (enqueue/stage history/cancel/retry), the evidence, claim
 and finding ledgers with human finding disposition, the human-only Ready
-transition, manual Markdown revisions, Markdown export, and an authenticated
-SSE notification stream.
+transition, manual Markdown revisions, Markdown export, promotion into a
+normal vault document, and an authenticated SSE notification stream.
 
-Promotion (``POST /drafts/{id}/promote``) is deliberately NOT implemented — it
-is issue #437 / SPEC PR 4. ``GET /capabilities`` advertises it as unavailable
-rather than leaving a future client to guess.
+Promotion (``POST /drafts/{id}/promote``, issue #437 / SPEC PR 4) is the one
+operation that requires vault ``write`` rather than ``read``: it copies the
+selected input's bytes or renders the selected revision's ``content_md`` as
+a ``.md`` file, then calls ``app.services.draft_promotion`` — the shared
+internal ingestion seam a normal document upload also uses — to create a
+normal `files` row and enqueue it for ordinary ingestion/indexing. It never
+mutates the source `draft_inputs`/`draft_revisions` row and never pretends
+the promoted document is already indexed.
 
 Compile-surface invariants enforced here (SPEC sections 8.2, 9.1, 12.5):
 
@@ -84,14 +89,18 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.api.deps import (
     _evaluate_policy,
     _resolve_active_user,
+    get_background_processor,
     get_current_active_user,
     get_db,
+    get_db_pool,
     get_evaluate_policy,
     log_db_released,
 )
 from app.config import settings
 from app.limiter import limiter
+from app.models.database import SQLiteConnectionPool
 from app.security import csrf_protect
+from app.services.background_tasks import BackgroundProcessor
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_events import build_event, get_draft_event_bus
 from app.services.draft_evidence_freshness import enforce_evidence_freshness
@@ -103,6 +112,11 @@ from app.services.draft_pipeline import (
     COMPILE_STAGE_ORDER,
     compile_fingerprint,
     compile_fingerprint_payload,
+)
+from app.services.draft_promotion import (
+    DraftPromotionDuplicateError,
+    promote_input,
+    promote_revision,
 )
 from app.services.draft_prompts import PROMPT_BUNDLE_VERSION
 from app.services.draft_provider_policy import (
@@ -133,7 +147,9 @@ from app.services.draft_store import (
     canonical_json,
     sha256_text,
 )
+from app.services.folder_store import FolderNotFoundError, FolderStore
 from app.services.security_audit import safe_record_security_event
+from app.services.tag_store import TagStore
 from app.services.upload_validation import secure_filename
 
 logger = logging.getLogger(__name__)
@@ -145,6 +161,8 @@ T = TypeVar("T")
 _PIECE_TYPES = ("article", "report", "brief", "press_release", "other")
 _TRANSFORMATION_STRENGTHS = ("light", "moderate", "substantial")
 _DRAFTING_PRIORITIES = ("manuscript", "vault", "balanced")
+_PROMOTE_SOURCE_TYPES = ("input", "revision")
+_MAX_PROMOTE_TAG_IDS = 50
 
 # ── compile-surface constants (SPEC sections 8.1, 8.2, 12.5) ────────────────
 
@@ -305,6 +323,18 @@ async def _require_vault_read(evaluate: Callable, user: dict, vault_id: int) -> 
     if not await evaluate(user, "vault", vault_id, "read"):
         raise DraftRoomHTTPError(
             403, "no read access to this vault", "vault_access_revoked"
+        )
+
+
+async def _require_vault_write(evaluate: Callable, user: dict, vault_id: int) -> None:
+    """Promotion's own gate (SPEC section 8.2): unlike every other Draft Room
+    operation, promotion creates a normal vault document and therefore needs
+    vault ``write``, not just ``read``. Losing write access disables promotion
+    without blocking the private read/export/delete rights vault ``read``
+    (or a revoked vault) still allows (issue #437)."""
+    if not await evaluate(user, "vault", vault_id, "write"):
+        raise DraftRoomHTTPError(
+            403, "no write access to this vault", "vault_write_required"
         )
 
 
@@ -505,6 +535,37 @@ class FindingDispositionRequest(BaseModel):
 class ReadyRequest(BaseModel):
     lock_version: int
     acknowledge_source_only: bool = False
+
+
+class PromoteRequest(BaseModel):
+    """SPEC sections 3.4, 6.4, 8.2, issue #437.
+
+    The destination vault is always ``draft.vault_id`` — a body-supplied
+    ``vault_id`` is deliberately not accepted, so promotion can never write
+    into a vault other than the one the draft itself belongs to.
+    ``source_type`` is validated in the route (not here) against
+    :data:`_PROMOTE_SOURCE_TYPES` so an invalid value gets the Draft Room
+    ``{"detail","code":"validation_failed"}`` envelope rather than the
+    framework's default validation-error shape.
+    """
+
+    source_type: str
+    source_id: int
+    title: str = Field(..., min_length=1, max_length=300)
+    folder_id: Optional[int] = None
+    tag_ids: list[int] = Field(default_factory=list, max_length=_MAX_PROMOTE_TAG_IDS)
+
+
+class PromoteResponse(BaseModel):
+    promotion_id: int
+    draft_id: int
+    vault_id: int
+    source_type: str
+    source_id: int
+    source_sha256: str
+    file_id: int
+    filename: str
+    created_at: str
 
 
 class DraftSummary(BaseModel):
@@ -2310,10 +2371,10 @@ async def get_capabilities(
         claims_available=True,
         evidence_available=True,
         ready_available=True,
-        # Promotion is issue #437 / SPEC PR 4 and an explicit non-goal here.
-        # There is no POST /drafts/{id}/promote route in this module, so
-        # advertising it would be a false claim.
-        promote_available=False,
+        # Promotion (issue #437 / SPEC PR 4) is reachable end to end:
+        # POST /drafts/{id}/promote exists in this module and calls
+        # app.services.draft_promotion, the shared internal ingestion seam.
+        promote_available=True,
     )
 
 
@@ -3411,6 +3472,194 @@ async def export_draft_revision(
             "X-Draft-Approval-Status": approval_status,
             "X-Draft-Content-Sha256": revision.content_sha256,
         },
+    )
+
+
+def _apply_promotion_organization(
+    db: sqlite3.Connection,
+    *,
+    vault_id: int,
+    file_id: int,
+    folder_id: Optional[int],
+    tag_ids: list[int],
+) -> None:
+    """Best-effort, vault-scoped folder/tag assignment for a just-promoted file.
+
+    Reuses the exact stores the folders/tags surface already uses (never
+    duplicated logic): invalid tag IDs are silently dropped by
+    :meth:`TagStore.assign_tags` (matches its documented cross-vault
+    behavior); a ``folder_id`` naming a folder outside this vault raises
+    :class:`FolderNotFoundError`, translated by the caller.
+    """
+    if folder_id is not None:
+        FolderStore(db).move_documents(vault_id, [file_id], folder_id)
+    if tag_ids:
+        TagStore(db).assign_tags(vault_id, [file_id], tag_ids)
+
+
+@router.post(
+    "/drafts/{draft_id}/promote", status_code=202, response_model=PromoteResponse
+)
+async def promote_draft_source(
+    request: Request,
+    draft_id: int,
+    body: PromoteRequest,
+    db: sqlite3.Connection = Depends(get_db),
+    db_pool: SQLiteConnectionPool = Depends(get_db_pool),
+    background_processor: BackgroundProcessor = Depends(get_background_processor),
+    user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
+    storage: DraftInputStorage = Depends(get_draft_input_storage),
+    _csrf_token: str = Depends(csrf_protect),
+) -> PromoteResponse:
+    """Copy a draft input or revision into the draft's vault as a normal
+    document and enqueue it through the existing ingestion/indexing workflow
+    (SPEC sections 3.4, 6.4, 8.2; issue #437).
+
+    Promotion never mutates the source ``draft_inputs``/``draft_revisions``
+    row and never marks it indexed — the promoted bytes are a copy, written
+    by :mod:`app.services.draft_promotion`, the exact internal seam a normal
+    document upload uses (``DocumentProcessor._check_duplicate_in_flight`` /
+    ``_insert_or_get_file_record`` / ``background_processor.enqueue``). It
+    requires vault ``write`` — not just ``read`` — because, unlike every
+    other Draft Room operation, it creates a document other vault members
+    can see.
+    """
+    _require_enabled()
+    if body.source_type not in _PROMOTE_SOURCE_TYPES:
+        raise DraftRoomHTTPError(
+            422,
+            f"source_type must be one of {sorted(_PROMOTE_SOURCE_TYPES)}",
+            "validation_failed",
+        )
+
+    owner_id = int(user["id"])
+    store = DraftStore(db)
+    draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
+    await _require_vault_write(evaluate, user, draft.vault_id)
+
+    if draft.status == "archived":
+        raise DraftRoomHTTPError(
+            409, "an archived draft cannot be promoted", "invalid_state"
+        )
+
+    revision_fact_status: Optional[str] = None
+    was_ready_revision: Optional[bool] = None
+
+    if body.source_type == "input":
+        input_record = await _run_store(
+            lambda: store.get_input(
+                draft_id=draft_id, owner_id=owner_id, input_id=body.source_id
+            )
+        )
+        if input_record.parse_status != "ready":
+            raise DraftRoomHTTPError(
+                409, "input is not ready for promotion", "input_not_ready"
+            )
+        try:
+            result = await promote_input(
+                storage=storage,
+                db_pool=db_pool,
+                background_processor=background_processor,
+                draft_id=draft_id,
+                vault_id=draft.vault_id,
+                title=body.title,
+                promoted_by=owner_id,
+                input_record=input_record,
+            )
+        except DraftPromotionDuplicateError as exc:
+            raise DraftRoomHTTPError(
+                409,
+                str(exc),
+                "duplicate_document",
+                {"existing_file_id": exc.existing_file_id},
+            ) from exc
+    else:
+        revision_record = await _run_store(
+            lambda: store.get_revision(
+                draft_id=draft_id,
+                owner_id=owner_id,
+                revision_id=body.source_id,
+                include_content=True,
+            )
+        )
+        revision_fact_status = revision_record.fact_status
+        was_ready_revision = bool(draft.ready_revision_id == revision_record.id)
+        try:
+            result = await promote_revision(
+                storage=storage,
+                db_pool=db_pool,
+                background_processor=background_processor,
+                draft_id=draft_id,
+                vault_id=draft.vault_id,
+                title=body.title,
+                promoted_by=owner_id,
+                revision_record=revision_record,
+            )
+        except DraftPromotionDuplicateError as exc:
+            raise DraftRoomHTTPError(
+                409,
+                str(exc),
+                "duplicate_document",
+                {"existing_file_id": exc.existing_file_id},
+            ) from exc
+
+    if body.folder_id is not None or body.tag_ids:
+        try:
+            await asyncio.to_thread(
+                _apply_promotion_organization,
+                db,
+                vault_id=draft.vault_id,
+                file_id=result.file_id,
+                folder_id=body.folder_id,
+                tag_ids=body.tag_ids,
+            )
+        except FolderNotFoundError as exc:
+            raise DraftRoomHTTPError(404, str(exc), "not_found") from exc
+
+    await _run_store(
+        lambda: store.record_event(
+            draft_id=draft_id,
+            owner_id=owner_id,
+            event_type="promoted",
+            actor_user_id=owner_id,
+            revision_id=result.source_id if body.source_type == "revision" else None,
+            payload={
+                "source_type": result.source_type,
+                "source_id": result.source_id,
+                "vault_id": result.vault_id,
+                "file_id": result.file_id,
+            },
+        )
+    )
+    await safe_record_security_event(
+        db,
+        event_type="draft_promoted",
+        actor=user,
+        request=request,
+        metadata={
+            "draft_id": draft_id,
+            "source_type": result.source_type,
+            "source_id": result.source_id,
+            "source_sha256": result.source_sha256,
+            "vault_id": result.vault_id,
+            "file_id": result.file_id,
+            "filename": result.filename,
+            "revision_fact_status": revision_fact_status,
+            "was_ready_revision": was_ready_revision,
+        },
+    )
+
+    return PromoteResponse(
+        promotion_id=result.promotion_id,
+        draft_id=result.draft_id,
+        vault_id=result.vault_id,
+        source_type=result.source_type,
+        source_id=result.source_id,
+        source_sha256=result.source_sha256,
+        file_id=result.file_id,
+        filename=result.filename,
+        created_at=result.created_at,
     )
 
 

@@ -1241,10 +1241,19 @@ class TestExportMatrix(CompileRouteTestBase):
 
 
 class TestCapabilitiesHonesty(CompileRouteTestBase):
-    def test_promote_available_stays_false_and_no_promote_route(self):
+    def test_promote_available_is_true_and_promote_route_exists(self):
+        """SUPERSEDED ASSERTION (issue #437): this test previously asserted
+        ``promote_available`` stayed False and no promote route existed, which
+        was correct while promotion was an explicit non-goal. Promotion now
+        ships end to end (route + ``app.services.draft_promotion`` + the
+        ``draft_promotions`` provenance table), so advertising it as
+        unavailable would now be the dishonest answer. See
+        ``tests/draft_room/test_draft_promote.py`` for the promotion route's
+        own behavior coverage.
+        """
         resp = self.client.get("/api/draft-room/capabilities", headers=self._owner_headers())
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertFalse(resp.json()["promote_available"])
+        self.assertTrue(resp.json()["promote_available"])
 
         from app.api.routes.draft_room import router as draft_room_router
 
@@ -1253,7 +1262,7 @@ class TestCapabilitiesHonesty(CompileRouteTestBase):
             for route in draft_room_router.routes
             for method in getattr(route, "methods", set())
         }
-        self.assertNotIn(("POST", "/draft-room/drafts/{draft_id}/promote"), routes)
+        self.assertIn(("POST", "/draft-room/drafts/{draft_id}/promote"), routes)
 
 
 # ── audit metadata never carries content (SPEC section 9.3) ────────────────

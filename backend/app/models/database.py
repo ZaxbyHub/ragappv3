@@ -362,6 +362,34 @@ CREATE INDEX IF NOT EXISTS idx_draft_findings_open
     ON draft_findings(draft_id, status, severity);
 """
 
+# Draft Room promotion provenance schema (issue #437, specs/draft-room/SPEC.md
+# sections 3.4, 6.4, 9.3).
+#
+# Records that a draft input or revision was promoted into a normal vault
+# document, without ever mutating the source input/revision row itself.
+# `file_id` is the `files` row created by the shared internal ingestion
+# service (never the draft's private storage path).
+#
+# Defined as its own constant, appended to SCHEMA below and executed verbatim by
+# migrate_add_draft_room_promotions(), so a fresh database and a migrated
+# database cannot drift apart.
+_DRAFT_ROOM_PROMOTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS draft_promotions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL CHECK (source_type IN ('input','revision')),
+    source_id INTEGER NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    vault_id INTEGER NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    filename TEXT NOT NULL,
+    promoted_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_draft_promotions_draft
+    ON draft_promotions(draft_id);
+"""
+
 
 # Database schema definition
 _BASE_SCHEMA = """
@@ -1232,7 +1260,13 @@ CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id ON prompt_ab_ex
 # definition, shared by SCHEMA and by their respective migrate_add_* functions,
 # and therefore cannot drift apart.
 # static DDL only
-SCHEMA = _BASE_SCHEMA + _DRAFT_ROOM_CORE_DDL + _DRAFT_ROOM_PIPELINE_DDL + _DRAFT_ROOM_FACTUALITY_DDL  # nosec B608
+SCHEMA = (
+    _BASE_SCHEMA
+    + _DRAFT_ROOM_CORE_DDL
+    + _DRAFT_ROOM_PIPELINE_DDL
+    + _DRAFT_ROOM_FACTUALITY_DDL
+    + _DRAFT_ROOM_PROMOTIONS_DDL
+)  # nosec B608
 
 
 
@@ -1403,6 +1437,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_draft_room_core(sqlite_path)
     migrate_add_draft_room_pipeline(sqlite_path)
     migrate_add_draft_room_factuality(sqlite_path)
+    migrate_add_draft_room_promotions(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -4095,6 +4130,33 @@ def migrate_add_draft_room_factuality(sqlite_path: str) -> None:
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_DRAFT_ROOM_FACTUALITY_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
+    """
+    Migration: create the Draft Room promotion provenance table (issue #437,
+    SPEC.md sections 3.4, 6.4, 9.3).
+
+    Creates `draft_promotions`, recording that a draft input or revision was
+    promoted into a normal vault document (the new `files` row), together
+    with every CHECK constraint, foreign key, and index in the specification.
+
+    Executes ``_DRAFT_ROOM_PROMOTIONS_DDL`` — the exact same constant that is
+    appended to ``SCHEMA`` — so a database created by ``init_db`` and a legacy
+    database upgraded by this migration converge on an identical schema. Every
+    statement is ``CREATE ... IF NOT EXISTS``, so repeat execution is a no-op
+    and existing data is preserved.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript(_DRAFT_ROOM_PROMOTIONS_DDL)
         conn.commit()
     finally:
         conn.close()
