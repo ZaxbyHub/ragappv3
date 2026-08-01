@@ -168,6 +168,14 @@ _RETRY_STAGE_NORMALIZATION: dict[str, str] = {"assemble": "fact", "intake": "res
 #: allowlist because ``DraftStore``'s transition tables are module-private; a
 #: Ready draft is first invalidated to ``needs_review`` inside the same
 #: transaction, so the write always lands on ``queued`` from a legal prior.
+#: Draft statuses from which applying a finding may legally land on
+#: ``needs_review``. Mirrors the ``_DRAFT_TRANSITIONS`` edges into
+#: ``needs_review``; ``failed``/``cancelled``/``archived`` are excluded because
+#: those may only move to ``queued``/``archived``/``draft``.
+_APPLY_FINDING_ALLOWED_PRIOR_STATUSES: frozenset[str] = frozenset(
+    {"draft", "needs_review", "ready"}
+)
+
 _COMPILE_ALLOWED_PRIOR_STATUSES: frozenset[str] = frozenset(
     {"draft", "needs_review", "failed", "cancelled", "ready"}
 )
@@ -552,6 +560,17 @@ class DraftJob(BaseModel):
     model_call_count: int
     max_model_calls: int
     retry_count: int
+    # Compile-gate and retry-lineage fields. Without these a client cannot see
+    # the resume-gate fingerprint a retry will be judged against, nor which
+    # parent a retry descends from, so an inherited-checkpoint run is
+    # indistinguishable from a full recompile.
+    parent_job_id: Optional[int]
+    attempt_no: int
+    compile_input_sha256: Optional[str]
+    prompt_bundle_version: Optional[str]
+    timeout_seconds: int
+    cancel_requested_at: Optional[str]
+    heartbeat_at: Optional[str]
     error_code: Optional[str]
     error_message: Optional[str]
     created_at: str
@@ -804,6 +823,13 @@ def _to_job(record: DraftJobRecord) -> DraftJob:
         model_call_count=record.model_call_count,
         max_model_calls=record.max_model_calls,
         retry_count=record.retry_count,
+        parent_job_id=record.parent_job_id,
+        attempt_no=record.attempt_no,
+        compile_input_sha256=record.compile_input_sha256,
+        prompt_bundle_version=record.prompt_bundle_version,
+        timeout_seconds=record.timeout_seconds,
+        cancel_requested_at=record.cancel_requested_at,
+        heartbeat_at=record.heartbeat_at,
         error_code=record.error_code,
         error_message=record.error_message,
         created_at=record.created_at,
@@ -1877,7 +1903,22 @@ def _sync_apply_finding(
             "resolved_at = CURRENT_TIMESTAMP, resolution_note = ? WHERE id = ?",
             (owner_id, note, finding_id),
         )
-        # Any prior factual approval described the old bytes.
+        # Any prior factual approval described the old bytes. Guard the prior
+        # status: _DRAFT_TRANSITIONS allows failed/cancelled -> queued|archived
+        # only, so moving one of those straight to needs_review would corrupt
+        # the state machine. Mirrors DraftStore.create_manual_revision, which
+        # routes the same edge through _check_transition.
+        prior_status_row = conn.execute(
+            "SELECT status FROM drafts WHERE id = ? AND created_by = ?",
+            (draft_id, owner_id),
+        ).fetchone()
+        prior_status = prior_status_row[0] if prior_status_row else None
+        if prior_status not in _APPLY_FINDING_ALLOWED_PRIOR_STATUSES:
+            raise _conflict(
+                "a finding cannot be applied from this draft status",
+                "invalid_draft_status",
+                draft_status=str(prior_status),
+            )
         conn.execute(
             "UPDATE drafts SET status = 'needs_review', ready_revision_id = NULL, "
             "ready_by = NULL, ready_at = NULL, lock_version = lock_version + 1, "

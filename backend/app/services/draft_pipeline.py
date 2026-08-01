@@ -2493,8 +2493,11 @@ class _CompileRun:
                 prompt_id=prompt.prompt_id if prompt else None,
                 prompt_version=prompt.version if prompt else None,
                 prompt_sha256=prompt.sha256 if prompt else None,
+                # The MODEL NAME, never the endpoint (SPEC §9.2). This row is
+                # returned to any draft owner with vault read through
+                # GET /drafts/{id}/jobs/{job_id}/stages via DraftStage.model_name.
                 model_name=(
-                    _provider_base_url(prompt.logical_mode) if prompt else None
+                    _provider_model_name(prompt.logical_mode) if prompt else None
                 ),
                 temperature=prompt.temperature if prompt else None,
             )
@@ -3112,6 +3115,17 @@ async def run_compile(
     except ProviderPolicyError as exc:
         await asyncio.to_thread(_persist_failure, pool, job, exc.code, "provider policy")
         raise CompileFailure(exc.code, retryable=False) from None
+    except asyncio.CancelledError:
+        # CancelledError is a BaseException, so it escapes `except Exception`.
+        # Without this the job would stay 'running' on outer cancellation
+        # (worker shutdown, task cancellation) until startup orphan recovery
+        # noticed it, leaving a live resume window on a job nobody is running.
+        # Settle it, then re-raise so cancellation still propagates and the
+        # task really does stop.
+        await asyncio.shield(
+            asyncio.to_thread(_persist_cancelled, pool, job)
+        )
+        raise
     except Exception as exc:
         logger.error(
             "draft compile: job id=%d raised %s", job_id, type(exc).__name__
