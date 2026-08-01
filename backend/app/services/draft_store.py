@@ -396,26 +396,85 @@ def validate_claim_span(content_md: str, span_start: int, span_end: int) -> str:
     return sha256_text(content_md[span_start:span_end])
 
 
+#: Unicode quote marks folded to their ASCII equivalent for comparison only
+#: (SPEC 12.4: "Normalize line endings and Unicode quote marks only for
+#: comparison"). Typographic substitution is a rendering difference, not an
+#: alteration of what was said, so a curly apostrophe in the manuscript must
+#: still match a straight one in the source.
+_QUOTE_FOLD = str.maketrans(
+    {
+        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+        "\u2032": "'", "\u00b4": "'", "\u02bc": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+        "\u2033": '"', "\u00ab": '"', "\u00bb": '"',
+    }
+)
+
+#: Ellipsis forms that may mark an omission inside a direct quote.
+_ELLIPSIS_FORMS = ("\u2026", "...", ". . .")
+
+
 def _normalize_quote(text: str) -> str:
-    """Collapse whitespace — the one permitted exact-quote normalization."""
-    return " ".join(text.split())
+    """Fold Unicode quote marks and line endings, then collapse whitespace.
+
+    These are the only permitted exact-quote normalizations (SPEC 12.4). The
+    quote must otherwise match the source verbatim.
+    """
+    folded = text.replace("\r\n", "\n").replace("\r", "\n").translate(_QUOTE_FOLD)
+    return " ".join(folded.split())
+
+
+def _matches_with_ellipsis(passage: str, quote: str) -> bool:
+    """True when ``quote`` matches ``passage`` around ellipsis-marked omissions.
+
+    SPEC 12.4 allows a direct quotation to omit material as long as the
+    omission is marked with an ellipsis. Each segment between ellipses must
+    still appear verbatim, in order, and without overlapping — so an ellipsis
+    can only ever hide text that is genuinely present between the surrounding
+    segments. It can never be used to stitch together words the source does
+    not contain, nor to reorder them.
+    """
+    normalized = quote
+    for form in _ELLIPSIS_FORMS:
+        normalized = normalized.replace(form, "\u2026")
+    if "\u2026" not in normalized:
+        return False
+    segments = [seg.strip() for seg in normalized.split("\u2026")]
+    segments = [seg for seg in segments if seg]
+    if not segments:
+        # A quote consisting only of ellipses asserts nothing; reject it.
+        return False
+    cursor = 0
+    for segment in segments:
+        found = passage.find(segment, cursor)
+        if found < 0:
+            return False
+        cursor = found + len(segment)
+    return True
 
 
 def validate_exact_quote(passage: str, exact_quote: str) -> None:
     """Validate that ``exact_quote`` is extractable from the evidence ``passage``.
 
-    Only whitespace-collapse normalization is permitted (SPEC 5.7); the quote
-    must otherwise be a verbatim substring, never a free-form model paraphrase.
+    Permitted normalizations are exactly those SPEC 12.4 allows: line endings,
+    Unicode quote marks, and whitespace collapse. Beyond those the quote must
+    be verbatim, so a paraphrase never validates. An omission marked with an
+    ellipsis is accepted only when every remaining segment appears in the
+    passage verbatim and in order.
 
     Raises:
         DraftValidationError: ``exact_quote`` is empty or does not occur in
-            ``passage`` (verbatim or whitespace-collapsed).
+            ``passage`` under those rules.
     """
     if not exact_quote:
         raise DraftValidationError("exact_quote must not be empty")
     if exact_quote in passage:
         return
-    if _normalize_quote(exact_quote) in _normalize_quote(passage):
+    normalized_passage = _normalize_quote(passage)
+    normalized_quote = _normalize_quote(exact_quote)
+    if normalized_quote in normalized_passage:
+        return
+    if _matches_with_ellipsis(normalized_passage, normalized_quote):
         return
     raise DraftValidationError(
         "exact_quote does not match the snapshotted evidence passage"

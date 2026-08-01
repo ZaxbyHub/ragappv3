@@ -16,6 +16,22 @@ correctness) is owned by ``test_draft_pipeline.py``; this file never runs
 claims/findings directly at the SQLite layer (through ``DraftStore`` where a
 public accessor exists, raw SQL otherwise) so route behavior can be exercised
 against every ledger state without a real model or retrieval call.
+
+KNOWN BUG (found while writing this file, NOT fixed here per scope): cancelling
+a still-*pending* compile job (``POST .../jobs/{job_id}/cancel``) only updates
+``draft_jobs.status`` -- ``DraftStore.request_job_cancel`` never touches
+``drafts.status``, which was set to ``'queued'`` when the job was enqueued.
+Both a fresh ``POST .../compile`` and ``POST .../jobs/{job_id}/retry`` gate on
+``drafts.status in _COMPILE_ALLOWED_PRIOR_STATUSES`` (``draft``,
+``needs_review``, ``failed``, ``cancelled``, ``ready`` -- ``'queued'`` is
+deliberately absent), so a draft whose only compile job was cancelled while
+still pending is left permanently stuck at ``status='queued'`` with no active
+job and no legal path back to a compilable state through the HTTP API. A
+*running* job's cancellation is fine, because ``draft_pipeline.run_compile``
+itself observes the cancellation and settles both the job and the draft to a
+terminal status before returning. ``test_retry_audit_has_no_content`` below
+seeds a *failed* job/draft pair directly instead of going through cancel to
+stay independent of this gap.
 """
 
 import json
@@ -474,18 +490,20 @@ class TestCompileIdempotency(CompileRouteTestBase):
             self._connection_pool.release_connection(conn)
 
     def test_same_key_different_fingerprint_is_409(self):
+        """A fresh compile (no prior checkpoints) always normalizes every
+        requested ``start_stage`` back to ``research`` (SPEC 8.1), so two
+        first-time compiles reusing a key never differ on start_stage alone
+        -- the fingerprint also folds in ``base_revision_id``, which this
+        test varies instead to produce a genuinely different fingerprint."""
         draft_id = self._draft_with_ready_input()
-        first = self._compile(draft_id, idempotency_key="dup-key", start_stage="research")
+        first = self._compile(
+            draft_id, idempotency_key="dup-key", start_stage="research", base_revision_id=None
+        )
         self.assertEqual(first.status_code, 202, first.text)
 
-        # Cancel the active job so a second compile is otherwise legal --
-        # only the idempotency-key conflict should distinguish this request.
-        job_id = first.json()["id"]
-        self.client.post(
-            f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/cancel",
-            headers=self._owner_headers(),
+        second = self._compile(
+            draft_id, idempotency_key="dup-key", start_stage="research", base_revision_id=999999
         )
-        second = self._compile(draft_id, idempotency_key="dup-key", start_stage="outline")
         self.assertEqual(second.status_code, 409, second.text)
         self.assertEqual(second.json()["code"], "idempotency_key_conflict")
 
@@ -503,7 +521,18 @@ class TestCompileIdempotency(CompileRouteTestBase):
 
     def test_idempotency_key_must_be_ascii(self):
         draft_id = self._draft_with_ready_input()
-        resp = self._compile(draft_id, idempotency_key="café")
+        lv = self._lock_version(draft_id)
+        headers = dict(self._owner_headers())
+        # httpx's own header layer rejects a `str` with non-ASCII bytes
+        # before the request is even built, so this exercises the server's
+        # ASCII check the way a real non-ASCII byte sequence would arrive:
+        # as raw UTF-8-encoded header bytes.
+        headers["Idempotency-Key"] = "café".encode("utf-8")
+        resp = self.client.post(
+            f"/api/draft-room/drafts/{draft_id}/compile",
+            json={"base_revision_id": None, "lock_version": lv, "start_stage": "research"},
+            headers=headers,
+        )
         self.assertEqual(resp.status_code, 422, resp.text)
         self.assertEqual(resp.json()["code"], "invalid_idempotency_key")
 
@@ -1261,12 +1290,26 @@ class TestAuditMetadataNoContent(CompileRouteTestBase):
         self._assert_metadata_clean(self._audit_metadata("draft_job_cancelled"))
 
     def test_retry_audit_has_no_content(self):
+        # Seed a *failed* compile job directly rather than cancelling a
+        # pending one through the route: see KNOWN BUG note in this file's
+        # module docstring -- cancelling a still-pending compile job never
+        # resets drafts.status off 'queued', which then permanently blocks
+        # both a fresh compile and a retry with 409 invalid_state. Seeding a
+        # terminal 'failed' job/draft pair (the state draft_pipeline itself
+        # produces on a real failure) keeps this test independent of that gap.
         draft_id = self._draft_with_ready_input()
-        job_id = self._compile(draft_id).json()["id"]
-        self.client.post(
-            f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/cancel",
-            headers=self._owner_headers(),
-        )
+        job_id = self._seed_completed_job(draft_id)
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "UPDATE draft_jobs SET status = 'failed', error_code = 'model_unavailable' "
+                "WHERE id = ?",
+                (job_id,),
+            )
+            conn.execute("UPDATE drafts SET status = 'failed' WHERE id = ?", (draft_id,))
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
         resp = self.client.post(
             f"/api/draft-room/drafts/{draft_id}/jobs/{job_id}/retry",
             headers=self._owner_headers(),

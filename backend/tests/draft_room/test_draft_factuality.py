@@ -355,45 +355,60 @@ class TestQuoteFidelity(DraftFactualityTestBase):
         self.assertIn("fact.quote_mismatch", rules)
 
 
-class TestQuoteFidelityGaps(DraftFactualityTestBase):
-    """Documents two SPEC 12.4 requirements NOT implemented by the shipped
-    ``draft_store.validate_exact_quote`` (whitespace-collapse is the only
-    normalization it performs). These are reported as findings for the
-    Draft Room module owners, not fixed here (out of this file's ownership).
+class TestQuoteFidelityNormalization(DraftFactualityTestBase):
+    """SPEC 12.4's permitted normalizations, and their limits.
+
+    "Normalize line endings and Unicode quote marks only for comparison.
+    Otherwise a direct quotation must match the source text exactly, including
+    omissions marked with an ellipsis."
+
+    These previously asserted the opposite: an earlier ``validate_exact_quote``
+    performed whitespace collapse only, so a curly apostrophe failed against a
+    straight one and an ellipsis-marked omission never validated. Both are now
+    implemented, and the old assertions are superseded.
     """
 
-    async def test_kept_gap_a_curly_apostrophe_inside_a_quote_does_not_match_a_straight_one(
-        self,
-    ):
-        # SPEC 12.4: "Normalize line endings and Unicode quote marks only for
-        # comparison." The passage has a straight apostrophe; the candidate's
-        # quoted span uses a curly one. This currently fails to pin, and the
-        # claim is downgraded to unsupported/blocked rather than supported --
-        # documenting the gap so it is not silently masked by this suite.
-        assert "'" in EVIDENCE_PASSAGE or True  # EVIDENCE_PASSAGE has no apostrophe
-        quoted_with_curly = "the internal review window at 30 days"  # baseline, no apostrophe
-        # Construct a passage-adjacent phrase that DOES contain an apostrophe
-        # via the candidate/section text so the mismatch is genuine, using a
-        # dedicated evidence passage substitute is out of scope here; instead
-        # this test simply pins the documented current (spec-noncompliant)
-        # outcome using a straight-vs-curly apostrophe fixture.
+    async def test_unicode_quote_marks_fold_for_comparison(self):
+        from app.services.draft_store import validate_exact_quote
+
+        passage = "The charter's internal review window is thirty days."
+        validate_exact_quote(passage, "charter\u2019s internal review window")
+
+    async def test_curly_double_quotes_and_crlf_fold(self):
+        from app.services.draft_store import validate_exact_quote
+
+        passage = 'It said "no exceptions" applied.\r\nThe board agreed.'
+        validate_exact_quote(passage, "It said \u201cno exceptions\u201d applied.")
+
+    async def test_ellipsis_marked_omission_validates(self):
+        from app.services.draft_store import validate_exact_quote
+
+        passage = (
+            "The charter's internal review window is thirty days for all amendments."
+        )
+        validate_exact_quote(passage, "internal review window is ... thirty days")
+        validate_exact_quote(passage, "internal review window\u2026amendments.")
+
+    async def test_a_paraphrase_still_fails(self):
         from app.services.draft_store import DraftValidationError, validate_exact_quote
 
         passage = "The charter's internal review window is thirty days."
-        curly_quote = "charter’s internal review window"
         with self.assertRaises(DraftValidationError):
-            validate_exact_quote(passage, curly_quote)
+            validate_exact_quote(passage, "the charter allows a month for review")
 
-    async def test_kept_gap_b_an_ellipsis_marked_omission_does_not_validate(self):
-        # SPEC 12.4: "a direct quotation must match the source text exactly,
-        # including omissions marked with an ellipsis." No ellipsis handling
-        # exists in validate_exact_quote; this pins the current behavior.
+    async def test_an_ellipsis_cannot_reorder_or_invent_text(self):
+        """The omission rule must not become a wildcard."""
         from app.services.draft_store import DraftValidationError, validate_exact_quote
 
-        passage = "The charter's internal review window is thirty days for all amendments."
-        quote_with_ellipsis = "internal review window is ... thirty days"
+        passage = (
+            "The charter's internal review window is thirty days for all amendments."
+        )
         with self.assertRaises(DraftValidationError):
-            validate_exact_quote(passage, quote_with_ellipsis)
+            validate_exact_quote(passage, "amendments.\u2026The charter's internal")
+        with self.assertRaises(DraftValidationError):
+            validate_exact_quote(passage, "internal review window\u2026was abolished.")
+        with self.assertRaises(DraftValidationError):
+            validate_exact_quote(passage, "\u2026")
 
 
 # ── 6. High-stakes classification may only widen, never narrow ───────────────

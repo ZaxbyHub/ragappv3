@@ -679,6 +679,37 @@ def _evidence_kwargs(snapshot: object) -> dict[str, Any]:
     return kwargs
 
 
+def _single_source_policy(
+    tier: str, *, sole_authority: bool
+) -> tuple[str, bool, str]:
+    """Severity/waivability for a single-source high-stakes claim (SPEC §12.5.4).
+
+    Tiers may only tighten. ``standard`` keeps the visible ``single_source``
+    warning SPEC §12.4 requires; ``high_stakes`` raises it to a waivable
+    blocker so a human must attribute it explicitly; ``sensitive`` makes it
+    non-waivable unless the sole source is the primary official authority for
+    that exact proposition, which is the one carve-out the spec allows.
+
+    An unknown tier is treated as the strictest, so a future tier cannot
+    silently downgrade a known defect.
+    """
+    if tier == "standard":
+        return "warning", True, "standard tier: visible warning"
+    if tier == "high_stakes":
+        return (
+            "blocker",
+            True,
+            "high_stakes tier: waivable with explicit attribution and reason",
+        )
+    if sole_authority:
+        return (
+            "blocker",
+            True,
+            "sensitive tier: sole source is the primary authority for this claim",
+        )
+    return "blocker", False, "sensitive tier: corroboration required"
+
+
 def _canonical_source_sha256_for(
     conn: "sqlite3.Connection",
     kwargs: dict[str, Any],
@@ -782,6 +813,9 @@ class _CompileRun:
         self._packet: Optional[ResearchPacket] = None
         self._evidence_ids: dict[str, int] = {}
         self._evidence_passages: dict[str, str] = {}
+        #: label -> snapshotted authority, for the SPEC §12.5.4 sensitive-tier
+        #: sole-source carve-out.
+        self._evidence_authorities: dict[str, str] = {}
         self._outline: Optional[OutlineArtifact] = None
         self._draft_artifact: Optional[DraftArtifact] = None
         self._candidate: str = ""
@@ -1683,18 +1717,28 @@ class _CompileRun:
                 and len([s for s in sources if s[1] == "supports"]) == 1
             )
             if single_source:
+                # SPEC §12.5 rule 4: tiers may tighten corroboration but never
+                # make a known defect acceptable. standard -> warning;
+                # high_stakes -> waivable blocker needing explicit attribution;
+                # sensitive -> non-waivable unless the sole source is the
+                # primary official authority for this exact proposition.
+                sole_authority = self._sole_source_is_primary_authority(sources)
+                severity_ss, waivable_ss, detail = _single_source_policy(
+                    self._ctx.tier, sole_authority=sole_authority
+                )
                 self._findings.append(
                     _PendingFinding(
                         stage="fact",
                         rule_id="fact.single_source_high_stakes",
                         rule_version=PROMPT_BUNDLE_VERSION,
                         category="factuality",
-                        severity="warning",
+                        severity=severity_ss,
                         message=(
                             "a high-stakes claim rests on a single source; "
                             "corroboration was not fabricated"
+                            f" ({detail})"
                         ),
-                        waivable=True,
+                        waivable=waivable_ss,
                         span_start=span_start,
                         span_end=span_end,
                     )
@@ -2029,6 +2073,25 @@ class _CompileRun:
                 temperature=prompt.temperature if prompt else None,
             )
 
+    def _sole_source_is_primary_authority(
+        self, sources: Sequence[tuple[Any, ...]]
+    ) -> bool:
+        """True when the single supporting source is a primary/official one.
+
+        SPEC §12.5 rule 4's ``sensitive`` carve-out: a lone source may stand
+        only when it is "the primary official authority for that exact
+        proposition". The evidence snapshot records that judgement in its
+        ``authority`` column, so read it from the snapshot rather than
+        inferring it, and default to False (strict) whenever it cannot be
+        established.
+        """
+        supporting = [s for s in sources if len(s) > 1 and s[1] == "supports"]
+        if len(supporting) != 1:
+            return False
+        label = supporting[0][0]
+        authority = self._evidence_authorities.get(label)
+        return authority in ("primary", "official")
+
     def _db_snapshot_evidence(self, snapshots: tuple[object, ...]) -> None:
         """Persist the research evidence snapshot for this job.
 
@@ -2057,6 +2120,9 @@ class _CompileRun:
                 evidence_id = store.insert_evidence(job_id=self._ctx.job_id, **kwargs)
                 self._evidence_ids[kwargs["label"]] = evidence_id
                 self._evidence_passages[kwargs["label"]] = kwargs["passage"]
+                self._evidence_authorities[kwargs["label"]] = kwargs.get(
+                    "authority"
+                ) or "unknown"
 
     def _db_load_evidence_index(self) -> None:
         with self._pool.connection() as conn:
@@ -2064,6 +2130,7 @@ class _CompileRun:
         for row in rows:
             self._evidence_ids[row.label] = row.id
             self._evidence_passages[row.label] = row.passage
+            self._evidence_authorities[row.label] = row.authority or "unknown"
 
     def _db_commit_revision(
         self,
