@@ -852,6 +852,9 @@ class _CompileRun:
         #: label -> snapshotted authority, for the SPEC §12.5.4 sensitive-tier
         #: sole-source carve-out.
         self._evidence_authorities: dict[str, str] = {}
+        #: stage -> the input hash most recently computed for it, so a failed
+        #: stage row can record the input it was actually working from.
+        self._last_stage_input_sha: dict[str, str] = {}
         self._outline: Optional[OutlineArtifact] = None
         self._draft_artifact: Optional[DraftArtifact] = None
         self._candidate: str = ""
@@ -886,7 +889,17 @@ class _CompileRun:
             "fact": self._stage_fact_loop,
             "assemble": self._stage_assemble,
         }
-        await handlers[stage]()
+        try:
+            await handlers[stage]()
+        except CompileFailure as exc:
+            # Persist a FAILED stage row. Stage rows were previously written
+            # only on success (start and success back to back after the work
+            # finished), so a failed stage left no row at all: it never showed
+            # up in GET /jobs/{id}/stages, record_stage_failure was
+            # unreachable, and the worker_restart settling pass could never
+            # find anything to settle.
+            await asyncio.to_thread(self._db_record_stage_failure, stage, exc)
+            raise
 
     # -- budgets, cancellation, checkpoints --------------------------------
 
@@ -925,6 +938,9 @@ class _CompileRun:
         chain automatically. The artifact is additionally re-hashed here, so a
         row whose stored hash drifted from its stored JSON is never trusted.
         """
+        # Remember the hash so a failure can be attributed to the exact stage
+        # input it was computed from (see _run_stage's failure recorder).
+        self._last_stage_input_sha[stage] = input_sha256
         if not self._ctx.resume_allowed:
             return None
         record = self._checkpoints.get(stage)
@@ -1566,6 +1582,16 @@ class _CompileRun:
         are what the Ready endpoint refuses to approve.
         """
         while True:
+            # SPEC §11.7 step 5: citation repair and reasoning-trace
+            # sanitation run BEFORE Fact, deterministically. Without this a
+            # single hallucinated label -- the commonest failure of the very
+            # prompt that hands the model an evidence registry -- reached
+            # Assemble and discarded the entire compile after every model call.
+            # Repairing here means Fact always verifies the bytes that will be
+            # assembled, so Assemble's own check is a safety assertion rather
+            # than a routine failure path.
+            self._sanitize_candidate_before_fact()
+            self._relint_current_candidate()
             await self._stage_fact()
             if not self._fact_requires_correction():
                 return
@@ -1588,6 +1614,92 @@ class _CompileRun:
             # result above; the loop therefore returns to Fact, never onward.
             self._fact_report = None
             self._fact_candidate_sha256 = None
+
+    def _sanitize_candidate_before_fact(self) -> None:
+        """Strip unknown citation labels and reasoning traces (SPEC §11.7.5).
+
+        Deterministic and bounded: it removes only labels absent from the
+        immutable evidence registry and known reasoning-trace markers, never
+        prose. Any change invalidates the previous Fact result, which is
+        already guaranteed because this runs immediately before Fact.
+
+        Removing an unsupported label is the honest repair: the claim it
+        decorated keeps its text and is then judged on its merits by Fact,
+        which will mark it unsupported if no evidence backs it. Keeping a
+        label that points at nothing would instead present fabricated
+        provenance.
+        """
+        candidate = self._candidate
+        allowed = set(self._evidence_ids)
+        repaired = _CITATION_LABEL_RE.sub(
+            lambda m: (
+                m.group(0) if f"{m.group(1)}{m.group(2)}" in allowed else ""
+            ),
+            candidate,
+        )
+        for marker in _REASONING_TRACE_MARKERS:
+            repaired = repaired.replace(marker, "")
+        if repaired == candidate:
+            return
+        removed = sorted(
+            {
+                f"{m.group(1)}{m.group(2)}"
+                for m in _CITATION_LABEL_RE.finditer(candidate)
+            }
+            - allowed
+        )
+        # Tidy only whitespace the removals created; never reflow prose.
+        repaired = re.sub(r"[ \t]{2,}", " ", repaired)
+        repaired = re.sub(r" +([.,;:!?])", r"\1", repaired)
+        self._candidate = repaired
+        self._fact_report = None
+        self._fact_candidate_sha256 = None
+        if removed:
+            self._findings.append(
+                _PendingFinding(
+                    stage="standards",
+                    rule_id="citation.unknown_label_removed",
+                    rule_version=PROMPT_BUNDLE_VERSION,
+                    category="citation",
+                    severity="warning",
+                    message=(
+                        "removed citation label(s) absent from the evidence "
+                        f"registry: {', '.join(removed)}"
+                    ),
+                    waivable=True,
+                    span_start=0,
+                    span_end=0,
+                )
+            )
+        logger.info(
+            "draft compile: pre-fact sanitation changed the candidate "
+            "(job_id=%s removed_labels=%d)",
+            self._ctx.job_id,
+            len(removed),
+        )
+
+    def _relint_current_candidate(self) -> None:
+        """Re-run deterministic lint against the CURRENT candidate bytes.
+
+        Two SPEC requirements at once. §11.7 step 1 reruns lint after Copy or
+        Standards edit the text, because either desk can reintroduce exact
+        boilerplate the lint stage had already removed — which would otherwise
+        ship silently, since the stored findings still describe the pre-edit
+        text and Ready would approve it.
+
+        It also re-anchors the spans. Lint findings carry byte offsets, and
+        DraftStore.insert_finding hashes whatever bytes sit at that span, so a
+        stale offset satisfies the §5.7 "stored hashes match" invariant
+        vacuously and points a waiver at unrelated text — a waiver that could
+        then never be invalidated by an edit to the real boilerplate (§13.3).
+        Running this AFTER every mutation, immediately before Fact, means the
+        persisted offsets always describe the bytes that get assembled.
+        """
+        self._collect_lint_findings(
+            run_deterministic_lint(
+                self._candidate, rule_version=BOILERPLATE_RULE_VERSION
+            )
+        )
 
     async def _stage_fact(self) -> None:
         """Run Fact against an IMMUTABLE candidate (SPEC §11.8).
@@ -1935,8 +2047,11 @@ class _CompileRun:
                 message="assemble input does not match the successful fact candidate",
             )
 
-        # Step 1: validate WITHOUT modifying content. Anything that would
-        # require a mutation invalidates Fact instead of being silently fixed.
+        # Step 1: validate WITHOUT modifying content. Pre-Fact sanitation
+        # (SPEC §11.7.5) already removed unknown labels and reasoning traces,
+        # so reaching this branch means something reintroduced them after Fact
+        # verified the bytes — a real invariant violation, not the routine
+        # hallucinated-label case it used to catch.
         allowed_labels = set(self._evidence_ids)
         cited = {
             f"{m.group(1)}{m.group(2)}" for m in _CITATION_LABEL_RE.finditer(candidate)
@@ -2160,6 +2275,39 @@ class _CompileRun:
             )
             conn.commit()
 
+    def _db_record_stage_failure(self, stage: str, exc: "CompileFailure") -> None:
+        """Record a failed attempt for ``stage``. Never masks the original error.
+
+        A failed row is never a checkpoint -- ``_reusable`` requires
+        ``status == 'completed'`` -- so this is purely audit and
+        inspectability. Any error while recording is swallowed: losing the
+        audit row must not replace the real compile failure the caller is
+        about to raise.
+        """
+        try:
+            attempt = self._next_attempt(stage)
+            with self._pool.connection() as conn:
+                store = DraftStore(conn)
+                row_id = store.record_stage_start(
+                    job_id=self._ctx.job_id,
+                    stage=stage,
+                    attempt=attempt,
+                    input_sha256=self._last_stage_input_sha.get(stage, ""),
+                )
+                store.record_stage_failure(
+                    stage_row_id=row_id,
+                    error_code=exc.code,
+                    error_message=(str(exc.args[0]) if exc.args else exc.code)[:500],
+                )
+        except Exception:
+            logger.warning(
+                "draft compile: could not record failed stage row "
+                "(job_id=%s stage=%s)",
+                self._ctx.job_id,
+                stage,
+                exc_info=True,
+            )
+
     def _db_record_stage(
         self,
         stage: str,
@@ -2231,6 +2379,19 @@ class _CompileRun:
         """
         with self._pool.connection() as conn:
             store = DraftStore(conn)
+            # Idempotent. Each insert_evidence commits its own transaction, and
+            # the research stage row is written only afterwards, so a crash
+            # mid-loop left committed evidence with no checkpoint. Orphan
+            # recovery then returned the SAME job to pending, Research re-ran,
+            # and the first row hit UNIQUE(job_id, label) -- a DraftConflictError
+            # mapped to a non-retryable internal_error, permanently wedging the
+            # job. Clearing this job's own evidence first makes the re-run a
+            # clean replay. Only rows for this job are touched, so historical
+            # evidence from other jobs is untouched.
+            store.delete_evidence_for_job(job_id=self._ctx.job_id)
+            self._evidence_ids.clear()
+            self._evidence_passages.clear()
+            self._evidence_authorities.clear()
             for snapshot in snapshots:
                 kwargs = _evidence_kwargs(snapshot)
                 canonical = _canonical_source_sha256_for(

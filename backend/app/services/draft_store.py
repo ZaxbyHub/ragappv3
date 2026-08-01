@@ -2649,6 +2649,28 @@ class DraftStore:
             raise
         return evidence_id
 
+    def delete_evidence_for_job(self, *, job_id: int) -> int:
+        """Remove this job's evidence rows so a re-run can replay cleanly.
+
+        Scoped strictly to ``job_id``. Evidence is immutable for a COMPLETED
+        historical job; this exists only for the case where a compile crashed
+        partway through snapshotting and the same job is being resumed, where
+        the alternative is a permanent UNIQUE(job_id, label) conflict.
+
+        Returns:
+            The number of rows removed.
+        """
+        self._begin_immediate()
+        try:
+            cur = self._db.execute(
+                "DELETE FROM draft_evidence WHERE job_id = ?", (job_id,)
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        return int(cur.rowcount or 0)
+
     def list_evidence(
         self,
         *,

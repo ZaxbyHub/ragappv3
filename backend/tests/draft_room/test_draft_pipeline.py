@@ -569,6 +569,20 @@ class PipelineTestBase(unittest.IsolatedAsyncioTestCase):
     def _stages(self):
         return DraftStore(self.conn).list_stages(job_id=self.job_id, limit=500)
 
+    def _completed_stage_names(self, *a, **k):
+        """Stage names for COMPLETED rows only.
+
+        Failed attempts now persist a row too, so a test asserting a stage did
+        not finish must look at completed rows rather than at row existence.
+        """
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT stage FROM draft_job_stages WHERE job_id = ? "
+                "AND status = 'completed' ORDER BY id",
+                (self.job_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
+
     def _stage_names(self):
         return [row.stage for row in self._stages()]
 
@@ -906,7 +920,10 @@ class TestBudgets(PipelineTestBase):
         self.assertFalse(failure.retryable)
         self.assertEqual(self._job_row()["error_code"], CODE_SECTION_BUDGET_EXCEEDED)
         # The over-budget outline was refused, not persisted and drafted from.
-        self.assertNotIn("outline", self._stage_names())
+        # A failed attempt now leaves an audit row, so assert the stage never
+        # COMPLETED rather than that no row exists.
+        self.assertNotIn("outline", self._completed_stage_names())
+        self.assertIn("outline", self._stage_names())
         self.assertNotIn("draft", self._stage_names())
 
 
@@ -957,7 +974,10 @@ class TestProviderFailureHandling(PipelineTestBase):
         self.assertIn("REPAIR REQUEST", repair_prompt)
         self.assertEqual(failure.code, CODE_INVALID_STAGE_OUTPUT)
         self.assertFalse(failure.retryable)
-        self.assertNotIn("outline", self._stage_names())
+        # A failed attempt now leaves an audit row, so assert the stage never
+        # COMPLETED rather than that no row exists.
+        self.assertNotIn("outline", self._completed_stage_names())
+        self.assertIn("outline", self._stage_names())
 
 
 # ── 13. Cancellation discards the in-flight result ───────────────────────────
@@ -986,7 +1006,9 @@ class TestCancellation(PipelineTestBase):
 
         self.assertEqual(failure.code, CODE_JOB_CANCELLED)
         self.assertEqual(model.count("outline"), 1)
-        # The in-flight outline is discarded: no stage row exists for it.
+        # Cancellation discards the in-flight result entirely: it raises
+        # _CompileCancelled rather than CompileFailure, so unlike a failed
+        # stage it leaves NO row at all, completed or otherwise.
         self.assertNotIn("outline", self._stage_names())
         self.assertEqual(self._stage_names(), ["intake", "research"])
         self.assertEqual(self._job_row()["status"], "cancelled")
