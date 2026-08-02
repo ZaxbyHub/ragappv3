@@ -495,6 +495,111 @@ class TestDatabaseSchema(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_migrate_draft_room_promotions_fk_rebuild_converges_with_init_db(self):
+        """`init_db()` and every `migrate_add_*` function share the same DDL
+        constants by construction for the ordinary path, so fresh-versus-
+        migrated convergence is guaranteed there. The FK-rebuild branch is
+        different: it does not execute `_DRAFT_ROOM_PROMOTIONS_TABLE_DDL`
+        directly against a fresh database -- it renames the old table away,
+        recreates, and copies rows across. Prove that path actually produces
+        a structurally identical table rather than assuming it from the
+        constants alone (issue #437 review finding)."""
+        fresh_db = self.temp_db_path + ".fresh.db"
+        self.addCleanup(lambda: os.path.exists(fresh_db) and os.remove(fresh_db))
+        init_db(fresh_db)
+
+        # migrated_db: build the OLD FK'd shape (with its index), then let
+        # migrate_add_draft_room_promotions() detect it and rebuild.
+        init_db(self.temp_db_path)
+        run_migrations(self.temp_db_path)
+        conn = sqlite3.connect(self.temp_db_path)
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_draft_promotions_draft")
+            conn.execute("DROP TABLE draft_promotions")
+            conn.executescript("""
+                CREATE TABLE draft_promotions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+                    source_type TEXT NOT NULL CHECK (source_type IN ('input','revision')),
+                    source_id INTEGER NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    vault_id INTEGER NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    promoted_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX idx_draft_promotions_draft
+                    ON draft_promotions(draft_id);
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        migrate_add_draft_room_promotions(self.temp_db_path)
+
+        def _table_info(db_path):
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                # (cid excluded -- column *order* is not a claimed guarantee,
+                # only name/type/notnull/default/pk are).
+                return [
+                    (row["name"], row["type"], row["notnull"], row["dflt_value"], row["pk"])
+                    for row in conn.execute("PRAGMA table_info(draft_promotions)").fetchall()
+                ]
+            finally:
+                conn.close()
+
+        def _index_info(db_path):
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                indexes = conn.execute("PRAGMA index_list(draft_promotions)").fetchall()
+                result = []
+                for idx in indexes:
+                    columns = conn.execute(
+                        f"PRAGMA index_info({idx['name']})"
+                    ).fetchall()
+                    result.append(
+                        (
+                            idx["name"],
+                            bool(idx["unique"]),
+                            tuple(c["name"] for c in columns),
+                        )
+                    )
+                return sorted(result)
+            finally:
+                conn.close()
+
+        fresh_columns = _table_info(fresh_db)
+        migrated_columns = _table_info(self.temp_db_path)
+        self.assertEqual(
+            set(fresh_columns),
+            set(migrated_columns),
+            "the FK-rebuild path must produce column definitions identical "
+            "to init_db()'s fresh-install schema",
+        )
+
+        fresh_indexes = _index_info(fresh_db)
+        migrated_indexes = _index_info(self.temp_db_path)
+        self.assertEqual(
+            fresh_indexes,
+            migrated_indexes,
+            "the FK-rebuild path must produce indexes identical to "
+            "init_db()'s fresh-install schema",
+        )
+
+        # And the rebuilt table must genuinely have no FK on files(id) --
+        # convergence with a schema that still had one would be a bug this
+        # comparison must not paper over.
+        conn = sqlite3.connect(self.temp_db_path)
+        try:
+            fk_rows = conn.execute("PRAGMA foreign_key_list(draft_promotions)").fetchall()
+        finally:
+            conn.close()
+        self.assertFalse(any(row[2] == "files" for row in fk_rows))
+
 
 if __name__ == '__main__':
     unittest.main()

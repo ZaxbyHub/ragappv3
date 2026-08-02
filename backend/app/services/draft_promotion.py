@@ -26,19 +26,20 @@ registering the row), it silently overwrites that row's ``file_hash`` /
 ``status='pending'``. A promotion that later failed and tried to compensate
 could not undo that overwrite — the victim document's identity is gone
 either way, by UPDATE if adoption happens, or corrupted regardless of
-whether the caller then also deletes the row. Instead, :func:`_insert_new_file_row`
-does its own exclusive insert inside a ``BEGIN IMMEDIATE`` transaction that
-re-checks the path first: if anything already occupies that exact path — no
-matter what created it, or when — this raises
-:class:`DraftPromotionPathConflictError` rather than touching that row.
-``created`` is therefore true by construction for every ``files`` row this
-module ever creates, and compensation can always safely delete exactly the
-rows (and only the rows) this attempt itself made.
+whether the caller then also deletes the row. Instead, :func:`_register_file`
+does its own exclusive insert inside one ``BEGIN IMMEDIATE`` transaction that
+re-checks both the content hash and the destination path first: if identical
+content already exists in the vault, or if anything already occupies that
+exact path — no matter what created it, or when — this raises the
+corresponding domain error rather than touching that row. ``created`` is
+therefore true by construction for every ``files`` row this module ever
+creates, and compensation can always safely delete exactly the rows (and
+only the rows) this attempt itself made.
 
 Atomicity: a promotion either leaves behind bytes + a ``files`` row + a
 ``draft_promotions`` row + an enqueued ingestion job, or it leaves nothing at
-all. ``_insert_new_file_row`` and ``_insert_promotion_row`` each commit their
-own transaction (there is no cross-table atomicity between the two "files"
+all. ``_register_file`` and ``_insert_promotion_row`` each commit their own
+transaction (there is no cross-table atomicity between the two "files"
 and "draft_promotions" inserts — see ``_insert_promotion_row``'s docstring
 for why), so every step after the ``files`` row is created runs inside one
 compensation block: if the provenance insert, the phase update, or the
@@ -261,21 +262,41 @@ def _enforce_size_limit(dest_path: Path) -> None:
         )
 
 
-def _insert_new_file_row(
-    db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: str, vault_id: int
-) -> int:
-    """Promotion's own exclusive ``files`` row insert.
+def _register_file(db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: str, vault_id: int) -> int:
+    """Promotion's own exclusive ``files`` row registration: the
+    duplicate-content check, the path-conflict check, and the insert all run
+    inside one ``BEGIN IMMEDIATE`` transaction on one connection.
+
+    The duplicate-content check and the insert used to run on *separate*
+    connections (the check released its connection before the path-checking
+    insert transaction acquired its own) — two concurrent promotions of
+    identical bytes to two different destination filenames could each pass
+    the duplicate lookup before either had committed a row, and both would
+    then insert, landing two ``files`` rows for the same content instead of
+    the documented ``409 duplicate_document``. ``BEGIN IMMEDIATE`` takes
+    SQLite's write lock before either check runs, so a second, concurrent
+    caller genuinely blocks (``PRAGMA busy_timeout``) until the first
+    transaction commits or rolls back, and then sees that transaction's
+    effects — the race window is closed by construction, not by luck.
+
+    Precedence when a row satisfies *both* checks (identical content already
+    exists in the vault, AND something already occupies the exact
+    destination path): the duplicate-content check runs first, so
+    :class:`DraftPromotionDuplicateError` (``409 duplicate_document``) wins
+    over :class:`DraftPromotionPathConflictError` (``409
+    promotion_path_conflict``). "Identical content already exists" is judged
+    the more actionable signal to the caller than "something unrelated
+    occupies this path" when both happen to be true at once.
 
     Deliberately does NOT call ``DocumentProcessor._insert_or_get_file_record``
     (the path-keyed upsert ``_do_upload`` uses) — see the module docstring
-    for why an adopted row can never be safely compensated. The ``BEGIN
-    IMMEDIATE`` takes SQLite's write lock before re-checking the path, so the
-    "does a row already exist here" check and this INSERT are atomic against
-    any other writer racing for the same path — a concurrent promotion, a
-    concurrent normal upload, or ``FileWatcher``'s background scan. If
-    anything is already there, this raises
+    for why an adopted row can never be safely compensated. If anything
+    already exists at the reserved path, this raises
     :class:`DraftPromotionPathConflictError` instead of adopting or
     overwriting it; the caller must clean up the reserved bytes and fail.
+    The returned id always names a row this call itself just created, so the
+    caller's compensation logic can always safely delete it on a later
+    failure without risk of touching an unrelated document.
 
     The column set and defaults mirror ``_insert_or_get_file_record``'s own
     insert branch (``document_processor.py``) exactly — ``status='pending'``,
@@ -283,6 +304,7 @@ def _insert_new_file_row(
     with the same UTC-ISO convention — so ingestion behaves identically
     either way. That method itself is not imported or modified here.
     """
+    processor = DocumentProcessor(pool=db_pool)
     file_name = dest_path.name
     file_size = dest_path.stat().st_size
     file_type = dest_path.suffix.lower() if dest_path.suffix else None
@@ -293,6 +315,13 @@ def _insert_new_file_row(
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            duplicate = processor._check_duplicate_in_flight(file_hash, conn, vault_id)
+            if duplicate is not None:
+                raise DraftPromotionDuplicateError(
+                    f"file with hash {file_hash} already exists in this vault "
+                    f"(status={duplicate['status']}, file_id={duplicate['id']})",
+                    existing_file_id=int(duplicate["id"]),
+                )
             existing = conn.execute(
                 "SELECT id FROM files WHERE file_path = ?", (path_str,)
             ).fetchone()
@@ -327,28 +356,6 @@ def _insert_new_file_row(
             raise
     finally:
         db_pool.release_connection(conn)
-
-
-def _register_file(db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: str, vault_id: int) -> int:
-    """Duplicate-content check, then promotion's own exclusive ``files`` row
-    insert (:func:`_insert_new_file_row` — never the shared path-keyed
-    upsert). The returned id always names a row this call itself just
-    created, so the caller's compensation logic can always safely delete it
-    on a later failure without risk of touching an unrelated document.
-    """
-    processor = DocumentProcessor(pool=db_pool)
-    conn = db_pool.get_connection()
-    try:
-        duplicate = processor._check_duplicate_in_flight(file_hash, conn, vault_id)
-        if duplicate is not None:
-            raise DraftPromotionDuplicateError(
-                f"file with hash {file_hash} already exists in this vault "
-                f"(status={duplicate['status']}, file_id={duplicate['id']})",
-                existing_file_id=int(duplicate["id"]),
-            )
-    finally:
-        db_pool.release_connection(conn)
-    return _insert_new_file_row(db_pool, dest_path, file_hash, vault_id)
 
 
 def _insert_promotion_row(
@@ -413,7 +420,7 @@ def _insert_promotion_row(
 
 def _delete_file_row(db_pool: SQLiteConnectionPool, file_id: int) -> bool:
     """Compensation: remove a ``files`` row this attempt itself inserted
-    (see :func:`_insert_new_file_row` — never an adopted or unrelated one)
+    (see :func:`_register_file` — never an adopted or unrelated one)
     when a later step in the same promotion attempt failed.
 
     Without this, a promotion that fails after the ``files`` row commits

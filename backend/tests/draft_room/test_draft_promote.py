@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -43,7 +44,7 @@ from app.main import app
 from app.security import CSRFManager, csrf_protect
 from app.services.auth_service import compute_client_fingerprint, create_access_token
 from app.services.draft_input_storage import DraftInputStorage
-from app.services.draft_promotion import promote_input
+from app.services.draft_promotion import DraftPromotionDuplicateError, promote_input
 from app.services.draft_store import DraftStore
 
 
@@ -648,13 +649,12 @@ class TestPromoteValidation(DraftPromoteTestBase):
 
 class TestPromoteDuplicate(DraftPromoteTestBase):
     def test_duplicate_content_in_vault_returns_409(self):
-        """Covers only the SEQUENTIAL case: the second promotion is issued
-        strictly after the first has already committed its `files` row. Two
-        truly concurrent promotions racing each other can both land — that
-        race is inherited from `_do_upload`'s own documented window
-        (`_check_duplicate_in_flight` then `_insert_or_get_file_record` is
-        not one atomic check-and-insert) and is out of scope here; this test
-        does not exercise or assert anything about that race."""
+        """Covers the SEQUENTIAL case: the second promotion is issued
+        strictly after the first has already committed its `files` row.
+        See `TestPromoteConcurrentDuplicateContent` below for the genuinely
+        concurrent case (`_register_file`'s single `BEGIN IMMEDIATE`
+        transaction over both the duplicate-content check and the path
+        check closes the race this test does not exercise)."""
         content = b"Identical bytes across two different drafts."
 
         draft_1 = self._create_draft(title="First").json()["id"]
@@ -679,6 +679,118 @@ class TestPromoteDuplicate(DraftPromoteTestBase):
         # No orphan bytes were left behind by the rejected second promotion.
         files = self._files_rows()
         self.assertEqual(len(files), 1)
+
+
+class TestPromoteConcurrentDuplicateContent(DraftPromoteTestBase):
+    """P2 review finding: the duplicate-content check and the row insert
+    used to run on separate connections/transactions, so two genuinely
+    concurrent promotions of identical bytes (to two different destination
+    filenames, so no path conflict masks the race) could both pass the
+    duplicate lookup and both commit a `files` row.
+
+    This drives two REAL OS threads, each with its own event loop
+    (`asyncio.run`), synchronized with a `threading.Barrier` immediately
+    before each calls `promote_input` against the SAME test database and
+    vault. The harness cannot express a literal "pause after the duplicate
+    lookup, before the insert" barrier any more, because the fix's whole
+    point is that no such window exists to pause in any more: the lookup and
+    the insert are one `BEGIN IMMEDIATE` transaction on one connection, so
+    only one of the two threads can ever be inside it at a time -- the
+    second thread's `BEGIN IMMEDIATE` genuinely blocks (`PRAGMA
+    busy_timeout`/`timeout=` on the pool's connections) until the first
+    commits or rolls back, then it runs its own check *after* that
+    transaction's effects are visible. So instead of pausing mid-transaction,
+    this test relies on real SQLite locking to serialize two truly
+    concurrent callers and asserts the outcome: exactly one success, one
+    `409`-shaped rejection, one `files` row, one `draft_promotions` row, and
+    one enqueue call -- the property that was NOT guaranteed before the fix
+    and is deterministic after it.
+    """
+
+    def test_two_concurrent_promotions_of_identical_bytes_collapse_to_one(self):
+        content = b"Identical bytes raced by two real threads."
+
+        draft_1 = self._create_draft(title="Racer One").json()["id"]
+        upload_1 = self._upload_input(draft_1, content=content, filename="one.txt")
+        input_id_1 = upload_1.json()["input"]["id"]
+        self._mark_input_ready(input_id_1)
+
+        draft_2 = self._create_draft(title="Racer Two").json()["id"]
+        upload_2 = self._upload_input(draft_2, content=content, filename="two.txt")
+        input_id_2 = upload_2.json()["input"]["id"]
+        self._mark_input_ready(input_id_2)
+
+        storage = DraftInputStorage(Path(settings.data_dir) / "draft-room")
+        db_pool = self._connection_pool
+
+        def _resolve(draft_id, input_id):
+            conn = db_pool.get_connection()
+            try:
+                store = DraftStore(conn)
+                draft = store.get_draft(draft_id, self.OWNER_ID)
+                input_record = store.get_input(
+                    draft_id=draft_id, owner_id=self.OWNER_ID, input_id=input_id
+                )
+                return draft, input_record
+            finally:
+                db_pool.release_connection(conn)
+
+        draft_a, input_record_a = _resolve(draft_1, input_id_1)
+        draft_b, input_record_b = _resolve(draft_2, input_id_2)
+
+        shared_processor = MagicMock()
+        shared_processor.enqueue = AsyncMock(return_value=None)
+
+        barrier = threading.Barrier(2)
+        results: dict = {}
+
+        def _worker(key, draft, input_record, title):
+            barrier.wait(timeout=10)
+
+            async def _run():
+                return await promote_input(
+                    storage=storage,
+                    db_pool=db_pool,
+                    background_processor=shared_processor,
+                    draft_id=draft.id,
+                    vault_id=draft.vault_id,
+                    title=title,
+                    promoted_by=self.OWNER_ID,
+                    input_record=input_record,
+                )
+
+            try:
+                results[key] = ("ok", asyncio.run(_run()))
+            except BaseException as exc:  # noqa: BLE001 -- capturing exactly what each racer got
+                results[key] = ("error", exc)
+
+        t1 = threading.Thread(
+            target=_worker, args=("a", draft_a, input_record_a, "Racer One Title")
+        )
+        t2 = threading.Thread(
+            target=_worker, args=("b", draft_b, input_record_b, "Racer Two Title")
+        )
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        self.assertEqual(set(results.keys()), {"a", "b"})
+        outcomes = [results["a"], results["b"]]
+        successes = [r for kind, r in outcomes if kind == "ok"]
+        errors = [r for kind, r in outcomes if kind == "error"]
+
+        self.assertEqual(len(successes), 1, f"expected exactly one success, got {outcomes}")
+        self.assertEqual(len(errors), 1, f"expected exactly one rejection, got {outcomes}")
+
+        winner = successes[0]
+        loser = errors[0]
+        self.assertIsInstance(loser, DraftPromotionDuplicateError)
+        self.assertEqual(loser.existing_file_id, winner.file_id)
+
+        self.assertEqual(len(self._files_rows()), 1)
+        self.assertEqual(len(self._promotion_rows(draft_1) + self._promotion_rows(draft_2)), 1)
+        shared_processor.enqueue.assert_awaited_once()
 
 
 class TestPromoteAuditAndCapabilities(DraftPromoteTestBase):
@@ -1148,7 +1260,7 @@ class TestPromoteNeverAdoptsAnExistingFileRow(DraftPromoteTestBase):
     that UPDATE before compensation ever runs, and it wedges every retry
     into `409 duplicate_document` against the now-hijacked hash forever.
     Promotion now does its own exclusive insert
-    (`_insert_new_file_row`) and refuses outright — `409
+    (`_register_file`) and refuses outright — `409
     promotion_path_conflict` — if anything already exists at the reserved
     path, rather than adopting or overwriting it."""
 
