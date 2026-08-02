@@ -11,6 +11,13 @@ vi.mock("@/stores/useAuthStore", () => ({
   ),
 }));
 
+// This suite is unrelated to Draft Room gating (see MobileBottomNav.draft-room.test.tsx
+// for that) — stub the capability hook so it doesn't require a QueryClientProvider.
+vi.mock("@/hooks/useDraftRoomCapabilities", () => ({
+  useDraftRoomCapabilities: vi.fn(),
+  useDraftRoomVisible: vi.fn(() => false),
+}));
+
 describe("MobileBottomNav", () => {
   beforeEach(() => {
     mockLogout.mockResolvedValue(undefined);

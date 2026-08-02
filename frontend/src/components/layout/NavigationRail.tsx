@@ -20,8 +20,10 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useState, useEffect } from "react";
 import { HugeiconsIcon, type IconSvgElement } from "@hugeicons/react";
-import { MessageMultiple01Icon, AiBrain01Icon, Files01Icon, Database02Icon, BookOpenTextIcon, UserSettings01Icon, UserCircleIcon, UserGroupIcon, Setting07Icon, Building03Icon, Sun02Icon, MoonIcon, Logout01Icon } from "@hugeicons/core-free-icons";
+import { MessageMultiple01Icon, AiBrain01Icon, Files01Icon, Database02Icon, BookOpenTextIcon, UserSettings01Icon, UserCircleIcon, UserGroupIcon, Setting07Icon, Building03Icon, Sun02Icon, MoonIcon, Logout01Icon, PencilEdit01Icon } from "@hugeicons/core-free-icons";
 import { MeridianLogo } from "../icons/MeridianLogo";
+import { useDraftRoomVisible } from "@/hooks/useDraftRoomCapabilities";
+import { DRAFT_ROOM_NAV_LABEL } from "@/components/draft-room/labels";
 
 // Re-export types for backward compatibility
 export type { NavItemId, NavigationProps };
@@ -35,6 +37,10 @@ interface NavConfigItem {
   to: string;
   section: NavSection;
   adminOnly?: boolean;
+  /** Gated behind a live capability check (e.g. Draft Room), separate from
+   *  `adminOnly` — a nav entry must never point at a pipeline the backend
+   *  hasn't advertised as fully installed (SPEC 16.2, 1.1). */
+  capabilityGated?: boolean;
 }
 
 const navItems: NavConfigItem[] = [
@@ -43,6 +49,7 @@ const navItems: NavConfigItem[] = [
   { id: "memory", label: "Memory", icon: AiBrain01Icon, to: "/memory", section: "workspace" },
   { id: "wiki", label: "Wiki", icon: BookOpenTextIcon, to: "/wiki", section: "workspace" },
   { id: "kms", label: "KMS", icon: Library, to: "/kms", section: "workspace" },
+  { id: "draftRoom", label: DRAFT_ROOM_NAV_LABEL, icon: PencilEdit01Icon, to: "/draft-room", section: "workspace", capabilityGated: true },
   { id: "vaults", label: "Vaults", icon: Database02Icon, to: "/vaults", section: "workspace" },
   { id: "groups", label: "Groups", icon: UserGroupIcon, to: "/admin/groups", section: "admin", adminOnly: true },
   { id: "users", label: "Users", icon: UserSettings01Icon, to: "/admin/users", section: "admin", adminOnly: true },
@@ -113,6 +120,7 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
   const userRole = useAuthStore((state) => state.user?.role);
   const logout = useAuthStore((state) => state.logout);
   const isAdmin = userRole === "admin" || userRole === "superadmin";
+  const draftRoomVisible = useDraftRoomVisible();
 
   const [isExpanded, setIsExpanded] = useState(() => {
     const saved = localStorage.getItem(SIDEBAR_EXPANDED_KEY);
@@ -144,6 +152,7 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
       if (item.to === pathname) return item.id;
     }
     if (pathname.startsWith("/chat/")) return "chat";
+    if (pathname.startsWith("/draft-room")) return "draftRoom";
     if (pathname.startsWith("/admin/groups")) return "groups";
     if (pathname.startsWith("/admin/users")) return "users";
     if (pathname.startsWith("/admin/organizations")) return "organizations";
@@ -153,7 +162,9 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
 
   const activeItem = getActiveItem();
 
-  const visibleItems = navItems.filter((item) => !item.adminOnly || isAdmin);
+  const visibleItems = navItems.filter(
+    (item) => (!item.adminOnly || isAdmin) && (!item.capabilityGated || draftRoomVisible)
+  );
 
   const workspaceItems = visibleItems.filter((i) => i.section === "workspace");
   const adminItems = visibleItems.filter((i) => i.section === "admin");

@@ -4,12 +4,17 @@ Private, owner-scoped drafting projects: project/brief CRUD, raw-input upload
 and metadata (never `files`/LanceDB/Wiki/KMS), the durable parse-job lifecycle,
 the compile pipeline (enqueue/stage history/cancel/retry), the evidence, claim
 and finding ledgers with human finding disposition, the human-only Ready
-transition, manual Markdown revisions, Markdown export, and an authenticated
-SSE notification stream.
+transition, manual Markdown revisions, Markdown export, promotion into a
+normal vault document, and an authenticated SSE notification stream.
 
-Promotion (``POST /drafts/{id}/promote``) is deliberately NOT implemented — it
-is issue #437 / SPEC PR 4. ``GET /capabilities`` advertises it as unavailable
-rather than leaving a future client to guess.
+Promotion (``POST /drafts/{id}/promote``, issue #437 / SPEC PR 4) is the one
+operation that requires vault ``write`` rather than ``read``: it copies the
+selected input's bytes or renders the selected revision's ``content_md`` as
+a ``.md`` file, then calls ``app.services.draft_promotion`` — the shared
+internal ingestion seam a normal document upload also uses — to create a
+normal `files` row and enqueue it for ordinary ingestion/indexing. It never
+mutates the source `draft_inputs`/`draft_revisions` row and never pretends
+the promoted document is already indexed.
 
 Compile-surface invariants enforced here (SPEC sections 8.2, 9.1, 12.5):
 
@@ -84,14 +89,18 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.api.deps import (
     _evaluate_policy,
     _resolve_active_user,
+    get_background_processor,
     get_current_active_user,
     get_db,
+    get_db_pool,
     get_evaluate_policy,
     log_db_released,
 )
 from app.config import settings
 from app.limiter import limiter
+from app.models.database import SQLiteConnectionPool
 from app.security import csrf_protect
+from app.services.background_tasks import BackgroundProcessor
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_events import build_event, get_draft_event_bus
 from app.services.draft_evidence_freshness import enforce_evidence_freshness
@@ -103,6 +112,14 @@ from app.services.draft_pipeline import (
     COMPILE_STAGE_ORDER,
     compile_fingerprint,
     compile_fingerprint_payload,
+)
+from app.services.draft_promotion import (
+    DraftPromotionDuplicateError,
+    DraftPromotionError,
+    DraftPromotionPathConflictError,
+    DraftPromotionTooLargeError,
+    promote_input,
+    promote_revision,
 )
 from app.services.draft_prompts import PROMPT_BUNDLE_VERSION
 from app.services.draft_provider_policy import (
@@ -133,7 +150,9 @@ from app.services.draft_store import (
     canonical_json,
     sha256_text,
 )
+from app.services.folder_store import FolderStore
 from app.services.security_audit import safe_record_security_event
+from app.services.tag_store import TagStore
 from app.services.upload_validation import secure_filename
 
 logger = logging.getLogger(__name__)
@@ -145,6 +164,8 @@ T = TypeVar("T")
 _PIECE_TYPES = ("article", "report", "brief", "press_release", "other")
 _TRANSFORMATION_STRENGTHS = ("light", "moderate", "substantial")
 _DRAFTING_PRIORITIES = ("manuscript", "vault", "balanced")
+_PROMOTE_SOURCE_TYPES = ("input", "revision")
+_MAX_PROMOTE_TAG_IDS = 50
 
 # ── compile-surface constants (SPEC sections 8.1, 8.2, 12.5) ────────────────
 
@@ -308,6 +329,18 @@ async def _require_vault_read(evaluate: Callable, user: dict, vault_id: int) -> 
         )
 
 
+async def _require_vault_write(evaluate: Callable, user: dict, vault_id: int) -> None:
+    """Promotion's own gate (SPEC section 8.2): unlike every other Draft Room
+    operation, promotion creates a normal vault document and therefore needs
+    vault ``write``, not just ``read``. Losing write access disables promotion
+    without blocking the private read/export/delete rights vault ``read``
+    (or a revoked vault) still allows (issue #437)."""
+    if not await evaluate(user, "vault", vault_id, "write"):
+        raise DraftRoomHTTPError(
+            403, "no write access to this vault", "vault_write_required"
+        )
+
+
 async def _vault_access_label(evaluate: Callable, user: dict, vault_id: int) -> str:
     """``'write' | 'read' | 'revoked'`` for a list-row annotation (never suppresses)."""
     if await evaluate(user, "vault", vault_id, "write"):
@@ -449,6 +482,22 @@ class RevisionCreateRequest(BaseModel):
     lock_version: int
     content_md: str = Field(..., min_length=1)
 
+    @field_validator("content_md")
+    @classmethod
+    def _check_content_md_length(cls, v: str) -> str:
+        # Checked dynamically against the live setting (not baked into a
+        # `Field(max_length=...)` at import time) so a test or operator
+        # change to the setting takes effect immediately. Reuses the
+        # existing Draft Room content-size ceiling rather than inventing a
+        # new config knob; this is a defense-in-depth cap at creation time —
+        # the promotion path enforces the vault's actual byte-size limit
+        # (`settings.max_file_size_mb`) against the rendered `.md` bytes
+        # regardless of how the revision was created (manual or pipeline).
+        max_chars = settings.draft_max_total_parsed_chars
+        if len(v) > max_chars:
+            raise ValueError(f"content_md must not exceed {max_chars} characters")
+        return v
+
 
 def _validate_start_stage(value: Optional[str]) -> Optional[str]:
     """Reject any stage a user may not select — ``assemble`` above all."""
@@ -507,6 +556,37 @@ class ReadyRequest(BaseModel):
     acknowledge_source_only: bool = False
 
 
+class PromoteRequest(BaseModel):
+    """SPEC sections 3.4, 6.4, 8.2, issue #437.
+
+    The destination vault is always ``draft.vault_id`` — a body-supplied
+    ``vault_id`` is deliberately not accepted, so promotion can never write
+    into a vault other than the one the draft itself belongs to.
+    ``source_type`` is validated in the route (not here) against
+    :data:`_PROMOTE_SOURCE_TYPES` so an invalid value gets the Draft Room
+    ``{"detail","code":"validation_failed"}`` envelope rather than the
+    framework's default validation-error shape.
+    """
+
+    source_type: str
+    source_id: int
+    title: str = Field(..., min_length=1, max_length=300)
+    folder_id: Optional[int] = None
+    tag_ids: list[int] = Field(default_factory=list, max_length=_MAX_PROMOTE_TAG_IDS)
+
+
+class PromoteResponse(BaseModel):
+    promotion_id: int
+    draft_id: int
+    vault_id: int
+    source_type: str
+    source_id: int
+    source_sha256: str
+    file_id: int
+    filename: str
+    created_at: str
+
+
 class DraftSummary(BaseModel):
     id: int
     vault_id: int
@@ -523,6 +603,25 @@ class DraftSummary(BaseModel):
     created_at: str
     updated_at: str
     ready_at: Optional[str]
+    # Additive, backward-compatible fields beyond SPEC section 8.1's
+    # DraftSummary list — required by issue #437's Ready acceptance
+    # criterion ("show Ready actor/time"), which SPEC 8.1 predates.
+    # ``ready_by`` is the existing `drafts.ready_by` column (already written
+    # by `_sync_mark_ready`), populated on every DraftSummary the draft was
+    # ever marked Ready on. ``ready_by_username`` is resolved best-effort
+    # from the users table, but ONLY on the single-draft detail fetch
+    # (`_build_detail`) — it is always ``None`` on every `_build_summary`
+    # construction (list rows and every other mutation response: create,
+    # patch, archive, restore, ready), because `list_drafts` calls
+    # `_build_summary` once per row and resolving a username there would be
+    # an N+1 query against `users` for every listed draft. It is also
+    # ``None`` when the draft was never marked Ready, and when the approving
+    # user record no longer exists (a deleted user is never given a
+    # fabricated placeholder name) — but the dominant reason a caller sees
+    # ``None`` here in practice is simply "this was a list/summary response,
+    # not the detail endpoint".
+    ready_by: Optional[int]
+    ready_by_username: Optional[str]
 
 
 class DraftInput(BaseModel):
@@ -1101,6 +1200,22 @@ def _sync_ledger_counts(
     }
 
 
+def _sync_resolve_username(conn: sqlite3.Connection, user_id: Optional[int]) -> Optional[str]:
+    """Best-effort ``users.id -> users.username`` lookup for display only.
+
+    Returns ``None`` when ``user_id`` is ``None`` (nothing to resolve) or when
+    no such user row exists (the account was deleted since) — never a
+    fabricated placeholder. Mirrors the plain ``SELECT username FROM users
+    WHERE id = ?`` pattern already used for this exact lookup elsewhere in
+    the codebase (e.g. ``app.api.routes.organizations``); no shared
+    id-to-username helper exists in this repo to reuse instead.
+    """
+    if user_id is None:
+        return None
+    row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    return None if row is None else str(row["username"])
+
+
 def _sync_summary_extras(
     conn: sqlite3.Connection, store: DraftStore, draft: DraftRecord
 ) -> dict[str, Any]:
@@ -1144,6 +1259,14 @@ def _sync_detail_extras(
             draft_id=draft.id,
             current_revision_id=current.id if current else None,
         ),
+        # Resolved only here (the single-draft detail fetch), never in
+        # `_sync_summary_extras` — that one backs `list_drafts`, which calls
+        # `_build_summary` once per row, so joining/looking up a username
+        # there would be an N+1 query against `users` for every listed
+        # draft. The list endpoint still reports `ready_by` (already on the
+        # loaded `DraftRecord`, no extra query) and leaves the display name
+        # `None`.
+        "ready_by_username": _sync_resolve_username(conn, draft.ready_by),
     }
 
 
@@ -1172,6 +1295,12 @@ async def _build_summary(
         created_at=draft.created_at,
         updated_at=draft.updated_at,
         ready_at=draft.ready_at,
+        ready_by=draft.ready_by,
+        # Not resolved here: this backs `list_drafts`, which calls
+        # `_build_summary` once per row — resolving a username here would be
+        # an N+1 `users` lookup. See `_build_detail` for the single-draft
+        # fetch where the join cost is fine.
+        ready_by_username=None,
     )
 
 
@@ -1202,6 +1331,8 @@ async def _build_detail(
         created_at=draft.created_at,
         updated_at=draft.updated_at,
         ready_at=draft.ready_at,
+        ready_by=draft.ready_by,
+        ready_by_username=extras["ready_by_username"],
     )
     active_compile = extras["active_compile_job"]
     ledger = extras["ledger"]
@@ -2310,10 +2441,10 @@ async def get_capabilities(
         claims_available=True,
         evidence_available=True,
         ready_available=True,
-        # Promotion is issue #437 / SPEC PR 4 and an explicit non-goal here.
-        # There is no POST /drafts/{id}/promote route in this module, so
-        # advertising it would be a false claim.
-        promote_available=False,
+        # Promotion (issue #437 / SPEC PR 4) is reachable end to end:
+        # POST /drafts/{id}/promote exists in this module and calls
+        # app.services.draft_promotion, the shared internal ingestion seam.
+        promote_available=True,
     )
 
 
@@ -3411,6 +3542,376 @@ async def export_draft_revision(
             "X-Draft-Approval-Status": approval_status,
             "X-Draft-Content-Sha256": revision.content_sha256,
         },
+    )
+
+
+def _validate_promotion_organization(
+    db: sqlite3.Connection,
+    *,
+    vault_id: int,
+    folder_id: Optional[int],
+    tag_ids: list[int],
+) -> None:
+    """Reject an unusable ``folder_id``/``tag_ids`` *before any promotion side
+    effect runs* — no copied bytes, no ``files`` row, no ``draft_promotions``
+    row, no enqueue. A promotion that reports failure after already writing
+    the document would make the audit trail lie and turn a client retry into
+    a duplicate, so every id here must be confirmed to exist and belong to
+    ``vault_id`` up front, never discovered as a failure afterward.
+    """
+    if folder_id is not None:
+        row = db.execute(
+            "SELECT vault_id FROM folders WHERE id = ?", (folder_id,)
+        ).fetchone()
+        if row is None:
+            raise DraftRoomHTTPError(
+                404, "folder not found", "folder_not_found", {"folder_id": folder_id}
+            )
+        if int(row["vault_id"]) != vault_id:
+            raise DraftRoomHTTPError(
+                409,
+                "folder belongs to a different vault",
+                "folder_wrong_vault",
+                {"folder_id": folder_id},
+            )
+    for tag_id in tag_ids:
+        row = db.execute("SELECT vault_id FROM tags WHERE id = ?", (tag_id,)).fetchone()
+        if row is None:
+            raise DraftRoomHTTPError(
+                404, "tag not found", "tag_not_found", {"tag_id": tag_id}
+            )
+        if int(row["vault_id"]) != vault_id:
+            raise DraftRoomHTTPError(
+                409,
+                "tag belongs to a different vault",
+                "tag_wrong_vault",
+                {"tag_id": tag_id},
+            )
+
+
+def _duplicate_context(exc: DraftPromotionDuplicateError) -> dict[str, Any]:
+    """``{"existing_file_id": <id>}`` when the conflicting file id is known,
+    else ``{}`` (never a fabricated placeholder like ``-1``). ``context`` is
+    itself omitted from the response entirely when empty (see
+    ``DraftRoomHTTPError``/``draft_room_exception_handler``)."""
+    if exc.existing_file_id is None:
+        return {}
+    return {"existing_file_id": exc.existing_file_id}
+
+
+async def _run_promotion(
+    coro,
+    *,
+    db: sqlite3.Connection,
+    request: Request,
+    user: dict,
+    draft_id: int,
+):
+    """Await a ``promote_input``/``promote_revision`` call and translate its
+    domain errors, shared by both the input and revision branches below.
+
+    When ``exc.cleanup_incomplete`` is set — the promotion service's own
+    compensation (delete the just-created ``files``/``draft_promotions`` rows
+    and the bytes) itself failed after a later step in the same attempt
+    failed — an orphan may genuinely exist. That is recorded as its own
+    security-audit event so an operator can find it, and surfaced with a
+    status/code distinguishable from an ordinary clean failure.
+    """
+    try:
+        return await coro
+    except DraftPromotionDuplicateError as exc:
+        if exc.cleanup_incomplete:
+            await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
+        raise DraftRoomHTTPError(
+            409, str(exc), "duplicate_document", _duplicate_context(exc)
+        ) from exc
+    except DraftPromotionTooLargeError as exc:
+        if exc.cleanup_incomplete:
+            await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
+        raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
+    except DraftPromotionPathConflictError as exc:
+        if exc.cleanup_incomplete:
+            await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
+        raise DraftRoomHTTPError(409, str(exc), "promotion_path_conflict") from exc
+    except DraftPromotionError as exc:
+        if exc.cleanup_incomplete:
+            await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
+            raise DraftRoomHTTPError(
+                500, str(exc), "promotion_failed_incomplete_cleanup"
+            ) from exc
+        raise DraftRoomHTTPError(500, "promotion failed", "internal_error") from exc
+
+
+async def _record_promotion_cleanup_failure(
+    db: sqlite3.Connection,
+    request: Request,
+    user: dict,
+    draft_id: int,
+    exc: DraftPromotionError,
+) -> None:
+    """Best-effort audit trail for the rare case where a failed promotion's
+    own compensating deletes also failed, so an orphan ``files`` row,
+    ``draft_promotions`` row, or on-disk file may still exist. Distinct
+    ``event_type`` from ``draft_promoted`` so operators can search for it
+    specifically."""
+    await safe_record_security_event(
+        db,
+        event_type="draft_promotion_cleanup_failed",
+        actor=user,
+        request=request,
+        metadata={"draft_id": draft_id, "detail": str(exc)},
+    )
+
+
+def _apply_promotion_organization(
+    db: sqlite3.Connection,
+    *,
+    vault_id: int,
+    file_id: int,
+    folder_id: Optional[int],
+    tag_ids: list[int],
+) -> None:
+    """Apply an already-validated folder/tag assignment to a just-promoted file.
+
+    Reuses the exact stores the folders/tags surface already uses (never
+    duplicated logic). Callers must run :func:`_validate_promotion_organization`
+    first — by the time this runs, the promotion itself has already happened
+    (the ``files``/``draft_promotions`` rows exist and ingestion is enqueued),
+    so a failure here (e.g. a concurrent delete of the folder/tag between
+    validation and this call) must never be reported as a promotion failure;
+    see the caller for how that is surfaced instead.
+    """
+    if folder_id is not None:
+        FolderStore(db).move_documents(vault_id, [file_id], folder_id)
+    if tag_ids:
+        TagStore(db).assign_tags(vault_id, [file_id], tag_ids)
+
+
+@router.post(
+    "/drafts/{draft_id}/promote", status_code=202, response_model=PromoteResponse
+)
+@limiter.limit(settings.draft_upload_rate_limit)
+async def promote_draft_source(
+    request: Request,
+    draft_id: int,
+    body: PromoteRequest,
+    db: sqlite3.Connection = Depends(get_db),
+    db_pool: SQLiteConnectionPool = Depends(get_db_pool),
+    background_processor: BackgroundProcessor = Depends(get_background_processor),
+    user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
+    storage: DraftInputStorage = Depends(get_draft_input_storage),
+    _csrf_token: str = Depends(csrf_protect),
+) -> PromoteResponse:
+    """Copy a draft input or revision into the draft's vault as a normal
+    document and enqueue it through the existing ingestion/indexing workflow
+    (SPEC sections 3.4, 6.4, 8.2; issue #437).
+
+    Promotion never mutates the source ``draft_inputs``/``draft_revisions``
+    row and never marks it indexed — the promoted bytes are a copy, written
+    by :mod:`app.services.draft_promotion`, the internal ingestion seam a
+    normal document upload also reaches (duplicate-content check, a `files`
+    row, ``background_processor.enqueue``) — but promotion performs its own
+    exclusive `files`-row insert rather than the shared path-keyed upsert
+    ``_do_upload`` uses, so it can never adopt or corrupt a document it did
+    not create (see the service module's docstring). It requires vault
+    ``write`` — not just ``read`` — because, unlike every other Draft Room
+    operation, it creates a document other vault members can see.
+    """
+    _require_enabled()
+    if body.source_type not in _PROMOTE_SOURCE_TYPES:
+        raise DraftRoomHTTPError(
+            422,
+            f"source_type must be one of {sorted(_PROMOTE_SOURCE_TYPES)}",
+            "validation_failed",
+        )
+
+    owner_id = int(user["id"])
+    store = DraftStore(db)
+    draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
+    await _require_vault_write(evaluate, user, draft.vault_id)
+
+    if draft.status == "archived":
+        raise DraftRoomHTTPError(
+            409, "an archived draft cannot be promoted", "invalid_state"
+        )
+
+    # Validate the organization target(s) up front, before any promotion side
+    # effect (copied bytes, `files` row, `draft_promotions` row, enqueue) —
+    # see `_validate_promotion_organization` for why this must run first.
+    if body.folder_id is not None or body.tag_ids:
+        await asyncio.to_thread(
+            _validate_promotion_organization,
+            db,
+            vault_id=draft.vault_id,
+            folder_id=body.folder_id,
+            tag_ids=body.tag_ids,
+        )
+
+    revision_fact_status: Optional[str] = None
+    was_ready_revision: Optional[bool] = None
+
+    if body.source_type == "input":
+        input_record = await _run_store(
+            lambda: store.get_input(
+                draft_id=draft_id, owner_id=owner_id, input_id=body.source_id
+            )
+        )
+        if input_record.parse_status != "ready":
+            raise DraftRoomHTTPError(
+                409, "input is not ready for promotion", "input_not_ready"
+            )
+        result = await _run_promotion(
+            promote_input(
+                storage=storage,
+                db_pool=db_pool,
+                background_processor=background_processor,
+                draft_id=draft_id,
+                vault_id=draft.vault_id,
+                title=body.title,
+                promoted_by=owner_id,
+                input_record=input_record,
+            ),
+            db=db,
+            request=request,
+            user=user,
+            draft_id=draft_id,
+        )
+    else:
+        revision_record = await _run_store(
+            lambda: store.get_revision(
+                draft_id=draft_id,
+                owner_id=owner_id,
+                revision_id=body.source_id,
+                include_content=True,
+            )
+        )
+        revision_fact_status = revision_record.fact_status
+        was_ready_revision = bool(draft.ready_revision_id == revision_record.id)
+        result = await _run_promotion(
+            promote_revision(
+                storage=storage,
+                db_pool=db_pool,
+                background_processor=background_processor,
+                draft_id=draft_id,
+                vault_id=draft.vault_id,
+                title=body.title,
+                promoted_by=owner_id,
+                revision_record=revision_record,
+            ),
+            db=db,
+            request=request,
+            user=user,
+            draft_id=draft_id,
+        )
+
+    # The promotion itself has now genuinely happened (`files` and
+    # `draft_promotions` rows exist, ingestion is enqueued) — organization
+    # (folder/tags) was already validated to exist in this vault above, but a
+    # race (e.g. concurrent delete) could still make the assignment itself
+    # fail. That must never be reported as a promotion failure: the document
+    # exists and a client retry would create a duplicate. Record it in the
+    # audit payload instead of raising.
+    organization_error: Optional[str] = None
+    if body.folder_id is not None or body.tag_ids:
+        try:
+            await asyncio.to_thread(
+                _apply_promotion_organization,
+                db,
+                vault_id=draft.vault_id,
+                file_id=result.file_id,
+                folder_id=body.folder_id,
+                tag_ids=body.tag_ids,
+            )
+        except BaseException as exc:  # noqa: BLE001 — must not turn a real success into a reported failure; includes cancellation, which must not skip the audit write below either
+            organization_error = str(exc)
+            logger.warning(
+                "draft_room: promotion organization step failed after promotion "
+                "succeeded (draft_id=%s file_id=%s): %s",
+                draft_id,
+                result.file_id,
+                exc,
+            )
+
+    # The promotion has genuinely happened (files/draft_promotions rows
+    # exist, ingestion is enqueued) -- exactly like `organization_error`
+    # above, nothing from this point on may turn the response into a
+    # failure. `record_event` starts with `DraftStore.get_draft`, which 404s
+    # if the draft was deleted between enqueue and here; that must be
+    # recorded and logged, never allowed to make the client believe the
+    # promotion it can already see evidence of (a real, enqueued document)
+    # never happened.
+    draft_event_error: Optional[str] = None
+    try:
+        await _run_store(
+            lambda: store.record_event(
+                draft_id=draft_id,
+                owner_id=owner_id,
+                event_type="promoted",
+                actor_user_id=owner_id,
+                revision_id=result.source_id if body.source_type == "revision" else None,
+                payload={
+                    "source_type": result.source_type,
+                    "source_id": result.source_id,
+                    "vault_id": result.vault_id,
+                    "file_id": result.file_id,
+                },
+            )
+        )
+    except BaseException as exc:  # noqa: BLE001 — must not turn a real success into a reported failure; includes cancellation, which must not skip the audit write below either
+        draft_event_error = str(exc)
+        logger.warning(
+            "draft_room: failed to record draft_events row after promotion "
+            "succeeded (draft_id=%s file_id=%s): %s",
+            draft_id,
+            result.file_id,
+            exc,
+        )
+
+    # The very last thing that may be skipped, and even this must not
+    # prevent the 202 response: nothing before this point can propagate
+    # past it any more (both guards above now catch BaseException), so this
+    # is deliberately the final opportunity to record provenance for a
+    # promotion that has already, irreversibly, happened.
+    try:
+        await safe_record_security_event(
+            db,
+            event_type="draft_promoted",
+            actor=user,
+            request=request,
+            metadata={
+                "draft_id": draft_id,
+                "source_type": result.source_type,
+                "source_id": result.source_id,
+                "source_sha256": result.source_sha256,
+                "vault_id": result.vault_id,
+                "file_id": result.file_id,
+                "filename": result.filename,
+                "revision_fact_status": revision_fact_status,
+                "was_ready_revision": was_ready_revision,
+                "organization_error": organization_error,
+                "draft_event_error": draft_event_error,
+            },
+        )
+    except BaseException as exc:  # noqa: BLE001 — the promotion already succeeded; this must not prevent the response either
+        logger.warning(
+            "draft_room: failed to record draft_promoted security audit "
+            "event (draft_id=%s file_id=%s): %s",
+            draft_id,
+            result.file_id,
+            exc,
+        )
+
+    return PromoteResponse(
+        promotion_id=result.promotion_id,
+        draft_id=result.draft_id,
+        vault_id=result.vault_id,
+        source_type=result.source_type,
+        source_id=result.source_id,
+        source_sha256=result.source_sha256,
+        file_id=result.file_id,
+        filename=result.filename,
+        created_at=result.created_at,
     )
 
 

@@ -1171,6 +1171,113 @@ class TestReadyEligibility(CompileRouteTestBase):
         self.assertNotIn('status = "ready"', pipeline_source)
 
 
+# ── Ready actor reporting (issue #437 acceptance criterion) ─────────────────
+#
+# SPEC section 8.1's DraftSummary field list does not include `ready_by` /
+# `ready_by_username` -- this is a deliberate, additive, backward-compatible
+# response field required by issue #437 ("show Ready actor/time"), not a
+# SPEC-text field. `ready_by` (the existing `drafts.ready_by` column, already
+# written by `_sync_mark_ready`) is populated on every DraftSummary; the
+# human-readable `ready_by_username` is resolved from `users` only on the
+# single-draft detail fetch (`_build_detail`) to avoid an N+1 `users` lookup
+# on `list_drafts`, which calls `_build_summary` once per row.
+
+
+class TestReadyActorReporting(CompileRouteTestBase):
+    def _orphan_ready_by(self, draft_id, fake_user_id=999999):
+        """Point `ready_by` at a user id with no matching `users` row, to
+        simulate an approver whose account was later deleted -- without
+        cascading away the draft itself.
+
+        `drafts.created_by` is `ON DELETE CASCADE` on `users(id)`, and the
+        Ready route only ever lets the draft's own owner mark it Ready, so
+        the approver and the owner are always the same user: a real `DELETE
+        FROM users WHERE id = <owner>` (with FK enforcement on, as this
+        harness always runs) would cascade-delete the draft before
+        `ready_by` could ever be inspected, and would also break the very
+        authentication needed to fetch it afterward. A direct, FK-bypassed
+        UPDATE of `ready_by` to a nonexistent id reaches the same storage
+        state -- an integer `ready_by` with no matching `users` row -- that
+        a real dangling reference would leave behind, without destroying the
+        draft or the ability to authenticate as its still-real owner.
+        """
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(
+                "UPDATE drafts SET ready_by = ? WHERE id = ?", (fake_user_id, draft_id)
+            )
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys = ON")
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def test_ready_draft_reports_approver_id_and_name_on_detail(self):
+        draft_id, job_id, revision_id = self._seed_ready_eligible_draft()
+        ready = self._mark_ready(draft_id, revision_id)
+        self.assertEqual(ready.status_code, 200, ready.text)
+        # The mark-ready response itself is built via `_build_summary`
+        # (list-shaped): the id is populated, the name is not.
+        self.assertEqual(ready.json()["ready_by"], self.OWNER_ID)
+        self.assertIsNone(ready.json()["ready_by_username"])
+
+        resp = self.client.get(
+            f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        summary = resp.json()["summary"]
+        self.assertEqual(summary["ready_by"], self.OWNER_ID)
+        self.assertEqual(summary["ready_by_username"], "owner")
+
+    def test_ready_draft_reports_approver_id_but_not_name_on_list(self):
+        draft_id, job_id, revision_id = self._seed_ready_eligible_draft()
+        ready = self._mark_ready(draft_id, revision_id)
+        self.assertEqual(ready.status_code, 200, ready.text)
+
+        resp = self.client.get("/api/draft-room/drafts", headers=self._owner_headers())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        row = next(d for d in resp.json()["items"] if d["id"] == draft_id)
+        self.assertEqual(row["ready_by"], self.OWNER_ID)
+        # N+1 avoidance: list rows never resolve the display name.
+        self.assertIsNone(row["ready_by_username"])
+
+    def test_draft_never_marked_ready_reports_none_for_both_fields(self):
+        draft_id, job_id, revision_id = self._seed_ready_eligible_draft()
+        # Left in `needs_review` -- never marked Ready.
+
+        detail = self.client.get(
+            f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        summary = detail.json()["summary"]
+        self.assertIsNone(summary["ready_by"])
+        self.assertIsNone(summary["ready_by_username"])
+
+        listing = self.client.get(
+            "/api/draft-room/drafts", headers=self._owner_headers()
+        )
+        row = next(d for d in listing.json()["items"] if d["id"] == draft_id)
+        self.assertIsNone(row["ready_by"])
+        self.assertIsNone(row["ready_by_username"])
+
+    def test_ready_by_username_is_none_when_approver_no_longer_exists(self):
+        draft_id, job_id, revision_id = self._seed_ready_eligible_draft()
+        ready = self._mark_ready(draft_id, revision_id)
+        self.assertEqual(ready.status_code, 200, ready.text)
+
+        self._orphan_ready_by(draft_id, fake_user_id=999999)
+
+        resp = self.client.get(
+            f"/api/draft-room/drafts/{draft_id}", headers=self._owner_headers()
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        summary = resp.json()["summary"]
+        # The id is preserved verbatim -- never dropped or fabricated away --
+        # but no placeholder name is invented for a user that no longer exists.
+        self.assertEqual(summary["ready_by"], 999999)
+        self.assertIsNone(summary["ready_by_username"])
+
+
 # ── export (SPEC section 8.2 filename/header matrix) ────────────────────────
 
 
@@ -1241,10 +1348,19 @@ class TestExportMatrix(CompileRouteTestBase):
 
 
 class TestCapabilitiesHonesty(CompileRouteTestBase):
-    def test_promote_available_stays_false_and_no_promote_route(self):
+    def test_promote_available_is_true_and_promote_route_exists(self):
+        """SUPERSEDED ASSERTION (issue #437): this test previously asserted
+        ``promote_available`` stayed False and no promote route existed, which
+        was correct while promotion was an explicit non-goal. Promotion now
+        ships end to end (route + ``app.services.draft_promotion`` + the
+        ``draft_promotions`` provenance table), so advertising it as
+        unavailable would now be the dishonest answer. See
+        ``tests/draft_room/test_draft_promote.py`` for the promotion route's
+        own behavior coverage.
+        """
         resp = self.client.get("/api/draft-room/capabilities", headers=self._owner_headers())
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertFalse(resp.json()["promote_available"])
+        self.assertTrue(resp.json()["promote_available"])
 
         from app.api.routes.draft_room import router as draft_room_router
 
@@ -1253,7 +1369,7 @@ class TestCapabilitiesHonesty(CompileRouteTestBase):
             for route in draft_room_router.routes
             for method in getattr(route, "methods", set())
         }
-        self.assertNotIn(("POST", "/draft-room/drafts/{draft_id}/promote"), routes)
+        self.assertIn(("POST", "/draft-room/drafts/{draft_id}/promote"), routes)
 
 
 # ── audit metadata never carries content (SPEC section 9.3) ────────────────

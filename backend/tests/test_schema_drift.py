@@ -32,7 +32,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # 51 -> 56: Draft Room pipeline and factuality tables add draft_job_stages and
 # draft_evidence (SPEC section 5.5-5.6), plus draft_claims, draft_claim_sources
 # and draft_findings (SPEC section 5.7) -- issue #436.
-EXPECTED_BASE_TABLE_COUNT = 56
+# 56 -> 57: Draft Room promotion provenance adds draft_promotions (SPEC
+# sections 3.4, 6.4, 9.3) -- issue #437.
+EXPECTED_BASE_TABLE_COUNT = 57
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

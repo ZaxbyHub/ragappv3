@@ -1421,4 +1421,5 @@ docker compose pull && docker compose up -d
 
 - Main README: `README.md`
 - Setup Guide: `docs/non-technical-setup.md`
+- Draft Room Guide: `docs/draft-room.md`
 - API Docs: `http://localhost:9090/docs`

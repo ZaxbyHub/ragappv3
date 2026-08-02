@@ -653,17 +653,16 @@ class TestCapabilitiesAndPagination(DraftRoomTestBase):
     def test_capabilities_advertises_unavailable_future_features(self):
         """Capability reporting must be honest about what is actually wired.
 
-        SUPERSEDED ASSERTION (issue #436): this test previously asserted that
-        ALL SIX capability flags were False, which was correct while the route
-        module shipped project/input/job/revision CRUD only. Compile, evidence,
-        claims, findings and Ready are now genuinely wired end to end — the
-        routes exist in ``draft_room.py``, their store accessors shipped in
-        ``draft_store.py``, and the orchestrator that populates the ledgers
-        shipped in ``draft_pipeline.py`` — so advertising them as False would
-        now be the dishonest answer. The assertion is therefore inverted for
-        those five, and NOT weakened: each flag is still asserted explicitly,
-        and ``promote_available`` must remain False because promotion is issue
-        #437 / SPEC PR 4 and no ``POST /drafts/{id}/promote`` route exists.
+        SUPERSEDED ASSERTION (issues #436, #437): this test previously asserted
+        that ALL SIX capability flags were False, which was correct while the
+        route module shipped project/input/job/revision CRUD only. Compile,
+        evidence, claims, findings, Ready, and now promotion are all genuinely
+        wired end to end — the routes exist in ``draft_room.py``, their store
+        accessors shipped in ``draft_store.py``/``draft_promotion.py``, and the
+        orchestrator that populates the ledgers shipped in
+        ``draft_pipeline.py`` — so advertising any of them as False would now
+        be the dishonest answer. The assertion is therefore inverted for all
+        six, and NOT weakened: each flag is still asserted explicitly.
         """
         resp = self.client.get("/api/draft-room/capabilities", headers=self._owner_headers())
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -676,9 +675,9 @@ class TestCapabilitiesAndPagination(DraftRoomTestBase):
             "claims_available",
             "evidence_available",
             "ready_available",
+            "promote_available",
         ):
             self.assertTrue(caps[key], key)
-        self.assertFalse(caps["promote_available"])
 
         # The wiring the flags above claim, asserted structurally rather than
         # taken on trust from the capability payload itself.
@@ -702,7 +701,7 @@ class TestCapabilitiesAndPagination(DraftRoomTestBase):
             ("POST", "/draft-room/drafts/{draft_id}/revisions/{revision_id}/ready"),
             routes,
         )
-        self.assertNotIn(("POST", "/draft-room/drafts/{draft_id}/promote"), routes)
+        self.assertIn(("POST", "/draft-room/drafts/{draft_id}/promote"), routes)
 
         # SPEC section 8.1: `assemble` is never exposed as a selectable start.
         self.assertEqual(
