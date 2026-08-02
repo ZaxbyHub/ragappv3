@@ -250,20 +250,24 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
 
   // ---- Permission model ---------------------------------------------------
   // Two tiers, documented here since the API doesn't expose a single flag:
-  //  - `canManageContent`: draft-private actions (sources, brief, saving a
-  //    revision, disposing findings) that never touch the vault itself.
-  //    Blocked only by archival or a fully revoked vault relationship — per
-  //    VAULT_ACCESS_REVOKED_WARNING's own text, revoked access leaves only
-  //    "cancel runs and delete the project" available.
-  //  - `canCompileOrPromote`: actions that read from or write into the vault
-  //    (compiling reads vault evidence; promoting writes a new document),
-  //    which require `write` vault access specifically, not just `read`.
+  //  - `canManageContent`: everything that only needs vault `read` access —
+  //    sources, brief, saving a revision, disposing findings, compiling,
+  //    retrying and marking Ready (compiling and retrying only *read* vault
+  //    evidence; the server enforces this with `_require_vault_read` on every
+  //    one of those routes). Blocked only by archival or a fully revoked
+  //    vault relationship — per VAULT_ACCESS_REVOKED_WARNING's own text,
+  //    revoked access leaves only "cancel runs and delete the project"
+  //    available.
+  //  - `canPromote`: promotion alone, because it *writes* a new document into
+  //    the vault that other vault members can see. The server gates it with
+  //    `_require_vault_write`, so this is the only action here that requires
+  //    `write` specifically, not just `read`.
   const archived = draft.status === "archived";
   const vaultRevoked = vaultAccess === "revoked";
   const activeJob = detail.active_compile_job;
   const hasActiveJob = activeJob != null;
   const canManageContent = !archived && !vaultRevoked;
-  const canCompileOrPromote = canManageContent && vaultAccess === "write";
+  const canPromote = canManageContent && vaultAccess === "write";
 
   // ---- Job / stage lookups -------------------------------------------------
   const jobsQuery = useQuery({
@@ -414,9 +418,6 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     }
     if (archived) return "This project is archived. Restore it before compiling.";
     if (vaultRevoked) return READY_BLOCKER_LABELS.vault_access_revoked;
-    if (vaultAccess !== "write") {
-      return "You have read-only access to this project's vault. Compiling requires vault write permission.";
-    }
     if (hasActiveJob) return "A newsroom run is already active for this project.";
     if (readyInputCount === 0) return "Add at least one parsed, ready source file before compiling.";
     const briefErrors = validateDraftAssignmentForm(toFormValue(draft, detail.brief), "edit");
@@ -491,7 +492,15 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   // constraint without a manual filter.
   const [retryStage, setRetryStage] = useState<DraftCompileStartStage | "">("");
   const retryOptions = capabilities?.compile_start_stages ?? [];
-  const canRetry = latestCompileJob != null && latestCompileJob.status === "failed" && canCompileOrPromote;
+  const canRetry = latestCompileJob != null && latestCompileJob.status === "failed" && canManageContent;
+  // Retry hits the same `_require_enabled` gate as compile server-side, so it
+  // must not be submittable when the capability is off — the detail page
+  // stays reachable in that state (direct URLs must render an honest view),
+  // and a failed job would otherwise show an actionable Retry that
+  // deterministically 503s. `blockedReason` already renders
+  // `DRAFT_ROOM_DISABLED_MESSAGE` in this same control block, so disabling
+  // here doesn't need its own duplicate reason text.
+  const retryCapabilityBlocked = capabilities?.enabled === false || capabilities?.compile_available === false;
 
   const retryMutation = useMutation({
     mutationFn: (startStage: DraftCompileStartStage) =>
@@ -563,11 +572,17 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const [promoteDialogOpen, setPromoteDialogOpen] = useState(false);
 
   // The server can disable promotion independently of vault-write access
-  // (`capabilities.promote_available`); fail closed while capabilities are
-  // still loading, matching `compileBlockedReason`'s convention.
-  const promoteDisabled = !capabilities || capabilities.promote_available === false;
+  // (`capabilities.promote_available`), and promotion is also a mutation
+  // gated server-side by `_require_enabled` like compile/retry — fail closed
+  // while capabilities are still loading, matching `compileBlockedReason`'s
+  // convention.
+  // When the whole feature is disabled, the compile blocker banner already
+  // states `DRAFT_ROOM_DISABLED_MESSAGE`; this reason is only for the
+  // promote-specific capability so the two don't duplicate the same text.
+  const promoteDisabled =
+    !capabilities || capabilities.enabled === false || capabilities.promote_available === false;
   const promoteUnavailableReason =
-    capabilities && capabilities.promote_available === false
+    capabilities && capabilities.enabled !== false && capabilities.promote_available === false
       ? "Promotion is currently unavailable."
       : null;
 
@@ -737,9 +752,16 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             {canManageContent && (
               <div className="mt-3 space-y-2">
                 {isDirty && <p className="text-xs text-muted-foreground">{SAVE_REVISION_CONSEQUENCE}</p>}
-                <Button type="button" onClick={() => setSaveConfirmOpen(true)} disabled={!isDirty}>
+                <Button
+                  type="button"
+                  onClick={() => setSaveConfirmOpen(true)}
+                  disabled={!isDirty || capabilities?.enabled === false}
+                >
                   {SAVE_REVISION_CTA}
                 </Button>
+                {isDirty && capabilities?.enabled === false && (
+                  <p className="text-xs text-muted-foreground">{DRAFT_ROOM_DISABLED_MESSAGE}</p>
+                )}
               </div>
             )}
           </TabsContent>
@@ -802,8 +824,13 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             Archive project
           </Button>
         )}
-        {currentRevisionSummary && canCompileOrPromote && (
-          <Button type="button" variant="outline" onClick={() => setReadyDialogOpen(true)}>
+        {currentRevisionSummary && canManageContent && (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setReadyDialogOpen(true)}
+            disabled={capabilities?.enabled === false}
+          >
             {MARK_READY_CTA}
           </Button>
         )}
@@ -812,7 +839,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             {EXPORT_CTA}
           </Button>
         )}
-        {canCompileOrPromote && (
+        {canPromote && (
           <Button
             type="button"
             variant="outline"
@@ -830,7 +857,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
       {archiveBlockedReason != null && (
         <p className="text-sm text-muted-foreground">{archiveBlockedReason}</p>
       )}
-      {canCompileOrPromote && promoteUnavailableReason != null && (
+      {canPromote && promoteUnavailableReason != null && (
         <p className="text-sm text-muted-foreground">{promoteUnavailableReason}</p>
       )}
 
@@ -839,7 +866,11 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           <Label htmlFor={`draft-${draftId}-retry-stage`} className="mb-0">
             Retry from
           </Label>
-          <Select value={retryStage} onValueChange={(value) => setRetryStage(value as DraftCompileStartStage)}>
+          <Select
+            value={retryStage}
+            onValueChange={(value) => setRetryStage(value as DraftCompileStartStage)}
+            disabled={retryCapabilityBlocked}
+          >
             <SelectTrigger id={`draft-${draftId}-retry-stage`} className="w-48">
               <SelectValue placeholder="Choose a stage" />
             </SelectTrigger>
@@ -855,7 +886,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
             type="button"
             size="sm"
             onClick={() => retryStage && retryMutation.mutate(retryStage)}
-            disabled={!retryStage || retryMutation.isPending}
+            disabled={!retryStage || retryMutation.isPending || retryCapabilityBlocked}
           >
             {retryMutation.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin motion-reduce:animate-none" aria-hidden="true" />}
             Retry
@@ -950,7 +981,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           jobId={inspectorJobId}
           stage={selectedStageEntry}
           lockVersion={draft.lock_version}
-          canDispose={canManageContent && !hasActiveJob}
+          canDispose={canManageContent && !hasActiveJob && capabilities?.enabled !== false}
           tier={draft.tier}
         />
       </div>
@@ -1190,7 +1221,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
         inputs={detail.inputs}
         revisions={revisions}
         currentRevisionId={currentRevisionId}
-        canWrite={canCompileOrPromote}
+        canWrite={canPromote}
         onPromoted={(result: PromoteResponse) => {
           toast.success(`Promoted to the vault as ${result.filename}.`);
         }}

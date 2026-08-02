@@ -625,6 +625,52 @@ describe("DraftWorkspace", () => {
     expect(screen.getByTestId("source-upload")).toHaveTextContent("disabled:true");
   });
 
+  it("offers compile, retry and Mark Ready with read-only vault access, but not Promote to vault (backend gates only promote on vault write)", async () => {
+    mockListDraftJobs.mockReset().mockResolvedValue({
+      items: [makeJob({ status: "failed" })],
+      total: 1,
+      page: 1,
+      per_page: 10,
+    });
+    renderWorkspace({ vaultAccess: "read" });
+
+    expect(await screen.findByRole("button", { name: "Create draft" })).toBeEnabled();
+    await screen.findByRole("group", { name: "Retry from" });
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Mark Ready" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Promote to vault" })).not.toBeInTheDocument();
+  });
+
+  it("offers compile, retry, Mark Ready and Promote to vault with vault write access", async () => {
+    mockListDraftJobs.mockReset().mockResolvedValue({
+      items: [makeJob({ status: "failed" })],
+      total: 1,
+      page: 1,
+      per_page: 10,
+    });
+    renderWorkspace({ vaultAccess: "write" });
+
+    expect(await screen.findByRole("button", { name: "Create draft" })).toBeEnabled();
+    await screen.findByRole("group", { name: "Retry from" });
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Mark Ready" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Promote to vault" })).toBeEnabled();
+  });
+
+  it("offers no submittable Retry when the capability is disabled, even with a failed job", async () => {
+    mockListDraftJobs.mockReset().mockResolvedValue({
+      items: [makeJob({ status: "failed" })],
+      total: 1,
+      page: 1,
+      per_page: 10,
+    });
+    renderWorkspace({ capabilities: makeCapabilities({ enabled: false, compile_available: false }) });
+
+    await screen.findByRole("group", { name: "Retry from" });
+    expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
+    expect(mockRetryDraftJob).not.toHaveBeenCalled();
+  });
+
   it("shows Restore for an authorized archived project and blocks compile with the archived reason", async () => {
     renderWorkspace({ draft: makeDraft({ status: "archived" }), detail: makeDetail({ summary: makeDraft({ status: "archived" }) }) });
 

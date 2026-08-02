@@ -4,9 +4,11 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
+import { useNavigate } from "react-router-dom";
 import DraftRoomDetailPage from "./DraftRoomDetailPage";
 import { DRAFT_ROOM_DISABLED_MESSAGE } from "@/components/draft-room/labels";
 import { useDraftRoomUiStore } from "@/stores/useDraftRoomUiStore";
+import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import type { DraftDetail, DraftRoomCapabilities } from "@/lib/api/draftRoom";
 
 const {
@@ -169,11 +171,32 @@ function makeCapabilities(overrides: Partial<DraftRoomCapabilities> = {}): Draft
 
 const initialUiState = useDraftRoomUiStore.getState();
 
+// Stand-in for the mobile bottom nav's tab switcher: a plain
+// `<button onClick>` (no `<a href>`) that consults the shared
+// `useNavigationGuardStore` before navigating, exactly like `App.tsx`'s
+// `handleItemSelect` does for the real bottom nav.
+function ProgrammaticNavButton() {
+  const navigate = useNavigate();
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        const confirmLeave = useNavigationGuardStore.getState().confirmLeave;
+        if (confirmLeave && !confirmLeave()) return;
+        navigate("/draft-room");
+      }}
+    >
+      mobile-nav-documents
+    </button>
+  );
+}
+
 function renderDetailPage(draftId: string) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const utils = render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[`/draft-room/${draftId}`]}>
+        <ProgrammaticNavButton />
         <Routes>
           <Route path="/draft-room" element={<div>Draft Room List</div>} />
           <Route path="/draft-room/:draftId" element={<DraftRoomDetailPage />} />
@@ -213,6 +236,7 @@ beforeEach(() => {
   mockUseDraftRoomEvents.mockReset().mockReturnValue({ connected: true, pollingFallback: false, lastEvent: null });
   mockRequestCompile.mockReset();
   vi.mocked(window.confirm).mockReset().mockReturnValue(true);
+  useNavigationGuardStore.getState().setConfirmLeave(null);
 });
 
 describe("DraftRoomDetailPage", () => {
@@ -334,6 +358,37 @@ describe("DraftRoomDetailPage", () => {
     vi.mocked(window.confirm).mockReturnValue(true);
 
     await user.click(screen.getByRole("link", { name: /back to draft room/i }));
+
+    expect(window.confirm).toHaveBeenCalled();
+    expect(await screen.findByText("Draft Room List")).toBeInTheDocument();
+  });
+
+  it("blocks a button-triggered programmatic navigation (no <a href> involved) when the warning is declined", async () => {
+    const user = userEvent.setup();
+    mockGetDraft.mockResolvedValue(makeDetail());
+    renderDetailPage("42");
+    await screen.findByTestId("workspace");
+
+    useDraftRoomUiStore.setState((state) => ({ draftText: { ...state.draftText, 42: "Edited text." } }));
+    vi.mocked(window.confirm).mockReturnValue(false);
+
+    await user.click(screen.getByRole("button", { name: "mobile-nav-documents" }));
+
+    expect(window.confirm).toHaveBeenCalled();
+    expect(screen.queryByText("Draft Room List")).not.toBeInTheDocument();
+    expect(screen.getByTestId("workspace")).toBeInTheDocument();
+  });
+
+  it("allows a button-triggered programmatic navigation once the warning is accepted", async () => {
+    const user = userEvent.setup();
+    mockGetDraft.mockResolvedValue(makeDetail());
+    renderDetailPage("42");
+    await screen.findByTestId("workspace");
+
+    useDraftRoomUiStore.setState((state) => ({ draftText: { ...state.draftText, 42: "Edited text." } }));
+    vi.mocked(window.confirm).mockReturnValue(true);
+
+    await user.click(screen.getByRole("button", { name: "mobile-nav-documents" }));
 
     expect(window.confirm).toHaveBeenCalled();
     expect(await screen.findByText("Draft Room List")).toBeInTheDocument();

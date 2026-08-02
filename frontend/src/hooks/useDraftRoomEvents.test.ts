@@ -519,6 +519,62 @@ describe("useDraftRoomEvents", () => {
     unmount();
   });
 
+  // Regression test for the residual of issue #437 finding 3: the fix above
+  // covers a connection that eventually *drops* (an explicit `fail()`).
+  // This covers the case that fix left open — a 200 OK response whose body
+  // never yields anything AT ALL, ever. Without an inactivity timeout,
+  // `reader.read()` blocks forever, `firstByteAt` is never set, and the
+  // reconnect loop's failure counter never increments, so the polling
+  // fallback is unreachable. This test fails against the pre-fix hook: with
+  // no timeout racing `reader.read()`, advancing fake timers past the
+  // inactivity window does nothing (the real, ever-pending `read()` promise
+  // is still what the loop is awaiting), so `fetchMock` is never called a
+  // second time and `pollingFallback` never becomes `true`.
+  it("tears a hung connection down on inactivity and reaches the polling fallback (no drop, no bytes, ever)", async () => {
+    vi.useFakeTimers();
+    queryClient.setQueryData(
+      draftRoomKeys.detail(DRAFT_ID),
+      { active_compile_job: { id: 1 } } as unknown as DraftDetail
+    );
+    const hung1 = controllableSse();
+    const hung2 = controllableSse();
+    const hung3 = controllableSse();
+    fetchMock
+      .mockResolvedValueOnce(hung1.response)
+      .mockResolvedValueOnce(hung2.response)
+      .mockResolvedValueOnce(hung3.response)
+      .mockImplementation(() => new Promise<Response>(() => {}));
+
+    const { result, unmount } = renderEvents();
+
+    // Connection 1: 200 OK, `emit`/`close`/`fail` never called — the body
+    // truly never yields. Only the inactivity timeout (45s) can end it. Exact
+    // backoff-doubling timing is already covered by the "never deliver a
+    // byte" test above (via an explicit `fail()` at a known instant); this
+    // test's job is the inactivity teardown itself, so it advances in
+    // generous, non-overlapping blocks (timeout + worst-case backoff) rather
+    // than pinning the exact millisecond each reconnect fires.
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await advance(46000); // 45s inactivity timeout + base 1s backoff
+    expect(hung1.reader.cancel).toHaveBeenCalled(); // the hung reader is actually torn down
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+    // Connection 2: same hang. Reaching a second reconnect at all proves the
+    // silent timeout counted as a real failure, not a healthy stream (a
+    // healthy stream resets backoff and this loop would never escalate
+    // toward the polling fallback below).
+    await advance(47000); // 45s inactivity timeout + doubled 2s backoff
+    expect(hung2.reader.cancel).toHaveBeenCalled();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+
+    // Connection 3: third consecutive silent failure — polling fallback engages.
+    await advance(45500);
+    expect(hung3.reader.cancel).toHaveBeenCalled();
+    await vi.waitFor(() => expect(result.current.pollingFallback).toBe(true));
+
+    unmount();
+  });
+
   it("aborts the controller and stops fetching on unmount", async () => {
     fetchMock.mockResolvedValue(controllableSse().response);
     const { unmount } = renderEvents();

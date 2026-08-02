@@ -62,6 +62,16 @@ const RECONNECT_MAX_MS = 30000;
 // that would silently defeat both backoff escalation and the polling
 // fallback below, leaving the user with no data and no recovery.
 const STREAM_HEALTHY_MS = 20000;
+// The server sends an SSE keepalive comment every 15s (see STREAM_HEALTHY_MS
+// above), so a genuinely live connection always yields bytes well inside any
+// window past that. 45s (3x the keepalive interval) gives generous margin
+// for scheduling jitter/a slow tick under load while still catching the
+// failure mode this constant exists for: a 200 OK response whose body never
+// yields anything at all. Without this, `reader.read()` blocks forever,
+// `firstByteAt` is never set, and the reconnect loop's failure counter never
+// increments — the polling fallback becomes unreachable for a hung-but-open
+// connection, even though it works correctly for a connection that drops.
+const STREAM_INACTIVITY_TIMEOUT_MS = 45000;
 const MAX_BUFFER_BYTES = 64 * 1024;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const DEFAULT_POLL_INTERVAL_SECONDS = 2;
@@ -84,6 +94,31 @@ function isDraftRoomEvent(value: unknown): value is DraftRoomEvent {
   if (typeof value !== "object" || value === null) return false;
   const type = (value as { type?: unknown }).type;
   return typeof type === "string" && KNOWN_EVENT_TYPES.has(type);
+}
+
+/**
+ * Race a single `reader.read()` against an inactivity timeout. A stream that
+ * never yields a byte leaves the underlying `read()` promise pending
+ * forever, so the timeout — not `reader.read()` itself — is what lets the
+ * caller notice and tear the connection down.
+ */
+function readWithInactivityTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("draft_room_stream_inactivity_timeout")), timeoutMs);
+    reader.read().then(
+      (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
 }
 
 /**
@@ -314,7 +349,7 @@ export function useDraftRoomEvents(
       let receivedBytes = false;
       try {
         for (;;) {
-          const { value, done } = await reader.read();
+          const { value, done } = await readWithInactivityTimeout(reader, STREAM_INACTIVITY_TIMEOUT_MS);
           if (done) {
             cleanEnd = true;
             break;
@@ -333,7 +368,11 @@ export function useDraftRoomEvents(
           buffer = drainBuffer(buffer);
         }
       } catch {
-        // Stream interrupted — fall through; cleanEnd stays false.
+        // Stream interrupted, or timed out with no bytes ever received —
+        // either way cancel the reader so a hung-but-open connection is
+        // actually torn down rather than merely abandoned, then fall
+        // through; cleanEnd stays false.
+        await Promise.resolve(reader.cancel()).catch(() => {});
       }
       setConnected(false);
       if (controller.signal.aborted) return "stop";

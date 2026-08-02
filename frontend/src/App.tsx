@@ -6,6 +6,7 @@ import { PageShell } from "@/components/layout/PageShell";
 import { useHealthCheck } from "@/hooks/useHealthCheck";
 import { useEffect, lazy, Suspense } from "react";
 import { useAuthStore } from "@/stores/useAuthStore";
+import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import type { NavItemId } from "@/components/layout/navigationTypes";
 import { Loader2 } from "lucide-react";
 import { APP_BASENAME } from "@/lib/paths";
@@ -73,6 +74,12 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
   const activeItem = getActiveItemFromPath(location.pathname);
 
   const handleItemSelect = (id: string) => {
+    // The mobile bottom nav switches tabs via a plain `<button onClick>`
+    // (no `<a href>`), so Draft Room's unsaved-changes guard can't see it
+    // through its click-based interceptor. Consult the same guard here —
+    // see `useNavigationGuardStore` / `DraftRoomDetailPage`.
+    const confirmLeave = useNavigationGuardStore.getState().confirmLeave;
+    if (confirmLeave && !confirmLeave()) return;
     switch (id) {
       case "chat":
         navigate("/chat");

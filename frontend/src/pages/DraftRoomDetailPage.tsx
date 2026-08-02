@@ -14,6 +14,7 @@ import { DRAFT_ROOM_DISABLED_MESSAGE } from "@/components/draft-room/labels";
 import { useDraftRoomCapabilities } from "@/hooks/useDraftRoomCapabilities";
 import { useDraftRoomEvents } from "@/hooks/useDraftRoomEvents";
 import { useDraftRoomUiStore } from "@/stores/useDraftRoomUiStore";
+import { useNavigationGuardStore } from "@/stores/useNavigationGuardStore";
 import {
   draftRoomKeys,
   getDraft,
@@ -107,24 +108,42 @@ export default function DraftRoomDetailPage() {
   }, [isDirty]);
 
   // In-app guard: this app uses a plain `<BrowserRouter>` (no data router), so
-  // `useBlocker`/`unstable_usePrompt` aren't available. Every in-app
-  // navigation in this codebase renders as a real `<a>` (react-router's
+  // `useBlocker`/`unstable_usePrompt` throw at runtime here — verified
+  // against `node_modules/react-router`, they require `useDataRouterContext`,
+  // which only a `createBrowserRouter`/`RouterProvider` tree provides.
+  //
+  // Most in-app navigation renders as a real `<a>` (react-router's
   // `Link`/`NavLink`), so a capturing click listener on the nearest anchor
   // covers the nav rail, breadcrumbs, and any link this page itself renders,
   // without needing cooperation from the components that own those links.
+  // But the mobile bottom nav's tab switcher navigates programmatically
+  // (`navigate()` from a plain `<button onClick>`, no `<a>` involved), so it
+  // registers this same `confirmLeave` predicate in a shared store
+  // (`useNavigationGuardStore`) that `App.tsx`'s navigation dispatch consults
+  // before calling `navigate()` — a second enforcement point for the one
+  // guard, rather than two different guards.
+  const setConfirmLeave = useNavigationGuardStore((s) => s.setConfirmLeave);
   useEffect(() => {
-    if (!isDirty) return;
+    if (!isDirty) {
+      setConfirmLeave(null);
+      return;
+    }
+    const confirmLeave = () => window.confirm(UNSAVED_CHANGES_WARNING);
+    setConfirmLeave(confirmLeave);
     const handler = (event: MouseEvent) => {
       const target = (event.target as HTMLElement | null)?.closest("a[href]");
       if (!target) return;
-      if (!window.confirm(UNSAVED_CHANGES_WARNING)) {
+      if (!confirmLeave()) {
         event.preventDefault();
         event.stopPropagation();
       }
     };
     document.addEventListener("click", handler, true);
-    return () => document.removeEventListener("click", handler, true);
-  }, [isDirty]);
+    return () => {
+      document.removeEventListener("click", handler, true);
+      setConfirmLeave(null);
+    };
+  }, [isDirty, setConfirmLeave]);
 
   const [derivedStatus, setDerivedStatus] = useState<DraftDerivedStatus>({
     sourceOnly: false,
