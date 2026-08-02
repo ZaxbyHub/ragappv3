@@ -447,8 +447,13 @@ def _delete_file_row(db_pool: SQLiteConnectionPool, file_id: int) -> bool:
     except Exception:
         try:
             conn.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            logger.debug(
+                "draft_room_promote: rollback failed while compensating files "
+                "row id=%s: %s",
+                file_id,
+                rollback_exc,
+            )
         logger.warning(
             "draft_room_promote: failed to compensate files row id=%s after a "
             "later promotion step failed — an orphan files row may now exist",
@@ -458,8 +463,13 @@ def _delete_file_row(db_pool: SQLiteConnectionPool, file_id: int) -> bool:
     finally:
         try:
             db_pool.release_connection(conn)
-        except Exception:
-            pass
+        except Exception as release_exc:
+            logger.debug(
+                "draft_room_promote: releasing the connection used to "
+                "compensate files row id=%s failed: %s",
+                file_id,
+                release_exc,
+            )
 
 
 def _delete_promotion_row(db_pool: SQLiteConnectionPool, promotion_id: int) -> bool:
@@ -483,8 +493,13 @@ def _delete_promotion_row(db_pool: SQLiteConnectionPool, promotion_id: int) -> b
     except Exception:
         try:
             conn.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            logger.debug(
+                "draft_room_promote: rollback failed while compensating "
+                "draft_promotions row id=%s: %s",
+                promotion_id,
+                rollback_exc,
+            )
         logger.warning(
             "draft_room_promote: failed to compensate draft_promotions row "
             "id=%s after a later promotion step failed — an orphan "
@@ -495,8 +510,13 @@ def _delete_promotion_row(db_pool: SQLiteConnectionPool, promotion_id: int) -> b
     finally:
         try:
             db_pool.release_connection(conn)
-        except Exception:
-            pass
+        except Exception as release_exc:
+            logger.debug(
+                "draft_room_promote: releasing the connection used to "
+                "compensate draft_promotions row id=%s failed: %s",
+                promotion_id,
+                release_exc,
+            )
 
 
 def _discard_safe(path: Optional[Path]) -> bool:
