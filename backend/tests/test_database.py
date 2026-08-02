@@ -370,6 +370,131 @@ class TestDatabaseSchema(unittest.TestCase):
         # Idempotent: re-running the (now up to date) migration again is a no-op.
         migrate_add_draft_room_promotions(self.temp_db_path)
 
+    def test_migrate_draft_room_promotions_rebuild_is_atomic_on_failure(self):
+        """`conn.executescript()` implicitly commits any pending transaction
+        first, so a naive rebuild that used it for the recreate step would
+        make `ALTER TABLE RENAME`/`DROP INDEX` permanent before the row copy
+        could even run -- if the copy then failed (e.g. a legacy row that
+        violates the current CHECK constraint), the old data would be
+        stranded in `draft_promotions_legacy_fk` and a later re-run would
+        see the new-shape table and silently treat the migration as done,
+        permanently losing that data. The rebuild must instead run as one
+        explicit transaction: on failure, everything rolls back and the
+        database is left exactly as it was -- the old FK'd table, indexed,
+        with all of its original rows intact (issue #437 review finding)."""
+        init_db(self.temp_db_path)
+        run_migrations(self.temp_db_path)
+
+        conn = sqlite3.connect(self.temp_db_path)
+        try:
+            conn.execute(
+                "INSERT INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (101,'promo-owner','x','Owner','member',1)"
+            )
+            conn.execute("INSERT INTO vaults (id, name) VALUES (101,'Promo Vault')")
+            conn.execute(
+                "INSERT INTO drafts (id, vault_id, created_by, title, mode) "
+                "VALUES (101,101,101,'D','rewrite')"
+            )
+            conn.execute(
+                "INSERT INTO files (id, vault_id, file_path, file_name, file_size) "
+                "VALUES (101,101,'/tmp/x.txt','x.txt',10)"
+            )
+            conn.execute("DROP INDEX IF EXISTS idx_draft_promotions_draft")
+            conn.execute("DROP TABLE draft_promotions")
+            conn.executescript("""
+                CREATE TABLE draft_promotions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+                    source_type TEXT NOT NULL CHECK (source_type IN ('input','revision')),
+                    source_id INTEGER NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    vault_id INTEGER NOT NULL REFERENCES vaults(id) ON DELETE CASCADE,
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL,
+                    promoted_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX idx_draft_promotions_draft
+                    ON draft_promotions(draft_id);
+            """)
+            # A valid row plus one that will violate the CURRENT (rebuilt)
+            # table's CHECK constraint -- bypass the legacy table's own
+            # CHECK (it has the same constraint) via writable_schema so the
+            # bad row can exist here at all, exactly as a real legacy
+            # database with pre-constraint data could.
+            conn.execute(
+                "INSERT INTO draft_promotions "
+                "(id, draft_id, source_type, source_id, source_sha256, vault_id, "
+                "file_id, filename, promoted_by) "
+                "VALUES (101,101,'input',101,'deadbeef',101,101,'x.txt',101)"
+            )
+            conn.execute("PRAGMA writable_schema = ON")
+            conn.execute(
+                "UPDATE sqlite_master SET sql = replace(sql, "
+                "\"CHECK (source_type IN ('input','revision'))\", '') "
+                "WHERE name = 'draft_promotions'"
+            )
+            conn.execute("PRAGMA writable_schema = OFF")
+            conn.commit()
+            conn.close()
+
+            conn = sqlite3.connect(self.temp_db_path)
+            conn.execute(
+                "INSERT INTO draft_promotions "
+                "(id, draft_id, source_type, source_id, source_sha256, vault_id, "
+                "file_id, filename, promoted_by) "
+                "VALUES (102,101,'BAD_TYPE',102,'cafebabe',101,101,'y.txt',101)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            migrate_add_draft_room_promotions(self.temp_db_path)
+
+        conn = sqlite3.connect(self.temp_db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name LIKE 'draft_promotions%'"
+                ).fetchall()
+            }
+            self.assertEqual(
+                tables,
+                {"draft_promotions"},
+                "a failed rebuild must not strand a _legacy_fk table",
+            )
+
+            fk_rows = conn.execute("PRAGMA foreign_key_list(draft_promotions)").fetchall()
+            self.assertTrue(
+                any(row["table"] == "files" for row in fk_rows),
+                "on rollback the OLD FK'd shape must still be in place",
+            )
+
+            rows = conn.execute(
+                "SELECT id FROM draft_promotions ORDER BY id"
+            ).fetchall()
+            self.assertEqual(
+                [r["id"] for r in rows],
+                [101, 102],
+                "both original rows must survive the rolled-back attempt",
+            )
+
+            indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND tbl_name = 'draft_promotions'"
+                ).fetchall()
+            }
+            self.assertIn("idx_draft_promotions_draft", indexes)
+        finally:
+            conn.close()
+
 
 if __name__ == '__main__':
     unittest.main()

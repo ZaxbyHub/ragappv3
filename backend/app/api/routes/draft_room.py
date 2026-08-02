@@ -116,6 +116,7 @@ from app.services.draft_pipeline import (
 from app.services.draft_promotion import (
     DraftPromotionDuplicateError,
     DraftPromotionError,
+    DraftPromotionPathConflictError,
     DraftPromotionTooLargeError,
     promote_input,
     promote_revision,
@@ -3628,6 +3629,10 @@ async def _run_promotion(
         if exc.cleanup_incomplete:
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
         raise DraftRoomHTTPError(413, str(exc), "promotion_too_large") from exc
+    except DraftPromotionPathConflictError as exc:
+        if exc.cleanup_incomplete:
+            await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
+        raise DraftRoomHTTPError(409, str(exc), "promotion_path_conflict") from exc
     except DraftPromotionError as exc:
         if exc.cleanup_incomplete:
             await _record_promotion_cleanup_failure(db, request, user, draft_id, exc)
@@ -3704,12 +3709,14 @@ async def promote_draft_source(
 
     Promotion never mutates the source ``draft_inputs``/``draft_revisions``
     row and never marks it indexed — the promoted bytes are a copy, written
-    by :mod:`app.services.draft_promotion`, the exact internal seam a normal
-    document upload uses (``DocumentProcessor._check_duplicate_in_flight`` /
-    ``_insert_or_get_file_record`` / ``background_processor.enqueue``). It
-    requires vault ``write`` — not just ``read`` — because, unlike every
-    other Draft Room operation, it creates a document other vault members
-    can see.
+    by :mod:`app.services.draft_promotion`, the internal ingestion seam a
+    normal document upload also reaches (duplicate-content check, a `files`
+    row, ``background_processor.enqueue``) — but promotion performs its own
+    exclusive `files`-row insert rather than the shared path-keyed upsert
+    ``_do_upload`` uses, so it can never adopt or corrupt a document it did
+    not create (see the service module's docstring). It requires vault
+    ``write`` — not just ``read`` — because, unlike every other Draft Room
+    operation, it creates a document other vault members can see.
     """
     _require_enabled()
     if body.source_type not in _PROMOTE_SOURCE_TYPES:
@@ -3816,7 +3823,7 @@ async def promote_draft_source(
                 folder_id=body.folder_id,
                 tag_ids=body.tag_ids,
             )
-        except Exception as exc:  # noqa: BLE001 — must not turn a real success into a reported failure
+        except BaseException as exc:  # noqa: BLE001 — must not turn a real success into a reported failure; includes cancellation, which must not skip the audit write below either
             organization_error = str(exc)
             logger.warning(
                 "draft_room: promotion organization step failed after promotion "
@@ -3851,7 +3858,7 @@ async def promote_draft_source(
                 },
             )
         )
-    except Exception as exc:  # noqa: BLE001 — must not turn a real success into a reported failure
+    except BaseException as exc:  # noqa: BLE001 — must not turn a real success into a reported failure; includes cancellation, which must not skip the audit write below either
         draft_event_error = str(exc)
         logger.warning(
             "draft_room: failed to record draft_events row after promotion "
@@ -3861,25 +3868,39 @@ async def promote_draft_source(
             exc,
         )
 
-    await safe_record_security_event(
-        db,
-        event_type="draft_promoted",
-        actor=user,
-        request=request,
-        metadata={
-            "draft_id": draft_id,
-            "source_type": result.source_type,
-            "source_id": result.source_id,
-            "source_sha256": result.source_sha256,
-            "vault_id": result.vault_id,
-            "file_id": result.file_id,
-            "filename": result.filename,
-            "revision_fact_status": revision_fact_status,
-            "was_ready_revision": was_ready_revision,
-            "organization_error": organization_error,
-            "draft_event_error": draft_event_error,
-        },
-    )
+    # The very last thing that may be skipped, and even this must not
+    # prevent the 202 response: nothing before this point can propagate
+    # past it any more (both guards above now catch BaseException), so this
+    # is deliberately the final opportunity to record provenance for a
+    # promotion that has already, irreversibly, happened.
+    try:
+        await safe_record_security_event(
+            db,
+            event_type="draft_promoted",
+            actor=user,
+            request=request,
+            metadata={
+                "draft_id": draft_id,
+                "source_type": result.source_type,
+                "source_id": result.source_id,
+                "source_sha256": result.source_sha256,
+                "vault_id": result.vault_id,
+                "file_id": result.file_id,
+                "filename": result.filename,
+                "revision_fact_status": revision_fact_status,
+                "was_ready_revision": was_ready_revision,
+                "organization_error": organization_error,
+                "draft_event_error": draft_event_error,
+            },
+        )
+    except BaseException as exc:  # noqa: BLE001 — the promotion already succeeded; this must not prevent the response either
+        logger.warning(
+            "draft_room: failed to record draft_promoted security audit "
+            "event (draft_id=%s file_id=%s): %s",
+            draft_id,
+            result.file_id,
+            exc,
+        )
 
     return PromoteResponse(
         promotion_id=result.promotion_id,

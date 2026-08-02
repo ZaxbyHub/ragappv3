@@ -379,7 +379,12 @@ CREATE INDEX IF NOT EXISTS idx_draft_findings_open
 # Defined as its own constant, appended to SCHEMA below and executed verbatim by
 # migrate_add_draft_room_promotions(), so a fresh database and a migrated
 # database cannot drift apart.
-_DRAFT_ROOM_PROMOTIONS_DDL = """
+#: Split into table/index so the FK-rebuild migration can issue each as its
+#: own ``conn.execute()`` inside one explicit transaction — ``executescript``
+#: (needed for a multi-statement string) implicitly commits any pending
+#: transaction first, which would make an in-progress rebuild's
+#: ``ALTER TABLE RENAME`` permanent before the row copy could even run.
+_DRAFT_ROOM_PROMOTIONS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS draft_promotions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
@@ -392,9 +397,12 @@ CREATE TABLE IF NOT EXISTS draft_promotions (
     promoted_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+"""
+_DRAFT_ROOM_PROMOTIONS_INDEX_DDL = """
 CREATE INDEX IF NOT EXISTS idx_draft_promotions_draft
     ON draft_promotions(draft_id);
 """
+_DRAFT_ROOM_PROMOTIONS_DDL = _DRAFT_ROOM_PROMOTIONS_TABLE_DDL + _DRAFT_ROOM_PROMOTIONS_INDEX_DDL
 
 
 # Database schema definition
@@ -4159,11 +4167,27 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
     CONSTRAINT`, so `CREATE TABLE IF NOT EXISTS` alone would silently leave
     that old, cascading shape in place on any database that already ran it.
     This function detects that shape via `PRAGMA foreign_key_list` and
-    rebuilds the table (copying every existing row across) before falling
-    through to the idempotent `CREATE TABLE IF NOT EXISTS` path used by
-    every other case, so a fresh database, a never-migrated legacy database,
-    and a database that already ran the old FK-having shape all converge on
-    the identical current schema.
+    rebuilds the table, copying every existing row across.
+
+    The whole rebuild (rename, index drop, recreate, row copy, old-table
+    drop) runs inside one explicit `BEGIN IMMEDIATE` transaction, issuing
+    each DDL statement individually via `conn.execute()` rather than
+    `conn.executescript()` — SQLite fully supports transactional DDL when
+    statements are executed this way, but `executescript()` implicitly
+    commits any pending transaction first, which would make the
+    `ALTER TABLE RENAME` and index drop permanent before the row copy could
+    even run. If any step fails (including a legacy row that violates the
+    current schema's CHECK constraint), the whole transaction rolls back
+    and the database is left exactly as it was before this call — the old
+    FK'd table, still indexed, untouched — so a retry (or, for a genuinely
+    unmigratable row, an operator fixing the data first) starts from a
+    clean, known state rather than a stranded intermediate one. No
+    "resume a partial rebuild" logic is needed because a partial rebuild
+    can no longer exist on disk.
+
+    A fresh database, a never-migrated legacy database, and a database that
+    already ran the old FK-having shape all converge on the identical
+    current schema.
 
     Args:
         sqlite_path: Path to the SQLite database file.
@@ -4175,27 +4199,30 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' "
             "AND name = 'draft_promotions'"
         ).fetchone()
+        needs_rebuild = False
         if table_row is not None:
             fk_rows = conn.execute("PRAGMA foreign_key_list(draft_promotions)").fetchall()
-            has_file_id_fk = any(
+            needs_rebuild = any(
                 fk_row[2] == "files" and fk_row[3] == "file_id" for fk_row in fk_rows
             )
-            if has_file_id_fk:
+        if needs_rebuild:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 conn.execute(
                     "ALTER TABLE draft_promotions RENAME TO draft_promotions_legacy_fk"
                 )
                 # SQLite index names are global, not scoped per-table:
                 # `ALTER TABLE RENAME` does NOT rename the index bound to it,
                 # so `idx_draft_promotions_draft` now belongs to
-                # `draft_promotions_legacy_fk`. Left alone, the DDL's own
-                # `CREATE INDEX IF NOT EXISTS idx_draft_promotions_draft`
+                # `draft_promotions_legacy_fk`. Left alone, the CREATE INDEX
                 # below would silently no-op (the name is still taken), and
-                # then `DROP TABLE draft_promotions_legacy_fk` would take
-                # that index away entirely, leaving the new table with none.
-                # Drop it explicitly first so the DDL's CREATE INDEX actually
-                # runs against the new table.
+                # then dropping `draft_promotions_legacy_fk` would take that
+                # index away entirely, leaving the new table with none. Drop
+                # it explicitly first so CREATE INDEX actually runs against
+                # the new table.
                 conn.execute("DROP INDEX IF EXISTS idx_draft_promotions_draft")
-                conn.executescript(_DRAFT_ROOM_PROMOTIONS_DDL)
+                conn.execute(_DRAFT_ROOM_PROMOTIONS_TABLE_DDL)
+                conn.execute(_DRAFT_ROOM_PROMOTIONS_INDEX_DDL)
                 conn.execute(
                     "INSERT INTO draft_promotions "
                     "(id, draft_id, source_type, source_id, source_sha256, vault_id, "
@@ -4206,8 +4233,11 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
                 )
                 conn.execute("DROP TABLE draft_promotions_legacy_fk")
                 conn.commit()
-                conn.execute("PRAGMA foreign_keys = ON;")
-                return
+            except BaseException:
+                conn.rollback()
+                raise
+            conn.execute("PRAGMA foreign_keys = ON;")
+            return
         conn.executescript(_DRAFT_ROOM_PROMOTIONS_DDL)
         conn.commit()
         conn.execute("PRAGMA foreign_keys = ON;")

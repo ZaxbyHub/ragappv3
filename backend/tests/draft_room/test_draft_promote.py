@@ -33,6 +33,7 @@ except ImportError:
 
     sys.modules["lancedb"] = types.ModuleType("lancedb")
 
+import anyio
 from fastapi.testclient import TestClient
 
 import app.services.draft_promotion as draft_promotion_module
@@ -984,14 +985,14 @@ class TestPromoteAtomicity(DraftPromoteTestBase):
         real_register_file = draft_promotion_module._register_file
 
         def _register_then_delete_draft(db_pool, dest_path, file_hash, vault_id):
-            created_file_id, created = real_register_file(db_pool, dest_path, file_hash, vault_id)
+            created_file_id = real_register_file(db_pool, dest_path, file_hash, vault_id)
             conn = self._connection_pool.get_connection()
             try:
                 conn.execute("DELETE FROM drafts WHERE id = ?", (draft_id,))
                 conn.commit()
             finally:
                 self._connection_pool.release_connection(conn)
-            return created_file_id, created
+            return created_file_id
 
         with patch.object(
             draft_promotion_module, "_register_file", side_effect=_register_then_delete_draft
@@ -1135,15 +1136,21 @@ class TestPromoteAuditWritesAreBestEffort(DraftPromoteTestBase):
         self.assertIsNotNone(metadata["draft_event_error"])
 
 
-class TestPromoteAdoptedFileProtection(DraftPromoteTestBase):
-    """HIGH review finding: `_insert_or_get_file_record` is an upsert keyed
-    on `file_path`. If a `files` row already exists for the exact
-    destination path — reachable when an earlier row's bytes went missing
-    without the row itself being cleaned up — promotion adopts that row
-    rather than creating a new one, and a later failure in the same attempt
-    must never delete it: every FK to `files(id)` is CASCADE/SET NULL, so
-    destroying an adopted, unrelated document would take everything hanging
-    off it with it."""
+class TestPromoteNeverAdoptsAnExistingFileRow(DraftPromoteTestBase):
+    """HIGH review finding (architectural): promotion must never touch a
+    `files` row it did not itself create — not delete it, and not silently
+    UPDATE/adopt it either. The shared path-keyed upsert
+    (`DocumentProcessor._insert_or_get_file_record`) is an UPDATE on its
+    adoption branch: it overwrites `file_hash`/`file_size`/`file_type`/
+    `vault_id`/`source` and forces `status='pending'` on whatever row
+    already sits at the destination path. Skipping the DELETE in
+    compensation was not enough, because the corruption already happened via
+    that UPDATE before compensation ever runs, and it wedges every retry
+    into `409 duplicate_document` against the now-hijacked hash forever.
+    Promotion now does its own exclusive insert
+    (`_insert_new_file_row`) and refuses outright — `409
+    promotion_path_conflict` — if anything already exists at the reserved
+    path, rather than adopting or overwriting it."""
 
     def _ready_input(self, draft_id, content=b"body"):
         upload = self._upload_input(draft_id, content=content)
@@ -1151,7 +1158,30 @@ class TestPromoteAdoptedFileProtection(DraftPromoteTestBase):
         self._mark_input_ready(input_id)
         return input_id
 
-    def test_preexisting_file_row_survives_later_promotion_failure(self):
+    def _seed_victim_row(self, dest_path, expected_filename):
+        conn = self._connection_pool.get_connection()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO files (vault_id, file_path, file_name, file_hash, "
+                "file_size, file_type, source, status) "
+                "VALUES (?, ?, ?, 'OLD_HASH_AAA', 12345, '.txt', 'upload', 'indexed')",
+                (self.READ_VAULT_ID, str(dest_path), expected_filename),
+            )
+            victim_id = int(cursor.lastrowid)
+            conn.execute(
+                "INSERT INTO failed_chunks (file_id, chunk_index, chunk_text, "
+                "chunk_metadata) VALUES (?, 0, 'the victim document text', '{}')",
+                (victim_id,),
+            )
+            conn.commit()
+            before = dict(
+                conn.execute("SELECT * FROM files WHERE id = ?", (victim_id,)).fetchone()
+            )
+        finally:
+            self._connection_pool.release_connection(conn)
+        return victim_id, before
+
+    def test_preexisting_file_row_is_rejected_not_adopted_or_corrupted(self):
         draft_id = self._create_draft().json()["id"]
         input_id = self._ready_input(draft_id)
 
@@ -1160,33 +1190,61 @@ class TestPromoteAdoptedFileProtection(DraftPromoteTestBase):
         upload_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
         dest_path = upload_dir / expected_filename
 
-        conn = self._connection_pool.get_connection()
-        try:
-            cursor = conn.execute(
-                "INSERT INTO files (vault_id, file_path, file_name, file_size, status) "
-                "VALUES (?, ?, ?, ?, 'indexed')",
-                (self.READ_VAULT_ID, str(dest_path), expected_filename, 999),
-            )
-            preexisting_file_id = cursor.lastrowid
-            conn.commit()
-        finally:
-            self._connection_pool.release_connection(conn)
+        victim_id, before = self._seed_victim_row(dest_path, expected_filename)
+        self.assertFalse(dest_path.exists(), "victim bytes are missing (precondition)")
 
-        # Force a failure strictly after `_register_file` has already
-        # adopted the pre-existing row.
-        self._mock_background_processor.enqueue = AsyncMock(
-            side_effect=RuntimeError("queue unavailable")
-        )
         resp = self._promote(
             draft_id, source_type="input", source_id=input_id, title=title
         )
-        self.assertEqual(resp.status_code, 500, resp.text)
 
-        files = self._files_rows()
-        self.assertEqual(
-            len(files), 1, "the pre-existing row must not be deleted by compensation"
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["code"], "promotion_path_conflict")
+
+        # The victim row is untouched byte for byte -- not deleted, and not
+        # silently overwritten by an adoption UPDATE either.
+        conn = self._connection_pool.get_connection()
+        try:
+            after = dict(
+                conn.execute("SELECT * FROM files WHERE id = ?", (victim_id,)).fetchone()
+            )
+            chunk_count = conn.execute(
+                "SELECT COUNT(*) c FROM failed_chunks WHERE file_id = ?", (victim_id,)
+            ).fetchone()["c"]
+        finally:
+            self._connection_pool.release_connection(conn)
+        self.assertEqual(before, after)
+        self.assertEqual(chunk_count, 1)
+
+        # No new row was created, no promotion row, nothing enqueued, and
+        # the reserved (empty) file this attempt created is cleaned up.
+        self.assertEqual(len(self._files_rows()), 1)
+        self.assertEqual(self._promotion_rows(draft_id), [])
+        self._mock_background_processor.enqueue.assert_not_awaited()
+
+    def test_retry_after_path_conflict_is_not_permanently_wedged(self):
+        """A rejected promotion must not leave the destination path — or the
+        vault's dedupe index — in a state where every subsequent retry (even
+        under a different title, i.e. a different destination path) is
+        blocked."""
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        expected_filename = "Existing_Document.txt"
+        dest_path = settings.vault_uploads_dir(self.READ_VAULT_ID) / expected_filename
+        self._seed_victim_row(dest_path, expected_filename)
+
+        first = self._promote(
+            draft_id, source_type="input", source_id=input_id, title="Existing Document"
         )
-        self.assertEqual(files[0]["id"], preexisting_file_id)
+        self.assertEqual(first.status_code, 409, first.text)
+        self.assertEqual(first.json()["code"], "promotion_path_conflict")
+
+        # Retrying under a different title (a different destination path)
+        # succeeds normally -- the earlier rejection left no wedge behind.
+        second = self._promote(
+            draft_id, source_type="input", source_id=input_id, title="A New Title"
+        )
+        self.assertEqual(second.status_code, 202, second.text)
 
 
 class TestPromoteCleanupFailureIsRecorded(DraftPromoteTestBase):
@@ -1267,6 +1325,265 @@ class TestPromoteCancellation(DraftPromoteTestBase):
         self.assertEqual(self._files_rows(), [])
         uploads_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
         self.assertEqual(list(uploads_dir.glob("*")), [])
+
+    def test_anyio_cancel_scope_still_runs_compensation(self):
+        """The real production mechanism: Starlette delivers a dropped
+        client connection as anyio task-group cancellation, which is
+        level-triggered -- the next `await` inside a cancelled scope raises
+        immediately regardless of plain `asyncio.shield`. Only
+        `anyio.CancelScope(shield=True)` (used by `_compensate_shielded`)
+        actually protects compensation from this."""
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id, content=b"cancel me via anyio")
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+
+        conn = self._connection_pool.get_connection()
+        try:
+            store = DraftStore(conn)
+            draft = store.get_draft(draft_id, self.OWNER_ID)
+            input_record = store.get_input(
+                draft_id=draft_id, owner_id=self.OWNER_ID, input_id=input_id
+            )
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        storage = DraftInputStorage(Path(settings.data_dir) / "draft-room")
+
+        class _SlowThenCancelledProcessor:
+            async def enqueue(self, **kwargs):
+                # Give the killer task a chance to fire the cancel scope
+                # while this coroutine is still the one running.
+                await anyio.sleep(0.2)
+
+        outcome: dict = {}
+
+        async def _body():
+            try:
+                await promote_input(
+                    storage=storage,
+                    db_pool=self._connection_pool,
+                    background_processor=_SlowThenCancelledProcessor(),
+                    draft_id=draft_id,
+                    vault_id=draft.vault_id,
+                    title="Cancelled Via Anyio",
+                    promoted_by=self.OWNER_ID,
+                    input_record=input_record,
+                )
+            except BaseException as exc:  # noqa: BLE001 -- capturing exactly what propagates
+                outcome["exception_type"] = type(exc).__name__
+
+        async def _run():
+            async with anyio.create_task_group() as tg:
+                async def _killer():
+                    await anyio.sleep(0.05)
+                    tg.cancel_scope.cancel()
+
+                tg.start_soon(_killer)
+                tg.start_soon(_body)
+
+        asyncio.run(_run())
+
+        self.assertIn("exception_type", outcome)
+        self.assertEqual(outcome["exception_type"], "CancelledError")
+        # Compensation ran to completion despite the cancel scope having
+        # already fired -- the whole point of the anyio shield.
+        self.assertEqual(self._files_rows(), [])
+        uploads_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
+        self.assertEqual(list(uploads_dir.glob("*")), [])
+
+
+class TestPromoteConcurrentPathWriter(DraftPromoteTestBase):
+    """HIGH review finding (architectural): a concurrent writer for the exact
+    reserved path — another promotion, a normal upload, or ``FileWatcher``'s
+    default-on background scan (`settings.auto_scan_enabled`) — must never
+    be silently adopted. Simulated deterministically: a `files` row is
+    inserted for the destination path in between path reservation and
+    registration, exactly the window a concurrent writer would land in."""
+
+    def test_row_appearing_after_reservation_is_rejected_not_adopted(self):
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id, content=b"racing content")
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+
+        upload_dir = settings.vault_uploads_dir(self.READ_VAULT_ID)
+        title = "Racing Document"
+        expected_filename = "Racing_Document.txt"
+
+        real_reserve = draft_promotion_module._reserve_destination_path
+
+        def _reserve_then_insert_concurrent_row(reserve_upload_dir, file_name):
+            dest = real_reserve(reserve_upload_dir, file_name)
+            # A concurrent writer (e.g. FileWatcher) commits a `files` row
+            # for this exact path in the window before `_register_file` runs.
+            conn = self._connection_pool.get_connection()
+            try:
+                conn.execute(
+                    "INSERT INTO files (vault_id, file_path, file_name, "
+                    "file_hash, file_size, source, status) "
+                    "VALUES (?, ?, ?, 'SCAN_HASH', 0, 'scan', 'indexed')",
+                    (self.READ_VAULT_ID, str(dest), file_name),
+                )
+                conn.commit()
+            finally:
+                self._connection_pool.release_connection(conn)
+            return dest
+
+        with patch.object(
+            draft_promotion_module,
+            "_reserve_destination_path",
+            side_effect=_reserve_then_insert_concurrent_row,
+        ):
+            resp = self._promote(
+                draft_id, source_type="input", source_id=input_id, title=title
+            )
+
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertEqual(resp.json()["code"], "promotion_path_conflict")
+
+        # The concurrent writer's row survives untouched; no second row was
+        # adopted or created alongside it.
+        files = self._files_rows()
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0]["source"], "scan")
+        self.assertEqual(files[0]["file_hash"], "SCAN_HASH")
+        self._mock_background_processor.enqueue.assert_not_awaited()
+
+        dest_path = upload_dir / expected_filename
+        self.assertFalse(
+            dest_path.exists(), "the reserved (empty) bytes must be cleaned up"
+        )
+
+
+class TestPromoteCorrelatedPoolExhaustion(DraftPromoteTestBase):
+    """HIGH review finding: pool exhaustion is exactly the condition most
+    likely to cause the original failure (registering the file, inserting
+    provenance, updating phase) AND the compensation that tries to clean up
+    after it — the two are correlated, not independent. Escaping that
+    correlation must never surface as a raw, unenveloped exception."""
+
+    def test_pool_exhausted_from_registration_onward_still_returns_envelope(self):
+        draft_id = self._create_draft().json()["id"]
+        upload = self._upload_input(draft_id, content=b"pool exhaustion probe")
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+
+        pool = self._connection_pool
+        real_get = pool.get_connection
+        armed = {"on": False}
+
+        real_register_file = draft_promotion_module._register_file
+
+        def _register_then_arm(*args, **kwargs):
+            result = real_register_file(*args, **kwargs)
+            armed["on"] = True
+            return result
+
+        def _gated_get():
+            if armed["on"]:
+                raise RuntimeError(
+                    "Could not obtain a connection from the pool after 3 attempts"
+                )
+            return real_get()
+
+        with (
+            patch.object(draft_promotion_module, "_register_file", side_effect=_register_then_arm),
+            patch.object(pool, "get_connection", side_effect=_gated_get),
+        ):
+            try:
+                resp = self._promote(draft_id, source_type="input", source_id=input_id)
+            finally:
+                armed["on"] = False
+
+        # A truly exhausted pool cannot physically run the compensating
+        # DELETE either -- that correlation is the whole point of this
+        # scenario. The fix's job is not to make the impossible possible;
+        # it is to make sure that failure surfaces as the Draft Room error
+        # envelope (never a bare escaped exception or plain-text server
+        # error) with a status/code distinguishable from an ordinary clean
+        # failure, and that it is recorded so an operator can find and
+        # reconcile the orphan later.
+        self.assertEqual(resp.status_code, 500, resp.text)
+        body = resp.json()
+        self.assertEqual(body["code"], "promotion_failed_incomplete_cleanup")
+        self.assertIn("detail", body)
+
+        files = self._files_rows()
+        self.assertEqual(len(files), 1, "the orphan is real -- the pool genuinely could not clean it up")
+
+        cleanup_events = self._security_audit_rows("draft_promotion_cleanup_failed")
+        self.assertEqual(
+            len(cleanup_events),
+            1,
+            "the orphan must be recorded so an operator can find it",
+        )
+        metadata = json.loads(cleanup_events[0]["metadata_json"])
+        self.assertEqual(metadata["draft_id"], draft_id)
+
+        self._mock_background_processor.enqueue.assert_not_awaited()
+
+
+class TestPromotePostEnqueueControlFlowExceptions(DraftPromoteTestBase):
+    """MEDIUM review finding: the post-enqueue best-effort guards
+    (organization, `draft_events`) must catch `BaseException`, not just
+    `Exception` -- a cancellation reaching either of those must not skip the
+    other, and must not skip the final `draft_promoted` audit write either."""
+
+    def _ready_input(self, draft_id, content=b"body"):
+        upload = self._upload_input(draft_id, content=content)
+        input_id = upload.json()["input"]["id"]
+        self._mark_input_ready(input_id)
+        return input_id
+
+    def test_record_event_basexception_still_returns_202_with_audit(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+
+        def _boom(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with patch.object(DraftStore, "record_event", _boom):
+            resp = self._promote(draft_id, source_type="input", source_id=input_id)
+
+        self.assertEqual(resp.status_code, 202, resp.text)
+        rows = self._security_audit_rows("draft_promoted")
+        self.assertEqual(len(rows), 1)
+        metadata = json.loads(rows[0]["metadata_json"])
+        self.assertIsNotNone(metadata["draft_event_error"])
+
+    def test_organization_basexception_still_returns_202_with_audit(self):
+        draft_id = self._create_draft().json()["id"]
+        input_id = self._ready_input(draft_id)
+        conn = self._connection_pool.get_connection()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO folders (vault_id, name) VALUES (?, ?)",
+                (self.READ_VAULT_ID, "Target"),
+            )
+            folder_id = int(cursor.lastrowid)
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        from app.services.folder_store import FolderStore
+
+        def _boom(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        with patch.object(FolderStore, "move_documents", _boom):
+            resp = self._promote(
+                draft_id,
+                source_type="input",
+                source_id=input_id,
+                folder_id=folder_id,
+            )
+
+        self.assertEqual(resp.status_code, 202, resp.text)
+        rows = self._security_audit_rows("draft_promoted")
+        self.assertEqual(len(rows), 1)
+        metadata = json.loads(rows[0]["metadata_json"])
+        self.assertIsNotNone(metadata["organization_error"])
 
 
 if __name__ == "__main__":

@@ -2,11 +2,10 @@
 ``specs/draft-room/SPEC.md`` sections 3.4 and 6.4).
 
 Promoting a draft input or revision copies its bytes into a vault's normal
-upload directory and runs them through the *exact same* duplicate-check /
-``files``-row-creation / background-enqueue sequence a normal document
-upload uses (``app.api.routes.documents._do_upload``), so the promoted
-document enters ordinary ingestion and indexing with no special-cased
-behavior.
+upload directory and creates a ``files`` row + enqueues it for background
+ingestion, the same downstream effect a normal document upload
+(``app.api.routes.documents._do_upload``) has, so the promoted document
+enters ordinary ingestion and indexing with no special-cased behavior.
 
 This module never imports from ``app.api.routes.*`` and never issues an HTTP
 request — SPEC section 6.4 requires promotion to call this service directly,
@@ -16,18 +15,42 @@ input storage path (``DraftInputStorage``'s root); the destination path is
 always inside ``UploadPathProvider().get_upload_dir(vault_id)``, and the
 source input's bytes are only *read*, then copied.
 
+Promotion does NOT call ``DocumentProcessor._insert_or_get_file_record`` (the
+upsert ``_do_upload`` uses) — deliberately. That method's adoption branch is
+an UPDATE: given an existing ``files`` row at the destination path (reachable
+whenever an earlier row's bytes went missing without the row itself being
+cleaned up, or from ``FileWatcher``'s default-on background scan of the same
+upload directory landing in the window between reserving the path and
+registering the row), it silently overwrites that row's ``file_hash`` /
+``file_size`` / ``file_type`` / ``vault_id`` / ``source`` and forces
+``status='pending'``. A promotion that later failed and tried to compensate
+could not undo that overwrite — the victim document's identity is gone
+either way, by UPDATE if adoption happens, or corrupted regardless of
+whether the caller then also deletes the row. Instead, :func:`_insert_new_file_row`
+does its own exclusive insert inside a ``BEGIN IMMEDIATE`` transaction that
+re-checks the path first: if anything already occupies that exact path — no
+matter what created it, or when — this raises
+:class:`DraftPromotionPathConflictError` rather than touching that row.
+``created`` is therefore true by construction for every ``files`` row this
+module ever creates, and compensation can always safely delete exactly the
+rows (and only the rows) this attempt itself made.
+
 Atomicity: a promotion either leaves behind bytes + a ``files`` row + a
 ``draft_promotions`` row + an enqueued ingestion job, or it leaves nothing at
-all. ``DocumentProcessor._insert_or_get_file_record`` commits its own
-transaction internally (shared with the normal upload route — not something
-this module can safely change), so a single all-or-nothing SQL transaction
-spanning the ``files`` insert and the ``draft_promotions`` insert is not
-available without touching that shared method. Instead, every step after the
-``files`` row is created runs inside one compensation block: if the
-provenance insert, the phase update, or the enqueue call fails for any
-reason, the just-created ``files`` row (and, if it was created, the
-``draft_promotions`` row) are deleted along with the copied bytes, so a
-failed promotion is never left half-done — see :func:`_promote`.
+all. ``_insert_new_file_row`` and ``_insert_promotion_row`` each commit their
+own transaction (there is no cross-table atomicity between the two "files"
+and "draft_promotions" inserts — see ``_insert_promotion_row``'s docstring
+for why), so every step after the ``files`` row is created runs inside one
+compensation block: if the provenance insert, the phase update, or the
+enqueue call fails for any reason, the just-created ``files`` row (and, if it
+was created, the ``draft_promotions`` row) are deleted along with the copied
+bytes, so a failed promotion is never left half-done — see :func:`_promote`.
+Compensation itself never raises (every step is independently guarded) and
+runs shielded from cancellation with a bounded timeout, because Starlette
+delivers a dropped client connection as anyio task-group cancellation, which
+re-raises at the *next* await regardless of ordinary ``asyncio.shield`` —
+without an anyio-level shield, a cancelled request would skip compensation
+entirely and leave everything behind.
 """
 
 from __future__ import annotations
@@ -38,13 +61,16 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
+
+import anyio
 
 from app.config import settings
 from app.models.database import SQLiteConnectionPool
 from app.services.background_tasks import BackgroundProcessor
-from app.services.document_processor import DocumentProcessor, DuplicateFileError
+from app.services.document_processor import DocumentProcessor
 from app.services.document_progress import PHASE_QUEUED, set_phase
 from app.services.draft_input_storage import DraftInputStorage
 from app.services.draft_store import DraftInputRecord, DraftRevisionRecord
@@ -66,6 +92,12 @@ _FALLBACK_STEM = "promoted_document"
 #: 300 characters; without this clamp, a long-but-otherwise-valid title can
 #: make `os.open` raise `OSError: [Errno 36] File name too long`.
 _MAX_FILENAME_STEM_CHARS = 200
+
+#: Upper bound on how long failure-path compensation (deleting whatever this
+#: attempt itself created, plus the copied bytes) may run once shielded from
+#: cancellation. Generous for three local SQLite statements and one unlink,
+#: but finite: a genuinely wedged pool must not hang the request forever.
+_COMPENSATION_TIMEOUT_SECONDS = 30.0
 
 
 class DraftPromotionError(Exception):
@@ -104,6 +136,20 @@ class DraftPromotionTooLargeError(DraftPromotionError):
     translate this to ``413``, matching ``_do_upload``'s own limit."""
 
     code = "promotion_too_large"
+
+
+class DraftPromotionPathConflictError(DraftPromotionError):
+    """A ``files`` row already exists at the exact path this attempt reserved.
+
+    Reachable when an earlier row's bytes went missing without the row
+    itself being cleaned up, or when ``FileWatcher``'s default-on background
+    scan (``settings.auto_scan_enabled``) inserts a row for this same path
+    in the window between reserving it and registering it. Either way, this
+    module never adopts or overwrites a row it did not itself insert —
+    see the module docstring. Callers translate this to ``409``.
+    """
+
+    code = "promotion_path_conflict"
 
 
 @dataclass
@@ -173,6 +219,23 @@ def _reserve_destination_path(upload_dir: Path, file_name: str) -> Path:
     return file_path
 
 
+async def _reserve_destination_path_shielded(upload_dir: Path, file_name: str) -> Path:
+    """Reserve the destination path shielded from cancellation.
+
+    This is a fast, local filesystem call with a real, irreversible side
+    effect (it creates an empty file on disk). If the ``await`` on it were
+    cancelled at exactly this point, the underlying thread-pool worker would
+    still create the file — threads cannot be forcibly stopped — but the
+    caller would never learn the path, and so could never clean it up
+    (nothing this module doesn't track can be discarded, and the file would
+    become a ``FileWatcher`` scan target). Shielding guarantees the caller
+    always ends up with a definite ``dest_path`` (or a definite failure
+    before any file was created) instead of this in-between state.
+    """
+    with anyio.CancelScope(shield=True):
+        return await asyncio.to_thread(_reserve_destination_path, upload_dir, file_name)
+
+
 def _copy_input_bytes(storage: DraftInputStorage, input_record: DraftInputRecord, dest: Path) -> None:
     source_path = storage.resolve(input_record.storage_relpath)
     shutil.copy2(source_path, dest)
@@ -198,29 +261,80 @@ def _enforce_size_limit(dest_path: Path) -> None:
         )
 
 
-def _register_file(
+def _insert_new_file_row(
     db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: str, vault_id: int
-) -> tuple[int, bool]:
-    """Duplicate-check + ``files`` row creation, exactly like a normal upload.
+) -> int:
+    """Promotion's own exclusive ``files`` row insert.
 
-    Returns ``(file_id, created)``. ``DocumentProcessor._insert_or_get_file_record``
-    is an upsert keyed on ``file_path`` (not an insert-only call): if a
-    ``files`` row already exists for this exact path — reachable, per
-    ``_do_upload``'s own known behavior, when an earlier row's bytes went
-    missing without the row itself being cleaned up — it *adopts* that row
-    (updating it in place) and returns its existing id rather than creating
-    a new one. ``created`` distinguishes the two so the caller's failure
-    compensation can delete a row it just inserted, but must never delete an
-    adopted row that predates this attempt and may be referenced elsewhere
-    (chunks, wiki pages, tags — every FK to ``files(id)`` is CASCADE/SET
-    NULL).
+    Deliberately does NOT call ``DocumentProcessor._insert_or_get_file_record``
+    (the path-keyed upsert ``_do_upload`` uses) — see the module docstring
+    for why an adopted row can never be safely compensated. The ``BEGIN
+    IMMEDIATE`` takes SQLite's write lock before re-checking the path, so the
+    "does a row already exist here" check and this INSERT are atomic against
+    any other writer racing for the same path — a concurrent promotion, a
+    concurrent normal upload, or ``FileWatcher``'s background scan. If
+    anything is already there, this raises
+    :class:`DraftPromotionPathConflictError` instead of adopting or
+    overwriting it; the caller must clean up the reserved bytes and fail.
 
-    ``DocumentProcessor._insert_or_get_file_record`` commits its own
-    transaction internally, so this function's write is already durable by
-    the time it returns — see the module docstring for why the caller must
-    treat every step after this one as needing its own compensation on
-    failure, rather than assuming this can be folded into one larger
-    transaction with the ``draft_promotions`` insert.
+    The column set and defaults mirror ``_insert_or_get_file_record``'s own
+    insert branch (``document_processor.py``) exactly — ``status='pending'``,
+    the same five identity columns, ``created_at``/``modified_at`` stamped
+    with the same UTC-ISO convention — so ingestion behaves identically
+    either way. That method itself is not imported or modified here.
+    """
+    file_name = dest_path.name
+    file_size = dest_path.stat().st_size
+    file_type = dest_path.suffix.lower() if dest_path.suffix else None
+    now = datetime.now(UTC).isoformat()
+    path_str = str(dest_path)
+
+    conn = db_pool.get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT id FROM files WHERE file_path = ?", (path_str,)
+            ).fetchone()
+            if existing is not None:
+                raise DraftPromotionPathConflictError(
+                    f"a files row already exists for path {path_str!r}"
+                )
+            cursor = conn.execute(
+                "INSERT INTO files "
+                "(file_path, file_name, file_hash, file_size, file_type, "
+                "vault_id, source, status, created_at, modified_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    path_str,
+                    file_name,
+                    file_hash,
+                    file_size,
+                    file_type,
+                    vault_id,
+                    PROMOTE_SOURCE,
+                    now,
+                    now,
+                ),
+            )
+            new_file_id = cursor.lastrowid
+            if new_file_id is None:
+                raise DraftPromotionError("failed to insert files row: lastrowid is None")
+            conn.commit()
+            return int(new_file_id)
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        db_pool.release_connection(conn)
+
+
+def _register_file(db_pool: SQLiteConnectionPool, dest_path: Path, file_hash: str, vault_id: int) -> int:
+    """Duplicate-content check, then promotion's own exclusive ``files`` row
+    insert (:func:`_insert_new_file_row` — never the shared path-keyed
+    upsert). The returned id always names a row this call itself just
+    created, so the caller's compensation logic can always safely delete it
+    on a later failure without risk of touching an unrelated document.
     """
     processor = DocumentProcessor(pool=db_pool)
     conn = db_pool.get_connection()
@@ -232,25 +346,9 @@ def _register_file(
                 f"(status={duplicate['status']}, file_id={duplicate['id']})",
                 existing_file_id=int(duplicate["id"]),
             )
-        existing_row = conn.execute(
-            "SELECT id FROM files WHERE file_path = ?", (str(dest_path),)
-        ).fetchone()
-        created = existing_row is None
-        try:
-            file_id = processor._insert_or_get_file_record(
-                str(dest_path), file_hash, conn, vault_id, PROMOTE_SOURCE, None, None
-            )
-        except DuplicateFileError as exc:
-            # A race lost against another request's commit between the check
-            # above and this insert. Re-query so the client-facing error
-            # carries the real conflicting file id rather than a placeholder.
-            conflict = processor._check_duplicate_in_flight(file_hash, conn, vault_id)
-            existing_id = int(conflict["id"]) if conflict is not None else None
-            raise DraftPromotionDuplicateError(str(exc), existing_file_id=existing_id) from exc
-        conn.commit()
-        return file_id, created
     finally:
         db_pool.release_connection(conn)
+    return _insert_new_file_row(db_pool, dest_path, file_hash, vault_id)
 
 
 def _insert_promotion_row(
@@ -314,9 +412,9 @@ def _insert_promotion_row(
 
 
 def _delete_file_row(db_pool: SQLiteConnectionPool, file_id: int) -> bool:
-    """Compensation: remove a ``files`` row *this attempt itself created* (never
-    an adopted pre-existing one — see :func:`_register_file`) when a later
-    step in the same promotion attempt failed.
+    """Compensation: remove a ``files`` row this attempt itself inserted
+    (see :func:`_insert_new_file_row` — never an adopted or unrelated one)
+    when a later step in the same promotion attempt failed.
 
     Without this, a promotion that fails after the ``files`` row commits
     (provenance insert, phase update, or enqueue) leaves a permanently
@@ -325,17 +423,32 @@ def _delete_file_row(db_pool: SQLiteConnectionPool, file_id: int) -> bool:
     ever enqueue it. (``_do_upload`` has this exact hole for the same reason
     and is not changed here — this module can only close it for promotion.)
 
-    Returns ``True`` on success, ``False`` if the delete itself failed —
-    the caller must treat ``False`` as "an orphan may now exist" and record
-    it somewhere an operator can find it, never silently swallow it.
+    Connection acquisition is inside the ``try`` deliberately: pool
+    exhaustion is exactly the condition most likely to have caused the
+    original failure this is compensating for, so it must be at least as
+    likely to fail here too. This function must never raise — every failure
+    mode returns ``False`` instead, so it can never replace the exception
+    :func:`_promote` is already handling with one of its own.
     """
-    conn = db_pool.get_connection()
+    try:
+        conn = db_pool.get_connection()
+    except Exception as exc:
+        logger.warning(
+            "draft_room_promote: could not obtain a connection to compensate "
+            "files row id=%s — an orphan files row may now exist: %s",
+            file_id,
+            exc,
+        )
+        return False
     try:
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
         conn.commit()
         return True
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         logger.warning(
             "draft_room_promote: failed to compensate files row id=%s after a "
             "later promotion step failed — an orphan files row may now exist",
@@ -343,23 +456,35 @@ def _delete_file_row(db_pool: SQLiteConnectionPool, file_id: int) -> bool:
         )
         return False
     finally:
-        db_pool.release_connection(conn)
+        try:
+            db_pool.release_connection(conn)
+        except Exception:
+            pass
 
 
 def _delete_promotion_row(db_pool: SQLiteConnectionPool, promotion_id: int) -> bool:
     """Compensation: remove a just-created ``draft_promotions`` row when a
-    later step (phase update or enqueue) in the same attempt failed.
-
-    Returns ``True`` on success, ``False`` if the delete itself failed — see
-    :func:`_delete_file_row`.
-    """
-    conn = db_pool.get_connection()
+    later step (phase update or enqueue) in the same attempt failed. Never
+    raises — see :func:`_delete_file_row`."""
+    try:
+        conn = db_pool.get_connection()
+    except Exception as exc:
+        logger.warning(
+            "draft_room_promote: could not obtain a connection to compensate "
+            "draft_promotions row id=%s — an orphan row may now exist: %s",
+            promotion_id,
+            exc,
+        )
+        return False
     try:
         conn.execute("DELETE FROM draft_promotions WHERE id = ?", (promotion_id,))
         conn.commit()
         return True
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         logger.warning(
             "draft_room_promote: failed to compensate draft_promotions row "
             "id=%s after a later promotion step failed — an orphan "
@@ -368,7 +493,121 @@ def _delete_promotion_row(db_pool: SQLiteConnectionPool, promotion_id: int) -> b
         )
         return False
     finally:
-        db_pool.release_connection(conn)
+        try:
+            db_pool.release_connection(conn)
+        except Exception:
+            pass
+
+
+def _discard_safe(path: Optional[Path]) -> bool:
+    """Remove copied bytes on a failed promotion. Returns ``True`` on success
+    (including "already gone" and "nothing was ever reserved"), ``False`` if
+    the removal itself raised — guarded so an ``OSError`` here (e.g. a
+    permissions change mid-request) can never escape past the typed
+    exception handling in :func:`_promote` and leave the caller without
+    having run the rest of its compensation."""
+    if path is None:
+        return True
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        logger.warning(
+            "draft_room_promote: failed to remove copied bytes at %s — an "
+            "orphan file may now exist on disk",
+            path,
+        )
+        return False
+
+
+async def _compensate(
+    db_pool: SQLiteConnectionPool,
+    *,
+    promotion_id: Optional[int],
+    file_id: Optional[int],
+    dest_path: Optional[Path],
+) -> bool:
+    """Undo everything a failed promotion attempt created: the provenance
+    row (if inserted), the ``files`` row (only ever one this attempt itself
+    inserted), and the copied bytes.
+
+    Never raises. Each step is independently guarded so a failure in one
+    does not stop the others from running, and nothing here can replace or
+    mask the exception the caller is already handling — that guard is
+    layered on top of ``_delete_file_row``/``_delete_promotion_row``
+    already never raising, as defense against something unexpected in the
+    ``asyncio.to_thread`` marshalling itself. Returns whether every step
+    succeeded; ``False`` means an orphan may genuinely still exist somewhere.
+    """
+    cleanup_ok = True
+    if promotion_id is not None:
+        try:
+            if not await asyncio.to_thread(_delete_promotion_row, db_pool, promotion_id):
+                cleanup_ok = False
+        except Exception:
+            cleanup_ok = False
+            logger.warning(
+                "draft_room_promote: compensation step _delete_promotion_row "
+                "raised unexpectedly for id=%s",
+                promotion_id,
+            )
+    if file_id is not None:
+        try:
+            if not await asyncio.to_thread(_delete_file_row, db_pool, file_id):
+                cleanup_ok = False
+        except Exception:
+            cleanup_ok = False
+            logger.warning(
+                "draft_room_promote: compensation step _delete_file_row "
+                "raised unexpectedly for id=%s",
+                file_id,
+            )
+    try:
+        if not await asyncio.to_thread(_discard_safe, dest_path):
+            cleanup_ok = False
+    except Exception:
+        cleanup_ok = False
+        logger.warning(
+            "draft_room_promote: compensation step _discard_safe raised "
+            "unexpectedly for %s",
+            dest_path,
+        )
+    return cleanup_ok
+
+
+async def _compensate_shielded(
+    db_pool: SQLiteConnectionPool,
+    *,
+    promotion_id: Optional[int],
+    file_id: Optional[int],
+    dest_path: Optional[Path],
+) -> bool:
+    """Run :func:`_compensate` shielded from the enclosing cancel scope, with
+    a bounded timeout, so a cancelled request cannot skip compensation
+    wholesale.
+
+    Starlette delivers a dropped client connection as anyio task-group
+    cancellation (its ``BaseHTTPMiddleware`` layers run request handling in
+    a child task group). anyio's cancellation is level-triggered: once a
+    scope is cancelled, the *next* ``await`` inside it raises immediately,
+    regardless of ordinary ``asyncio.shield`` — shield only protects a task
+    from a direct ``task.cancel()``, not from the surrounding scope
+    re-raising at its next checkpoint. ``anyio.CancelScope(shield=True)`` is
+    the primitive that actually protects a block from an already-cancelled
+    outer scope, which is why it is used here instead.
+    """
+    with anyio.move_on_after(_COMPENSATION_TIMEOUT_SECONDS, shield=True):
+        return await _compensate(
+            db_pool, promotion_id=promotion_id, file_id=file_id, dest_path=dest_path
+        )
+    logger.warning(
+        "draft_room_promote: compensation timed out after %ss "
+        "(promotion_id=%s file_id=%s) — an orphan may exist",
+        _COMPENSATION_TIMEOUT_SECONDS,
+        promotion_id,
+        file_id,
+    )
+    return False
 
 
 async def promote_input(
@@ -441,18 +680,16 @@ async def _promote(
 ) -> DraftPromotionResult:
     upload_dir = UploadPathProvider().get_upload_dir(vault_id)
     file_name = _destination_filename(title, extension)
-    dest_path = await asyncio.to_thread(_reserve_destination_path, upload_dir, file_name)
 
+    dest_path: Optional[Path] = None
     file_id: Optional[int] = None
-    file_row_created = False
     promotion_id: Optional[int] = None
     try:
+        dest_path = await _reserve_destination_path_shielded(upload_dir, file_name)
         await asyncio.to_thread(write_bytes, dest_path)
         await asyncio.to_thread(_enforce_size_limit, dest_path)
         source_sha256 = await asyncio.to_thread(compute_file_hash, str(dest_path))
-        file_id, file_row_created = await asyncio.to_thread(
-            _register_file, db_pool, dest_path, source_sha256, vault_id
-        )
+        file_id = await asyncio.to_thread(_register_file, db_pool, dest_path, source_sha256, vault_id)
         promotion_id, created_at = await asyncio.to_thread(
             _insert_promotion_row,
             db_pool,
@@ -480,40 +717,25 @@ async def _promote(
         )
     except BaseException as exc:
         # Cancellation/interrupt must unwind as itself, never be reported as
-        # a promotion failure — but compensation still runs first, the same
-        # as for any other failure here.
+        # a promotion failure — but compensation still runs first, shielded
+        # so it cannot itself be cut short by the same cancellation.
         is_control_flow = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit))
 
-        # Full rollback of everything this attempt created, in reverse order:
-        # a promotion either fully happened or did not happen at all. Never
-        # report failure while leaving the document, its provenance row, or
-        # its bytes behind — a client retry must be safe, and the audit
-        # trail must never lie about what exists. `file_id` is only ever
-        # deleted when this attempt actually created that row itself
-        # (`file_row_created`) — `_insert_or_get_file_record` is an upsert
-        # keyed on path, so an unrelated pre-existing (adopted) row must
-        # never be destroyed by a failure in *this* attempt.
-        cleanup_ok = True
-        if promotion_id is not None:
-            if not await asyncio.to_thread(_delete_promotion_row, db_pool, promotion_id):
-                cleanup_ok = False
-        if file_id is not None and file_row_created:
-            if not await asyncio.to_thread(_delete_file_row, db_pool, file_id):
-                cleanup_ok = False
-        if not await asyncio.to_thread(_discard_safe, dest_path):
-            cleanup_ok = False
+        cleanup_ok = await _compensate_shielded(
+            db_pool, promotion_id=promotion_id, file_id=file_id, dest_path=dest_path
+        )
 
         if is_control_flow:
             raise
 
-        # Recognized domain errors (duplicate / too-large) carry a specific
-        # meaning the route maps to a specific status code and must pass
-        # through unchanged (with `cleanup_incomplete` updated). Anything
-        # else — a bare `sqlite3.IntegrityError` from a concurrently deleted
-        # draft, an `OSError`, etc. — is wrapped into a generic
-        # `DraftPromotionError` so the route's catch-all handler returns the
-        # same clean error envelope every other failure here does, instead
-        # of leaking a raw, unhandled exception type.
+        # Recognized domain errors (duplicate / too-large / path-conflict)
+        # carry a specific meaning the route maps to a specific status code
+        # and must pass through unchanged (with `cleanup_incomplete`
+        # updated). Anything else — a bare `sqlite3.IntegrityError` from a
+        # concurrently deleted draft, an `OSError`, etc. — is wrapped into a
+        # generic `DraftPromotionError` so the route's catch-all handler
+        # returns the same clean error envelope every other failure here
+        # does, instead of leaking a raw, unhandled exception type.
         if isinstance(exc, DraftPromotionError):
             exc.cleanup_incomplete = not cleanup_ok
             raise
@@ -532,21 +754,3 @@ async def _promote(
         filename=dest_path.name,
         created_at=created_at,
     )
-
-
-def _discard_safe(path: Path) -> bool:
-    """Remove copied bytes on a failed promotion. Returns ``True`` on success
-    (including "already gone"), ``False`` if the removal itself raised —
-    guarded so an ``OSError`` here (e.g. a permissions change mid-request)
-    can never escape past the typed exception handling in :func:`_promote`
-    and leave the caller without having run the rest of its compensation."""
-    try:
-        path.unlink(missing_ok=True)
-        return True
-    except OSError:
-        logger.warning(
-            "draft_room_promote: failed to remove copied bytes at %s — an "
-            "orphan file may now exist on disk",
-            path,
-        )
-        return False
