@@ -30,7 +30,7 @@ KnowledgeVault stores data in the following locations:
 | Vector Database | `{DATA_DIR}/lancedb/` | Critical |
 | Documents | `{DATA_DIR}/documents/` | High |
 | Configuration | `.env` file | High |
-| Logs | `{DATA_DIR}/logs/` | Low |
+| Logs | stdout (captured by Docker — see "Log Files") | Low |
 
 ### Automated Backup Script
 
@@ -170,8 +170,7 @@ crontab -e
 │       ├── data/
 │       └── _transactions/
 ├── app.db                    # SQLite database
-└── logs/
-    └── knowledgevault.log
+└── ...                       # (no logs/ dir — see "Log Files" below)
 ```
 
 **Note:** The system now stores uploads in vault-specific directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to the appropriate vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
@@ -376,14 +375,16 @@ docker logs -f knowledgevault
 
 ### Log Files
 
-Application logs are stored in:
-```
-/data/knowledgevault/logs/knowledgevault.log
+The application writes structured JSON logs to **stdout** — there is no log file on disk under `{DATA_DIR}`. Docker captures stdout via the default `json-file` driver.
+
+View live logs from host:
+```bash
+docker compose logs -f knowledgevault
 ```
 
-View from host:
+Pipe through `jq` to filter on the structured fields (e.g. `request_id`, `status_code`, `duration_ms`):
 ```bash
-docker compose exec knowledgevault tail -f /data/knowledgevault/logs/knowledgevault.log
+docker compose logs --no-log-prefix knowledgevault | jq 'select(.status_code >= 400)'
 ```
 
 ### Log Levels
@@ -1415,7 +1416,7 @@ docker compose pull && docker compose up -d
 | Database | `{DATA_DIR}/app.db` |
 | Vectors | `{DATA_DIR}/lancedb/` |
 | Documents | `{DATA_DIR}/documents/` |
-| Logs | `{DATA_DIR}/logs/app.log` |
+| Logs | stdout (`docker compose logs knowledgevault`) |
 
 ### Support Resources
 

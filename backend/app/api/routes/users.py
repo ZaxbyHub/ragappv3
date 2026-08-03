@@ -49,6 +49,10 @@ class AdminResetPasswordRequest(BaseModel):
 
 
 class CreateUserRequest(BaseModel):
+    # 3-char username floor matches the public registration path (RegisterRequest
+    # in auth.py, enforced manually for a clean 400). Here it is a Pydantic
+    # constraint because the admin path returns a different error contract.
+    # Rationale documented in issue #395 LOW-4.
     username: str = Field(..., min_length=3, max_length=255)
     password: str = Field(..., min_length=8, max_length=128)
     full_name: str = Field(default="", max_length=255)

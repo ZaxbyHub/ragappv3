@@ -287,10 +287,10 @@ data/
 │   ├── library/          # Library files
 │   ├── lancedb/          # Vector database
 │   │   └── chunks.lance/
-│   ├── app.db            # SQLite database
-│   └── logs/
-│       └── app.log
+│   └── app.db            # SQLite database
 ```
+
+> **Logs:** the application writes structured JSON logs to **stdout** (there is no log file on disk). Docker captures them via the default `json-file` driver; retrieve them with `docker compose logs knowledgevault` (or `docker logs <container>`). Configure a Docker logging driver or redirect output if you need file-based persistence.
 
 **Note:** The system stores uploads in vault-specific directories (`/data/knowledgevault/vaults/{vault_id}/uploads/`). On first startup, the system automatically migrates files from the legacy flat `uploads/` directory to vault-specific directories. Files are renamed with `.migrated` suffix to create a safe backup. If a file cannot be associated with a specific vault, the migration logs a warning and skips the file — vault_id must always be explicit.
 

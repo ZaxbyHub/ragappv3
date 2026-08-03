@@ -190,6 +190,7 @@ class TestSettingsResponseFields(unittest.TestCase):
         self.assertIn("instant_reranker_top_n", data)
         self.assertIn("instant_memory_context_top_k", data)
         self.assertIn("instant_max_tokens", data)
+        self.assertIn("thinking_max_tokens", data)
 
         # Instant-mode latency skip flags (operator tuning surface)
         self.assertIn("instant_skip_query_transformation", data)
@@ -275,6 +276,7 @@ class TestSettingsUpdateValidation(unittest.TestCase):
             "instant_reranker_top_n": 3,
             "instant_memory_context_top_k": 2,
             "instant_max_tokens": 2048,
+            "thinking_max_tokens": 16384,
         }
 
         response = self.client.post("/api/settings", json=payload)

@@ -231,6 +231,13 @@ def _is_secure_request(request: Request) -> bool:
 
 
 class RegisterRequest(BaseModel):
+    # NOTE: no Pydantic ``min_length`` here by design. The 3-char username floor
+    # is enforced manually in ``register()`` below so a too-short username
+    # returns a clean HTTP 400 with a domain-specific message rather than a
+    # generic FastAPI 422 validation envelope. The 3-char minimum is a deliberate
+    # tradeoff (issue #395 LOW-4): it is loose enough to allow short handles
+    # while resisting trivial spoofing/collision, and raising it would break
+    # existing 3-char accounts. It matches the admin path (CreateUserRequest).
     username: str = Field(max_length=255)
     password: str = Field(max_length=128)
     full_name: str = Field(default="", max_length=255)
@@ -266,6 +273,8 @@ async def register(
             status_code=403,
             detail="User registration is disabled in single-admin mode",
         )
+    # 3-char username floor — see RegisterRequest for the rationale (issue #395
+    # LOW-4). Kept here (not as Pydantic min_length) to preserve the 400 response.
     if not body.username or len(body.username) < 3:
         raise HTTPException(
             status_code=400, detail="Username must be at least 3 characters"

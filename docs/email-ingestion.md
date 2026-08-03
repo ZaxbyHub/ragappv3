@@ -953,7 +953,7 @@ curl -H "Authorization: Bearer <token>" \
 openssl s_client -connect mail.yourdomain.com:993
 
 # 4. Check logs for errors
-tail -f /var/log/knowledgevault/app.log | grep -i email
+docker compose logs -f knowledgevault | grep -i email
 ```
 
 ---
@@ -992,7 +992,7 @@ grep IMAP_ALLOWED_MIME_TYPES .env
 grep IMAP_MAX_ATTACHMENT_SIZE .env
 
 # 3. Look for skipped attachments in logs
-grep -i "skipping attachment" /var/log/knowledgevault/app.log
+docker compose logs knowledgevault | grep -i "skipping attachment"
 
 # 4. Verify file was enqueued
 sqlite3 /data/knowledgevault/app.db "SELECT id, filename, source, status FROM files WHERE source='email' ORDER BY created_at DESC LIMIT 10;"
@@ -1028,7 +1028,7 @@ sqlite3 /data/knowledgevault/app.db "SELECT id, name FROM vaults;"
 sqlite3 /data/knowledgevault/app.db "SELECT id, filename, vault_id, email_subject FROM files WHERE source='email' ORDER BY created_at DESC LIMIT 5;"
 
 # 3. Look for vault resolution warnings
-grep -i "vault.*not found" /var/log/knowledgevault/app.log
+docker compose logs knowledgevault | grep -i "vault.*not found"
 ```
 
 ---
@@ -1067,7 +1067,7 @@ curl -s -H "Authorization: Bearer <token>" \
 sqlite3 /data/knowledgevault/app.db "SELECT id, filename, error_message FROM files WHERE status='error' AND source='email' ORDER BY created_at DESC LIMIT 10;"
 
 # 3. Review error logs
-grep -i "error" /var/log/knowledgevault/app.log | grep -i email | tail -20
+docker compose logs knowledgevault | grep -i "error" | grep -i email | tail -20
 ```
 
 ---
@@ -1154,7 +1154,7 @@ curl -s -H "Authorization: Bearer <token>" \
      http://localhost:9090/api/email/status | jq '.current_backoff_delay'
 
 # 3. Monitor processing time
-grep "Processing email" /var/log/knowledgevault/app.log | tail -10
+docker compose logs knowledgevault | grep "Processing email" | tail -10
 
 # 4. Check IMAP response time
 time openssl s_client -connect mail.yourdomain.com:993 -crlf </dev/null
@@ -1168,7 +1168,7 @@ If you encounter issues not covered here:
 
 1. **Check logs first**
    ```bash
-   tail -100 /var/log/knowledgevault/app.log
+   docker compose logs --tail 100 knowledgevault
    ```
 
 2. **Verify configuration**

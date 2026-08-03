@@ -5,6 +5,19 @@ Verifies Task 2.2:
 1. hybrid_status is computed correctly: 'disabled' | 'both' | 'dense_only'
 2. fts_exceptions is retrieved from vector_store.get_fts_exceptions()
 3. Both are included in retrieval_debug in the done message
+
+Why the vector_store is mocked here (issue #395 F-slop-009):
+- The logic under test is pure orchestration over the vector_store *interface*
+  (how RAGEngine computes hybrid_status from the store's reported
+  dense/FTS capability and propagates fts_exceptions into retrieval_debug).
+  It is independent of LanceDB storage behavior, so a real LanceDB instance
+  would add no signal for these assertions.
+- lancedb/pyarrow are heavy native deps that the top-level ``backend/conftest.py``
+  stubs globally, and this file also installs its own per-file inline stub
+  (see the ``try: import lancedb`` block above) so the suite is deterministic
+  and CI-stable without those wheels. Real-LanceDB coverage lives in
+  ``test_embedding_model_versioning.py``, which re-imports the genuine module
+  inline for its storage-level assertions.
 """
 
 import logging

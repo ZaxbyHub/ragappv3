@@ -114,8 +114,15 @@ class TestValidateInstantChatConfig:
             Settings(default_chat_mode="fast")
 
     def test_instant_budgets_must_be_positive(self):
-        with pytest.raises(ValueError, match="instant-mode numeric settings"):
+        with pytest.raises(ValueError, match="per-mode numeric settings"):
             Settings(instant_max_tokens=0)
+
+    def test_thinking_max_tokens_must_be_positive(self):
+        # thinking_max_tokens mirrors instant_max_tokens validation (issue #395
+        # DD-rag-005). Default 32768 preserves the prior hardcoded budget.
+        assert Settings().thinking_max_tokens == 32768
+        with pytest.raises(ValueError, match="per-mode numeric settings"):
+            Settings(thinking_max_tokens=0)
 
     def test_hyde_disabled_without_query_transformation_no_warning(self):
         """hyde_enabled=False, query_transformation_enabled=False should not emit warning."""

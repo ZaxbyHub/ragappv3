@@ -809,7 +809,7 @@ class RAGEngine:
             effective_initial_top_k = self.initial_retrieval_top_k
             effective_reranker_top_n = self.reranker_top_n
             effective_memory_top_k = settings.memory_context_top_k
-            effective_max_tokens = 32768
+            effective_max_tokens = settings.thinking_max_tokens
             active_client = self.thinking_client
 
         logger.debug(
