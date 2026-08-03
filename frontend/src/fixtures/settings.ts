@@ -15,6 +15,7 @@ export const mockSettings: SettingsResponse = import.meta.env.DEV ? ({
   instant_reranker_top_n: 5,
   instant_memory_context_top_k: 5,
   instant_max_tokens: 4096,
+  thinking_max_tokens: 32768,
   chunk_size_chars: 1000,
   chunk_overlap_chars: 200,
   retrieval_top_k: 8,

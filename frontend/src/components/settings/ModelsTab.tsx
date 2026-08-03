@@ -425,6 +425,16 @@ export function ModelsTab({
             onChange={onChange}
             source={effectiveSources.instant_max_tokens}
           />
+          <NumberField
+            field="thinking_max_tokens"
+            label="Thinking max output tokens"
+            description="Maximum completion size for Thinking mode."
+            min={1}
+            formData={formData}
+            errors={errors}
+            onChange={onChange}
+            source={effectiveSources.thinking_max_tokens}
+          />
         </CardContent>
       </Card>
     </div>

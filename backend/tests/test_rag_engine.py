@@ -705,5 +705,56 @@ class TestVariantFailureHandling:
         assert "hyde" in done[0]["retrieval_debug"]["variants_dropped"]
 
 
+@pytest.mark.asyncio
+async def test_thinking_mode_max_tokens_reads_config():
+    """The thinking chat-mode branch must pass settings.thinking_max_tokens to
+    the LLM client, not the former hardcoded 32768 literal (issue #395
+    DD-rag-005). Forces mode=THINKING and asserts the configured value flows
+    through effective_max_tokens into chat_completion(max_tokens=...)."""
+    from app.config import settings
+    from app.models.chat_mode import ChatMode
+
+    class _CapturingLLMClient:
+        def __init__(self, response: str):
+            self._response = response
+            self.captured_max_tokens = None
+
+        async def chat_completion(self, messages, **kwargs):
+            self.captured_max_tokens = kwargs.get("max_tokens")
+            return self._response
+
+        async def chat_completion_stream(self, messages, **kwargs):
+            self.captured_max_tokens = kwargs.get("max_tokens")
+            yield self._response
+
+    engine = RAGEngine()
+    engine.embedding_service = cast(EmbeddingService, FakeEmbeddingService([0.1, 0.2]))
+    engine.vector_store = cast(
+        VectorStore,
+        FakeVectorStore([{"text": "chunk", "file_id": "f1", "metadata": {}, "score": 0.5}]),
+    )
+    engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+    capturing_client = _CapturingLLMClient(response="answer [S1]")
+    # thinking_client property falls back to self.llm_client when no override is
+    # set, so assigning llm_client makes the thinking branch use it.
+    engine.llm_client = cast(LLMClient, capturing_client)
+
+    # A distinctive non-default value proves the literal 32768 is no longer used.
+    with patch.object(settings, "thinking_max_tokens", 12345), \
+         patch.object(settings, "query_transformation_enabled", False):
+        results = [
+            msg async for msg in engine.query(
+                "query", [], stream=False, mode=ChatMode.THINKING
+            )
+        ]
+
+    done = [r for r in results if isinstance(r, dict) and r.get("type") == "done"]
+    assert done, "expected a done message"
+    assert capturing_client.captured_max_tokens == 12345, (
+        f"thinking-mode max_tokens must come from settings.thinking_max_tokens "
+        f"(expected 12345, got {capturing_client.captured_max_tokens})"
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

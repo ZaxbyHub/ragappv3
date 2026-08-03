@@ -63,6 +63,7 @@ class SettingsUpdate(BaseModel):
     instant_reranker_top_n: Optional[int] = None
     instant_memory_context_top_k: Optional[int] = None
     instant_max_tokens: Optional[int] = None
+    thinking_max_tokens: Optional[int] = None
 
     # Instant-mode latency skips (trade quality for speed in Instant mode only)
     instant_skip_query_transformation: Optional[bool] = None
@@ -159,9 +160,10 @@ class SettingsUpdate(BaseModel):
         "instant_reranker_top_n",
         "instant_memory_context_top_k",
         "instant_max_tokens",
+        "thinking_max_tokens",
     )
     @classmethod
-    def validate_instant_positive_ints(cls, v):
+    def validate_per_mode_positive_ints(cls, v):
         if v is not None and v <= 0:
             raise ValueError("must be a positive integer")
         return v
@@ -392,6 +394,7 @@ ALLOWED_FIELDS = [
     "instant_reranker_top_n",
     "instant_memory_context_top_k",
     "instant_max_tokens",
+    "thinking_max_tokens",
     "instant_skip_query_transformation",
     "instant_skip_retrieval_evaluation",
     "instant_skip_distillation_synthesis",
@@ -541,6 +544,7 @@ class SettingsResponse(BaseModel):
     instant_reranker_top_n: int = 4
     instant_memory_context_top_k: int = 2
     instant_max_tokens: int = 4096
+    thinking_max_tokens: int = 32768
     instant_skip_query_transformation: bool = True
     instant_skip_retrieval_evaluation: bool = True
     instant_skip_distillation_synthesis: bool = True
@@ -655,6 +659,7 @@ def _build_settings_dict() -> dict:
         "instant_reranker_top_n": settings.instant_reranker_top_n,
         "instant_memory_context_top_k": settings.instant_memory_context_top_k,
         "instant_max_tokens": settings.instant_max_tokens,
+        "thinking_max_tokens": settings.thinking_max_tokens,
         "instant_skip_query_transformation": settings.instant_skip_query_transformation,
         "instant_skip_retrieval_evaluation": settings.instant_skip_retrieval_evaluation,
         "instant_skip_distillation_synthesis": settings.instant_skip_distillation_synthesis,

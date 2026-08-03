@@ -46,5 +46,6 @@ class TestStartupModelAssertion:
             "instant_reranker_top_n",
             "instant_memory_context_top_k",
             "instant_max_tokens",
+            "thinking_max_tokens",
         ]:
             assert key in source, f"lifespan should restore persisted {key}"

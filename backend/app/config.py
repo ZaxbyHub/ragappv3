@@ -54,7 +54,12 @@ class Settings(BaseSettings):
     instant_reranker_top_n: int = 4
     instant_memory_context_top_k: int = 2
     instant_max_tokens: int = 4096
-
+    thinking_max_tokens: int = 32768
+    """Maximum output tokens for the thinking (high-quality) chat mode. Mirrors
+    ``instant_max_tokens`` for the thinking branch of RAGEngine.query; default
+    32768 preserves the prior hardcoded budget exactly. Configurable so operators
+    can shrink the thinking-mode token budget without editing source (issue #395
+    DD-rag-005). Must be >= 1 (see validate_per_mode_positive_ints)."""
     # Library vault mapping for file watcher
     library_vault_id: Optional[int] = None
 
@@ -1065,13 +1070,15 @@ class Settings(BaseSettings):
         "instant_reranker_top_n",
         "instant_memory_context_top_k",
         "instant_max_tokens",
+        "thinking_max_tokens",
         mode="after",
     )
     @classmethod
-    def validate_instant_positive_ints(cls, v: int) -> int:
-        """Validate instant-mode budgets from env/defaults before startup."""
+    def validate_per_mode_positive_ints(cls, v: int) -> int:
+        """Validate per-chat-mode budgets (instant + thinking) from env/defaults
+        before startup."""
         if v < 1:
-            raise ValueError("instant-mode numeric settings must be >= 1")
+            raise ValueError("per-mode numeric settings must be >= 1")
         return v
 
     @field_validator("library_vault_id", mode="after")

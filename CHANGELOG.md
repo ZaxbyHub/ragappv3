@@ -98,6 +98,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Backend hygiene + doc-drift cluster (issues #395, #409)**: addressed the v8-review (#211/#257) residuals bundle:
+  - **`thinking_max_tokens` configurable (DD-rag-005)**: the thinking (high-quality) chat-mode max output token budget is now a `thinking_max_tokens` setting (default `32768`, preserving the prior hardcoded literal exactly) wired through `config.py`, the `/api/settings` GET/PUT surface, the persisted-runtime-reload allowlist, `rag_engine.py` (the thinking branch now reads `settings.thinking_max_tokens`), and `.env.example`. Operators can shrink the thinking-mode token budget without editing source. Mirrors the existing `instant_max_tokens` knob.
+  - **Username 3-char floor documented (LOW-4)**: added rationale comments at both validation sites (`auth.py` registration, `users.py` admin path). Zero behavior change — the manual HTTP 400 is intentionally kept (vs a generic Pydantic 422). Raising the floor is out of scope (breaking change for existing accounts).
+  - **Log filename drift reconciled (LOW-10)**: the app logs structured JSON to **stdout** only (no log file on disk); Docker captures it. Reconciled 16 fictional `app.log`/`knowledgevault.log` references across README, admin-guide, email-ingestion, and release docs to `docker compose logs` / stdout.
+  - **`test_rag_engine_hybrid_status.py` mock rationale documented (F-slop-009)**: documented why the vector_store is mocked (the logic under test is interface orchestration, not LanceDB storage; lancedb is globally stubbed in `backend/conftest.py` plus per-file inline stubs).
+  - **CHANGELOG count-drift note**: the historical FR-4 "3934 backend tests" count (issue #209) is a point-in-time snapshot; the authoritative current total is `pytest --co -q tests/` run from `backend/` (currently 5379).
+  - **Already-satisfied ACs (verified, no edit)**: memory-backfill task strong-ref + shutdown cancel (LOW-11); main DB pool `max_size` configurable via `db_pool_max_size` (LOW-12); orphan `=0.9.0`/`=6.0.0` files removed + aioimaplib/bleach pins upper-bounded (LOW-9). Bandit baseline regenerated (pure line drift from the comment additions; 138 → 138 findings, no new debt).
+
 - **Document upload limit raised to 100 MB**: the backend `max_file_size_mb`
   default, `.env.example`, `docker-compose.yml` env forwarding, frontend
   preflight, and schema parser guardrail now allow 100 MB per document upload.

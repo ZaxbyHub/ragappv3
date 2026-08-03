@@ -512,12 +512,14 @@ curl -H "X-Request-ID: req-123-abc" http://localhost:8080/api/health
 
 #### Correlating Logs
 
+The application emits structured JSON logs to stdout (captured by Docker — there is no `app.log` file on disk). Pipe the container's stdout into `jq`:
+
 ```bash
 # Find all logs for a specific request
-grep "request_id.*req-123-abc" /var/log/knowledgevault/app.log
+docker compose logs --no-log-prefix knowledgevault | grep "request_id.*req-123-abc"
 
 # Or using structured logging (JSON)
-jq 'select(.request_id == "req-123-abc")' /var/log/knowledgevault/app.log
+docker compose logs --no-log-prefix knowledgevault | jq 'select(.request_id == "req-123-abc")'
 ```
 
 ### Log Redaction Fields
@@ -606,15 +608,15 @@ All HTTP requests are logged in structured JSON format:
 #### Find Slow Requests
 
 ```bash
-# Using jq with structured logs
-jq 'select(.duration_ms > 5000) | {path, method, duration_ms, request_id}' app.log
+# Using jq with structured logs (stdout captured by Docker)
+docker compose logs --no-log-prefix knowledgevault | jq 'select(.duration_ms > 5000) | {path, method, duration_ms, request_id}'
 ```
 
 #### Error Rate by Endpoint
 
 ```bash
 # Count errors by endpoint
-jq -r 'select(.status_code >= 400) | "\(.status_code) \(.method) \(.path)"' app.log | \
+docker compose logs --no-log-prefix knowledgevault | jq -r 'select(.status_code >= 400) | "\(.status_code) \(.method) \(.path)"' | \
   sort | uniq -c | sort -rn | head -20
 ```
 
@@ -622,7 +624,7 @@ jq -r 'select(.status_code >= 400) | "\(.status_code) \(.method) \(.path)"' app.
 
 ```bash
 # Extract RAG query timings from logs
-grep "rag_query" app.log | \
+docker compose logs --no-log-prefix knowledgevault | grep "rag_query" | \
   jq -s 'map(.duration_ms) | {count: length, avg: (add/length), max: max}'
 ```
 

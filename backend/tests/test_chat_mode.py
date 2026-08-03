@@ -31,3 +31,7 @@ def test_instant_mode_settings_defaults_present():
     assert isinstance(settings.instant_reranker_top_n, int)
     assert isinstance(settings.instant_memory_context_top_k, int)
     assert isinstance(settings.instant_max_tokens, int)
+    # thinking-mode token budget is configurable and defaults to the prior
+    # hardcoded 32768 (issue #395 DD-rag-005).
+    assert isinstance(settings.thinking_max_tokens, int)
+    assert settings.thinking_max_tokens == 32768

@@ -187,6 +187,7 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "instant_reranker_top_n",
             "instant_memory_context_top_k",
             "instant_max_tokens",
+            "thinking_max_tokens",
             "vector_top_k",
             "kms_enabled",
             "kms_compile_on_ingest",

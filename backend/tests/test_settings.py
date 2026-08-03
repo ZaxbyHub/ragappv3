@@ -190,6 +190,7 @@ class TestSettingsResponseFields(unittest.TestCase):
         self.assertIn("instant_reranker_top_n", data)
         self.assertIn("instant_memory_context_top_k", data)
         self.assertIn("instant_max_tokens", data)
+        self.assertIn("thinking_max_tokens", data)
 
         # Instant-mode latency skip flags (operator tuning surface)
         self.assertIn("instant_skip_query_transformation", data)
@@ -275,7 +276,15 @@ class TestSettingsUpdateValidation(unittest.TestCase):
             "instant_reranker_top_n": 3,
             "instant_memory_context_top_k": 2,
             "instant_max_tokens": 2048,
+            "thinking_max_tokens": 16384,
         }
+
+        # PRR-004: POST mutates the live settings singleton; restore the token
+        # budgets afterward (same addCleanup idiom used at the SEEDED_VALUES
+        # restore in this file) so the mutation cannot leak into later tests.
+        for _f in ("instant_max_tokens", "thinking_max_tokens"):
+            _orig = getattr(settings, _f)
+            self.addCleanup(setattr, settings, _f, _orig)
 
         response = self.client.post("/api/settings", json=payload)
 
@@ -311,6 +320,15 @@ class TestSettingsUpdateValidation(unittest.TestCase):
         response = self.client.post(
             "/api/settings",
             json={"instant_initial_retrieval_top_k": 0},
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_post_settings_invalid_thinking_max_tokens(self):
+        """Test POST /api/settings rejects non-positive thinking_max_tokens."""
+        response = self.client.post(
+            "/api/settings",
+            json={"thinking_max_tokens": 0},
         )
 
         self.assertEqual(response.status_code, 422)
