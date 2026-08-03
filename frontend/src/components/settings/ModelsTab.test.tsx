@@ -34,6 +34,7 @@ function formData(): SettingsFormData {
     instant_reranker_top_n: 4,
     instant_memory_context_top_k: 2,
     instant_max_tokens: 4096,
+    thinking_max_tokens: 32768,
     wiki_enabled: true,
     wiki_compile_on_ingest: true,
     wiki_compile_on_query: true,
@@ -125,7 +126,9 @@ describe("ModelsTab", () => {
       />,
     );
 
-    const input = screen.getByLabelText(/Max output tokens/i);
+    // Anchored so it matches the Instant "Max output tokens" field only, not
+    // the sibling "Thinking max output tokens" field introduced in #395.
+    const input = screen.getByLabelText(/^Max output tokens$/i);
 
     fireEvent.change(input, {
       target: { value: "" },

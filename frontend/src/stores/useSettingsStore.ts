@@ -57,6 +57,7 @@ export interface SettingsFormData {
   instant_reranker_top_n: number;
   instant_memory_context_top_k: number;
   instant_max_tokens: number;
+  thinking_max_tokens: number;
   // Wiki & curator (PR B + PR C)
   wiki_enabled: boolean;
   wiki_compile_on_ingest: boolean;
@@ -119,6 +120,7 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   instant_reranker_top_n: "models",
   instant_memory_context_top_k: "models",
   instant_max_tokens: "models",
+  thinking_max_tokens: "models",
   wiki_enabled: "wiki",
   wiki_compile_on_ingest: "wiki",
   wiki_compile_on_query: "wiki",
@@ -228,6 +230,7 @@ const defaultFormData: SettingsFormData = {
   instant_reranker_top_n: 4,
   instant_memory_context_top_k: 2,
   instant_max_tokens: 4096,
+  thinking_max_tokens: 32768,
   wiki_enabled: true,
   wiki_compile_on_ingest: true,
   wiki_compile_on_query: true,
@@ -307,6 +310,7 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     instant_reranker_top_n: settings.instant_reranker_top_n ?? 4,
     instant_memory_context_top_k: settings.instant_memory_context_top_k ?? 2,
     instant_max_tokens: settings.instant_max_tokens ?? 4096,
+    thinking_max_tokens: settings.thinking_max_tokens ?? 32768,
     wiki_enabled: settings.wiki_enabled ?? true,
     wiki_compile_on_ingest: settings.wiki_compile_on_ingest ?? true,
     wiki_compile_on_query: settings.wiki_compile_on_query ?? true,
@@ -527,6 +531,13 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     ) {
       newErrors.instant_max_tokens =
         "Instant max tokens must be a positive integer";
+    }
+    if (
+      formData.thinking_max_tokens <= 0 ||
+      !Number.isInteger(formData.thinking_max_tokens)
+    ) {
+      newErrors.thinking_max_tokens =
+        "Thinking max tokens must be a positive integer";
     }
 
     // Curator: required-when-enabled (frontend mirror of backend invariant).

@@ -33,6 +33,7 @@ function baseSettings(): SettingsResponse {
     instant_reranker_top_n: 4,
     instant_memory_context_top_k: 2,
     instant_max_tokens: 4096,
+    thinking_max_tokens: 32768,
     chunk_size_chars: 2000,
     chunk_overlap_chars: 200,
     retrieval_top_k: 5,
@@ -215,12 +216,14 @@ describe("useSettingsStore (PR B)", () => {
       .getState()
       .updateFormField("default_chat_mode", "instant");
     useSettingsStore.getState().updateFormField("instant_max_tokens", 1.5);
+    useSettingsStore.getState().updateFormField("thinking_max_tokens", 0);
     const ok = useSettingsStore.getState().validateForm();
     expect(ok).toBe(false);
     const errs = useSettingsStore.getState().errors;
     expect(errs.instant_chat_url).toBeTruthy();
     expect(errs.instant_chat_model).toBeTruthy();
     expect(errs.instant_max_tokens).toBeTruthy();
+    expect(errs.thinking_max_tokens).toBeTruthy();
   });
 
   it("validateForm allows thinking mode without an instant model", () => {
