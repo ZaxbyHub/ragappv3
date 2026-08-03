@@ -55,6 +55,7 @@ export const mockSettings: SettingsResponse = import.meta.env.DEV ? ({
   wiki_llm_curator_run_on_ingest: false,
   wiki_llm_curator_run_on_query: false,
   wiki_llm_curator_run_on_manual: true,
+  draft_room_enabled: false,
   effective_sources: {
     port: "default",
     embedding_model: "env",

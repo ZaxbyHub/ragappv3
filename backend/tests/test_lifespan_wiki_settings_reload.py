@@ -264,6 +264,71 @@ class TestLoadKmsSettingsBehavior:
         assert mock_settings.kms_compile_on_ingest is True
 
 
+class TestLoadDraftRoomSettingsBehavior:
+    """Test _load_persisted_settings correctly loads draft_room_enabled.
+
+    Mirrors TestLoadKmsSettingsBehavior: draft_room_enabled must be restored
+    from settings_kv on startup, or an admin's PUT /settings toggle would
+    silently revert after a restart (see app/api/routes/settings.py
+    ALLOWED_FIELDS and app/lifespan.py NEW_DIRECT_KEYS).
+    """
+
+    @pytest.fixture
+    def temp_db(self):
+        """Create a temporary database with settings_kv table."""
+        temp_dir = tempfile.mkdtemp()
+        db_path = Path(temp_dir) / "test_settings.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings_kv (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+        yield str(db_path)
+        # Cleanup
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @pytest.fixture
+    def mock_settings(self):
+        """Create a mock settings object with the draft_room_enabled field."""
+        from app.config import Settings
+        return Settings()
+
+    def test_load_draft_room_enabled_true(self, temp_db, mock_settings):
+        """_load_persisted_settings should load draft_room_enabled=true from DB."""
+        conn = sqlite3.connect(temp_db)
+        conn.execute("INSERT INTO settings_kv (key, value) VALUES ('draft_room_enabled', 'true')")
+        conn.commit()
+        conn.close()
+
+        mock_settings.draft_room_enabled = False  # Default
+
+        with patch('app.lifespan.settings', mock_settings):
+            from app.lifespan import _load_persisted_settings
+            _load_persisted_settings(temp_db)
+
+        assert mock_settings.draft_room_enabled is True
+
+    def test_load_draft_room_enabled_false(self, temp_db, mock_settings):
+        """_load_persisted_settings should load draft_room_enabled=false from DB."""
+        conn = sqlite3.connect(temp_db)
+        conn.execute("INSERT INTO settings_kv (key, value) VALUES ('draft_room_enabled', 'false')")
+        conn.commit()
+        conn.close()
+
+        mock_settings.draft_room_enabled = True
+
+        with patch('app.lifespan.settings', mock_settings):
+            from app.lifespan import _load_persisted_settings
+            _load_persisted_settings(temp_db)
+
+        assert mock_settings.draft_room_enabled is False
+
+
 class TestWikiAndKmsParity:
     """Test that wiki and KMS keys have symmetric reload behavior."""
 

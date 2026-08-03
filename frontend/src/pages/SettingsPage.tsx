@@ -17,6 +17,7 @@
  * url/model.
  */
 import { useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -51,6 +52,9 @@ import { ModelsTab } from "@/components/settings/ModelsTab";
 import { OverviewTab } from "@/components/settings/OverviewTab";
 import { WikiCuratorSettings } from "@/components/settings/WikiCuratorSettings";
 import { MaintenanceSettings } from "@/components/settings/MaintenanceSettings";
+import { DraftRoomSettings } from "@/components/settings/DraftRoomSettings";
+import { payloadTogglesDraftRoom } from "@/components/settings/draftRoomCapabilitiesInvalidation";
+import { draftRoomKeys } from "@/lib/api/draftRoom";
 import { SaveDiscardFooter } from "@/components/settings/SaveDiscardFooter";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { ReindexConfirmDialog } from "@/components/settings/ReindexConfirmDialog";
@@ -104,6 +108,7 @@ function SettingsPageContent({
   } = useSettingsStore();
 
   const activeVaultId = useVaultStore((s) => s.activeVaultId);
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<SettingsTab>("overview");
   const [reindexDialogOpen, setReindexDialogOpen] = useState(false);
 
@@ -173,6 +178,12 @@ function SettingsPageContent({
       // Re-initialize so the snapshot reflects the new persisted state
       // and dirtyFields drops to zero.
       initializeForm(updated);
+      // The sidebar nav gate (useDraftRoomVisible) reads capabilities via a
+      // 5-minute-staleTime query — invalidate it so a saved toggle takes
+      // effect immediately instead of waiting out the cache.
+      if (payloadTogglesDraftRoom(payload)) {
+        queryClient.invalidateQueries({ queryKey: draftRoomKeys.capabilities() });
+      }
       if (dirtyReindexFields.length > 0) {
         setReindexRequired(true);
         toast.warning(
@@ -356,6 +367,12 @@ function SettingsPageContent({
         </TabsContent>
 
         <TabsContent value="maintenance" className="space-y-4">
+          <DraftRoomSettings
+            formData={formData}
+            onChange={(f, v) =>
+              updateFormField(f, v as SettingsFormData[typeof f])
+            }
+          />
           <MaintenanceSettings vaultId={activeVaultId} />
         </TabsContent>
       </Tabs>

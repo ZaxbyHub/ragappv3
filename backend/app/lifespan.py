@@ -195,6 +195,7 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "wiki_compile_on_ingest",
             "wiki_compile_on_query",
             "wiki_compile_after_indexing",
+            "draft_room_enabled",
         ]
         for key in NEW_DIRECT_KEYS:
             if key in persisted:
