@@ -736,6 +736,83 @@ class TestCapabilitiesAndPagination(DraftRoomTestBase):
         self.assertEqual(len(ids_page1 & ids_page2), 0)
 
 
+class TestCapabilitiesReflectsSettingsToggle(DraftRoomTestBase):
+    """End-to-end: an admin flipping ``draft_room_enabled`` through the
+    settings API (``PUT /api/settings``) is what ``GET
+    /api/draft-room/capabilities`` reports, with no restart required. Ties
+    together ``app/api/routes/settings.py`` (ALLOWED_FIELDS,
+    SettingsUpdate/SettingsResponse) and ``app/api/routes/draft_room.py``
+    (``get_capabilities`` reads ``settings.draft_room_enabled`` live).
+    """
+
+    ADMIN_ID = 3
+
+    def setUp(self):
+        super().setUp()
+        # DraftRoomTestBase seeds only 'member' users; require_role("admin")
+        # resolves the caller's role from a DB lookup by user id (not from
+        # the JWT claim), so an admin-level caller needs a real admin row.
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO users (id, username, hashed_password, full_name, role, is_active) "
+                "VALUES (?, 'admin1', 'test-password-hash', 'Admin', 'admin', 1)",
+                (self.ADMIN_ID,),
+            )
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _admin_headers(self):
+        return self._headers(self.ADMIN_ID, "admin1", "admin")
+
+    def test_admin_enabling_via_settings_api_flips_capabilities_live(self):
+        settings.draft_room_enabled = False
+
+        before = self.client.get(
+            "/api/draft-room/capabilities", headers=self._owner_headers()
+        )
+        self.assertEqual(before.status_code, 200, before.text)
+        self.assertFalse(before.json()["enabled"])
+
+        put_resp = self.client.put(
+            "/api/settings",
+            headers=self._admin_headers(),
+            json={"draft_room_enabled": True},
+        )
+        self.assertEqual(put_resp.status_code, 200, put_resp.text)
+        self.assertTrue(put_resp.json()["draft_room_enabled"])
+
+        after = self.client.get(
+            "/api/draft-room/capabilities", headers=self._owner_headers()
+        )
+        self.assertEqual(after.status_code, 200, after.text)
+        self.assertTrue(after.json()["enabled"])
+
+    def test_admin_disabling_via_settings_api_flips_capabilities_live(self):
+        settings.draft_room_enabled = True
+
+        before = self.client.get(
+            "/api/draft-room/capabilities", headers=self._owner_headers()
+        )
+        self.assertEqual(before.status_code, 200, before.text)
+        self.assertTrue(before.json()["enabled"])
+
+        put_resp = self.client.put(
+            "/api/settings",
+            headers=self._admin_headers(),
+            json={"draft_room_enabled": False},
+        )
+        self.assertEqual(put_resp.status_code, 200, put_resp.text)
+        self.assertFalse(put_resp.json()["draft_room_enabled"])
+
+        after = self.client.get(
+            "/api/draft-room/capabilities", headers=self._owner_headers()
+        )
+        self.assertEqual(after.status_code, 200, after.text)
+        self.assertFalse(after.json()["enabled"])
+
+
 class TestSSE(DraftRoomTestBase):
     def test_events_stream_emits_subscribed_without_content(self):
         """Calls the route function directly rather than through

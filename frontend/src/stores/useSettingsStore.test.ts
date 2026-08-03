@@ -244,6 +244,28 @@ describe("useSettingsStore (PR B)", () => {
     expect(useSettingsStore.getState().errors.default_chat_mode).toBeTruthy();
   });
 
+  it("draft_room_enabled defaults to false when absent from the settings response", () => {
+    useSettingsStore.getState().initializeForm(baseSettings());
+    expect(useSettingsStore.getState().formData.draft_room_enabled).toBe(false);
+  });
+
+  it("draft_room_enabled round-trips through initializeForm, dirty tracking, and the maintenance tab", () => {
+    useSettingsStore
+      .getState()
+      .initializeForm({ ...baseSettings(), draft_room_enabled: true });
+    expect(useSettingsStore.getState().formData.draft_room_enabled).toBe(true);
+    expect(useSettingsStore.getState().dirtyFields().size).toBe(0);
+
+    useSettingsStore.getState().updateFormField("draft_room_enabled", false);
+    const dirty = useSettingsStore.getState().dirtyFields();
+    expect(dirty.has("draft_room_enabled")).toBe(true);
+    expect(useSettingsStore.getState().dirtyByTab().maintenance).toBe(1);
+
+    useSettingsStore.getState().discard();
+    expect(useSettingsStore.getState().formData.draft_room_enabled).toBe(true);
+    expect(useSettingsStore.getState().hasChanges()).toBe(false);
+  });
+
   it("save snapshot resync via initializeForm zeroes dirty after persist round-trip", () => {
     useSettingsStore.getState().initializeForm(baseSettings());
     useSettingsStore.getState().updateFormField("retrieval_top_k", 11);

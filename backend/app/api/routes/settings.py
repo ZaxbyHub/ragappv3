@@ -104,6 +104,9 @@ class SettingsUpdate(BaseModel):
     kms_enabled: Optional[bool] = None
     kms_compile_on_ingest: Optional[bool] = None
 
+    # Draft Room (feature gate — spec: admin opt-in, specs/draft-room/SPEC.md §15)
+    draft_room_enabled: Optional[bool] = None
+
     @field_validator("chunk_size")
     @classmethod
     def validate_chunk_size(cls, v):
@@ -423,6 +426,8 @@ ALLOWED_FIELDS = [
     # KMS / Knowledge Management
     "kms_enabled",
     "kms_compile_on_ingest",
+    # Draft Room
+    "draft_room_enabled",
 ]
 
 
@@ -616,6 +621,9 @@ class SettingsResponse(BaseModel):
     kms_enabled: bool = True
     kms_compile_on_ingest: bool = True
 
+    # Draft Room
+    draft_room_enabled: bool = False
+
     # Limits (safe to expose)
     max_file_size_mb: int
     allowed_extensions: list[str]
@@ -716,6 +724,8 @@ def _build_settings_dict() -> dict:
         # KMS / Knowledge Management
         "kms_enabled": settings.kms_enabled,
         "kms_compile_on_ingest": settings.kms_compile_on_ingest,
+        # Draft Room
+        "draft_room_enabled": settings.draft_room_enabled,
     }
     # NOTE: callers MUST set base["effective_sources"] explicitly with a
     # real DB connection. _compute_effective_sources(None) would silently

@@ -67,6 +67,9 @@ export interface SettingsResponse {
   kms_enabled?: boolean;
   kms_compile_on_ingest?: boolean;
 
+  // Draft Room — admin opt-in; gates the sidebar nav entry & workspace
+  draft_room_enabled?: boolean;
+
   // Optional LLM Wiki Curator config (PR B persists, PR C wires)
   wiki_llm_curator_enabled?: boolean;
   wiki_llm_curator_url?: string;
@@ -143,6 +146,8 @@ export interface UpdateSettingsRequest {
   // KMS / Knowledge Management config
   kms_enabled?: boolean;
   kms_compile_on_ingest?: boolean;
+  // Draft Room — admin opt-in; gates the sidebar nav entry & workspace
+  draft_room_enabled?: boolean;
   // Optional LLM Wiki Curator config
   wiki_llm_curator_enabled?: boolean;
   wiki_llm_curator_url?: string;

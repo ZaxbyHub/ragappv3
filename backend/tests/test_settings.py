@@ -5,6 +5,7 @@ Tests cover SettingsResponse fields (reranking, hybrid search) and SettingsUpdat
 All external services (LLM, vector store) are mocked for deterministic tests.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -448,6 +449,120 @@ class TestSettingsUpdateValidation(unittest.TestCase):
         self.assertEqual(data["hybrid_search_enabled"], False)
         self.assertEqual(data["hybrid_alpha"], 0.7)
         self.assertEqual(data["embedding_batch_size"], 32)
+
+
+class TestDraftRoomEnabledSetting(unittest.TestCase):
+    """PUT /settings can flip draft_room_enabled at runtime (no restart) and
+    the value persists to settings_kv, so it survives a restart via
+    lifespan._load_persisted_settings (see NEW_DIRECT_KEYS)."""
+
+    def setUp(self):
+        self._orig_users_enabled = settings.users_enabled
+        self._orig_draft_room_enabled = settings.draft_room_enabled
+        settings.users_enabled = False
+        self.client = TestClient(app)
+        self.client.headers.update(
+            {"Authorization": f"Bearer {settings.admin_secret_token}"}
+        )
+        # Override get_db to use a pool that allows cross-thread usage
+        from app.api.deps import get_db
+        from app.models.database import get_pool
+
+        self._test_pool = get_pool(str(TEST_DB_PATH))
+
+        def override_get_db():
+            conn = self._test_pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self._test_pool.release_connection(conn)
+
+        app.dependency_overrides[get_db] = override_get_db
+        self._get_db = get_db
+
+    def tearDown(self):
+        app.dependency_overrides.pop(self._get_db, None)
+        settings.users_enabled = self._orig_users_enabled
+        settings.draft_room_enabled = self._orig_draft_room_enabled
+        # Remove any persisted row so later tests start from a clean slate.
+        conn = self._test_pool.get_connection()
+        try:
+            conn.execute("DELETE FROM settings_kv WHERE key = 'draft_room_enabled'")
+            conn.commit()
+        finally:
+            self._test_pool.release_connection(conn)
+
+    def test_put_settings_enables_draft_room_and_persists(self):
+        """PUT /settings {draft_room_enabled: true} applies live and persists."""
+        response = self.client.put("/api/settings", json={"draft_room_enabled": True})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertIn("draft_room_enabled", data)
+        self.assertTrue(data["draft_room_enabled"])
+
+        # Applied live to the singleton the gates read at request time.
+        self.assertTrue(settings.draft_room_enabled)
+
+        # Persisted to settings_kv for restart survival.
+        conn = self._test_pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT value FROM settings_kv WHERE key = 'draft_room_enabled'"
+            ).fetchone()
+        finally:
+            self._test_pool.release_connection(conn)
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row[0]), True)
+
+    def test_get_settings_reflects_current_singleton_value(self):
+        settings.draft_room_enabled = True
+        try:
+            response = self.client.get("/api/settings")
+            self.assertEqual(response.status_code, 200)
+            data = response.json()
+            self.assertIn("draft_room_enabled", data)
+            self.assertTrue(data["draft_room_enabled"])
+        finally:
+            settings.draft_room_enabled = False
+
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["draft_room_enabled"])
+
+    def test_put_settings_survives_simulated_restart_via_load_persisted_settings(self):
+        """Composite path: admin PUT persists draft_room_enabled to
+        settings_kv, then a simulated process restart (singleton reset to
+        False + a fresh sqlite3 connection running
+        lifespan._load_persisted_settings against the same DB file) must
+        restore the value from the persisted row, not from in-memory state."""
+        response = self.client.put("/api/settings", json={"draft_room_enabled": True})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["draft_room_enabled"])
+        self.assertTrue(settings.draft_room_enabled)
+
+        # Confirm the row is committed and visible to a separate connection
+        # before we simulate the restart.
+        conn = self._test_pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT value FROM settings_kv WHERE key = 'draft_room_enabled'"
+            ).fetchone()
+        finally:
+            self._test_pool.release_connection(conn)
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row[0]), True)
+
+        # Simulate a restart: the in-memory singleton loses its value...
+        settings.draft_room_enabled = False
+        self.assertFalse(settings.draft_room_enabled)
+
+        # ...and startup re-derives it from the persisted settings_kv row.
+        from app.lifespan import _load_persisted_settings
+
+        _load_persisted_settings(str(TEST_DB_PATH))
+
+        self.assertTrue(settings.draft_room_enabled)
 
 
 class TestConnectionEndpoint(unittest.TestCase):

@@ -81,6 +81,8 @@ export interface SettingsFormData {
   // KMS / Knowledge Management config
   kms_enabled: boolean;
   kms_compile_on_ingest: boolean;
+  // Draft Room
+  draft_room_enabled: boolean;
 }
 
 export type SettingsErrors = Partial<Record<keyof SettingsFormData, string>>;
@@ -142,6 +144,7 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   wiki_llm_curator_run_on_manual: "wiki",
   kms_enabled: "maintenance",
   kms_compile_on_ingest: "maintenance",
+  draft_room_enabled: "maintenance",
 };
 
 // Fields that invalidate existing embeddings when changed — reindex required.
@@ -252,6 +255,7 @@ const defaultFormData: SettingsFormData = {
   wiki_llm_curator_run_on_manual: true,
   kms_enabled: true,
   kms_compile_on_ingest: true,
+  draft_room_enabled: false,
 };
 
 // Unwrap legacy json.dumps-encoded strings ('"x"' -> 'x').
@@ -338,6 +342,7 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
       settings.wiki_llm_curator_run_on_manual ?? true,
     kms_enabled: settings.kms_enabled ?? true,
     kms_compile_on_ingest: settings.kms_compile_on_ingest ?? true,
+    draft_room_enabled: settings.draft_room_enabled ?? false,
   };
 }
 
