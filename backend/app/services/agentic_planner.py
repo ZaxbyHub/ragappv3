@@ -190,8 +190,11 @@ class AgenticPlanner:
     ) -> Dict[str, Any]:
         """Ask the LLM whether another retrieval round is needed.
 
-        The prompt contains the original query and a summary of sources
-        retrieved so far.  The expected response is a JSON object::
+        Builds a ``[system, user]`` message pair: the system message carries a
+        ``SECURITY BOUNDARY`` directive naming the ``<user_query>`` and
+        ``<sources>`` wrapper tags; the user message contains the escaped
+        ``original_query`` and an escaped summary of ``gathered_sources``. The
+        expected response is a JSON object::
 
             {{"action": "retrieve_more", "sub_query": "<refined query>"}}
             # or
@@ -264,7 +267,15 @@ class AgenticPlanner:
         for i, src in enumerate(sources[:10], start=1):
             snippet = str(src.get("snippet", ""))[:120]
             score = src.get("score")
-            score_str = f" (score={score:.2f})" if score is not None else ""
+            # Guard against non-numeric scores (pre-existing latent bug):
+            # RAGSource.score is typed float but the annotation is not enforced,
+            # so a corrupted/non-numeric value would raise ValueError here and
+            # propagate out of plan_and_execute (this helper is called outside
+            # the try/except in _decide_next_action).
+            if isinstance(score, (int, float)) and not isinstance(score, bool):
+                score_str = f" (score={score:.2f})"
+            else:
+                score_str = ""
             lines.append(f"  [{i}] <source>{_xml_escape(snippet)}</source>{score_str}")
         if len(sources) > 10:
             lines.append(f"  ... and {len(sources) - 10} more sources")
