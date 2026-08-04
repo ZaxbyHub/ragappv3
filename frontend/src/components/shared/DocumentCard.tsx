@@ -117,11 +117,11 @@ export function DocumentCard({
                   onSelectionChange(document.id, !!checked)
                 }
                 aria-label={`Select ${document.filename}`}
-                className="flex-shrink-0"
+                className="shrink-0"
               />
             )}
             <div
-              className="flex-shrink-0 p-2 bg-muted rounded-sm"
+              className="shrink-0 p-2 bg-muted rounded-sm"
               aria-hidden="true"
             >
               <FileIcon filename={document.filename} className="w-5 h-5" />
@@ -144,7 +144,7 @@ export function DocumentCard({
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-11 w-11 flex-shrink-0"
+                  className="h-11 w-11 shrink-0"
                   aria-label={`Actions for ${document.filename}`}
                   aria-haspopup="menu"
                 >
@@ -165,7 +165,7 @@ export function DocumentCard({
                   <DropdownMenuItem
                     onClick={() => onDelete(document.id)}
                     disabled={isDeleting}
-                    className="text-destructive focus:text-destructive bg-destructive/10 hover:!bg-destructive/20"
+                    className="text-destructive focus:text-destructive bg-destructive/10 hover:bg-destructive/20!"
                     aria-label={`Delete ${document.filename}`}
                   >
                     <Trash2 className="w-4 h-4 mr-2" />

@@ -248,7 +248,7 @@ export function AssistantMessageActions({
   onCopy,
 }: AssistantMessageActionsProps) {
   return (
-    <div className="flex items-center gap-0.5 mt-3 opacity-60 group-hover:opacity-100 focus-within:opacity-100 [@media(pointer:coarse)]:opacity-100 transition-opacity duration-200">
+    <div className="flex items-center gap-0.5 mt-3 opacity-60 group-hover:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity duration-200">
       <TooltipProvider>
         <CopyAction content={content} stripCitations onCopy={onCopy} />
 
@@ -333,7 +333,7 @@ export function UserMessageActions({
   onFork,
 }: UserMessageActionsProps) {
   return (
-    <div className="flex items-center gap-0.5 mt-2 opacity-0 group-hover:opacity-100 focus-within:opacity-100 [@media(pointer:coarse)]:opacity-100 transition-opacity duration-200">
+    <div className="flex items-center gap-0.5 mt-2 opacity-0 group-hover:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity duration-200">
       <TooltipProvider>
         <CopyAction content={content} />
 

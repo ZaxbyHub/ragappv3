@@ -221,7 +221,7 @@ export function DocumentTable({
                     </td>
                     <td className="p-4 flex-none" style={{ width: filenameColWidth, flexShrink: 0 }}>
                       <div className="flex items-center gap-2">
-                        <FileIcon filename={doc.filename} className="w-4 h-4 flex-shrink-0" />
+                        <FileIcon filename={doc.filename} className="w-4 h-4 shrink-0" />
                         <Link
                           to={`/documents/${docId}`}
                           className="font-medium truncate max-w-full hover:underline"

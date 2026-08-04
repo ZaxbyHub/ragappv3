@@ -8,7 +8,7 @@ const cardVariants = cva(
   {
     variants: {
       variant: {
-        default: "bg-card shadow-sm",
+        default: "bg-card shadow-xs",
         elevated: "bg-card shadow-md hover:shadow-lg transition-shadow",
         // Theme-aware glass: derives from the foreground token instead of
         // hard-coded white so dark-mode stays subtle and light-mode keeps

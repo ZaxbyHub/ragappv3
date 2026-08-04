@@ -49,7 +49,7 @@ function SourceCard({ source, fallbackIndex, onClick }: SourceCardProps) {
       className={cn(
         "rounded-sm border border-border bg-card p-3 text-sm cursor-pointer",
         "hover:border-primary/30 hover:bg-accent/5 transition-colors duration-150",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
       )}
       onClick={onClick}
       role="button"
@@ -60,7 +60,7 @@ function SourceCard({ source, fallbackIndex, onClick }: SourceCardProps) {
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-center gap-2 min-w-0">
           <span
-            className="flex-shrink-0 flex items-center justify-center min-w-[1.25rem] h-5 px-1 rounded-full bg-primary/10 text-primary text-[10px] font-bold"
+            className="shrink-0 flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-primary/10 text-primary text-[10px] font-bold"
             aria-label={`Source label ${badgeLabel}`}
           >
             {badgeLabel}
@@ -69,7 +69,7 @@ function SourceCard({ source, fallbackIndex, onClick }: SourceCardProps) {
             {source.filename}
           </span>
         </div>
-        <div className="flex items-center gap-1 flex-shrink-0">
+        <div className="flex items-center gap-1 shrink-0">
           {isSynthesized && (
             <Badge
               variant="outline"

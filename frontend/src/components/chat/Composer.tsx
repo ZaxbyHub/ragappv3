@@ -549,9 +549,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                   aria-label={`Attachment ${att.file.name}: ${statusText}`}
                 >
                   {att.status === "error" ? (
-                    <AlertCircle className="h-3.5 w-3.5 text-destructive flex-shrink-0" />
+                    <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
                   ) : (
-                    <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                    <FileText className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                   )}
                   <span className="max-w-[120px] truncate" title={att.file.name}>
                     {att.file.name}
@@ -596,7 +596,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
         {/* Composer container */}
         <div
           className={cn(
-            "relative rounded-xl border bg-card shadow-sm transition-all duration-150",
+            "relative rounded-xl border bg-card shadow-xs transition-all duration-150",
             "focus-within:border-primary/50 focus-within:shadow-md focus-within:shadow-primary/5",
             isStreaming ? "border-primary/30" : "border-input",
           )}
@@ -866,7 +866,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                 size="sm"
                 onClick={handleSubmit}
                 disabled={!input.trim() || input.length > MAX_INPUT_LENGTH || hasUploading}
-                className="h-8 w-8 rounded-full p-0 shadow-sm active:scale-95"
+                className="h-8 w-8 rounded-full p-0 shadow-xs active:scale-95"
                 aria-label="Send message"
               >
                 <Send className="h-3.5 w-3.5" />

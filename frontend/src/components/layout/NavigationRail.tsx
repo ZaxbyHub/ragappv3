@@ -86,7 +86,7 @@ function StatusIndicator({ isUp, label, loading, isExpanded }: { isUp: boolean; 
     <div className="flex items-center min-h-4 gap-2.5">
       <div
         className={cn(
-          "rounded-full flex-shrink-0 size-3",
+          "rounded-full shrink-0 size-3",
           loading ? "bg-warning animate-pulse" : isUp ? "bg-success" : "bg-destructive"
         )}
         // Non-color cue + accessible name on the dot itself so collapsed-rail
@@ -172,7 +172,7 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
   return (
     <nav
       className={cn(
-        "h-screen bg-card border-r border-border flex flex-col flex-shrink-0 z-50 transition-all duration-300 ease-in-out relative shadow-md",
+        "h-screen bg-card border-r border-border flex flex-col shrink-0 z-50 transition-all duration-300 ease-in-out relative shadow-md",
         isExpanded ? "w-60" : "w-14"
       )}
       aria-label="Main navigation"
@@ -180,13 +180,13 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
       {/* Header / Brand */}
       <div className="flex items-center px-4 pt-5 pb-2 min-h-[76px]">
         <div className="flex items-center mb-4 w-full gap-2">
-          <div className={cn("flex items-center justify-center flex-shrink-0 transition-all duration-200 ease-in-out", isExpanded ? "size-8" : "size-6")}>
+          <div className={cn("flex items-center justify-center shrink-0 transition-all duration-200 ease-in-out", isExpanded ? "size-8" : "size-6")}>
             <MeridianLogo />
           </div>
           <span
             className={cn(
               "font-bold text-md text-primary transition-all duration-200 ease-in-out font-electrolize uppercase tracking-tighter",
-              isExpanded ? "opacity-100 blur-none" : "opacity-0 w-0 overflow-hidden blur-sm"
+              isExpanded ? "opacity-100 blur-none" : "opacity-0 w-0 overflow-hidden blur-xs"
             )}
           >
             Meridian
@@ -234,16 +234,16 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
           <DropdownMenuTrigger asChild>
             <button
               type="button"
-              className="flex items-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground text-sm transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring w-full gap-2 px-3 py-1.5 mb-3 h-8"
+              className="flex items-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground text-sm transition-all focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring w-full gap-2 px-3 py-1.5 mb-3 h-8"
               aria-label="Select theme"
               data-resolved-appearance={resolvedDark ? "dark" : "light"}
             >
               {resolvedDark ? (
-                <HugeiconsIcon strokeWidth={1.2} icon={MoonIcon} size={16} className="flex-shrink-0" aria-hidden="true" />
+                <HugeiconsIcon strokeWidth={1.2} icon={MoonIcon} size={16} className="shrink-0" aria-hidden="true" />
               ) : (
-                <HugeiconsIcon strokeWidth={1.2} icon={Sun02Icon} size={16} className="flex-shrink-0" aria-hidden="true" />
+                <HugeiconsIcon strokeWidth={1.2} icon={Sun02Icon} size={16} className="shrink-0" aria-hidden="true" />
               )}
-              <span className={cn("text-[11px] opacity-0 blur-sm transition-all duration-200 ease-in-out whitespace-nowrap", !isExpanded && "sr-only", isExpanded && "opacity-100 blur-none")}>Theme</span>
+              <span className={cn("text-[11px] opacity-0 blur-xs transition-all duration-200 ease-in-out whitespace-nowrap", !isExpanded && "sr-only", isExpanded && "opacity-100 blur-none")}>Theme</span>
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent side="right" align="end" className="w-44">
@@ -263,11 +263,11 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
         <button
           type="button"
           onClick={() => logout()}
-          className="flex items-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground text-sm transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring w-full gap-2 px-3 py-1.5 mb-3 h-8"
+          className="flex items-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground text-sm transition-all focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring w-full gap-2 px-3 py-1.5 mb-3 h-8"
           aria-label="Log out"
         >
-          <HugeiconsIcon strokeWidth={1.2} icon={Logout01Icon} size={16} className="flex-shrink-0" aria-hidden="true" />
-          <span className={cn("text-[11px] opacity-0 blur-sm transition-all duration-200 ease-in-out whitespace-nowrap", !isExpanded && "sr-only", isExpanded && "opacity-100 blur-none")}>Log out</span>
+          <HugeiconsIcon strokeWidth={1.2} icon={Logout01Icon} size={16} className="shrink-0" aria-hidden="true" />
+          <span className={cn("text-[11px] opacity-0 blur-xs transition-all duration-200 ease-in-out whitespace-nowrap", !isExpanded && "sr-only", isExpanded && "opacity-100 blur-none")}>Log out</span>
         </button>
 
         {/* Health Status */}
@@ -294,7 +294,7 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
 function SectionHeader({ label, isExpanded = false }: { label: string; isExpanded: boolean }) {
   return (
     <h3 className="w-full px-2 pt-4 pb-1 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider border-b border-border overflow-hidden">
-      <span className={cn("opacity-0 transition-all duration-200 ease-in-out blur-sm whitespace-nowrap", isExpanded && "opacity-100 blur-none")}>{label}</span>
+      <span className={cn("opacity-0 transition-all duration-200 ease-in-out blur-xs whitespace-nowrap", isExpanded && "opacity-100 blur-none")}>{label}</span>
     </h3>
   );
 }
@@ -314,7 +314,7 @@ function NavRow({
       to={item.to}
       className={cn(
         "flex items-center rounded-sm text-sm transition-colors gap-2.5 px-3 py-1.5 min-h-[32px]",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
         isActive
           ? "bg-accent text-accent-foreground font-medium hover:bg-accent/90"
           : "text-muted-foreground hover:text-foreground hover:bg-muted",
@@ -324,9 +324,9 @@ function NavRow({
       title={isExpanded ? undefined : item.label}
     >
       {isHugeicon(Icon) ? (
-        <HugeiconsIcon strokeWidth={1.2} icon={Icon} size={16} className="flex-shrink-0" aria-hidden="true" />
+        <HugeiconsIcon strokeWidth={1.2} icon={Icon} size={16} className="shrink-0" aria-hidden="true" />
       ) : (
-        <Icon className="w-4 h-4 flex-shrink-0" aria-hidden="true" />
+        <Icon className="w-4 h-4 shrink-0" aria-hidden="true" />
       )}
       {isExpanded && <span className="truncate whitespace-nowrap">{item.label}</span>}
     </NavLink>

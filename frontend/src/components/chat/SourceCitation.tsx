@@ -39,8 +39,8 @@ export function SourceCitation({ source, index, onClick, variant = "strip" }: So
                 "text-[10px] font-semibold leading-none",
                 "bg-primary/10 text-primary hover:bg-primary/20 active:scale-95",
                 "border border-primary/20 hover:border-primary/35 transition-colors duration-150",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
-                "[@media(pointer:coarse)]:min-w-[26px] [@media(pointer:coarse)]:h-[26px]"
+                "focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary/40",
+                "pointer-coarse:min-w-[26px] pointer-coarse:h-[26px]"
               )}
               aria-label={label}
             >
@@ -65,11 +65,11 @@ export function SourceCitation({ source, index, onClick, variant = "strip" }: So
             className={cn(
               "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs",
               "bg-primary/10 text-primary hover:bg-primary/20 active:scale-95 transition-all duration-150",
-              "border border-primary/20 hover:border-primary/35 hover:shadow-sm"
+              "border border-primary/20 hover:border-primary/35 hover:shadow-xs"
             )}
             aria-label={label}
           >
-            <FileText className="h-3 w-3 flex-shrink-0" />
+            <FileText className="h-3 w-3 shrink-0" />
             <span className="truncate max-w-[120px]">{source.filename}</span>
           </button>
         </TooltipTrigger>

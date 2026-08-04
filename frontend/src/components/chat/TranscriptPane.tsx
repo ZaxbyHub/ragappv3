@@ -109,10 +109,10 @@ export function EmptyTranscript({
               <button
                 key={i}
                 onClick={() => onPromptClick(prompt.text)}
-                className="group flex items-start gap-3 rounded-xl border border-border bg-card p-4 text-left transition-all duration-200 hover:border-primary/30 hover:bg-accent/5 hover:-translate-y-0.5 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="group flex items-start gap-3 rounded-xl border border-border bg-card p-4 text-left transition-all duration-200 hover:border-primary/30 hover:bg-accent/5 hover:-translate-y-0.5 hover:shadow-xs focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                 aria-label={`Use prompt: ${prompt.text}`}
               >
-                <prompt.Icon className="mt-0.5 h-4 w-4 flex-shrink-0 text-muted-foreground group-hover:text-primary transition-colors" aria-hidden />
+                <prompt.Icon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground group-hover:text-primary transition-colors" aria-hidden />
                 <span className="text-sm font-medium">{prompt.text}</span>
               </button>
             ))}
@@ -518,7 +518,7 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
       </div>
 
       {/* Composer */}
-      <div className="border-t border-border bg-background/80 backdrop-blur-sm p-3 sm:p-4">
+      <div className="border-t border-border bg-background/80 backdrop-blur-xs p-3 sm:p-4">
         <div className="mx-auto w-full max-w-[760px]">
           <Composer
             onSend={handleSend}

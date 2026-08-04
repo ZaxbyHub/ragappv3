@@ -34,7 +34,7 @@ export function StageIndicator({ stage }: StageIndicatorProps) {
     >
       {/* Avatar placeholder — mirrors AssistantMessage avatar */}
       <div
-        className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-muted"
+        className="shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-muted"
         aria-hidden="true"
       >
         <Icon className="h-4 w-4 text-muted-foreground" />

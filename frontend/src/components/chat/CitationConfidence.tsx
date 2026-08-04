@@ -48,7 +48,7 @@ export function CitationConfidence({ score, label, className }: CitationConfiden
   return (
     <span
       className={cn(
-        "inline-block h-2 w-2 flex-shrink-0 rounded-full",
+        "inline-block h-2 w-2 shrink-0 rounded-full",
         colorClass,
         className
       )}

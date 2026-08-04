@@ -224,7 +224,7 @@ function SourceListItem({
     >
       <div className="flex items-start gap-3">
         <div
-          className="flex-shrink-0 min-w-[1.5rem] h-6 px-1 rounded-full bg-primary/10 flex items-center justify-center text-xs font-medium text-primary"
+          className="shrink-0 min-w-6 h-6 px-1 rounded-full bg-primary/10 flex items-center justify-center text-xs font-medium text-primary"
           aria-label={`Source label ${
             source.source_label && source.source_label.trim()
               ? source.source_label
@@ -237,7 +237,7 @@ function SourceListItem({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+            <FileText className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
             <span className="text-sm font-medium truncate">
               {source.filename}
             </span>
@@ -381,7 +381,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
 
   return (
     <div className="flex flex-col h-full min-h-0 gap-4">
-      <div className="flex flex-col justify-start items-start gap-2 flex-shrink-0">
+      <div className="flex flex-col justify-start items-start gap-2 shrink-0">
         <div className="flex items-center gap-2">
           <FileText className="h-4 w-4 text-primary" />
           <h3 className="font-semibold">{source.filename}</h3>
@@ -410,7 +410,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
       </div>
 
       {(source.snippet || chunkContext?.context_source || isLoadingContext || contextError || documentError) && (
-        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground flex-shrink-0">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground shrink-0">
           {isLoadingContext && (
             <span className="inline-flex items-center gap-1">
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -437,7 +437,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
       )}
 
       {!isSynthesized && source.score !== undefined && source.score_type && (
-        <div className="flex items-center gap-2 text-sm flex-shrink-0">
+        <div className="flex items-center gap-2 text-sm shrink-0">
           <span className="text-muted-foreground">Relevance:</span>
           <span className={getRelevanceLabel(source.score, source.score_type).color}>
             {getRelevanceLabel(source.score, source.score_type).text}
@@ -617,7 +617,7 @@ export function RightPane() {
     tabCount >= 5 ? "grid-cols-5" : tabCount === 4 ? "grid-cols-4" : "grid-cols-3";
 
   return (
-    <div className="flex h-full flex-col flex-shrink-0 min-w-0">
+    <div className="flex h-full flex-col shrink-0 min-w-0">
       <div className="mb-4 flex items-center justify-between">
         <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
           Evidence
@@ -629,7 +629,7 @@ export function RightPane() {
         onValueChange={setActiveTab}
         className="flex-1 flex flex-col min-h-0 w-full"
       >
-        <TabsList className={`grid w-full flex-shrink-0 ${tabsGridCols}`}>
+        <TabsList className={`grid w-full shrink-0 ${tabsGridCols}`}>
           <TabsTrigger value="sources" className="text-xs flex items-center gap-1.5">
             Sources
             {hasSources && (
@@ -667,7 +667,7 @@ export function RightPane() {
           )}
         </TabsList>
 
-        <TabsContent value="sources" className="flex-1 min-h-0 mt-4 flex-shrink-0">
+        <TabsContent value="sources" className="flex-1 min-h-0 mt-4 shrink-0">
           {!hasSources ? (
             <div className="flex-1 min-w-[320px]">
               <EmptyState

@@ -48,7 +48,7 @@ export const MessageBubble = memo(function MessageBubble({
             <div className="flex items-center gap-2 mb-2">
               {message.created_at && (
                 <time
-                  className="text-[10px] text-muted-foreground/50 opacity-0 group-hover:opacity-100 [@media(pointer:coarse)]:opacity-100 transition-opacity"
+                  className="text-[10px] text-muted-foreground/50 opacity-0 group-hover:opacity-100 pointer-coarse:opacity-100 transition-opacity"
                   dateTime={message.created_at}
                   title={new Date(message.created_at).toLocaleString()}
                 >
@@ -63,7 +63,7 @@ export const MessageBubble = memo(function MessageBubble({
               className={cn(
                 "rounded-tl-2xl rounded-bl-2xl rounded-br-2xl rounded-tr px-4 py-3 text-sm leading-relaxed",
                 "bg-primary text-primary-foreground",
-                "max-w-full break-words"
+                "max-w-full wrap-break-word"
               )}
             >
               {message.content}
@@ -72,7 +72,7 @@ export const MessageBubble = memo(function MessageBubble({
             {/* Error */}
             {message.error && (
               <div className="mt-2 flex items-start gap-2 rounded-sm bg-destructive/10 border border-destructive/20 p-3 text-left">
-                <AlertCircle className="h-4 w-4 text-destructive flex-shrink-0 mt-0.5" aria-hidden />
+                <AlertCircle className="h-4 w-4 text-destructive shrink-0 mt-0.5" aria-hidden />
                 <div>
                   <p className="text-sm font-medium text-destructive">Error</p>
                   <p className="text-xs text-destructive/80 mt-0.5">{message.error}</p>
@@ -97,7 +97,7 @@ export const MessageBubble = memo(function MessageBubble({
 
           {/* Avatar */}
           <div
-            className="flex-shrink-0 w-7 h-7 mt-0.5 rounded-full flex items-center justify-center bg-primary text-primary-foreground self-start"
+            className="shrink-0 w-7 h-7 mt-0.5 rounded-full flex items-center justify-center bg-primary text-primary-foreground self-start"
             aria-hidden
           >
             <span className="text-[10px] font-bold leading-none">{userInitial}</span>
@@ -106,7 +106,7 @@ export const MessageBubble = memo(function MessageBubble({
       ) : (
         // Fallback: assistant rendered via MessageBubble (shouldn't normally happen)
         <>
-          <div className="flex-shrink-0 w-7 h-7 mt-0.5 rounded-full flex items-center justify-center bg-primary/10 text-primary" aria-hidden>
+          <div className="shrink-0 w-7 h-7 mt-0.5 rounded-full flex items-center justify-center bg-primary/10 text-primary" aria-hidden>
             <span className="text-xs font-semibold">{userInitial}</span>
           </div>
           <div className="flex-1 min-w-0 max-w-[68ch]">

@@ -37,14 +37,14 @@ function WikiCard({ wikiRef }: WikiCardProps) {
     >
       <div className="flex items-start gap-2">
         <span
-          className="flex-shrink-0 inline-flex items-center justify-center min-w-[1.5rem] h-5 px-1.5 rounded-full bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold"
+          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 text-[10px] font-bold"
           aria-label={`Wiki label ${wikiRef.wiki_label}`}
         >
           {wikiRef.wiki_label}
         </span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap text-xs text-indigo-700/80 dark:text-indigo-300/80 mb-1">
-            <BookOpen className="h-3 w-3 flex-shrink-0" aria-hidden />
+            <BookOpen className="h-3 w-3 shrink-0" aria-hidden />
             <span className="font-semibold truncate">{wikiRef.title}</span>
             {wikiRef.page_type && (
               <>
@@ -68,7 +68,7 @@ function WikiCard({ wikiRef }: WikiCardProps) {
               <button
                 type="button"
                 onClick={handleNavigate}
-                className="ml-auto flex-shrink-0 inline-flex items-center gap-0.5 text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="ml-auto shrink-0 inline-flex items-center gap-0.5 text-[10px] text-indigo-600 dark:text-indigo-400 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                 aria-label={`Open wiki page ${wikiRef.title}`}
               >
                 <ExternalLink className="h-2.5 w-2.5" aria-hidden />

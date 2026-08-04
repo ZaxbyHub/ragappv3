@@ -36,7 +36,7 @@ export function ErrorState({
   size = "md",
 }: ErrorStateProps) {
   return (
-    <Card className="flex-shrink-0 w-full flex flex-col flex-1">
+    <Card className="shrink-0 w-full flex flex-col flex-1">
       <CardContent className="py-12 text-center flex-1" role="alert">
         <div
           className={`${sizeClasses[size]} mx-auto mb-4 rounded-full bg-destructive/10 flex items-center justify-center`}

@@ -29,7 +29,7 @@ export function SaveDiscardFooter({
   return (
     <div
       className={cn(
-        "sticky bottom-0 inset-x-0 z-10 -mx-4 mt-6 border-t bg-card/95 backdrop-blur",
+        "sticky bottom-0 inset-x-0 z-10 -mx-4 mt-6 border-t bg-card/95 backdrop-blur-sm",
         "transition-all",
         visible ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-2 opacity-0",
       )}
