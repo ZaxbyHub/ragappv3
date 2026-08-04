@@ -19,10 +19,17 @@ export default defineConfig(({ mode }) => {
     build: {
       rollupOptions: {
         output: {
-          manualChunks: {
-            'vendor-react': ['react', 'react-dom', 'react-router-dom'],
-            'vendor-ui': ['framer-motion', '@radix-ui/react-dialog', '@radix-ui/react-select', '@radix-ui/react-tabs'],
-            'vendor-state': ['zustand', '@tanstack/react-query', 'axios'],
+          manualChunks: (id) => {
+            const chunks: Record<string, string[]> = {
+              'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+              'vendor-ui': ['framer-motion', '@radix-ui/react-dialog', '@radix-ui/react-select', '@radix-ui/react-tabs'],
+              'vendor-state': ['zustand', '@tanstack/react-query', 'axios'],
+            }
+            for (const [chunkName, modules] of Object.entries(chunks)) {
+              if (modules.some((mod) => id.includes(`/node_modules/${mod}/`))) {
+                return chunkName
+              }
+            }
           },
         },
       },

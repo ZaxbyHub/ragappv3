@@ -131,7 +131,7 @@ function extractStructuredOutputs(messages: Message[]): StructuredOutput[] {
         const tableLines = lines.slice(tableStart, i);
         // Filter out separator lines (like |---|---|)
         const contentLines = tableLines.filter(
-          (l) => !/^\|[-:|\s]+\|$/.test(l.trim())
+          (l) => !/^\|(?:-|:|\||\s)+\|$/.test(l.trim())
         );
         const tableContent = tableLines.join("\n");
         const firstDataLine = contentLines[0] || "";
@@ -161,7 +161,7 @@ function extractStructuredOutputs(messages: Message[]): StructuredOutput[] {
     if (inTable) {
       const tableLines = lines.slice(tableStart);
       const contentLines = tableLines.filter(
-        (l) => !/^\|[-:|\s]+\|$/.test(l.trim())
+        (l) => !/^\|(?:-|:|\||\s)+\|$/.test(l.trim())
       );
       const tableContent = tableLines.join("\n");
       const firstDataLine = contentLines[0] || "";
