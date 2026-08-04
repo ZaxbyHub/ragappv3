@@ -86,3 +86,6 @@ tmp/
 # SQLite files created by tests with MagicMock paths
 backend/<MagicMock*
 .zcode/
+
+# Ephemeral agent worktrees (never commit)
+.claude/worktrees/
