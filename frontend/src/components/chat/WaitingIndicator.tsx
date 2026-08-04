@@ -15,7 +15,7 @@ export function WaitingIndicator() {
     >
       {/* Avatar placeholder — matches AssistantMessage avatar */}
       <div
-        className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-muted"
+        className="shrink-0 w-8 h-8 rounded-full flex items-center justify-center bg-muted"
         aria-hidden="true"
       >
         <svg

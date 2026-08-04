@@ -125,7 +125,7 @@ function DraftParsedTextViewer({ draftId, input }: { draftId: number; input: Dra
             <p className="text-sm text-destructive">{parseDraftRoomError(contentQuery.error).detail}</p>
           )}
           {contentQuery.data && (
-            <pre className="max-h-64 min-w-0 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-2 text-xs">
+            <pre className="max-h-64 min-w-0 overflow-y-auto whitespace-pre-wrap wrap-break-word rounded-md border border-border bg-muted/30 p-2 text-xs">
               {contentQuery.data.parsed_text ?? "No parsed text available."}
             </pre>
           )}

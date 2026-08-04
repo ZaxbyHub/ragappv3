@@ -33,11 +33,11 @@ export function EmptyState({
 }: EmptyStateProps) {
   return (
     <div
-      className="flex-shrink-0 w-full flex flex-col flex-1"
+      className="shrink-0 w-full flex flex-col flex-1"
       role="status"
       aria-live="polite"
     >
-      <Card className="flex-shrink-0 w-full flex flex-col flex-1">
+      <Card className="shrink-0 w-full flex flex-col flex-1">
         <CardContent className={`py-12 text-center flex-1 ${className}`}>
           {Icon && (
             <div

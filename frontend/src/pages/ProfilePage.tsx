@@ -323,7 +323,7 @@ function ProfilePageContent() {
             <ul className="space-y-2">
               {orgs.map((org) => (
                 <li key={org.id} className="flex items-center gap-2 text-sm">
-                  <Building2 className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  <Building2 className="w-4 h-4 text-muted-foreground shrink-0" />
                   <span className="font-medium">{org.name}</span>
                 </li>
               ))}
@@ -349,7 +349,7 @@ function ProfilePageContent() {
             <ul className="space-y-2">
               {vaults.map((vault) => (
                 <li key={vault.id} className="flex items-center gap-2 text-sm">
-                  <Database className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  <Database className="w-4 h-4 text-muted-foreground shrink-0" />
                   <span className="font-medium">{vault.name}</span>
                   {vault.file_count > 0 && (
                     <span className="text-xs text-muted-foreground">{vault.file_count} docs</span>

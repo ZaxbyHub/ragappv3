@@ -81,7 +81,7 @@ export function VaultSelector({ className }: VaultSelectorProps) {
                   </span>
                 )}
               </div>
-              <span className="text-xs text-muted-foreground ml-2 flex-shrink-0">
+              <span className="text-xs text-muted-foreground ml-2 shrink-0">
                 {vault.file_count} {vault.file_count === 1 ? "file" : "files"}
               </span>
             </div>

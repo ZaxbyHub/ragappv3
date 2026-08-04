@@ -367,10 +367,10 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
                 <div className="flex items-center justify-between gap-2">
                   <span className={`truncate font-medium${isActive ? " text-foreground" : ""}`}>{truncatedTitle}</span>
                   {session.forked_from_session_id != null && (
-                    <span title="Branched conversation"><GitBranch className="h-3 w-3 text-muted-foreground flex-shrink-0" aria-hidden="true" /></span>
+                    <span title="Branched conversation"><GitBranch className="h-3 w-3 text-muted-foreground shrink-0" aria-hidden="true" /></span>
                   )}
                   {isPinned && (
-                    <Pin className="h-3 w-3 text-muted-foreground flex-shrink-0" aria-hidden="true" />
+                    <Pin className="h-3 w-3 text-muted-foreground shrink-0" aria-hidden="true" />
                   )}
                   {!isEditing && (
                     <div className="justify-items-end">
@@ -423,7 +423,7 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
                             e.stopPropagation();
                             onDelete();
                           }}
-                          className="text-destructive focus:text-destructive bg-destructive/10 hover:!bg-destructive/20"
+                          className="text-destructive focus:text-destructive bg-destructive/10 hover:bg-destructive/20!"
                         >
                           <Trash2 className="mr-2 h-4 w-4" aria-hidden="true" />
                           Delete
@@ -890,7 +890,7 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
         <div className="space-y-4 flex-1">
           {[...Array(5)].map((_, i) => (
             <div key={i} className="flex items-center gap-3 px-2 h-16">
-              <Skeleton className="h-4 w-4 flex-shrink-0" />
+              <Skeleton className="h-4 w-4 shrink-0" />
               <div className="flex-1 space-y-2">
                 <Skeleton className="h-4 w-[150px]" />
                 <Skeleton className="h-3 w-[100px]" />

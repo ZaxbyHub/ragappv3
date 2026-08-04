@@ -57,7 +57,7 @@ export function SourceSpanPopover({
           {/* Header: label + confidence */}
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
-              <FileText className="h-4 w-4 flex-shrink-0 text-muted-foreground" aria-hidden />
+              <FileText className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
               <span className="truncate">{source.filename}</span>
               <span className="text-muted-foreground font-normal">{label}</span>
             </div>

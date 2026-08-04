@@ -133,7 +133,7 @@ export function DraftStatusBanner({
               <button
                 type="button"
                 onClick={cta.onClick}
-                className="shrink-0 rounded-sm border border-current px-2 py-1 text-xs font-medium underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                className="shrink-0 rounded-sm border border-current px-2 py-1 text-xs font-medium underline-offset-2 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
               >
                 {cta.label}
               </button>

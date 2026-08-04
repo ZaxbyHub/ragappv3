@@ -17,7 +17,7 @@ export function FormFieldError({ children, id }: FormFieldErrorProps) {
       aria-live="assertive"
       aria-atomic="true"
     >
-      <AlertCircle className="h-3 w-3 flex-shrink-0" aria-hidden="true" />
+      <AlertCircle className="h-3 w-3 shrink-0" aria-hidden="true" />
       {children}
     </p>
   );

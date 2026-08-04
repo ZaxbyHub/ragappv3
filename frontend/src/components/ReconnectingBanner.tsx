@@ -26,7 +26,7 @@ function ReconnectingBanner({ health }: { health: HealthStatus }) {
       aria-live="polite"
       aria-atomic="true"
       className={cn(
-        "sticky top-0 z-50 flex w-full items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium shadow-sm",
+        "sticky top-0 z-50 flex w-full items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium shadow-xs",
         "transition-colors duration-200",
         isSevere
           ? "bg-destructive/95 text-destructive-foreground"

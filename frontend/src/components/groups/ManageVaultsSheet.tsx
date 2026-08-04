@@ -213,13 +213,13 @@ export function ManageVaultsSheet({
                           className="flex items-center gap-2 cursor-pointer"
                         >
                           <FolderOpen
-                            className="h-4 w-4 text-muted-foreground flex-shrink-0"
+                            className="h-4 w-4 text-muted-foreground shrink-0"
                             aria-hidden="true"
                           />
                           <span className="font-medium truncate">{vault.name}</span>
                           {hasAccess && (
                             <Shield
-                              className="h-3 w-3 text-primary flex-shrink-0"
+                              className="h-3 w-3 text-primary shrink-0"
                               aria-hidden="true"
                             />
                           )}

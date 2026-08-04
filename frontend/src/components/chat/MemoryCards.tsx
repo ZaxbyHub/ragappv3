@@ -26,7 +26,7 @@ function MemoryCard({ memory }: MemoryCardProps) {
     >
       <div className="flex items-start gap-2">
         <span
-          className="flex-shrink-0 inline-flex items-center justify-center min-w-[1.5rem] h-5 px-1.5 rounded-full bg-amber-500/20 text-amber-700 dark:text-amber-300 text-[10px] font-bold"
+          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-amber-500/20 text-amber-700 dark:text-amber-300 text-[10px] font-bold"
           aria-label={`Memory label ${memory.memory_label}`}
         >
           {memory.memory_label}

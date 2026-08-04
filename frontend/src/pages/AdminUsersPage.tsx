@@ -518,7 +518,7 @@ function AdminUsersPageContent() {
                           aria-label={`${user.is_active ? "Deactivate" : "Activate"} user ${user.username}`}
                           onClick={() => handleActiveToggle(user.id, !user.is_active)}
                           disabled={updatingUserId === user.id || user.id === currentUser?.id}
-                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${
+                          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${
                             user.is_active ? "bg-primary" : "bg-input"
                           }`}
                         >

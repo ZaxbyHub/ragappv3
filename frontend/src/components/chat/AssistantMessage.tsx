@@ -107,7 +107,7 @@ export function AssistantMessage({
     >
       {/* Avatar */}
       <div
-        className="flex-shrink-0 w-7 h-7 mt-0.5 rounded-full flex items-center justify-center bg-primary/10 text-primary"
+        className="shrink-0 w-7 h-7 mt-0.5 rounded-full flex items-center justify-center bg-primary/10 text-primary"
         aria-hidden
       >
         <Bot className="h-3.5 w-3.5" />
@@ -180,7 +180,7 @@ export function AssistantMessage({
         {/* Error */}
         {message.error && (
           <div className="mt-3 flex items-start gap-2 rounded-sm bg-destructive/10 border border-destructive/20 p-3">
-            <AlertCircle className="h-4 w-4 text-destructive flex-shrink-0 mt-0.5" aria-hidden />
+            <AlertCircle className="h-4 w-4 text-destructive shrink-0 mt-0.5" aria-hidden />
             <div className="min-w-0">
               <p className="text-sm font-medium text-destructive">Error</p>
               <p className="text-xs text-destructive/80 mt-0.5">{message.error}</p>

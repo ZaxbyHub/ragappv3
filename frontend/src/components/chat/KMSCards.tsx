@@ -30,14 +30,14 @@ function KMSCard({ kmsRef }: KMSCardProps) {
     >
       <div className="flex items-start gap-2">
         <span
-          className="flex-shrink-0 inline-flex items-center justify-center min-w-[1.5rem] h-5 px-1.5 rounded-full bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold"
+          className="shrink-0 inline-flex items-center justify-center min-w-6 h-5 px-1.5 rounded-full bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold"
           aria-label={`Knowledge label ${kmsRef.kms_label}`}
         >
           {kmsRef.kms_label}
         </span>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 flex-wrap text-xs text-emerald-700/80 dark:text-emerald-300/80 mb-1">
-            <Library className="h-3 w-3 flex-shrink-0" aria-hidden />
+            <Library className="h-3 w-3 shrink-0" aria-hidden />
             <span className="font-semibold truncate">{kmsRef.title}</span>
             {kmsRef.source_type && (
               <>
@@ -54,7 +54,7 @@ function KMSCard({ kmsRef }: KMSCardProps) {
             <button
               type="button"
               onClick={handleNavigate}
-              className="ml-auto flex-shrink-0 inline-flex items-center gap-0.5 text-[10px] text-emerald-600 dark:text-emerald-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              className="ml-auto shrink-0 inline-flex items-center gap-0.5 text-[10px] text-emerald-600 dark:text-emerald-400 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
               aria-label={`Open knowledge entry ${kmsRef.title}`}
             >
               <ExternalLink className="h-2.5 w-2.5" aria-hidden />

@@ -271,7 +271,7 @@ function SettingsPageContent({
       {reindexRequired && (
         <div className="flex items-start gap-3 rounded-sm border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 p-4">
           <AlertTriangle
-            className="h-5 w-5 text-amber-600 flex-shrink-0 mt-0.5"
+            className="h-5 w-5 text-amber-600 shrink-0 mt-0.5"
             aria-hidden
           />
           <div className="flex-1 min-w-0">
@@ -287,7 +287,7 @@ function SettingsPageContent({
           </div>
           <button
             onClick={() => setReindexRequired(false)}
-            className="text-amber-600 hover:text-amber-800 text-xs underline flex-shrink-0"
+            className="text-amber-600 hover:text-amber-800 text-xs underline shrink-0"
           >
             Dismiss
           </button>

@@ -412,7 +412,7 @@ export default function ChatShell() {
       {/* DESKTOP: Session Rail (persistent sidebar) */}
       <aside
         className={cn(
-          "relative hidden md:flex md:flex-col md:flex-shrink-0 md:border-r md:border-border md:bg-background md:transition-all md:duration-300 md:ease-in-out",
+          "relative hidden md:flex md:flex-col md:shrink-0 md:border-r md:border-border md:bg-background md:transition-all md:duration-300 md:ease-in-out",
           sessionRailOpen ? "md:translate-x-0 md:opacity-100" : "md:w-0 md:opacity-0 md:overflow-hidden"
         )}
         style={{ width: sessionRailOpen ? `${sessionRailWidth}px` : "0px" }}
@@ -495,8 +495,8 @@ export default function ChatShell() {
       {/* DESKTOP: Right Pane (persistent resizable sidebar) */}
       <aside
         className={cn(
-          "relative hidden lg:flex lg:flex-col lg:flex-shrink-0 lg:border-l lg:border-border lg:bg-background lg:transition-all lg:duration-300 lg:ease-in-out",
-          rightPaneOpen ? "lg:translate-x-0 lg:opacity-100 blur-none" : "lg:w-0 lg:opacity-0 lg:overflow-hidden blur-sm"
+          "relative hidden lg:flex lg:flex-col lg:shrink-0 lg:border-l lg:border-border lg:bg-background lg:transition-all lg:duration-300 lg:ease-in-out",
+          rightPaneOpen ? "lg:translate-x-0 lg:opacity-100 blur-none" : "lg:w-0 lg:opacity-0 lg:overflow-hidden blur-xs"
         )}
         style={{ width: rightPaneOpen ? `${rightPaneWidth}px` : undefined }}
         aria-label="Details panel"
@@ -517,7 +517,7 @@ export default function ChatShell() {
             tabIndex={0}
           />
         )}
-        <div className="flex h-full flex-col p-4 bg-card/80 flex-shrink-0 w-full">
+        <div className="flex h-full flex-col p-4 bg-card/80 shrink-0 w-full">
           <ErrorBoundary fallback={sourcesFallback}>
             <RightPane />
           </ErrorBoundary>

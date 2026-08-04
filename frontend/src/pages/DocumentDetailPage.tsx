@@ -182,7 +182,7 @@ export default function DocumentDetailPage() {
             <Button variant="ghost" size="icon" onClick={() => navigate("/documents")} aria-label="Back">
               <ArrowLeft className="w-4 h-4" />
             </Button>
-            <FileIcon filename={doc.filename} className="w-5 h-5 flex-shrink-0" />
+            <FileIcon filename={doc.filename} className="w-5 h-5 shrink-0" />
             <h1 className="text-lg font-semibold truncate" title={doc.filename}>
               {doc.filename}
             </h1>

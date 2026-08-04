@@ -218,7 +218,7 @@ export function DraftStageRail({
                   onKeyDown={handleKeyDown}
                   onClick={() => onSelectStage(stage)}
                   className={cn(
-                    "flex flex-col items-center gap-1 rounded-sm border bg-background px-3 py-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                    "flex flex-col items-center gap-1 rounded-sm border bg-background px-3 py-2 text-xs font-medium transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                     STATE_CLASSES[state],
                     stage === selectedStage && "bg-accent",
                   )}

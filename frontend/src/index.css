@@ -13,9 +13,231 @@
    (including Inter, the body font). The previous CSS @import block was
    render-blocking and duplicated 3 of the 4 families — removed (UI-PERF-5). */
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* `source(none)` disables v4's automatic source detection (which would scan the
+   whole Vite root) so that the scanned set is exactly the v3 `content` array
+   from the now-removed tailwind.config.js — no more, no less. */
+@import 'tailwindcss' source(none);
+
+@source '../index.html';
+@source './**/*.{js,ts,jsx,tsx}';
+
+@plugin 'tailwindcss-animate';
+@plugin '@tailwindcss/typography';
+
+@custom-variant dark (&:is(.dark *));
+
+@utility container {
+  margin-inline: auto;
+  padding-inline: 2rem;
+  @media (width >= --theme(--breakpoint-sm)) {
+    max-width: none;
+  }
+  @media (width >= 1400px) {
+    max-width: 1400px;
+  }
+}
+
+@theme {
+  --font-sans: Spline Sans, system-ui, sans-serif;
+
+  --text-2xs: 0.625rem;
+  --text-2xs--line-height: 0.9rem;
+
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-success: hsl(var(--success));
+  --color-success-foreground: hsl(var(--success-foreground));
+
+  --color-success-subdued: hsl(var(--success-subdued));
+  --color-success-subdued-foreground: hsl(var(--success-subdued-foreground));
+
+  --color-warning: hsl(var(--warning));
+  --color-warning-foreground: hsl(var(--warning-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+
+  --animate-page-load: page-load 0.5s ease-out forwards;
+  --animate-stagger: stagger 0.4s ease-out forwards;
+  --animate-ripple: ripple 0.6s ease-out forwards;
+  --animate-pulse-soft: pulse-soft 2s ease-in-out infinite;
+  --animate-slide-up: slide-up 0.3s ease-out forwards;
+
+  @keyframes page-load {
+    0% {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @keyframes stagger {
+    0% {
+      opacity: 0;
+      transform: translateY(20px) scale(0.98);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+  @keyframes ripple {
+    0% {
+      transform: scale(0);
+      opacity: 0.5;
+    }
+    100% {
+      transform: scale(4);
+      opacity: 0;
+    }
+  }
+  @keyframes pulse-soft {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.7;
+    }
+  }
+  @keyframes slide-up {
+    0% {
+      transform: translateY(100%);
+      opacity: 0;
+    }
+    100% {
+      transform: translateY(0);
+      opacity: 1;
+    }
+  }
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+
+  /*
+    v4 preflight also dropped `cursor: pointer` on buttons and changed the
+    placeholder color from gray-400 to currentColor/50%. Both are visible in
+    this app (every ui/button.tsx button, every input/textarea placeholder),
+    so restore the v3 behaviour rather than let it silently regress.
+  */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-gray-400, currentcolor);
+  }
+}
+
+/* =============================================================================
+   Custom scrollbar — subtle and consistent across panes
+   ============================================================================= */
+
+@utility chat-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--border)) transparent;
+  &::-webkit-scrollbar {
+    width: 5px;
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  &::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 9999px;
+  }
+  &::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.4);
+  }
+}
+
+/* =============================================================================
+   Streaming caret — custom blinking cursor shown at end of streaming text
+   ============================================================================= */
+
+@utility streaming-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background-color: hsl(var(--primary));
+  border-radius: 1px;
+  animation: caret-blink 1s step-end infinite;
+}
+
+@utility text-filetype-pdf {
+  color: hsl(var(--filetype-pdf));
+}
+
+@utility text-filetype-docx {
+  color: hsl(var(--filetype-docx));
+}
+
+@utility text-filetype-pptx {
+  color: hsl(var(--filetype-pptx));
+}
+
+@utility text-filetype-md {
+  color: hsl(var(--filetype-md));
+}
+
+@utility text-filetype-xlsx {
+  color: hsl(var(--filetype-xlsx));
+}
+
+@utility text-filetype-json {
+  color: hsl(var(--filetype-json));
+}
+
+@utility text-filetype-code {
+  color: hsl(var(--filetype-code));
+}
 
 @layer base {
   /*
@@ -301,54 +523,22 @@
   }
 }
 
-/* =============================================================================
-   Custom scrollbar — subtle and consistent across panes
-   ============================================================================= */
 @layer utilities {
-  .chat-scrollbar {
-    scrollbar-width: thin;
-    scrollbar-color: hsl(var(--border)) transparent;
+  @keyframes caret-blink {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0;
+    }
   }
-  .chat-scrollbar::-webkit-scrollbar {
-    width: 5px;
-  }
-  .chat-scrollbar::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  .chat-scrollbar::-webkit-scrollbar-thumb {
-    background: hsl(var(--border));
-    border-radius: 9999px;
-  }
-  .chat-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: hsl(var(--muted-foreground) / 0.4);
-  }
-}
 
-/* =============================================================================
-   Streaming caret — custom blinking cursor shown at end of streaming text
-   ============================================================================= */
-@layer utilities {
-  .streaming-caret {
-    display: inline-block;
-    width: 2px;
-    height: 1.1em;
-    margin-left: 2px;
-    vertical-align: text-bottom;
-    background-color: hsl(var(--primary));
-    border-radius: 1px;
-    animation: caret-blink 1s step-end infinite;
-  }
-}
-
-@keyframes caret-blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
-}
-
-/* =============================================================================
+  /* =============================================================================
    Shiki code block theme overrides — transparent background so our own
    container controls the surface color in both light and dark modes.
    ============================================================================= */
+}
 @layer base {
   .shiki-wrapper pre {
     background: transparent !important;
@@ -380,26 +570,20 @@
   }
 }
 
-/* Respect user motion preferences */
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
-  }
-  .streaming-caret {
-    animation: none !important;
-    opacity: 1 !important;
-  }
-}
-
 @layer utilities {
-  .text-filetype-pdf { color: hsl(var(--filetype-pdf)); }
-  .text-filetype-docx { color: hsl(var(--filetype-docx)); }
-  .text-filetype-pptx { color: hsl(var(--filetype-pptx)); }
-  .text-filetype-md { color: hsl(var(--filetype-md)); }
-  .text-filetype-xlsx { color: hsl(var(--filetype-xlsx)); }
-  .text-filetype-json { color: hsl(var(--filetype-json)); }
-  .text-filetype-code { color: hsl(var(--filetype-code)); }
+  /* Respect user motion preferences */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+    .streaming-caret {
+      animation: none !important;
+      opacity: 1 !important;
+    }
+  }
 }
