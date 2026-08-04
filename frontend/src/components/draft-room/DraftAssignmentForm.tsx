@@ -1,4 +1,5 @@
 import { useId, useMemo, useState } from "react";
+import type { JSX } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listAccessibleVaults } from "@/lib/api";
 import { Label } from "@/components/ui/label";
