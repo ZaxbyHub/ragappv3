@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import type { JSX } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Loader2, FolderOpen, Search, Shield } from "lucide-react";
 import {

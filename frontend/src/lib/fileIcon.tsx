@@ -15,7 +15,7 @@ import {
  * Always use via JSX: <FileIcon filename={doc.filename} className="h-4 w-4" />
  */
 export function FileIcon({ filename, className }: { filename: string | null | undefined; className?: string }) {
-  const ext = (filename ?? '').split('.').pop()?.toLowerCase() ?? '';
+  const ext = (typeof filename === 'string' ? filename : '').split('.').pop()?.toLowerCase() ?? '';
   const cls = className ?? '';
 
   if (ext === 'pdf') {

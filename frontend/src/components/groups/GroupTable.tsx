@@ -3,6 +3,7 @@
 // Coder: implement TODO items, do not change component structure or accessibility attributes
 
 import { useState, useCallback, useEffect, useRef } from "react";
+import type { JSX } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   useReactTable,
@@ -96,7 +97,7 @@ export function GroupTable({
   const [sorting, setSorting] = useState<SortingState>([]);
 
   // Debounce search input (300ms)
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => {
     debounceRef.current = setTimeout(() => {
       setDebouncedSearch(searchInput);

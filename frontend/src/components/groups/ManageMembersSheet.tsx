@@ -3,6 +3,7 @@
 // Coder: implement TODO items, do not change component structure or accessibility attributes
 
 import { useState, useEffect, useCallback } from "react";
+import type { JSX } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Loader2, Users, Search } from "lucide-react";
 import {

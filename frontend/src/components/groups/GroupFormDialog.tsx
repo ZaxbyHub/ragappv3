@@ -3,6 +3,7 @@
 // Coder: implement TODO items, do not change component structure or accessibility attributes
 
 import { useState, useEffect } from "react";
+import type { JSX } from "react";
 import { Loader2 } from "lucide-react";
 import {
   Dialog,
