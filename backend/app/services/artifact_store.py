@@ -228,10 +228,12 @@ def enqueue_asset_cleanup(
                 (file_id, vault_id, rel_path, generation_hash),
             )
         except Exception as exc:  # noqa: BLE001
-            # A tombstone write must not abort the owning transaction; the
-            # reconciler's path-rescan fallback still bounds the leak.
-            logger.warning(
-                "Could not enqueue asset cleanup for %s (file_id=%s): %s",
+            # A tombstone write must not abort the owning transaction. There is
+            # no automatic rescan fallback: an unrecorded tombstone leaks its
+            # bytes until operator intervention, so log it loudly.
+            logger.error(
+                "Could not enqueue asset cleanup for %s (file_id=%s); bytes may "
+                "leak until operator reconciliation: %s",
                 rel_path,
                 file_id,
                 exc,
@@ -280,19 +282,24 @@ def sweep_pending_asset_deletes(conn) -> tuple[int, int]:
             conn.execute("DELETE FROM artifact_delete_pending WHERE id = ?", (row["id"],))
             removed += 1
         else:
-            attempts = (row["attempts"] or 0) + 1
-            if attempts >= _MAX_UNLINK_ATTEMPTS:
+            prev_attempts = row["attempts"] or 0
+            new_attempts = prev_attempts + 1
+            # Persist capped attempts so the row is not rewritten unboundedly
+            # once it is clearly stuck, and only log the error the first time
+            # the threshold is crossed (prevents per-sweep log spam while still
+            # leaving the path for a later sweep / operator reconciliation).
+            persist = min(new_attempts, _MAX_UNLINK_ATTEMPTS + 1)
+            conn.execute(
+                "UPDATE artifact_delete_pending SET attempts = ? WHERE id = ?",
+                (persist, row["id"]),
+            )
+            if prev_attempts < _MAX_UNLINK_ATTEMPTS and new_attempts >= _MAX_UNLINK_ATTEMPTS:
                 logger.error(
                     "Asset cleanup failed repeatedly (file_id=%s rel=%s attempts=%s); "
                     "requires operator reconciliation",
                     row["file_id"],
                     row["rel_path"],
-                    attempts,
-                )
-            else:
-                conn.execute(
-                    "UPDATE artifact_delete_pending SET attempts = ? WHERE id = ?",
-                    (attempts, row["id"]),
+                    new_attempts,
                 )
             remaining += 1
     conn.commit()

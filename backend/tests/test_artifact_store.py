@@ -217,6 +217,98 @@ class TestGenerationPublish:
             "SELECT COUNT(*) FROM document_atoms WHERE file_id=1 AND generation_hash='genB'"
         ).fetchone()[0] == 1
 
+    def test_cross_file_shared_asset_keeps_both_rows(self, db):
+        """Regression: the same asset_id across two files must not cross-delete.
+
+        The schema must rely on the composite ``UNIQUE(file_id, generation_hash,
+        asset_id)`` only — a global ``asset_id UNIQUE`` would make the second
+        file's ``INSERT OR REPLACE`` delete the first file's asset row (breaking
+        its provenance) when two files share identical extracted bytes.
+        """
+        from app.services.document_artifacts import DocumentAsset
+
+        db.execute(
+            "INSERT INTO files (vault_id, file_path, file_name, file_hash, file_size, status) "
+            "VALUES (1, '/tmp/y.png', 'y.png', 'h2', 1, 'indexed')"
+        )
+        db.commit()
+
+        shared = DocumentAsset(
+            asset_id="shaa", file_id=1, generation_hash="genA", sha256="shaa",
+            rel_path="genA/shaa", byte_size=1,
+        )
+        artifact_store.publish_generation(
+            db, file_id=1, vault_id=1, generation_hash="genA",
+            atoms=[_atom(0, asset_id="shaa", kind=AtomKind.IMAGE, raw="img")],
+            assets=[shared],
+            stage_states=[{"stage": "parse", "status": "succeeded"}],
+            parser_fingerprint="p", implementation_version="1",
+        )
+        db.commit()
+
+        shared2 = DocumentAsset(
+            asset_id="shaa", file_id=2, generation_hash="genA", sha256="shaa",
+            rel_path="genA/shaa", byte_size=1,
+        )
+        artifact_store.publish_generation(
+            db, file_id=2, vault_id=1, generation_hash="genA",
+            atoms=[_atom(0, asset_id="shaa", kind=AtomKind.IMAGE, raw="img")],
+            assets=[shared2],
+            stage_states=[{"stage": "parse", "status": "succeeded"}],
+            parser_fingerprint="p", implementation_version="1",
+        )
+        db.commit()
+
+        # Both files must still own their asset row (no cross-file REPLACE).
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_assets WHERE asset_id='shaa'"
+        ).fetchone()[0] == 2
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_assets WHERE file_id=1 AND asset_id='shaa'"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_assets WHERE file_id=2 AND asset_id='shaa'"
+        ).fetchone()[0] == 1
+        # No tombstone should have been enqueued (nothing was retired).
+        assert db.execute(
+            "SELECT COUNT(*) FROM artifact_delete_pending"
+        ).fetchone()[0] == 0
+
+
+class TestRetireGenerationQuick:
+    def test_retire_generation_drops_rows_and_tombstones_assets(self, db):
+        from app.services.document_artifacts import DocumentAsset
+
+        asset = DocumentAsset(
+            asset_id="sha1", file_id=1, generation_hash="genX", sha256="sha1",
+            rel_path="genX/sha1", byte_size=1,
+        )
+        artifact_store.publish_generation(
+            db, file_id=1, vault_id=1, generation_hash="genX",
+            atoms=[_atom(0, asset_id="sha1", kind=AtomKind.IMAGE, raw="img", generation_hash="genX")],
+            assets=[asset],
+            stage_states=[{"stage": "parse", "status": "succeeded"}],
+            parser_fingerprint="p", implementation_version="1",
+        )
+        db.commit()
+
+        artifact_store.retire_generation_quick(
+            db, file_id=1, vault_id=1, generation_hash="genX"
+        )
+        db.commit()
+
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_assets WHERE file_id=1 AND generation_hash='genX'"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_atoms WHERE file_id=1 AND generation_hash='genX'"
+        ).fetchone()[0] == 0
+        pending = db.execute(
+            "SELECT rel_path, generation_hash FROM artifact_delete_pending WHERE rel_path='genX/sha1'"
+        ).fetchone()
+        assert pending is not None
+        assert pending["generation_hash"] == "genX"
+
 
 class TestSweep:
     def test_sweep_collects_pending_tombstones(self, db, artifact_root):
@@ -248,3 +340,29 @@ class TestSweep:
         # Out-of-root paths are never unlinked; they remain for the reconciler.
         assert removed == 0
         assert remaining == 1
+
+    def test_sweep_attempts_stop_growing_after_threshold(self, db):
+        """Regression: attempts must be persisted but capped once a path is stuck.
+
+        Repeated sweeps must not rewrite an unboundedly growing counter and must
+        leave the row pending (removed only on success), not silently drop it.
+        """
+        artifact_store.enqueue_asset_cleanup(
+            db, file_id=1, vault_id=1, rel_paths=["../../stuck"]
+        )
+        db.commit()
+        prev = 0
+        for _ in range(12):
+            removed, remaining = artifact_store.sweep_pending_asset_deletes(db)
+            assert removed == 0
+            assert remaining == 1
+            attempts = db.execute(
+                "SELECT attempts FROM artifact_delete_pending WHERE id = 1"
+            ).fetchone()[0]
+            assert attempts >= prev  # monotonically non-decreasing
+            assert attempts <= artifact_store._MAX_UNLINK_ATTEMPTS + 1  # capped
+            prev = attempts
+        # Still present (never silently dropped) and capped.
+        assert db.execute(
+            "SELECT COUNT(*) FROM artifact_delete_pending WHERE id = 1"
+        ).fetchone()[0] == 1

@@ -449,7 +449,7 @@ CREATE INDEX IF NOT EXISTS idx_document_atoms_generation
 -- every read/delete and rejects traversal / symlink-reparse escapes.
 CREATE TABLE IF NOT EXISTS document_assets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    asset_id TEXT NOT NULL UNIQUE,
+    asset_id TEXT NOT NULL,
     file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     generation_hash TEXT NOT NULL,
     sha256 TEXT NOT NULL,

@@ -1995,7 +1995,19 @@ class DocumentProcessor:
                 generation_hash,
                 exc,
             )
+            # Canonical compensation: drop any partial new-generation rows via
+            # retire_generation_quick, then tombstone the new-generation asset
+            # bytes we already wrote so the sweep collects them even though the
+            # publish never committed a row for them. Kept on its own short
+            # transaction; a compensation failure is surfaced (not silently
+            # swallowed) so orphaned bytes require operator reconciliation.
             try:
+                artifact_store.retire_generation_quick(
+                    conn,
+                    file_id=file_id,
+                    vault_id=vault_id,
+                    generation_hash=generation_hash,
+                )
                 artifact_store.enqueue_asset_cleanup(
                     conn,
                     file_id=file_id,
@@ -2004,8 +2016,16 @@ class DocumentProcessor:
                     generation_hash=generation_hash,
                 )
                 conn.commit()
-            except Exception:
+            except Exception as exc2:  # noqa: BLE001
                 conn.rollback()
+                logger.error(
+                    "Artifact compensation failed for file_id=%s gen=%s; "
+                    "new-generation bytes may be orphaned and require operator "
+                    "reconciliation: %s",
+                    file_id,
+                    generation_hash,
+                    exc2,
+                )
         finally:
             self.pool.release_connection(conn)
 
