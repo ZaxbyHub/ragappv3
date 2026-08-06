@@ -167,6 +167,10 @@ async def test_same_file_concurrent_re_enqueues_are_serialized():
         processor._running = False
 
     assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_embedding_global_semaphore_limits_batches_across_documents():
     from app.services.embeddings import EmbeddingService
 
     active = 0
