@@ -101,6 +101,7 @@ from app.limiter import limiter
 from app.models.database import SQLiteConnectionPool
 from app.security import csrf_protect
 from app.services.background_tasks import BackgroundProcessor
+from app.services.document_artifacts import RASTER_IMAGE_EXTENSIONS
 from app.services.draft_deletion import DraftDeletionService
 from app.services.draft_events import build_event, get_draft_event_bus
 from app.services.draft_evidence_freshness import enforce_evidence_freshness
@@ -2688,7 +2689,12 @@ async def upload_draft_input(
     try:
         staged = await storage.stage_upload(
             file,
-            allowed_extensions=settings.allowed_extensions,
+            # Draft Room is a parse-only text seam and must keep its own
+            # acceptance behavior unchanged (issue #460). The vault image
+            # allowlist is a document-ingestion feature, so raster images are
+            # filtered out here: Draft Room does not extract standalone images.
+            allowed_extensions=set(settings.allowed_extensions)
+            - set(RASTER_IMAGE_EXTENSIONS),
             max_file_bytes=settings.max_file_size_mb * 1024 * 1024,
         )
     except DraftInputStorageError as exc:

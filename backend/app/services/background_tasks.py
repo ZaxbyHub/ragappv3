@@ -285,10 +285,16 @@ class BackgroundProcessor:
         await self._recover_stranded_pending_rows()
         await self._recover_stranded_enrichment_rows()
         await self.retry_pending_vector_deletes()
+        await self.sweep_pending_artifact_deletes()
         # Re-run the vector-delete reconciliation hourly so orphaned chunks
         # from a failed delete are cleaned without waiting for a restart.
         self._vector_delete_sweep_task = asyncio.create_task(
             self._vector_delete_sweep_loop(), name="vector-delete-sweep"
+        )
+        # Re-run the binary-asset cleanup reconciliation (issue #460) hourly so
+        # post-commit asset unlink failures are collected without a restart.
+        self._artifact_delete_sweep_task = asyncio.create_task(
+            self._artifact_delete_sweep_loop(), name="artifact-delete-sweep"
         )
 
         logger.info(f"Background processor started with {worker_count} worker(s)")
@@ -303,6 +309,43 @@ class BackgroundProcessor:
                 raise
             except Exception:  # noqa: BLE001 — sweep must never kill the loop
                 logger.exception("Periodic vector-delete sweep failed")
+
+    async def sweep_pending_artifact_deletes(self) -> None:
+        """Best-effort confined deletion of every pending binary-asset tombstone.
+
+        Called at startup and hourly (issue #460) so a crash after a DB commit
+        cannot leak asset bytes permanently. Best-effort: skipped when no pool.
+        """
+        if self.processor is None or self.processor.pool is None:
+            return
+        try:
+            from .artifact_store import sweep_pending_asset_deletes
+
+            with self.processor.pool.connection() as conn:
+                removed, remaining = sweep_pending_asset_deletes(conn)
+            if remaining:
+                logger.warning(
+                    "Artifact cleanup: %d removed, %d pending (will retry)",
+                    removed,
+                    remaining,
+                )
+            elif removed:
+                logger.info("Artifact cleanup: removed %d orphaned asset(s)", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Artifact cleanup sweep failed: %s", exc)
+
+    async def _artifact_delete_sweep_loop(self, interval_seconds: float = 3600.0) -> None:
+        """Hourly retry loop for pending binary-asset deletes."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self.sweep_pending_artifact_deletes()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — sweep must never kill the loop
+                logger.exception("Periodic artifact-delete sweep failed")
 
     async def _recover_stranded_pending_rows(self) -> None:
         """Re-enqueue any `files` rows left at status='pending' from a prior process.

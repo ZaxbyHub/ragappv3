@@ -659,6 +659,24 @@ async def delete_vault(
             conn.execute, "DELETE FROM files WHERE vault_id = ?", (vault_id,)
         )
 
+        # Tombstone every binary asset path within the vault in the same
+        # transaction so the background artifact sweep collects the bytes after
+        # commit (issue #460); the document_assets rows cascade from the
+        # files-row delete above.
+        from app.services import artifact_store as _artifact_store
+
+        vault_assets = await asyncio.to_thread(
+            _artifact_store.devault_asset_rel_paths, conn, vault_id
+        )
+        if vault_assets:
+            _artifact_store.enqueue_asset_cleanup(
+                conn,
+                file_id=0,
+                vault_id=vault_id,
+                rel_paths=vault_assets,
+                generation_hash=None,
+            )
+
         # Delete the vault itself. drafts.vault_id carries ON DELETE CASCADE
         # to vaults(id) (see app/models/database.py _DRAFT_ROOM_CORE_DDL), and
         # draft_inputs/draft_jobs/draft_revisions/draft_events all cascade

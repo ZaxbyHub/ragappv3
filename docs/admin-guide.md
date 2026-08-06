@@ -615,9 +615,20 @@ AGENTIC_RAG_ENABLED=true
 
 Restart the container after changing the flag. When disabled (default), the standard single-step retrieval pipeline is used.
 
-### Image Ingestion (FR-009)
+### Image Ingestion (issue #460)
 
-Images embedded within supported document formats (e.g., PDF pages) are processed using OCR when optional dependencies are installed.
+**Standalone raster images** can be uploaded and indexed through the normal
+document path. Accepted formats: `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`,
+`.tif`, `.tiff`, `.webp`. Uploads are content-verified by decoding the image
+before injection — corrupt, spoofed (mismatched extension), SVG/HTML, and
+oversized (decompression-bomb / too many frames) payloads are rejected and the
+partial upload is removed. The raster bytes are stored as a content-addressed
+binary asset under the vault artifact root and OCR'd into searchable text.
+
+> **Not included in this release:** extraction of images *embedded inside* PDFs
+> or other document formats. That is scheduled for the later multimodal RAG
+> stages; this release only indexes standalone image files. Do not expect
+> embedded-image OCR today.
 
 **Requirements:**
 ```bash
@@ -635,16 +646,29 @@ pip install Pillow pytesseract
 ```
 
 **Behavior:**
-- When Pillow and pytesseract are importable, images within documents are extracted and passed through Tesseract OCR
-- The resulting text is chunked and embedded like any other document content
-- If the dependencies are not installed, image ingestion is silently skipped (no error; documents without images are processed normally)
-- Re-upload existing documents after installing the dependencies to index any previously skipped images
+- Standalone raster images are decoded/verified at upload, stored as assets, and
+  OCR'd via Tesseract; the OCR text is chunked and embedded like any other content.
+- If Pillow and pytesseract are both absent, image uploads are rejected with a
+  stable error and the partial upload is removed rather than accepted unvalidated.
+- Valid images whose OCR returns no text are recorded but not searchable.
 
 **Verification:**
 ```bash
 # Check that tesseract is installed and reachable
 tesseract --version
 ```
+
+### Document atoms and asset storage (issue #460)
+
+Parsed documents are normalized into ordered, typed **document atoms**
+(`title`, `text`, `list`, `image`, `chart`, `table`, `equation`, `code`) with
+stable opaque ids, schema versioning, page/bbox/section metadata, and durable
+stage-state tracking in SQLite (`document_atoms`, `document_assets`,
+`ingestion_stage_states`). Extracted binary assets are stored beneath the
+per-vault artifact root (`data/vaults/{id}/artifacts`), represented outside the
+storage layer only by opaque ids (never raw paths or bytes), and are
+garbage-collected after commit via a durable reconciler. No external multimodal
+provider is called and query-time behavior is unchanged.
 
 ## Query Intelligence
 

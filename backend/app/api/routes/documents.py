@@ -63,11 +63,14 @@ from app.services.embeddings import EmbeddingService
 from app.services.secret_manager import SecretManager
 from app.services.upload_path import UploadPathProvider
 from app.services.upload_validation import (
+    _IMAGE_MAGIC_BYTES,
     _MAGIC_BYTES,  # noqa: F401  # re-exported: referenced by existing tests
     _OOXML_REQUIRED_MEMBERS,
+    _check_image_magic,
     _check_magic_bytes,
     _validate_ooxml_member,
     secure_filename,
+    validate_image_content,
 )
 from app.services.vector_store import VectorStore
 
@@ -1697,6 +1700,20 @@ async def _do_upload(
                 status_code=400,
                 detail=f"File content does not match the declared extension '{file_suffix}'",
             )
+        # Early polyglot screen for raster images (issue #460): reject an image
+        # whose 8-byte header does not match any signature for its extension
+        # before streaming the rest. The authoritative decode happens later.
+        if file_suffix in _IMAGE_MAGIC_BYTES and not _check_image_magic(
+            file_suffix, header_bytes
+        ):
+            file_path.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Image header does not match the declared extension "
+                    f"'{file_suffix}'"
+                ),
+            )
 
         # Save file using aiofiles with chunked reading and size validation
         total_bytes = len(header_bytes)
@@ -1729,6 +1746,23 @@ async def _do_upload(
                 raise HTTPException(
                     status_code=400,
                     detail=f"File is not a valid {file_suffix} archive (missing {required_member}).",
+                )
+
+        # Raster image content verification (issue #460): suffix acceptance alone
+        # is insufficient. Actually decode the image and enforce decompression /
+        # frame bounds; on any failure the partial upload is removed. SVG/HTML and
+        # corrupt/spoofed payloads are rejected here rather than reaching OCR.
+        if file_suffix in _IMAGE_MAGIC_BYTES:
+            image_ok, image_code = validate_image_content(temp_file_path)
+            if not image_ok:
+                if temp_file_path.exists():
+                    temp_file_path.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"File is not a valid {file_suffix} image"
+                        + (f" ({image_code})" if image_code else "")
+                    ),
                 )
 
         # Async ingestion: register the file row synchronously (so duplicate
@@ -2093,6 +2127,25 @@ async def _delete_file_record(
                 _record_pending_vector_delete, conn, file_id, vault_id
             )
 
+        # Collect and tombstone the file's confined asset paths in the SAME
+        # transaction as the row delete, so the background artifact sweep can
+        # retry confined filesystem cleanup after commit (issue #460). Rows
+        # cascade from files on commit; the tombstone survives a crash.
+        from app.services import artifact_store as _artifact_store
+
+        asset_paths = await asyncio.to_thread(
+            _artifact_store.collect_asset_rel_paths_for_file, conn, file_id
+        )
+        if asset_paths:
+            await asyncio.to_thread(
+                _artifact_store.enqueue_asset_cleanup,
+                conn,
+                file_id=file_id,
+                vault_id=vault_id,
+                rel_paths=asset_paths,
+                generation_hash=None,
+            )
+
         await asyncio.to_thread(
             conn.execute, "DELETE FROM files WHERE id = ?", (file_id,)
         )
@@ -2344,6 +2397,20 @@ async def delete_all_vault_documents(
             # deletes so the background sweep can retry them (Issue #219).
             for failed_file_id in vector_delete_failed_ids:
                 _record_pending_vector_delete(conn, failed_file_id, vault_id)
+            # Tombstone every asset path within the vault in the same
+            # transaction so the artifact sweep collects them after commit
+            # (issue #460); rows cascade from the files-row delete.
+            from app.services import artifact_store as _artifact_store
+
+            vault_assets = _artifact_store.devault_asset_rel_paths(conn, vault_id)
+            if vault_assets:
+                _artifact_store.enqueue_asset_cleanup(
+                    conn,
+                    file_id=0,
+                    vault_id=vault_id,
+                    rel_paths=vault_assets,
+                    generation_hash=None,
+                )
             cur = conn.execute(
                 "DELETE FROM files WHERE vault_id = ?", (vault_id,)
             )

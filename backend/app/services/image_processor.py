@@ -15,10 +15,13 @@ Usage:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
+
+from app.services.document_artifacts import RASTER_IMAGE_EXTENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,9 @@ except ImportError:
 # Public constants
 # ---------------------------------------------------------------------------
 
-SUPPORTED_IMAGE_TYPES: set[str] = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"}
+# Canonical raster image extension registry shared with the upload allowlist,
+# magic checks, and content validation (issue #460). Includes both .tif/.tiff.
+SUPPORTED_IMAGE_TYPES: set[str] = set(RASTER_IMAGE_EXTENSIONS)
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -66,13 +71,27 @@ class ImageProcessingResult:
             Empty dict if metadata could not be extracted.
         success: True when the image was processed successfully (even if no
             text was found), False when processing failed.
-        error: Human-readable error message. None when success is True.
+        error: Bounded, human-readable error message. None when success is True.
+        error_code: Stable machine-readable failure code (one of the
+            ``ERROR_*`` module constants), or None on success.
     """
 
     extracted_text: str
     metadata: dict
     success: bool
     error: Optional[str]
+    error_code: Optional[str] = None
+
+
+# Stable, bounded, machine-readable failure codes (issue #460). Error messages
+# are capped at MAX_ERROR_MESSAGE_CHARS so a hostile image can never inflate
+# logged/persisted payloads.
+ERROR_MISSING_LIBRARY = "missing_library"
+ERROR_FILE_NOT_FOUND = "file_not_found"
+ERROR_INVALID_IMAGE = "invalid_image"
+ERROR_OCR_FAILED = "ocr_failed"
+ERROR_UNSUPPORTED = "unsupported_image"
+MAX_ERROR_MESSAGE_CHARS = 200
 
 
 # ---------------------------------------------------------------------------
@@ -95,9 +114,19 @@ def is_image_file(file_path: str) -> bool:
     return ext.lower() in SUPPORTED_IMAGE_TYPES
 
 
+def _bounded_error(message: str) -> str:
+    """Cap an error message so it is bounded and content-free of image payload."""
+    return message[:MAX_ERROR_MESSAGE_CHARS]
+
+
 async def process_image(file_path: str) -> ImageProcessingResult:
     """
     Process a single image file and extract searchable text.
+
+    This is the async public contract (issue #460). The actual PIL/pytesseract
+    work is blocking, so it is delegated to the synchronous
+    :func:`_process_image_sync` helper via :func:`asyncio.to_thread` — keeping
+    the event loop responsive while OCR runs.
 
     Extraction order:
       1. OCR via pytesseract (if available).
@@ -110,7 +139,19 @@ async def process_image(file_path: str) -> ImageProcessingResult:
         file_path: Absolute or relative path to the image file.
 
     Returns:
-        An ImageProcessingResult instance describing the outcome.
+        An ImageProcessingResult instance describing the outcome, with stable
+        ``error_code`` on failure.
+    """
+    return await asyncio.to_thread(_process_image_sync, file_path)
+
+
+def _process_image_sync(file_path: str) -> ImageProcessingResult:
+    """
+    Synchronous implementation of image processing (blocking PIL/pytesseract).
+
+    Runs off the event loop inside :func:`process_image`. Kept private; callers
+    must use the async :func:`process_image` so the pipeline never mis-uses
+    ``asyncio.to_thread`` on an already-async function (issue #460 defect 2).
     """
     if not _PIL_AVAILABLE and not _pytesseract_AVAILABLE:
         return ImageProcessingResult(
@@ -118,6 +159,7 @@ async def process_image(file_path: str) -> ImageProcessingResult:
             metadata={},
             success=False,
             error="Image processing libraries not installed. Install Pillow + pytesseract.",
+            error_code=ERROR_MISSING_LIBRARY,
         )
 
     if not os.path.exists(file_path):
@@ -126,6 +168,7 @@ async def process_image(file_path: str) -> ImageProcessingResult:
             metadata={},
             success=False,
             error=f"File not found: {file_path}",
+            error_code=ERROR_FILE_NOT_FOUND,
         )
 
     extracted_text = ""
@@ -153,7 +196,8 @@ async def process_image(file_path: str) -> ImageProcessingResult:
                 extracted_text="",
                 metadata={},
                 success=False,
-                error=f"Failed to open image: {exc}",
+                error=_bounded_error(f"Failed to open image: {exc}"),
+                error_code=ERROR_INVALID_IMAGE,
             )
     else:
         # PIL not available but pytesseract is — try to run OCR directly.
@@ -167,7 +211,8 @@ async def process_image(file_path: str) -> ImageProcessingResult:
                     extracted_text="",
                     metadata={},
                     success=False,
-                    error=f"OCR failed: {exc}",
+                    error=_bounded_error(f"OCR failed: {exc}"),
+                    error_code=ERROR_OCR_FAILED,
                 )
 
     return ImageProcessingResult(

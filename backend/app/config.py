@@ -10,6 +10,7 @@ from typing import Annotated, Optional
 from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from app.services.document_artifacts import RASTER_IMAGE_EXTENSIONS
 from app.utils.paths import normalize_root_path
 
 logger = logging.getLogger(__name__)
@@ -598,7 +599,19 @@ class Settings(BaseSettings):
         ".yaml",
         ".yml",
         ".log",
-    }
+    } | set(RASTER_IMAGE_EXTENSIONS)
+
+    # Multimodal artifact storage bounds (issue #460). Binary assets are
+    # confined per-vault and hardened against decompression bombs / oversize
+    # generations. These default to permissive-but-bounded values; tune via env.
+    max_asset_pixels: int = 50_000_000
+    """Maximum decoded pixel area accepted for a standalone image asset."""
+    max_asset_frames: int = 64
+    """Maximum frames accepted for animated/multi-frame image assets."""
+    max_assets_per_generation: int = 256
+    """Maximum number of binary assets persisted per source generation."""
+    max_asset_bytes_per_generation: int = 512 * 1024 * 1024
+    """Maximum total asset bytes persisted per source generation (512 MB)."""
 
     # IMAP Email Ingestion configuration
     imap_enabled: bool = False
@@ -1185,6 +1198,17 @@ class Settings(BaseSettings):
     def vault_documents_dir(self, vault_id: int) -> Path:
         """Canonical per-vault documents directory."""
         path = self.vault_dir(vault_id) / "documents"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def vault_artifacts_dir(self, vault_id: int) -> Path:
+        """Confined per-vault artifact root for extracted binary assets.
+
+        Assets are stored beneath this root and represented only by opaque IDs
+        outside the storage layer; their validated relative paths are resolved
+        against this root on every read/delete (issue #460).
+        """
+        path = self.vault_dir(vault_id) / "artifacts"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
