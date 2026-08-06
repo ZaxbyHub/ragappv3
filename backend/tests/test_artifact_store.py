@@ -15,8 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
+from app.config import settings
 from app.services import artifact_store
-from app.services.document_artifacts import AtomKind, DocumentAtom
+from app.services.document_artifacts import (
+    AtomKind,
+    DocumentAsset,
+    DocumentAtom,
+    ParsedDocument,
+)
 
 
 @pytest.fixture()
@@ -121,6 +127,35 @@ class TestAssetStorage:
 
     def test_unlink_refuses_out_of_root(self, artifact_root):
         assert artifact_store.unlink_asset_rel("../../x", 1) is False
+
+    def test_same_bytes_do_not_alias_across_files(self, artifact_root):
+        """PRR-015: identical content yields the same content-address, but the
+        per-owner (file_id) path keeps two files' assets distinct on disk.
+        """
+        a1 = artifact_store.store_asset_bytes(
+            file_id=1, vault_id=1, generation_hash="genA", data=b"same"
+        )
+        a2 = artifact_store.store_asset_bytes(
+            file_id=2, vault_id=2, generation_hash="genA", data=b"same"
+        )
+        assert a1.asset_id == a2.asset_id
+        assert a1.rel_path != a2.rel_path
+        assert (artifact_root / a1.rel_path).exists()
+        assert (artifact_root / a2.rel_path).exists()
+
+    def test_read_path_via_resolve_confined(self, artifact_root):
+        """PRR-016: the production read path (resolve_confined) locates a stored
+        asset inside the vault root, and rejects traversal.
+        """
+        asset = artifact_store.store_asset_bytes(
+            file_id=1, vault_id=1, generation_hash="genA", data=b"xyz"
+        )
+        resolved = artifact_store.resolve_confined(asset.rel_path, vault_id=1)
+        assert resolved is not None
+        assert resolved.exists()
+        assert resolved.read_bytes() == b"xyz"
+        # Traversal is refused at the read path.
+        assert artifact_store.resolve_confined("../../etc/hosts", vault_id=1) is None
 
 
 class TestGenerationPublish:
@@ -357,6 +392,70 @@ class TestGenerationBounds:
         assert db.execute(
             "SELECT COUNT(*) FROM artifact_delete_pending"
         ).fetchone()[0] == 0
+
+    def test_publish_artifacts_enforces_asset_count_limit(
+        self, db, artifact_root, monkeypatch
+    ):
+        """PRR-027: the configured asset-count bound is enforced through the
+        DocumentProcessor publish path (not only via direct ``publish_generation``),
+        and the processor compensates the materialized bytes.
+        """
+        from app.services.document_processor import DocumentProcessor
+
+        class _Pool:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def get_connection(self):
+                return self.conn
+
+            def release_connection(self, _conn):
+                pass
+
+        monkeypatch.setattr(artifact_store.settings, "max_assets_per_generation", 1)
+        asset = DocumentAsset(
+            asset_id="a1", file_id=1, generation_hash="genA", sha256="a1",
+            rel_path=artifact_store.compute_asset_rel_path(1, "genA", "a1"),
+            mime_type="image/png", byte_size=1,
+        )
+        asset2 = DocumentAsset(
+            asset_id="a2", file_id=1, generation_hash="genA", sha256="a2",
+            rel_path=artifact_store.compute_asset_rel_path(1, "genA", "a2"),
+            mime_type="image/png", byte_size=1,
+        )
+        parsed = ParsedDocument(
+            atoms=[DocumentAtom(atom_id="a1", schema_version=1, file_id=1,
+                                generation_hash="genA", ordinal=0, kind=AtomKind.IMAGE,
+                                raw_text="img", asset_id="a1")],
+            assets=(asset, asset2),
+            parser_fingerprint="unstructured:test",
+            asset_payloads={asset.asset_id: b"x", asset2.asset_id: b"y"},
+        )
+        proc_like = object.__new__(DocumentProcessor)
+        proc_like.pool = _Pool(db)
+        DocumentProcessor._publish_artifacts(
+            proc_like, file_id=1, vault_id=1, generation_hash="genA", parsed=parsed
+        )
+        # The bound rejection is non-fatal but must persist NO rows and tombstone
+        # the materialized bytes for the sweep.
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_assets WHERE file_id=1"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_atoms WHERE file_id=1"
+        ).fetchone()[0] == 0
+        pending = {
+            r["rel_path"]
+            for r in db.execute("SELECT rel_path FROM artifact_delete_pending")
+        }
+        # The materializer content-addresses the payload bytes, so the actual
+        # written paths derive from sha256(b"x")/sha256(b"y").
+        import hashlib
+
+        real_x = artifact_store.compute_asset_rel_path(1, "genA", hashlib.sha256(b"x").hexdigest())
+        real_y = artifact_store.compute_asset_rel_path(1, "genA", hashlib.sha256(b"y").hexdigest())
+        assert real_x in pending
+        assert real_y in pending
 
 
 class TestBackgroundTaskLifecycle:

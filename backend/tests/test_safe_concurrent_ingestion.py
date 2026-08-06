@@ -103,7 +103,70 @@ async def test_worker_count_two_vector_store_mutations_are_serialized():
 
 
 @pytest.mark.asyncio
-async def test_embedding_global_semaphore_limits_batches_across_documents():
+async def test_same_file_concurrent_re_enqueues_are_serialized():
+    """PRR-007: two workers handed the SAME file must never write the vector
+    store concurrently — the write semaphore collapses them to one active
+    writer (in-flight same-file collapse under concurrency).
+    """
+    from app.services.background_tasks import BackgroundProcessor
+    from app.services.vector_store import VectorStore
+
+    store = VectorStore()
+    active = 0
+    max_active = 0
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def guarded_operation(*_args):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        if not first_entered.is_set():
+            first_entered.set()
+            await release_first.wait()
+        active -= 1
+        return {"vector_write_ms": 0.0, "optimize_ms": 0.0}
+
+    async def guarded_delete(*_args):
+        await guarded_operation()
+        return 0
+
+    store._add_chunks_unlocked = guarded_operation
+    store._delete_by_file_unlocked = guarded_delete
+
+    processor = BackgroundProcessor()
+    processor.processor = MagicMock()
+    processor.processor.pool = None
+
+    async def process_existing_file(file_id, file_path, vault_id):
+        # The same file content on both enqueues -> same file_id.
+        await store.add_chunks([{"id": str(file_id)}])
+
+    processor.processor.process_existing_file = AsyncMock(
+        side_effect=process_existing_file
+    )
+
+    with patch("app.services.background_tasks.settings") as mock_settings:
+        mock_settings.ingestion_worker_count = 2
+        # Two concurrent enqueues of the SAME file must serialize to one writer.
+        await processor.enqueue("same.txt", vault_id=1, file_id=1)
+        await processor.enqueue("same.txt", vault_id=1, file_id=1)
+        await processor.start()
+
+        await first_entered.wait()
+        await asyncio.sleep(0)
+        assert active == 1
+
+        release_first.set()
+        await processor.queue.join()
+        processor.shutdown_event.set()
+        await asyncio.wait_for(
+            asyncio.gather(*processor._worker_tasks, return_exceptions=True),
+            timeout=2,
+        )
+        processor._running = False
+
+    assert max_active == 1
     from app.services.embeddings import EmbeddingService
 
     active = 0

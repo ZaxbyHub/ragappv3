@@ -177,3 +177,143 @@ def test_successful_publish_writes_bytes_and_does_not_tombstone_live_assets(
         (asset.rel_path,),
     ).fetchone()[0] == 0
     db.close()
+
+
+def test_failed_publish_rolls_back_discards_old_generation_retirement(
+    tmp_path, artifact_root, monkeypatch
+):
+    """PRR-005 regression: a mid-publish failure must NOT discard a prior
+    generation's live rows / bytes.
+
+    We seed a real old generation (rows + on-disk bytes), then simulate
+    ``publish_generation`` retiring that generation AND inserting a partial new
+    row before raising. The compensation rollback must restore the old
+    generation and drop both the partial row and the mid-way tombstone.
+    """
+    db = _new_db(tmp_path)
+    old_asset = _asset(b"oldbytes")
+    old_rel = artifact_store.compute_asset_rel_path(1, "genOLD", old_asset.asset_id)
+    db.execute(
+        "INSERT INTO document_assets "
+        "(asset_id, file_id, generation_hash, sha256, rel_path, byte_size) "
+        "VALUES (?, 1, 'genOLD', ?, ?, ?)",
+        (old_asset.asset_id, old_asset.sha256, old_rel, len(b"oldbytes")),
+    )
+    db.execute(
+        "INSERT INTO document_atoms "
+        "(atom_id, file_id, generation_hash, ordinal, kind, schema_version) "
+        "VALUES ('old-atom', 1, 'genOLD', 0, 'text', 1)"
+    )
+    db.commit()
+    (artifact_root / old_rel).parent.mkdir(parents=True, exist_ok=True)
+    (artifact_root / old_rel).write_bytes(b"oldbytes")
+
+    new_asset = _asset()
+    payloads = {new_asset.asset_id: b"abc"}
+
+    def _fail_mid(conn, **_kw):
+        # Simulate publish_generation retiring the OLD generation (rows + a
+        # tombstone for its bytes) and inserting a partial new row mid-transaction.
+        conn.execute(
+            "DELETE FROM document_assets WHERE file_id=1 AND generation_hash='genOLD'"
+        )
+        conn.execute(
+            "DELETE FROM document_atoms WHERE file_id=1 AND generation_hash='genOLD'"
+        )
+        conn.execute(
+            "INSERT INTO artifact_delete_pending "
+            "(file_id, vault_id, rel_path, generation_hash) VALUES (1, 1, ?, 'genOLD')",
+            (old_rel,),
+        )
+        conn.execute(
+            "INSERT INTO document_assets "
+            "(asset_id, file_id, generation_hash, sha256, rel_path, byte_size) "
+            "VALUES ('partial', 1, 'genA', 'partial', '1/genA/partial', 1)"
+        )
+        raise RuntimeError("mid-transaction failure")
+
+    monkeypatch.setattr(
+        "app.services.document_processor.artifact_store.publish_generation", _fail_mid
+    )
+
+    proc_like = object.__new__(DocumentProcessor)
+    proc_like.pool = _FakePool(db)
+    DocumentProcessor._publish_artifacts(
+        proc_like, file_id=1, vault_id=1, generation_hash="genA", parsed=_parsed(new_asset, payloads)
+    )
+
+    # The OLD generation was retired mid-transaction; rollback restored it.
+    assert db.execute(
+        "SELECT COUNT(*) FROM document_assets WHERE file_id=1 AND generation_hash='genOLD'"
+    ).fetchone()[0] == 1
+    assert db.execute(
+        "SELECT COUNT(*) FROM document_atoms WHERE file_id=1 AND generation_hash='genOLD'"
+    ).fetchone()[0] == 1
+    # The old on-disk bytes must NOT be tombstoned (they still have a live row).
+    assert db.execute(
+        "SELECT COUNT(*) FROM artifact_delete_pending WHERE rel_path=?", (old_rel,)
+    ).fetchone()[0] == 0
+    # The partial new-generation row is discarded.
+    assert db.execute(
+        "SELECT COUNT(*) FROM document_assets WHERE file_id=1 AND generation_hash='genA'"
+    ).fetchone()[0] == 0
+    # Only the NEW generation's materialized bytes are tombstoned for the sweep.
+    assert db.execute(
+        "SELECT COUNT(*) FROM artifact_delete_pending WHERE rel_path=?",
+        (new_asset.rel_path,),
+    ).fetchone()[0] == 1
+    db.close()
+
+
+def test_compensation_failure_is_surfaced_not_silently_swallowed(
+    tmp_path, artifact_root, monkeypatch, caplog
+):
+    """PRR-004/012: when the compensation (tombstone enqueue) itself fails after
+    a publish failure, the error is surfaced at ERROR (not swallowed) and the
+    publish failure remains non-fatal to the caller.
+    """
+    db = _new_db(tmp_path)
+    asset = _asset()
+    payloads = {asset.asset_id: b"abc"}
+
+    def _fail_publish(conn, **_kw):
+        raise RuntimeError("publish failed")
+
+    monkeypatch.setattr(
+        "app.services.document_processor.artifact_store.publish_generation", _fail_publish
+    )
+    # Force the compensation itself to fail on its own commit.
+    def _fail_tombstone(*_args, **_kw):
+        raise RuntimeError("tombstone persistence failed")
+
+    monkeypatch.setattr(
+        "app.services.document_processor.artifact_store.enqueue_asset_cleanup",
+        _fail_tombstone,
+    )
+
+    proc_like = object.__new__(DocumentProcessor)
+    proc_like.pool = _FakePool(db)
+    import logging
+
+    with caplog.at_level(logging.ERROR, logger="app.services.document_processor"):
+        DocumentProcessor._publish_artifacts(
+            proc_like,
+            file_id=1,
+            vault_id=1,
+            generation_hash="genA",
+            parsed=_parsed(asset, payloads),
+        )
+
+    # The compensation failure is surfaced at ERROR (not silently swallowed)
+    # so orphaned bytes require operator reconciliation.
+    assert any(
+        "compensation failed" in r.message
+        for r in caplog.records
+        if r.name == "app.services.document_processor"
+    )
+    # No partial rows remain (publish rolled back) and no tombstone was written
+    # (the compensation failed), matching the surfaced-orphan-bytes state.
+    assert db.execute(
+        "SELECT COUNT(*) FROM document_assets WHERE file_id=1"
+    ).fetchone()[0] == 0
+    db.close()

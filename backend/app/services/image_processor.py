@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from app.services.document_artifacts import RASTER_IMAGE_EXTENSIONS
+from app.services.upload_validation import validate_image_content
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,19 @@ def _process_image_sync(file_path: str) -> ImageProcessingResult:
 
     # Open image and extract metadata
     if _PIL_AVAILABLE:
+        # Authoritative raster gate (decompression-bomb / frame-count / real
+        # decode) BEFORE the expensive OCR. Mirrors the upload-route check so
+        # ingestion paths that bypass the upload gate (FileWatcher, email) cannot
+        # skip it and force an unbounded decode (issue #460 review, PRR-003).
+        valid, vc_error = validate_image_content(file_path)
+        if not valid:
+            return ImageProcessingResult(
+                extracted_text="",
+                metadata={},
+                success=False,
+                error=_bounded_error(str(vc_error) or "Image rejected"),
+                error_code=ERROR_INVALID_IMAGE,
+            )
         try:
             with _PILImage.open(file_path) as img:
                 metadata = {

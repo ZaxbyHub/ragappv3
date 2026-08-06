@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # it will be reset to 'pending' for re-processing.
 STRANDED_PROCESSING_TIMEOUT_MINUTES = 30
 
+# Per-row cap on the startup stranded-row re-enqueue (PRR-011). Recovery is
+# best-effort: if the bounded queue is saturated, bow out with a warning and
+# leave the row for a later sweep instead of blocking startup on the backlog.
+STRANDED_REENQUEUE_TIMEOUT_SECONDS = 30.0
+
 # Retry cap for pending vector-store deletes (Issue #219). Rows that exceed
 # this are left in place and logged for operator visibility — we never delete
 # a pending record without confirming the chunks are actually gone.
@@ -429,12 +434,25 @@ class BackgroundProcessor:
                     except Exception:  # pragma: no cover - defensive
                         pass
                     continue
-                await self.enqueue(
-                    file_path=file_path,
-                    source=source,
-                    vault_id=int(vault_id),
-                    file_id=int(row_id),
-                )
+                try:
+                    await asyncio.wait_for(
+                        self.enqueue(
+                            file_path=file_path,
+                            source=source,
+                            vault_id=int(vault_id),
+                            file_id=int(row_id),
+                        ),
+                        timeout=STRANDED_REENQUEUE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # Queue saturated: leave the row for the next recovery sweep
+                    # rather than blocking startup on a stranded backlog (PRR-011).
+                    logger.warning(
+                        "Stranded re-enqueue timed out for row id=%s; left for "
+                        "the next recovery sweep",
+                        row_id,
+                    )
+                    continue
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("Failed to re-enqueue stranded row id=%s: %s", row, e)
 

@@ -1972,19 +1972,9 @@ class DocumentProcessor:
         tombstoned for the sweep, and a later reprocess/reindex republishes.
         """
         atoms = list(parsed.atoms)
-        assets = list(parsed.assets)
-        if not atoms and not assets:
+        asset_specs = list(parsed.assets)
+        if not atoms and not asset_specs:
             return
-        # Materialize any deferred asset bytes onto disk now — immediately before
-        # the rows are published — so bytes exist on disk only transiently
-        # alongside the uncommitted row, and are tombstoned by the compensation
-        # below on a publish failure (issue #460, final-critic finding 3).
-        assets = [
-            self._materialize_asset(
-                asset, parsed.asset_payloads, file_id, vault_id, generation_hash
-            )
-            for asset in assets
-        ]
         stage_states = [
             {"stage": "parse", "status": "succeeded", "attempts": 1,
              "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
@@ -1992,14 +1982,30 @@ class DocumentProcessor:
              "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
         ]
         conn = self.pool.get_connection()
+        materialized: List[DocumentAsset] = []
+        publish_reached = False
         try:
+            # Materialize any deferred asset bytes onto disk inside the protected
+            # region so a partial I/O failure tombstones exactly the bytes written
+            # so far (issue #460 review, PRR-002/012).
+            for asset in asset_specs:
+                materialized.append(
+                    self._materialize_asset(
+                        asset,
+                        parsed.asset_payloads,
+                        file_id,
+                        vault_id,
+                        generation_hash,
+                    )
+                )
+            publish_reached = True
             artifact_store.publish_generation(
                 conn,
                 file_id=file_id,
                 vault_id=vault_id,
                 generation_hash=generation_hash,
                 atoms=atoms,
-                assets=assets,
+                assets=materialized,
                 stage_states=stage_states,
                 parser_fingerprint=parsed.parser_fingerprint,
                 implementation_version=str(ATOM_SCHEMA_VERSION),
@@ -2013,32 +2019,59 @@ class DocumentProcessor:
                 exc,
             )
             # Compensation: roll back the failed publish entirely (discarding any
-            # partial rows and any old-generation retirement it performed mid-way),
-            # then tombstone ONLY the bytes materialized for this attempt — they
-            # have no committed row now, so the sweep must collect them. Kept on
-            # a short transaction; a compensation failure is surfaced (not
-            # silently swallowed) so orphaned bytes require operator
-            # reconciliation (issue #460, final-critic findings 2/4).
+            # partial rows and any old-generation retirement it performed
+            # mid-way), then tombstone ONLY the bytes materialized for this
+            # attempt — they have no committed row now, so the sweep must collect
+            # them. A compensation failure is surfaced (not silently swallowed)
+            # so orphaned bytes require operator reconciliation (issue #460,
+            # final-critic findings 2/4).
             conn.rollback()
-            try:
-                artifact_store.enqueue_asset_cleanup(
-                    conn,
-                    file_id=file_id,
-                    vault_id=vault_id,
-                    rel_paths=[a.rel_path for a in assets],
-                    generation_hash=generation_hash,
-                )
-                conn.commit()
-            except Exception as exc2:  # noqa: BLE001
-                conn.rollback()
-                logger.error(
-                    "Artifact compensation failed for file_id=%s gen=%s; "
-                    "new-generation bytes may be orphaned and require operator "
-                    "reconciliation: %s",
-                    file_id,
-                    generation_hash,
-                    exc2,
-                )
+            self._tombstone_materialized_assets(
+                materialized, file_id, vault_id, generation_hash
+            )
+            if not publish_reached:
+                # A materialization (disk I/O) failure occurred before any rows
+                # were published. Its partial bytes were tombstoned above;
+                # re-raise so the caller marks the file errored.
+                raise
+        finally:
+            self.pool.release_connection(conn)
+
+    def _tombstone_materialized_assets(
+        self,
+        materialized: List[DocumentAsset],
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+    ) -> None:
+        """Enqueue cleanup of asset bytes written for a failed publish attempt.
+
+        No-op when nothing was materialized. A compensation failure is surfaced
+        at ERROR (not silently swallowed) so orphaned bytes require operator
+        reconciliation (issue #460 review, PRR-004/012).
+        """
+        if not materialized:
+            return
+        conn = self.pool.get_connection()
+        try:
+            artifact_store.enqueue_asset_cleanup(
+                conn,
+                file_id=file_id,
+                vault_id=vault_id,
+                rel_paths=[a.rel_path for a in materialized],
+                generation_hash=generation_hash,
+            )
+            conn.commit()
+        except Exception as exc2:  # noqa: BLE001
+            conn.rollback()
+            logger.error(
+                "Artifact compensation failed for file_id=%s gen=%s; "
+                "new-generation bytes may be orphaned and require operator "
+                "reconciliation: %s",
+                file_id,
+                generation_hash,
+                exc2,
+            )
         finally:
             self.pool.release_connection(conn)
 

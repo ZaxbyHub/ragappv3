@@ -31,12 +31,6 @@ class _FakeUpload:
         return b""
 
 
-def _filtered_allowed() -> set:
-    # Mirrors the Draft Room upload route: image suffixes removed from the
-    # global (now image-inclusive) allowlist.
-    return set(settings.allowed_extensions) - set(RASTER_IMAGE_EXTENSIONS)
-
-
 @pytest.fixture()
 def storage(tmp_path):
     root = tmp_path / "draft-storage"
@@ -47,26 +41,36 @@ def storage(tmp_path):
 def test_vault_allowlist_includes_images_but_draft_filter_removes_them():
     # The document feature enables raster images...
     assert RASTER_IMAGE_EXTENSIONS <= set(settings.allowed_extensions)
-    # ...while Draft Room's filtered list excludes them.
-    assert not (set(RASTER_IMAGE_EXTENSIONS) & _filtered_allowed())
+    # ...while Draft Room's own route allowlist excludes them. Importing the
+    # real route constant (not re-deriving the filter locally) proves the
+    # shipped policy stays in sync with the test (PRR-014).
+    from app.api.routes.draft_room import DRAFT_ROOM_ALLOWED_EXTENSIONS
+
+    assert not (set(RASTER_IMAGE_EXTENSIONS) & DRAFT_ROOM_ALLOWED_EXTENSIONS)
 
 
 @pytest.mark.asyncio
 async def test_draft_rooms_still_rejects_images(storage):
+    # Uses the real route allowlist, so this asserts the shipped deployment
+    # policy (not a locally re-computed one).
+    from app.api.routes.draft_room import DRAFT_ROOM_ALLOWED_EXTENSIONS
+
     with pytest.raises(DraftInputUnsupportedError):
         await storage.stage_upload(
             _FakeUpload("photo.png"),
-            allowed_extensions=_filtered_allowed(),
+            allowed_extensions=DRAFT_ROOM_ALLOWED_EXTENSIONS,
             max_file_bytes=10 * 1024 * 1024,
         )
 
 
 @pytest.mark.asyncio
 async def test_draft_rooms_accepts_text_with_filtered_list(storage):
+    from app.api.routes.draft_room import DRAFT_ROOM_ALLOWED_EXTENSIONS
+
     try:
         result = await storage.stage_upload(
             _FakeUpload("notes.txt"),
-            allowed_extensions=_filtered_allowed(),
+            allowed_extensions=DRAFT_ROOM_ALLOWED_EXTENSIONS,
             max_file_bytes=10 * 1024 * 1024,
         )
     except DraftInputUnsupportedError:

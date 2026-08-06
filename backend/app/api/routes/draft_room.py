@@ -158,6 +158,15 @@ from app.services.upload_validation import secure_filename
 
 logger = logging.getLogger(__name__)
 
+# Draft Room's own upload allowlist excludes raster images (parse-only text
+# seam, issue #460). The vault image allowlist is a document-ingestion feature,
+# so raster images are filtered out here and Draft Room does not accept
+# standalone images. Kept as a module constant so the route and its tests share
+# one source of truth (PRR-014).
+DRAFT_ROOM_ALLOWED_EXTENSIONS: set[str] = set(settings.allowed_extensions) - set(
+    RASTER_IMAGE_EXTENSIONS
+)
+
 router = APIRouter(prefix="/draft-room", tags=["draft-room"])
 
 T = TypeVar("T")
@@ -2693,8 +2702,7 @@ async def upload_draft_input(
             # acceptance behavior unchanged (issue #460). The vault image
             # allowlist is a document-ingestion feature, so raster images are
             # filtered out here: Draft Room does not extract standalone images.
-            allowed_extensions=set(settings.allowed_extensions)
-            - set(RASTER_IMAGE_EXTENSIONS),
+            allowed_extensions=DRAFT_ROOM_ALLOWED_EXTENSIONS,
             max_file_bytes=settings.max_file_size_mb * 1024 * 1024,
         )
     except DraftInputStorageError as exc:

@@ -78,10 +78,70 @@ class TestProcessImageContract:
         result = asyncio.run(_run())
         assert result.error_code == "file_not_found"
 
+    def _png_bytes(self):
+        from PIL import Image
 
-@pytest.mark.skipif(True, reason="covered via PIL if available in environment")
-def test_valid_image_content():
-    pass
+        buf = io.BytesIO()
+        Image.new("RGB", (4, 4), "white").save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_process_image_accepts_real_image_with_metadata(self, tmp_path):
+        """PRR-006/018: the processor accepts a real raster and extracts
+        metadata (replaces the previously-skipped placeholder test).
+        """
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            pytest.skip("Pillow not available")
+        path = tmp_path / "ok.png"
+        path.write_bytes(self._png_bytes())
+
+        import asyncio
+
+        async def _run():
+            return await process_image(str(path))
+
+        result = asyncio.run(_run())
+        assert result.success is True
+        assert result.error_code is None
+        assert result.metadata.get("width") == 4
+        assert result.metadata.get("height") == 4
+
+    def test_process_image_enforces_pixel_bound(self, tmp_path, monkeypatch):
+        """PRR-003 regression: the decompression-bomb bound applies on the
+        processor path too, so non-upload ingestion cannot bypass it.
+        """
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            pytest.skip("Pillow not available")
+        path = tmp_path / "bomb.png"
+        path.write_bytes(self._png_bytes())
+        # Force the same 4x4 image over the pixel bound (16 px > 10 px).
+        monkeypatch.setattr(settings, "max_asset_pixels", 10)
+
+        import asyncio
+
+        async def _run():
+            return await process_image(str(path))
+
+        result = asyncio.run(_run())
+        assert result.success is False
+        assert result.error_code == "invalid_image"
+
+    def test_process_image_rejects_corrupt_content(self, tmp_path):
+        """PRR-018: a spoofed/corrupt raster is rejected with a stable code."""
+        path = tmp_path / "fake.png"
+        path.write_bytes(b"This is not an image")
+
+        import asyncio
+
+        async def _run():
+            return await process_image(str(path))
+
+        result = asyncio.run(_run())
+        assert result.success is False
+        assert result.error_code == "invalid_image"
 
 
 class TestValidateImageContent:
