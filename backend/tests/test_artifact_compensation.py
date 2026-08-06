@@ -317,3 +317,61 @@ def test_compensation_failure_is_surfaced_not_silently_swallowed(
         "SELECT COUNT(*) FROM document_assets WHERE file_id=1"
     ).fetchone()[0] == 0
     db.close()
+
+
+def test_materialize_failure_re_raises_and_tombstones_partial_bytes(
+    tmp_path, artifact_root, monkeypatch
+):
+    """PRR-002 regression: a mid-materialize (disk I/O) failure occurs before any
+    rows are published. The bytes written so far must be tombstoned for the sweep
+    and the failure re-raised so the caller marks the file errored (it is NOT a
+    non-fatal publish failure).
+    """
+    db = _new_db(tmp_path)
+    a1 = _asset(b"a1bytes")
+    a2 = _asset(b"a2bytes")
+    payloads = {a1.asset_id: b"a1bytes", a2.asset_id: b"a2bytes"}
+    parsed = ParsedDocument(
+        atoms=[
+            DocumentAtom(
+                atom_id="a-0",
+                schema_version=1,
+                file_id=1,
+                generation_hash="genA",
+                ordinal=0,
+                kind=AtomKind.IMAGE,
+                raw_text="img",
+                asset_id=a1.asset_id,
+            )
+        ],
+        assets=(a1, a2),
+        parser_fingerprint="unstructured:test",
+        asset_payloads=payloads,
+    )
+
+    real_materialize = DocumentProcessor._materialize_asset
+
+    def _fail_second(proc, asset, payloads_, file_id, vault_id, generation_hash):
+        if asset.asset_id == a2.asset_id:
+            raise OSError("disk full")
+        return real_materialize(proc, asset, payloads_, file_id, vault_id, generation_hash)
+
+    monkeypatch.setattr(DocumentProcessor, "_materialize_asset", _fail_second)
+
+    proc_like = object.__new__(DocumentProcessor)
+    proc_like.pool = _FakePool(db)
+    with pytest.raises(OSError):
+        DocumentProcessor._publish_artifacts(
+            proc_like, file_id=1, vault_id=1, generation_hash="genA", parsed=parsed
+        )
+
+    # No rows were published.
+    assert db.execute(
+        "SELECT COUNT(*) FROM document_assets WHERE file_id=1"
+    ).fetchone()[0] == 0
+    # The first (already-materialized) asset's bytes are tombstoned for the sweep.
+    assert db.execute(
+        "SELECT COUNT(*) FROM artifact_delete_pending WHERE rel_path=?",
+        (a1.rel_path,),
+    ).fetchone()[0] == 1
+    db.close()
