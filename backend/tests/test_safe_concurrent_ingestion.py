@@ -28,13 +28,15 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
             await processor.start()
 
     # The periodic vector-delete reconciliation sweep is spawned in start()
-    # after the workers/enrichment task (added with the #219 retry queue).
+    # after the workers/enrichment task (added with the #219 retry queue); the
+    # artifact-delete sweep task is spawned alongside it (issue #460).
     assert created_workers == [
         "worker-0",
         "worker-1",
         "enrichment-worker",
         "reindex-worker",
         "vector-delete-sweep",
+        "artifact-delete-sweep",
     ]
 
 
@@ -188,6 +190,8 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
         mock_settings.parent_window_chars = 20
         mock_settings.reupload_safe_order = False
         mock_settings.embedding_batch_size = 64
+        from app.services.document_artifacts import ParsedDocument
+
         with patch.object(processor, "_check_duplicate", return_value=None), \
             patch.object(processor, "_insert_or_get_file_record", return_value=123), \
             patch.object(processor, "_update_status"), \
@@ -197,7 +201,7 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
             patch.object(
                 processor,
                 "_process_document_file",
-                new=AsyncMock(return_value=([chunk], "hello world")),
+                new=AsyncMock(return_value=([chunk], "hello world", ParsedDocument(atoms=()))),
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \

@@ -103,11 +103,14 @@ def _compile_generation(file_hash: str) -> tuple[str, str]:
     #460), so an unchanged file+parser reprocesses idempotently and any
     change retires the old generation.
     """
-    config_version = getattr(settings, "document_parsing_strategy", "") or ""
+    # Coerced to str so a mocked/None config value can never crash the
+    # json.dumps inside compute_generation_hash with a non-serializable object
+    # (e.g. a MagicMock when tests patch settings).
+    config_version = str(getattr(settings, "document_parsing_strategy", "") or "")
     generation_hash = compute_generation_hash(
         file_hash,
         parser_name=DEFAULT_PARSER_NAME,
-        parser_version=_parser_version(),
+        parser_version=str(_parser_version()),
         config_version=config_version,
         schema_version=ATOM_SCHEMA_VERSION,
     )

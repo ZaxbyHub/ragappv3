@@ -58,6 +58,8 @@ except ImportError:
     sys.modules['unstructured.documents'] = _unstructured.documents
     sys.modules['unstructured.documents.elements'] = _unstructured.documents.elements
 
+from app.services.document_artifacts import ParsedDocument  # noqa: E402
+
 
 def _make_mock_settings(wiki_enabled=True, wiki_compile_on_ingest=True):
     """Create a mock settings object with properly configured attributes."""
@@ -147,7 +149,13 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 processor,
                 "_process_document_file",
-                new=AsyncMock(return_value=([chunk], "Justice Sakyi is the AFOMIS Chief.")),
+                new=AsyncMock(
+                    return_value=(
+                        [chunk],
+                        "Justice Sakyi is the AFOMIS Chief.",
+                        ParsedDocument(atoms=()),
+                    )
+                ),
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
@@ -234,7 +242,13 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 processor,
                 "_process_document_file",
-                new=AsyncMock(return_value=([chunk], "Justice Sakyi is the AFOMIS Chief.")),
+                new=AsyncMock(
+                    return_value=(
+                        [chunk],
+                        "Justice Sakyi is the AFOMIS Chief.",
+                        ParsedDocument(atoms=()),
+                    )
+                ),
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
@@ -322,7 +336,13 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
             patch.object(
                 processor,
                 "_process_document_file",
-                new=AsyncMock(return_value=([chunk], "Justice Sakyi is the AFOMIS Chief.")),
+                new=AsyncMock(
+                    return_value=(
+                        [chunk],
+                        "Justice Sakyi is the AFOMIS Chief.",
+                        ParsedDocument(atoms=()),
+                    )
+                ),
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \

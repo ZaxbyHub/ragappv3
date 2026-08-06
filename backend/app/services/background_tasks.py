@@ -223,6 +223,7 @@ class BackgroundProcessor:
         self._worker_tasks: List[asyncio.Task] = []
         self._enrichment_worker_task: Optional[asyncio.Task] = None
         self._vector_delete_sweep_task: Optional[asyncio.Task] = None
+        self._artifact_delete_sweep_task: Optional[asyncio.Task] = None
         self._reindex_worker_task: Optional[asyncio.Task] = None
         self._running = False
         self.maintenance_service = maintenance_service

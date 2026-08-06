@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 70,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 60041,
+      "loc": 60047,
       "nosec": 0,
       "skipped_tests": 22
     },
@@ -257,7 +257,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 925,
+      "loc": 929,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -348,7 +348,7 @@
       "SEVERITY.LOW": 7,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 637,
+      "loc": 638,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -556,7 +556,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 955,
+      "loc": 956,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3230,7 +3230,7 @@
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "427                             conn.commit()\n428                     except Exception:  # pragma: no cover - defensive\n429                         pass\n430                     continue\n",
+      "code": "428                             conn.commit()\n429                     except Exception:  # pragma: no cover - defensive\n430                         pass\n431                     continue\n",
       "col_offset": 20,
       "end_col_offset": 28,
       "filename": "backend/app/services/background_tasks.py",
@@ -3241,17 +3241,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 428,
+      "line_number": 429,
       "line_range": [
-        428,
-        429
+        429,
+        430
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "551                         conn.commit()\n552                 except Exception:  # pragma: no cover - defensive\n553                     pass\n554                 continue\n",
+      "code": "552                         conn.commit()\n553                 except Exception:  # pragma: no cover - defensive\n554                     pass\n555                 continue\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/services/background_tasks.py",
@@ -3262,17 +3262,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 552,
+      "line_number": 553,
       "line_range": [
-        552,
-        553
+        553,
+        554
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1368                 conn.execute(\n1369                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n1370                     clear_ids,\n",
+      "code": "1371                 conn.execute(\n1372                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n1373                     clear_ids,\n",
       "col_offset": 20,
       "end_col_offset": 77,
       "filename": "backend/app/services/document_processor.py",
@@ -3283,9 +3283,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1369,
+      "line_number": 1372,
       "line_range": [
-        1369
+        1372
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
