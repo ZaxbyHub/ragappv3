@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 70,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 59998,
+      "loc": 60041,
       "nosec": 0,
       "skipped_tests": 22
     },
@@ -530,7 +530,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 448,
+      "loc": 436,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -556,7 +556,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 952,
+      "loc": 955,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -660,7 +660,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 362,
+      "loc": 365,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -686,7 +686,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2830,
+      "loc": 2879,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -2916,7 +2916,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "927         lambda: conn.execute(\n928             f\"\"\"\n929             SELECT id, org_id FROM groups\n930             WHERE id IN ({placeholders})\n931             \"\"\",\n932             tuple(group_ids),\n",
+      "code": "928         lambda: conn.execute(\n929             f\"\"\"\n930             SELECT id, org_id FROM groups\n931             WHERE id IN ({placeholders})\n932             \"\"\",\n933             tuple(group_ids),\n",
       "col_offset": 12,
       "end_col_offset": 15,
       "filename": "backend/app/api/routes/vaults.py",
@@ -2927,12 +2927,12 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 928,
+      "line_number": 929,
       "line_range": [
-        928,
         929,
         930,
-        931
+        931,
+        932
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -3272,7 +3272,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "1364                 conn.execute(\n1365                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n1366                     clear_ids,\n",
+      "code": "1368                 conn.execute(\n1369                     f\"DELETE FROM failed_chunks WHERE id IN ({placeholders})\",\n1370                     clear_ids,\n",
       "col_offset": 20,
       "end_col_offset": 77,
       "filename": "backend/app/services/document_processor.py",
@@ -3283,9 +3283,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1365,
+      "line_number": 1369,
       "line_range": [
-        1365
+        1369
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

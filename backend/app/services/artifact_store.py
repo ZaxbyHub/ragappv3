@@ -104,15 +104,28 @@ def _is_within(path: Path, root: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _asset_rel_path(generation_hash: str, asset_id: str) -> str:
+def _asset_rel_path(file_id: int, generation_hash: str, asset_id: str) -> str:
     """Server-derived relative path for an asset.
 
-    Only contains the opaque generation hash short and the content-addressable
-    asset id — never any caller-controlled filename, which is what makes
-    traversal/symlink attacks structurally impossible.
+    Only contains the opaque file id, the opaque generation hash short and the
+    content-addressable asset id — never any caller-controlled filename, which
+    is what makes traversal/symlink attacks structurally impossible. Including
+    ``file_id`` makes paths per-owner so two files that share identical content
+    (and therefore the same ``generation_hash`` + ``asset_id``) never alias one
+    another on disk (issue #460, final-critic finding 5).
     """
     gen_short = generation_hash[:12] or "gen"
-    return f"{gen_short}/{asset_id}"
+    return f"{file_id}/{gen_short}/{asset_id}"
+
+
+def compute_asset_rel_path(file_id: int, generation_hash: str, asset_id: str) -> str:
+    """Public wrapper so planners and the materializer share one path formula.
+
+    Used by the image path to build a :class:`DocumentAsset` value object before
+    the bytes are materialized at publish time, guaranteeing the planned path
+    exactly matches what ``store_asset_bytes`` will write.
+    """
+    return _asset_rel_path(file_id, generation_hash, asset_id)
 
 
 def store_asset_bytes(
@@ -145,7 +158,7 @@ def store_asset_bytes(
     """
     sha256 = hashlib.sha256(data).hexdigest()
     asset_id = sha256
-    rel_path = _asset_rel_path(generation_hash, asset_id)
+    rel_path = _asset_rel_path(file_id, generation_hash, asset_id)
     root = artifact_root(vault_id=vault_id)
     dest = root / rel_path
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -347,6 +360,22 @@ def publish_generation(
     if validation_error is not None:
         raise ValueError(f"refusing to publish invalid generation: {validation_error}")
 
+    # Enforce the configured per-generation asset bounds so the declared config
+    # knobs are real (issue #460, final-critic finding 6). Checked before any
+    # tombstone/delete so a bound violation cannot partially retire the prior
+    # generation.
+    assets = list(assets)
+    if len(assets) > settings.max_assets_per_generation:
+        raise ValueError(
+            f"refusing to publish generation with {len(assets)} assets "
+            f"(> {settings.max_assets_per_generation})"
+        )
+    if sum(a.byte_size or 0 for a in assets) > settings.max_asset_bytes_per_generation:
+        raise ValueError(
+            f"refusing to publish generation with asset bytes "
+            f"exceeding {settings.max_asset_bytes_per_generation}"
+        )
+
     # Retire old generations (different hash): tombstone their assets, then
     # delete their atom/asset/stage rows. Never touches the current generation.
     old_paths = [
@@ -488,44 +517,6 @@ def _upsert_stage(
             started_at,
             completed_at,
         ),
-    )
-
-
-def retire_generation_quick(
-    conn,
-    *,
-    file_id: int,
-    vault_id: int,
-    generation_hash: str,
-) -> None:
-    """Drop all artifact rows for a specific generation and tombstone its assets.
-
-    Used by failure compensation (a failed publish must not leave partial
-    new-generation rows/assets visible).
-    """
-    paths = [
-        row["rel_path"]
-        for row in conn.execute(
-            "SELECT rel_path FROM document_assets "
-            "WHERE file_id = ? AND generation_hash = ?",
-            (file_id, generation_hash),
-        ).fetchall()
-    ]
-    if paths:
-        enqueue_asset_cleanup(
-            conn, file_id=file_id, vault_id=vault_id, rel_paths=paths, generation_hash=generation_hash
-        )
-    conn.execute(
-        "DELETE FROM document_assets WHERE file_id = ? AND generation_hash = ?",
-        (file_id, generation_hash),
-    )
-    conn.execute(
-        "DELETE FROM document_atoms WHERE file_id = ? AND generation_hash = ?",
-        (file_id, generation_hash),
-    )
-    conn.execute(
-        "DELETE FROM ingestion_stage_states WHERE file_id = ? AND generation_hash = ?",
-        (file_id, generation_hash),
     )
 
 

@@ -6,6 +6,7 @@ while tracking processing status in SQLite and handling file deduplication.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -33,6 +34,7 @@ from .contextual_chunking import ContextualChunker
 from .document_artifacts import (
     ATOM_SCHEMA_VERSION,
     DEFAULT_PARSER_NAME,
+    RASTER_IMAGE_EXTENSIONS,
     AtomKind,
     DocumentAsset,
     DocumentAtom,
@@ -650,8 +652,10 @@ class DocumentProcessor:
     # File extensions that should use SpreadsheetParser
     SPREADSHEET_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 
-    # File extensions that should use image processing (OCR + metadata)
-    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"}
+    # File extensions that should use image processing (OCR + metadata).
+    # Derived from the canonical raster set so dispatch and the upload allowlist
+    # can never drift apart (issue #460, final-critic finding 2). Includes .tif.
+    IMAGE_EXTENSIONS = set(RASTER_IMAGE_EXTENSIONS)
 
     def __init__(
         self,
@@ -1968,6 +1972,16 @@ class DocumentProcessor:
         assets = list(parsed.assets)
         if not atoms and not assets:
             return
+        # Materialize any deferred asset bytes onto disk now — immediately before
+        # the rows are published — so bytes exist on disk only transiently
+        # alongside the uncommitted row, and are tombstoned by the compensation
+        # below on a publish failure (issue #460, final-critic finding 3).
+        assets = [
+            self._materialize_asset(
+                asset, parsed.asset_payloads, file_id, vault_id, generation_hash
+            )
+            for asset in assets
+        ]
         stage_states = [
             {"stage": "parse", "status": "succeeded", "attempts": 1,
              "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
@@ -1995,19 +2009,15 @@ class DocumentProcessor:
                 generation_hash,
                 exc,
             )
-            # Canonical compensation: drop any partial new-generation rows via
-            # retire_generation_quick, then tombstone the new-generation asset
-            # bytes we already wrote so the sweep collects them even though the
-            # publish never committed a row for them. Kept on its own short
-            # transaction; a compensation failure is surfaced (not silently
-            # swallowed) so orphaned bytes require operator reconciliation.
+            # Compensation: roll back the failed publish entirely (discarding any
+            # partial rows and any old-generation retirement it performed mid-way),
+            # then tombstone ONLY the bytes materialized for this attempt — they
+            # have no committed row now, so the sweep must collect them. Kept on
+            # a short transaction; a compensation failure is surfaced (not
+            # silently swallowed) so orphaned bytes require operator
+            # reconciliation (issue #460, final-critic findings 2/4).
+            conn.rollback()
             try:
-                artifact_store.retire_generation_quick(
-                    conn,
-                    file_id=file_id,
-                    vault_id=vault_id,
-                    generation_hash=generation_hash,
-                )
                 artifact_store.enqueue_asset_cleanup(
                     conn,
                     file_id=file_id,
@@ -2028,6 +2038,35 @@ class DocumentProcessor:
                 )
         finally:
             self.pool.release_connection(conn)
+
+    def _materialize_asset(
+        self,
+        asset: DocumentAsset,
+        payloads: Dict[str, bytes],
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+    ) -> DocumentAsset:
+        """Write a deferred asset's bytes to disk, returning the materialized asset.
+
+        If no payload was planned for this asset (e.g. already materialized, or a
+        best-effort plan produced no bytes), the asset is returned unchanged. The
+        planned path is identical to the materialized path, so provenance and the
+        tombstone path remain consistent.
+        """
+        data = payloads.get(asset.asset_id) if payloads else None
+        if data is None:
+            return asset
+        return artifact_store.store_asset_bytes(
+            file_id=file_id,
+            vault_id=vault_id,
+            generation_hash=generation_hash,
+            data=data,
+            mime_type=asset.mime_type,
+            width=asset.width,
+            height=asset.height,
+            extra_metadata=asset.metadata,
+        )
 
     async def _process_image_file(
         self,
@@ -2089,28 +2128,37 @@ class DocumentProcessor:
                 atoms=(), parser_fingerprint=parser_fingerprint
             )
 
-        # Persist the raster bytes as a content-addressed asset under the vault
-        # artifact root. Failure to store the asset is non-fatal: the atom and
+        # Plan the raster asset (opaque id + confined path) WITHOUT touching
+        # disk. The raw bytes are stashed on the ParsedDocument and materialized
+        # on disk only inside _publish_artifacts, immediately before the rows are
+        # published — so bytes can never linger unowned if the generation is
+        # never published (pre-publish failure or no vector store), and are
+        # tombstoned by compensation on a publish failure (issue #460,
+        # final-critic finding 3). Failure here is non-fatal: the atom and
         # searchable text still index, and provenance is simply omitted.
         asset: Optional[DocumentAsset] = None
+        asset_payloads: Dict[str, bytes] = {}
         try:
             image_data = Path(file_path).read_bytes()
             fmt = str(image_result.metadata.get("format") or "").lower()
-            asset = artifact_store.store_asset_bytes(
+            asset_id = hashlib.sha256(image_data).hexdigest()
+            asset = DocumentAsset(
+                asset_id=asset_id,
                 file_id=file_id,
-                vault_id=vault_id,
                 generation_hash=generation_hash,
-                data=image_data,
+                sha256=asset_id,
+                rel_path=artifact_store.compute_asset_rel_path(
+                    file_id, generation_hash, asset_id
+                ),
                 mime_type=f"image/{fmt}" if fmt else None,
                 width=image_result.metadata.get("width"),
                 height=image_result.metadata.get("height"),
-                extra_metadata={
-                    "format": fmt,
-                    "mode": image_result.metadata.get("mode"),
-                },
+                byte_size=len(image_data),
+                metadata={"format": fmt, "mode": image_result.metadata.get("mode")},
             )
-        except Exception as exc:  # noqa: BLE001 - asset write is best-effort
-            logger.warning("Failed to store image asset for %s: %s", file_path, exc)
+            asset_payloads[asset_id] = image_data
+        except Exception as exc:  # noqa: BLE001 - asset planning is best-effort
+            logger.warning("Failed to plan image asset for %s: %s", file_path, exc)
 
         atom = DocumentAtom(
             atom_id=make_atom_id(file_id, generation_hash, 0),
@@ -2164,6 +2212,7 @@ class DocumentProcessor:
             normalized_projection=searchable_text,
             parser_fingerprint=parser_fingerprint,
             assets=(asset,) if asset else (),
+            asset_payloads=asset_payloads,
         )
         return [chunk], searchable_text, parsed
 

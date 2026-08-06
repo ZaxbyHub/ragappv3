@@ -654,15 +654,11 @@ async def delete_vault(
             conn.execute, "DELETE FROM chat_sessions WHERE vault_id = ?", (vault_id,)
         )
 
-        # Delete files
-        await asyncio.to_thread(
-            conn.execute, "DELETE FROM files WHERE vault_id = ?", (vault_id,)
-        )
-
-        # Tombstone every binary asset path within the vault in the same
-        # transaction so the background artifact sweep collects the bytes after
-        # commit (issue #460); the document_assets rows cascade from the
-        # files-row delete above.
+        # Tombstone every binary asset path within the vault, in the same
+        # transaction, BEFORE deleting the files rows. The collect query reads
+        # `document_assets` joined to `files`; deleting files first would cascade
+        # the asset rows away and the sweep would never learn about these bytes
+        # (issue #460, final-critic finding 1).
         from app.services import artifact_store as _artifact_store
 
         vault_assets = await asyncio.to_thread(
@@ -676,6 +672,11 @@ async def delete_vault(
                 rel_paths=vault_assets,
                 generation_hash=None,
             )
+
+        # Delete files
+        await asyncio.to_thread(
+            conn.execute, "DELETE FROM files WHERE vault_id = ?", (vault_id,)
+        )
 
         # Delete the vault itself. drafts.vault_id carries ON DELETE CASCADE
         # to vaults(id) (see app/models/database.py _DRAFT_ROOM_CORE_DDL), and

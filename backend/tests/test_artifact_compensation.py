@@ -1,15 +1,16 @@
 """Failure-compensation tests for ``document_processor._publish_artifacts`` (#460).
 
-Regression for reviewer finding: when ``publish_generation`` raises after asset
-bytes were already written to disk, the compensation must (a) drop any partial
-new-generation rows via ``retire_generation_quick``, and (b) tombstone the
-written bytes for the background sweep — with a compensation failure surfaced
-rather than silently swallowed. Also guards that a successful publish does NOT
-tombstone its own (now-live) assets.
+Regression for the final-critic findings:
+- Asset bytes are materialized on disk only inside ``_publish_artifacts`` (just
+  before the rows are published), never before, so a pre-publish failure or a
+  missing vector-store cannot leave orphaned bytes.
+- On a publish failure the compensation rolls back the partial transaction
+  (discarding any partial rows AND any old-generation retirement it performed
+  mid-way) and tombstones the materialized bytes for the sweep.
+- A successful publish does NOT tombstone its own (now-live) assets.
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -56,22 +57,38 @@ def _new_db(tmp_path):
     return conn
 
 
-def _parsed(ordinal, asset):
+def _parsed(asset, payloads=None):
     return ParsedDocument(
         atoms=[
             DocumentAtom(
-                atom_id=f"a-{ordinal}",
+                atom_id="a-0",
                 schema_version=1,
                 file_id=1,
                 generation_hash="genA",
-                ordinal=ordinal,
+                ordinal=0,
                 kind=AtomKind.IMAGE,
                 raw_text="img",
                 asset_id=asset.asset_id,
             )
         ],
-        assets=[asset],
+        assets=(asset,),
         parser_fingerprint="unstructured:test",
+        asset_payloads=payloads or {},
+    )
+
+
+def _asset(data=b"abc"):
+    import hashlib
+
+    asset_id = hashlib.sha256(data).hexdigest()
+    return DocumentAsset(
+        asset_id=asset_id,
+        file_id=1,
+        generation_hash="genA",
+        sha256=asset_id,
+        rel_path=artifact_store.compute_asset_rel_path(1, "genA", asset_id),
+        mime_type="image/png",
+        byte_size=len(data),
     )
 
 
@@ -85,70 +102,78 @@ def artifact_root(tmp_path):
     artifact_store.artifact_root = real
 
 
-def test_failed_publish_tombstones_written_bytes(tmp_path, artifact_root, monkeypatch):
+def test_failed_publish_rolls_back_and_tombstones_bytes(
+    tmp_path, artifact_root, monkeypatch
+):
     db = _new_db(tmp_path)
+    asset = _asset()
+    payloads = {asset.asset_id: b"abc"}
 
-    def _raise(*_a, **_k):
-        raise ValueError("constraint failure")
+    def _fail_mid(conn, **_kw):
+        # Simulate a mid-transaction failure: publish already inserted a partial
+        # asset row (and may have retired old generations) before raising.
+        conn.execute(
+            "INSERT INTO document_assets "
+            "(asset_id, file_id, generation_hash, sha256, rel_path, byte_size) "
+            "VALUES ('partial', 1, 'genA', 'partial', '1/genA/partial', 1)"
+        )
+        raise RuntimeError("mid-transaction failure")
 
     monkeypatch.setattr(
-        "app.services.document_processor.artifact_store.publish_generation", _raise
+        "app.services.document_processor.artifact_store.publish_generation", _fail_mid
     )
-
-    # Write the asset bytes to disk just like store_asset_bytes would.
-    asset = DocumentAsset(
-        asset_id="sha1", file_id=1, generation_hash="genA", sha256="sha1",
-        rel_path="genA/sha1", byte_size=3,
-    )
-    target = artifact_root / asset.rel_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"abc")
 
     proc_like = object.__new__(DocumentProcessor)
     proc_like.pool = _FakePool(db)
     DocumentProcessor._publish_artifacts(
-        proc_like, file_id=1, vault_id=1, generation_hash="genA", parsed=_parsed(0, asset)
+        proc_like, file_id=1, vault_id=1, generation_hash="genA", parsed=_parsed(asset, payloads)
     )
 
-    # No partial rows leaked.
+    # Rollback discarded the partial publish rows (both the partial insert AND
+    # any real atom/asset insert that could have happened).
     assert db.execute(
-        "SELECT COUNT(*) FROM document_assets WHERE file_id=1 AND generation_hash='genA'"
+        "SELECT COUNT(*) FROM document_assets WHERE file_id=1"
     ).fetchone()[0] == 0
     assert db.execute(
-        "SELECT COUNT(*) FROM document_atoms WHERE file_id=1 AND generation_hash='genA'"
+        "SELECT COUNT(*) FROM document_atoms WHERE file_id=1"
     ).fetchone()[0] == 0
-    # The written bytes are tombstoned for the sweep.
+    # The materialized bytes are tombstoned for the sweep (they have no row now).
     pending = db.execute(
         "SELECT rel_path, generation_hash FROM artifact_delete_pending "
-        "WHERE rel_path='genA/sha1'"
+        "WHERE rel_path=?",
+        (asset.rel_path,),
     ).fetchone()
     assert pending is not None
     assert pending["generation_hash"] == "genA"
     db.close()
 
 
-def test_successful_publish_does_not_tombstone_live_assets(tmp_path, artifact_root):
+def test_successful_publish_writes_bytes_and_does_not_tombstone_live_assets(
+    tmp_path, artifact_root
+):
     db = _new_db(tmp_path)
-    asset = DocumentAsset(
-        asset_id="sha1", file_id=1, generation_hash="genA", sha256="sha1",
-        rel_path="genA/sha1", byte_size=3,
-    )
-    target = artifact_root / asset.rel_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"abc")
+    asset = _asset()
+    payloads = {asset.asset_id: b"abc"}
 
     proc_like = object.__new__(DocumentProcessor)
     proc_like.pool = _FakePool(db)
-    # No monkeypatch: publish succeeds normally.
+    # No monkeypatch: publish succeeds normally; the deferred bytes are
+    # materialized on disk as part of the publish.
     DocumentProcessor._publish_artifacts(
-        proc_like, file_id=1, vault_id=1, generation_hash="genA", parsed=_parsed(0, asset)
+        proc_like, file_id=1, vault_id=1, generation_hash="genA", parsed=_parsed(asset, payloads)
     )
 
-    assert db.execute(
-        "SELECT COUNT(*) FROM document_assets WHERE file_id=1 AND rel_path='genA/sha1'"
-    ).fetchone()[0] == 1
+    row = db.execute(
+        "SELECT COUNT(*) FROM document_assets WHERE file_id=1 AND rel_path=?",
+        (asset.rel_path,),
+    ).fetchone()[0]
+    assert row == 1
+    # Bytes exist on disk exactly at the planned/per-owner path.
+    assert (artifact_root / asset.rel_path).exists()
+    assert (artifact_root / asset.rel_path).read_bytes() == b"abc"
     # Successful publish must NOT enqueue a tombstone for its own live asset.
     assert db.execute(
-        "SELECT COUNT(*) FROM artifact_delete_pending WHERE rel_path='genA/sha1'"
+        "SELECT COUNT(*) FROM artifact_delete_pending WHERE rel_path=?",
+        (asset.rel_path,),
     ).fetchone()[0] == 0
     db.close()

@@ -275,39 +275,123 @@ class TestGenerationPublish:
         ).fetchone()[0] == 0
 
 
-class TestRetireGenerationQuick:
-    def test_retire_generation_drops_rows_and_tombstones_assets(self, db):
+    def test_devault_collects_then_batch_tombstones_before_files_delete(self, db):
+        """Regression (final-critic finding 1): vault-wide asset cleanup must
+        collect + enqueue BEFORE the files delete cascades document_assets away.
+
+        Replicates the corrected `delete_vault` ordering: collect every asset
+        path for the vault, enqueue tombstones, only then delete the files rows.
+        """
         from app.services.document_artifacts import DocumentAsset
 
-        asset = DocumentAsset(
-            asset_id="sha1", file_id=1, generation_hash="genX", sha256="sha1",
-            rel_path="genX/sha1", byte_size=1,
-        )
-        artifact_store.publish_generation(
-            db, file_id=1, vault_id=1, generation_hash="genX",
-            atoms=[_atom(0, asset_id="sha1", kind=AtomKind.IMAGE, raw="img", generation_hash="genX")],
-            assets=[asset],
-            stage_states=[{"stage": "parse", "status": "succeeded"}],
-            parser_fingerprint="p", implementation_version="1",
-        )
+        # Two files in vault 1, each with an asset.
+        for i, (fid, pth) in enumerate([(1, "a.png"), (2, "b.png")], start=1):
+            db.execute(
+                "INSERT INTO files (vault_id, file_path, file_name, file_hash, "
+                "file_size, status) VALUES (1, ?, ?, ?, 1, 'indexed')",
+                (pth, pth, f"h{i}"),
+            )
+            db.commit()
+            artifact_store.publish_generation(
+                db, file_id=fid, vault_id=1, generation_hash="genA",
+                atoms=[_atom(0, kind=AtomKind.IMAGE, raw="img")],
+                assets=[DocumentAsset(
+                    asset_id=f"sha{fid}", file_id=fid, generation_hash="genA",
+                    sha256=f"sha{fid}", rel_path=f"1/genA/sha{fid}", byte_size=1,
+                )],
+                stage_states=[{"stage": "parse", "status": "succeeded"}],
+                parser_fingerprint="p", implementation_version="1",
+            )
+            db.commit()
+
+        paths = artifact_store.devault_asset_rel_paths(db, vault_id=1)
+        assert sorted(paths) == ["1/genA/sha1", "1/genA/sha2"]
+        artifact_store.enqueue_asset_cleanup(db, file_id=0, vault_id=1, rel_paths=paths)
+        # Cascade the file rows away (what delete_vault does AFTER the collect).
+        db.execute("DELETE FROM files WHERE vault_id = 1")
         db.commit()
 
-        artifact_store.retire_generation_quick(
-            db, file_id=1, vault_id=1, generation_hash="genX"
-        )
-        db.commit()
+        pending = {r["rel_path"] for r in db.execute(
+            "SELECT rel_path FROM artifact_delete_pending WHERE vault_id=1"
+        ).fetchall()}
+        assert pending == {"1/genA/sha1", "1/genA/sha2"}
 
+
+class TestGenerationBounds:
+    def test_publish_rejects_asset_count_over_limit(self, db, monkeypatch):
+        """Regression (final-critic finding 6): max_assets_per_generation is a
+        real runtime bound, not an inert config knob."""
+        from app.services.document_artifacts import DocumentAsset
+
+        monkeypatch.setattr(artifact_store.settings, "max_assets_per_generation", 1)
+        assets = [
+            DocumentAsset(asset_id=f"a{i}", file_id=1, generation_hash="genA",
+                          sha256=f"a{i}", rel_path=f"1/genA/a{i}", byte_size=1)
+            for i in (1, 2)
+        ]
+        with pytest.raises(ValueError, match="assets"):
+            artifact_store.publish_generation(
+                db, file_id=1, vault_id=1, generation_hash="genA",
+                atoms=[_atom(0)], assets=assets,
+                stage_states=[{"stage": "parse", "status": "succeeded"}],
+                parser_fingerprint="p", implementation_version="1",
+            )
+
+    def test_publish_rejects_asset_bytes_over_limit(self, db, monkeypatch):
+        from app.services.document_artifacts import DocumentAsset
+
+        monkeypatch.setattr(artifact_store.settings, "max_asset_bytes_per_generation", 4)
+        asset = DocumentAsset(asset_id="big", file_id=1, generation_hash="genA",
+                              sha256="big", rel_path="1/genA/big", byte_size=100)
+        with pytest.raises(ValueError, match="exceeding"):
+            artifact_store.publish_generation(
+                db, file_id=1, vault_id=1, generation_hash="genA",
+                atoms=[_atom(0)], assets=[asset],
+                stage_states=[{"stage": "parse", "status": "succeeded"}],
+                parser_fingerprint="p", implementation_version="1",
+            )
+        # No partial rows / tombstones on a bound rejection.
         assert db.execute(
-            "SELECT COUNT(*) FROM document_assets WHERE file_id=1 AND generation_hash='genX'"
+            "SELECT COUNT(*) FROM document_assets WHERE file_id=1"
         ).fetchone()[0] == 0
         assert db.execute(
-            "SELECT COUNT(*) FROM document_atoms WHERE file_id=1 AND generation_hash='genX'"
+            "SELECT COUNT(*) FROM artifact_delete_pending"
         ).fetchone()[0] == 0
-        pending = db.execute(
-            "SELECT rel_path, generation_hash FROM artifact_delete_pending WHERE rel_path='genX/sha1'"
-        ).fetchone()
-        assert pending is not None
-        assert pending["generation_hash"] == "genX"
+
+
+class TestBackgroundTaskLifecycle:
+    def test_stop_cancels_artifact_sweep_task(self):
+        """Regression (final-critic finding 7): ``BackgroundProcessor.stop`` must
+        cancel the artifact-delete sweep task, mirroring the vector sweep, so it
+        is not left sleeping (and firing against a closed pool) across restarts.
+        """
+        import asyncio
+        import types
+
+        from app.services.background_tasks import BackgroundProcessor
+
+        proc = object.__new__(BackgroundProcessor)
+        proc._running = True
+        proc.queue = asyncio.Queue()
+        proc.enrichment_queue = asyncio.Queue()
+        proc.shutdown_event = asyncio.Event()
+        proc._worker_tasks = []
+        proc._enrichment_worker_task = None
+        proc._vector_delete_sweep_task = None
+        proc._reindex_worker_task = None
+        proc.processor = types.SimpleNamespace(vector_store=None)
+
+        async def _sweep_forever():
+            await asyncio.sleep(3600)
+
+        async def _scenario():
+            sweep = asyncio.create_task(_sweep_forever())
+            proc._artifact_delete_sweep_task = sweep
+            await proc.stop(timeout=1.0)
+            return sweep
+
+        sweep = asyncio.run(_scenario())
+        assert sweep.cancelled()
 
 
 class TestSweep:

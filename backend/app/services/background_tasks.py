@@ -637,6 +637,9 @@ class BackgroundProcessor:
         if self._vector_delete_sweep_task:
             self._vector_delete_sweep_task.cancel()
             await asyncio.gather(self._vector_delete_sweep_task, return_exceptions=True)
+        if getattr(self, "_artifact_delete_sweep_task", None):
+            self._artifact_delete_sweep_task.cancel()
+            await asyncio.gather(self._artifact_delete_sweep_task, return_exceptions=True)
         if self._reindex_worker_task:
             self._reindex_worker_task.cancel()
             await asyncio.gather(self._reindex_worker_task, return_exceptions=True)

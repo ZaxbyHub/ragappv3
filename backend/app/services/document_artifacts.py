@@ -193,6 +193,15 @@ class ParsedDocument:
     normalized_projection: str = ""
     parser_fingerprint: str = ""
     assets: tuple[DocumentAsset, ...] = ()
+    # Transient, in-memory only: maps asset_id -> raw bytes yet to be
+    # materialized on disk at publish time. Excluded from equality/repr so it
+    # never leaks into persisted payloads or test fixtures. This lets the image
+    # path defer disk writes until ``_publish_artifacts``, so bytes can never
+    # linger on disk without either a committed row or a tombstone (issue #460,
+    # final-critic finding 3).
+    asset_payloads: dict[str, bytes] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
 
 # ---------------------------------------------------------------------------

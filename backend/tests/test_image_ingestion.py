@@ -37,6 +37,20 @@ class TestAllowlist:
         for ext in RASTER_IMAGE_EXTENSIONS:
             assert ext in settings.allowed_extensions, ext
 
+    def test_processor_dispatch_matches_canonical_raster_set(self):
+        """Regression (final-critic finding 2): the processor's image dispatch
+        must equal the canonical raster set (single source of truth), so every
+        allowlisted raster suffix — including ``.tif`` — routes to the image
+        pipeline, never the document parser.
+        """
+        from app.services.document_processor import DocumentProcessor
+
+        assert DocumentProcessor.IMAGE_EXTENSIONS == set(RASTER_IMAGE_EXTENSIONS)
+        assert ".tif" in DocumentProcessor.IMAGE_EXTENSIONS
+        proc = object.__new__(DocumentProcessor)
+        for ext in RASTER_IMAGE_EXTENSIONS:
+            assert proc._is_image_file(f"file{ext}") is True, ext
+
 
 class TestProcessImageContract:
     def test_process_image_is_async_and_returns_result_not_coroutine(self):
