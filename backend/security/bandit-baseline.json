@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 70,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 60047,
+      "loc": 60111,
       "nosec": 0,
       "skipped_tests": 22
     },
@@ -101,7 +101,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3622,
+      "loc": 3624,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -556,7 +556,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 956,
+      "loc": 979,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -686,7 +686,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2879,
+      "loc": 2908,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -972,7 +972,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 157,
+      "loc": 167,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3230,7 +3230,7 @@
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "428                             conn.commit()\n429                     except Exception:  # pragma: no cover - defensive\n430                         pass\n431                     continue\n",
+      "code": "433                             conn.commit()\n434                     except Exception:  # pragma: no cover - defensive\n435                         pass\n436                     continue\n",
       "col_offset": 20,
       "end_col_offset": 28,
       "filename": "backend/app/services/background_tasks.py",
@@ -3241,17 +3241,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 429,
+      "line_number": 434,
       "line_range": [
-        429,
-        430
+        434,
+        435
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "552                         conn.commit()\n553                 except Exception:  # pragma: no cover - defensive\n554                     pass\n555                 continue\n",
+      "code": "584                         conn.commit()\n585                 except Exception:  # pragma: no cover - defensive\n586                     pass\n587                 continue\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/services/background_tasks.py",
@@ -3262,10 +3262,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 553,
+      "line_number": 585,
       "line_range": [
-        553,
-        554
+        585,
+        586
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",

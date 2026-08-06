@@ -490,13 +490,27 @@ class BackgroundProcessor:
                     "Recovered stuck processing row id=%s: status=pending, phase=queued",
                     row_id,
                 )
-                # Re-enqueue for processing
-                await self.enqueue(
-                    file_path=file_path,
-                    source=source,
-                    vault_id=int(vault_id),
-                    file_id=int(row_id),
-                )
+                # Re-enqueue for processing, bounded like the pending loop so a
+                # saturated queue cannot stall startup (PRR-011).
+                try:
+                    await asyncio.wait_for(
+                        self.enqueue(
+                            file_path=file_path,
+                            source=source,
+                            vault_id=int(vault_id),
+                            file_id=int(row_id),
+                        ),
+                        timeout=STRANDED_REENQUEUE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # The row was already flipped to pending/queued above, so the
+                    # first recovery loop naturally re-queues it on the next start.
+                    logger.warning(
+                        "Processing-row re-enqueue timed out for row id=%s; left "
+                        "for the next recovery sweep",
+                        row_id,
+                    )
+                    continue
             except Exception as e:
                 logger.warning("Failed to recover processing row %s: %s", row, e)
 
