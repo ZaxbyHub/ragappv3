@@ -702,6 +702,7 @@ class BackgroundProcessor:
 
             enqueued = 0
             with self.processor.pool.connection() as conn:
+                # (1) Files with actionable stage rows (interrupted work).
                 rows = conn.execute(
                     "SELECT DISTINCT s.file_id, f.vault_id, f.file_hash "
                     "FROM ingestion_stage_states s "
@@ -715,9 +716,36 @@ class BackgroundProcessor:
                         est.SKIPPED_NOT_APPLICABLE,
                     ),
                 ).fetchall()
-            for row in rows:
+                # (2) Backfill: files whose active generation has eligible-kind
+                # atoms but NO enrichment stage row at all. Enabling multimodal
+                # after ingestion creates no stage rows (F-6a), so these files
+                # would otherwise never be enriched without a re-ingest.
+                # Restricted to 'indexed' files so error/deleted/processing-state
+                # rows are not (re)enqueued for enrichment.
+                backfill_rows = conn.execute(
+                    "SELECT DISTINCT a.file_id, f.vault_id, f.file_hash "
+                    "FROM document_atoms a "
+                    "JOIN files f ON f.id = a.file_id "
+                    "WHERE f.status = 'indexed' "
+                    "AND a.generation_hash = f.active_generation_hash "
+                    "AND a.kind IN ('image','chart','table','equation') "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM ingestion_stage_states s "
+                    "  WHERE s.file_id = a.file_id "
+                    "  AND s.generation_hash = a.generation_hash "
+                    "  AND s.stage = ? "
+                    "  AND s.atom_id = a.id"
+                    ")",
+                    (est.ENRICH_STAGE,),
+                ).fetchall()
+            seen: set[tuple[int, int]] = set()
+            for row in rows + backfill_rows:
                 if self.shutdown_event.is_set():
                     break
+                key = (row["file_id"], row["vault_id"])
+                if key in seen:
+                    continue
+                seen.add(key)
                 file_id = row["file_id"]
                 vault_id = row["vault_id"]
                 if not self._should_enqueue_atom_enrichment(file_id, vault_id):
@@ -789,7 +817,19 @@ class BackgroundProcessor:
             if eligible is None:
                 return False
         allow = list(settings.multimodal_allowed_model_origins or [])
-        return bool(allow and settings.multimodal_chat_url)
+        if not (allow and settings.multimodal_chat_url):
+            return False
+        # Run the real exact-origin + SSRF policy check here, not just the
+        # allowlist-non-empty test. Without it, a misconfigured origin (trailing
+        # slash, scheme/port mismatch, non-allowlisted host) would pass enqueue and
+        # then stamp every atom SKIPPED_POLICY permanently at the worker, where the
+        # policy-only status is terminal (F-6). Catching it at the gate means the
+        # item is simply not enqueued and no irrecoverable stage is written.
+        try:
+            self.multimodal_service.client._assert_policy()
+        except Exception:  # noqa: BLE001 — policy denial is the point
+            return False
+        return True
 
     def enqueue_atom_enrichment(
         self,
@@ -967,8 +1007,16 @@ class BackgroundProcessor:
             )
         if not new_records:
             return
+        # Determine which atoms were (re-)written in THIS batch so stale-id deletion
+        # is scoped to them only. Using the whole-file prior_proxy_ids here would
+        # delete sibling atoms' durable proxies that a partial re-enrichment did not
+        # touch, leaving dangling proxy_vector_id references in SQL (F-2 fix).
+        batch_atom_ids = [pr.get("atom_id") for pr in proxy_records]
         with self.processor.pool.connection() as conn:
-            prior_ids = est.prior_proxy_ids(conn, file_id=file_id, generation_hash=generation_hash)
+            prior_ids = est.prior_proxy_ids_for_atoms(
+                conn, file_id=file_id, generation_hash=generation_hash,
+                atom_ids=[aid for aid in batch_atom_ids if aid],
+            )
         stale_ids = [pid for pid in prior_ids if pid not in new_ids]
         await vec_store.add_chunks_then_delete_ids(new_records, stale_ids)
         # Record the new proxy vector ids in the derived table. Records are only
@@ -987,6 +1035,28 @@ class BackgroundProcessor:
                     input_fingerprint=meta.get("fingerprint"),
                     proxy_vector_id=rec["id"],
                 )
+            # A batch atom may have had a durable prior proxy superseded (stale) but
+            # produced no replacement row this run (e.g. its embed failed and was
+            # skipped). Its vector was just deleted from LanceDB (it is in stale_ids),
+            # so clear the dangling proxy_vector_id reference rather than let SQL keep
+            # claiming a proxy that no longer exists. Atoms that DID get a replacement
+            # this batch keep their freshly-recorded vector id.
+            #
+            # We derive the atom ids from the batch records directly rather than by
+            # splitting the composite vector id, which is not a safe reversible
+            # encoding (atom ids may contain underscores).
+            written_atom_ids = {
+                (json.loads(r["metadata"]).get("atom_id") or "") for r in new_records
+            }
+            for pr in proxy_records:
+                clear_atom_id = pr.get("atom_id") or ""
+                if clear_atom_id and clear_atom_id not in written_atom_ids:
+                    est.clear_proxy_vector_id(
+                        conn,
+                        file_id=file_id,
+                        generation_hash=generation_hash,
+                        atom_id=clear_atom_id,
+                    )
             conn.commit()
 
     async def stop(self, timeout: float = 60.0) -> None:

@@ -898,6 +898,12 @@ INFRA_REDACTED_FIELDS: tuple[str, ...] = (
     "wiki_llm_curator_model",
     "multimodal_chat_url",
     "multimodal_model",
+    # The multimodal allowlist is itself a list of normalized scheme://host:port
+    # origins — exactly the topology (internal hosts/ports) that redaction exists
+    # to hide from viewers/members, and the sibling redaction of multimodal_chat_url
+    # is defeated if the allowlist is returned wholesale. A non-empty list also
+    # discloses that a multimodal backend is wired at all.
+    "multimodal_allowed_model_origins",
 )
 
 
@@ -924,7 +930,13 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
         return settings_dict
     for field in INFRA_REDACTED_FIELDS:
         if field in settings_dict:
-            settings_dict[field] = ""
+            # Redaction must be type-aware: multimodal_allowed_model_origins is a
+            # list[str] response field, so blank it to [] (not "") or SettingsResponse
+            # validation would fail for every non-admin.
+            if field == "multimodal_allowed_model_origins":
+                settings_dict[field] = []
+            else:
+                settings_dict[field] = ""
     # Keep the curator enable flag consistent with the redacted URL/model so
     # the frontend's required-when-enabled validator does not fire for non-admins.
     settings_dict["wiki_llm_curator_enabled"] = False

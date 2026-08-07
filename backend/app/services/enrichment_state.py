@@ -105,27 +105,6 @@ def compute_input_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def resolve_atom_pk(conn, *, file_id: int, generation_hash: str, atom_id: str) -> Optional[int]:
-    """Return the document_atoms rowid PK for an opaque atom_id (or None)."""
-    row = conn.execute(
-        "SELECT id FROM document_atoms "
-        "WHERE file_id = ? AND generation_hash = ? AND atom_id = ?",
-        (file_id, generation_hash, atom_id),
-    ).fetchone()
-    return row["id"] if row else None
-
-
-def load_atom(conn, *, atom_pk: int) -> Optional[dict]:
-    row = conn.execute(
-        "SELECT atom_id, file_id, generation_hash, ordinal, kind, raw_text, "
-        "page_number, bbox_json, section_path_json, caption, parent_atom_id, "
-        "asset_id, parser_fingerprint "
-        "FROM document_atoms WHERE id = ?",
-        (atom_pk,),
-    ).fetchone()
-    return dict(row) if row else None
-
-
 def _atom_stage_status(conn, *, file_id: int, generation_hash: str, atom_pk: int, stage: str) -> Optional[dict]:
     row = conn.execute(
         "SELECT status, input_fingerprint, attempts, error_code "
@@ -194,7 +173,9 @@ def complete_atom_stage(
     If the current stage row's input_fingerprint differs from ``input_fingerprint``
     (i.e. the source generation moved on), the completion is a no-op and returns
     False so an old job cannot overwrite a newer generation. Otherwise the row is
-    updated in place (preserving any prior attempts) and returns True.
+    updated (attempts is set to the supplied value — it does not accumulate across
+    calls, because retries are bounded at the job/worker level via
+    ``multimodal_max_attempts``, not per-stage) and returns True.
     """
     if status not in ALL_STATUSES:
         raise ValueError(f"invalid enrichment stage status: {status}")
@@ -237,7 +218,12 @@ def list_enrichable_atoms(conn, *, file_id: int, generation_hash: str, stage: st
     """Return atom rows for kinds requiring enrichment whose stage is actionable.
 
     Actionable statuses: pending, failed_retryable, and (re-runnable) skipped_*.
-    ``succeeded``/``partial``/``failed_permanent``/``running`` are not returned.
+    ``succeeded``/``partial``/``failed_permanent``/``running`` are not returned —
+    EXCEPT a ``succeeded`` atom whose derived proxy vector was never made durable
+    (proxy_vector_id is NULL). Such an atom was committed SUCCEEDED before its LanceDB
+    proxy write failed (F-1), and must be re-enqueued so the proxy is (re)written;
+    treating it as actionable is the recovery path. ````input_fingerprint`` remains the
+    recovery trigger for genuinely-changed atoms; this is strictly the missing-proxy case.
     """
     rows = conn.execute(
         "SELECT atom_id, id AS atom_pk, kind, asset_id, raw_text, caption, "
@@ -257,6 +243,21 @@ def list_enrichable_atoms(conn, *, file_id: int, generation_hash: str, stage: st
         status = existing["status"] if existing else PENDING
         if status in (PENDING, FAILED_RETRYABLE, SKIPPED_NOT_APPLICABLE):
             out.append(dict(row))
+        elif status == SUCCEEDED:
+            # Recovery: a SUCCEEDED atom whose derived record exists but has no
+            # durable proxy vector must be re-run (F-1). In production the derived
+            # row is written in the same transaction as the SUCCEEDED stage, then
+            # the LanceDB proxy write happens afterwards; if that write failed the
+            # derived row is left with proxy_vector_id NULL and the atom must be
+            # recovered. A SUCCEEDED stage with NO derived row is not this case
+            # (it predates the derived pipeline) and stays terminal.
+            derived = conn.execute(
+                "SELECT proxy_vector_id FROM document_atom_enrichments "
+                "WHERE file_id = ? AND generation_hash = ? AND atom_id = ?",
+                (file_id, generation_hash, row["atom_id"]),
+            ).fetchone()
+            if derived is not None and derived["proxy_vector_id"] is None:
+                out.append(dict(row))
     return out
 
 
@@ -374,38 +375,40 @@ def set_proxy_vector_id(conn, *, file_id: int, generation_hash: str, atom_id: st
     return cursor.rowcount
 
 
-def prior_proxy_ids(conn, *, file_id: int, generation_hash: str) -> list[str]:
-    """Return previously recorded proxy vector ids for a file/generation."""
-    rows = conn.execute(
-        "SELECT proxy_vector_id FROM document_atom_enrichments "
-        "WHERE file_id = ? AND generation_hash = ? AND proxy_vector_id IS NOT NULL",
-        (file_id, generation_hash),
-    ).fetchall()
-    return [r["proxy_vector_id"] for r in rows]
+def prior_proxy_ids_for_atoms(conn, *, file_id: int, generation_hash: str, atom_ids: list[str]) -> list[str]:
+    """Return prior proxy vector ids for ONLY the given atoms.
+
+    Scoping the prior ids to the current batch prevents a cascading delete: if
+    sibling atom A already wrote a durable proxy and this run only re-writes atom
+    B, ``prior_proxy_ids`` (whole-file scope) would list A's id as "stale" and
+    remove A's vector from LanceDB even though A's SQL row still references it.
+    Limiting to the batch's atoms means we only ever replace the proxies of atoms
+    actually being re-enriched here (F-2 fix).
+    """
+    if not atom_ids:
+        return []
+    # Parameterized per-atom point reads (never a dynamic IN clause, which would
+    # trip bandit B608 and add a new suppression). atom_ids is bounded by the
+    # batch asset cap; the reads are single-connection indexed point lookups with
+    # no provider/filesystem call between them, matching the N+1 point-read
+    # pattern already used by list_enrichable_atoms.
+    out: list[str] = []
+    for atom_id in atom_ids:
+        row = conn.execute(
+            "SELECT proxy_vector_id FROM document_atom_enrichments "
+            "WHERE file_id = ? AND generation_hash = ? AND proxy_vector_id IS NOT NULL "
+            "AND atom_id = ?",
+            (file_id, generation_hash, atom_id),
+        ).fetchone()
+        if row is not None:
+            out.append(row["proxy_vector_id"])
+    return out
 
 
-def aggregate_derived_counts(conn, *, file_id: int) -> dict[str, int]:
-    """Aggregate derived-record status counts for one file (values are not NULL
-    only for enriched/attempted atoms)."""
-    counts: dict[str, int] = {
-        "enriched": 0,
-        "partial": 0,
-        "failed": 0,
-        "skipped": 0,
-    }
-    rows = conn.execute(
-        "SELECT status, COUNT(*) AS n FROM document_atom_enrichments "
-        "WHERE file_id = ? GROUP BY status",
-        (file_id,),
-    ).fetchall()
-    for row in rows:
-        s = row["status"]
-        if s == SUCCEEDED:
-            counts["enriched"] += row["n"]
-        elif s == PARTIAL:
-            counts["partial"] += row["n"]
-        elif s in (FAILED_RETRYABLE, FAILED_PERMANENT):
-            counts["failed"] += row["n"]
-        elif s in (SKIPPED_POLICY, SKIPPED_NOT_APPLICABLE):
-            counts["skipped"] += row["n"]
-    return counts
+def clear_proxy_vector_id(conn, *, file_id: int, generation_hash: str, atom_id: str) -> None:
+    """NULL the proxy_vector_id for an atom whose vector was deleted (no commit)."""
+    conn.execute(
+        "UPDATE document_atom_enrichments SET proxy_vector_id = NULL, updated_at = ? "
+        "WHERE file_id = ? AND generation_hash = ? AND atom_id = ?",
+        (_iso_now(), file_id, generation_hash, atom_id),
+    )

@@ -61,6 +61,12 @@ ERR_INVALID_ASSET = "invalid_asset"
 ERR_ASSET_NO_BYTES = "asset_bytes_unavailable"
 ERR_ASSET_OVERSIZE = "asset_oversize_pixels"
 
+# Cap for the persisted/embedded proxy text. Must stay at or below the embedding
+# service's per-text maximum (embeddings.MAX_TEXT_LENGTH=8192) so embed_batch never
+# raises on a schema-compliant provider response after the stage is committed
+# (F-1). Kept as a module constant so the service and its tests share one value.
+_EMBED_TEXT_CAP = 8000
+
 
 class MultimodalProviderError(Exception):
     """Classified provider error with a stable code and retryability."""
@@ -80,13 +86,15 @@ class MultimodalProviderClient:
         base_url: str = "",
         model: str = "",
         timeout: Optional[float] = None,
-        concurrency: int = 2,
+        concurrency: Optional[int] = None,
     ) -> None:
         self.base_url = base_url or settings.multimodal_chat_url
         self.model = model or settings.multimodal_model
         self.logical_mode = settings.multimodal_mode or "thinking"
         self.timeout = timeout if timeout is not None else settings.multimodal_timeout_seconds
-        self.concurrency = concurrency or settings.multimodal_concurrency
+        # None default so settings.multimodal_concurrency is actually honored when
+        # the client is constructed without an explicit value (lifespan does this).
+        self.concurrency = concurrency if concurrency is not None else settings.multimodal_concurrency
         self._client: Optional[httpx.AsyncClient] = None
         self._semaphore = asyncio.Semaphore(self.concurrency)
 
@@ -97,7 +105,22 @@ class MultimodalProviderClient:
             self.model = model
 
     def _assert_policy(self) -> None:
-        """Exact-origin allowlist + SSRF gate, sensitive tier. Before every call."""
+        """Re-verify the authorizing gates immediately before a provider call.
+
+        Enforces the global kill switch (``multimodal_enrichment_enabled``) and the
+        exact-origin allowlist + SSRF gate (sensitive tier). Checking the global
+        switch here closes the race where a mid-run revocation (a kill-switch flip
+        landing during fingerprinting/claim/asset-read or while waiting on the
+        concurrency semaphore) would otherwise let an already-authorized atom egress
+        after the operator disabled the feature — the documented invariant is that
+        revocation stops further outbound calls.
+        """
+        # Global kill switch: re-read live settings so a flip lands even for
+        # atoms that cleared _authorized before the revocation.
+        if not settings.multimodal_enrichment_enabled:
+            raise MultimodalProviderError(
+                ERR_POLICY, retryable=False, message="multimodal enrichment disabled"
+            )
         allow = list(settings.multimodal_allowed_model_origins or [])
         try:
             assert_model_provider_allowed(
@@ -250,35 +273,34 @@ class ArtifactEnrichmentService:
         """
         proxy_records: list[dict[str, Any]] = []
 
-        async with asyncio.Semaphore(self.client.concurrency):
-            # Read the ordered atom list (short claim) for neighbor context.
-            atoms = self._load_ordered_atoms(file_id, generation_hash)
-            if not atoms:
-                return proxy_records
-            # Only atoms whose stage is actionable are enriched. This skips
-            # already-succeeded atoms (fingerprint/status-based skip), so a
-            # retry or re-run does not re-transmit unchanged atoms to the
-            # external provider.
-            actionable = self._actionable_atom_pks(file_id, generation_hash)
-            candidates = [a for a in atoms if a["atom_pk"] in actionable]
+        # Read the ordered atom list (short claim) for neighbor context.
+        atoms = self._load_ordered_atoms(file_id, generation_hash)
+        if not atoms:
+            return proxy_records
+        # Only atoms whose stage is actionable are enriched. This skips
+        # already-succeeded atoms (fingerprint/status-based skip), so a
+        # retry or re-run does not re-transmit unchanged atoms to the
+        # external provider.
+        actionable = self._actionable_atom_pks(file_id, generation_hash)
+        candidates = [a for a in atoms if a["atom_pk"] in actionable]
 
-            tasks = [
-                self._enrich_atom(
-                    atom=atom, vault_id=vault_id, file_id=file_id,
-                    generation_hash=generation_hash,
-                    neighbors=self._neighbors(atoms, atom),
-                    document_title=document_title,
-                )
-                for atom in candidates
-                if str(atom.get("kind", "")).lower()
-                in ("image", "chart", "table", "equation")
-            ]
-            if not tasks:
-                return proxy_records
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, dict) and result.get("proxy_record"):
-                    proxy_records.append(result["proxy_record"])
+        tasks = [
+            self._enrich_atom(
+                atom=atom, vault_id=vault_id, file_id=file_id,
+                generation_hash=generation_hash,
+                neighbors=self._neighbors(atoms, atom),
+                document_title=document_title,
+            )
+            for atom in candidates
+            if str(atom.get("kind", "")).lower()
+            in ("image", "chart", "table", "equation")
+        ]
+        if not tasks:
+            return proxy_records
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, dict) and result.get("proxy_record"):
+                proxy_records.append(result["proxy_record"])
         return proxy_records
 
     def _actionable_atom_pks(self, file_id: int, generation_hash: str) -> set[int]:
@@ -427,7 +449,14 @@ class ArtifactEnrichmentService:
             conn.commit()
 
         self._audit(vault_id, file_id, atom_id, atom.get("asset_id"), "attempted_external_transmission", snapshot, "succeeded")
-        proxy = build_proxy_text(raw_evidence=raw_evidence, kind=kind, description=description, retrieval_aids=aids)
+        raw_proxy = build_proxy_text(raw_evidence=raw_evidence, kind=kind, description=description, retrieval_aids=aids)
+        # Bound the proxy text so it can never exceed the embedding service's
+        # per-text cap (embeddings.MAX_TEXT_LENGTH=8192): a schema-compliant
+        # provider response (20000 chars allowed) could otherwise raise
+        # EmbeddingError inside _write_atom_proxies AFTER this stage is already
+        # committed SUCCEEDED, leaving a permanently unrecoverable proxy-less atom
+        # (F-1). Truncate to the embedding limit so the durable proxy always fits.
+        proxy = raw_proxy[: _EMBED_TEXT_CAP]
         proxy_record = {
             "atom_id": atom_id,
             "atom_kind": kind,
@@ -454,16 +483,19 @@ class ArtifactEnrichmentService:
         data = await asyncio.to_thread(_read_bounded, path, settings.multimodal_max_asset_bytes)
         if data is None:
             raise MultimodalProviderError(ERR_ASSET_NO_BYTES, retryable=False)
-        # MIME inference is intentionally narrow; non-raster is rejected before call.
-        mime = _infer_mime(rel)
+        # MIME is derived from the image header (authoritative, and independent of
+        # the asset path which carries no file extension — asset_id is an opaque
+        # SHA-256 hexdigest). Non-raster is rejected before any outbound call.
+        mime = _image_mime_from_peek(data)
         if mime not in ACCEPTED_RASTER_MIMES:
             raise MultimodalProviderError(ERR_INVALID_ASSET, retryable=False)
         # Enforce the decoded pixel cap (multimodal_max_pixels) so a small,
         # highly compressed file with a huge pixel surface cannot force excessive
         # provider-side decode. Dimensions are read from the header only (lazy).
-        dims = await asyncio.to_thread(_bounded_image_dimensions, data)
-        if dims is None:
+        peek = _peek_image(data)
+        if peek is None:
             raise MultimodalProviderError(ERR_INVALID_ASSET, retryable=False)
+        dims = peek[0]
         _check_pixel_cap(dims, settings.multimodal_max_pixels)
         return build_image_content_part(mime, data, atom.get("caption"))
 
@@ -575,26 +607,15 @@ def _read_bounded(path: Path, cap: int) -> Optional[bytes]:
         return None
 
 
-def _infer_mime(rel: str) -> str:
-    ext = rel.rsplit(".", 1)[-1].lower() if "." in rel else ""
-    return {
-        "png": "image/png",
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "gif": "image/gif",
-        "webp": "image/webp",
-        "bmp": "image/bmp",
-        "tif": "image/tiff",
-        "tiff": "image/tiff",
-    }.get(ext, "")
-
-
-def _bounded_image_dimensions(data: bytes) -> Optional[tuple[int, int]]:
-    """Return (width, height) by decoding only the image header (lazy).
+def _peek_image(data: bytes) -> Optional[tuple[tuple[int, int], str]]:
+    """Return ((width, height), pil_format) by decoding only the image header (lazy).
 
     Pillow's ``Image.open`` reads the header without fully decoding pixel data,
     so this is cheap and does not allocate a large decompressed surface. Returns
-    None if the bytes are not a decodable raster or PIL is unavailable.
+    None if the bytes are not a decodable raster or PIL is unavailable. The PIL
+    format (e.g. ``JPEG``, ``MPO``) is returned so the raster MIME can be derived
+    authoritatively from the bytes rather than from an asset path that carries no
+    extension.
     """
     try:
         from PIL import Image
@@ -602,6 +623,29 @@ def _bounded_image_dimensions(data: bytes) -> Optional[tuple[int, int]]:
         return None
     try:
         with Image.open(io.BytesIO(data)) as img:
-            return img.size
+            return img.size, str(img.format or "").upper()
     except Exception:  # noqa: BLE001 - truncated/corrupt/unsupported
         return None
+
+
+# Map Pillow's format identifiers to accepted raster MIME types. MPO (multi-picture
+# JPEG) is treated as JPEG: it is a JPEG container and is a standalone-image output
+# of the #460 image path. Unmapped formats yield "" so the caller rejects them before
+# any outbound call (ERR_INVALID_ASSET).
+_PIL_FORMAT_TO_MIME: dict[str, str] = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "JPG": "image/jpeg",
+    "MPO": "image/jpeg",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+    "BMP": "image/bmp",
+    "TIFF": "image/tiff",
+}
+
+
+def _image_mime_from_peek(data: bytes) -> str:
+    peek = _peek_image(data)
+    if peek is None:
+        return ""
+    return _PIL_FORMAT_TO_MIME.get(peek[1], "")

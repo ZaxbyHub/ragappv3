@@ -1100,6 +1100,16 @@ class Settings(BaseSettings):
         """Validate draft_default_logical_mode is 'instant' or 'thinking'."""
         return cls._validate_enum(v, {"instant", "thinking"}, "draft_default_logical_mode")
 
+    @field_validator("multimodal_mode", mode="after")
+    @classmethod
+    def validate_multimodal_mode(cls, v: str) -> str:
+        """Validate multimodal_mode is 'instant' or 'thinking'.
+
+        The mode is persisted into provider_snapshot_json, so an arbitrary operator
+        string would otherwise flow unnormalized into the audit/snapshot record.
+        """
+        return cls._validate_enum(v, {"instant", "thinking"}, "multimodal_mode")
+
     @field_validator(
         "draft_max_sections",
         "draft_job_timeout_seconds",

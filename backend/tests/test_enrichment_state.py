@@ -195,6 +195,100 @@ class TestStageMachine(StateTestBase):
             [],
         )
 
+    def test_succeeded_without_durable_proxy_is_recoverable(self) -> None:
+        """F-1: a SUCCEEDED atom whose derived record has no proxy_vector_id must be
+        re-enqueued (its LanceDB proxy write failed after the stage was committed)."""
+        fp = self._fp()
+        with self.conn:
+            st.claim_atom_stage(
+                self.conn, file_id=self.file_id, generation_hash=self.gen,
+                atom_pk=self.atom_pk, stage=st.ENRICH_STAGE, input_fingerprint=fp,
+                implementation_version="1", model_id="m", prompt_id="v1", config_id="v1",
+            )
+            # Derived persisted (as production does when SUCCEEDED), but no proxy
+            # vector recorded yet — the durable write is still pending.
+            st.upsert_derived(
+                self.conn, file_id=self.file_id, generation_hash=self.gen,
+                atom_id=self.atom_id, input_fingerprint=fp, description="d",
+                retrieval_aids=["a"], prompt_version="v1", schema_version="v1",
+                impl_version="1", provider_snapshot={"base_host": "h"},
+            )
+            st.complete_atom_stage(
+                self.conn, file_id=self.file_id, generation_hash=self.gen,
+                atom_pk=self.atom_pk, stage=st.ENRICH_STAGE, input_fingerprint=fp,
+                status=st.SUCCEEDED, attempts=1,
+            )
+            self.conn.commit()
+        actionable = st.list_enrichable_atoms(
+            self.conn, file_id=self.file_id, generation_hash=self.gen, stage=st.ENRICH_STAGE
+        )
+        self.assertEqual([a["atom_pk"] for a in actionable], [self.atom_pk])
+        # Once the proxy vector is durable, the atom is no longer recoverable.
+        with self.conn:
+            st.set_proxy_vector_id(
+                self.conn, file_id=self.file_id, generation_hash=self.gen,
+                atom_id=self.atom_id, input_fingerprint=fp, proxy_vector_id="pid",
+            )
+            self.conn.commit()
+        self.assertEqual(
+            st.list_enrichable_atoms(
+                self.conn, file_id=self.file_id, generation_hash=self.gen, stage=st.ENRICH_STAGE
+            ),
+            [],
+        )
+
+    def test_prior_proxy_ids_scoped_to_batch_atoms(self) -> None:
+        """F-2: prior_proxy_ids_for_atoms returns only the requested atoms' ids, so
+        sibling atoms' durable proxies are never treated as stale/removed."""
+        a_fp = self._fp()
+        with self.conn:
+            for i, atom_id in enumerate((self.atom_id, "other-atom")):
+                st.upsert_derived(
+                    self.conn, file_id=self.file_id, generation_hash=self.gen,
+                    atom_id=atom_id, input_fingerprint=a_fp, description="d",
+                    retrieval_aids=[], prompt_version="v1", schema_version="v1",
+                    impl_version="1", provider_snapshot={"base_host": "h"},
+                )
+                st.set_proxy_vector_id(
+                    self.conn, file_id=self.file_id, generation_hash=self.gen,
+                    atom_id=atom_id, input_fingerprint=a_fp,
+                    proxy_vector_id=f"pid_{i}",
+                )
+            self.conn.commit()
+        # Only the requested atom's id comes back — the sibling's is not "prior".
+        ids = st.prior_proxy_ids_for_atoms(
+            self.conn, file_id=self.file_id, generation_hash=self.gen,
+            atom_ids=[self.atom_id],
+        )
+        self.assertEqual(ids, ["pid_0"])
+
+    def test_clear_proxy_vector_id_nulls(self) -> None:
+        a_fp = self._fp()
+        with self.conn:
+            st.upsert_derived(
+                self.conn, file_id=self.file_id, generation_hash=self.gen,
+                atom_id=self.atom_id, input_fingerprint=a_fp, description="d",
+                retrieval_aids=[], prompt_version="v1", schema_version="v1",
+                impl_version="1", provider_snapshot={"base_host": "h"},
+            )
+            st.set_proxy_vector_id(
+                self.conn, file_id=self.file_id, generation_hash=self.gen,
+                atom_id=self.atom_id, input_fingerprint=a_fp, proxy_vector_id="pid",
+            )
+            self.conn.commit()
+        with self.conn:
+            st.clear_proxy_vector_id(
+                self.conn, file_id=self.file_id, generation_hash=self.gen,
+                atom_id=self.atom_id,
+            )
+            self.conn.commit()
+        proxy_row = self.conn.execute(
+            "SELECT proxy_vector_id FROM document_atom_enrichments "
+            "WHERE file_id = ? AND generation_hash = ? AND atom_id = ?",
+            (self.file_id, self.gen, self.atom_id),
+        ).fetchone()
+        self.assertIsNone(proxy_row["proxy_vector_id"])
+
     def test_aggregate_status_counts(self) -> None:
         fp = self._fp()
         with self.conn:
