@@ -103,6 +103,20 @@ class VaultEnrichmentToggleRequest(BaseModel):
     )
 
 
+class VaultMultimodalToggleRequest(BaseModel):
+    """Request model for toggling vault-level multimodal provider opt-in (issue #461).
+
+    enabled: True  → vault-level ON (overrides global)
+    enabled: False → vault-level OFF (overrides global)
+    enabled: null  → clears override, falls back to global
+    """
+
+    enabled: Optional[bool] = Field(
+        None,
+        description="True=opt in for vault, False=opt out, null=inherit global",
+    )
+
+
 class VaultResponse(BaseModel):
     """Response model for a vault record."""
 
@@ -119,6 +133,8 @@ class VaultResponse(BaseModel):
     visibility: Optional[str] = None
     enrichment_enabled: Optional[bool] = None
     effective_enrichment_enabled: bool = False
+    multimodal_provider_enabled: Optional[bool] = None
+    effective_multimodal_enabled: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -134,8 +150,9 @@ def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -
     vault_id = row[0]
     # Row structure: id, name, description, created_at, updated_at,
     #               file_count, memory_count, session_count,
-    #               org_id, visibility, enrichment_enabled
+    #               org_id, visibility, enrichment_enabled, multimodal_provider_enabled
     enrichment_enabled_raw = row[10] if len(row) > 10 else None
+    multimodal_raw = row[11] if len(row) > 11 else None
     enrichment_override: Optional[bool] = None
     if enrichment_enabled_raw is not None:
         enrichment_override = bool(enrichment_enabled_raw)
@@ -143,6 +160,17 @@ def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -
         enrichment_override
         if enrichment_override is not None
         else settings.chunk_enrichment_enabled
+    )
+    multimodal_override: Optional[bool] = None
+    if multimodal_raw is not None:
+        multimodal_override = bool(multimodal_raw)
+    # Multimodal enrichment transmits vault artifacts to an external provider,
+    # so it requires an EXPLICIT per-vault opt-in (override is True) in addition
+    # to the global switch. A NULL/inherit value is fail-closed and does NOT
+    # authorize egress — unlike chunk enrichment (local processing) which may
+    # inherit the global switch.
+    effective_multimodal = bool(
+        settings.multimodal_enrichment_enabled and multimodal_override is True
     )
     return VaultResponse(
         id=vault_id,
@@ -157,6 +185,8 @@ def _row_to_vault_response(row, current_user_permission: Optional[str] = None) -
         visibility=row[9] if len(row) > 9 else None,
         enrichment_enabled=enrichment_override,
         effective_enrichment_enabled=effective,
+        multimodal_provider_enabled=multimodal_override,
+        effective_multimodal_enabled=effective_multimodal,
         current_user_permission=current_user_permission,
     )
 
@@ -168,7 +198,8 @@ _VAULT_WITH_COUNTS_SQL = """
            COUNT(DISTINCT cs.id) as session_count,
            v.org_id,
            v.visibility,
-           v.enrichment_enabled
+           v.enrichment_enabled,
+           v.multimodal_provider_enabled
     FROM vaults v
     LEFT JOIN files f ON f.vault_id = v.id
     LEFT JOIN memories m ON m.vault_id = v.id
@@ -777,6 +808,56 @@ async def toggle_vault_enrichment(
     await asyncio.to_thread(conn.commit)
 
     # Return updated vault
+    vault = await _fetch_vault_with_counts(conn, vault_id, user)
+    if vault is None:
+        raise HTTPException(
+            status_code=404, detail=f"Vault with id {vault_id} not found"
+        )
+    return vault
+
+
+@router.put("/vaults/{vault_id}/multimodal-provider-toggle", response_model=VaultResponse)
+async def toggle_vault_multimodal_provider(
+    vault_id: int,
+    request: VaultMultimodalToggleRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(require_vault_permission("admin")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Set or clear the per-vault multimodal provider opt-in (issue #461).
+
+    Requires admin permission on the vault. This is a *vault authorization*
+    gate only; outbound calls additionally require the global
+    multimodal_enrichment_enabled switch, exact-origin allowlisting, and SSRF
+    safety (evaluated at enqueue and immediately before every provider call).
+    - enabled=true  → vault-level opt-in (required for egress)
+    - enabled=false → vault-level opt-out
+    - enabled=null  → clears override; fail-closed for egress (not opted in)
+
+    Returns the updated vault with effective_multimodal_enabled computed.
+    """
+    row = await asyncio.to_thread(
+        lambda: conn.execute(
+            "SELECT id FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone()
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"Vault with id {vault_id} not found"
+        )
+
+    if request.enabled is None:
+        new_value: Optional[int] = None
+    else:
+        new_value = 1 if request.enabled else 0
+
+    await asyncio.to_thread(
+        conn.execute,
+        "UPDATE vaults SET multimodal_provider_enabled = ? WHERE id = ?",
+        (new_value, vault_id),
+    )
+    await asyncio.to_thread(conn.commit)
+
     vault = await _fetch_vault_with_counts(conn, vault_id, user)
     if vault is None:
         raise HTTPException(

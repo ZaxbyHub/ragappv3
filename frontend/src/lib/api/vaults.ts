@@ -13,6 +13,8 @@ export interface Vault {
   current_user_permission?: "read" | "write" | "admin" | null;
   enrichment_enabled?: boolean | null;
   effective_enrichment_enabled: boolean;
+  multimodal_provider_enabled?: boolean | null;
+  effective_multimodal_enabled: boolean;
 }
 
 export interface VaultListResponse {
@@ -31,6 +33,10 @@ export interface VaultUpdateRequest {
 }
 
 export interface VaultEnrichmentToggleRequest {
+  enabled: boolean | null;
+}
+
+export interface VaultMultimodalToggleRequest {
   enabled: boolean | null;
 }
 
@@ -69,6 +75,17 @@ export async function toggleVaultEnrichment(
 ): Promise<Vault> {
   const response = await apiClient.put<Vault>(
     `/vaults/${vaultId}/enrichment-toggle`,
+    request,
+  );
+  return response.data;
+}
+
+export async function toggleVaultMultimodalProvider(
+  vaultId: number,
+  request: VaultMultimodalToggleRequest,
+): Promise<Vault> {
+  const response = await apiClient.put<Vault>(
+    `/vaults/${vaultId}/multimodal-provider-toggle`,
     request,
   );
   return response.data;

@@ -10,6 +10,7 @@ from app.api.deps import get_csrf_manager, get_current_active_user, get_db, requ
 from app.config import settings
 from app.limiter import limiter
 from app.security import CSRFManager, csrf_protect, issue_csrf_token
+from app.services.model_provider_policy import ProviderPolicyError, _parse_strict_origin
 from app.services.ssrf import URLBlocked, assert_url_safe
 from app.services.ssrf_transport import SSRFSafeTransport
 
@@ -106,6 +107,23 @@ class SettingsUpdate(BaseModel):
 
     # Draft Room (feature gate — spec: admin opt-in, specs/draft-room/SPEC.md §15)
     draft_room_enabled: Optional[bool] = None
+
+    # Multimodal artifact enrichment (issue #461) — global admin contract.
+    multimodal_enrichment_enabled: Optional[bool] = None
+    multimodal_allowed_model_origins: Optional[list[str]] = None
+    multimodal_chat_url: Optional[str] = None
+    multimodal_model: Optional[str] = None
+    multimodal_mode: Optional[str] = None
+    multimodal_timeout_seconds: Optional[float] = None
+    multimodal_concurrency: Optional[int] = None
+    multimodal_max_assets_per_batch: Optional[int] = None
+    multimodal_max_asset_bytes: Optional[int] = None
+    multimodal_max_total_payload_bytes: Optional[int] = None
+    multimodal_max_pixels: Optional[int] = None
+    multimodal_max_attempts: Optional[int] = None
+    multimodal_prompt_version: Optional[str] = None
+    multimodal_schema_version: Optional[str] = None
+    multimodal_impl_version: Optional[str] = None
 
     @field_validator("chunk_size")
     @classmethod
@@ -270,6 +288,64 @@ class SettingsUpdate(BaseModel):
             raise ValueError("Model name must not contain control characters")
         return v
 
+    # ── Multimodal enrichment validators (issue #461) ─────────────────────
+    @field_validator("multimodal_mode")
+    @classmethod
+    def validate_multimodal_mode(cls, v):
+        if v is not None and v not in ("thinking", "instant"):
+            raise ValueError("multimodal_mode must be 'thinking' or 'instant'")
+        return v
+
+    @field_validator(
+        "multimodal_timeout_seconds",
+        "multimodal_concurrency",
+        "multimodal_max_assets_per_batch",
+        "multimodal_max_asset_bytes",
+        "multimodal_max_total_payload_bytes",
+        "multimodal_max_pixels",
+        "multimodal_max_attempts",
+    )
+    @classmethod
+    def validate_multimodal_positive(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("multimodal limit must be a positive number")
+        return v
+
+    @field_validator("multimodal_chat_url", mode="before")
+    @classmethod
+    def validate_multimodal_url(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, str) or len(v) > 2048:
+            raise ValueError("multimodal_chat_url must be a string up to 2048 chars")
+        v = v.strip()
+        if v and not v.startswith(("http://", "https://")):
+            raise ValueError("multimodal_chat_url must start with http:// or https://")
+        if "@" in v:
+            raise ValueError("multimodal_chat_url must not contain credentials (@)")
+        return v
+
+    @field_validator("multimodal_model", mode="before")
+    @classmethod
+    def validate_multimodal_model(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, str) or len(v) > 256:
+            raise ValueError("multimodal_model must be a string up to 256 chars")
+        v = v.strip()
+        if any(ord(c) < 32 or ord(c) == 127 for c in v):
+            raise ValueError("multimodal_model must not contain control characters")
+        return v
+
+    @field_validator(
+        "multimodal_prompt_version", "multimodal_schema_version", "multimodal_impl_version"
+    )
+    @classmethod
+    def validate_multimodal_version(cls, v):
+        if v is not None and (not v.strip() or len(v) > 64 or any(ord(c) < 32 for c in v)):
+            raise ValueError("multimodal version must be a non-empty short identifier")
+        return v
+
     @model_validator(mode="after")
     def validate_chunk_overlap_less_than_size(self):
         chunk_overlap = self.chunk_overlap
@@ -428,6 +504,22 @@ ALLOWED_FIELDS = [
     "kms_compile_on_ingest",
     # Draft Room
     "draft_room_enabled",
+    # Multimodal artifact enrichment (issue #461)
+    "multimodal_enrichment_enabled",
+    "multimodal_allowed_model_origins",
+    "multimodal_chat_url",
+    "multimodal_model",
+    "multimodal_mode",
+    "multimodal_timeout_seconds",
+    "multimodal_concurrency",
+    "multimodal_max_assets_per_batch",
+    "multimodal_max_asset_bytes",
+    "multimodal_max_total_payload_bytes",
+    "multimodal_max_pixels",
+    "multimodal_max_attempts",
+    "multimodal_prompt_version",
+    "multimodal_schema_version",
+    "multimodal_impl_version",
 ]
 
 
@@ -441,6 +533,11 @@ _URL_FIELDS_TO_VALIDATE = {
     "instant_chat_url": "instant chat URL",
     "reranker_url": "reranker URL",
 }
+
+# Multimodal endpoint URL: validated for shape (strict origin) + SSRF at PUT-time,
+# with exact-origin allowlist membership enforced separately at enqueue and
+# immediately before every provider call (issue #461).
+_MULTIMODAL_URL_FIELD = "multimodal_chat_url"
 
 
 def _persist_settings(conn: sqlite3.Connection, update: SettingsUpdate) -> None:
@@ -507,6 +604,20 @@ def _validate_updated_urls(update: SettingsUpdate) -> None:
             raise HTTPException(
                 status_code=422,
                 detail=f"Unsafe {label}: {exc}",
+            ) from exc
+
+    # Multimodal endpoint: strict-origin shape + SSRF safety (the generic policy
+    # shape check also rejects credentials/path/query/malformed). Exact-origin
+    # allowlist membership is enforced at enqueue + immediately before each call.
+    mm_url = getattr(update, _MULTIMODAL_URL_FIELD, None)
+    if mm_url:
+        try:
+            _parse_strict_origin(mm_url, allow_path=True)
+            assert_url_safe(mm_url)
+        except (ProviderPolicyError, URLBlocked) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsafe multimodal chat URL: {exc}",
             ) from exc
 
 
@@ -624,6 +735,23 @@ class SettingsResponse(BaseModel):
     # Draft Room
     draft_room_enabled: bool = False
 
+    # Multimodal artifact enrichment (issue #461)
+    multimodal_enrichment_enabled: bool = False
+    multimodal_allowed_model_origins: list[str] = []
+    multimodal_chat_url: str = ""
+    multimodal_model: str = ""
+    multimodal_mode: str = "thinking"
+    multimodal_timeout_seconds: float = 60.0
+    multimodal_concurrency: int = 2
+    multimodal_max_assets_per_batch: int = 4
+    multimodal_max_asset_bytes: int = 10 * 1024 * 1024
+    multimodal_max_total_payload_bytes: int = 40 * 1024 * 1024
+    multimodal_max_pixels: int = 4_000_000
+    multimodal_max_attempts: int = 3
+    multimodal_prompt_version: str = "v1"
+    multimodal_schema_version: str = "v1"
+    multimodal_impl_version: str = "1"
+
     # Limits (safe to expose)
     max_file_size_mb: int
     allowed_extensions: list[str]
@@ -726,6 +854,22 @@ def _build_settings_dict() -> dict:
         "kms_compile_on_ingest": settings.kms_compile_on_ingest,
         # Draft Room
         "draft_room_enabled": settings.draft_room_enabled,
+        # Multimodal artifact enrichment (issue #461)
+        "multimodal_enrichment_enabled": settings.multimodal_enrichment_enabled,
+        "multimodal_allowed_model_origins": list(settings.multimodal_allowed_model_origins),
+        "multimodal_chat_url": settings.multimodal_chat_url,
+        "multimodal_model": settings.multimodal_model,
+        "multimodal_mode": settings.multimodal_mode,
+        "multimodal_timeout_seconds": settings.multimodal_timeout_seconds,
+        "multimodal_concurrency": settings.multimodal_concurrency,
+        "multimodal_max_assets_per_batch": settings.multimodal_max_assets_per_batch,
+        "multimodal_max_asset_bytes": settings.multimodal_max_asset_bytes,
+        "multimodal_max_total_payload_bytes": settings.multimodal_max_total_payload_bytes,
+        "multimodal_max_pixels": settings.multimodal_max_pixels,
+        "multimodal_max_attempts": settings.multimodal_max_attempts,
+        "multimodal_prompt_version": settings.multimodal_prompt_version,
+        "multimodal_schema_version": settings.multimodal_schema_version,
+        "multimodal_impl_version": settings.multimodal_impl_version,
     }
     # NOTE: callers MUST set base["effective_sources"] explicitly with a
     # real DB connection. _compute_effective_sources(None) would silently
@@ -752,6 +896,8 @@ INFRA_REDACTED_FIELDS: tuple[str, ...] = (
     "instant_chat_model",
     "reranker_model",
     "wiki_llm_curator_model",
+    "multimodal_chat_url",
+    "multimodal_model",
 )
 
 
@@ -782,6 +928,9 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
     # Keep the curator enable flag consistent with the redacted URL/model so
     # the frontend's required-when-enabled validator does not fire for non-admins.
     settings_dict["wiki_llm_curator_enabled"] = False
+    # Same for multimodal: redacted URL/model; don't disclose an enabled multimodal
+    # backend to non-admins.
+    settings_dict["multimodal_enrichment_enabled"] = False
     # Drop the provenance hints for redacted fields so a non-admin cannot learn
     # from effective_sources whether an infra URL was set (kv) vs default.
     effective_sources = settings_dict.get("effective_sources")
@@ -867,6 +1016,14 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
             else:
                 ingestion_client = None
             background_processor.set_llm_client(ingestion_client)
+    mm_client = getattr(app.state, "multimodal_client", None)
+    if mm_client is not None and (
+        update.multimodal_chat_url is not None or update.multimodal_model is not None
+    ):
+        mm_client.reconfigure(
+            base_url=settings.multimodal_chat_url,
+            model=settings.multimodal_model,
+        )
 
 
 def _apply_validated_settings(values: dict[str, object]) -> SettingsResponse:

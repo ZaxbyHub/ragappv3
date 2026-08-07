@@ -22,6 +22,16 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Loader2, ShieldAlert } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   REINDEX_REQUIRED_FIELDS,
@@ -29,10 +39,13 @@ import {
   type SettingsFormData,
 } from "@/stores/useSettingsStore";
 import { ReindexFieldWarning } from "./ReindexFieldWarning";
+import { getVault, toggleVaultMultimodalProvider } from "@/lib/api";
 
 export interface ModelsTabProps {
   formData: SettingsFormData;
   errors: SettingsErrors;
+  /** When provided (per-vault settings surface), shows the multimodal opt-in card. */
+  vaultId?: number | null;
   onChange: <K extends keyof SettingsFormData>(
     field: K,
     value: SettingsFormData[K],
@@ -196,6 +209,113 @@ function NumberField({
   );
 }
 
+interface OriginsFieldProps {
+  field: "multimodal_allowed_model_origins";
+  label: string;
+  placeholder: string;
+  description: string;
+  formData: SettingsFormData;
+  errors: SettingsErrors;
+  onChange: ModelsTabProps["onChange"];
+  source?: "kv" | "env" | "default";
+}
+
+function OriginsField({
+  field,
+  label,
+  placeholder,
+  description,
+  formData,
+  errors,
+  onChange,
+  source,
+}: OriginsFieldProps) {
+  const value = formData[field];
+  const [draft, setDraft] = useState(value.join(", "));
+  const err = errors[field];
+
+  useEffect(() => {
+    setDraft(value.join(", "));
+  }, [value]);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={String(field)} className="text-sm font-medium">
+          {label}
+        </Label>
+        <SourceBadge source={source} />
+      </div>
+      <Input
+        id={String(field)}
+        type="text"
+        placeholder={placeholder}
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          const parts = e.target.value
+            .split(",")
+            .map((p) => p.trim())
+            .filter(Boolean);
+          onChange(field, parts);
+        }}
+        onBlur={() => setDraft(value.join(", "))}
+        aria-invalid={err ? true : undefined}
+        className={err ? "border-destructive" : undefined}
+      />
+      {err && (
+        <p className="text-xs text-destructive" role="alert">
+          {err}
+        </p>
+      )}
+      <p className="text-xs text-muted-foreground">{description}</p>
+    </div>
+  );
+}
+
+interface ModeFieldProps {
+  field: "multimodal_mode";
+  value: "thinking" | "instant";
+  disabled?: boolean;
+  onChange: (v: "thinking" | "instant") => void;
+  source?: "kv" | "env" | "default";
+}
+
+function MultimodalModeField({
+  field,
+  value,
+  disabled,
+  onChange,
+  source,
+}: ModeFieldProps) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={field} className="text-sm font-medium">
+          Enrichment mode
+        </Label>
+        <SourceBadge source={source} />
+      </div>
+      <Select
+        value={value}
+        onValueChange={(v) => onChange(v as "thinking" | "instant")}
+        disabled={disabled}
+      >
+        <SelectTrigger id={field}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="thinking">Thinking</SelectItem>
+          <SelectItem value="instant">Instant</SelectItem>
+        </SelectContent>
+      </Select>
+      <p className="text-xs text-muted-foreground">
+        Larger contexts for artifact description; instant is faster/lower-cost.
+      </p>
+    </div>
+  );
+}
+
 function DefaultModeField({
   formData,
   errors,
@@ -262,7 +382,68 @@ export function ModelsTab({
   errors,
   onChange,
   effectiveSources,
+  vaultId = null,
 }: ModelsTabProps) {
+  // Per-vault multimodal provider opt-in (tri-state: inherit/on/off)
+  const [vaultMultimodal, setVaultMultimodal] = useState<{
+    multimodal_provider_enabled: boolean | null;
+    effective_multimodal_enabled: boolean;
+    current_user_permission?: string | null;
+  } | null>(null);
+  const [togglingMultimodal, setTogglingMultimodal] = useState(false);
+
+  useEffect(() => {
+    if (!vaultId) {
+      setVaultMultimodal(null);
+      return;
+    }
+    getVault(vaultId)
+      .then((vault) => {
+        setVaultMultimodal({
+          multimodal_provider_enabled: vault.multimodal_provider_enabled ?? null,
+          effective_multimodal_enabled: vault.effective_multimodal_enabled ?? false,
+          current_user_permission: vault.current_user_permission,
+        });
+      })
+      .catch(() => setVaultMultimodal(null));
+  }, [vaultId]);
+
+  const handleVaultMultimodalToggle = async (
+    enabled: boolean | null,
+  ): Promise<void> => {
+    if (!vaultId) return;
+    setTogglingMultimodal(true);
+    try {
+      const updated = await toggleVaultMultimodalProvider(vaultId, {
+        enabled,
+      });
+      setVaultMultimodal({
+        multimodal_provider_enabled: updated.multimodal_provider_enabled ?? null,
+        effective_multimodal_enabled: updated.effective_multimodal_enabled ?? false,
+        current_user_permission: updated.current_user_permission,
+      });
+    } catch {
+      if (vaultId) {
+        getVault(vaultId)
+          .then((vault) =>
+            setVaultMultimodal({
+              multimodal_provider_enabled:
+                vault.multimodal_provider_enabled ?? null,
+              effective_multimodal_enabled:
+                vault.effective_multimodal_enabled ?? false,
+              current_user_permission: vault.current_user_permission,
+            }),
+          )
+          .catch(() => setVaultMultimodal(null));
+      }
+    } finally {
+      setTogglingMultimodal(false);
+    }
+  };
+
+  const canToggleMultimodal =
+    vaultMultimodal?.current_user_permission === "admin";
+
   return (
     <div className="space-y-4">
       <Card>
@@ -437,6 +618,240 @@ export function ModelsTab({
           />
         </CardContent>
       </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4" />
+            Multimodal artifact enrichment
+          </CardTitle>
+          <CardDescription>
+            Enrich typed image/chart/table/equation atoms from documents with
+            a configured multimodal model. Off by default; provider must be
+            exact-origin allowlisted and each vault must opt in.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <Alert variant="warning">
+            <AlertTitle>External data egress</AlertTitle>
+            <AlertDescription>
+              Enabling this sends artifact bytes and surrounding evidence from
+              opted-in vaults to the configured provider. Only enable with a
+              provider you trust and whose origin appears in the allowlist.
+            </AlertDescription>
+          </Alert>
+
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="multimodal-enrichment-enabled"
+              checked={formData.multimodal_enrichment_enabled}
+              onCheckedChange={(v) =>
+                onChange("multimodal_enrichment_enabled", Boolean(v))
+              }
+            />
+            <Label
+              htmlFor="multimodal-enrichment-enabled"
+              className="text-sm font-normal"
+            >
+              Enable multimodal enrichment globally
+            </Label>
+          </div>
+
+          <StringField
+            field="multimodal_chat_url"
+            label="Multimodal provider URL"
+            placeholder="https://provider.example.com"
+            description="OpenAI-compatible /v1/chat/completions base URL. Must exactly match an allowlisted origin (scheme://host:port)."
+            type="url"
+            formData={formData}
+            errors={errors}
+            onChange={onChange}
+            source={effectiveSources.multimodal_chat_url}
+          />
+          <StringField
+            field="multimodal_model"
+            label="Multimodal model name"
+            placeholder="gpt-4o"
+            description="Model identifier passed verbatim to the provider."
+            formData={formData}
+            errors={errors}
+            onChange={onChange}
+            source={effectiveSources.multimodal_model}
+          />
+          <OriginsField
+            field="multimodal_allowed_model_origins"
+            label="Allowed provider origins"
+            placeholder="https://provider.example.com, http://localhost:11434"
+            description="Comma-separated exact origins (scheme://host:port). Empty = disabled; SSRF guard is enforced independently for allowlisted origins."
+            formData={formData}
+            errors={errors}
+            onChange={onChange}
+            source={effectiveSources.multimodal_allowed_model_origins}
+          />
+          <MultimodalModeField
+            field="multimodal_mode"
+            value={formData.multimodal_mode}
+            onChange={(v) => onChange("multimodal_mode", v)}
+            source={effectiveSources.multimodal_mode}
+          />
+
+          <div className="grid gap-6 md:grid-cols-2">
+            <NumberField
+              field="multimodal_timeout_seconds"
+              label="Provider timeout (s)"
+              description="Per-request timeout for the multimodal provider."
+              min={1}
+              formData={formData}
+              errors={errors}
+              onChange={onChange}
+              source={effectiveSources.multimodal_timeout_seconds}
+            />
+            <NumberField
+              field="multimodal_concurrency"
+              label="Concurrency"
+              description="Max concurrent provider requests."
+              min={1}
+              formData={formData}
+              errors={errors}
+              onChange={onChange}
+              source={effectiveSources.multimodal_concurrency}
+            />
+            <NumberField
+              field="multimodal_max_assets_per_batch"
+              label="Max assets per batch"
+              description="Max artifact assets sent in one request."
+              min={1}
+              formData={formData}
+              errors={errors}
+              onChange={onChange}
+              source={effectiveSources.multimodal_max_assets_per_batch}
+            />
+            <NumberField
+              field="multimodal_max_asset_bytes"
+              label="Max asset bytes"
+              description="Per-asset size cap before decoding."
+              min={1}
+              formData={formData}
+              errors={errors}
+              onChange={onChange}
+              source={effectiveSources.multimodal_max_asset_bytes}
+            />
+            <NumberField
+              field="multimodal_max_total_payload_bytes"
+              label="Max total payload bytes"
+              description="Aggregate bytes cap for the whole request."
+              min={1}
+              formData={formData}
+              errors={errors}
+              onChange={onChange}
+              source={effectiveSources.multimodal_max_total_payload_bytes}
+            />
+            <NumberField
+              field="multimodal_max_pixels"
+              label="Max decoded pixels"
+              description="Upper bound on decoded image dimensions."
+              min={1}
+              formData={formData}
+              errors={errors}
+              onChange={onChange}
+              source={effectiveSources.multimodal_max_pixels}
+            />
+            <NumberField
+              field="multimodal_max_attempts"
+              label="Max retry attempts"
+              description="Retry cap for transient provider failures."
+              min={1}
+              formData={formData}
+              errors={errors}
+              onChange={onChange}
+              source={effectiveSources.multimodal_max_attempts}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      {vaultId && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Multimodal provider opt-in (this vault)</CardTitle>
+            <CardDescription>
+              Decide whether this vault's artifacts may be sent to the
+              configured multimodal provider.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Alert variant="warning">
+              <AlertTitle>Vault data egress</AlertTitle>
+              <AlertDescription>
+                Enabling external providers may receive this vault&apos;s
+                artifacts. Only enable when the global feature and allowlist
+                are configured.
+              </AlertDescription>
+            </Alert>
+            {vaultMultimodal === null ? null : (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium">Override</span>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="radio"
+                      name="vault-multimodal"
+                      checked={
+                        vaultMultimodal.multimodal_provider_enabled === null
+                      }
+                      onChange={() => void handleVaultMultimodalToggle(null)}
+                      disabled={togglingMultimodal || !canToggleMultimodal}
+                      className="h-4 w-4"
+                    />
+                    Inherit global
+                    {vaultMultimodal.multimodal_provider_enabled === null && (
+                      <span className="text-xs text-muted-foreground">
+                        (not opted in — fail-closed; select “On” to send)
+                      </span>
+                    )}
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="radio"
+                      name="vault-multimodal"
+                      checked={
+                        vaultMultimodal.multimodal_provider_enabled === true
+                      }
+                      onChange={() => void handleVaultMultimodalToggle(true)}
+                      disabled={togglingMultimodal || !canToggleMultimodal}
+                      className="h-4 w-4"
+                    />
+                    On
+                  </label>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="radio"
+                      name="vault-multimodal"
+                      checked={
+                        vaultMultimodal.multimodal_provider_enabled === false
+                      }
+                      onChange={() => void handleVaultMultimodalToggle(false)}
+                      disabled={togglingMultimodal || !canToggleMultimodal}
+                      className="h-4 w-4"
+                    />
+                    Off
+                  </label>
+                </div>
+              </div>
+            )}
+            {!canToggleMultimodal && vaultMultimodal && (
+              <p className="text-xs text-muted-foreground">
+                Only vault admins can change this.
+              </p>
+            )}
+            {togglingMultimodal && (
+              <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+            )}
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

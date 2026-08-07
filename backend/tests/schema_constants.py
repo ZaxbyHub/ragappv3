@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS vaults (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     enrichment_enabled INTEGER,
+    multimodal_provider_enabled INTEGER,
     FOREIGN KEY (owner_id) REFERENCES users(id),
     FOREIGN KEY (org_id) REFERENCES organizations(id)
 );

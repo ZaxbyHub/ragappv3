@@ -472,6 +472,50 @@ class Settings(BaseSettings):
     """Stricter exact-origin allowlist required for the `sensitive` tier, in
     addition to draft_allowed_model_origins. Empty blocks sensitive-tier
     compile (fail closed)."""
+
+    # ── Multimodal artifact enrichment configuration (issue #461) ──────────
+    # Default OFF + fail-closed: no external multimodal provider is contacted until
+    # global enablement AND a per-vault opt-in AND exact-origin allowlisting AND
+    # SSRF safety all hold. Raw evidence is never rewritten; only derived
+    # description/search proxies are produced for typed artifacts (image/chart/
+    # table/equation) whose typed atoms/assets exist (issue #460).
+    multimodal_enrichment_enabled: bool = False
+    """Global master switch for multimodal artifact enrichment. Default OFF. This
+    enables the pipeline (overall feature is also gated per-vault and by exact-origin
+    allowlist + SSRF), it is never sufficient on its own to transmit data."""
+    multimodal_allowed_model_origins: Annotated[list[str], NoDecode] = []
+    """Comma-separated exact normalized origins (scheme://host:port) allowed to
+    receive vault artifact content for multimodal enrichment. Empty (default)
+    fails closed -- zero outbound calls."""
+    multimodal_chat_url: str = ""
+    """OpenAI-compatible multimodal /chat/completions base URL. Empty when disabled.
+    SSRF + exact-origin policy guarded before every call."""
+    multimodal_model: str = ""
+    """Multimodal model name passed to the enrichment endpoint. Empty when disabled."""
+    multimodal_mode: str = "thinking"
+    """Logical mode label reported in safe provider snapshots/audit (thinking/instant)."""
+    multimodal_timeout_seconds: float = 60.0
+    """Per-call timeout for a multimodal enrichment request."""
+    multimodal_concurrency: int = 2
+    """Maximum concurrent multimodal enrichment calls."""
+    multimodal_max_assets_per_batch: int = 4
+    """Maximum typed assets enriched together in one request batch."""
+    multimodal_max_asset_bytes: int = 10 * 1024 * 1024
+    """Per-asset byte cap loaded for enrichment (10 MiB default)."""
+    multimodal_max_total_payload_bytes: int = 40 * 1024 * 1024
+    """Total per-request payload byte cap (40 MiB default)."""
+    multimodal_max_pixels: int = 4_000_000
+    """Decoded image pixel cap per asset (width*height) for enrichment."""
+    multimodal_max_attempts: int = 3
+    """Maximum enrichment attempts per artifact before permanent failure (retryable
+    timeout/rate/temporary-provider failures back off; policy/schema failures never retry)."""
+    multimodal_prompt_version: str = "v1"
+    """Version identifier of the enrichment prompt template (part of the fingerprint)."""
+    multimodal_schema_version: str = "v1"
+    """Version identifier of the derived response schema (part of the fingerprint)."""
+    multimodal_impl_version: str = "1"
+    """Enrichment implementation/config version (part of the fingerprint)."""
+
     draft_max_sections: int = 12
     """Maximum outline sections a compile job may produce."""
     draft_qa_retry_limit: int = 2
@@ -708,12 +752,13 @@ class Settings(BaseSettings):
     @field_validator(
         "draft_allowed_model_origins",
         "draft_sensitive_allowed_model_origins",
+        "multimodal_allowed_model_origins",
         mode="before",
     )
     @classmethod
-    def parse_draft_allowed_model_origins(cls, v):
-        """Support JSON lists and comma-separated env values for Draft Room
-        provider-origin allowlists (same convention as backend_cors_origins)."""
+    def parse_allowed_model_origins(cls, v):
+        """Support JSON lists and comma-separated env values for provider-origin
+        allowlists (Draft Room and multimodal), same convention as backend_cors_origins."""
         if isinstance(v, str):
             value = v.strip()
             if not value:
@@ -723,7 +768,7 @@ class Settings(BaseSettings):
 
                 parsed = json.loads(value)
                 if not isinstance(parsed, list):
-                    raise ValueError("draft origin allowlist JSON value must be a list")
+                    raise ValueError("origin allowlist JSON value must be a list")
                 return parsed
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return v

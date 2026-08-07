@@ -516,6 +516,40 @@ CREATE INDEX IF NOT EXISTS idx_artifact_delete_pending_vault
 """
 
 
+# Derived atom-enrichment records (issue #461). Immutable raw atoms are never
+# rewritten; generated description/search fields live here, separately, with full
+# non-secret provenance/fingerprint. UNIQUE(file_id, generation_hash, atom_id)
+# keeps a regenerated description scoped to one atom+generation (old generations
+# are retired by the publication seam). error_code/error_message carry bounded,
+# safe, content-free codes only -- never raw provider errors, prompts, or content.
+_ENRICHMENT_DERIVED_DDL = """
+CREATE TABLE IF NOT EXISTS document_atom_enrichments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    atom_id TEXT NOT NULL,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    generation_hash TEXT NOT NULL,
+    input_fingerprint TEXT,
+    description TEXT,
+    retrieval_aids_json TEXT,
+    prompt_version TEXT,
+    schema_version TEXT,
+    impl_version TEXT,
+    provider_snapshot_json TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    proxy_vector_id TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    completed_at TEXT,
+    UNIQUE(file_id, generation_hash, atom_id)
+);
+CREATE INDEX IF NOT EXISTS idx_atom_enrichment_file
+    ON document_atom_enrichments(file_id);
+"""
+
+
 # Database schema definition
 _BASE_SCHEMA = """
 -- Vaults table: stores document collection vaults
@@ -528,8 +562,10 @@ CREATE TABLE IF NOT EXISTS vaults (
     visibility TEXT DEFAULT 'private' CHECK (visibility IN ('private', 'org', 'public')),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    enrichment_enabled INTEGER
+    enrichment_enabled INTEGER,
     -- NULL = inherit global chunk_enrichment_enabled; 1 = on; 0 = off
+    multimodal_provider_enabled INTEGER
+    -- NULL = inherit global multimodal_enrichment_enabled; 1 = on; 0 = off
 );
 
 -- Files table: stores uploaded file metadata
@@ -1393,6 +1429,7 @@ SCHEMA = (
     + _DRAFT_ROOM_FACTUALITY_DDL
     + _DRAFT_ROOM_PROMOTIONS_DDL
     + _MULTIMODAL_ARTIFACT_DDL
+    + _ENRICHMENT_DERIVED_DDL
 )  # nosec B608
 
 
@@ -1566,6 +1603,8 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_draft_room_factuality(sqlite_path)
     migrate_add_draft_room_promotions(sqlite_path)
     migrate_add_multimodal_artifact_tables(sqlite_path)
+    migrate_add_atom_enrichment_table(sqlite_path)
+    migrate_add_vaults_multimodal_provider(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -2850,6 +2889,28 @@ def migrate_add_files_enrichment_enabled(sqlite_path: str) -> None:
         }
         if "enrichment_enabled" not in existing_cols:
             conn.execute("ALTER TABLE files ADD COLUMN enrichment_enabled INTEGER")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_vaults_multimodal_provider(sqlite_path: str) -> None:
+    """Migration: add nullable multimodal_provider_enabled column to vaults table.
+
+    Per-vault opt-in override for multimodal artifact enrichment (issue #461).
+    NULL = inherit global multimodal_enrichment_enabled; 1 = on; 0 = off.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(vaults)").fetchall()
+        }
+        if "multimodal_provider_enabled" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE vaults ADD COLUMN multimodal_provider_enabled INTEGER"
+            )
         conn.commit()
     finally:
         conn.close()
@@ -4394,6 +4455,20 @@ def migrate_add_multimodal_artifact_tables(sqlite_path: str) -> None:
                 "ALTER TABLE files ADD COLUMN active_generation_hash TEXT"
             )
         conn.executescript(_MULTIMODAL_ARTIFACT_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_atom_enrichment_table(sqlite_path: str) -> None:
+    """Migration: add the document_atom_enrichments derived table (issue #461).
+
+    Idempotent (``CREATE ... IF NOT EXISTS``); existing data is preserved.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript(_ENRICHMENT_DERIVED_DDL)
         conn.commit()
     finally:
         conn.close()

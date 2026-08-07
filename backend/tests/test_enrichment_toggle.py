@@ -922,3 +922,96 @@ class TestIsEnrichmentEnabledForFile:
         monkeypatch.setattr(settings, "chunk_enrichment_enabled", True)
         assert is_enrichment_enabled_for_file(99999, vault_id) is True
 
+
+
+class TestMultimodalProviderToggleAPI:
+    """Tests for PUT /api/vaults/{vault_id}/multimodal-provider-toggle (#461)."""
+
+    def test_toggle_on_sets_opt_in_and_effective(self, setup_db):
+        test_app, db_path, pool, monkeypatch = setup_db
+        monkeypatch.setattr("app.config.settings.multimodal_enrichment_enabled", True)
+        client = TestClient(test_app)
+        resp = client.post(
+            "/api/vaults", json={"name": "MM Vault"}, headers=auth_headers(1, "superadmin")
+        )
+        vault_id = resp.json()["id"]
+
+        resp = client.put(
+            f"/api/vaults/{vault_id}/multimodal-provider-toggle",
+            json={"enabled": True},
+            headers=auth_headers(1, "superadmin"),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["multimodal_provider_enabled"] is True
+        # explicit opt-in + global on -> effective True
+        assert data["effective_multimodal_enabled"] is True
+
+        conn = pool.get_connection()
+        row = conn.execute(
+            "SELECT multimodal_provider_enabled FROM vaults WHERE id = ?", (vault_id,)
+        ).fetchone()
+        pool.release_connection(conn)
+        assert row[0] == 1
+
+    def test_null_is_fail_closed_even_with_global_on(self, setup_db):
+        """Clearing the override (NULL) must NOT authorize egress even when the
+        global switch is on — external egress requires an explicit opt-in."""
+        test_app, db_path, pool, monkeypatch = setup_db
+        monkeypatch.setattr("app.config.settings.multimodal_enrichment_enabled", True)
+        client = TestClient(test_app)
+        resp = client.post(
+            "/api/vaults", json={"name": "MM Null"}, headers=auth_headers(1, "superadmin")
+        )
+        vault_id = resp.json()["id"]
+
+        resp = client.put(
+            f"/api/vaults/{vault_id}/multimodal-provider-toggle",
+            json={"enabled": None},
+            headers=auth_headers(1, "superadmin"),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["multimodal_provider_enabled"] is None
+        # fail-closed: NULL does not authorize, even with global on
+        assert data["effective_multimodal_enabled"] is False
+
+    def test_non_admin_cannot_toggle(self, setup_db):
+        test_app, db_path, pool, monkeypatch = setup_db
+        client = TestClient(test_app)
+        resp = client.post(
+            "/api/vaults", json={"name": "MM Authz"}, headers=auth_headers(1, "superadmin")
+        )
+        vault_id = resp.json()["id"]
+        # Give viewer1 read permission on the vault
+        conn = pool.get_connection()
+        conn.execute(
+            "INSERT INTO vault_members (vault_id, user_id, permission) VALUES (?, ?, ?)",
+            (vault_id, 4, "read"),
+        )
+        conn.commit()
+        pool.release_connection(conn)
+        # Override get_current_active_user to return viewer1 (not superadmin)
+        from app.api.deps import get_current_active_user
+
+        def override_viewer_user():
+            return {
+                "id": 4,
+                "username": "viewer1",
+                "full_name": "Viewer One",
+                "role": "viewer",
+                "is_active": True,
+                "must_change_password": False,
+            }
+
+        test_app.dependency_overrides[get_current_active_user] = override_viewer_user
+        try:
+            resp = client.put(
+                f"/api/vaults/{vault_id}/multimodal-provider-toggle",
+                json={"enabled": True},
+                headers=auth_headers(4, "viewer"),
+            )
+            assert resp.status_code == 403
+        finally:
+            if get_current_active_user in test_app.dependency_overrides:
+                del test_app.dependency_overrides[get_current_active_user]

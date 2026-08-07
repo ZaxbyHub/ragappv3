@@ -83,6 +83,22 @@ export interface SettingsFormData {
   kms_compile_on_ingest: boolean;
   // Draft Room
   draft_room_enabled: boolean;
+  // Multimodal artifact enrichment (issue #461)
+  multimodal_enrichment_enabled: boolean;
+  multimodal_allowed_model_origins: string[];
+  multimodal_chat_url: string;
+  multimodal_model: string;
+  multimodal_mode: "thinking" | "instant";
+  multimodal_timeout_seconds: number;
+  multimodal_concurrency: number;
+  multimodal_max_assets_per_batch: number;
+  multimodal_max_asset_bytes: number;
+  multimodal_max_total_payload_bytes: number;
+  multimodal_max_pixels: number;
+  multimodal_max_attempts: number;
+  multimodal_prompt_version: string;
+  multimodal_schema_version: string;
+  multimodal_impl_version: string;
 }
 
 export type SettingsErrors = Partial<Record<keyof SettingsFormData, string>>;
@@ -145,6 +161,21 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   kms_enabled: "maintenance",
   kms_compile_on_ingest: "maintenance",
   draft_room_enabled: "maintenance",
+  multimodal_enrichment_enabled: "models",
+  multimodal_allowed_model_origins: "models",
+  multimodal_chat_url: "models",
+  multimodal_model: "models",
+  multimodal_mode: "models",
+  multimodal_timeout_seconds: "models",
+  multimodal_concurrency: "models",
+  multimodal_max_assets_per_batch: "models",
+  multimodal_max_asset_bytes: "models",
+  multimodal_max_total_payload_bytes: "models",
+  multimodal_max_pixels: "models",
+  multimodal_max_attempts: "models",
+  multimodal_prompt_version: "models",
+  multimodal_schema_version: "models",
+  multimodal_impl_version: "models",
 };
 
 // Fields that invalidate existing embeddings when changed — reindex required.
@@ -256,6 +287,21 @@ const defaultFormData: SettingsFormData = {
   kms_enabled: true,
   kms_compile_on_ingest: true,
   draft_room_enabled: false,
+  multimodal_enrichment_enabled: false,
+  multimodal_allowed_model_origins: [],
+  multimodal_chat_url: "",
+  multimodal_model: "",
+  multimodal_mode: "thinking",
+  multimodal_timeout_seconds: 60,
+  multimodal_concurrency: 2,
+  multimodal_max_assets_per_batch: 4,
+  multimodal_max_asset_bytes: 10 * 1024 * 1024,
+  multimodal_max_total_payload_bytes: 40 * 1024 * 1024,
+  multimodal_max_pixels: 4_000_000,
+  multimodal_max_attempts: 3,
+  multimodal_prompt_version: "v1",
+  multimodal_schema_version: "v1",
+  multimodal_impl_version: "1",
 };
 
 // Unwrap legacy json.dumps-encoded strings ('"x"' -> 'x').
@@ -343,6 +389,28 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     kms_enabled: settings.kms_enabled ?? true,
     kms_compile_on_ingest: settings.kms_compile_on_ingest ?? true,
     draft_room_enabled: settings.draft_room_enabled ?? false,
+    multimodal_enrichment_enabled: settings.multimodal_enrichment_enabled ?? false,
+    multimodal_allowed_model_origins: Array.isArray(
+      settings.multimodal_allowed_model_origins,
+    )
+      ? settings.multimodal_allowed_model_origins
+      : [],
+    multimodal_chat_url: decodeStr(settings.multimodal_chat_url ?? "", ""),
+    multimodal_model: decodeStr(settings.multimodal_model ?? "", ""),
+    multimodal_mode:
+      settings.multimodal_mode === "instant" ? "instant" : "thinking",
+    multimodal_timeout_seconds: settings.multimodal_timeout_seconds ?? 60,
+    multimodal_concurrency: settings.multimodal_concurrency ?? 2,
+    multimodal_max_assets_per_batch:
+      settings.multimodal_max_assets_per_batch ?? 4,
+    multimodal_max_asset_bytes: settings.multimodal_max_asset_bytes ?? 10 * 1024 * 1024,
+    multimodal_max_total_payload_bytes:
+      settings.multimodal_max_total_payload_bytes ?? 40 * 1024 * 1024,
+    multimodal_max_pixels: settings.multimodal_max_pixels ?? 4_000_000,
+    multimodal_max_attempts: settings.multimodal_max_attempts ?? 3,
+    multimodal_prompt_version: settings.multimodal_prompt_version ?? "v1",
+    multimodal_schema_version: settings.multimodal_schema_version ?? "v1",
+    multimodal_impl_version: settings.multimodal_impl_version ?? "1",
   };
 }
 

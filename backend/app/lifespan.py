@@ -196,6 +196,22 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "wiki_compile_on_query",
             "wiki_compile_after_indexing",
             "draft_room_enabled",
+            # Multimodal artifact enrichment (issue #461)
+            "multimodal_enrichment_enabled",
+            "multimodal_allowed_model_origins",
+            "multimodal_chat_url",
+            "multimodal_model",
+            "multimodal_mode",
+            "multimodal_timeout_seconds",
+            "multimodal_concurrency",
+            "multimodal_max_assets_per_batch",
+            "multimodal_max_asset_bytes",
+            "multimodal_max_total_payload_bytes",
+            "multimodal_max_pixels",
+            "multimodal_max_attempts",
+            "multimodal_prompt_version",
+            "multimodal_schema_version",
+            "multimodal_impl_version",
         ]
         for key in NEW_DIRECT_KEYS:
             if key in persisted:
@@ -559,6 +575,22 @@ async def lifespan(app: FastAPI):
 
     # Initialize background processor as singleton (runs continuously)
     try:
+        multimodal_service = None
+        try:
+            from app.services.multimodal_enrichment import (
+                ArtifactEnrichmentService,
+                MultimodalProviderClient,
+            )
+
+            multimodal_client = MultimodalProviderClient()
+            app.state.multimodal_client = multimodal_client
+            multimodal_service = ArtifactEnrichmentService(
+                pool=app.state.db_pool, client=multimodal_client
+            )
+        except Exception as exc:  # noqa: BLE001 - multimodal enrichment is optional
+            logger.warning("Multimodal enrichment service not available: %s", exc)
+            app.state.multimodal_client = None
+
         app.state.background_processor = get_background_processor(
             max_retries=3,
             retry_delay=1.0,
@@ -569,6 +601,7 @@ async def lifespan(app: FastAPI):
             maintenance_service=app.state.maintenance_service,
             pool=app.state.db_pool,
             llm_client=ingestion_llm_client,
+            multimodal_service=multimodal_service,
         )
         await _safe_await(
             app.state.background_processor.start(),
