@@ -34,7 +34,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # and draft_findings (SPEC section 5.7) -- issue #436.
 # 56 -> 57: Draft Room promotion provenance adds draft_promotions (SPEC
 # sections 3.4, 6.4, 9.3) -- issue #437.
-EXPECTED_BASE_TABLE_COUNT = 57
+# 57 -> 61: Multimodal RAG foundation (issue #460) adds document_atoms,
+# document_assets, ingestion_stage_states, and artifact_delete_pending.
+EXPECTED_BASE_TABLE_COUNT = 61
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

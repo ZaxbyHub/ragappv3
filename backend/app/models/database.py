@@ -405,6 +405,117 @@ CREATE INDEX IF NOT EXISTS idx_draft_promotions_draft
 _DRAFT_ROOM_PROMOTIONS_DDL = _DRAFT_ROOM_PROMOTIONS_TABLE_DDL + _DRAFT_ROOM_PROMOTIONS_INDEX_DDL
 
 
+# Multimodal artifact foundation (issue #460, multimodal RAG part 1).
+#
+# Canonical typed parse units ("atoms"), extracted binary assets, and per-stage
+# ingestion progress. All owner tables cascade FROM files(id) so deleting a file
+# removes its atoms/assets/stage rows. Asset *bytes* live on disk outside the
+# database and require explicit, confined post-commit garbage collection via the
+# durable tombstones in `artifact_delete_pending` (see app/services/artifact_store.py).
+_MULTIMODAL_ARTIFACT_DDL = """
+-- Ordered, typed, versioned parse atoms. UNIQUE(file_id, generation_hash,
+-- ordinal) makes reprocessing an unchanged generation idempotent and a changed
+-- generation a clean replacement (old-generation rows are retired by the
+-- publication seam). atom_id is opaque and stable within one generation.
+CREATE TABLE IF NOT EXISTS document_atoms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    atom_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    generation_hash TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    kind TEXT NOT NULL CHECK (kind IN ('title','text','list','image','chart','table','equation','code','unknown')),
+    raw_text TEXT,
+    page_number INTEGER,
+    bbox_json TEXT,
+    bbox_coord_system TEXT,
+    section_path_json TEXT,
+    caption TEXT,
+    parent_atom_id TEXT,
+    asset_id TEXT,
+    metadata_json TEXT,
+    warnings_json TEXT,
+    parser_fingerprint TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(file_id, generation_hash, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_document_atoms_file
+    ON document_atoms(file_id);
+CREATE INDEX IF NOT EXISTS idx_document_atoms_generation
+    ON document_atoms(generation_hash);
+
+-- Extracted binary assets. Only validated relative storage paths are persisted;
+-- the storage layer resolves them against the configured vault artifact root on
+-- every read/delete and rejects traversal / symlink-reparse escapes.
+CREATE TABLE IF NOT EXISTS document_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id TEXT NOT NULL,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    generation_hash TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    mime_type TEXT,
+    width INTEGER,
+    height INTEGER,
+    byte_size INTEGER NOT NULL,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(file_id, generation_hash, asset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_document_assets_file
+    ON document_assets(file_id);
+
+-- Per-stage ingestion/artifact state. `stage` is intentionally a free-form text
+-- column so future enrichment stages (multimodal RAG parts 2/3) can be added
+-- without a schema replacement; `status` carries the bounded v1 vocabulary.
+CREATE TABLE IF NOT EXISTS ingestion_stage_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    atom_id INTEGER REFERENCES document_atoms(id) ON DELETE CASCADE,
+    generation_hash TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','running','succeeded','partial','failed_retryable','failed_permanent','skipped_policy','skipped_not_applicable')),
+    input_fingerprint TEXT,
+    implementation_version TEXT,
+    parser_id TEXT,
+    model_id TEXT,
+    prompt_id TEXT,
+    config_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    error_message TEXT,
+    started_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    completed_at TEXT
+);
+-- SQLite does not collapse multiple NULLs in a normal unique index, so file-scoped
+-- (atom_id IS NULL) and atom-scoped (atom_id IS NOT NULL) identity each get their
+-- own partial unique index.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stage_file_scoped
+    ON ingestion_stage_states(file_id, generation_hash, stage)
+    WHERE atom_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stage_atom_scoped
+    ON ingestion_stage_states(file_id, generation_hash, atom_id, stage)
+    WHERE atom_id IS NOT NULL;
+
+-- Durable tombstone for binary asset filesystem cleanup. Rows are inserted in the
+-- SAME transaction that removes the owning rows/generation, so a crash after the
+-- DB commit cannot leak bytes permanently; a background sweep confincedly unlinks
+-- each path and removes the tombstone only after success (or confirmed absence).
+CREATE TABLE IF NOT EXISTS artifact_delete_pending (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL,
+    vault_id INTEGER NOT NULL,
+    rel_path TEXT NOT NULL,
+    generation_hash TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_artifact_delete_pending_vault
+    ON artifact_delete_pending(vault_id);
+"""
+
+
 # Database schema definition
 _BASE_SCHEMA = """
 -- Vaults table: stores document collection vaults
@@ -443,6 +554,7 @@ CREATE TABLE IF NOT EXISTS files (
     document_date TEXT,
     supersedes_file_id INTEGER,
     ingestion_version INTEGER DEFAULT 1,
+    active_generation_hash TEXT,
     -- Phase-aware progress (status stays in the canonical 4-value enum;
     -- async/queued/parsing/chunking/embedding live in `phase`).
     phase TEXT,
@@ -1280,6 +1392,7 @@ SCHEMA = (
     + _DRAFT_ROOM_PIPELINE_DDL
     + _DRAFT_ROOM_FACTUALITY_DDL
     + _DRAFT_ROOM_PROMOTIONS_DDL
+    + _MULTIMODAL_ARTIFACT_DDL
 )  # nosec B608
 
 
@@ -1452,6 +1565,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_draft_room_pipeline(sqlite_path)
     migrate_add_draft_room_factuality(sqlite_path)
     migrate_add_draft_room_promotions(sqlite_path)
+    migrate_add_multimodal_artifact_tables(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -4244,5 +4358,42 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def migrate_add_multimodal_artifact_tables(sqlite_path: str) -> None:
+    """
+    Migration: create the multimodal RAG artifact foundation tables (issue #460).
+
+    Creates `document_atoms`, `document_assets`, `ingestion_stage_states`, and
+    the durable `artifact_delete_pending` tombstone table, plus the
+    `files.active_generation_hash` column that records which source generation is
+    currently the authoritative one for a file.
+
+    Executes ``_MULTIMODAL_ARTIFACT_DDL`` — the exact same constant appended to
+    ``SCHEMA`` — so a database created by ``init_db`` and a legacy database
+    upgraded by this migration converge on an identical schema. Every statement
+    is ``CREATE ... IF NOT EXISTS`` and the column add is guarded by
+    ``PRAGMA table_info``, so repeat execution is a no-op and existing data is
+    preserved.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        # Add files.active_generation_hash for databases created before this PR.
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(files)").fetchall()
+        }
+        if "active_generation_hash" not in columns:
+            conn.execute(
+                "ALTER TABLE files ADD COLUMN active_generation_hash TEXT"
+            )
+        conn.executescript(_MULTIMODAL_ARTIFACT_DDL)
+        conn.commit()
     finally:
         conn.close()

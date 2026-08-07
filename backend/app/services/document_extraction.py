@@ -14,6 +14,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from app.services.document_artifacts import parse_elements_to_atoms, project_text
 from app.services.document_processor import DocumentParser
 
 logger = logging.getLogger(__name__)
@@ -107,8 +108,18 @@ class DocumentExtractionService:
             raise self._fail(CODE_INPUT_PARSE_FAILED, exc) from exc
 
         # Same joining/ordering as DocumentProcessor._process_document_file, so
-        # paragraph order, headings and list boundaries match ingestion.
-        text = _normalize("\n".join([str(e) for e in elements]))
+        # paragraph order, headings and list boundaries match ingestion. Routing
+        # through the shared document-atom projection keeps the parse-only output
+        # and ingestion derived from one parser-neutral definition (issue #460);
+        # the adapter is pure (no DB/vector/job side effects) and this service
+        # remains deliberately inert.
+        atoms = parse_elements_to_atoms(
+            elements,
+            file_id=0,
+            generation_hash="extract",
+            parser_fingerprint="",
+        )
+        text = project_text(atoms)
 
         warnings: list[str] = []
         if not text.strip():

@@ -6,6 +6,7 @@ while tracking processing status in SQLite and handling file deduplication.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -21,6 +22,7 @@ from ..config import settings
 from ..models.database import SQLiteConnectionPool, get_pool
 from ..utils.file_utils import compute_file_hash
 from ..utils.retry import with_retry
+from . import artifact_store
 from .chunk_enrichment import ChunkEnrichmentService
 from .chunking import (
     EmbeddingSemanticChunker,
@@ -29,6 +31,19 @@ from .chunking import (
     compute_parent_windows,
 )
 from .contextual_chunking import ContextualChunker
+from .document_artifacts import (
+    ATOM_SCHEMA_VERSION,
+    DEFAULT_PARSER_NAME,
+    RASTER_IMAGE_EXTENSIONS,
+    AtomKind,
+    DocumentAsset,
+    DocumentAtom,
+    ParsedDocument,
+    compute_generation_hash,
+    make_atom_id,
+    parse_elements_to_atoms,
+    project_text,
+)
 from .document_progress import (
     PHASE_CHUNKING,
     PHASE_EMBEDDING,
@@ -63,6 +78,44 @@ _STAGE_TIMING_FIELDS = (
 
 def _new_stage_timings() -> dict[str, float]:
     return {field: 0.0 for field in _STAGE_TIMING_FIELDS}
+
+
+def _parser_version() -> str:
+    """Best-effort version of the installed Unstructured parser.
+
+    Returns ``"unknown"`` under reduced CI dependencies (unstructured stubbed);
+    the value feeds the generation fingerprint so a parser upgrade invalidates
+    prior generations.
+    """
+    try:
+        import unstructured
+
+        return getattr(unstructured, "__version__", "unknown")
+    except Exception:  # noqa: BLE001 - availability is best-effort
+        return "unknown"
+
+
+def _compile_generation(file_hash: str) -> tuple[str, str]:
+    """Compute the generation fingerprint and parser-fingerprint for ingestion.
+
+    Returns ``(generation_hash, parser_fingerprint)``. The generation is keyed by
+    the file-byte hash plus parser implementation/config/schema versions (issue
+    #460), so an unchanged file+parser reprocesses idempotently and any
+    change retires the old generation.
+    """
+    # Coerced to str so a mocked/None config value can never crash the
+    # json.dumps inside compute_generation_hash with a non-serializable object
+    # (e.g. a MagicMock when tests patch settings).
+    config_version = str(getattr(settings, "document_parsing_strategy", "") or "")
+    generation_hash = compute_generation_hash(
+        file_hash,
+        parser_name=DEFAULT_PARSER_NAME,
+        parser_version=str(_parser_version()),
+        config_version=config_version,
+        schema_version=ATOM_SCHEMA_VERSION,
+    )
+    parser_fingerprint = f"{DEFAULT_PARSER_NAME}:{_parser_version()}"
+    return generation_hash, parser_fingerprint
 
 
 def is_enrichment_enabled_for_vault(vault_id: Optional[int]) -> bool:
@@ -602,8 +655,10 @@ class DocumentProcessor:
     # File extensions that should use SpreadsheetParser
     SPREADSHEET_EXTENSIONS = {".csv", ".xls", ".xlsx"}
 
-    # File extensions that should use image processing (OCR + metadata)
-    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"}
+    # File extensions that should use image processing (OCR + metadata).
+    # Derived from the canonical raster set so dispatch and the upload allowlist
+    # can never drift apart (issue #460, final-critic finding 2). Includes .tif.
+    IMAGE_EXTENSIONS = set(RASTER_IMAGE_EXTENSIONS)
 
     def __init__(
         self,
@@ -1062,6 +1117,13 @@ class DocumentProcessor:
             "page_number": chunk.metadata.get("page_number"),
             "chunk_bbox": chunk.metadata.get("chunk_bbox"),
             "total_chunks": chunk.metadata.get("total_chunks"),
+            # Optional exact provenance (image/spreadsheet/schema paths, issue
+            # #460): carried so a chunk-scoped retry rebuilds with the same
+            # atom/asset provenance as the first-pass record.
+            "atom_id": chunk.metadata.get("atom_id"),
+            "atom_kind": chunk.metadata.get("atom_kind"),
+            "asset_id": chunk.metadata.get("asset_id"),
+            "generation_hash": chunk.metadata.get("generation_hash"),
         }
         if (
             chunk.parent_window_start is not None
@@ -1129,6 +1191,11 @@ class DocumentProcessor:
             "page_number": stored_meta.get("page_number"),
             "chunk_bbox": stored_meta.get("chunk_bbox"),
             "chunk_uid": stored_meta.get("chunk_uid"),
+            # Exact provenance preserved through chunk-scoped retry (issue #460).
+            "atom_id": stored_meta.get("atom_id"),
+            "atom_kind": stored_meta.get("atom_kind"),
+            "asset_id": stored_meta.get("asset_id"),
+            "generation_hash": stored_meta.get("generation_hash"),
         }
         chunk = ProcessedChunk(
             text=stored_row["chunk_text"],
@@ -1747,7 +1814,13 @@ class DocumentProcessor:
         """
         return Path(file_path).suffix.lower() in self.IMAGE_EXTENSIONS
 
-    async def _process_spreadsheet_file(self, file_path: str) -> List[ProcessedChunk]:
+    async def _process_spreadsheet_file(
+        self,
+        file_path: str,
+        file_id: int,
+        generation_hash: str = "",
+        parser_fingerprint: str = "",
+    ) -> Tuple[List[ProcessedChunk], str, ParsedDocument]:
         """
         Process a spreadsheet file using SpreadsheetParser.
 
@@ -1756,9 +1829,12 @@ class DocumentProcessor:
 
         Args:
             file_path: Path to the .csv, .xls, or .xlsx file.
+            file_id: Database ID of the file.
+            generation_hash: Source generation fingerprint.
+            parser_fingerprint: Parser provenance string.
 
         Returns:
-            List of ProcessedChunk objects, one per row-group per sheet.
+            Tuple of (List of ProcessedChunk objects, joined text, ParsedDocument).
 
         Raises:
             DocumentParseError: If SpreadsheetParser.parse() raises.
@@ -1776,9 +1852,22 @@ class DocumentProcessor:
             )
 
         processed_chunks: List[ProcessedChunk] = []
+        atoms: List[DocumentAtom] = []
         total = len(sheet_chunks)
 
         for idx, chunk_data in enumerate(sheet_chunks):
+            # One atom per chunk -> exact, provable provenance.
+            atom = DocumentAtom(
+                atom_id=make_atom_id(file_id, generation_hash, idx),
+                schema_version=ATOM_SCHEMA_VERSION,
+                file_id=file_id,
+                generation_hash=generation_hash,
+                ordinal=idx,
+                kind=AtomKind.TEXT,
+                raw_text=chunk_data["text"],
+                parser_fingerprint=parser_fingerprint,
+            )
+            atoms.append(atom)
             chunk = ProcessedChunk(
                 text=chunk_data["text"],
                 metadata={
@@ -1786,27 +1875,59 @@ class DocumentProcessor:
                     "chunk_index": idx,
                     "total_chunks": total,
                     "chunk_scale": "default",  # Spreadsheet files bypass multi-scale
+                    "atom_id": atom.atom_id,
+                    "atom_kind": atom.kind.value,
+                    "generation_hash": generation_hash,
                 },
                 chunk_index=idx,
             )
             processed_chunks.append(chunk)
 
-        return processed_chunks
+        document_text = " ".join(c.text for c in processed_chunks)
+        parsed = ParsedDocument(
+            atoms=tuple(atoms),
+            raw_projection=document_text,
+            normalized_projection=project_text(atoms),
+            parser_fingerprint=parser_fingerprint,
+        )
+        return processed_chunks, document_text, parsed
 
-    async def _process_schema_file(self, file_path: str) -> List[ProcessedChunk]:
+    async def _process_schema_file(
+        self,
+        file_path: str,
+        file_id: int,
+        generation_hash: str = "",
+        parser_fingerprint: str = "",
+    ) -> Tuple[List[ProcessedChunk], str, ParsedDocument]:
         """
         Process a schema file using SchemaParser.
 
         Args:
             file_path: Path to the schema file
+            file_id: Database ID of the file.
+            generation_hash: Source generation fingerprint.
+            parser_fingerprint: Parser provenance string.
 
         Returns:
-            List of ProcessedChunk objects
+            Tuple of (List of ProcessedChunk objects, joined text, ParsedDocument).
         """
         schema_chunks = await asyncio.to_thread(self.schema_parser.parse, file_path)
 
         processed_chunks = []
+        atoms: List[DocumentAtom] = []
         for idx, chunk_data in enumerate(schema_chunks):
+            # One atom per chunk -> exact, provable provenance.
+            atom = DocumentAtom(
+                atom_id=make_atom_id(file_id, generation_hash, idx),
+                schema_version=ATOM_SCHEMA_VERSION,
+                file_id=file_id,
+                generation_hash=generation_hash,
+                ordinal=idx,
+                kind=AtomKind.CODE,
+                raw_text=chunk_data["text"],
+                parser_fingerprint=parser_fingerprint,
+            )
+            atoms.append(atom)
             chunk = ProcessedChunk(
                 text=chunk_data["text"],
                 metadata={
@@ -1814,40 +1935,212 @@ class DocumentProcessor:
                     "chunk_index": idx,
                     "total_chunks": len(schema_chunks),
                     "chunk_scale": "default",  # Schema files don't use multi-scale
+                    "atom_id": atom.atom_id,
+                    "atom_kind": atom.kind.value,
+                    "generation_hash": generation_hash,
                 },
                 chunk_index=idx,
             )
             processed_chunks.append(chunk)
 
-        return processed_chunks
+        document_text = " ".join(c.text for c in processed_chunks)
+        parsed = ParsedDocument(
+            atoms=tuple(atoms),
+            raw_projection=document_text,
+            normalized_projection=project_text(atoms),
+            parser_fingerprint=parser_fingerprint,
+        )
+        return processed_chunks, document_text, parsed
+
+    def _publish_artifacts(
+        self,
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+        parsed: ParsedDocument,
+    ) -> None:
+        """Persist a generation's atoms/assets/stage rows (issue #460).
+
+        Called only after the new vectors are durable, so old-generation atom and
+        asset rows are retired (and their filesystem bytes tombstoned) only once
+        the replacement searchable state is in place — never before. The write
+        and the old-generation retirement share one short transaction on a pooled
+        connection (no connection is held during parse/embed/vector work).
+
+        A failure here is non-fatal to retrieval: the transaction rolls back (no
+        partial rows), any asset bytes already written for this generation are
+        tombstoned for the sweep, and a later reprocess/reindex republishes.
+        """
+        atoms = list(parsed.atoms)
+        asset_specs = list(parsed.assets)
+        if not atoms and not asset_specs:
+            return
+        stage_states = [
+            {"stage": "parse", "status": "succeeded", "attempts": 1,
+             "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
+            {"stage": "publish", "status": "succeeded", "attempts": 1,
+             "completed_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")},
+        ]
+        conn = self.pool.get_connection()
+        materialized: List[DocumentAsset] = []
+        publish_reached = False
+        try:
+            # Materialize any deferred asset bytes onto disk inside the protected
+            # region so a partial I/O failure tombstones exactly the bytes written
+            # so far (issue #460 review, PRR-002/012).
+            for asset in asset_specs:
+                materialized.append(
+                    self._materialize_asset(
+                        asset,
+                        parsed.asset_payloads,
+                        file_id,
+                        vault_id,
+                        generation_hash,
+                    )
+                )
+            publish_reached = True
+            artifact_store.publish_generation(
+                conn,
+                file_id=file_id,
+                vault_id=vault_id,
+                generation_hash=generation_hash,
+                atoms=atoms,
+                assets=materialized,
+                stage_states=stage_states,
+                parser_fingerprint=parsed.parser_fingerprint,
+                implementation_version=str(ATOM_SCHEMA_VERSION),
+            )
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - publish failure is compensated
+            logger.warning(
+                "Failed to publish artifacts for file_id=%s gen=%s: %s",
+                file_id,
+                generation_hash,
+                exc,
+            )
+            # Compensation: roll back the failed publish entirely (discarding any
+            # partial rows and any old-generation retirement it performed
+            # mid-way), then tombstone ONLY the bytes materialized for this
+            # attempt — they have no committed row now, so the sweep must collect
+            # them. A compensation failure is surfaced (not silently swallowed)
+            # so orphaned bytes require operator reconciliation (issue #460,
+            # final-critic findings 2/4).
+            conn.rollback()
+            self._tombstone_materialized_assets(
+                materialized, file_id, vault_id, generation_hash
+            )
+            if not publish_reached:
+                # A materialization (disk I/O) failure occurred before any rows
+                # were published. Its partial bytes were tombstoned above;
+                # re-raise so the caller marks the file errored.
+                raise
+        finally:
+            self.pool.release_connection(conn)
+
+    def _tombstone_materialized_assets(
+        self,
+        materialized: List[DocumentAsset],
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+    ) -> None:
+        """Enqueue cleanup of asset bytes written for a failed publish attempt.
+
+        No-op when nothing was materialized. A compensation failure is surfaced
+        at ERROR (not silently swallowed) so orphaned bytes require operator
+        reconciliation (issue #460 review, PRR-004/012).
+        """
+        if not materialized:
+            return
+        conn = self.pool.get_connection()
+        try:
+            artifact_store.enqueue_asset_cleanup(
+                conn,
+                file_id=file_id,
+                vault_id=vault_id,
+                rel_paths=[a.rel_path for a in materialized],
+                generation_hash=generation_hash,
+            )
+            conn.commit()
+        except Exception as exc2:  # noqa: BLE001
+            conn.rollback()
+            logger.error(
+                "Artifact compensation failed for file_id=%s gen=%s; "
+                "new-generation bytes may be orphaned and require operator "
+                "reconciliation: %s",
+                file_id,
+                generation_hash,
+                exc2,
+            )
+        finally:
+            self.pool.release_connection(conn)
+
+    def _materialize_asset(
+        self,
+        asset: DocumentAsset,
+        payloads: Dict[str, bytes],
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+    ) -> DocumentAsset:
+        """Write a deferred asset's bytes to disk, returning the materialized asset.
+
+        If no payload was planned for this asset (e.g. already materialized, or a
+        best-effort plan produced no bytes), the asset is returned unchanged. The
+        planned path is identical to the materialized path, so provenance and the
+        tombstone path remain consistent.
+        """
+        data = payloads.get(asset.asset_id) if payloads else None
+        if data is None:
+            return asset
+        return artifact_store.store_asset_bytes(
+            file_id=file_id,
+            vault_id=vault_id,
+            generation_hash=generation_hash,
+            data=data,
+            mime_type=asset.mime_type,
+            width=asset.width,
+            height=asset.height,
+            extra_metadata=asset.metadata,
+        )
 
     async def _process_image_file(
         self,
         file_path: str,
-        file_id: Optional[int] = None,
-    ) -> Tuple[List[ProcessedChunk], str]:
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+        parser_fingerprint: str,
+    ) -> Tuple[List[ProcessedChunk], str, ParsedDocument]:
         """
         Process an image file using image_processor + image_search.
 
-        Extracts OCR text and image metadata, builds a searchable text
-        representation, and produces a single chunk that flows through the
-        standard embedding/indexing pipeline.
+        Extracts OCR text and image metadata, stores the raster bytes as a
+        content-addressed binary asset under the vault artifact root, builds a
+        single ``IMAGE`` document atom with exact provenance, and produces a
+        single chunk that flows through the standard embedding/indexing pipeline.
 
-        Graceful degradation: if image libraries are missing or the image
-        is corrupt, logs a warning and returns an empty chunk list so the
-        file is recorded but not searchable.
+        Graceful degradation: if image libraries are missing or the image is
+        corrupt, logs a warning and returns an empty chunk list / empty atom list
+        so the file is recorded but not searchable.
 
         Args:
             file_path: Path to the image file.
-            file_id: Database ID of the file (used for chunk UID construction).
+            file_id: Database ID of the file.
+            vault_id: Owning vault (asset root selection).
+            generation_hash: Source generation fingerprint.
+            parser_fingerprint: Parser provenance string.
 
         Returns:
-            Tuple of (list of ProcessedChunk objects, searchable document text).
-            Returns ([], "") when processing fails.
+            Tuple of (list of ProcessedChunk objects, searchable document text,
+            ParsedDocument with atoms and assets). Returns ([], "", empty parsed)
+            when processing fails.
         """
-        image_result: ImageProcessingResult = await asyncio.to_thread(
-            process_image, file_path
-        )
+        # process_image is async and already offloads its blocking PIL/OCR work
+        # to a worker thread internally, so we await it directly here. Wrapping
+        # it in asyncio.to_thread would dead-return a coroutine object and crash
+        # on `.success` (issue #460 defect 2).
+        image_result: ImageProcessingResult = await process_image(file_path)
 
         if not image_result.success:
             logger.warning(
@@ -1856,7 +2149,7 @@ class DocumentProcessor:
                 file_path,
                 image_result.error,
             )
-            return [], ""
+            return [], "", ParsedDocument(atoms=(), parser_fingerprint=parser_fingerprint)
 
         filename = Path(file_path).name
         searchable_text = build_searchable_text(image_result, filename)
@@ -1867,9 +2160,62 @@ class DocumentProcessor:
                 "File recorded but not searchable.",
                 file_path,
             )
-            return [], searchable_text
+            return [], searchable_text, ParsedDocument(
+                atoms=(), parser_fingerprint=parser_fingerprint
+            )
 
-        # Build chunk metadata mirroring the structure used by text/spreadsheet paths
+        # Plan the raster asset (opaque id + confined path) WITHOUT touching
+        # disk. The raw bytes are stashed on the ParsedDocument and materialized
+        # on disk only inside _publish_artifacts, immediately before the rows are
+        # published — so bytes can never linger unowned if the generation is
+        # never published (pre-publish failure or no vector store), and are
+        # tombstoned by compensation on a publish failure (issue #460,
+        # final-critic finding 3). Failure here is non-fatal: the atom and
+        # searchable text still index, and provenance is simply omitted.
+        asset: Optional[DocumentAsset] = None
+        asset_payloads: Dict[str, bytes] = {}
+        try:
+            image_data = Path(file_path).read_bytes()
+            fmt = str(image_result.metadata.get("format") or "").lower()
+            asset_id = hashlib.sha256(image_data).hexdigest()
+            asset = DocumentAsset(
+                asset_id=asset_id,
+                file_id=file_id,
+                generation_hash=generation_hash,
+                sha256=asset_id,
+                rel_path=artifact_store.compute_asset_rel_path(
+                    file_id, generation_hash, asset_id
+                ),
+                mime_type=f"image/{fmt}" if fmt else None,
+                width=image_result.metadata.get("width"),
+                height=image_result.metadata.get("height"),
+                byte_size=len(image_data),
+                metadata={"format": fmt, "mode": image_result.metadata.get("mode")},
+            )
+            asset_payloads[asset_id] = image_data
+        except Exception as exc:  # noqa: BLE001 - asset planning is best-effort
+            logger.warning("Failed to plan image asset for %s: %s", file_path, exc)
+
+        atom = DocumentAtom(
+            atom_id=make_atom_id(file_id, generation_hash, 0),
+            schema_version=ATOM_SCHEMA_VERSION,
+            file_id=file_id,
+            generation_hash=generation_hash,
+            ordinal=0,
+            kind=AtomKind.IMAGE,
+            raw_text=searchable_text,
+            asset_id=asset.asset_id if asset else None,
+            parser_fingerprint=parser_fingerprint,
+            metadata={
+                "width": image_result.metadata.get("width"),
+                "height": image_result.metadata.get("height"),
+                "format": image_result.metadata.get("format"),
+                "mode": image_result.metadata.get("mode"),
+            },
+        )
+
+        # Build chunk metadata mirroring the structure used by text/spreadsheet
+        # paths, plus exact atom/asset provenance.
         chunk_metadata: Dict[str, Any] = {
             "source_type": "image",
             "file_path": str(file_path),
@@ -1878,9 +2224,13 @@ class DocumentProcessor:
             "image_height": image_result.metadata.get("height"),
             "image_format": image_result.metadata.get("format"),
             "image_mode": image_result.metadata.get("mode"),
+            "atom_id": atom.atom_id,
+            "atom_kind": atom.kind.value,
+            "generation_hash": generation_hash,
         }
-        if file_id is not None:
-            chunk_metadata["file_id"] = str(file_id)
+        if asset is not None:
+            chunk_metadata["asset_id"] = asset.asset_id
+        chunk_metadata["file_id"] = str(file_id)
 
         chunk_index = 0
         chunk_metadata["chunk_index"] = chunk_index
@@ -1892,23 +2242,37 @@ class DocumentProcessor:
             chunk_index=chunk_index,
         )
 
-        return [chunk], searchable_text
+        parsed = ParsedDocument(
+            atoms=(atom,),
+            raw_projection=searchable_text,
+            normalized_projection=searchable_text,
+            parser_fingerprint=parser_fingerprint,
+            assets=(asset,) if asset else (),
+            asset_payloads=asset_payloads,
+        )
+        return [chunk], searchable_text, parsed
 
     async def _process_document_file(
         self,
         file_path: str,
         file_id: Optional[int] = None,
         stage_timings: Optional[dict[str, float]] = None,
-    ) -> Tuple[List[ProcessedChunk], str]:
+        generation_hash: str = "",
+        parser_fingerprint: str = "",
+    ) -> Tuple[List[ProcessedChunk], str, ParsedDocument]:
         """
         Process a document file using DocumentParser and SemanticChunker.
 
         Args:
             file_path: Path to the document file
             file_id: Database ID of the file (required for multi-scale indexing)
+            stage_timings: optional timing accumulator
+            generation_hash: Source generation fingerprint.
+            parser_fingerprint: Parser provenance string.
 
         Returns:
-            Tuple of (List of ProcessedChunk objects, document text as string)
+            Tuple of (List of ProcessedChunk objects, document text as string,
+            ParsedDocument of typed atoms).
         """
         parse_started_at = time.monotonic()
         try:
@@ -1923,8 +2287,26 @@ class DocumentProcessor:
         finally:
             if stage_timings is not None:
                 _add_elapsed_ms(stage_timings, "parse_ms", parse_started_at)
-        # Join all element texts for use as context in contextual chunking
+        # Join all element texts for use as context in contextual chunking.
+        # Unchanged raw join: parent-window offsets and retrieval depend on it
+        # byte-for-byte (issue #460 preserves existing text retrieval behavior).
         document_text = "\n".join([str(e) for e in elements])
+
+        # Parser-neutral ordered atoms (issue #460). Document chunks generally
+        # merge multiple elements, so per-chunk singular atom provenance is NOT
+        # asserted here; the atoms themselves are durable and validation-scoped.
+        atoms = parse_elements_to_atoms(
+            elements,
+            file_id=file_id or 0,
+            generation_hash=generation_hash,
+            parser_fingerprint=parser_fingerprint,
+        )
+        parsed = ParsedDocument(
+            atoms=tuple(atoms),
+            raw_projection=document_text,
+            normalized_projection=project_text(atoms),
+            parser_fingerprint=parser_fingerprint,
+        )
 
         # Check if multi-scale indexing is enabled
         chunk_started_at = time.monotonic()
@@ -1965,7 +2347,7 @@ class DocumentProcessor:
 
             if stage_timings is not None:
                 _add_elapsed_ms(stage_timings, "chunk_ms", chunk_started_at)
-            return all_chunks, document_text
+            return all_chunks, document_text, parsed
         else:
             # Existing single-scale behavior — use the live-settings chunker so
             # chunk_size_chars / chunk_overlap_chars changes apply per-document.
@@ -1980,7 +2362,7 @@ class DocumentProcessor:
                 )
             if stage_timings is not None:
                 _add_elapsed_ms(stage_timings, "chunk_ms", chunk_started_at)
-            return chunks, document_text
+            return chunks, document_text, parsed
 
     async def process_file(
         self,
@@ -2066,12 +2448,17 @@ class DocumentProcessor:
 
         # Phase 2: Long operations (NO connection held!)
         try:
+            generation_hash, parser_fingerprint = _compile_generation(file_hash)
+            parsed: ParsedDocument = ParsedDocument(
+                atoms=(), parser_fingerprint=parser_fingerprint
+            )
             # Process the file based on type
             if self._is_schema_file(file_path):
                 stage_started_at = time.monotonic()
-                chunks = await self._process_schema_file(file_path)
+                chunks, document_text, parsed = await self._process_schema_file(
+                    file_path, file_id, generation_hash, parser_fingerprint
+                )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
-                document_text = ""
             elif self._is_spreadsheet_file(file_path):
                 set_phase(
                     self.pool,
@@ -2080,9 +2467,10 @@ class DocumentProcessor:
                     message="Parsing spreadsheet (large spreadsheets can take several minutes)",
                 )
                 stage_started_at = time.monotonic()
-                chunks = await self._process_spreadsheet_file(file_path)
+                chunks, document_text, parsed = await self._process_spreadsheet_file(
+                    file_path, file_id, generation_hash, parser_fingerprint
+                )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
-                document_text = " ".join(c.text for c in chunks)
             elif self._is_image_file(file_path):
                 set_phase(
                     self.pool,
@@ -2091,11 +2479,13 @@ class DocumentProcessor:
                     message="Processing image",
                 )
                 stage_started_at = time.monotonic()
-                chunks, document_text = await self._process_image_file(file_path, file_id)
+                chunks, document_text, parsed = await self._process_image_file(
+                    file_path, file_id, vault_id, generation_hash, parser_fingerprint
+                )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             else:
-                chunks, document_text = await self._process_document_file(
-                    file_path, file_id, stage_timings
+                chunks, document_text, parsed = await self._process_document_file(
+                    file_path, file_id, stage_timings, generation_hash, parser_fingerprint
                 )
 
             set_phase(
@@ -2404,6 +2794,13 @@ class DocumentProcessor:
                         _merge_vector_timings(stage_timings, vector_timings)
 
                     await self._verify_vector_rows_visible(file_id)
+
+                    # Publish the generation's atoms/assets/stage rows after the
+                    # new vectors are durable, so old-generation atoms/assets are
+                    # retired only once the replacement retrieval state is in place.
+                    self._publish_artifacts(
+                        file_id, vault_id, generation_hash, parsed
+                    )
         except Exception as e:
             # Phase 3: Update status to error on failure
             # Get connection again to update error status
@@ -2642,11 +3039,16 @@ class DocumentProcessor:
         stage_timings = _new_stage_timings()
 
         try:
+            generation_hash, parser_fingerprint = _compile_generation(file_hash)
+            parsed: ParsedDocument = ParsedDocument(
+                atoms=(), parser_fingerprint=parser_fingerprint
+            )
             if self._is_schema_file(file_path):
                 stage_started_at = time.monotonic()
-                chunks = await self._process_schema_file(file_path)
+                chunks, document_text, parsed = await self._process_schema_file(
+                    file_path, file_id, generation_hash, parser_fingerprint
+                )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
-                document_text = ""
             elif self._is_spreadsheet_file(file_path):
                 set_phase(
                     self.pool,
@@ -2655,9 +3057,10 @@ class DocumentProcessor:
                     message="Parsing spreadsheet (large spreadsheets can take several minutes)",
                 )
                 stage_started_at = time.monotonic()
-                chunks = await self._process_spreadsheet_file(file_path)
+                chunks, document_text, parsed = await self._process_spreadsheet_file(
+                    file_path, file_id, generation_hash, parser_fingerprint
+                )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
-                document_text = " ".join(c.text for c in chunks)
             elif self._is_image_file(file_path):
                 set_phase(
                     self.pool,
@@ -2666,11 +3069,13 @@ class DocumentProcessor:
                     message="Processing image",
                 )
                 stage_started_at = time.monotonic()
-                chunks, document_text = await self._process_image_file(file_path, file_id)
+                chunks, document_text, parsed = await self._process_image_file(
+                    file_path, file_id, vault_id, generation_hash, parser_fingerprint
+                )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             else:
-                chunks, document_text = await self._process_document_file(
-                    file_path, file_id, stage_timings
+                chunks, document_text, parsed = await self._process_document_file(
+                    file_path, file_id, stage_timings, generation_hash, parser_fingerprint
                 )
 
             set_phase(
@@ -2936,6 +3341,12 @@ class DocumentProcessor:
                         _merge_vector_timings(stage_timings, vector_timings)
 
                     await self._verify_vector_rows_visible(file_id)
+
+                    # Publish the generation's atoms/assets/stage rows after the
+                    # new vectors are durable (issue #460).
+                    self._publish_artifacts(
+                        file_id, vault_id, generation_hash, parsed
+                    )
         except Exception as e:
             if self._write_semaphore:
                 await self._write_semaphore.acquire()

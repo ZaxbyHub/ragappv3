@@ -28,13 +28,15 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
             await processor.start()
 
     # The periodic vector-delete reconciliation sweep is spawned in start()
-    # after the workers/enrichment task (added with the #219 retry queue).
+    # after the workers/enrichment task (added with the #219 retry queue); the
+    # artifact-delete sweep task is spawned alongside it (issue #460).
     assert created_workers == [
         "worker-0",
         "worker-1",
         "enrichment-worker",
         "reindex-worker",
         "vector-delete-sweep",
+        "artifact-delete-sweep",
     ]
 
 
@@ -82,6 +84,73 @@ async def test_worker_count_two_vector_store_mutations_are_serialized():
         mock_settings.ingestion_worker_count = 2
         await processor.enqueue("first.txt", vault_id=1, file_id=1)
         await processor.enqueue("second.txt", vault_id=1, file_id=2)
+        await processor.start()
+
+        await first_entered.wait()
+        await asyncio.sleep(0)
+        assert active == 1
+
+        release_first.set()
+        await processor.queue.join()
+        processor.shutdown_event.set()
+        await asyncio.wait_for(
+            asyncio.gather(*processor._worker_tasks, return_exceptions=True),
+            timeout=2,
+        )
+        processor._running = False
+
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_same_file_concurrent_re_enqueues_are_serialized():
+    """PRR-007: two workers handed the SAME file must never write the vector
+    store concurrently — the write semaphore collapses them to one active
+    writer (in-flight same-file collapse under concurrency).
+    """
+    from app.services.background_tasks import BackgroundProcessor
+    from app.services.vector_store import VectorStore
+
+    store = VectorStore()
+    active = 0
+    max_active = 0
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def guarded_operation(*_args):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        if not first_entered.is_set():
+            first_entered.set()
+            await release_first.wait()
+        active -= 1
+        return {"vector_write_ms": 0.0, "optimize_ms": 0.0}
+
+    async def guarded_delete(*_args):
+        await guarded_operation()
+        return 0
+
+    store._add_chunks_unlocked = guarded_operation
+    store._delete_by_file_unlocked = guarded_delete
+
+    processor = BackgroundProcessor()
+    processor.processor = MagicMock()
+    processor.processor.pool = None
+
+    async def process_existing_file(file_id, file_path, vault_id):
+        # The same file content on both enqueues -> same file_id.
+        await store.add_chunks([{"id": str(file_id)}])
+
+    processor.processor.process_existing_file = AsyncMock(
+        side_effect=process_existing_file
+    )
+
+    with patch("app.services.background_tasks.settings") as mock_settings:
+        mock_settings.ingestion_worker_count = 2
+        # Two concurrent enqueues of the SAME file must serialize to one writer.
+        await processor.enqueue("same.txt", vault_id=1, file_id=1)
+        await processor.enqueue("same.txt", vault_id=1, file_id=1)
         await processor.start()
 
         await first_entered.wait()
@@ -188,6 +257,8 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
         mock_settings.parent_window_chars = 20
         mock_settings.reupload_safe_order = False
         mock_settings.embedding_batch_size = 64
+        from app.services.document_artifacts import ParsedDocument
+
         with patch.object(processor, "_check_duplicate", return_value=None), \
             patch.object(processor, "_insert_or_get_file_record", return_value=123), \
             patch.object(processor, "_update_status"), \
@@ -197,7 +268,7 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
             patch.object(
                 processor,
                 "_process_document_file",
-                new=AsyncMock(return_value=([chunk], "hello world")),
+                new=AsyncMock(return_value=([chunk], "hello world", ParsedDocument(atoms=()))),
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \

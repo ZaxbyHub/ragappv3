@@ -505,6 +505,43 @@ CREATE TABLE posts (
         self.assertEqual(metadata["raw_text"], "original evidence text")
         self.assertNotIn("enrichment", metadata)
 
+    def test_vector_record_propagates_atom_provenance_metadata(self):
+        """PRR-008: on the image/spreadsheet/schema paths the chunk carries
+        exact atom/asset provenance, and ``_build_vector_record`` must propagate
+        it into the persisted record metadata JSON untouched.
+        """
+        chunk = ProcessedChunk(
+            text="rendered image",
+            metadata={
+                "chunk_scale": "default",
+                "total_chunks": 1,
+                "source_type": "image",
+                "atom_id": "img-atom-123",
+                "atom_kind": "image",
+                "generation_hash": "genPROV",
+                "asset_id": "asset-abc",
+                "file_id": "42",
+            },
+            chunk_index=0,
+            raw_text="rendered image",
+        )
+
+        record = self.processor._build_vector_record(
+            file_id=42,
+            vault_id=1,
+            file_hash="abcdef012345",
+            chunk=chunk,
+            embedding=[0.1, 0.2],
+            sparse_emb=None,
+            document_text="rendered image",
+        )
+
+        metadata = json.loads(record["metadata"])
+        self.assertEqual(metadata["atom_id"], "img-atom-123")
+        self.assertEqual(metadata["atom_kind"], "image")
+        self.assertEqual(metadata["generation_hash"], "genPROV")
+        self.assertEqual(metadata["asset_id"], "asset-abc")
+
     def test_enriched_vector_record_adds_searchable_text_and_keeps_raw_text(self):
         """Post-index enrichment is searchable while citations keep original evidence."""
         chunk = ProcessedChunk(

@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # it will be reset to 'pending' for re-processing.
 STRANDED_PROCESSING_TIMEOUT_MINUTES = 30
 
+# Per-row cap on the startup stranded-row re-enqueue (PRR-011). Recovery is
+# best-effort: if the bounded queue is saturated, bow out with a warning and
+# leave the row for a later sweep instead of blocking startup on the backlog.
+STRANDED_REENQUEUE_TIMEOUT_SECONDS = 30.0
+
 # Retry cap for pending vector-store deletes (Issue #219). Rows that exceed
 # this are left in place and logged for operator visibility — we never delete
 # a pending record without confirming the chunks are actually gone.
@@ -223,6 +228,7 @@ class BackgroundProcessor:
         self._worker_tasks: List[asyncio.Task] = []
         self._enrichment_worker_task: Optional[asyncio.Task] = None
         self._vector_delete_sweep_task: Optional[asyncio.Task] = None
+        self._artifact_delete_sweep_task: Optional[asyncio.Task] = None
         self._reindex_worker_task: Optional[asyncio.Task] = None
         self._running = False
         self.maintenance_service = maintenance_service
@@ -285,10 +291,16 @@ class BackgroundProcessor:
         await self._recover_stranded_pending_rows()
         await self._recover_stranded_enrichment_rows()
         await self.retry_pending_vector_deletes()
+        await self.sweep_pending_artifact_deletes()
         # Re-run the vector-delete reconciliation hourly so orphaned chunks
         # from a failed delete are cleaned without waiting for a restart.
         self._vector_delete_sweep_task = asyncio.create_task(
             self._vector_delete_sweep_loop(), name="vector-delete-sweep"
+        )
+        # Re-run the binary-asset cleanup reconciliation (issue #460) hourly so
+        # post-commit asset unlink failures are collected without a restart.
+        self._artifact_delete_sweep_task = asyncio.create_task(
+            self._artifact_delete_sweep_loop(), name="artifact-delete-sweep"
         )
 
         logger.info(f"Background processor started with {worker_count} worker(s)")
@@ -303,6 +315,43 @@ class BackgroundProcessor:
                 raise
             except Exception:  # noqa: BLE001 — sweep must never kill the loop
                 logger.exception("Periodic vector-delete sweep failed")
+
+    async def sweep_pending_artifact_deletes(self) -> None:
+        """Best-effort confined deletion of every pending binary-asset tombstone.
+
+        Called at startup and hourly (issue #460) so a crash after a DB commit
+        cannot leak asset bytes permanently. Best-effort: skipped when no pool.
+        """
+        if self.processor is None or self.processor.pool is None:
+            return
+        try:
+            from .artifact_store import sweep_pending_asset_deletes
+
+            with self.processor.pool.connection() as conn:
+                removed, remaining = sweep_pending_asset_deletes(conn)
+            if remaining:
+                logger.warning(
+                    "Artifact cleanup: %d removed, %d pending (will retry)",
+                    removed,
+                    remaining,
+                )
+            elif removed:
+                logger.info("Artifact cleanup: removed %d orphaned asset(s)", removed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Artifact cleanup sweep failed: %s", exc)
+
+    async def _artifact_delete_sweep_loop(self, interval_seconds: float = 3600.0) -> None:
+        """Hourly retry loop for pending binary-asset deletes."""
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                await self.sweep_pending_artifact_deletes()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — sweep must never kill the loop
+                logger.exception("Periodic artifact-delete sweep failed")
 
     async def _recover_stranded_pending_rows(self) -> None:
         """Re-enqueue any `files` rows left at status='pending' from a prior process.
@@ -385,12 +434,25 @@ class BackgroundProcessor:
                     except Exception:  # pragma: no cover - defensive
                         pass
                     continue
-                await self.enqueue(
-                    file_path=file_path,
-                    source=source,
-                    vault_id=int(vault_id),
-                    file_id=int(row_id),
-                )
+                try:
+                    await asyncio.wait_for(
+                        self.enqueue(
+                            file_path=file_path,
+                            source=source,
+                            vault_id=int(vault_id),
+                            file_id=int(row_id),
+                        ),
+                        timeout=STRANDED_REENQUEUE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # Queue saturated: leave the row for the next recovery sweep
+                    # rather than blocking startup on a stranded backlog (PRR-011).
+                    logger.warning(
+                        "Stranded re-enqueue timed out for row id=%s; left for "
+                        "the next recovery sweep",
+                        row_id,
+                    )
+                    continue
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("Failed to re-enqueue stranded row id=%s: %s", row, e)
 
@@ -428,13 +490,27 @@ class BackgroundProcessor:
                     "Recovered stuck processing row id=%s: status=pending, phase=queued",
                     row_id,
                 )
-                # Re-enqueue for processing
-                await self.enqueue(
-                    file_path=file_path,
-                    source=source,
-                    vault_id=int(vault_id),
-                    file_id=int(row_id),
-                )
+                # Re-enqueue for processing, bounded like the pending loop so a
+                # saturated queue cannot stall startup (PRR-011).
+                try:
+                    await asyncio.wait_for(
+                        self.enqueue(
+                            file_path=file_path,
+                            source=source,
+                            vault_id=int(vault_id),
+                            file_id=int(row_id),
+                        ),
+                        timeout=STRANDED_REENQUEUE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # The row was already flipped to pending/queued above, so the
+                    # first recovery loop naturally re-queues it on the next start.
+                    logger.warning(
+                        "Processing-row re-enqueue timed out for row id=%s; left "
+                        "for the next recovery sweep",
+                        row_id,
+                    )
+                    continue
             except Exception as e:
                 logger.warning("Failed to recover processing row %s: %s", row, e)
 
@@ -594,6 +670,9 @@ class BackgroundProcessor:
         if self._vector_delete_sweep_task:
             self._vector_delete_sweep_task.cancel()
             await asyncio.gather(self._vector_delete_sweep_task, return_exceptions=True)
+        if getattr(self, "_artifact_delete_sweep_task", None):
+            self._artifact_delete_sweep_task.cancel()
+            await asyncio.gather(self._artifact_delete_sweep_task, return_exceptions=True)
         if self._reindex_worker_task:
             self._reindex_worker_task.cancel()
             await asyncio.gather(self._reindex_worker_task, return_exceptions=True)
