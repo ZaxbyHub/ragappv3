@@ -70,7 +70,7 @@
     "eslint-plugin-jsx-a11y-x": "^0.2.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.8.0",
-    "jest-axe": "^10.0.0",
+    "jest-axe": "^11.0.0",
     "jsdom": "^29.1.1",
     "postcss": "^8.5.25",
     "tailwindcss": "^4.3.3",
