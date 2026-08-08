@@ -360,7 +360,11 @@ class LiveEvalAdapter:
             # outage is recorded as a status, not folded into the means as a 0.0
             # that would conflate outage with genuine zero recall.
             has_expected = bool(item.relevant_ids)
-            not_outage = (ranking.status if ranking else None) != "unavailable"
+            # A missing ranking is recorded as an outage (status="unavailable"), so
+            # it must be treated as one here too — otherwise `None != "unavailable"`
+            # evaluates True and a 0.0 (no-retrieval) query is folded into the means,
+            # conflating outage with genuine zero recall (Plan F).
+            not_outage = (ranking.status if ranking else "unavailable") != "unavailable"
             query_metrics.append(
                 QueryMetrics(
                     query_id=item.id,

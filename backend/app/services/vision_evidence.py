@@ -434,6 +434,13 @@ class VisionEvidenceService:
         selected = self._select(sources)
         result.selected = len(selected)
 
+        # V5 feature-off non-regression (F-03): when query-time vision is disabled
+        # (the default), return an empty result BEFORE the `not selected` branch so
+        # ineligible-modality artifact sources (e.g. code) do not leak
+        # VISION_PROXY_ONLY onto the wire. vision_status must be omitted entirely.
+        if not settings.multimodal_query_vision_enabled:
+            return result
+
         # Whole-batch gate: if no artifact may be sent, degrade all to proxy_only
         # without any byte open / provider call.
         if not selected:

@@ -20,9 +20,11 @@ except ImportError:  # pragma: no cover
     sys.modules["lancedb"] = types.ModuleType("lancedb")
 
 from app.config import settings
+from app.services.multimodal_enrichment import MultimodalProviderError
 from app.services.vision_evidence import (
     VISION_ASSET_MISSING,
     VISION_POLICY_BLOCKED,
+    VISION_PROVIDER_UNAVAILABLE,
     VISION_PROXY_ONLY,
     VISION_USED,
     VisionEvidenceResult,
@@ -189,6 +191,29 @@ class TestRunDegradation(unittest.TestCase):
         self.assertEqual(result.statuses, {})
         self.assertEqual(result.policy_blocked, 0)
 
+    def test_feature_off_with_ineligible_artifacts_omits_statuses_v5(self) -> None:
+        """F-03 regression: feature-off + all-ineligible artifacts must NOT leak
+        VISION_PROXY_ONLY (the old `not selected` branch ran before the gate)."""
+        svc = VisionEvidenceService()
+        sources = [
+            _src("art1", modality="code", asset_id="x"),  # code -> ineligible
+            _src("art2", modality="code", asset_id="y"),
+        ]
+        settings.multimodal_query_vision_enabled = False
+        try:
+            with patch.object(
+                svc, "_process_one", side_effect=AssertionError("must not call")
+            ):
+                result = asyncio.run(
+                    svc.run(query="q", sources=sources, vault_id=1)
+                )
+        finally:
+            settings.multimodal_query_vision_enabled = True
+        self.assertEqual(result.selected, 0)
+        # V5: statuses omitted entirely even when nothing is eligible.
+        self.assertEqual(result.statuses, {})
+        self.assertEqual(result.proxy_only, 0)
+
     def test_whole_batch_vault_not_opted_in_marks_policy_blocked(self) -> None:
         svc = VisionEvidenceService()
         sources = [_src("art1", modality="table", asset_id="y")]
@@ -226,7 +251,7 @@ class TestProcessOneSecurity(unittest.TestCase):
 
     def _process_one(self, *, row=None, can_read=True, policy_reason=None,
                      read_result=b"fake-img", client_obs="an observation",
-                     sniff_mime="image/png"):
+                     client_side_effect=None, sniff_mime="image/png"):
         """Run `_process_one` with a fake conn + spies for byte-open and provider."""
         svc = VisionEvidenceService()
         conn = MagicMock()
@@ -243,6 +268,8 @@ class TestProcessOneSecurity(unittest.TestCase):
 
             async def chat_multimodal(self, messages, max_tokens=1024):
                 self.calls += 1
+                if client_side_effect is not None:
+                    raise client_side_effect
                 return client_obs
 
             async def close(self):
@@ -345,6 +372,42 @@ class TestProcessOneSecurity(unittest.TestCase):
         self.assertTrue(reads, "read bytes for an authorized call")
         self.assertTrue(factory.called)
 
+    def test_provider_error_non_policy_degrades_to_provider_unavailable(self) -> None:
+        # A provider failure (not a policy denial) must degrade safely to
+        # provider_unavailable without crashing the batch (F-12).
+        result, reads, factory = self._process_one(
+            client_side_effect=MultimodalProviderError("network", retryable=True, message="boom")
+        )
+        self.assertEqual(result[1], VISION_PROVIDER_UNAVAILABLE)
+        self.assertTrue(reads, "bytes were opened before the provider call")
+        self.assertTrue(factory.called)
+
+    def test_generic_exception_degrades_to_provider_unavailable(self) -> None:
+        # Unexpected exceptions bubbling out of the provider map to
+        # provider_unavailable (safe per-source degradation) (F-12).
+        result, reads, factory = self._process_one(
+            client_side_effect=ValueError("unexpected")
+        )
+        self.assertEqual(result[1], VISION_PROVIDER_UNAVAILABLE)
+        self.assertTrue(factory.called)
+
+    def test_provider_timeout_degrades_to_provider_unavailable(self) -> None:
+        # asyncio.TimeoutError from the provider call maps to provider_unavailable,
+        # not a batch crash (F-12).
+        result, reads, factory = self._process_one(
+            client_side_effect=asyncio.TimeoutError()
+        )
+        self.assertEqual(result[1], VISION_PROVIDER_UNAVAILABLE)
+        self.assertTrue(factory.called)
+
+    def test_empty_observation_degrades_to_provider_unavailable(self) -> None:
+        # A 200-OK-but-empty provider payload maps to a safe status (F-12); the
+        # batch must not crash and observation stays None.
+        result, reads, factory = self._process_one(client_obs="")
+        self.assertEqual(result[1], VISION_PROVIDER_UNAVAILABLE)
+        self.assertIsNone(result[2])
+        self.assertTrue(reads)
+        self.assertTrue(factory.called)
 
 async def _can_read_true(user, evaluate, c, vid):
     """Always-True coroutine for patching `_can_read` (it is awaited)."""

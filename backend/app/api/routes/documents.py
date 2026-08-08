@@ -1197,10 +1197,13 @@ async def get_artifact_raw(
     try:
         if confined.stat().st_size != cap:
             raise HTTPException(status_code=404, detail="Artifact not found")
-        data = confined.read_bytes()
+        # Bound the read to `cap` + 1: a file swapped/grown between the stat and the
+        # read must not trigger an unbounded read (F-01) — a length mismatch rejects.
+        with confined.open("rb") as fh:
+            data = fh.read(cap + 1)
     except OSError:
         raise HTTPException(status_code=404, detail="Artifact not found")
-    if not data:
+    if len(data) != cap:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
     # (5) Header-derived safe MIME allowlist (ignore stored mime_type as authoritative).

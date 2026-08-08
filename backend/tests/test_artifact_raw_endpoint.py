@@ -135,6 +135,20 @@ class TestArtifactRawEndpoint(unittest.TestCase):
         self.assertEqual(r.headers["cache-control"], "private, no-store")
         self.assertEqual(r.content, PNG_BYTES)
 
+    def test_non_raster_bytes_rejected_404(self):
+        # F-02: the served bytes are MIME-sniffed against the raster allowlist; a
+        # stored asset whose on-disk content is not raster must 404 (and the row's
+        # trusted mime_type is NOT enough to serve it). Same length as the stored
+        # cap so the size check passes and the MIME-allowlist branch is exercised.
+        abs_path = self.vault_root / self.rel
+        abs_path.write_bytes(b"A" * len(PNG_BYTES))  # non-image, non-PNG header
+        with self._patch_root():
+            r = self.client.get(f"/documents/artifacts/{self.atom_id}/raw")
+        self.assertEqual(r.status_code, 404)
+        # Non-disclosing: no asset id or filesystem path leaks in the body.
+        self.assertNotIn(self.asset_id, r.text)
+        self.assertNotIn(self.rel, r.text)
+
     def test_authz_denied_returns_forbidden(self):
         async def _deny(user, resource_type, resource_id, action):
             return False

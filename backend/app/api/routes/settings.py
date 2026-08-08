@@ -949,6 +949,9 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
     # Same for multimodal: redacted URL/model; don't disclose an enabled multimodal
     # backend to non-admins.
     settings_dict["multimodal_enrichment_enabled"] = False
+    # The query-time vision flag likewise discloses that a multimodal query-vision
+    # backend is wired; redact it symmetrically for non-admins (F-08).
+    settings_dict["multimodal_query_vision_enabled"] = False
     # Drop the provenance hints for redacted fields so a non-admin cannot learn
     # from effective_sources whether an infra URL was set (kv) vs default.
     effective_sources = settings_dict.get("effective_sources")
