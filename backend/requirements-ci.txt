@@ -28,4 +28,4 @@ argon2-cffi>=21.3.0,<26.0
 rapidfuzz>=3.0.0,<4.0
 Pillow>=10.0.0,<13.0
 pytesseract>=0.3.10,<1.0
-pyarrow>=14.0.0,<25.0
+pyarrow>=25.0.0,<26.0
