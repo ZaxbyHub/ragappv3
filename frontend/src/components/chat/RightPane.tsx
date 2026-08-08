@@ -17,13 +17,15 @@ import {
   parseCompletedAssistantIds,
 } from "@/stores/useChatStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
-import { getChunkContext, getDocumentRawBlob, type ChunkContextResponse, type Source } from "@/lib/api";
+import { getChunkContext, getDocumentRawBlob, getArtifactRawBlob, type ChunkContextResponse, type Source } from "@/lib/api";
 import { WikiCards } from "./WikiCards";
 import { KMSCards } from "./KMSCards";
 import { getRelevanceLabel, type ScoreType } from "@/lib/relevance";
 import { EmptyState } from "@/components/EmptyState";
 
 const PdfPreview = lazy(() => import("@/components/preview/PdfPreview"));
+
+const ARTIFACT_MODALITIES = new Set(["image", "chart", "table", "equation", "code"]);
 
 interface StructuredOutput {
   id: string;
@@ -247,6 +249,24 @@ function SourceListItem({
               <span className="font-medium">§</span> {source.section}
             </div>
           )}
+          <div className="flex items-center gap-1 mt-0.5">
+            {source.modality && ARTIFACT_MODALITIES.has(source.modality) && (
+                <span
+                  className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+                  aria-label={`modality: ${source.modality}`}
+                >
+                  {source.modality}
+                </span>
+              )}
+            {source.vision_status && source.vision_status !== "used" && (
+              <span
+                className="shrink-0 rounded-sm bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600"
+                aria-label={`vision status: ${source.vision_status}`}
+              >
+                proxy
+              </span>
+            )}
+          </div>
           {source.snippet && (
             <div className="text-xs text-muted-foreground mt-0.5 line-clamp-2">
               {source.snippet}
@@ -281,6 +301,11 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
   const [isLoadingDocument, setIsLoadingDocument] = useState(false);
   const [documentError, setDocumentError] = useState<string | null>(null);
   const documentAbortRef = useRef<AbortController | null>(null);
+  // Raster artifact preview (image/chart) fetched via the opaque asset
+  // endpoint by artifact_id — never path/base64 on the wire.
+  const [artifactPreview, setArtifactPreview] = useState<string | null>(null);
+  const [artifactError, setArtifactError] = useState<string | null>(null);
+  const artifactAbortRef = useRef<AbortController | null>(null);
   const previewContent = chunkContext?.context_text || source.snippet || "";
   const highlightedContent = useMemo(
     () => highlightQueryTerms(previewContent, query),
@@ -293,6 +318,11 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
     (source.metadata as Record<string, unknown> | undefined)?.synthesized
   );
   const sourceFileId = isSynthesized ? undefined : source.file_id;
+  // Raster artifacts (image/chart) render via the opaque asset endpoint;
+  // table/equation/code stay as safe text previews (no asset round-trip).
+  const isRasterArtifact =
+    (source.modality === "image" || source.modality === "chart") &&
+    Boolean(source.artifact_id);
   const sourcePageNumber =
     typeof source.page_number === "number"
       ? source.page_number
@@ -345,6 +375,34 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
       if (documentPreview) URL.revokeObjectURL(documentPreview.url);
     };
   }, [documentPreview]);
+
+  useEffect(() => {
+    artifactAbortRef.current?.abort();
+    artifactAbortRef.current = null;
+    setArtifactPreview((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return null;
+    });
+    setArtifactError(null);
+    if (!isRasterArtifact || isSynthesized) return;
+
+    const controller = new AbortController();
+    artifactAbortRef.current = controller;
+    getArtifactRawBlob(source.artifact_id!, controller.signal)
+      .then((blob) => {
+        if (controller.signal.aborted || artifactAbortRef.current !== controller) return;
+        // Blocked/missing assets degrade to the proxy-only text preview
+        // rather than breaking the pane: only treat a real HTTP failure as
+        // an error, and fall back to the textual description otherwise.
+        setArtifactPreview(URL.createObjectURL(blob));
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setArtifactError("Asset unavailable; showing text preview only.");
+      });
+
+    return () => controller.abort();
+  }, [source.id, source.artifact_id, isRasterArtifact, isSynthesized]);
 
   const handleOpenDocument = useCallback(async () => {
     if (!sourceFileId) return;
@@ -463,10 +521,20 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
             />
           </Suspense>
         </div>
+      ) : artifactPreview ? (
+        <div className="flex-1 min-h-0 flex items-center justify-center rounded-sm border p-4 bg-card">
+          <img
+            src={artifactPreview}
+            alt={source.description ?? `${source.modality} artifact`}
+            className="max-h-full max-w-full object-contain rounded-sm"
+          />
+        </div>
       ) : (
         <ScrollArea className="flex-1 min-h-0 rounded-sm border p-4">
           <div className="text-sm leading-relaxed whitespace-pre-wrap">
-            {previewContent ? highlightedContent : "No preview content available."}
+            {artifactError ? (
+              <span className="text-warning-foreground">{artifactError}</span>
+            ) : previewContent ? highlightedContent : "No preview content available."}
           </div>
         </ScrollArea>
       )}

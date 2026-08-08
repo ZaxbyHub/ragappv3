@@ -36,6 +36,7 @@ from app.security import csrf_protect
 from app.services.citation_validator import repair_against_sources_and_memories
 from app.services.rag_engine import RAGEngine, RAGEngineError
 from app.services.vector_store import SearchSemaphoreTimeoutError
+from app.services.vision_evidence import VisionEvidenceService, VisionRunContext
 from app.services.wiki_citation_helpers import (
     build_per_claim_sources as _build_per_claim_sources_impl,
 )
@@ -234,6 +235,7 @@ def stream_chat_response(
     citation_mode: Optional[str] = None,
     include_global: bool = False,
     can_write_memory: bool = False,
+    vision_context: Optional[VisionRunContext] = None,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
@@ -302,6 +304,7 @@ def stream_chat_response(
                 temperature=temperature, retrieval_mode=retrieval_mode,
                 citation_mode=citation_mode,
                 include_global=include_global, can_write_memory=can_write_memory,
+                vision_context=vision_context,
             )
             rag_gen_ait = rag_gen.__aiter__()
 
@@ -483,6 +486,7 @@ async def non_stream_chat_response(
     citation_mode: Optional[str] = None,
     include_global: bool = False,
     can_write_memory: bool = False,
+    vision_context: Optional[VisionRunContext] = None,
 ) -> ChatResponse:
     """
     Generate a non-streaming chat response.
@@ -518,6 +522,7 @@ async def non_stream_chat_response(
             temperature=temperature, retrieval_mode=retrieval_mode,
             citation_mode=citation_mode,
             include_global=include_global, can_write_memory=can_write_memory,
+            vision_context=vision_context,
         ):
             chunk_type = chunk.get("type")
             logger.debug(
@@ -678,6 +683,12 @@ async def chat(
     # functions that expect List[Dict[str, Any]]. Mirror the streaming path
     # (line 705) which uses model_dump(exclude_none=True).
     history = [msg.model_dump(exclude_none=True) for msg in body.history]
+    # Issue #462 — construct the query-time vision context (enables retrieval-first
+    # VLM for the standard path). The service self-authorizes on a short-lived
+    # connection; DI evaluate is passed when available.
+    vision_context = VisionRunContext(
+        service=VisionEvidenceService(), user=user, evaluate=evaluate
+    )
     try:
         return await non_stream_chat_response(
             body.message,
@@ -692,6 +703,7 @@ async def chat(
             temperature=body.temperature,
             retrieval_mode=body.retrieval_mode,
             citation_mode=body.citation_mode,
+            vision_context=vision_context,
         )
     except Exception:
         logger.exception("[chat] UNHANDLED EXCEPTION during chat processing")
@@ -795,6 +807,9 @@ async def chat_stream(
     can_write_memory = bool(user.get("_can_write_memory"))
     history = [msg.model_dump(exclude_none=True) for msg in body.messages[:-1]]
     effective_mode = ChatMode(body.mode) if body.mode else None
+    # Issue #462 — query-time vision context (self-authorizes via the user dict on
+    # a short-lived connection; no DI evaluate is available on the streaming path).
+    vision_context = VisionRunContext(service=VisionEvidenceService(), user=user)
     return stream_chat_response(
         last_message.content,
         history,
@@ -808,6 +823,7 @@ async def chat_stream(
         citation_mode=body.citation_mode,
         include_global=include_global,
         can_write_memory=can_write_memory,
+        vision_context=vision_context,
     )
 
 

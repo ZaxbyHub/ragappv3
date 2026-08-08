@@ -48,8 +48,19 @@ def _load_results(path: Path) -> List[CaseResult]:
                     answer=str(obj.get("answer", "")),
                     cited_source_labels=list(obj.get("cited_source_labels") or []),
                     cited_memory_labels=list(obj.get("cited_memory_labels") or []),
+                    # Issue #462: restore cited_wiki_labels (was previously dropped,
+                    # silently skewing wiki recall) and read the new artifact fields.
+                    cited_wiki_labels=list(obj.get("cited_wiki_labels") or []),
                     invalid_citations=list(obj.get("invalid_citations") or []),
                     no_match_returned=bool(obj.get("no_match_returned", False)),
+                    retrieved_artifact_ids=list(obj.get("retrieved_artifact_ids") or []),
+                    cited_artifact_ids=list(obj.get("cited_artifact_ids") or []),
+                    retrieved_modalities=list(obj.get("retrieved_modalities") or []),
+                    retrieval_status=obj.get("retrieval_status"),
+                    vision_used_artifact_ids=list(obj.get("vision_used_artifact_ids") or []),
+                    vision_degraded_artifact_ids=list(
+                        obj.get("vision_degraded_artifact_ids") or []
+                    ),
                 )
             )
     return out

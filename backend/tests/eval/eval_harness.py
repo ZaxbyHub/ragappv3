@@ -60,6 +60,10 @@ class GoldenCase:
     expected_memories: List[str] = field(default_factory=list)
     expected_wiki_labels: List[str] = field(default_factory=list)
     expect_no_match: bool = False
+    # Issue #462 — artifact-level expectations (independent of file/chunk ids).
+    expected_artifact_ids: List[str] = field(default_factory=list)
+    expected_modalities: List[str] = field(default_factory=list)
+    expected_vision_mode: str = "either"  # "used" | "degraded" | "either"
 
 
 @dataclass
@@ -73,6 +77,15 @@ class CaseResult:
     cited_wiki_labels: List[str] = field(default_factory=list)
     invalid_citations: List[str] = field(default_factory=list)
     no_match_returned: bool = False
+    # Issue #462 — artifact-level retrieval/citation/vision + retrieval status.
+    retrieved_artifact_ids: List[str] = field(default_factory=list)
+    cited_artifact_ids: List[str] = field(default_factory=list)
+    # Per-source modality kinds for the retrieved artifacts (plan F: retrieve_eval
+    # returns "per-source modalities"), aligned positionally with retrieved ids.
+    retrieved_modalities: List[str] = field(default_factory=list)
+    retrieval_status: Optional[str] = None  # "ok" | "partial" | "unavailable"
+    vision_used_artifact_ids: List[str] = field(default_factory=list)
+    vision_degraded_artifact_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -89,6 +102,16 @@ class CaseMetrics:
     unsupported_citations: int
     fact_coverage: Optional[float]
     no_match_correct: Optional[bool]
+    # Issue #462 — artifact metrics (computed independently of file/chunk/text).
+    artifact_recall_at_k: Optional[float] = None
+    artifact_mrr: Optional[float] = None
+    artifact_ndcg_at_k: Optional[float] = None
+    artifact_citation_validity: Optional[float] = None
+    vision_use_rate: Optional[float] = None
+    vision_degradation_rate: Optional[float] = None
+    # Fraction of expected modalities observed among retrieved modality kinds.
+    modality_match_rate: Optional[float] = None
+    retrieval_status: Optional[str] = None
 
 
 def load_jsonl(path: str | Path) -> List[GoldenCase]:
@@ -122,6 +145,9 @@ def _case_from_dict(obj: Dict[str, Any]) -> GoldenCase:
         expected_memories=list(obj.get("expected_memories") or []),
         expected_wiki_labels=list(obj.get("expected_wiki_labels") or []),
         expect_no_match=bool(obj.get("expect_no_match", False)),
+        expected_artifact_ids=list(obj.get("expected_artifact_ids") or []),
+        expected_modalities=list(obj.get("expected_modalities") or []),
+        expected_vision_mode=str(obj.get("expected_vision_mode", "either")),
     )
 
 
@@ -198,19 +224,25 @@ class EvalRunner:
                 )
                 continue
 
+            # Plan F: "denominators exclude `unavailable`". A total retrieval
+            # outage must not be folded into the metric means as a 0.0 (which
+            # would conflate outage with genuine zero recall). Status is still
+            # recorded; only the numeric metric contributions are dropped.
+            outage = result.retrieval_status == "unavailable"
+
             recall = (
                 recall_at_k(result.retrieved_chunk_ids, case.expected_chunk_ids, self.top_k)
-                if case.expected_chunk_ids
+                if case.expected_chunk_ids and not outage
                 else None
             )
             mrr = (
                 mean_reciprocal_rank(result.retrieved_chunk_ids, case.expected_chunk_ids)
-                if case.expected_chunk_ids
+                if case.expected_chunk_ids and not outage
                 else None
             )
             ndcg = (
                 ndcg_at_k(result.retrieved_chunk_ids, case.expected_chunk_ids, self.top_k)
-                if case.expected_chunk_ids
+                if case.expected_chunk_ids and not outage
                 else None
             )
             cv = (
@@ -246,6 +278,54 @@ class EvalRunner:
                     else not result.no_match_returned
                 )
 
+            # Issue #462 — artifact metrics (independent of file/chunk/text metrics).
+            exp_art = case.expected_artifact_ids
+            artifact_recall = (
+                recall_at_k(result.retrieved_artifact_ids, exp_art, self.top_k)
+                if exp_art and not outage
+                else None
+            )
+            artifact_mrr = (
+                mean_reciprocal_rank(result.retrieved_artifact_ids, exp_art)
+                if exp_art and not outage
+                else None
+            )
+            artifact_ndcg = (
+                ndcg_at_k(result.retrieved_artifact_ids, exp_art, self.top_k)
+                if exp_art and not outage
+                else None
+            )
+            artifact_cv = (
+                citation_validity(
+                    result.cited_artifact_ids, result.retrieved_artifact_ids
+                )
+                if (result.cited_artifact_ids or result.retrieved_artifact_ids)
+                else None
+            )
+            vision_use = None
+            vision_degraded = None
+            if exp_art:
+                used = set(result.vision_used_artifact_ids)
+                degraded = set(result.vision_degraded_artifact_ids)
+                if case.expected_vision_mode == "used":
+                    vision_use = sum(1 for a in exp_art if a in used) / len(exp_art)
+                    vision_degraded = sum(1 for a in exp_art if a in degraded) / len(exp_art)
+                elif case.expected_vision_mode == "degraded":
+                    vision_use = sum(1 for a in exp_art if a in used) / len(exp_art)
+                    vision_degraded = sum(1 for a in exp_art if a in degraded) / len(exp_art)
+                else:  # either — report use rate only
+                    vision_use = sum(1 for a in exp_art if a in used) / len(exp_art)
+
+            # Modality match (plan F): fraction of expected modality kinds that were
+            # observed among the retrieved per-source modality kinds. Only meaningful
+            # when both expectations and observations are present.
+            modality_match = None
+            if case.expected_modalities and not outage:
+                got = set(result.retrieved_modalities)
+                modality_match = (
+                    sum(1 for m in case.expected_modalities if m in got) / len(case.expected_modalities)
+                )
+
             out.append(
                 CaseMetrics(
                     id=case_id,
@@ -258,6 +338,14 @@ class EvalRunner:
                     unsupported_citations=len(result.invalid_citations),
                     fact_coverage=facts,
                     no_match_correct=no_match_correct,
+                    artifact_recall_at_k=artifact_recall,
+                    artifact_mrr=artifact_mrr,
+                    artifact_ndcg_at_k=artifact_ndcg,
+                    artifact_citation_validity=artifact_cv,
+                    vision_use_rate=vision_use,
+                    vision_degradation_rate=vision_degraded,
+                    modality_match_rate=modality_match,
+                    retrieval_status=result.retrieval_status,
                 )
             )
         return out
@@ -277,6 +365,11 @@ class EvalRunner:
         no_match_rate = (
             sum(1 for x in no_match if x) / len(no_match) if no_match else None
         )
+        retrieval_counts: Dict[str, int] = {}
+        for c in m:
+            st = c.retrieval_status
+            if st:
+                retrieval_counts[st] = retrieval_counts.get(st, 0) + 1
         return {
             "case_count": len(m),
             "ran_count": sum(1 for c in m if c.recall_at_k is not None or c.fact_coverage is not None or c.citation_validity is not None),
@@ -290,6 +383,15 @@ class EvalRunner:
             "fact_coverage_mean": _mean("fact_coverage"),
             "unsupported_citation_total": sum(c.unsupported_citations for c in m),
             "no_match_correct_rate": no_match_rate,
+            # Issue #462 — artifact-level means + retrieval-status distribution.
+            "artifact_recall_at_k_mean": _mean("artifact_recall_at_k"),
+            "artifact_mrr_mean": _mean("artifact_mrr"),
+            "artifact_ndcg_at_k_mean": _mean("artifact_ndcg_at_k"),
+            "artifact_citation_validity_mean": _mean("artifact_citation_validity"),
+            "vision_use_rate_mean": _mean("vision_use_rate"),
+            "vision_degradation_rate_mean": _mean("vision_degradation_rate"),
+            "modality_match_rate_mean": _mean("modality_match_rate"),
+            "retrieval_status_counts": retrieval_counts,
         }
 
     def to_json(self, path: str | Path) -> None:
@@ -316,6 +418,13 @@ class EvalRunner:
             f"fact coverage:      {_fmt(s['fact_coverage_mean'])}",
             f"unsupported cites:  {s['unsupported_citation_total']}",
             f"no-match correctness: {_fmt(s['no_match_correct_rate'])}",
+            f"artifact recall@k:  {_fmt(s['artifact_recall_at_k_mean'])}",
+            f"artifact MRR:       {_fmt(s['artifact_mrr_mean'])}",
+            f"artifact nDCG@k:    {_fmt(s['artifact_ndcg_at_k_mean'])}",
+            f"artifact citation validity: {_fmt(s['artifact_citation_validity_mean'])}",
+            f"vision use rate:    {_fmt(s['vision_use_rate_mean'])}",
+            f"vision degradation: {_fmt(s['vision_degradation_rate_mean'])}",
+            f"retrieval status:   {s['retrieval_status_counts'] or 'n/a'}",
         ]
         return "\n".join(lines)
 

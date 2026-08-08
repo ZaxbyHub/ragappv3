@@ -27,6 +27,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
 )
 from fastapi.exceptions import RequestValidationError
@@ -53,6 +54,12 @@ from app.config import Settings, settings
 from app.limiter import limiter
 from app.models.database import SQLiteConnectionPool
 from app.security import csrf_protect
+from app.services.artifact_store import (
+    RASTER_MIME_ALLOWLIST,
+    compute_asset_rel_path,
+    resolve_confined,
+    sniff_raster_mime,
+)
 from app.services.background_tasks import BackgroundProcessor
 from app.services.document_processor import (
     DocumentProcessingError,
@@ -1109,6 +1116,123 @@ async def get_document_raw(
         content_disposition_type="inline" if is_pdf else "attachment",
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+@router.get("/artifacts/{artifact_id}/raw")
+async def get_artifact_raw(
+    artifact_id: str,
+    request: Request,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_user_or_service_account),
+    evaluate: Callable = Depends(get_evaluate_policy),
+    settings_dep: Settings = Depends(get_settings),
+):
+    """Serve a safe raster artifact asset by opaque id (issue #462).
+
+    Authorization-before-byte-open (V3). Looks up the artifact -> parent file ->
+    vault in scoped queries, requires current vault ``read`` permission, resolves the
+    persisted relative path only beneath the confined per-vault artifact root (rejects
+    traversal / symlink / wrong-parent / out-of-root), serves only the safe raster MIME
+    allowlist, and never accepts a storage path from the caller. 403 for missing vault
+    read permission (mirrors get_document_raw); nondisclosing 404 for missing IDs /
+    unavailable assets (no leak that an artifact exists). No path / base64 / data-URL is
+    ever emitted.
+    """
+    # (1) Joined artifact -> file -> vault membership by opaque atom id.
+    atom = await asyncio.to_thread(
+        conn.execute,
+        """
+        SELECT atom_id, file_id, asset_id, kind
+        FROM document_atoms
+        WHERE atom_id = ?
+        """,
+        (artifact_id,),
+    )
+    atom_row = await asyncio.to_thread(atom.fetchone)
+    if atom_row is None or not atom_row["asset_id"]:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    file_row = await asyncio.to_thread(
+        conn.execute, "SELECT id, vault_id FROM files WHERE id = ?", (atom_row["file_id"],)
+    )
+    f = await asyncio.to_thread(file_row.fetchone)
+    if f is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    vault_id = int(f["vault_id"])
+
+    # (2) Vault read authorization.
+    if not await evaluate(user, "vault", vault_id, "read"):
+        raise HTTPException(status_code=403, detail="No read access to this vault")
+
+    # (3) Asset record under the same parent file (scoped) for generation/path/hash.
+    asset = await asyncio.to_thread(
+        conn.execute,
+        """
+        SELECT asset_id, generation_hash, rel_path, sha256, byte_size
+        FROM document_assets
+        WHERE asset_id = ? AND file_id = ?
+        """,
+        (atom_row["asset_id"], atom_row["file_id"]),
+    )
+    asset_row = await asyncio.to_thread(asset.fetchone)
+    if asset_row is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    # (4) Confined root containment — reject traversal / symlink / out-of-root.
+    confined = resolve_confined(asset_row["rel_path"], vault_id)
+    if confined is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    # Defense-in-depth: the persisted path must equal the server-derived path.
+    if str(asset_row["rel_path"]) != compute_asset_rel_path(
+        atom_row["file_id"], asset_row["generation_hash"], asset_row["asset_id"]
+    ):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if not confined.exists() or not confined.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    # Bound the read by the stored size and the global per-asset cap.
+    cap = int(asset_row["byte_size"] or 0)
+    if cap <= 0 or cap > int(settings_dep.multimodal_max_asset_bytes):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    try:
+        if confined.stat().st_size != cap:
+            raise HTTPException(status_code=404, detail="Artifact not found")
+        data = confined.read_bytes()
+    except OSError:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if not data:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    # (5) Header-derived safe MIME allowlist (ignore stored mime_type as authoritative).
+    mime = sniff_raster_mime(data)
+    if mime not in RASTER_MIME_ALLOWLIST:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    # (6) Safe response: no path/base64 headers; nosniff; ETag = asset hash; private cache.
+    etag = f'"{asset_row["sha256"]}"'
+    response = Response(content=data, media_type=mime)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Disposition"] = "inline; filename=artifact"
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "private, no-store"
+
+    # Audit access using ids/hash/outcome only (never paths/bytes/base64).
+    try:
+        from app.services.security_audit import record_security_event
+
+        record_security_event(
+            conn,
+            event_type="artifact_bytes_served",
+            metadata={
+                "artifact_id": atom_row["atom_id"],
+                "file_id": atom_row["file_id"],
+                "vault_id": vault_id,
+                "asset_sha256": asset_row["sha256"],
+                "outcome": "ok",
+            },
+        )
+    except Exception:  # noqa: BLE001 — audit must never break asset serving
+        logger.warning("artifact_bytes_served audit failed (suppressed)", exc_info=False)
     return response
 
 

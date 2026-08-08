@@ -6,7 +6,7 @@ import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 import { RightPane } from "./RightPane";
 import * as useChatStoreModule from "@/stores/useChatStore";
 import * as useChatShellStoreModule from "@/stores/useChatStore";
-import { getChunkContext } from "@/lib/api";
+import { getChunkContext, getArtifactRawBlob } from "@/lib/api";
 
 // Mock the stores
 vi.mock("@/stores/useChatStore", () => {
@@ -93,6 +93,9 @@ vi.mock("@/lib/api", () => ({
     context_text: "Expanded source context",
     context_source: "parent_window",
   }),
+  getArtifactRawBlob: vi.fn().mockResolvedValue(
+    new Blob(["fake-png"], { type: "image/png" })
+  ),
 }));
 
 // Mock UI components with proper interactivity
@@ -448,6 +451,47 @@ describe("RightPane", () => {
       await waitFor(() => {
         const previewContent = screen.getByTestId("tab-content-preview");
         expect(previewContent).toBeInTheDocument();
+      });
+    });
+
+    // Issue #462 — a raster artifact source fetches its bytes via the opaque
+    // artifact endpoint and renders an image preview (never a path/base64 URL).
+    it("fetches and renders a raster artifact preview for image sources", async () => {
+      const sources = [
+        createMockSource({
+          id: "src-art",
+          filename: "chart.png",
+          modality: "image",
+          artifact_id: "atom-1",
+          asset_id: "asset-1",
+          vision_status: "used",
+        }),
+      ];
+
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "what is in this chart?" }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+
+      const sourceButtons = screen.getAllByRole("button");
+      const sourceButton = sourceButtons.find(btn =>
+        btn.textContent?.includes("chart.png")
+      );
+      expect(sourceButton).toBeInTheDocument();
+      expect(sourceButton?.textContent).toContain("image");
+      if (sourceButton) fireEvent.click(sourceButton);
+
+      await waitFor(() => {
+        expect(getArtifactRawBlob).toHaveBeenCalledWith("atom-1", expect.anything());
+      });
+      // The opaque blob URL is rendered into an <img> preview.
+      await waitFor(() => {
+        expect(document.querySelector("img")).not.toBeNull();
       });
     });
   });

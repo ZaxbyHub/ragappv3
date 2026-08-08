@@ -212,6 +212,8 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "multimodal_prompt_version",
             "multimodal_schema_version",
             "multimodal_impl_version",
+            # Query-time retrieval-first VLM master switch (issue #462)
+            "multimodal_query_vision_enabled",
         ]
         for key in NEW_DIRECT_KEYS:
             if key in persisted:

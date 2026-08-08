@@ -184,6 +184,31 @@ describe("ModelsTab", () => {
     );
   });
 
+  it("renders the query-time vision toggle and emits its changes", () => {
+    const onChange = vi.fn();
+    render(
+      <ModelsTab
+        formData={formData()}
+        errors={{}}
+        onChange={onChange}
+        effectiveSources={{}}
+      />,
+    );
+
+    expect(
+      screen.getByText(/retrieval-first VLM synthesis at query time/i),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByLabelText(/Enable retrieval-first VLM synthesis at query time/i),
+    );
+
+    expect(onChange).toHaveBeenCalledWith(
+      "multimodal_query_vision_enabled",
+      true,
+    );
+  });
+
   it("converts the comma-separated allowlist into an origins array", () => {
     const onChange = vi.fn();
     render(
