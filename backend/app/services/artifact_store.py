@@ -46,6 +46,45 @@ logger = logging.getLogger(__name__)
 # operator; it is never silently dropped while bytes may remain.
 _MAX_UNLINK_ATTEMPTS = 5
 
+# Safe raster MIME allowlist for asset serving / VLM transmission (issue #462).
+# SVG/HTML and all other types are excluded. This is the single source of truth
+# for "is this asset safe to present/send".
+RASTER_MIME_ALLOWLIST = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/tiff"}
+)
+
+
+def sniff_raster_mime(data: bytes) -> Optional[str]:
+    """Derive a safe raster MIME from the byte header (never the path).
+
+    The asset path is extensionless content hashes, and the persisted
+    ``document_assets.mime_type`` may drift, so the authoritative + independent
+    signal is a lazy Pillow header decode. Returns a MIME in
+    :data:`RASTER_MIME_ALLOWLIST` or ``None`` for unsupported/corrupt data.
+    'MPO' (multi-picture JPEG) is a JPEG container and maps to ``image/jpeg``.
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:  # pragma: no cover — Pillow optional
+        return None
+    import io
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = (img.format or "").upper()
+    except Exception:  # noqa: BLE001 — corrupt/undecodable header
+        return None
+    table = {
+        "PNG": "image/png",
+        "JPEG": "image/jpeg",
+        "MPO": "image/jpeg",
+        "GIF": "image/gif",
+        "WEBP": "image/webp",
+        "BMP": "image/bmp",
+        "TIFF": "image/tiff",
+    }
+    return table.get(fmt)
+
 
 # ---------------------------------------------------------------------------
 # Path security

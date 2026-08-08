@@ -460,6 +460,22 @@ export interface Source {
   snippet?: string;
   score?: number;
   score_type?: "distance" | "rerank" | "rrf";
+  /**
+   * Multi-modal artifact presentation (issue #462). These are first-class safe
+   * fields: they NEVER carry paths, bytes, or base64 — artifact bytes are fetched
+   * by opaque `artifact_id` via GET /api/documents/artifacts/{id}/raw.
+   */
+  modality?: string;
+  artifact_id?: string;
+  asset_id?: string;
+  bbox?: { x0: number; y0: number; x1: number; y1: number } | null;
+  vision_status?:
+    | "used"
+    | "proxy_only"
+    | "policy_blocked"
+    | "asset_missing"
+    | "provider_unavailable";
+  description?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -704,6 +720,21 @@ export async function getDocumentRawBlob(
 ): Promise<Blob> {
   const response = await apiClient.get<Blob>(
     `/documents/${fileId}/raw`,
+    {
+      responseType: "blob",
+      signal,
+    }
+  );
+  return response.data;
+}
+
+/** Fetch a safe raster artifact asset by opaque id (issue #462). */
+export async function getArtifactRawBlob(
+  artifactId: string,
+  signal?: AbortSignal
+): Promise<Blob> {
+  const response = await apiClient.get<Blob>(
+    `/documents/artifacts/${artifactId}/raw`,
     {
       responseType: "blob",
       signal,

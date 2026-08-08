@@ -657,6 +657,26 @@ export function ModelsTab({
             </Label>
           </div>
 
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="multimodal-query-vision-enabled"
+              checked={formData.multimodal_query_vision_enabled}
+              onCheckedChange={(v) =>
+                onChange("multimodal_query_vision_enabled", Boolean(v))
+              }
+            />
+            <Label
+              htmlFor="multimodal-query-vision-enabled"
+              className="text-sm font-normal"
+            >
+              Enable retrieval-first VLM synthesis at query time
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              Runs after normal retrieval/rerank/distill/pack against only the
+              retrieved artifact sources. Off by default.
+            </p>
+          </div>
+
           <StringField
             field="multimodal_chat_url"
             label="Multimodal provider URL"

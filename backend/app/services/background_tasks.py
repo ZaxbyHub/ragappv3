@@ -993,6 +993,10 @@ class BackgroundProcessor:
                 "fingerprint": pr.get("fingerprint"),
                 "description": pr.get("description", ""),
                 "raw_text": pr.get("proxy_text", ""),
+                # Persistent artifact presentation metadata (issue #462). bbox was
+                # already bounded/validated at enrichment time; never raw paths.
+                "page_number": pr.get("page_number"),
+                "bbox": pr.get("bbox"),
             }
             new_records.append(
                 {

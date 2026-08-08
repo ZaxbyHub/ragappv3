@@ -81,6 +81,20 @@ class RAGTrace:
     ab_variant: Optional[str] = None  # 'control' | 'challenger' | None
     # SC-015: effective prompt version label used for this query (e.g. 'v1', 'v3.5-org-override')
     prompt_version: Optional[str] = None
+    # --- Multi-modal query-time vision aggregates (issue #462) ---
+    # Safe counts/aggregates only — never bytes, paths, prompts, or model bodies.
+    artifact_sources_retrieved: int = 0
+    vision_eligible: int = 0
+    vision_selected: int = 0
+    vision_deduped: int = 0
+    vision_capped: int = 0
+    vision_used: int = 0
+    vision_proxy_only: int = 0
+    vision_policy_blocked: int = 0
+    vision_asset_missing: int = 0
+    vision_provider_unavailable: int = 0
+    vision_latency_ms: Optional[float] = None
+    vision_payload_bytes: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -123,6 +137,19 @@ class RAGTrace:
             "ab_experiment_id": self.ab_experiment_id,
             "ab_variant": self.ab_variant,
             "prompt_version": self.prompt_version,
+            # Multi-modal query-time vision aggregates (issue #462)
+            "artifact_sources_retrieved": self.artifact_sources_retrieved,
+            "vision_eligible": self.vision_eligible,
+            "vision_selected": self.vision_selected,
+            "vision_deduped": self.vision_deduped,
+            "vision_capped": self.vision_capped,
+            "vision_used": self.vision_used,
+            "vision_proxy_only": self.vision_proxy_only,
+            "vision_policy_blocked": self.vision_policy_blocked,
+            "vision_asset_missing": self.vision_asset_missing,
+            "vision_provider_unavailable": self.vision_provider_unavailable,
+            "vision_latency_ms": self.vision_latency_ms,
+            "vision_payload_bytes": self.vision_payload_bytes,
         }
 
     def to_log_dict(self) -> Dict[str, Any]:

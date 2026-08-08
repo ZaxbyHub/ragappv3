@@ -85,6 +85,7 @@ export interface SettingsFormData {
   draft_room_enabled: boolean;
   // Multimodal artifact enrichment (issue #461)
   multimodal_enrichment_enabled: boolean;
+  multimodal_query_vision_enabled: boolean;
   multimodal_allowed_model_origins: string[];
   multimodal_chat_url: string;
   multimodal_model: string;
@@ -162,6 +163,7 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   kms_compile_on_ingest: "maintenance",
   draft_room_enabled: "maintenance",
   multimodal_enrichment_enabled: "models",
+  multimodal_query_vision_enabled: "models",
   multimodal_allowed_model_origins: "models",
   multimodal_chat_url: "models",
   multimodal_model: "models",
@@ -288,6 +290,7 @@ const defaultFormData: SettingsFormData = {
   kms_compile_on_ingest: true,
   draft_room_enabled: false,
   multimodal_enrichment_enabled: false,
+  multimodal_query_vision_enabled: false,
   multimodal_allowed_model_origins: [],
   multimodal_chat_url: "",
   multimodal_model: "",
@@ -390,6 +393,8 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     kms_compile_on_ingest: settings.kms_compile_on_ingest ?? true,
     draft_room_enabled: settings.draft_room_enabled ?? false,
     multimodal_enrichment_enabled: settings.multimodal_enrichment_enabled ?? false,
+    multimodal_query_vision_enabled:
+      settings.multimodal_query_vision_enabled ?? false,
     multimodal_allowed_model_origins: Array.isArray(
       settings.multimodal_allowed_model_origins,
     )

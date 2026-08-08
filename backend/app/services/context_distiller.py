@@ -341,6 +341,15 @@ class ContextDistiller:
                     file_id=source.file_id,
                     score=source.score,
                     metadata=source.metadata,
+                    # Carry multi-modal artifact identity through distillation
+                    # (issue #462) so identity survives the dedup/synthesis seam.
+                    parent_window_text=source.parent_window_text,
+                    artifact_id=source.artifact_id,
+                    modality=source.modality,
+                    asset_id=source.asset_id,
+                    bbox=source.bbox,
+                    description=source.description,
+                    vision_status=source.vision_status,
                 )
             )
             surviving_indices.add(src_idx)

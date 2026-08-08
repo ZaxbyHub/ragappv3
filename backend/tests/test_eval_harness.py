@@ -162,5 +162,152 @@ class TestEvalRunner(unittest.TestCase):
             runner.add_result(CaseResult(id="nope"))
 
 
+class TestArtifactMetrics(unittest.TestCase):
+    """Issue #462 — artifact-level retrieval/citation/vision metrics."""
+
+    def _runner(self, expected_artifact_ids, expected_vision_mode="either"):
+        from tests.eval.eval_harness import GoldenCase
+
+        cases = [
+            GoldenCase(
+                id="g-art",
+                query="?",
+                expected_artifact_ids=expected_artifact_ids,
+                expected_vision_mode=expected_vision_mode,
+            )
+        ]
+        return EvalRunner(cases, top_k=3)
+
+    def test_artifact_recall_independent_of_chunk_ids(self):
+        runner = self._runner(expected_artifact_ids=["art-a", "art-b"])
+        runner.add_result(
+            CaseResult(
+                id="g-art",
+                retrieved_artifact_ids=["art-a", "art-x"],
+            )
+        )
+        metrics = runner.evaluate()
+        m = metrics[0]
+        self.assertAlmostEqual(m.artifact_recall_at_k, 0.5)
+        # Chunk recall is separate and None here (no chunk expectations).
+        self.assertIsNone(m.recall_at_k)
+
+    def test_artifact_citation_validity(self):
+        runner = self._runner(expected_artifact_ids=["art-a"])
+        runner.add_result(
+            CaseResult(
+                id="g-art",
+                retrieved_artifact_ids=["art-a"],
+                cited_artifact_ids=["art-a", "art-bogus"],
+            )
+        )
+        metrics = runner.evaluate()
+        # 1 of 2 cited artifact ids is retrieved -> 0.5
+        self.assertAlmostEqual(metrics[0].artifact_citation_validity, 0.5)
+
+    def test_vision_use_rate_for_used_mode(self):
+        runner = self._runner(
+            expected_artifact_ids=["art-a", "art-b"], expected_vision_mode="used"
+        )
+        runner.add_result(
+            CaseResult(
+                id="g-art",
+                retrieved_artifact_ids=["art-a", "art-b"],
+                vision_used_artifact_ids=["art-a"],
+            )
+        )
+        metrics = runner.evaluate()
+        # 1 of 2 expected artifacts used by the VLM.
+        self.assertAlmostEqual(metrics[0].vision_use_rate, 0.5)
+        self.assertEqual(metrics[0].vision_degradation_rate, 0.0)
+
+    def test_vision_degradation_rate(self):
+        runner = self._runner(
+            expected_artifact_ids=["art-a", "art-b"], expected_vision_mode="degraded"
+        )
+        runner.add_result(
+            CaseResult(
+                id="g-art",
+                retrieved_artifact_ids=["art-a", "art-b"],
+                vision_degraded_artifact_ids=["art-b"],
+            )
+        )
+        metrics = runner.evaluate()
+        self.assertAlmostEqual(metrics[0].vision_degradation_rate, 0.5)
+
+    def test_retrieval_status_counts_in_summary(self):
+        runner = self._runner(expected_artifact_ids=["art-a"])
+        runner.add_result(
+            CaseResult(id="g-art", retrieval_status="ok")
+        )
+        summary = runner.summarize()
+        self.assertEqual(
+            summary.get("retrieval_status_counts", {}).get("ok"), 1
+        )
+
+    def test_artifact_case_from_dict_parses_fields(self):
+        from tests.eval.eval_harness import _case_from_dict
+
+        case = _case_from_dict(
+            {
+                "id": "x",
+                "query": "?",
+                "expected_artifact_ids": ["a1"],
+                "expected_modalities": ["image"],
+                "expected_vision_mode": "used",
+            }
+        )
+        self.assertEqual(case.expected_artifact_ids, ["a1"])
+        self.assertEqual(case.expected_modalities, ["image"])
+        self.assertEqual(case.expected_vision_mode, "used")
+
+    def test_retrieval_unavailable_excluded_from_means(self):
+        """Plan F: denominators exclude `unavailable` (outage != zero recall)."""
+        from tests.eval.eval_harness import GoldenCase
+
+        runner = EvalRunner(
+            [
+                GoldenCase(id="ok", query="?", expected_chunk_ids=["c1"]),
+                GoldenCase(id="out", query="?", expected_chunk_ids=["c1"]),
+            ],
+            top_k=3,
+        )
+        runner.add_result(
+            CaseResult(id="ok", retrieved_chunk_ids=["c1"], retrieval_status="ok")
+        )
+        runner.add_result(
+            CaseResult(id="out", retrieved_chunk_ids=[], retrieval_status="unavailable")
+        )
+        summary = runner.summarize()
+        # The ok case alone contributes (recall 1.0) even though the outage case
+        # exists with 0 retrieved — outage must not drag the mean to 0.5.
+        self.assertEqual(summary["recall_at_k_mean"], 1.0)
+        self.assertEqual(summary["retrieval_status_counts"].get("unavailable"), 1)
+
+    def test_modality_match_rate(self):
+        from tests.eval.eval_harness import GoldenCase
+
+        runner = EvalRunner(
+            [
+                GoldenCase(
+                    id="g",
+                    query="?",
+                    expected_modalities=["image", "chart"],
+                )
+            ],
+            top_k=3,
+        )
+        runner.add_result(
+            CaseResult(
+                id="g",
+                retrieved_artifact_ids=["a1", "a2"],
+                retrieved_modalities=["image", "table"],
+            )
+        )
+        metrics = runner.evaluate()
+        # 1 of 2 expected modalities (image) observed; chart absent.
+        self.assertAlmostEqual(metrics[0].modality_match_rate, 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

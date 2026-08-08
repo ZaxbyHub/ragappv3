@@ -515,6 +515,12 @@ class Settings(BaseSettings):
     """Version identifier of the derived response schema (part of the fingerprint)."""
     multimodal_impl_version: str = "1"
     """Enrichment implementation/config version (part of the fingerprint)."""
+    multimodal_query_vision_enabled: bool = False
+    """Query-time vision master switch (issue #462). Default OFF. When ON, selected
+    authorized artifact winners MAY be sent to the multimodal provider for
+    query-conditioned observations AFTER retrieval/rerank/distill/pack. Always
+    additionally gated by the per-vault multimodal provider opt-in, the exact-origin
+    allowlist, and SSRF — never sufficient alone to transmit data."""
 
     draft_max_sections: int = 12
     """Maximum outline sections a compile job may produce."""
