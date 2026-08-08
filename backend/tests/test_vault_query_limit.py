@@ -376,7 +376,8 @@ class TestVaultQueryLimitSQLiteVerification(unittest.TestCase):
                 org_id INTEGER,
                 visibility TEXT DEFAULT 'private',
                 owner_id INTEGER,
-                enrichment_enabled INTEGER
+                enrichment_enabled INTEGER,
+                multimodal_provider_enabled INTEGER
             );
             CREATE TABLE files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

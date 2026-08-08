@@ -36,7 +36,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # sections 3.4, 6.4, 9.3) -- issue #437.
 # 57 -> 61: Multimodal RAG foundation (issue #460) adds document_atoms,
 # document_assets, ingestion_stage_states, and artifact_delete_pending.
-EXPECTED_BASE_TABLE_COUNT = 61
+# 61 -> 62: Multimodal artifact enrichment (issue #461) adds
+# document_atom_enrichments.
+EXPECTED_BASE_TABLE_COUNT = 62
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

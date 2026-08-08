@@ -492,6 +492,106 @@ class TestBackgroundTaskLifecycle:
         sweep = asyncio.run(_scenario())
         assert sweep.cancelled()
 
+    def test_stop_drains_atom_enrichment_queue(self):
+        """Regression (review finding): graceful stop must drain the atom
+        (multimodal) enrichment queue before cancelling its worker, rather than
+        dropping queued artifacts."""
+        import asyncio
+        import types
+
+        from app.services.background_tasks import (
+            AtomEnrichmentTaskItem,
+            BackgroundProcessor,
+        )
+
+        processed = []
+
+        proc = object.__new__(BackgroundProcessor)
+        proc._running = True
+        proc.queue = asyncio.Queue()
+        proc.enrichment_queue = asyncio.Queue()
+        proc.atom_enrichment_queue = asyncio.Queue()
+        proc.shutdown_event = asyncio.Event()
+        proc._worker_tasks = []
+        proc._enrichment_worker_task = None
+        proc._vector_delete_sweep_task = None
+        proc._reindex_worker_task = None
+        proc.processor = types.SimpleNamespace(vector_store=None)
+
+        async def _atom_worker():
+            while True:
+                item = await proc.atom_enrichment_queue.get()
+                processed.append(item.file_id)
+                proc.atom_enrichment_queue.task_done()
+
+        proc.atom_enrichment_queue.put_nowait(
+            AtomEnrichmentTaskItem(
+                file_id=7, vault_id=1, generation_hash="g", file_hash="h",
+                document_title="d", attempt=0,
+            )
+        )
+
+        async def _scenario():
+            worker = asyncio.create_task(_atom_worker())
+            proc._atom_enrichment_worker_task = worker
+            await proc.stop(timeout=5.0)
+            return worker
+
+        worker = asyncio.run(_scenario())
+        # The enqueued artifact was processed before the worker was cancelled.
+        assert processed == [7]
+        # A completed worker may have finished; if still running it must be cancelled.
+        assert worker.cancelled() or worker.done()
+
+    def test_stop_does_not_cancel_atom_worker_when_queued(self):
+        """Parameterized guard: with a live queued item and a slow consumer, the
+        worker must NOT be cancelled before the queue drains (bounded by timeout)."""
+        import asyncio
+        import types
+
+        from app.services.background_tasks import (
+            AtomEnrichmentTaskItem,
+            BackgroundProcessor,
+        )
+
+        processed = []
+
+        proc = object.__new__(BackgroundProcessor)
+        proc._running = True
+        proc.queue = asyncio.Queue()
+        proc.enrichment_queue = asyncio.Queue()
+        proc.atom_enrichment_queue = asyncio.Queue()
+        proc.shutdown_event = asyncio.Event()
+        proc._worker_tasks = []
+        proc._enrichment_worker_task = None
+        proc._vector_delete_sweep_task = None
+        proc._reindex_worker_task = None
+        proc.processor = types.SimpleNamespace(vector_store=None)
+
+        async def _atom_worker():
+            while True:
+                item = await proc.atom_enrichment_queue.get()
+                await asyncio.sleep(0)
+                processed.append(item.file_id)
+                proc.atom_enrichment_queue.task_done()
+
+        proc.atom_enrichment_queue.put_nowait(
+            AtomEnrichmentTaskItem(
+                file_id=9, vault_id=1, generation_hash="g", file_hash="h",
+                document_title="d", attempt=0,
+            )
+        )
+
+        async def _scenario():
+            worker = asyncio.create_task(_atom_worker())
+            proc._atom_enrichment_worker_task = worker
+            await proc.stop(timeout=5.0)
+            return worker
+
+        worker = asyncio.run(_scenario())
+        assert processed == [9]
+        assert worker.cancelled() or worker.done()
+
 
 class TestSweep:
     def test_sweep_collects_pending_tombstones(self, db, artifact_root):

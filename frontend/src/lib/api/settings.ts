@@ -70,6 +70,23 @@ export interface SettingsResponse {
   // Draft Room — admin opt-in; gates the sidebar nav entry & workspace
   draft_room_enabled?: boolean;
 
+  // Multimodal artifact enrichment (issue #461) — default off, fail-closed
+  multimodal_enrichment_enabled?: boolean;
+  multimodal_allowed_model_origins?: string[];
+  multimodal_chat_url?: string;
+  multimodal_model?: string;
+  multimodal_mode?: "thinking" | "instant";
+  multimodal_timeout_seconds?: number;
+  multimodal_concurrency?: number;
+  multimodal_max_assets_per_batch?: number;
+  multimodal_max_asset_bytes?: number;
+  multimodal_max_total_payload_bytes?: number;
+  multimodal_max_pixels?: number;
+  multimodal_max_attempts?: number;
+  multimodal_prompt_version?: string;
+  multimodal_schema_version?: string;
+  multimodal_impl_version?: string;
+
   // Optional LLM Wiki Curator config (PR B persists, PR C wires)
   wiki_llm_curator_enabled?: boolean;
   wiki_llm_curator_url?: string;
@@ -148,6 +165,22 @@ export interface UpdateSettingsRequest {
   kms_compile_on_ingest?: boolean;
   // Draft Room — admin opt-in; gates the sidebar nav entry & workspace
   draft_room_enabled?: boolean;
+  // Multimodal artifact enrichment (issue #461)
+  multimodal_enrichment_enabled?: boolean;
+  multimodal_allowed_model_origins?: string[];
+  multimodal_chat_url?: string;
+  multimodal_model?: string;
+  multimodal_mode?: "thinking" | "instant";
+  multimodal_timeout_seconds?: number;
+  multimodal_concurrency?: number;
+  multimodal_max_assets_per_batch?: number;
+  multimodal_max_asset_bytes?: number;
+  multimodal_max_total_payload_bytes?: number;
+  multimodal_max_pixels?: number;
+  multimodal_max_attempts?: number;
+  multimodal_prompt_version?: string;
+  multimodal_schema_version?: string;
+  multimodal_impl_version?: string;
   // Optional LLM Wiki Curator config
   wiki_llm_curator_enabled?: boolean;
   wiki_llm_curator_url?: string;

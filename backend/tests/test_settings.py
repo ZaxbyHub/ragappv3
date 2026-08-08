@@ -829,6 +829,46 @@ class TestSettingsInfraRedaction(unittest.TestCase):
         for field in self.REDACTED_FIELDS:
             self.assertNotIn(field, effective_sources)
 
+    def test_viewer_multimodal_allowlist_redacted_typeaware(self):
+        # F-4: the multimodal allowlist is a list[str] response field. Redacting it
+        # to "" (the blanket loop) would fail SettingsResponse validation, so it must
+        # be blanked to [] for non-admins. It must also be stripped from
+        # effective_sources so a viewer cannot learn it was configured.
+        original = settings.multimodal_allowed_model_origins
+        settings.multimodal_allowed_model_origins = [
+            "http://mm-internal:9000", "https://mm-public:443"
+        ]
+        self.addCleanup(setattr, settings, "multimodal_allowed_model_origins", original)
+
+        self._override_role("viewer")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        # Type-aware: must be a list (empty), not a string, so SettingsResponse
+        # (multimodal_allowed_model_origins: list[str]) validates.
+        self.assertEqual(
+            data["multimodal_allowed_model_origins"], [],
+            "viewer should see multimodal allowlist redacted to []",
+        )
+        self.assertNotIn(
+            "multimodal_allowed_model_origins", data.get("effective_sources", {}),
+            "viewer effective_sources leaks multimodal allowlist provenance",
+        )
+
+    def test_admin_sees_multimodal_allowlist(self):
+        original = settings.multimodal_allowed_model_origins
+        settings.multimodal_allowed_model_origins = ["http://mm-internal:9000"]
+        self.addCleanup(setattr, settings, "multimodal_allowed_model_origins", original)
+
+        self._override_role("admin")
+        response = self.client.get("/api/settings")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(
+            data["multimodal_allowed_model_origins"], ["http://mm-internal:9000"],
+            "admin should see the real multimodal allowlist",
+        )
+
     def test_admin_sees_full_infra_fields(self):
         self._override_role("admin")
         response = self.client.get("/api/settings")

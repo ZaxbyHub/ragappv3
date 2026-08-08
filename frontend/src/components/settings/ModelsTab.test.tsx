@@ -55,6 +55,21 @@ function formData(): SettingsFormData {
     wiki_llm_curator_run_on_query: false,
     wiki_llm_curator_run_on_manual: true,
     maintenance_mode: false,
+    multimodal_enrichment_enabled: false,
+    multimodal_allowed_model_origins: [],
+    multimodal_chat_url: "",
+    multimodal_model: "",
+    multimodal_mode: "thinking",
+    multimodal_timeout_seconds: 60,
+    multimodal_concurrency: 2,
+    multimodal_max_assets_per_batch: 4,
+    multimodal_max_asset_bytes: 10 * 1024 * 1024,
+    multimodal_max_total_payload_bytes: 40 * 1024 * 1024,
+    multimodal_max_pixels: 4_000_000,
+    multimodal_max_attempts: 3,
+    multimodal_prompt_version: "v1",
+    multimodal_schema_version: "v1",
+    multimodal_impl_version: "1",
   };
 }
 
@@ -140,4 +155,123 @@ describe("ModelsTab", () => {
     fireEvent.blur(input);
     expect(input).toHaveValue(4096);
   });
+
+  it("renders the global multimodal enrichment card and emits toggle changes", () => {
+    const onChange = vi.fn();
+    render(
+      <ModelsTab
+        formData={formData()}
+        errors={{}}
+        onChange={onChange}
+        effectiveSources={{}}
+      />,
+    );
+
+    expect(
+      screen.getByText(/Multimodal artifact enrichment/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/External data egress/i),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByLabelText(/Enable multimodal enrichment globally/i),
+    );
+
+    expect(onChange).toHaveBeenCalledWith(
+      "multimodal_enrichment_enabled",
+      true,
+    );
+  });
+
+  it("converts the comma-separated allowlist into an origins array", () => {
+    const onChange = vi.fn();
+    render(
+      <ModelsTab
+        formData={formData()}
+        errors={{}}
+        onChange={onChange}
+        effectiveSources={{}}
+      />,
+    );
+
+    const originsInput = screen.getByLabelText(/Allowed provider origins/i);
+    fireEvent.change(originsInput, {
+      target: { value: "https://provider.example.com, http://localhost:11434 " },
+    });
+
+    expect(onChange).toHaveBeenCalledWith(
+      "multimodal_allowed_model_origins",
+      ["https://provider.example.com", "http://localhost:11434"],
+    );
+  });
+
+  it("shows the vault multimodal opt-in tri-state when a vaultId is provided", async () => {
+    const { getVault, toggleVaultMultimodalProvider } = await import(
+      "@/lib/api"
+    );
+    vi.mocked(getVault).mockResolvedValue({
+      id: 7,
+      name: "Vault",
+      description: "",
+      created_at: "",
+      updated_at: "",
+      file_count: 0,
+      memory_count: 0,
+      session_count: 0,
+      org_id: null,
+      current_user_permission: "admin",
+      enrichment_enabled: null,
+      effective_enrichment_enabled: true,
+      multimodal_provider_enabled: null,
+      effective_multimodal_enabled: true,
+    });
+    vi.mocked(toggleVaultMultimodalProvider).mockResolvedValue({
+      id: 7,
+      name: "Vault",
+      description: "",
+      created_at: "",
+      updated_at: "",
+      file_count: 0,
+      memory_count: 0,
+      session_count: 0,
+      org_id: null,
+      current_user_permission: "admin",
+      enrichment_enabled: null,
+      effective_enrichment_enabled: true,
+      multimodal_provider_enabled: null,
+      effective_multimodal_enabled: true,
+    });
+
+    render(
+      <ModelsTab
+        formData={formData()}
+        errors={{}}
+        onChange={vi.fn()}
+        effectiveSources={{}}
+        vaultId={7}
+      />,
+    );
+
+    expect(
+      await screen.findByText(/Multimodal provider opt-in \(this vault\)/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Vault data egress/i),
+    ).toBeInTheDocument();
+    // Tri-state radios inherit/on/off render
+    expect(screen.getByLabelText(/Inherit global/i)).toBeInTheDocument();
+    expect(screen.getByLabelText("On")).toBeInTheDocument();
+    expect(screen.getByLabelText("Off")).toBeInTheDocument();
+  });
+});
+
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    getVault: vi.fn(),
+    toggleVaultMultimodalProvider: vi.fn(),
+  };
 });

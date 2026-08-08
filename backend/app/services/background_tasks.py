@@ -8,6 +8,7 @@ documents with retry logic and graceful shutdown.
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import List, Optional
@@ -19,6 +20,7 @@ from .document_processor import DocumentProcessingError, DocumentProcessor
 from .embeddings import EmbeddingService
 from .llm_client import LLMClient
 from .maintenance import MaintenanceService
+from .multimodal_enrichment import ArtifactEnrichmentService
 from .vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,7 @@ def get_background_processor(
     maintenance_service: Optional[MaintenanceService] = None,
     pool: Optional["SQLiteConnectionPool"] = None,
     llm_client: Optional[LLMClient] = None,
+    multimodal_service: Optional[ArtifactEnrichmentService] = None,
 ) -> "BackgroundProcessor":
     """
     Get or create the singleton BackgroundProcessor instance.
@@ -70,6 +73,7 @@ def get_background_processor(
         maintenance_service: MaintenanceService instance for maintenance mode checks
         pool: SQLiteConnectionPool instance for database connections
         llm_client: LLMClient instance for contextual chunking
+        multimodal_service: Optional atom-scoped multimodal enrichment service.
 
     Returns:
         The singleton BackgroundProcessor instance
@@ -86,6 +90,7 @@ def get_background_processor(
             maintenance_service=maintenance_service,
             pool=pool,
             llm_client=llm_client,
+            multimodal_service=multimodal_service,
         )
         logger.info("Created singleton BackgroundProcessor instance")
     return _processor_instance
@@ -162,6 +167,27 @@ class ReindexTaskItem:
     job_id: int
 
 
+@dataclass
+class AtomEnrichmentTaskItem:
+    """Atom-scoped multimodal enrichment task for an already indexed file.
+
+    Attributes:
+        file_id: Database ID of the file.
+        vault_id: Vault the file belongs to.
+        generation_hash: The source generation whose atoms to enrich.
+        file_hash: SHA-256 of the file content.
+        document_title: Title used as top-level prompt context.
+        attempt: Current retry attempt (0 = first).
+    """
+
+    file_id: int
+    vault_id: int
+    generation_hash: str
+    file_hash: str
+    document_title: str
+    attempt: int = 0
+
+
 class BackgroundProcessor:
     """
     Background task processor using asyncio.Queue for document ingestion.
@@ -196,6 +222,7 @@ class BackgroundProcessor:
         maintenance_service: Optional[MaintenanceService] = None,
         pool: Optional["SQLiteConnectionPool"] = None,
         llm_client: Optional[LLMClient] = None,
+        multimodal_service: Optional[ArtifactEnrichmentService] = None,
     ):
         """
         Initialize the background processor.
@@ -210,11 +237,13 @@ class BackgroundProcessor:
             maintenance_service: MaintenanceService instance for maintenance mode
             pool: SQLiteConnectionPool instance for database connections
             llm_client: LLMClient instance for contextual chunking
+            multimodal_service: Optional atom-scoped multimodal enrichment service.
         """
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.queue: asyncio.Queue[TaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
         self.enrichment_queue: asyncio.Queue[EnrichmentTaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
+        self.atom_enrichment_queue: asyncio.Queue[AtomEnrichmentTaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
         self.reindex_queue: asyncio.Queue[ReindexTaskItem] = asyncio.Queue(maxsize=settings.ingestion_queue_max_size)
         self.shutdown_event = asyncio.Event()
         self.processor = DocumentProcessor(
@@ -225,8 +254,10 @@ class BackgroundProcessor:
             pool=pool,
             llm_client=llm_client,
         )
+        self.multimodal_service = multimodal_service
         self._worker_tasks: List[asyncio.Task] = []
         self._enrichment_worker_task: Optional[asyncio.Task] = None
+        self._atom_enrichment_worker_task: Optional[asyncio.Task] = None
         self._vector_delete_sweep_task: Optional[asyncio.Task] = None
         self._artifact_delete_sweep_task: Optional[asyncio.Task] = None
         self._reindex_worker_task: Optional[asyncio.Task] = None
@@ -285,11 +316,17 @@ class BackgroundProcessor:
         self._enrichment_worker_task = asyncio.create_task(
             self._enrichment_worker_loop(), name="enrichment-worker"
         )
+        if self.multimodal_service is not None:
+            self._atom_enrichment_worker_task = asyncio.create_task(
+                self._atom_enrichment_worker_loop(), name="atom-enrichment-worker"
+            )
         self._reindex_worker_task = asyncio.create_task(self._reindex_worker_loop(), name="reindex-worker")
 
         # Step 3: NOW run recovery. Workers are ready to consume.
         await self._recover_stranded_pending_rows()
         await self._recover_stranded_enrichment_rows()
+        await self._recover_stranded_atom_enrichment_rows()
+        await self._resume_pending_atom_enrichment()
         await self.retry_pending_vector_deletes()
         await self.sweep_pending_artifact_deletes()
         # Re-run the vector-delete reconciliation hourly so orphaned chunks
@@ -626,6 +663,402 @@ class BackgroundProcessor:
         if recovered:
             logger.info("Recovered %d stranded enrichment row(s)", recovered)
 
+    async def _recover_stranded_atom_enrichment_rows(self) -> None:
+        """Reclaim stranded atom-scoped 'enrich' stage rows (running -> pending).
+
+        This is distinct from the file-level chunk-enrichment recovery above: it
+        operates on the #460 ``ingestion_stage_states`` atom rows, resuming atom-
+        scoped work instead of marking it as a file-level error. Safe to run on a
+        worker that owns no multimodal service (no-op).
+        """
+        if self.processor is None or self.processor.pool is None:
+            return
+        try:
+            from . import enrichment_state as est
+
+            with self.processor.pool.connection() as conn:
+                recovered = est.recover_stranded_atom_stages(conn)
+                conn.commit()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Stranded atom enrichment recovery sweep failed: %s", exc)
+            return
+        if recovered:
+            logger.info("Recovered %d stranded atom enrichment stage(s)", recovered)
+
+    async def _resume_pending_atom_enrichment(self) -> None:
+        """Re-enqueue files with actionable atom stages after a restart.
+
+        Recovering stranded ``running`` rows to ``pending`` in itself only marks
+        them actionable; this step finds every file with an actionable atom stage
+        and enqueues it (still gated by the global/vault/allowlist authorization
+        check) so interrupted multimodal work actually resumes on startup.
+        """
+        if self.multimodal_service is None or self.processor is None:
+            return
+        if self.processor.pool is None:
+            return
+        try:
+            from . import enrichment_state as est
+
+            enqueued = 0
+            with self.processor.pool.connection() as conn:
+                # (1) Files with actionable stage rows (interrupted work).
+                rows = conn.execute(
+                    "SELECT DISTINCT s.file_id, f.vault_id, f.file_hash "
+                    "FROM ingestion_stage_states s "
+                    "JOIN files f ON f.id = s.file_id "
+                    "WHERE s.stage = ? "
+                    "AND s.status IN (?, ?, ?)",
+                    (
+                        est.ENRICH_STAGE,
+                        est.PENDING,
+                        est.FAILED_RETRYABLE,
+                        est.SKIPPED_NOT_APPLICABLE,
+                    ),
+                ).fetchall()
+                # (2) Backfill: files whose active generation has eligible-kind
+                # atoms but NO enrichment stage row at all. Enabling multimodal
+                # after ingestion creates no stage rows (F-6a), so these files
+                # would otherwise never be enriched without a re-ingest.
+                # Restricted to 'indexed' files so error/deleted/processing-state
+                # rows are not (re)enqueued for enrichment.
+                backfill_rows = conn.execute(
+                    "SELECT DISTINCT a.file_id, f.vault_id, f.file_hash "
+                    "FROM document_atoms a "
+                    "JOIN files f ON f.id = a.file_id "
+                    "WHERE f.status = 'indexed' "
+                    "AND a.generation_hash = f.active_generation_hash "
+                    "AND a.kind IN ('image','chart','table','equation') "
+                    "AND NOT EXISTS ("
+                    "  SELECT 1 FROM ingestion_stage_states s "
+                    "  WHERE s.file_id = a.file_id "
+                    "  AND s.generation_hash = a.generation_hash "
+                    "  AND s.stage = ? "
+                    "  AND s.atom_id = a.id"
+                    ")",
+                    (est.ENRICH_STAGE,),
+                ).fetchall()
+            seen: set[tuple[int, int]] = set()
+            for row in rows + backfill_rows:
+                if self.shutdown_event.is_set():
+                    break
+                key = (row["file_id"], row["vault_id"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                file_id = row["file_id"]
+                vault_id = row["vault_id"]
+                if not self._should_enqueue_atom_enrichment(file_id, vault_id):
+                    continue
+                gen_row = None
+                with self.processor.pool.connection() as conn:
+                    gen_row = conn.execute(
+                        "SELECT active_generation_hash FROM files WHERE id = ?",
+                        (file_id,),
+                    ).fetchone()
+                generation_hash = gen_row["active_generation_hash"] if gen_row else None
+                if not generation_hash:
+                    continue
+                try:
+                    self.atom_enrichment_queue.put_nowait(
+                        AtomEnrichmentTaskItem(
+                            file_id=file_id,
+                            vault_id=vault_id,
+                            generation_hash=generation_hash,
+                            file_hash=row["file_hash"] or "",
+                            document_title="",
+                            attempt=0,
+                        )
+                    )
+                    enqueued += 1
+                except asyncio.QueueFull:
+                    break
+            if enqueued:
+                logger.info("Resumed atom enrichment for %d file(s) on startup", enqueued)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Atom enrichment resume sweep failed: %s", exc)
+
+    def _should_enqueue_atom_enrichment(self, file_id: int, vault_id: int) -> bool:
+        """Return True when atom enrichment should be enqueued (authorization gate).
+
+        Checks global + vault opt-in + non-empty allowlist + presence of eligible
+        typed atoms. Policy is rechecked immediately before every provider call.
+        """
+        if self.multimodal_service is None:
+            return False
+        if not settings.multimodal_enrichment_enabled:
+            return False
+
+        with self.processor.pool.connection() as conn:
+            vault_row = conn.execute(
+                "SELECT multimodal_provider_enabled FROM vaults WHERE id = ?",
+                (vault_id,),
+            ).fetchone()
+            if vault_row is None:
+                return False
+            raw = vault_row["multimodal_provider_enabled"]
+            # Multimodal enrichment sends vault artifacts to an external
+            # provider, so it requires an EXPLICIT per-vault opt-in. The column
+            # is SQLite INTEGER (1/0) — normalize via bool() so a stored 1 is
+            # accepted and NULL (inherit) and 0 (off) are fail-closed.
+            if not bool(raw):
+                return False
+            gen_row = conn.execute(
+                "SELECT active_generation_hash FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+            generation_hash = gen_row["active_generation_hash"] if gen_row else None
+            if not generation_hash:
+                return False
+            eligible = conn.execute(
+                "SELECT 1 FROM document_atoms WHERE file_id = ? AND generation_hash = ? "
+                "AND kind IN ('image','chart','table','equation') LIMIT 1",
+                (file_id, generation_hash),
+            ).fetchone()
+            if eligible is None:
+                return False
+        allow = list(settings.multimodal_allowed_model_origins or [])
+        if not (allow and settings.multimodal_chat_url):
+            return False
+        # Run the real exact-origin + SSRF policy check here, not just the
+        # allowlist-non-empty test. Without it, a misconfigured origin (trailing
+        # slash, scheme/port mismatch, non-allowlisted host) would pass enqueue and
+        # then stamp every atom SKIPPED_POLICY permanently at the worker, where the
+        # policy-only status is terminal (F-6). Catching it at the gate means the
+        # item is simply not enqueued and no irrecoverable stage is written.
+        try:
+            self.multimodal_service.client._assert_policy()
+        except Exception:  # noqa: BLE001 — policy denial is the point
+            return False
+        return True
+
+    def enqueue_atom_enrichment(
+        self,
+        *,
+        file_id: int,
+        vault_id: int,
+        file_hash: str,
+        document_title: str,
+    ) -> bool:
+        """Enqueue atom enrichment (best-effort). Returns True if enqueued."""
+        if not self._should_enqueue_atom_enrichment(file_id, vault_id):
+            return False
+        with self.processor.pool.connection() as conn:
+            gen_row = conn.execute(
+                "SELECT active_generation_hash FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+            generation_hash = gen_row["active_generation_hash"] if gen_row else None
+        if not generation_hash:
+            return False
+        try:
+            self.atom_enrichment_queue.put_nowait(
+                AtomEnrichmentTaskItem(
+                    file_id=file_id,
+                    vault_id=vault_id,
+                    generation_hash=generation_hash,
+                    file_hash=file_hash,
+                    document_title=document_title or "",
+                    attempt=0,
+                )
+            )
+            return True
+        except asyncio.QueueFull:
+            logger.warning("Atom enrichment queue full for file_id=%s", file_id)
+            return False
+
+    async def _atom_enrichment_worker_loop(self) -> None:
+        """Process queued atom-scoped multimodal enrichment with bounded retry.
+
+        Runs only when a multimodal service is configured. On each completed job,
+        derived proxies are embedded and written through the existing LanceDB path
+        with add-then-delete so a failed re-embed leaves the base/raw proxy intact.
+        """
+        while True:
+            if self.shutdown_event.is_set() and self.atom_enrichment_queue.empty():
+                break
+            try:
+                item = await asyncio.wait_for(
+                    self.atom_enrichment_queue.get(), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                continue
+            try:
+                proxy_records = await self.multimodal_service.enrich_atoms(
+                    vault_id=item.vault_id,
+                    file_id=item.file_id,
+                    generation_hash=item.generation_hash,
+                    document_title=item.document_title,
+                )
+                if proxy_records:
+                    await self._write_atom_proxies(
+                        proxy_records,
+                        file_id=item.file_id,
+                        vault_id=item.vault_id,
+                        generation_hash=item.generation_hash,
+                    )
+                # Per-file aggregate status reflects partial/failed atoms.
+                self._sync_file_enrichment_status(item)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Atom enrichment job failed for file_id=%s", item.file_id
+                )
+                if self.shutdown_event.is_set():
+                    continue
+                # Atom enrichment retries are capped by the multimodal_max_attempts
+                # setting (default 3), not the ingestion max_retries.
+                max_atom_attempts = max(
+                    1, int(settings.multimodal_max_attempts or 1)
+                )
+                if item.attempt < max_atom_attempts:
+                    delay = self.retry_delay * (2 ** item.attempt)
+                    await asyncio.sleep(delay)
+                    if self.shutdown_event.is_set():
+                        continue
+                    item.attempt += 1
+                    await self.atom_enrichment_queue.put(item)
+                else:
+                    logger.error(
+                        "Atom enrichment permanently failed for file_id=%s",
+                        item.file_id,
+                    )
+            finally:
+                self.atom_enrichment_queue.task_done()
+
+    def _sync_file_enrichment_status(self, item: AtomEnrichmentTaskItem) -> None:
+        """Map atom-stage aggregates onto files.enrichment_status (distinct from base)."""
+        try:
+            from . import enrichment_state as est
+
+            with self.processor.pool.connection() as conn:
+                counts = est.aggregate_stage_status(
+                    conn, file_id=item.file_id, stage=est.ENRICH_STAGE
+                )
+                total = sum(counts.values())
+                if total == 0:
+                    status = "complete"
+                elif counts[est.FAILED_PERMANENT] == total:
+                    status = "error"
+                elif counts[est.SUCCEEDED] == total:
+                    status = "complete"
+                else:
+                    status = "partial"
+                conn.execute(
+                    "UPDATE files SET enrichment_status = ?, enrichment_error = NULL, "
+                    "enrichment_updated_at = ? WHERE id = ?",
+                    (status, datetime.now(UTC).isoformat(), item.file_id),
+                )
+                conn.commit()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not sync atom enrichment status: %s", exc)
+
+    async def _write_atom_proxies(
+        self,
+        proxy_records: list[dict],
+        *,
+        file_id: int,
+        vault_id: int,
+        generation_hash: str,
+    ) -> None:
+        """Embed proxy texts and write them via the LanceDB add-then-delete path.
+
+        New proxy rows are added first; only after they are durable are the prior
+        proxy rows (tracked by id in the derived table) deleted. A failed re-embed
+        therefore never removes the base/raw proxy.
+        """
+        from . import enrichment_state as est
+
+        emb_service = self.processor.embedding_service
+        vec_store = self.processor.vector_store
+        if emb_service is None or vec_store is None:
+            return
+        gen_short = generation_hash[:12]
+        new_records: list[dict] = []
+        new_ids: list[str] = []
+        texts = [pr["proxy_text"] for pr in proxy_records]
+        embeddings = await emb_service.embed_batch(texts, fail_fast=False)
+        emb_list, _failed = embeddings
+        for i, pr in enumerate(proxy_records):
+            # embed_batch returns a per-text list with None placeholders for any
+            # failed text; skip those so a None vector is never written to LanceDB.
+            if emb_list[i] is None:
+                continue
+            pid = f"{file_id}_{pr['atom_id']}_{gen_short}_{(pr.get('fingerprint') or '')[:8]}"
+            new_ids.append(pid)
+            metadata = {
+                "proxy": True,
+                "atom_id": pr.get("atom_id"),
+                "atom_kind": pr.get("atom_kind"),
+                "asset_id": pr.get("asset_id"),
+                "generation_hash": generation_hash,
+                "enrichment_status": pr.get("status", "succeeded"),
+                "fingerprint": pr.get("fingerprint"),
+                "description": pr.get("description", ""),
+                "raw_text": pr.get("proxy_text", ""),
+            }
+            new_records.append(
+                {
+                    "id": pid,
+                    "text": pr["proxy_text"],
+                    "file_id": str(file_id),
+                    "vault_id": str(vault_id),
+                    "chunk_index": 0,
+                    "metadata": json.dumps(metadata),
+                    "embedding": emb_list[i],
+                }
+            )
+        if not new_records:
+            return
+        # Determine which atoms were (re-)written in THIS batch so stale-id deletion
+        # is scoped to them only. Using the whole-file prior_proxy_ids here would
+        # delete sibling atoms' durable proxies that a partial re-enrichment did not
+        # touch, leaving dangling proxy_vector_id references in SQL (F-2 fix).
+        batch_atom_ids = [pr.get("atom_id") for pr in proxy_records]
+        with self.processor.pool.connection() as conn:
+            prior_ids = est.prior_proxy_ids_for_atoms(
+                conn, file_id=file_id, generation_hash=generation_hash,
+                atom_ids=[aid for aid in batch_atom_ids if aid],
+            )
+        stale_ids = [pid for pid in prior_ids if pid not in new_ids]
+        await vec_store.add_chunks_then_delete_ids(new_records, stale_ids)
+        # Record the new proxy vector ids in the derived table. Records are only
+        # persisted when the atom's current derived-record fingerprint still
+        # matches (set_proxy_vector_id is fingerprint-guarded and returns 0 on a
+        # stale row), so a concurrent re-enrichment can never pin a vector id to
+        # the wrong/outdated derived record.
+        with self.processor.pool.connection() as conn:
+            for rec in new_records:
+                meta = json.loads(rec["metadata"])
+                est.set_proxy_vector_id(
+                    conn,
+                    file_id=file_id,
+                    generation_hash=generation_hash,
+                    atom_id=meta.get("atom_id") or "",
+                    input_fingerprint=meta.get("fingerprint"),
+                    proxy_vector_id=rec["id"],
+                )
+            # A batch atom may have had a durable prior proxy superseded (stale) but
+            # produced no replacement row this run (e.g. its embed failed and was
+            # skipped). Its vector was just deleted from LanceDB (it is in stale_ids),
+            # so clear the dangling proxy_vector_id reference rather than let SQL keep
+            # claiming a proxy that no longer exists. Atoms that DID get a replacement
+            # this batch keep their freshly-recorded vector id.
+            #
+            # We derive the atom ids from the batch records directly rather than by
+            # splitting the composite vector id, which is not a safe reversible
+            # encoding (atom ids may contain underscores).
+            written_atom_ids = {
+                (json.loads(r["metadata"]).get("atom_id") or "") for r in new_records
+            }
+            for pr in proxy_records:
+                clear_atom_id = pr.get("atom_id") or ""
+                if clear_atom_id and clear_atom_id not in written_atom_ids:
+                    est.clear_proxy_vector_id(
+                        conn,
+                        file_id=file_id,
+                        generation_hash=generation_hash,
+                        atom_id=clear_atom_id,
+                    )
+            conn.commit()
+
     async def stop(self, timeout: float = 60.0) -> None:
         """
         Stop the background processor gracefully.
@@ -657,6 +1090,16 @@ class BackgroundProcessor:
                 await asyncio.wait_for(self.enrichment_queue.join(), timeout=timeout)
             except asyncio.TimeoutError:
                 logger.warning("Enrichment queue did not drain within timeout")
+            # The atom (multimodal) enrichment queue is drained too, so queued
+            # artifacts are not silently dropped on a graceful shutdown.
+            atom_queue = getattr(self, "atom_enrichment_queue", None)
+            if atom_queue is not None:
+                try:
+                    await asyncio.wait_for(atom_queue.join(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Atom enrichment queue did not drain within timeout"
+                    )
         self.shutdown_event.set()
 
         # Phase 2: Cancel remaining workers
@@ -667,6 +1110,10 @@ class BackgroundProcessor:
         if self._enrichment_worker_task:
             self._enrichment_worker_task.cancel()
             await asyncio.gather(self._enrichment_worker_task, return_exceptions=True)
+        atom_task = getattr(self, "_atom_enrichment_worker_task", None)
+        if atom_task:
+            atom_task.cancel()
+            await asyncio.gather(atom_task, return_exceptions=True)
         if self._vector_delete_sweep_task:
             self._vector_delete_sweep_task.cancel()
             await asyncio.gather(self._vector_delete_sweep_task, return_exceptions=True)
@@ -1079,6 +1526,13 @@ class BackgroundProcessor:
                         document_text=result.document_text,
                         attempt=0,
                     )
+                )
+            if self.multimodal_service is not None:
+                self.enqueue_atom_enrichment(
+                    file_id=result.file_id,
+                    vault_id=result.vault_id,
+                    file_hash=result.file_hash,
+                    document_title=os.path.basename(result.file_path or ""),
                 )
             logger.info(f"Successfully processed: {task.file_path}")
 
