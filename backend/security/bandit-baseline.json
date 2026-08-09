@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 70,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 62888,
+      "loc": 62891,
       "nosec": 0,
       "skipped_tests": 24
     },
@@ -88,7 +88,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 12,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2129,
+      "loc": 2130,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1388,7 +1388,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 424,
+      "loc": 426,
       "nosec": 0,
       "skipped_tests": 2
     },
@@ -2335,7 +2335,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1334     # page, so the non-sargable filename LIKE runs once, not twice (NF3).\n1335     ranked_sql = f\"\"\"\n1336     WITH raw_matches AS (\n1337         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,\n1338                bm25(files_content_fts) AS rank,\n1339                highlight(files_content_fts, 0, '<mark>', '</mark>') AS excerpt_raw,\n1340                1 AS type_priority\n1341         FROM files_content_fts\n1342         JOIN files f ON f.id = files_content_fts.rowid\n1343         WHERE files_content_fts MATCH ?\n1344           AND {vault_clause_body}\n1345         UNION ALL\n1346         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,\n1347                bm25(files_search_fts) AS rank,\n1348                COALESCE(\n1349                    NULLIF(highlight(files_search_fts, 4, '<mark>', '</mark>'), ''),\n1350                    NULLIF(highlight(files_search_fts, 5, '<mark>', '</mark>'), ''),\n1351                    NULLIF(highlight(files_search_fts, 1, '<mark>', '</mark>'), ''),\n1352                    NULLIF(highlight(files_search_fts, 3, '<mark>', '</mark>'), ''),\n1353                    NULLIF(highlight(files_search_fts, 6, '<mark>', '</mark>'), ''),\n1354                    highlight(files_search_fts, 0, '<mark>', '</mark>')\n1355                ) AS excerpt_raw,\n1356                2 AS type_priority\n1357         FROM files_search_fts\n1358         JOIN files f ON f.id = files_search_fts.rowid\n1359         WHERE files_search_fts MATCH ?\n1360           AND {vault_clause_meta}\n1361         UNION ALL\n1362         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,\n1363                0.0 AS rank, NULL AS excerpt_raw,\n1364                3 AS type_priority\n1365         FROM files f\n1366         WHERE LOWER(f.file_name) LIKE ?\n1367           AND {vault_clause_name}\n1368     ),\n1369     ranked AS (\n1370         SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority,\n1371                ROW_NUMBER() OVER (PARTITION BY id ORDER BY type_priority ASC, rank ASC) AS rn\n1372         FROM raw_matches\n1373     ),\n1374     deduped AS (\n1375         SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority\n1376         FROM ranked WHERE rn = 1\n1377     ),\n1378     full_count AS (\n1379         SELECT COUNT(*) AS n FROM deduped\n1380     )\n1381     SELECT d.id, d.file_name, d.vault_id, d.status, d.rank, d.excerpt_raw,\n1382            d.parsed_text, d.type_priority, fc.n AS total_count\n1383     FROM deduped d, full_count fc\n1384     ORDER BY d.type_priority ASC, d.rank ASC\n1385     LIMIT ? OFFSET ?\n1386     \"\"\"\n1387 \n",
+      "code": "1335     # page, so the non-sargable filename LIKE runs once, not twice (NF3).\n1336     ranked_sql = f\"\"\"\n1337     WITH raw_matches AS (\n1338         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,\n1339                bm25(files_content_fts) AS rank,\n1340                highlight(files_content_fts, 0, '<mark>', '</mark>') AS excerpt_raw,\n1341                1 AS type_priority\n1342         FROM files_content_fts\n1343         JOIN files f ON f.id = files_content_fts.rowid\n1344         WHERE files_content_fts MATCH ?\n1345           AND {vault_clause_body}\n1346         UNION ALL\n1347         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,\n1348                bm25(files_search_fts) AS rank,\n1349                COALESCE(\n1350                    NULLIF(highlight(files_search_fts, 4, '<mark>', '</mark>'), ''),\n1351                    NULLIF(highlight(files_search_fts, 5, '<mark>', '</mark>'), ''),\n1352                    NULLIF(highlight(files_search_fts, 1, '<mark>', '</mark>'), ''),\n1353                    NULLIF(highlight(files_search_fts, 3, '<mark>', '</mark>'), ''),\n1354                    NULLIF(highlight(files_search_fts, 6, '<mark>', '</mark>'), ''),\n1355                    highlight(files_search_fts, 0, '<mark>', '</mark>')\n1356                ) AS excerpt_raw,\n1357                2 AS type_priority\n1358         FROM files_search_fts\n1359         JOIN files f ON f.id = files_search_fts.rowid\n1360         WHERE files_search_fts MATCH ?\n1361           AND {vault_clause_meta}\n1362         UNION ALL\n1363         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,\n1364                0.0 AS rank, NULL AS excerpt_raw,\n1365                3 AS type_priority\n1366         FROM files f\n1367         WHERE LOWER(f.file_name) LIKE ?\n1368           AND {vault_clause_name}\n1369     ),\n1370     ranked AS (\n1371         SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority,\n1372                ROW_NUMBER() OVER (PARTITION BY id ORDER BY type_priority ASC, rank ASC) AS rn\n1373         FROM raw_matches\n1374     ),\n1375     deduped AS (\n1376         SELECT id, file_name, vault_id, status, rank, excerpt_raw, parsed_text, type_priority\n1377         FROM ranked WHERE rn = 1\n1378     ),\n1379     full_count AS (\n1380         SELECT COUNT(*) AS n FROM deduped\n1381     )\n1382     SELECT d.id, d.file_name, d.vault_id, d.status, d.rank, d.excerpt_raw,\n1383            d.parsed_text, d.type_priority, fc.n AS total_count\n1384     FROM deduped d, full_count fc\n1385     ORDER BY d.type_priority ASC, d.rank ASC\n1386     LIMIT ? OFFSET ?\n1387     \"\"\"\n1388 \n",
       "col_offset": 17,
       "end_col_offset": 7,
       "filename": "backend/app/api/routes/documents.py",
@@ -2346,9 +2346,8 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1335,
+      "line_number": 1336,
       "line_range": [
-        1335,
         1336,
         1337,
         1338,
@@ -2399,14 +2398,15 @@
         1383,
         1384,
         1385,
-        1386
+        1386,
+        1387
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1403         # matches exist). Single cheap count over the deduped CTE.\n1404         count_only_sql = f\"\"\"\n1405         WITH raw_matches AS (\n1406             SELECT f.id FROM files_content_fts\n1407             JOIN files f ON f.id = files_content_fts.rowid\n1408             WHERE files_content_fts MATCH ? AND {vault_clause_body}\n1409             UNION\n1410             SELECT f.id FROM files_search_fts\n1411             JOIN files f ON f.id = files_search_fts.rowid\n1412             WHERE files_search_fts MATCH ? AND {vault_clause_meta}\n1413             UNION\n1414             SELECT f.id FROM files f\n1415             WHERE LOWER(f.file_name) LIKE ? AND {vault_clause_name}\n1416         )\n1417         SELECT COUNT(*) FROM raw_matches\n1418         \"\"\"\n1419         count_cursor = await asyncio.to_thread(\n",
+      "code": "1404         # matches exist). Single cheap count over the deduped CTE.\n1405         count_only_sql = f\"\"\"\n1406         WITH raw_matches AS (\n1407             SELECT f.id FROM files_content_fts\n1408             JOIN files f ON f.id = files_content_fts.rowid\n1409             WHERE files_content_fts MATCH ? AND {vault_clause_body}\n1410             UNION\n1411             SELECT f.id FROM files_search_fts\n1412             JOIN files f ON f.id = files_search_fts.rowid\n1413             WHERE files_search_fts MATCH ? AND {vault_clause_meta}\n1414             UNION\n1415             SELECT f.id FROM files f\n1416             WHERE LOWER(f.file_name) LIKE ? AND {vault_clause_name}\n1417         )\n1418         SELECT COUNT(*) FROM raw_matches\n1419         \"\"\"\n1420         count_cursor = await asyncio.to_thread(\n",
       "col_offset": 25,
       "end_col_offset": 11,
       "filename": "backend/app/api/routes/documents.py",
@@ -2417,9 +2417,8 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1404,
+      "line_number": 1405,
       "line_range": [
-        1404,
         1405,
         1406,
         1407,
@@ -2433,14 +2432,15 @@
         1415,
         1416,
         1417,
-        1418
+        1418,
+        1419
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1496         conn.execute,\n1497         f\"SELECT COUNT(*) as total_files FROM files {vault_filter_sql}\".strip(),\n1498         vault_filter_params,\n",
+      "code": "1497         conn.execute,\n1498         f\"SELECT COUNT(*) as total_files FROM files {vault_filter_sql}\".strip(),\n1499         vault_filter_params,\n",
       "col_offset": 8,
       "end_col_offset": 71,
       "filename": "backend/app/api/routes/documents.py",
@@ -2451,16 +2451,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1497,
+      "line_number": 1498,
       "line_range": [
-        1497
+        1498
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1505         conn.execute,\n1506         f\"SELECT COALESCE(SUM(chunk_count), 0) as total_chunks FROM files {vault_filter_sql}\".strip(),\n1507         vault_filter_params,\n",
+      "code": "1506         conn.execute,\n1507         f\"SELECT COALESCE(SUM(chunk_count), 0) as total_chunks FROM files {vault_filter_sql}\".strip(),\n1508         vault_filter_params,\n",
       "col_offset": 8,
       "end_col_offset": 93,
       "filename": "backend/app/api/routes/documents.py",
@@ -2471,16 +2471,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1506,
+      "line_number": 1507,
       "line_range": [
-        1506
+        1507
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1515             conn.execute,\n1516             f\"SELECT COALESCE(SUM(file_size), 0) as total_size FROM files {vault_filter_sql}\".strip(),\n1517             vault_filter_params,\n",
+      "code": "1516             conn.execute,\n1517             f\"SELECT COALESCE(SUM(file_size), 0) as total_size FROM files {vault_filter_sql}\".strip(),\n1518             vault_filter_params,\n",
       "col_offset": 12,
       "end_col_offset": 93,
       "filename": "backend/app/api/routes/documents.py",
@@ -2491,16 +2491,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1516,
+      "line_number": 1517,
       "line_range": [
-        1516
+        1517
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1526         conn.execute,\n1527         f\"SELECT status, COUNT(*) as count FROM files {vault_filter_sql} GROUP BY status\".strip(),\n1528         vault_filter_params,\n",
+      "code": "1527         conn.execute,\n1528         f\"SELECT status, COUNT(*) as count FROM files {vault_filter_sql} GROUP BY status\".strip(),\n1529         vault_filter_params,\n",
       "col_offset": 8,
       "end_col_offset": 89,
       "filename": "backend/app/api/routes/documents.py",
@@ -2511,9 +2511,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1527,
+      "line_number": 1528,
       "line_range": [
-        1527
+        1528
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

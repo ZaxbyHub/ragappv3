@@ -371,6 +371,15 @@ class VisionEvidenceService:
                 return await asyncio.wait_for(_run(), timeout=float(settings.multimodal_timeout_seconds))
             except asyncio.TimeoutError:
                 return artifact_id, VISION_PROVIDER_UNAVAILABLE, None
+            except Exception:  # noqa: BLE001 — never raise to the caller loop (F-003)
+                # Any unexpected failure for THIS artifact (e.g. _conn_ctx pool
+                # exhaustion) degrades only that source; the sibling gather tasks
+                # still report their own statuses and the batch is not discarded.
+                # Ordering matters: `asyncio.TimeoutError is builtin TimeoutError`
+                # (an Exception) on 3.11, so this handler MUST come after the
+                # TimeoutError branch above. CancelledError is BaseException and
+                # still propagates, preserving cancellation.
+                return artifact_id, VISION_PROVIDER_UNAVAILABLE, None
 
     def _record_latency_bytes(self, started: float, payload_bytes: int) -> None:
         # Safe per-source aggregate accumulator (latency + byte counts only).

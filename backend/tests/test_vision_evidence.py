@@ -221,6 +221,10 @@ class TestRunDegradation(unittest.TestCase):
         try:
             # Vault not opted in -> a real block (NOT the feature-off V5 case).
             with (
+                # Isolate from the real SQLite pool (F-001): this test reaches
+                # _whole_batch_allowed inside run(), so _conn_ctx must be faked like
+                # its siblings or a fresh-clone single-file run opens ./data/app.db.
+                patch("app.services.vision_evidence._conn_ctx", lambda: _AsyncCtx(MagicMock())),
                 patch("app.services.vision_evidence._vault_opted_in", return_value=False),
                 patch.object(
                     svc, "_process_one", side_effect=AssertionError("must not call")
@@ -408,6 +412,30 @@ class TestProcessOneSecurity(unittest.TestCase):
         self.assertIsNone(result[2])
         self.assertTrue(reads)
         self.assertTrue(factory.called)
+
+    def test_unexpected_runtime_error_degrades_without_raising(self) -> None:
+        # F-003: an unexpected failure inside _run (e.g. DB pool exhaustion at
+        # _conn_ctx) must degrade THIS artifact to provider_unavailable and never
+        # raise to the caller loop — otherwise gather(return_exceptions=False)
+        # would discard every status in the batch.
+        svc = VisionEvidenceService()
+
+        def _boom():
+            raise RuntimeError("connection pool exhausted")
+
+        with (
+            patch("app.services.vision_evidence._conn_ctx", _boom),
+            patch("app.services.vision_evidence.record_security_event"),
+        ):
+            result = asyncio.run(
+                svc._process_one(
+                    query="q", src=_src("art1", modality="image", asset_id="asset-1"),
+                    vault_id=1, user={"id": 1}, evaluate=None,
+                    semaphore=asyncio.Semaphore(1),
+                )
+            )
+        self.assertEqual(result[1], VISION_PROVIDER_UNAVAILABLE)
+        self.assertIsNone(result[2])
 
 async def _can_read_true(user, evaluate, c, vid):
     """Always-True coroutine for patching `_can_read` (it is awaited)."""

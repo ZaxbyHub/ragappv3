@@ -1134,10 +1134,11 @@ async def get_artifact_raw(
     vault in scoped queries, requires current vault ``read`` permission, resolves the
     persisted relative path only beneath the confined per-vault artifact root (rejects
     traversal / symlink / wrong-parent / out-of-root), serves only the safe raster MIME
-    allowlist, and never accepts a storage path from the caller. 403 for missing vault
-    read permission (mirrors get_document_raw); nondisclosing 404 for missing IDs /
-    unavailable assets (no leak that an artifact exists). No path / base64 / data-URL is
-    ever emitted.
+    allowlist, and never accepts a storage path from the caller. Missing vault read
+    permission returns 403 (mirrors ``get_document_raw``; this necessarily discloses to an
+    otherwise-authorized caller that the artifact exists — the same existence oracle the
+    sibling raw-file endpoint already exposes on a sequential ``file_id``). Missing IDs and
+    unavailable assets return a nondisclosing 404. No path / base64 / data-URL is ever emitted.
     """
     # (1) Joined artifact -> file -> vault membership by opaque atom id.
     atom = await asyncio.to_thread(
