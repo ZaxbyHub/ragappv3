@@ -5,6 +5,7 @@ Handles document retrieval, filtering by relevance thresholds, and window expans
 
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
@@ -107,6 +108,103 @@ def _group_aware_dedup(
     return selected
 
 
+def _coerce_metadata_dict(metadata: Any) -> Dict[str, Any]:
+    """Coerce artifact metadata (dict or JSON string) to a dict, else {}.
+
+    Multi-modal RAG proxies persist their identity nested inside the LanceDB
+    ``metadata`` column, which `_normalize_metadata` later parses. During early
+    retrieval stages (e.g. token packing in rag_engine) the metadata may still be
+    a raw JSON string, so identity extraction must be defensive about the shape.
+    """
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        try:
+            parsed = json.loads(metadata)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {}
+
+
+def artifact_id_from_metadata(metadata: Any) -> Optional[str]:
+    """Return the canonical opaque artifact id from proxy metadata, else None.
+
+    Canonical identity is the ``atom_id`` persisted by #461; ``artifact_id`` is
+    accepted as an alias so old/renamed rows are not lost.
+    """
+    m = _coerce_metadata_dict(metadata)
+    if not m:
+        return None
+    return m.get("atom_id") or m.get("artifact_id") or None
+
+
+def artifact_modality_from_metadata(metadata: Any) -> Optional[str]:
+    """Return the artifact modality (kind) from proxy metadata, else None."""
+    m = _coerce_metadata_dict(metadata)
+    if not m:
+        return None
+    return m.get("atom_kind") or m.get("modality") or None
+
+
+def _bounded_bbox(raw: Any) -> Optional[Dict[str, Any]]:
+    """Validate and bound a canonical bbox ``{x0,y0,x1,y1}`` (P4 contract).
+
+    Only finite numbers, nonnegative width/height, absolute coords <= 1e6, and no
+    extra keys are accepted. Any malformed / NaN / inf / negative / oversized /
+    extra-key payload yields ``None`` so nothing unsafe reaches the wire or UI.
+    """
+    if not isinstance(raw, dict):
+        return None
+    allowed = {"x0", "y0", "x1", "y1"}
+    if set(raw.keys()) != allowed:
+        return None
+    parts: Dict[str, Any] = {}
+    for key in ("x0", "y0", "x1", "y1"):
+        val = raw.get(key)
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            return None
+        if not math.isfinite(float(val)):
+            return None
+        parts[key] = float(val)
+    # nonnegative width/height
+    if parts["x1"] < parts["x0"] or parts["y1"] < parts["y0"]:
+        return None
+    if any(abs(v) > 1e6 for v in parts.values()):
+        return None
+    return parts
+
+
+def source_dedup_key(file_id: Any, text: Any, metadata: Any) -> tuple:
+    """Build a stable identity-preserving dedup key (issue #462).
+
+    When a record is an artifact proxy (has an artifact id), the key includes the
+    artifact id + text so two distinct artifacts with byte-identical proxy text
+    remain separate. Plain chunks fall back to ``(file_id, text)``.
+    """
+    artifact_id = artifact_id_from_metadata(metadata)
+    if artifact_id:
+        return ("artifact", artifact_id, str(text))
+    return ("chunk", str(file_id), str(text))
+
+
+def artifact_fields_from_metadata(metadata: Any) -> Dict[str, Any]:
+    """Extract the first-class artifact source fields from proxy metadata.
+
+    Returns a dict of ``artifact_id / modality / asset_id / bbox / description``
+    (each None when absent). defensive against dict-or-JSON-string metadata.
+    """
+    m = _coerce_metadata_dict(metadata)
+    return {
+        "artifact_id": m.get("atom_id") or m.get("artifact_id") or None,
+        "modality": m.get("atom_kind") or m.get("modality") or None,
+        "asset_id": m.get("asset_id") or None,
+        "bbox": _bounded_bbox(m.get("bbox")),
+        "description": m.get("description") or None,
+    }
+
+
 @dataclass
 class RAGSource:
     """Represents a retrieved document source."""
@@ -118,6 +216,30 @@ class RAGSource:
     # Parent-document retrieval field (Issue #12) — set by rag_engine when
     # parent_retrieval_enabled=True and the chunk has a stored parent window.
     parent_window_text: Optional[str] = None
+    # --- Multi-modal artifact identity (issue #462) ---
+    # Populated only for artifact proxy sources; None for plain text chunks.
+    artifact_id: Optional[str] = None  # canonical opaque atom_id
+    modality: Optional[str] = None  # image|chart|table|equation|code|...
+    asset_id: Optional[str] = None
+    bbox: Optional[Dict[str, Any]] = None  # bounded {x0,y0,x1,y1}
+    description: Optional[str] = None  # persisted offline description (proxy)
+    # Per-source degradation status — only set by the query-time vision run, never
+    # a blanket default here (V5: feature-off sources stay status-less).
+    vision_status: Optional[str] = None
+    # Validated query-conditioned observation (internal ONLY — never serialized to
+    # source JSON / SSE / history). Feeds the prompt and support-text scoring.
+    vision_observation: Optional[str] = None
+
+    def artifact_identity_key(self) -> tuple:
+        """Identity key for a RAGSource — artifact-aware (issue #462).
+
+        Mirrors ``source_dedup_key`` (str-coerces text) so the rebuild side of
+        the token-pack uses an identical key and a non-str text can never
+        silently drop a packed result.
+        """
+        if self.artifact_id:
+            return ("artifact", self.artifact_id, str(self.text))
+        return ("chunk", self.file_id, str(self.text))
 
 
 class DocumentRetrievalService:
@@ -251,12 +373,18 @@ class DocumentRetrievalService:
             # Carry the actual stored chunk ID so expand_window can handle
             # reupload-safe hash-prefixed IDs (e.g. "42_abc12345_default_0")
             raw_meta["_chunk_id"] = record.get("id", "")
+            artifact_fields = artifact_fields_from_metadata(raw_meta)
             sources.append(
                 RAGSource(
                     text=record.get("text", ""),
                     file_id=record.get("file_id", ""),
                     score=source_score,
                     metadata=raw_meta,
+                    # Multi-modal artifact identity (issue #462) — lifted from the
+                    # proxy metadata so identity survives retrieval as first-class
+                    # fields. vision_status stays None here (only the vision run
+                    # sets it — V5 feature-off stays status-less).
+                    **artifact_fields,
                 )
             )
 
@@ -564,6 +692,22 @@ class DocumentRetrievalService:
             "score": chunk.score,
             "metadata": chunk.metadata,
         }
+        # Multi-modal artifact presentation (issue #462): emit first-class
+        # optional artifact fields ONLY for artifact sources, and never when the
+        # query-time vision run did not set a status (V5 feature-off parity).
+        # Never emit _vision_observation / paths / bytes / base64 on the wire.
+        if chunk.artifact_id:
+            result["artifact_id"] = chunk.artifact_id
+            if chunk.modality:
+                result["modality"] = chunk.modality
+            if chunk.asset_id:
+                result["asset_id"] = chunk.asset_id
+            if chunk.bbox:
+                result["bbox"] = chunk.bbox
+            if chunk.description:
+                result["description"] = chunk.description
+            if chunk.vision_status:
+                result["vision_status"] = chunk.vision_status
         # Synthesized sources are LLM-condensed summaries, not concrete retrieved
         # documents. Drop the (placeholder) score so no relevance label renders
         # for them on any frontend surface (all guard on ``score !== undefined``).

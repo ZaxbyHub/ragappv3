@@ -124,6 +124,8 @@ class SettingsUpdate(BaseModel):
     multimodal_prompt_version: Optional[str] = None
     multimodal_schema_version: Optional[str] = None
     multimodal_impl_version: Optional[str] = None
+    # Issue #462 — query-time retrieval-first VLM master switch (default off).
+    multimodal_query_vision_enabled: Optional[bool] = None
 
     @field_validator("chunk_size")
     @classmethod
@@ -520,6 +522,7 @@ ALLOWED_FIELDS = [
     "multimodal_prompt_version",
     "multimodal_schema_version",
     "multimodal_impl_version",
+    "multimodal_query_vision_enabled",
 ]
 
 
@@ -751,6 +754,8 @@ class SettingsResponse(BaseModel):
     multimodal_prompt_version: str = "v1"
     multimodal_schema_version: str = "v1"
     multimodal_impl_version: str = "1"
+    # Issue #462 — query-time retrieval-first VLM master switch (default off).
+    multimodal_query_vision_enabled: bool = False
 
     # Limits (safe to expose)
     max_file_size_mb: int
@@ -870,6 +875,7 @@ def _build_settings_dict() -> dict:
         "multimodal_prompt_version": settings.multimodal_prompt_version,
         "multimodal_schema_version": settings.multimodal_schema_version,
         "multimodal_impl_version": settings.multimodal_impl_version,
+        "multimodal_query_vision_enabled": settings.multimodal_query_vision_enabled,
     }
     # NOTE: callers MUST set base["effective_sources"] explicitly with a
     # real DB connection. _compute_effective_sources(None) would silently
@@ -943,6 +949,9 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
     # Same for multimodal: redacted URL/model; don't disclose an enabled multimodal
     # backend to non-admins.
     settings_dict["multimodal_enrichment_enabled"] = False
+    # The query-time vision flag likewise discloses that a multimodal query-vision
+    # backend is wired; redact it symmetrically for non-admins (F-08).
+    settings_dict["multimodal_query_vision_enabled"] = False
     # Drop the provenance hints for redacted fields so a non-admin cannot learn
     # from effective_sources whether an infra URL was set (kv) vs default.
     effective_sources = settings_dict.get("effective_sources")

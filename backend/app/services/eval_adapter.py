@@ -125,6 +125,22 @@ class RetrievedRanking:
 
     query_id: str
     retrieved_ids: List[str] = field(default_factory=list)
+    artifact_ids: List[str] = field(default_factory=list)
+    status: str = "ok"  # "ok" | "partial" | "unavailable"
+
+
+@dataclass
+class RetrievalOutcome:
+    """Rich retrieval-only result with explicit status + artifact ids (issue #462).
+
+    Distinguishes "retrieved nothing relevant" (ok, empty) from a retrieval
+    outage (unavailable) or a partial failure (partial), so eval never conflates
+    an outage with empty recall.
+    """
+
+    status: str = "ok"  # "ok" | "partial" | "unavailable"
+    retrieved_ids: List[str] = field(default_factory=list)
+    artifact_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -135,6 +151,9 @@ class QueryMetrics:
     recall_at_k: Optional[float] = None
     mrr: Optional[float] = None
     ndcg_at_k: Optional[float] = None
+    # Issue #462 — surfaced artifact ids + explicit retrieval status (observation).
+    artifact_ids: List[str] = field(default_factory=list)
+    status: str = "ok"  # "ok" | "partial" | "unavailable"
 
 
 @dataclass
@@ -242,6 +261,16 @@ class RAGEngineRetrieveOnly(Protocol):
         """
         ...
 
+    async def retrieve_eval_results(
+        self, query: str, vault_id: Optional[int] = None, top_k: Optional[int] = None
+    ) -> RetrievalOutcome:
+        """Return rich retrieval outcome (status + ranked file_ids + artifact_ids).
+
+        Preferred over ``query_retrieve_only`` for eval so retrieval outages are
+        represented as ``partial``/``unavailable`` rather than an empty list.
+        """
+        ...
+
 
 class LiveEvalAdapter:
     """Adapter that runs retrieval-quality benchmarks against the live RAG pipeline.
@@ -326,20 +355,28 @@ class LiveEvalAdapter:
             # Recall — computed at effective_top_k
             recall = _recall(retrieved_ids, list(item.relevant_ids), effective_top_k)
 
-            # Only record a metric when we have ground-truth to compare against;
-            # a 0.0 MRR means "found nothing relevant" which is a valid score,
-            # but no expected ids means the metric is undefined (None).
+            # Only record a metric when we have ground-truth AND retrieval was not
+            # a total outage. Plan F: "denominators exclude `unavailable`" so an
+            # outage is recorded as a status, not folded into the means as a 0.0
+            # that would conflate outage with genuine zero recall.
             has_expected = bool(item.relevant_ids)
+            # A missing ranking is recorded as an outage (status="unavailable"), so
+            # it must be treated as one here too — otherwise `None != "unavailable"`
+            # evaluates True and a 0.0 (no-retrieval) query is folded into the means,
+            # conflating outage with genuine zero recall (Plan F).
+            not_outage = (ranking.status if ranking else "unavailable") != "unavailable"
             query_metrics.append(
                 QueryMetrics(
                     query_id=item.id,
                     mrr=mrr if has_expected else None,
                     ndcg_at_k=ndcg if has_expected else None,
                     recall_at_k=recall if has_expected else None,
+                    artifact_ids=list(ranking.artifact_ids) if ranking else [],
+                    status=ranking.status if ranking else "unavailable",
                 )
             )
 
-            if has_expected:
+            if has_expected and not_outage:
                 mrr_vals.append(mrr)
                 ndcg_vals.append(ndcg)
                 recall_vals.append(recall)
@@ -397,16 +434,37 @@ class LiveEvalAdapter:
             # Emit Searching event
             all_events.append(ProgressEvent(stage=STAGE_SEARCHING, query_id=item.id))
 
-            retrieved_ids = await rag_engine.query_retrieve_only(
-                query=item.query,
-                vault_id=vault_id,
-                top_k=effective_top_k,
-            )
+            # Prefer the rich outcome (status + artifact ids) so a retrieval
+            # outage is never misrepresented as empty recall (issue #462). Fall
+            # back to the legacy file_ids call for mocks that only implement it.
+            outcome = getattr(rag_engine, "retrieve_eval_results", None)
+            if outcome is not None:
+                res = await outcome(
+                    query=item.query,
+                    vault_id=vault_id,
+                    top_k=effective_top_k,
+                )
+                retrieved_ids = list(res.retrieved_ids)
+                artifact_ids = list(res.artifact_ids)
+                status = res.status
+            else:
+                retrieved_ids = await rag_engine.query_retrieve_only(
+                    query=item.query,
+                    vault_id=vault_id,
+                    top_k=effective_top_k,
+                )
+                artifact_ids = []
+                status = "ok"
 
             all_events.append(ProgressEvent(stage=STAGE_READING, query_id=item.id))
 
             retrieved_per_query.append(
-                RetrievedRanking(query_id=item.id, retrieved_ids=retrieved_ids)
+                RetrievedRanking(
+                    query_id=item.id,
+                    retrieved_ids=retrieved_ids,
+                    artifact_ids=artifact_ids,
+                    status=status,
+                )
             )
 
         # Compute release_id off the event loop (subprocess/git call).

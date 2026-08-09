@@ -7,6 +7,8 @@ import { cn } from "@/lib/utils";
 import { getRelevanceLabel, type ScoreType } from "@/lib/relevance";
 import type { Source } from "@/lib/api";
 
+const ARTIFACT_MODALITIES = new Set(["image", "chart", "table", "equation", "code"]);
+
 interface SourceCardProps {
   source: Source;
   /** Fallback ordinal for legacy sources without a source_label. */
@@ -70,6 +72,22 @@ function SourceCard({ source, fallbackIndex, onClick }: SourceCardProps) {
           </span>
         </div>
         <div className="flex items-center gap-1 shrink-0">
+          {source.modality && ARTIFACT_MODALITIES.has(source.modality) && (
+            <span
+              className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
+              aria-label={`modality: ${source.modality}`}
+            >
+              {source.modality}
+            </span>
+          )}
+          {source.vision_status && source.vision_status !== "used" && (
+            <span
+              className="shrink-0 rounded-sm bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600"
+              aria-label={`vision status: ${source.vision_status}`}
+            >
+              proxy
+            </span>
+          )}
           {isSynthesized && (
             <Badge
               variant="outline"

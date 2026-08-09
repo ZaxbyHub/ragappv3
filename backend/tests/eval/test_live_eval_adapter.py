@@ -240,6 +240,39 @@ class TestScoreRunMetrics:
         assert result.recall_mean == 0.0
         assert result.ndcg_mean == 0.0
 
+    def test_score_run_missing_ranking_for_query_excluded_from_means(self):
+        """F-05: a benchmark query with NO ranking is a retrieval outage, not a
+        zero. Its 0.0 metrics must be excluded from the aggregate means (Plan F:
+        denominators exclude 'unavailable'), so mrr_mean is None rather than 0.0."""
+        adapter = LiveEvalAdapter(top_k=3)
+
+        single_query = [BenchmarkItem(id="q1", query="test", relevant_ids=["f1"])]
+        # The benchmark covers q1 but no ranking was produced for it.
+        result = adapter.score_run(single_query, [], release_id=_FIXED_RELEASE_ID)
+
+        assert result.mrr_mean is None
+        assert result.recall_mean is None
+        assert result.ndcg_mean is None
+        assert result.query_metrics[0].status == "unavailable"
+
+    def test_score_run_partial_ranking_excludes_outage_query_from_means(self):
+        """F-05: with mixed coverage, the outage (unranked) query is excluded from
+        the means while ranked queries still contribute — no 0.0 is folded in."""
+        adapter = LiveEvalAdapter(top_k=3)
+        # q1 has a ranking; q2 has relevant_ids but no ranking (outage).
+        benchmark = [
+            BenchmarkItem(id="q1", query="a", relevant_ids=["f1"]),
+            BenchmarkItem(id="q2", query="b", relevant_ids=["f2"]),
+        ]
+        rankings = [RetrievedRanking(query_id="q1", retrieved_ids=["f1"])]
+
+        result = adapter.score_run(benchmark, rankings, release_id=_FIXED_RELEASE_ID)
+
+        assert result.mrr_mean == 1.0
+        assert {qm.query_id for qm in result.query_metrics} == {"q1", "q2"}
+        statuses = {qm.query_id: qm.status for qm in result.query_metrics}
+        assert statuses["q2"] == "unavailable"
+
     def test_score_run_top_k_override_changes_cutoff(self):
         """top_k_override causes metrics to be computed at the override k.
 

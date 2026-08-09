@@ -15,6 +15,12 @@ interface SourceCitationProps {
   variant?: "inline" | "strip";
 }
 
+const ARTIFACT_MODALITIES = new Set(["image", "chart", "table", "equation", "code"]);
+
+function isArtifactModality(modality?: string): boolean {
+  return !!modality && ARTIFACT_MODALITIES.has(modality);
+}
+
 export function SourceCitation({ source, index, onClick, variant = "strip" }: SourceCitationProps) {
   // Display label tracks the source's stable [S#] when assigned so sparse
   // citations (e.g. only S2 and S4 cited) keep their original numbering
@@ -71,6 +77,22 @@ export function SourceCitation({ source, index, onClick, variant = "strip" }: So
           >
             <FileText className="h-3 w-3 shrink-0" />
             <span className="truncate max-w-[120px]">{source.filename}</span>
+            {isArtifactModality(source.modality) && (
+              <span
+                className="shrink-0 rounded-sm bg-muted px-1 text-[9px] font-medium uppercase tracking-wide text-muted-foreground"
+                aria-label={`modality: ${source.modality}`}
+              >
+                {source.modality}
+              </span>
+            )}
+            {source.vision_status && source.vision_status !== "used" && (
+              <span
+                className="shrink-0 rounded-sm bg-amber-500/15 px-1 text-[9px] font-medium text-amber-600"
+                aria-label={`vision status: ${source.vision_status}`}
+              >
+                proxy
+              </span>
+            )}
           </button>
         </TooltipTrigger>
         {source.snippet && (

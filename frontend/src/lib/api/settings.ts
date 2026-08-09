@@ -72,6 +72,7 @@ export interface SettingsResponse {
 
   // Multimodal artifact enrichment (issue #461) — default off, fail-closed
   multimodal_enrichment_enabled?: boolean;
+  multimodal_query_vision_enabled?: boolean;
   multimodal_allowed_model_origins?: string[];
   multimodal_chat_url?: string;
   multimodal_model?: string;
@@ -167,6 +168,7 @@ export interface UpdateSettingsRequest {
   draft_room_enabled?: boolean;
   // Multimodal artifact enrichment (issue #461)
   multimodal_enrichment_enabled?: boolean;
+  multimodal_query_vision_enabled?: boolean;
   multimodal_allowed_model_origins?: string[];
   multimodal_chat_url?: string;
   multimodal_model?: string;

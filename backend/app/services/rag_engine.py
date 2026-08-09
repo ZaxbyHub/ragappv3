@@ -30,9 +30,19 @@ from app.services.citation_validator import (
     score_citations,
 )
 from app.services.context_distiller import ContextDistiller, SentenceProvenance
-from app.services.document_retrieval import DocumentRetrievalService, RAGSource
+from app.services.document_retrieval import (
+    DocumentRetrievalService,
+    RAGSource,
+    artifact_fields_from_metadata,
+    source_dedup_key,
+)
 from app.services.embeddings import EmbeddingError, EmbeddingService
-from app.services.eval_adapter import STAGE_DRAFTING, STAGE_READING, STAGE_SEARCHING
+from app.services.eval_adapter import (
+    STAGE_DRAFTING,
+    STAGE_READING,
+    STAGE_SEARCHING,
+    RetrievalOutcome,
+)
 from app.services.feedback_reranker import FeedbackReranker
 from app.services.llm_client import LLMClient, LLMError
 from app.services.memory_store import MemoryStore
@@ -41,6 +51,10 @@ from app.services.query_transformer import QueryPlanner, QueryTransformer
 from app.services.rag_trace import RAGTrace
 from app.services.retrieval_evaluator import RetrievalEvaluator
 from app.services.vector_store import SearchSemaphoreTimeoutError, VectorStore
+from app.services.vision_evidence import (
+    VisionRunContext,
+    apply_vision_to_sources,
+)
 from app.utils.fusion import rrf_fuse
 
 # Agentic tools are imported lazily behind the agentic_rag_enabled flag
@@ -132,6 +146,11 @@ class RetrievedSource:
     wiki_page_id: Optional[int] = None
     wiki_claim_id: Optional[int] = None
     kms_entry_id: Optional[int] = None
+    # --- Multi-modal artifact identity (issue #462) — for the eval adapter so it
+    # can distinguish multiple artifacts in one file and report artifact metrics.
+    artifact_id: Optional[str] = None  # canonical opaque atom_id
+    modality: Optional[str] = None  # image|chart|table|equation|code|...
+    asset_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -697,6 +716,7 @@ class RAGEngine:
         citation_mode: Optional[str] = None,
         include_global: bool = False,
         can_write_memory: bool = False,
+        vision_context: Optional[VisionRunContext] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute a RAG query: embed, search, build prompt, call LLM.
 
@@ -1499,6 +1519,49 @@ class RAGEngine:
         # the LLM now reads the assembled context.
         yield {"type": "stage", "stage": STAGE_READING}
 
+        # Issue #462 — retrieval-first vision evidence (LATE FUSION). Runs ONLY
+        # when a vision context was supplied (standard stream/non-stream chat) and
+        # eligible artifact sources exist, AFTER final distillation/packing/parent
+        # expansion and BEFORE prompt construction + source serialization (V1/V5).
+        # Per-source failures degrade to the stored proxy; this never changes rank
+        # or the [S#] labels. Cancelled on generator close (it is awaited here).
+        trace.artifact_sources_retrieved = sum(
+            1 for c in relevant_chunks if getattr(c, "artifact_id", None)
+        )
+        if vision_context is not None and relevant_chunks:
+            if any(
+                getattr(c, "artifact_id", None) and getattr(c, "modality", None)
+                for c in relevant_chunks
+            ):
+                try:
+                    vision_result = await vision_context.service.run(
+                        query=user_input,
+                        sources=relevant_chunks,
+                        vault_id=vault_id,
+                        user=vision_context.user,
+                        evaluate=vision_context.evaluate,
+                    )
+                    apply_vision_to_sources(vision_result, relevant_chunks)
+                    trace.vision_eligible = vision_result.eligible
+                    trace.vision_selected = vision_result.selected
+                    trace.vision_deduped = vision_result.deduped
+                    trace.vision_capped = vision_result.capped
+                    trace.vision_used = vision_result.vlm_used
+                    trace.vision_proxy_only = vision_result.proxy_only
+                    trace.vision_policy_blocked = vision_result.policy_blocked
+                    trace.vision_asset_missing = vision_result.asset_missing
+                    trace.vision_provider_unavailable = vision_result.provider_unavailable
+                    trace.vision_latency_ms = vision_result.latency_ms
+                    trace.vision_payload_bytes = vision_result.payload_bytes
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Never let a vision failure break the answer path; fall back to
+                    # the stored proxies with no statuses (V1/V5).
+                    logger.warning(
+                        "Query-time vision failed, continuing with proxies: %s", exc
+                    )
+
         # Build messages using prompt builder service.
         # Resolve the org-specific prompt (if any) per-query so different orgs
         # always get their own version without stale caching on the builder.
@@ -1620,17 +1683,26 @@ class RAGEngine:
             trace.answer_supported = None
 
         # Citation confidence scoring and unverifiable-claims (FR-004).
-        # Build source texts from the distilled sources so we can score citation
-        # alignment with retrieved evidence. v1 uses full-source lexical overlap;
-        # provenance-narrowed scoring is reserved for a future iteration.
+        # Build an INTERNAL support-text registry from the authoritative
+        # relevant_chunks (raw/proxy evidence + offline description + validated
+        # query observation). Wire-facing source metadata does not carry a `text`
+        # key; scoring must use this internal registry (issue #462). Lexical/Jaccard
+        # overlap here is support-scoring only — never pixel-level entailment.
         try:
-            source_texts = [
-                s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")
-                for s in done_msg.get("sources", [])
-            ]
+            support_texts: List[str] = []
+            for chunk in relevant_chunks:
+                parts: List[str] = []
+                raw = chunk.metadata.get("raw_text") or chunk.text
+                if raw:
+                    parts.append(raw)
+                if getattr(chunk, "description", None):
+                    parts.append(chunk.description)
+                if getattr(chunk, "vision_observation", None):
+                    parts.append(chunk.vision_observation)
+                support_texts.append("\n".join(parts))
             confidence_result = score_citations(
                 full_response,
-                source_texts,
+                support_texts,
                 sentence_provenance=self._last_distillation_provenance,
             )
             trace.citation_confidence = confidence_result.citation_confidence
@@ -1867,11 +1939,15 @@ class RAGEngine:
             limit=None,
         )
 
-        # Deduplicate by (file_id, text), preserving RRF rank order (first-seen wins).
-        seen: Set[Tuple[str, str]] = set()
+        # Deduplicate preserving RRF rank order (first-seen wins). Identity-aware
+        # key (issue #462): artifact proxids with identical proxy text but distinct
+        # artifact ids must NOT collapse.
+        seen: Set[tuple] = set()
         deduped: List[Dict[str, Any]] = []
         for record in fused:
-            key = (str(record.get("file_id", "")), record.get("text", ""))
+            key = source_dedup_key(
+                record.get("file_id", ""), record.get("text", ""), record.get("metadata")
+            )
             if key not in seen:
                 seen.add(key)
                 deduped.append(record)
@@ -2237,29 +2313,37 @@ class RAGEngine:
             try:
                 # Token packing (only if we have results)
                 if settings.context_max_tokens > 0:
+                    # Build temp RAGSource objects with first-class artifact
+                    # identity lifted from the proxy metadata (P2, issue #462) so
+                    # identity survives packing. metadata may be a JSON string at
+                    # this stage; artifact_fields_from_metadata is defensive.
                     temp_sources = [
                         RAGSource(
                             text=r.get("text", ""),
                             file_id=str(r.get("file_id", "")),
                             score=r.get("_distance", 0.0),
                             metadata=r.get("metadata", {}),
+                            **artifact_fields_from_metadata(r.get("metadata", {})),
                         )
                         for r in vector_results
                     ]
                     packed_sources, token_pack_stats = self._pack_context_by_token_budget(
                         temp_sources, settings.context_max_tokens
                     )
-                    # Rebuild vector_results in packed_sources ORDER (preserves reranker ranking).
-                    # Use (file_id, text) composite key — more unique than text alone.
+                    # Rebuild vector_results in packed_sources ORDER (preserves
+                    # reranker ranking). Identity-aware key (issue #462): distinct
+                    # artifact proxies with identical proxy text must not collapse.
                     _key_to_result: Dict[tuple, Any] = {}
                     for r in vector_results:
-                        k = (str(r.get("file_id", "")), r.get("text", ""))
+                        k = source_dedup_key(
+                            r.get("file_id", ""), r.get("text", ""), r.get("metadata")
+                        )
                         if k not in _key_to_result:  # first-seen wins (reranker order)
                             _key_to_result[k] = r
                     vector_results = [
-                        _key_to_result[(s.file_id, s.text)]
-                        for s in packed_sources
-                        if (s.file_id, s.text) in _key_to_result
+                        _key_to_result[packed.artifact_identity_key()]
+                        for packed in packed_sources
+                        if packed.artifact_identity_key() in _key_to_result
                     ]
                     logger.info(
                         "Token packing: %d results → %d results (budget=%d tokens, "
@@ -2982,11 +3066,33 @@ class RAGEngine:
             retrieval pipeline scoring).
         """
         effective_top_k = top_k if top_k is not None else self.retrieval_top_k
+        outcome = await self._retrieve_eval_outcome(query, vault_id, effective_top_k)
+        # Legacy public contract preserved: return ordered file_ids; the rich status
+        # + artifact ids are available via ``retrieve_eval_results`` (issue #462).
+        return outcome.retrieved_ids[:effective_top_k]
 
+    async def retrieve_eval_results(
+        self,
+        query: str,
+        vault_id: Optional[int] = None,
+        top_k: Optional[int] = None,
+    ) -> RetrievalOutcome:
+        """Rich retrieval-only outcome with explicit status + artifact ids.
+
+        Unlike ``query_retrieve_only``, a total retrieval failure is reported as
+        ``unavailable`` (never an empty list), and multiple artifacts per file are
+        surfaced as ranked ``artifact_ids`` (issue #462 eval contract).
+        """
+        effective_top_k = top_k if top_k is not None else self.retrieval_top_k
+        return await self._retrieve_eval_outcome(query, vault_id, effective_top_k)
+
+    async def _retrieve_eval_outcome(
+        self, query: str, vault_id: Optional[int], top_k: int
+    ) -> RetrievalOutcome:
+        """Shared retrieval-only pipeline returning a rich, status-explicit outcome."""
         # Build query embeddings (shared with retrieve_sources' document
         # adapter). An original-query embedding failure (or zero surviving
-        # variants) raises RAGEngineError here, uncaught — preserved exactly
-        # as before this method was factored apart.
+        # variants) raises RAGEngineError here, preserved as before factoring.
         query_embeddings, variants_dropped = await self._build_query_embeddings(query)
 
         # Execute retrieval (reuse internal method)
@@ -3012,12 +3118,13 @@ class RAGEngine:
                 effective_alpha=effective_alpha,
                 variants_dropped=variants_dropped,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            logger.warning(
-                "query_retrieve_only: retrieval failed (%s), returning empty list",
-                exc,
-            )
-            return []
+            # Issue #462: a total retrieval outage must be `unavailable`, not an
+            # empty result that looks like zero recall.
+            logger.warning("retrieve_eval: retrieval unavailable (%s)", exc)
+            return RetrievalOutcome(status="unavailable")
 
         # Filter to indexed files only
         if indexed_file_ids is not None:
@@ -3033,9 +3140,14 @@ class RAGEngine:
             reranked=False,
             indexed_file_ids=indexed_file_ids,
         )
-
-        # Return ordered file_ids
-        return [src.file_id for src in relevant_chunks[:effective_top_k] if src.file_id]
+        capped = relevant_chunks[:top_k]
+        return RetrievalOutcome(
+            status="ok",
+            retrieved_ids=[src.file_id for src in capped if src.file_id],
+            artifact_ids=[
+                src.artifact_id for src in capped if getattr(src, "artifact_id", None)
+            ],
+        )
 
     # ------------------------------------------------------------------
     # Public multi-kind retrieval seam (SPEC §4.4, Draft Room issue #436)
@@ -3146,6 +3258,11 @@ class RAGEngine:
             updated_at=metadata.get("processed_at"),
             file_id=file_id,
             chunk_uid=chunk_uid,
+            # Multi-modal artifact identity (issue #462) — for artifact recall/MRR
+            # and to distinguish multiple artifacts in one file in the eval adapter.
+            artifact_id=chunk.artifact_id,
+            modality=chunk.modality,
+            asset_id=chunk.asset_id,
         )
 
     def _wiki_evidence_to_retrieved_source(self, ev: Any) -> Optional[RetrievedSource]:

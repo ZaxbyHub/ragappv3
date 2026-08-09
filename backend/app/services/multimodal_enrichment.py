@@ -23,6 +23,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any, Optional
 
@@ -68,6 +69,39 @@ ERR_ASSET_OVERSIZE = "asset_oversize_pixels"
 _EMBED_TEXT_CAP = 8000
 
 
+def _parse_bounded_bbox(bbox_json: Optional[str]) -> Optional[dict[str, Any]]:
+    """Parse a stored ``bbox_json`` into a bounded canonical ``{x0,y0,x1,y1}``.
+
+    Only finite numbers, nonnegative width/height (x1>=x0, y1>=y0), absolute coords
+    <= 1e6, and EXACTLY the canonical keys are accepted (P4 contract, issue #462).
+    Malformed / NaN / inf / negative / oversized / extra-key inputs => None.
+    """
+    if not bbox_json:
+        return None
+    try:
+        raw = json.loads(bbox_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if set(raw.keys()) != {"x0", "y0", "x1", "y1"}:
+        return None
+    parts: dict[str, float] = {}
+    for key in ("x0", "y0", "x1", "y1"):
+        val = raw.get(key)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        fv = float(val)
+        if not math.isfinite(fv):
+            return None
+        parts[key] = fv
+    if parts["x1"] < parts["x0"] or parts["y1"] < parts["y0"]:
+        return None
+    if any(abs(v) > 1e6 for v in parts.values()):
+        return None
+    return parts
+
+
 class MultimodalProviderError(Exception):
     """Classified provider error with a stable code and retryability."""
 
@@ -87,6 +121,7 @@ class MultimodalProviderClient:
         model: str = "",
         timeout: Optional[float] = None,
         concurrency: Optional[int] = None,
+        purpose: str = "enrich",
     ) -> None:
         self.base_url = base_url or settings.multimodal_chat_url
         self.model = model or settings.multimodal_model
@@ -95,6 +130,10 @@ class MultimodalProviderClient:
         # None default so settings.multimodal_concurrency is actually honored when
         # the client is constructed without an explicit value (lifespan does this).
         self.concurrency = concurrency if concurrency is not None else settings.multimodal_concurrency
+        # "enrich" = offline artifact enrichment (#461); "query" = query-time
+        # retrieval-first VLM (#462). Selects the master switch checked in
+        # _assert_policy (they share the same origin allowlist + SSRF gate).
+        self.purpose = purpose
         self._client: Optional[httpx.AsyncClient] = None
         self._semaphore = asyncio.Semaphore(self.concurrency)
 
@@ -107,17 +146,21 @@ class MultimodalProviderClient:
     def _assert_policy(self) -> None:
         """Re-verify the authorizing gates immediately before a provider call.
 
-        Enforces the global kill switch (``multimodal_enrichment_enabled``) and the
-        exact-origin allowlist + SSRF gate (sensitive tier). Checking the global
-        switch here closes the race where a mid-run revocation (a kill-switch flip
-        landing during fingerprinting/claim/asset-read or while waiting on the
-        concurrency semaphore) would otherwise let an already-authorized atom egress
-        after the operator disabled the feature — the documented invariant is that
-        revocation stops further outbound calls.
+        Enforces the purpose-specific global kill switch (enrichment xor query-time
+        vision) and the exact-origin allowlist + SSRF gate (sensitive tier). Checking
+        the global switch here closes the race where a mid-run revocation would
+        otherwise let an already-authorized asset egress after the operator disabled
+        the feature — the documented invariant is that revocation stops further
+        outbound calls.
         """
-        # Global kill switch: re-read live settings so a flip lands even for
-        # atoms that cleared _authorized before the revocation.
-        if not settings.multimodal_enrichment_enabled:
+        # Global kill switch: re-read live settings so a flip lands even for assets
+        # that cleared the service-level gate before the revocation.
+        if self.purpose == "query":
+            if not settings.multimodal_query_vision_enabled:
+                raise MultimodalProviderError(
+                    ERR_POLICY, retryable=False, message="query vision disabled"
+                )
+        elif not settings.multimodal_enrichment_enabled:
             raise MultimodalProviderError(
                 ERR_POLICY, retryable=False, message="multimodal enrichment disabled"
             )
@@ -320,7 +363,7 @@ class ArtifactEnrichmentService:
         with self.pool.connection() as conn:
             rows = conn.execute(
                 "SELECT id AS atom_pk, atom_id, ordinal, kind, raw_text, page_number, "
-                "caption, asset_id, section_path_json "
+                "bbox_json, caption, asset_id, section_path_json "
                 "FROM document_atoms WHERE file_id = ? AND generation_hash = ? "
                 "ORDER BY ordinal",
                 (file_id, generation_hash),
@@ -469,6 +512,11 @@ class ArtifactEnrichmentService:
             "retrieval_aids": aids,
             "status": st.SUCCEEDED,
             "fingerprint": input_fingerprint,
+            # Persistent artifact presentation metadata (issue #462) so retrieval
+            # can carry page_number/bbox through to the source DTO. bbox is
+            # bounded/validated; never raw provider or file-path content.
+            "page_number": atom.get("page_number"),
+            "bbox": _parse_bounded_bbox(atom.get("bbox_json")),
         }
         return {"proxy_record": proxy_record, "atom_id": atom_id}
 
