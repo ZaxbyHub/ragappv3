@@ -90,6 +90,8 @@ and the **#480** follow-up hardening items landed in this change.
 Query-time vision is default-off and reuses the #461 authorization gates
 (global switch + per-vault opt-in + exact-origin allowlist + SSRF), re-checked
 per call. No paths, bytes, base64, or raw observations appear on any wire
-property (A1 closes the last metadata leak). Authz is enforced before any byte
-open; the stream path's fallback evaluator uses a fresh short-lived connection
-(S-003 no-double-connection invariant preserved).
+property (A1 closes the metadata leak across all source-emitting surfaces —
+chat/stream/history/agentic/eval AND the /search + chunk-context endpoints,
+all routed through one shared `whitelist_metadata_for_wire` whitelist). Authz
+is enforced before any byte open; the stream path's fallback evaluator uses a
+fresh short-lived connection (S-003 no-double-connection invariant preserved).

@@ -17,13 +17,46 @@ from app.config import settings  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# Metadata keys whitelisted for wire emission in ``to_source_metadata`` (issue #480).
+# Metadata keys whitelisted for wire emission (issue #480 A1 / PR #481 PRR-001).
 # Producers (document_processor/chunking/schema_parser) write server-absolute paths
 # (``file_path``/``source_file``) and internal ids into STORED chunk metadata, which
 # backend code legitimately reads (snippet/id/dedup). Only these two keys are emitted
 # to the API wire — the frontend reads no other metadata sub-key, and a whitelist
 # (not a blocklist) prevents any FUTURE metadata key from leaking by default.
-_WIRE_METADATA_WHITELIST: frozenset = frozenset({"synthesized", "page_number"})
+# Shared by every wire surface: to_source_metadata (chat/stream/history/agentic/eval)
+# AND the /search + /search/chunks endpoints.
+WIRE_METADATA_WHITELIST: frozenset = frozenset({"synthesized", "page_number"})
+
+
+def whitelist_metadata_for_wire(metadata: Any) -> Dict[str, Any]:
+    """Return only the wire-safe subset of a chunk metadata dict (issue #480 A1).
+
+    Used by every wire-emitting surface (to_source_metadata, /search, chunk-context)
+    so server-absolute paths (``file_path``/``source_file``) and internal ids never
+    reach the API. Accepts a dict or a JSON string (parses defensively).
+    """
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    if not isinstance(metadata, dict):
+        return {}
+    return {k: v for k, v in metadata.items() if k in WIRE_METADATA_WHITELIST}
+
+
+def sanitize_wire_filename(name: Any) -> str:
+    """Reduce a stored filename/source path to a display basename (issue #480 A1).
+
+    Producers may store server-absolute paths in ``source_file``/``file_path``.
+    Never emit a filesystem path on the wire — reduce to a basename (POSIX or
+    Windows separators). Falls back to ``"Unknown document"`` when the result is
+    empty (e.g. a trailing-separator path) so the wire never carries an empty name.
+    """
+    if not isinstance(name, str) or not name:
+        return "Unknown document"
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    return base or "Unknown document"
 
 
 def _extract_reupload_hash(chunk_id: str, file_id: str) -> Optional[str]:
@@ -669,17 +702,12 @@ class DocumentRetrievalService:
         Returns:
             Dictionary with source metadata
         """
-        filename = (
+        filename = sanitize_wire_filename(
             chunk.metadata.get("source_file")
             or chunk.metadata.get("filename")
             or chunk.metadata.get("section_title")
             or "Unknown document"
         )
-        # Issue #480 (A1): producers store server-absolute paths in
-        # ``source_file``/``file_path``. Never emit a filesystem path on the
-        # wire — reduce to a display basename (POSIX or Windows separators).
-        if isinstance(filename, str) and filename:
-            filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
         section = (
             chunk.metadata.get("section_title")
             or chunk.metadata.get("heading")
@@ -716,13 +744,11 @@ class DocumentRetrievalService:
             "chunk_bbox": chunk.metadata.get("chunk_bbox"),
             "snippet": snippet,
             "score": chunk.score,
-            # Issue #480: emit only the whitelisted metadata keys. Forwarding
-            # ``chunk.metadata`` wholesale leaked server-absolute ``file_path``/
-            # ``source_file`` to any vault-read user. See ``_WIRE_METADATA_WHITELIST``.
-            "metadata": {
-                k: v for k, v in chunk.metadata.items()
-                if k in _WIRE_METADATA_WHITELIST
-            },
+            # Issue #480 (A1) / PR #481 (PRR-001): emit only the whitelisted
+            # metadata keys. Forwarding ``chunk.metadata`` wholesale leaked
+            # server-absolute ``file_path``/``source_file`` to any vault-read
+            # user. See ``whitelist_metadata_for_wire``.
+            "metadata": whitelist_metadata_for_wire(chunk.metadata),
         }
         # Multi-modal artifact presentation (issue #462): emit first-class
         # optional artifact fields ONLY for artifact sources, and never when the

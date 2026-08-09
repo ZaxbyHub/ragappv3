@@ -19,7 +19,9 @@ from app.services.document_retrieval import (
     artifact_fields_from_metadata,
     artifact_id_from_metadata,
     artifact_modality_from_metadata,
+    sanitize_wire_filename,
     source_dedup_key,
+    whitelist_metadata_for_wire,
 )
 
 ART = {
@@ -235,6 +237,51 @@ class TestSourceMetadataSerialization(unittest.TestCase):
             source_index=1,
         )
         self.assertEqual(out["metadata"], {})
+
+
+class TestWireSanitizers(unittest.TestCase):
+    """PR #481 (PRR-001/003/004): edge cases for the shared wire sanitizers."""
+
+    def test_sanitize_wire_filename_posix_absolute(self) -> None:
+        self.assertEqual(
+            sanitize_wire_filename("/var/lib/ragapp/uploads/doc.pdf"), "doc.pdf"
+        )
+
+    def test_sanitize_wire_filename_windows_absolute(self) -> None:
+        self.assertEqual(
+            sanitize_wire_filename("C:\\Users\\uploads\\doc.pdf"), "doc.pdf"
+        )
+
+    def test_sanitize_wire_filename_unc(self) -> None:
+        self.assertEqual(
+            sanitize_wire_filename("\\\\server\\share\\file.xlsx"), "file.xlsx"
+        )
+
+    def test_sanitize_wire_filename_bare_passthrough(self) -> None:
+        self.assertEqual(sanitize_wire_filename("doc.pdf"), "doc.pdf")
+
+    def test_sanitize_wire_filename_trailing_separator_falls_back(self) -> None:
+        """PRR-003: a path ending in a separator reduces to '' — must fall back
+        to 'Unknown document' rather than emit an empty filename."""
+        self.assertEqual(sanitize_wire_filename("C:\\Users\\"), "Unknown document")
+        self.assertEqual(sanitize_wire_filename("/srv/uploads/"), "Unknown document")
+
+    def test_sanitize_wire_filename_none_and_empty(self) -> None:
+        self.assertEqual(sanitize_wire_filename(None), "Unknown document")
+        self.assertEqual(sanitize_wire_filename(""), "Unknown document")
+
+    def test_whitelist_metadata_for_wire_accepts_json_string(self) -> None:
+        out = whitelist_metadata_for_wire(
+            json.dumps({"file_path": "/x", "page_number": 2, "synthesized": True})
+        )
+        self.assertEqual(out, {"page_number": 2, "synthesized": True})
+
+    def test_whitelist_metadata_for_wire_invalid_json(self) -> None:
+        self.assertEqual(whitelist_metadata_for_wire("not json"), {})
+
+    def test_whitelist_metadata_for_wire_non_dict(self) -> None:
+        self.assertEqual(whitelist_metadata_for_wire(123), {})
+        self.assertEqual(whitelist_metadata_for_wire(None), {})
 
 
 class TestDedupIdentityInvariant(unittest.TestCase):

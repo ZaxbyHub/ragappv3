@@ -296,6 +296,91 @@ class TestRunDegradation(unittest.TestCase):
         self.assertEqual(shared.chat_calls, 2, "both artifacts reused the shared client")
         self.assertEqual(result.vlm_used, 2)
 
+    def test_per_call_policy_recheck_blocks_after_mid_batch_kill_switch_flip(self) -> None:
+        """PR #481 (PRR-002): the per-call policy re-check inside
+        ``MultimodalProviderClient.chat_multimodal`` (``_assert_policy``) is what
+        gates egress when the client is shared across a batch. Flipping
+        ``multimodal_query_vision_enabled`` to False mid-batch MUST make the NEXT
+        ``chat_multimodal`` call raise ``ERR_POLICY`` — the shared client must NOT
+        cache authorization from a prior call.
+
+        This drives the assertion THROUGH ``chat_multimodal`` (not by calling
+        ``_assert_policy`` directly): the network layer is mocked, but the policy
+        check is real, so removing ``self._assert_policy()`` from
+        ``chat_multimodal`` would make this test fail."""
+        from app.services.multimodal_enrichment import (
+            ERR_POLICY,
+            MultimodalProviderClient,
+            MultimodalProviderError,
+        )
+
+        class _FakeResp:
+            status_code = 200
+
+            def json(self):
+                return {"choices": [{"message": {"content": "ok"}}]}
+
+        class _FakeHttp:
+            def __init__(self):
+                self.post_calls = 0
+
+            async def post(self, url, json=None):
+                self.post_calls += 1
+                return _FakeResp()
+
+            async def aclose(self):
+                return None
+
+        client = MultimodalProviderClient(purpose="query")
+        fake_http = _FakeHttp()
+        client._client = fake_http  # avoid start()'s real httpx client
+        orig_qv = settings.multimodal_query_vision_enabled
+        settings.multimodal_query_vision_enabled = True
+
+        async def _run():
+            # First chat_multimodal: kill switch ON → policy passes (origin/SSRF
+            # gate stubbed to a no-op so the call reaches the mocked network).
+            with patch(
+                "app.services.multimodal_enrichment.assert_model_provider_allowed"
+            ):
+                out = await client.chat_multimodal(
+                    [{"role": "user", "content": "q"}], max_tokens=8
+                )
+            assert out == "ok"
+            assert fake_http.post_calls == 1, "first call reached the provider"
+
+            # Flip the kill switch OFF mid-batch. The next chat_multimodal MUST
+            # raise ERR_POLICY from the REAL _assert_policy (which re-reads live
+            # settings) BEFORE any network call — the shared client did not cache
+            # the prior authorization.
+            settings.multimodal_query_vision_enabled = False
+            raised = False
+            try:
+                await client.chat_multimodal(
+                    [{"role": "user", "content": "q2"}], max_tokens=8
+                )
+            except MultimodalProviderError as exc:
+                raised = exc.code == ERR_POLICY
+            assert raised, "second call must raise ERR_POLICY after the flip"
+            assert fake_http.post_calls == 1, "blocked call must NOT reach the provider"
+
+            # Flip back ON — the same shared client clears again (re-check is
+            # live per call, not cached).
+            settings.multimodal_query_vision_enabled = True
+            with patch(
+                "app.services.multimodal_enrichment.assert_model_provider_allowed"
+            ):
+                out2 = await client.chat_multimodal(
+                    [{"role": "user", "content": "q3"}], max_tokens=8
+                )
+            assert out2 == "ok"
+            assert fake_http.post_calls == 2, "third call reached the provider after re-enable"
+
+        try:
+            asyncio.run(_run())
+        finally:
+            settings.multimodal_query_vision_enabled = orig_qv
+
 
 class TestProcessOneSecurity(unittest.TestCase):
     """Plan V3/P5 security regressions for the per-artifact pipeline.
