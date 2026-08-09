@@ -156,6 +156,19 @@ class TestApplyVision(unittest.TestCase):
 
 
 class TestRunDegradation(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests assume the query-vision feature is ON (the config default
+        # is False). Several tests in this class mutate the global; without a
+        # per-test reset, xdist worker assignment could land a test first in a
+        # fresh worker where the global is still the False default, OR leave it
+        # in a mutated state for the next test. setUp/tearDown pin it True so
+        # every test is order-independent. (Pre-existing isolation fix.)
+        self._orig_qv = settings.multimodal_query_vision_enabled
+        settings.multimodal_query_vision_enabled = True
+
+    def tearDown(self) -> None:
+        settings.multimodal_query_vision_enabled = self._orig_qv
+
     def test_no_eligible_degrades_artifacts_to_proxy_only_no_call(self) -> None:
         svc = VisionEvidenceService()
         # No eligible selection: artifacts degrade to proxy_only without any call.
@@ -331,13 +344,21 @@ class TestRunDegradation(unittest.TestCase):
             async def aclose(self):
                 return None
 
-        client = MultimodalProviderClient(purpose="query")
         fake_http = _FakeHttp()
-        client._client = fake_http  # avoid start()'s real httpx client
-        orig_qv = settings.multimodal_query_vision_enabled
+        # Set the flag True up front and ALWAYS restore True in finally (the
+        # documented default + this file's convention). Capture-and-restore is
+        # fragile under xdist: if a prior test in the same worker left the global
+        # False, orig_qv would restore False and break later tests.
         settings.multimodal_query_vision_enabled = True
 
         async def _run():
+            # Construct the client INSIDE the running loop so its
+            # asyncio.Semaphore binds to THIS loop (constructing it outside
+            # asyncio.run deadlocks chat_multimodal's `async with self._semaphore`
+            # under xdist, since the semaphore is bound to a closed/no loop).
+            client = MultimodalProviderClient(purpose="query")
+            client._client = fake_http  # avoid start()'s real httpx client
+
             # First chat_multimodal: kill switch ON → policy passes (origin/SSRF
             # gate stubbed to a no-op so the call reaches the mocked network).
             with patch(
@@ -379,7 +400,7 @@ class TestRunDegradation(unittest.TestCase):
         try:
             asyncio.run(_run())
         finally:
-            settings.multimodal_query_vision_enabled = orig_qv
+            settings.multimodal_query_vision_enabled = True
 
 
 class TestProcessOneSecurity(unittest.TestCase):
