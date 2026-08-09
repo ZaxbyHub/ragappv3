@@ -183,6 +183,86 @@ class TestSourceMetadataSerialization(unittest.TestCase):
         self.assertNotIn("modality", out)
         self.assertNotIn("vision_status", out)
 
+    def test_metadata_whitelist_strips_server_paths(self) -> None:
+        """Issue #480 (A1): server-absolute paths must not leak to the wire.
+
+        Producers write ``file_path``/``source_file`` (and internal ids) into
+        STORED chunk metadata; only a whitelist of display keys may be emitted
+        in ``to_source_metadata``'s ``metadata`` field.
+        """
+        chunk = RAGSource(
+            text="t",
+            file_id="f1",
+            score=0.5,
+            metadata={
+                # Leak keys (must be stripped):
+                "file_path": "/var/lib/ragapp/vaults/1/artifacts/secret.png",
+                "source_file": "/srv/uploads/secret.pdf",
+                # Internal ids (must be stripped):
+                "atom_id": "atom-1",
+                "generation_hash": "g" * 12,
+                "chunk_uid": "f1_0",
+                "raw_text": "internal evidence",
+                "asset_id": "asset-1",
+                # Display keys the frontend reads (must survive):
+                "synthesized": True,
+                "page_number": 7,
+                # Unknown key (must be stripped — defense in depth):
+                "future_key": "anything",
+            },
+        )
+        out = self.svc.to_source_metadata(chunk, source_index=1)
+        wire_meta = out["metadata"]
+        # The whitelist is the complete set emitted on the wire.
+        self.assertEqual(set(wire_meta.keys()), {"synthesized", "page_number"})
+        self.assertTrue(wire_meta["synthesized"])
+        self.assertEqual(wire_meta["page_number"], 7)
+        # No server path or internal id survives anywhere in the wire metadata.
+        for leak_key in (
+            "file_path", "source_file", "atom_id", "generation_hash",
+            "chunk_uid", "raw_text", "asset_id", "future_key",
+        ):
+            self.assertNotIn(leak_key, wire_meta)
+        # Belt-and-suspenders: no absolute path string leaks anywhere in the
+        # serialized source object.
+        self.assertNotIn("/var/lib/ragapp", json.dumps(out))
+        self.assertNotIn("/srv/uploads", json.dumps(out))
+
+    def test_empty_metadata_emits_empty_dict(self) -> None:
+        """A chunk with no whitelisted keys still gets a dict (not None/wholesale)."""
+        out = self.svc.to_source_metadata(
+            RAGSource(text="t", file_id="f1", score=0.5, metadata={"file_path": "/x"}),
+            source_index=1,
+        )
+        self.assertEqual(out["metadata"], {})
+
+
+class TestDedupIdentityInvariant(unittest.TestCase):
+    """Issue #480 (B1): the artifact-aware dedup key is intentionally always-on.
+
+    It is strictly finer than the legacy ``(file_id, text)`` key, so it can only
+    SPLIT two rows that previously collapsed — never merge. This preserves artifact
+    identity even with the query-time vision feature OFF, and downstream consumers
+    are bounded by retrieval_top_k / context_max_tokens / per_doc_chunk_cap so
+    N-for-1 growth is intended and safe. Gating it behind the feature flag would
+    reintroduce the identity-collapse bug that #479 fixed.
+    """
+
+    def test_two_artifacts_same_file_and_text_do_not_collapse(self) -> None:
+        """Two artifact rows with identical file_id+text but different atom_id
+        must produce DISTINCT dedup keys (identity preserved)."""
+        meta_a = {"atom_id": "atom-A", "atom_kind": "image"}
+        meta_b = {"atom_id": "atom-B", "atom_kind": "image"}
+        key_a = source_dedup_key("file-1", "byte-identical proxy text", meta_a)
+        key_b = source_dedup_key("file-1", "byte-identical proxy text", meta_b)
+        self.assertNotEqual(key_a, key_b)
+
+    def test_two_plain_chunks_same_file_and_text_DO_collapse(self) -> None:
+        """Non-artifact (plain) chunks with identical file_id+text still collapse."""
+        key_a = source_dedup_key("file-1", "same text", {})
+        key_b = source_dedup_key("file-1", "same text", {})
+        self.assertEqual(key_a, key_b)
+
 
 if __name__ == "__main__":
     unittest.main()

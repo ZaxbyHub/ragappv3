@@ -93,6 +93,7 @@ class RAGTrace:
     vision_policy_blocked: int = 0
     vision_asset_missing: int = 0
     vision_provider_unavailable: int = 0
+    vision_empty_response: int = 0  # issue #480 (B2)
     vision_latency_ms: Optional[float] = None
     vision_payload_bytes: int = 0
 
@@ -148,6 +149,7 @@ class RAGTrace:
             "vision_policy_blocked": self.vision_policy_blocked,
             "vision_asset_missing": self.vision_asset_missing,
             "vision_provider_unavailable": self.vision_provider_unavailable,
+            "vision_empty_response": self.vision_empty_response,
             "vision_latency_ms": self.vision_latency_ms,
             "vision_payload_bytes": self.vision_payload_bytes,
         }

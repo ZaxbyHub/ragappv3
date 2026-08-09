@@ -1551,6 +1551,7 @@ class RAGEngine:
                     trace.vision_policy_blocked = vision_result.policy_blocked
                     trace.vision_asset_missing = vision_result.asset_missing
                     trace.vision_provider_unavailable = vision_result.provider_unavailable
+                    trace.vision_empty_response = vision_result.empty_response
                     trace.vision_latency_ms = vision_result.latency_ms
                     trace.vision_payload_bytes = vision_result.payload_bytes
                 except asyncio.CancelledError:
@@ -3090,11 +3091,6 @@ class RAGEngine:
         self, query: str, vault_id: Optional[int], top_k: int
     ) -> RetrievalOutcome:
         """Shared retrieval-only pipeline returning a rich, status-explicit outcome."""
-        # Build query embeddings (shared with retrieve_sources' document
-        # adapter). An original-query embedding failure (or zero surviving
-        # variants) raises RAGEngineError here, preserved as before factoring.
-        query_embeddings, variants_dropped = await self._build_query_embeddings(query)
-
         # Execute retrieval (reuse internal method)
         effective_alpha = self.hybrid_alpha
 
@@ -3111,6 +3107,13 @@ class RAGEngine:
             )
 
         try:
+            # Build query embeddings (shared with retrieve_sources' document
+            # adapter). Issue #480 (B3): an original-query embedding failure (or
+            # zero surviving variants) raises RAGEngineError — this is a total
+            # retrieval outage, so it MUST surface as ``unavailable`` (per the
+            # ``retrieve_eval_results`` docstring) rather than propagating and
+            # aborting the whole eval run. It therefore sits inside this try.
+            query_embeddings, variants_dropped = await self._build_query_embeddings(query)
             vector_results, _, _, _, _, _, _, _, _, _, _ = await self._execute_retrieval(
                 query_embeddings,
                 query,
@@ -3121,8 +3124,9 @@ class RAGEngine:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # Issue #462: a total retrieval outage must be `unavailable`, not an
-            # empty result that looks like zero recall.
+            # Issue #462: a total retrieval outage (embedding failure OR retrieval
+            # failure) must be `unavailable`, not an empty result that looks like
+            # zero recall (and not an exception that aborts the eval run).
             logger.warning("retrieve_eval: retrieval unavailable (%s)", exc)
             return RetrievalOutcome(status="unavailable")
 

@@ -17,6 +17,14 @@ from app.config import settings  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Metadata keys whitelisted for wire emission in ``to_source_metadata`` (issue #480).
+# Producers (document_processor/chunking/schema_parser) write server-absolute paths
+# (``file_path``/``source_file``) and internal ids into STORED chunk metadata, which
+# backend code legitimately reads (snippet/id/dedup). Only these two keys are emitted
+# to the API wire — the frontend reads no other metadata sub-key, and a whitelist
+# (not a blocklist) prevents any FUTURE metadata key from leaking by default.
+_WIRE_METADATA_WHITELIST: frozenset = frozenset({"synthesized", "page_number"})
+
 
 def _extract_reupload_hash(chunk_id: str, file_id: str) -> Optional[str]:
     """Return the 8-hex hash from a reupload-safe chunk ID, or None for legacy IDs.
@@ -182,6 +190,19 @@ def source_dedup_key(file_id: Any, text: Any, metadata: Any) -> tuple:
     When a record is an artifact proxy (has an artifact id), the key includes the
     artifact id + text so two distinct artifacts with byte-identical proxy text
     remain separate. Plain chunks fall back to ``(file_id, text)``.
+
+    Issue #480 (B1) invariant: this key is INTENTIONALLY always-on — it is NOT
+    gated behind ``multimodal_query_vision_enabled``. It is strictly finer than
+    the legacy ``(str(file_id), text)`` key, so it can only SPLIT two rows that
+    previously collapsed, never merge them. This preserves artifact identity
+    even with the query-time vision feature OFF (the default), which is the
+    correct behavior: two distinct images with byte-identical proxy text are
+    still two distinct sources. Downstream consumers of the deduplicated
+    ``sources`` list (rag_engine fusion/rebuild, token packing, prompt builder,
+    eval top_k cap) are all bounded by ``retrieval_top_k`` /
+    ``context_max_tokens`` / ``per_doc_chunk_cap``, so N-for-1 growth is
+    intended and safe. Gating this key behind the feature flag would reintroduce
+    the identity-collapse bug that #479 deliberately fixed.
     """
     artifact_id = artifact_id_from_metadata(metadata)
     if artifact_id:
@@ -654,6 +675,11 @@ class DocumentRetrievalService:
             or chunk.metadata.get("section_title")
             or "Unknown document"
         )
+        # Issue #480 (A1): producers store server-absolute paths in
+        # ``source_file``/``file_path``. Never emit a filesystem path on the
+        # wire — reduce to a display basename (POSIX or Windows separators).
+        if isinstance(filename, str) and filename:
+            filename = filename.replace("\\", "/").rsplit("/", 1)[-1]
         section = (
             chunk.metadata.get("section_title")
             or chunk.metadata.get("heading")
@@ -690,7 +716,13 @@ class DocumentRetrievalService:
             "chunk_bbox": chunk.metadata.get("chunk_bbox"),
             "snippet": snippet,
             "score": chunk.score,
-            "metadata": chunk.metadata,
+            # Issue #480: emit only the whitelisted metadata keys. Forwarding
+            # ``chunk.metadata`` wholesale leaked server-absolute ``file_path``/
+            # ``source_file`` to any vault-read user. See ``_WIRE_METADATA_WHITELIST``.
+            "metadata": {
+                k: v for k, v in chunk.metadata.items()
+                if k in _WIRE_METADATA_WHITELIST
+            },
         }
         # Multi-modal artifact presentation (issue #462): emit first-class
         # optional artifact fields ONLY for artifact sources, and never when the

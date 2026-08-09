@@ -359,6 +359,87 @@ def main() -> int:
                 f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
             )
 
+    # Multimodal family (issues #461 enrichment + #462 query-time vision): every
+    # setting must carry the same default across backend/app/config.py,
+    # .env.example, and docker-compose.yml. Mirrors the draft_*_settings pattern
+    # but split by type (bool/int/float/str/list) so each uses the right reader.
+    multimodal_bool_settings = {
+        "MULTIMODAL_ENRICHMENT_ENABLED": "multimodal_enrichment_enabled",
+        "MULTIMODAL_QUERY_VISION_ENABLED": "multimodal_query_vision_enabled",
+    }
+    multimodal_int_settings = {
+        "MULTIMODAL_CONCURRENCY": "multimodal_concurrency",
+        "MULTIMODAL_MAX_ASSETS_PER_BATCH": "multimodal_max_assets_per_batch",
+        "MULTIMODAL_MAX_ASSET_BYTES": "multimodal_max_asset_bytes",
+        "MULTIMODAL_MAX_TOTAL_PAYLOAD_BYTES": "multimodal_max_total_payload_bytes",
+        "MULTIMODAL_MAX_PIXELS": "multimodal_max_pixels",
+        "MULTIMODAL_MAX_ATTEMPTS": "multimodal_max_attempts",
+    }
+    multimodal_float_settings = {
+        "MULTIMODAL_TIMEOUT_SECONDS": "multimodal_timeout_seconds",
+    }
+    multimodal_str_settings = {
+        "MULTIMODAL_CHAT_URL": "multimodal_chat_url",
+        "MULTIMODAL_MODEL": "multimodal_model",
+        "MULTIMODAL_MODE": "multimodal_mode",
+        "MULTIMODAL_PROMPT_VERSION": "multimodal_prompt_version",
+        "MULTIMODAL_SCHEMA_VERSION": "multimodal_schema_version",
+        "MULTIMODAL_IMPL_VERSION": "multimodal_impl_version",
+    }
+    multimodal_list_settings = {
+        "MULTIMODAL_ALLOWED_MODEL_ORIGINS": "multimodal_allowed_model_origins",
+    }
+    for env_name, field_name, reader in (
+        *(
+            (env_name, field_name, backend_bool_default)
+            for env_name, field_name in multimodal_bool_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_int_default)
+            for env_name, field_name in multimodal_int_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_float_default)
+            for env_name, field_name in multimodal_float_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_str_default)
+            for env_name, field_name in multimodal_str_settings.items()
+        ),
+    ):
+        backend_val = reader(backend_config, field_name)
+        env_val = env_value(env_text, env_name)
+        compose_val = compose_default(compose_text, env_name)
+        if backend_val is None:
+            failures.append(
+                f"backend/app/config.py {field_name} default could not be parsed"
+            )
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match "
+                f"backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not "
+                f"match backend default {backend_val!r}"
+            )
+
+    for env_name, field_name in multimodal_list_settings.items():
+        backend_val = backend_list_default(backend_config, field_name)
+        env_val = parse_origins(env_value(env_text, env_name))
+        compose_val = parse_origins(compose_default(compose_text, env_name))
+        if backend_val is None:
+            failures.append(f"backend/app/config.py {field_name} list default could not be parsed")
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
+            )
+
     for message in failures:
         fail(message)
     if failures:

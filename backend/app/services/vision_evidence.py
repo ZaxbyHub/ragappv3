@@ -59,6 +59,11 @@ VISION_PROXY_ONLY = "proxy_only"
 VISION_POLICY_BLOCKED = "policy_blocked"
 VISION_ASSET_MISSING = "asset_missing"
 VISION_PROVIDER_UNAVAILABLE = "provider_unavailable"
+# Issue #480 (B2): the provider answered 200 but produced empty/whitespace output.
+# Distinct from VISION_PROVIDER_UNAVAILABLE (a true outage: network error, timeout,
+# or HTTP failure) so observability counters / badges don't conflate "provider down"
+# with "provider up but returned nothing useful".
+VISION_EMPTY_RESPONSE = "empty_response"
 
 _VISION_STATUSES = frozenset(
     {
@@ -67,6 +72,7 @@ _VISION_STATUSES = frozenset(
         VISION_POLICY_BLOCKED,
         VISION_ASSET_MISSING,
         VISION_PROVIDER_UNAVAILABLE,
+        VISION_EMPTY_RESPONSE,
     }
 )
 
@@ -99,6 +105,7 @@ class VisionEvidenceResult:
     policy_blocked: int = 0
     asset_missing: int = 0
     provider_unavailable: int = 0
+    empty_response: int = 0  # issue #480 (B2): provider up but empty output
     latency_ms: Optional[float] = None
     payload_bytes: int = 0
 
@@ -186,6 +193,15 @@ async def _can_read(user: Any, evaluate: Optional[Callable], conn: Any, vault_id
     """Vault read authorization (self-checked when no DI evaluate is available).
 
     Fails closed: a missing principal (``None``) or evaluation error denies.
+
+    Issue #480 (D3): when no DI ``evaluate`` is available (the streaming chat
+    path, which releases its request-scoped connection BEFORE vision runs per
+    the S-003 no-double-connection invariant), this fallback opens a FRESH
+    short-lived pooled connection per check and evaluates via the shared
+    service-layer policy (``app.services.authz_policy``) — NOT ``app.api.deps``,
+    which would invert the services→api dependency direction. Do NOT "optimize"
+    this by reusing a captured stream-path connection: that conn is already
+    released.
     """
     if user is None:
         return False
@@ -195,9 +211,9 @@ async def _can_read(user: Any, evaluate: Optional[Callable], conn: Any, vault_id
         except Exception:  # noqa: BLE001
             return False
     try:
-        from app.api.deps import _evaluate_policy
+        from app.services.authz_policy import evaluate_policy
 
-        return bool(await _evaluate_policy(conn, user, "vault", vault_id, "read"))
+        return bool(await evaluate_policy(conn, user, "vault", vault_id, "read"))
     except Exception:  # noqa: BLE001
         return False
 
@@ -268,12 +284,19 @@ class VisionEvidenceService:
         user: Any,
         evaluate: Callable,
         semaphore: asyncio.Semaphore,
+        client: Optional[MultimodalProviderClient] = None,
     ) -> tuple[str, str, Optional[str]]:
         """Load/authorize/call for a single artifact.
 
         Returns ``(artifact_id, vision_status, observation_or_None)``. Every failure
         degrades to a safe status — never raises to the caller loop. Opens its own
         short-lived connection so concurrent workers never share a sqlite conn.
+
+        ``client`` is a SHARED provider client amortized across the whole batch by
+        ``run()`` (issue #480 D1) — reuses one TCP/TLS connection pool instead of
+        creating+closing a fresh client per artifact. The per-call policy re-check
+        (``_assert_policy`` inside ``chat_multimodal``) is preserved, so a mid-batch
+        kill-switch flip still blocks the next call regardless of client reuse.
         """
         artifact_id = src.artifact_id
 
@@ -284,10 +307,15 @@ class VisionEvidenceService:
                     return artifact_id, VISION_POLICY_BLOCKED, None
 
                 # (2) Joined artifact->file->vault membership + authoritative metadata.
+                # Issue #480 (D2): offload blocking sqlite to a worker thread,
+                # aligned with the documents.py convention. The pool opens
+                # connections with check_same_thread=False so cross-thread use is safe.
                 try:
-                    row = conn.execute(
-                        _VISION_QUERY_SELECT, (artifact_id, vault_id)
-                    ).fetchone()
+                    row = await asyncio.to_thread(
+                        lambda: conn.execute(
+                            _VISION_QUERY_SELECT, (artifact_id, vault_id)
+                        ).fetchone()
+                    )
                 except Exception:  # noqa: BLE001
                     row = None
                 if row is None:
@@ -306,9 +334,11 @@ class VisionEvidenceService:
 
                 # (4) Policy re-check immediately before any byte open (and again before
                 # the call via the client). Global switch + vault opt-in read live.
-                blocked = self._whole_batch_allowed(conn, vault_id)
+                blocked = await asyncio.to_thread(
+                    self._whole_batch_allowed, conn, vault_id
+                )
                 if blocked is not None:
-                    self._audit(conn, vault_id, file_id, artifact_id, asset_id, "denied:policy")
+                    await self._audit(conn, vault_id, file_id, artifact_id, asset_id, "denied:policy")
                     return artifact_id, VISION_POLICY_BLOCKED, None
 
                 # (5) Open + read bounded bytes NOW (after the above gates).
@@ -342,28 +372,34 @@ class VisionEvidenceService:
                 )
                 messages = build_query_messages(user_text, image_part)
 
-                client = self._client_factory(purpose="query")
                 raw_bytes = len(data) + len(user_text.encode("utf-8"))
                 started = time.perf_counter()
                 try:
                     output = await client.chat_multimodal(messages, max_tokens=512)
-                    self._audit(conn, vault_id, file_id, artifact_id, asset_id, "used")
+                    await self._audit(conn, vault_id, file_id, artifact_id, asset_id, "used")
                 except MultimodalProviderError as exc:
                     if exc.code in (ERR_POLICY,):
-                        self._audit(conn, vault_id, file_id, artifact_id, asset_id, "denied:policy")
+                        await self._audit(conn, vault_id, file_id, artifact_id, asset_id, "denied:policy")
                         return artifact_id, VISION_POLICY_BLOCKED, None
-                    self._audit(conn, vault_id, file_id, artifact_id, asset_id, "degraded:provider")
+                    await self._audit(conn, vault_id, file_id, artifact_id, asset_id, "degraded:provider")
                     return artifact_id, VISION_PROVIDER_UNAVAILABLE, None
                 except Exception:  # noqa: BLE001 — cancellation propagates naturally here
-                    self._audit(conn, vault_id, file_id, artifact_id, asset_id, "degraded:provider")
+                    await self._audit(conn, vault_id, file_id, artifact_id, asset_id, "degraded:provider")
                     return artifact_id, VISION_PROVIDER_UNAVAILABLE, None
                 finally:
-                    await client.close()
+                    # Issue #480 (D1): the client is owned + closed by run(); do NOT
+                    # close it per-task. Latency/byte accounting stays per-call.
                     self._record_latency_bytes(started, raw_bytes)
 
                 observation = _validate_observation(output)
                 if observation is None:
-                    return artifact_id, VISION_PROVIDER_UNAVAILABLE, None
+                    # Issue #480 (B2): the provider call SUCCEEDED (no exception
+                    # reached here) but produced empty/whitespace output. This is
+                    # distinct from VISION_PROVIDER_UNAVAILABLE (a true outage:
+                    # error/timeout) — report it as empty_response so counters and
+                    # the proxy badge don't conflate "provider up but empty" with
+                    # "provider down".
+                    return artifact_id, VISION_EMPTY_RESPONSE, None
                 return artifact_id, VISION_USED, observation
 
         async with semaphore:
@@ -391,7 +427,7 @@ class VisionEvidenceService:
         except Exception:  # noqa: BLE001  # nosec B110 - best-effort accumulator
             pass
 
-    def _audit(
+    async def _audit(
         self,
         conn: Any,
         vault_id: int,
@@ -400,21 +436,28 @@ class VisionEvidenceService:
         asset_id: Optional[str],
         outcome: str,
     ) -> None:
-        """Record a query-vision external-transmission attempt/denial (ids only)."""
+        """Record a query-vision external-transmission attempt/denial (ids only).
+
+        Issue #480 (D2): offloads the blocking sqlite insert to a worker thread,
+        aligned with the documents.py convention (pool uses check_same_thread=False).
+        Best-effort: an audit failure must never break the degradation path.
+        """
         if conn is None:
             return
         try:
-            record_security_event(
-                conn,
-                event_type="attempted_external_transmission",
-                metadata={
-                    "vault_id": vault_id,
-                    "file_id": file_id,
-                    "artifact_id": artifact_id,
-                    "asset_id": asset_id,
-                    "purpose": "query_vision",
-                    "outcome": outcome,
-                },
+            await asyncio.to_thread(
+                lambda: record_security_event(
+                    conn,
+                    event_type="attempted_external_transmission",
+                    metadata={
+                        "vault_id": vault_id,
+                        "file_id": file_id,
+                        "artifact_id": artifact_id,
+                        "asset_id": asset_id,
+                        "purpose": "query_vision",
+                        "outcome": outcome,
+                    },
+                )
             )
         except Exception:  # noqa: BLE001  # nosec B110 - audit must never break degradation path
             pass
@@ -461,9 +504,10 @@ class VisionEvidenceService:
             return result
 
         # Whole-batch policy gate (global switch + vault opt-in + origin/SSRF) on a
-        # short-lived connection.
+        # short-lived connection. Issue #480 (D2): offload the blocking sqlite read
+        # to a worker thread (pool uses check_same_thread=False).
         async with _conn_ctx() as conn:
-            blocked = self._whole_batch_allowed(conn, vault_id)
+            blocked = await asyncio.to_thread(self._whole_batch_allowed, conn, vault_id)
         if blocked is not None:
             if blocked == "query_vision_disabled":
                 # V5 feature-off non-regression: vision is never attempted and
@@ -485,18 +529,29 @@ class VisionEvidenceService:
         self._latency_ms = 0.0
         self._payload_bytes = 0
         semaphore = asyncio.Semaphore(int(settings.multimodal_concurrency))
-        tasks = [
-            self._process_one(
-                query=query,
-                src=s,
-                vault_id=vault_id,
-                user=user,
-                evaluate=evaluate,
-                semaphore=semaphore,
-            )
-            for s in selected
-        ]
-        outcomes = await asyncio.gather(*tasks, return_exceptions=False)
+        # Issue #480 (D1): amortize ONE provider client across the whole batch —
+        # reuses a single TCP/TLS connection pool instead of creating+closing a
+        # fresh client per artifact. The per-call policy re-check (_assert_policy
+        # inside chat_multimodal) is preserved, so a mid-batch kill-switch flip
+        # still blocks the next call. Closed once in the finally below.
+        client = self._client_factory(purpose="query")
+        await client.start()
+        try:
+            tasks = [
+                self._process_one(
+                    query=query,
+                    src=s,
+                    vault_id=vault_id,
+                    user=user,
+                    evaluate=evaluate,
+                    semaphore=semaphore,
+                    client=client,
+                )
+                for s in selected
+            ]
+            outcomes = await asyncio.gather(*tasks, return_exceptions=False)
+        finally:
+            await client.close()
         for artifact_id, status, observation in outcomes:
             result.statuses[artifact_id] = status
             if status == VISION_USED and observation:
@@ -511,6 +566,8 @@ class VisionEvidenceService:
                 result.asset_missing += 1
             elif status == VISION_PROVIDER_UNAVAILABLE:
                 result.provider_unavailable += 1
+            elif status == VISION_EMPTY_RESPONSE:
+                result.empty_response += 1
 
         result.latency_ms = self._latency_ms
         result.payload_bytes = self._payload_bytes
