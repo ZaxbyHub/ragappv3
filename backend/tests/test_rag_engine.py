@@ -756,5 +756,49 @@ async def test_thinking_mode_max_tokens_reads_config():
     )
 
 
+@pytest.mark.asyncio
+async def test_retrieve_eval_results_returns_unavailable_on_embedding_failure():
+    """Issue #480 (B3): an embedding outage is a total retrieval failure and must
+    surface as ``status="unavailable"`` (per the docstring contract), NOT raise
+    RAGEngineError and abort the whole eval run.
+
+    Before the fix, ``_build_query_embeddings`` sat OUTSIDE the try in
+    ``_retrieve_eval_outcome``; an original-query embedding failure raised
+    ``RAGEngineError`` and propagated through ``run_live``'s per-query loop,
+    aborting the benchmark. The main ``query()`` path still raises (verified by
+    ``test_non_streaming_original_embedding_failure_raises``); only the eval path
+    degrades to ``unavailable``.
+    """
+    from app.services.eval_adapter import RetrievalOutcome
+
+    class FailingEmbeddingService:
+        async def embed_single(self, text):
+            raise EmbeddingError("Original query embed failed")
+        async def embed_passage(self, text):
+            raise EmbeddingError("Unexpected passage embed call")
+
+    engine = RAGEngine()
+    engine.embedding_service = cast(EmbeddingService, FailingEmbeddingService())
+    engine.vector_store = cast(VectorStore, FakeVectorStore([]))
+    engine.memory_store = cast(MemoryStore, FakeMemoryStore())
+    engine.llm_client = cast(LLMClient, FakeLLMClient(response=""))
+
+    from app.config import settings
+    with patch.object(settings, "query_transformation_enabled", False):
+        outcome = await engine.retrieve_eval_results("test query", vault_id=1)
+
+    assert isinstance(outcome, RetrievalOutcome)
+    assert outcome.status == "unavailable"
+    assert outcome.retrieved_ids == []
+    assert outcome.artifact_ids == []
+
+    # The legacy ``query_retrieve_only`` path delegates to the same
+    # ``_retrieve_eval_outcome``; an embedding outage must therefore degrade to
+    # an empty list (not raise) so ``run_live``'s loop is not aborted.
+    with patch.object(settings, "query_transformation_enabled", False):
+        legacy_ids = await engine.query_retrieve_only("test query", vault_id=1)
+    assert legacy_ids == []
+
+
 if __name__ == "__main__":
     unittest.main()

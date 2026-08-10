@@ -6,6 +6,12 @@ artifact foundation can be sent to an external multimodal model, and the model's
 derived description + retrieval aids are stored as deterministic **proxies** so
 retrieval can index rich content without a query-time vision model.
 
+> **#462 adds an OPTIONAL query-time vision layer** on top of this enrichment —
+> see [Query-time vision (#462)](#query-time-vision-462) below. Enrichment
+> (#461) is the default-off foundation; query-time vision (#462) is a further
+> default-off capability that sends a small number of authorized retrieved
+> artifacts to the provider at query time.
+
 This document is the ops guide: how to enable it safely, what it sends out, the
 hard limits, and how to roll it back. **It is off by default and makes zero
 outbound calls until every gate below holds.**
@@ -132,6 +138,50 @@ an off config produced zero outbound attempts.
 4. **Provider outage / policy revocation**: base/raw proxies and chunks are
    untouched — only derived proxies are affected, exactly as with the add-then-
    delete writer.
+
+## Query-time vision (#462)
+
+On top of the #461 enrichment foundation, **#462** adds an OPTIONAL, default-off
+**query-time vision** layer (`MULTIMODAL_QUERY_VISION_ENABLED`, default `false`).
+When enabled, a narrow `VisionEvidenceService` runs strictly AFTER
+retrieval/rerank/distill/pack and BEFORE prompt construction, sending a small
+number of authorized retrieved artifacts to the multimodal provider for
+**query-conditioned observations**.
+
+### Authorization (reuses the #461 gates, re-checked per call)
+
+A query-time vision call happens only when, at the moment of the call:
+
+1. **Global query-vision enablement** — `MULTIMODAL_QUERY_VISION_ENABLED=true`.
+2. **Global enrichment enablement** — `MULTIMODAL_ENRICHMENT_ENABLED=true` (the
+   provider/origin/SSRF config is shared with enrichment).
+3. **Per-vault opt-in** — the vault is explicitly opted in
+   (`multimodal_provider_enabled = TRUE`).
+4. **Exact-origin allowlist + SSRF** — the provider origin passes
+   `assert_model_provider_allowed` and `assert_url_safe`.
+5. **Vault read** — the requesting user holds read on the vault.
+
+The provider policy is **re-checked inside every `chat_multimodal` call**
+(`_assert_policy`), so a mid-batch operator kill-switch flip blocks the next
+call even though the HTTP client is shared across the batch.
+
+### What is sent / what is returned
+
+Only the confined raster asset bytes (header-MIME-validated, byte/pixel-capped)
+and an injection-hardened, query-conditioned prompt are sent. The bounded
+observation feeds the prompt and support-text scoring only — **no paths, bytes,
+base64, raw prompts, or provider bodies appear on any wire property**.
+
+### Degradation model
+
+Each source carries an optional `vision_status`: `used` (observation applied),
+`proxy_only` (degraded to the offline proxy), `policy_blocked`, `asset_missing`,
+`provider_unavailable` (outage/error/timeout), or `empty_response` (provider
+answered 200 but empty — distinct from an outage). Rank and the stable `[S#]`
+label are preserved regardless. Feature-off omits `vision_status` entirely.
+
+See `docs/releases/pending/462-multimodal-query-vision.md` for the full change
+note (including the #480 hardening follow-ups).
 
 ## Related reading
 

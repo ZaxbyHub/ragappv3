@@ -17,6 +17,47 @@ from app.config import settings  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Metadata keys whitelisted for wire emission (issue #480 A1 / PR #481 PRR-001).
+# Producers (document_processor/chunking/schema_parser) write server-absolute paths
+# (``file_path``/``source_file``) and internal ids into STORED chunk metadata, which
+# backend code legitimately reads (snippet/id/dedup). Only these two keys are emitted
+# to the API wire — the frontend reads no other metadata sub-key, and a whitelist
+# (not a blocklist) prevents any FUTURE metadata key from leaking by default.
+# Shared by every wire surface: to_source_metadata (chat/stream/history/agentic/eval)
+# AND the /search + /search/chunks endpoints.
+WIRE_METADATA_WHITELIST: frozenset = frozenset({"synthesized", "page_number"})
+
+
+def whitelist_metadata_for_wire(metadata: Any) -> Dict[str, Any]:
+    """Return only the wire-safe subset of a chunk metadata dict (issue #480 A1).
+
+    Used by every wire-emitting surface (to_source_metadata, /search, chunk-context)
+    so server-absolute paths (``file_path``/``source_file``) and internal ids never
+    reach the API. Accepts a dict or a JSON string (parses defensively).
+    """
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    if not isinstance(metadata, dict):
+        return {}
+    return {k: v for k, v in metadata.items() if k in WIRE_METADATA_WHITELIST}
+
+
+def sanitize_wire_filename(name: Any) -> str:
+    """Reduce a stored filename/source path to a display basename (issue #480 A1).
+
+    Producers may store server-absolute paths in ``source_file``/``file_path``.
+    Never emit a filesystem path on the wire — reduce to a basename (POSIX or
+    Windows separators). Falls back to ``"Unknown document"`` when the result is
+    empty (e.g. a trailing-separator path) so the wire never carries an empty name.
+    """
+    if not isinstance(name, str) or not name:
+        return "Unknown document"
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    return base or "Unknown document"
+
 
 def _extract_reupload_hash(chunk_id: str, file_id: str) -> Optional[str]:
     """Return the 8-hex hash from a reupload-safe chunk ID, or None for legacy IDs.
@@ -182,6 +223,19 @@ def source_dedup_key(file_id: Any, text: Any, metadata: Any) -> tuple:
     When a record is an artifact proxy (has an artifact id), the key includes the
     artifact id + text so two distinct artifacts with byte-identical proxy text
     remain separate. Plain chunks fall back to ``(file_id, text)``.
+
+    Issue #480 (B1) invariant: this key is INTENTIONALLY always-on — it is NOT
+    gated behind ``multimodal_query_vision_enabled``. It is strictly finer than
+    the legacy ``(str(file_id), text)`` key, so it can only SPLIT two rows that
+    previously collapsed, never merge them. This preserves artifact identity
+    even with the query-time vision feature OFF (the default), which is the
+    correct behavior: two distinct images with byte-identical proxy text are
+    still two distinct sources. Downstream consumers of the deduplicated
+    ``sources`` list (rag_engine fusion/rebuild, token packing, prompt builder,
+    eval top_k cap) are all bounded by ``retrieval_top_k`` /
+    ``context_max_tokens`` / ``per_doc_chunk_cap``, so N-for-1 growth is
+    intended and safe. Gating this key behind the feature flag would reintroduce
+    the identity-collapse bug that #479 deliberately fixed.
     """
     artifact_id = artifact_id_from_metadata(metadata)
     if artifact_id:
@@ -648,7 +702,7 @@ class DocumentRetrievalService:
         Returns:
             Dictionary with source metadata
         """
-        filename = (
+        filename = sanitize_wire_filename(
             chunk.metadata.get("source_file")
             or chunk.metadata.get("filename")
             or chunk.metadata.get("section_title")
@@ -690,7 +744,11 @@ class DocumentRetrievalService:
             "chunk_bbox": chunk.metadata.get("chunk_bbox"),
             "snippet": snippet,
             "score": chunk.score,
-            "metadata": chunk.metadata,
+            # Issue #480 (A1) / PR #481 (PRR-001): emit only the whitelisted
+            # metadata keys. Forwarding ``chunk.metadata`` wholesale leaked
+            # server-absolute ``file_path``/``source_file`` to any vault-read
+            # user. See ``whitelist_metadata_for_wire``.
+            "metadata": whitelist_metadata_for_wire(chunk.metadata),
         }
         # Multi-modal artifact presentation (issue #462): emit first-class
         # optional artifact fields ONLY for artifact sources, and never when the

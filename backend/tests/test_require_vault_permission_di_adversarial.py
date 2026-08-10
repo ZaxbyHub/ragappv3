@@ -777,7 +777,7 @@ class TestConcurrentAccessAttacks:
                     result[vid] = None
             return result
 
-        with patch("app.api.deps.get_effective_vault_permissions", side_effect=mock_get_effective_permissions):
+        with patch("app.services.authz_policy.get_effective_vault_permissions", side_effect=mock_get_effective_permissions):
             # Vault 1 → read allowed
             result1 = await _evaluate_policy(mock_db := MagicMock(), mock_user, "vault", 1, "read")
             assert result1 is True
@@ -826,11 +826,13 @@ class TestOversizedBoundaryAttacks:
         """
         mock_user = {"id": 1, "role": "member"}
 
-        # Mock the permission lookup at the get_effective_vault_permission level
+        # Mock the permission lookup at the get_effective_vault_permission level.
+        # Issue #480 (D3): the canonical evaluator now lives in app.services.authz_policy,
+        # so the helper must be patched there (it resolves via its own module namespace).
         async def mock_get_effective_vault_permission(db, principal, vault_id):
             return "read"  # member has read permission on vault 1
 
-        with patch("app.api.deps.get_effective_vault_permission", new=mock_get_effective_vault_permission):
+        with patch("app.services.authz_policy.get_effective_vault_permission", new=mock_get_effective_vault_permission):
             result = await _evaluate_policy(
                 MagicMock(), mock_user, "vault", 1, "nonexistent_action"
             )

@@ -751,13 +751,16 @@ class TestRAGEnginePipeline(unittest.IsolatedAsyncioTestCase):
             # is removing all results based on max_distance_threshold.
             # The test has been updated to show debug info.
             self.assertEqual(len(done_msg["sources"]), 3)
-            # Verify the sources are sorted by chunk_index
+            # Verify the sources are sorted by chunk_index. Issue #480 (A1): the
+            # wire metadata is now a whitelist ({synthesized, page_number}), so
+            # chunk_index is no longer emitted on the wire — verify ordering via
+            # the source id, which encodes the chunk index (doc1_4, doc1_5, ...).
             self.assertEqual(done_msg["sources"][0]["file_id"], "doc1")
-            self.assertEqual(done_msg["sources"][0]["metadata"].get("chunk_index"), 4)
+            self.assertTrue(done_msg["sources"][0]["id"].endswith("_4"))
             self.assertEqual(done_msg["sources"][1]["file_id"], "doc1")
-            self.assertEqual(done_msg["sources"][1]["metadata"].get("chunk_index"), 5)
+            self.assertTrue(done_msg["sources"][1]["id"].endswith("_5"))
             self.assertEqual(done_msg["sources"][2]["file_id"], "doc1")
-            self.assertEqual(done_msg["sources"][2]["metadata"].get("chunk_index"), 6)
+            self.assertTrue(done_msg["sources"][2]["id"].endswith("_6"))
 
     async def test_empty_query_handling(self):
         """Test handling of empty query string."""

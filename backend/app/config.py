@@ -500,11 +500,11 @@ class Settings(BaseSettings):
     """Maximum concurrent multimodal enrichment calls."""
     multimodal_max_assets_per_batch: int = 4
     """Maximum typed assets enriched together in one request batch."""
-    multimodal_max_asset_bytes: int = 10 * 1024 * 1024
+    multimodal_max_asset_bytes: int = 10485760
     """Per-asset byte cap loaded for enrichment (10 MiB default)."""
-    multimodal_max_total_payload_bytes: int = 40 * 1024 * 1024
+    multimodal_max_total_payload_bytes: int = 41943040
     """Total per-request payload byte cap (40 MiB default)."""
-    multimodal_max_pixels: int = 4_000_000
+    multimodal_max_pixels: int = 4000000
     """Decoded image pixel cap per asset (width*height) for enrichment."""
     multimodal_max_attempts: int = 3
     """Maximum enrichment attempts per artifact before permanent failure (retryable

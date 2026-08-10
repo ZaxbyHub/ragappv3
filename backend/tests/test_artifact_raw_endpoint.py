@@ -195,5 +195,129 @@ class TestArtifactRawEndpoint(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
 
 
+class TestArtifactRawEndpointRealAuthz(unittest.TestCase):
+    """Issue #480 (E2): a REAL cross-vault disallowed-read IDOR test.
+
+    Unlike TestArtifactRawEndpoint (which stubs ``evaluate`` to True/False),
+    this exercises the REAL ``get_evaluate_policy`` dependency against a seeded
+    SQLite DB: a second user with membership ONLY in a different vault requests
+    vault 1's artifact and must get 403 (not the bytes).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.tmp, "test.db")
+        init_db(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.vault_root = Path(self.tmp) / "vault_root" / "artifacts"
+
+        cur = self.conn.cursor()
+        # Owner (admin) of vault 1, which holds the artifact.
+        cur.execute(
+            "INSERT INTO users (username, hashed_password, full_name, role, is_active, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("owner", "pw", "Owner", "admin", 1, "2026-01-01"),
+        )
+        owner_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO vaults (name, visibility, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("Vault One", "private", "2026-01-01", "2026-01-01"),
+        )
+        vault_one_id = cur.lastrowid
+
+        # A SECOND private vault the owner also belongs to.
+        cur.execute(
+            "INSERT INTO vaults (name, visibility, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("Vault Two", "private", "2026-01-01", "2026-01-01"),
+        )
+        vault_two_id = cur.lastrowid
+
+        # A second user with membership ONLY in vault two (NOT vault one).
+        cur.execute(
+            "INSERT INTO users (username, hashed_password, full_name, role, is_active, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("outsider", "pw", "Outsider", "member", 1, "2026-01-01"),
+        )
+        outsider_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO vault_members (vault_id, user_id, permission, granted_by) "
+            "VALUES (?, ?, ?, ?)",
+            (vault_two_id, outsider_id, "read", owner_id),
+        )
+
+        # Seed a file + atom + asset in vault one.
+        cur.execute(
+            "INSERT INTO files (vault_id, file_path, file_name, file_size, status, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (vault_one_id, "/uploads/doc.pdf", "doc.pdf", 1234, "indexed", "upload"),
+        )
+        file_id = cur.lastrowid
+        self.atom_id = "atom-vault-one"
+        asset_id = "asset-vault-one"
+        gen_hash = "h" * 12
+        cur.execute(
+            "INSERT INTO document_atoms (atom_id, schema_version, file_id, generation_hash,"
+            " ordinal, kind, raw_text, page_number, asset_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (self.atom_id, 1, file_id, gen_hash, 0, "image", "FIG 1", 1, asset_id),
+        )
+        sha256 = __import__("hashlib").sha256(PNG_BYTES).hexdigest()
+        rel = compute_asset_rel_path(file_id, gen_hash, asset_id)
+        cur.execute(
+            "INSERT INTO document_assets (asset_id, file_id, generation_hash, sha256,"
+            " rel_path, mime_type, width, height, byte_size) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (asset_id, file_id, gen_hash, sha256, rel, "image/png", 1, 1, len(PNG_BYTES)),
+        )
+        self.conn.commit()
+
+        # Write the real asset file beneath the confined vault root.
+        abs_path = self.vault_root / rel
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        abs_path.write_bytes(PNG_BYTES)
+
+        self.outsider_user = {"id": outsider_id, "role": "member", "username": "outsider"}
+
+        self.app = FastAPI()
+        self.app.include_router(documents.router)
+
+        def _get_db():
+            try:
+                yield self.conn
+            finally:
+                pass
+
+        # NOTE: get_evaluate_policy is NOT overridden — the real policy evaluator
+        # runs against the seeded vault_members rows.
+        self.app.dependency_overrides[get_db] = _get_db
+        self.app.dependency_overrides[get_settings] = lambda: settings
+        self.client = TestClient(self.app)
+
+    def tearDown(self):
+        self.conn.close()
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch_root(self):
+        return patch("app.services.artifact_store.artifact_root", return_value=self.vault_root)
+
+    def test_outsider_in_other_vault_gets_403(self):
+        """A user with membership only in vault two cannot read vault one's
+        artifact asset — the REAL evaluate policy must deny (403), and no bytes
+        are served (authz-before-byte-open)."""
+        self.app.dependency_overrides[get_current_user_or_service_account] = (
+            lambda: self.outsider_user
+        )
+        with self._patch_root():
+            r = self.client.get(f"/documents/artifacts/{self.atom_id}/raw")
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("No read access", r.text)
+        # No artifact bytes leak on a denied read.
+        self.assertNotIn(PNG_BYTES, r.content)
+
+
 if __name__ == "__main__":
     unittest.main()

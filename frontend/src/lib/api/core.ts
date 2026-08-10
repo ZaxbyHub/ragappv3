@@ -474,7 +474,8 @@ export interface Source {
     | "proxy_only"
     | "policy_blocked"
     | "asset_missing"
-    | "provider_unavailable";
+    | "provider_unavailable"
+    | "empty_response";
   description?: string;
   metadata?: Record<string, unknown>;
 }

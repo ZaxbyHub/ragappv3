@@ -442,6 +442,66 @@ class TestSearchAuth(unittest.TestCase):
     # Additional edge case tests
     # ─────────────────────────────────────────────────────────────────────────────
 
+    def test_search_metadata_whitelist_strips_server_paths(self):
+        """PR #481 (PRR-001): /search must apply the same wire metadata whitelist
+        as to_source_metadata — server-absolute paths (file_path/source_file) and
+        internal ids must not leak via the SearchResult.metadata field."""
+        leaky_metadata = json.dumps(
+            {
+                "file_path": "/var/lib/ragapp/vaults/1/uploads/secret.pdf",
+                "source_file": "/srv/uploads/secret.pdf",
+                "atom_id": "atom-1",
+                "raw_text": "internal evidence",
+                "chunk_uid": "f1_0",
+                # whitelisted keys survive:
+                "page_number": 3,
+            }
+        )
+
+        class _LeakyVectorStore(FakeVectorStore):
+            async def search(self, embedding, limit=10, vault_id=None):
+                return [
+                    {
+                        "id": "chunk-leak",
+                        "text": "content",
+                        "file_id": "file-1",
+                        "chunk_index": 0,
+                        "metadata": leaky_metadata,
+                        "_distance": 0.4,
+                    }
+                ]
+
+        token = self._create_jwt_token(
+            self.superadmin_user_id, "superadmin_user", "superadmin"
+        )
+        from app.api.deps import get_vector_store as _get_vector_store_dep
+
+        self.app.dependency_overrides[_get_vector_store_dep] = lambda: _LeakyVectorStore()
+        try:
+            response = self.client.post(
+                "/api/search",
+                json={"query": "test", "limit": 10},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        finally:
+            self.app.dependency_overrides.pop(_get_vector_store_dep, None)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        results = response.json().get("results", [])
+        self.assertTrue(results, "expected at least one search result")
+        wire_meta = results[0].get("metadata", {})
+        # Only the whitelisted key survives.
+        self.assertEqual(set(wire_meta.keys()), {"page_number"})
+        self.assertEqual(wire_meta["page_number"], 3)
+        for leak_key in (
+            "file_path", "source_file", "atom_id", "raw_text", "chunk_uid",
+        ):
+            self.assertNotIn(leak_key, wire_meta)
+        # No absolute path leaks anywhere in the serialized response.
+        body = json.dumps(response.json())
+        self.assertNotIn("/var/lib/ragapp", body)
+        self.assertNotIn("/srv/uploads", body)
+
     def test_member_search_with_invalid_vault_id_format(self):
         """Member searching with string vault_id should handle gracefully."""
         token = self._create_jwt_token(self.member_user_id, "member_user", "member")

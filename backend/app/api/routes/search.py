@@ -24,6 +24,10 @@ from app.api.deps import (
 )
 from app.config import settings
 from app.limiter import limiter
+from app.services.document_retrieval import (
+    sanitize_wire_filename,
+    whitelist_metadata_for_wire,
+)
 from app.services.embeddings import EmbeddingError, EmbeddingService
 from app.services.vector_store import (
     SearchSemaphoreTimeoutError,
@@ -202,7 +206,11 @@ async def search(
                     chunk_index=record.get("chunk_index", 0)
                     if isinstance(record, dict)
                     else getattr(record, "chunk_index", 0),
-                    metadata=metadata,
+                    # Issue #480 (A1) / PR #481 (PRR-001): apply the same wire
+                    # metadata whitelist as to_source_metadata so server-absolute
+                    # paths (file_path/source_file) and internal ids do not leak
+                    # via the /search results either.
+                    metadata=whitelist_metadata_for_wire(metadata),
                     score=score,
                 )
             )
@@ -275,7 +283,10 @@ async def get_chunk_context(
     if not row:
         raise HTTPException(status_code=404, detail="Chunk not found")
 
-    filename = row["file_name"] or filename
+    # PR #481 (PRR-001): prefer the DB file_name; if it's NULL/empty, fall back to
+    # the metadata-derived name but SANITIZE it so a stored server-absolute
+    # ``source_file`` never reaches the wire filename field.
+    filename = row["file_name"] or sanitize_wire_filename(filename)
     vault_id = _coerce_int(row["vault_id"])
     if vault_id is None:
         raise HTTPException(status_code=404, detail="Chunk not found")
