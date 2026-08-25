@@ -1161,15 +1161,17 @@ Persist prompt ID, version, SHA-256 of rendered system/developer content, model,
 
 | Stage | Client | Default temperature |
 |---|---|---:|
-| facet extraction/research synthesis | instant | 0.1 |
+| facet extraction/research synthesis | thinking | 0.1 |
 | outline/critic | thinking | 0.2 |
 | section drafting | thinking | 0.5 |
 | lint rewrite | thinking | 0.3 |
-| copy | thinking | 0.2 |
-| standards | thinking | 0.2 |
-| atomic-claim extraction/fact | thinking | 0.1 |
+| copy | editorial | 0.2 |
+| standards | editorial | 0.2 |
+| atomic-claim extraction/fact | editorial | 0.1 |
 
 These are defaults, not user-visible promises. Single-model deployments must work. Optional per-role endpoints are PR 4 and follow the wiki-curator configuration/reload pattern.
+
+The `editorial` client routes copy/standards/fact to `DRAFT_EDITORIAL_CHAT_URL`/`DRAFT_EDITORIAL_CHAT_MODEL` (falling back to the thinking client when unset) so reasoning-loop-prone primary models cannot wedge editorial desk stages. Research synthesis runs on the thinking client for schema fidelity.
 
 ### 14.3 Structured output rules
 

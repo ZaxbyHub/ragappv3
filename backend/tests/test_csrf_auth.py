@@ -390,16 +390,22 @@ class TestCSRFProtection(unittest.TestCase):
         self.assertEqual(data["user"]["username"], "validuser")
 
     def test_csrf_cookie_mismatch_returns_403(self):
-        """CSRF cookie and header mismatch should return 403."""
-        csrf_cookie1, csrf_token1 = self._get_csrf_cookie_and_header()
-        csrf_cookie2, csrf_token2 = self._get_csrf_cookie_and_header()
+        """CSRF cookie and header mismatch should return 403.
 
-        # Send mismatched cookie and header
+        Note: the TestClient merges its cookie jar with per-request cookies,
+        so a second token fetched from the jar also rides along as a
+        duplicate cookie. The contract (security._cookie_candidates) is that
+        the echoed header must match a transmitted cookie value; a header
+        matching NONE of them is the true mismatch case.
+        """
+        csrf_cookie1, csrf_token1 = self._get_csrf_cookie_and_header()
+
+        # Header matches no transmitted cookie value (forged/garbage header)
         response = self.client.post(
             "/api/auth/register",
             json={"username": "mismatch", "password": "Password123"},
             cookies={"X-CSRF-Token": csrf_cookie1},
-            headers={"X-CSRF-Token": csrf_token2},  # Different token
+            headers={"X-CSRF-Token": "forged-token-matching-nothing"},
         )
         self.assertEqual(response.status_code, 403)
         self.assertIn("CSRF", response.json()["detail"])

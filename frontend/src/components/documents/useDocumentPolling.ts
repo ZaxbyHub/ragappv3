@@ -203,10 +203,24 @@ export function useDocumentPolling({
     return () => clearTimeout(timer);
   }, [documents, fetchDocuments, fetchStats]);
 
-  // Hydrate wiki statuses whenever the document list changes (best-effort).
+  // Hydrate wiki statuses when the doc-ID set changes (best-effort). Keyed on
+  // the ID join — NOT the array identity — so the adaptive status poll's
+  // fetchDocuments() refresh (new array, same IDs) doesn't refire a wiki GET
+  // per document on every cycle. Only docs with no cached status or a
+  // transient status (compiling/promoting) are re-polled; terminal wiki
+  // statuses don't change without user action.
+  const wikiDocKey = documents.map((d) => String(d.id)).join(",");
   useEffect(() => {
-    if (documents.length > 0) fetchWikiStatuses(documents);
-  }, [documents, fetchWikiStatuses]);
+    if (documents.length === 0) return;
+    const need = documents.filter((d) => {
+      if (d.metadata?.status !== "indexed") return false;
+      const w = wikiStatusMap[String(d.id)];
+      const transient = w?.wiki_status === "compiling";
+      return !w || transient;
+    });
+    if (need.length > 0) fetchWikiStatuses(need);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wikiDocKey, fetchWikiStatuses]);
 
   // Refresh documents shortly after uploads finish indexing.
   useEffect(() => {

@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import time
 from typing import Callable, Dict
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import redis
 from fastapi import Header, HTTPException, Request, Response
@@ -452,6 +452,40 @@ def _validate_csrf_origin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="CSRF origin validation failed")
 
 
+def _csrf_error_detail(request: Request, detail: str) -> HTTPException:
+    """Build a 403 that also sets the ``x-csrf-error: true`` header.
+
+    The frontend CSRF retry (``attachCsrfInterceptor`` in ``core.ts``)
+    recognises CSRF failures via this header or a "csrf" substring in the
+    detail, then refreshes its token and retries once. Stamping the header
+    makes that contract explicit and robust against detail rewording.
+    """
+    exc = HTTPException(status_code=403, detail=detail)
+    exc.headers = {"x-csrf-error": "true"}
+    return exc
+
+
+def _cookie_candidates(request: Request, name: str) -> list[str]:
+    """All values sent for a cookie name, in transmission order.
+
+    Browsers forward one ``Cookie`` header line per cookie jar entry that
+    matches the request path, so duplicate names (a stale ``Path=/`` cookie
+    plus the current scoped one) arrive as repeated name=value pairs.
+    Starlette's ``request.cookies`` collapses those to a single last-wins
+    value, which silently discards the valid token. Return every candidate
+    so double-submit comparison can accept a match against ANY transmitted
+    value; the echoed header is the same-origin proof, the cookie just has
+    to be present in the request at all.
+    """
+    header = request.headers.get("cookie") or ""
+    values: list[str] = []
+    for part in header.split(";"):
+        part = part.strip()
+        if part.startswith(name + "="):
+            values.append(unquote(part[len(name) + 1 :]))
+    return values
+
+
 def csrf_protect(
     request: Request,
     x_csrf_token: str = Header(""),
@@ -460,11 +494,22 @@ def csrf_protect(
         return "test-bypass"
     _validate_csrf_origin(request)
     csrf_manager = get_csrf_manager(request)
-    cookie = request.cookies.get(CSRF_COOKIE_NAME)
-    if not cookie or not x_csrf_token or cookie != x_csrf_token:
-        raise HTTPException(status_code=403, detail="CSRF token missing or mismatch")
+    cookie_values = _cookie_candidates(request, CSRF_COOKIE_NAME)
+    if not cookie_values or not x_csrf_token:
+        raise _csrf_error_detail(request, "CSRF token missing or mismatch")
+    # Strict double-submit when a single cookie value is transmitted: the
+    # header must equal it exactly. Only when duplicates are present (the
+    # shadow-cookie scenario: stale broad-path + current scoped cookie) does
+    # comparison accept a match against ANY transmitted value — the echoed
+    # header is the same-origin proof and Redis validation gates forgery.
+    if len(cookie_values) == 1:
+        matched = x_csrf_token == cookie_values[0]
+    else:
+        matched = x_csrf_token in cookie_values
+    if not matched:
+        raise _csrf_error_detail(request, "CSRF token missing or mismatch")
     if not csrf_manager.validate_token(x_csrf_token):
-        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+        raise _csrf_error_detail(request, "Invalid CSRF token")
     return x_csrf_token
 
 

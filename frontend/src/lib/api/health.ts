@@ -6,9 +6,16 @@ export interface HealthResponse {
   timestamp?: string;
   services?: {
     backend: boolean;
-    embeddings: boolean;
-    chat: boolean;
+    /** null = not checked this cycle (shallow poll before any deep result) */
+    embeddings: boolean | null;
+    /** null = not checked this cycle (shallow poll before any deep result) */
+    chat: boolean | null;
+    vector_store?: boolean | null;
   };
+  /** Present when services come from the server-side last-known cache */
+  services_cached?: boolean;
+  /** Age in seconds of the cached last-known service status */
+  services_age_seconds?: number;
 }
 
 export interface ConnectionCheck {

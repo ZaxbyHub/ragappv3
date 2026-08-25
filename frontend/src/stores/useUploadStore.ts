@@ -115,9 +115,13 @@ const MAX_POLL_DURATION_MS = 4 * 60 * 60 * 1000; // 4 hours hard cap
 const LONG_RUNNING_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
 function pickPollDelay(elapsedMs: number): number {
-  if (elapsedMs < 20_000) return 1500;
-  if (elapsedMs < 80_000) return 3000;
-  return 6000;
+  // Cadence relaxed 2026-08-25: with several files uploading at once the
+  // per-file pollers stacked into a ~5 req/s burst that upstream WAFs
+  // (AF proxy) rate-limit with 403s that look like app errors. 3/6/12s keeps
+  // progress UX responsive at a fraction of the request volume.
+  if (elapsedMs < 20_000) return 3000;
+  if (elapsedMs < 80_000) return 6000;
+  return 12000;
 }
 
 /**

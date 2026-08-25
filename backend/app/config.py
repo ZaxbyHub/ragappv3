@@ -7,7 +7,7 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Optional
 
-from pydantic import SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.services.document_artifacts import RASTER_IMAGE_EXTENSIONS
@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     """Maximum keep-alive connections in the LLM client pool."""
 
     # Instant mode (LM Studio on local GPU)
+    editorial_chat_url: str = Field(default="", alias="DRAFT_EDITORIAL_CHAT_URL")
+    editorial_chat_model: str = Field(default="", alias="DRAFT_EDITORIAL_CHAT_MODEL")
     instant_chat_url: str = "http://host.docker.internal:1234"
     instant_chat_model: str = "nvidia/nemotron-3-nano-4b"
     default_chat_mode: str = "thinking"  # "instant" | "thinking"

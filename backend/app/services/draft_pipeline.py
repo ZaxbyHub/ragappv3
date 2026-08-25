@@ -340,6 +340,8 @@ def _provider_model_name(logical_mode: str) -> str:
     Persisted on stage artifacts, which are client-visible, so this must never
     return an endpoint, credential or configured allowlist entry.
     """
+    if logical_mode == "editorial":
+        return settings.editorial_chat_model or settings.chat_model or "thinking"
     if logical_mode == "instant":
         return settings.instant_chat_model or "instant"
     return settings.chat_model or "thinking"
@@ -351,6 +353,8 @@ def _provider_base_url(logical_mode: str) -> str:
     SPEC §14.2 requires single-model deployments to work, so an unconfigured
     ``instant`` endpoint degrades to the ``thinking`` one rather than failing.
     """
+    if logical_mode == "editorial":
+        return (settings.editorial_chat_url or settings.ollama_chat_url or "").strip()
     if logical_mode == "instant":
         return (settings.instant_chat_url or settings.ollama_chat_url or "").strip()
     return (settings.ollama_chat_url or "").strip()
@@ -390,11 +394,18 @@ async def _default_complete(
     exceptions are never logged with their message — only their type name —
     because they can carry response bodies (SPEC §20).
     """
-    from app.services.llm_client import create_instant_client, create_thinking_client
-
-    client = (
-        create_instant_client() if logical_mode == "instant" else create_thinking_client()
+    from app.services.llm_client import (
+        create_editorial_client,
+        create_instant_client,
+        create_thinking_client,
     )
+
+    if logical_mode == "editorial":
+        client = create_editorial_client()
+    else:
+        client = (
+            create_instant_client() if logical_mode == "instant" else create_thinking_client()
+        )
     try:
         await client.start()
         _assert_redirects_disabled(client)
