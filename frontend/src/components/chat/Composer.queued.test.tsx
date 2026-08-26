@@ -124,26 +124,26 @@ describe("Composer polling — async upload path", () => {
     await vi.advanceTimersByTimeAsync(1);
 
     // Cycle 1: queued
-    await vi.advanceTimersByTimeAsync(1600);
+    await vi.advanceTimersByTimeAsync(3100); // one poll at the 3s floor cadence
     let u = useUploadStore.getState().uploads[0];
     expect(u.status).toBe("processing");
     expect(u.phase).toBe("queued");
     expect(u.error).toBeUndefined();
 
     // Cycle 2: parsing
-    await vi.advanceTimersByTimeAsync(1600);
+    await vi.advanceTimersByTimeAsync(3100); // one poll at the 3s floor cadence
     u = useUploadStore.getState().uploads[0];
     expect(u.phase).toBe("parsing");
     expect(u.status).toBe("processing");
 
     // Cycle 3: embedding 40%
-    await vi.advanceTimersByTimeAsync(1600);
+    await vi.advanceTimersByTimeAsync(3100); // one poll at the 3s floor cadence
     u = useUploadStore.getState().uploads[0];
     expect(u.phase).toBe("embedding");
     expect(u.processingProgress).toBe(40);
 
     // Cycle 4: indexed
-    await vi.advanceTimersByTimeAsync(1600);
+    await vi.advanceTimersByTimeAsync(3100); // one poll at the 3s floor cadence
     u = useUploadStore.getState().uploads[0];
     expect(u.status).toBe("indexed");
   });

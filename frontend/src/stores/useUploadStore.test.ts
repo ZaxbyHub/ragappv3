@@ -123,7 +123,7 @@ describe("useUploadStore — async-aware contract", () => {
     // Drain the microtask + the 0ms timeout that resolves uploadDocument.
     await vi.advanceTimersByTimeAsync(1);
     // Drive one polling cycle (1500ms first interval).
-    await vi.advanceTimersByTimeAsync(1600);
+    await vi.advanceTimersByTimeAsync(3100); // one poll at the 3s floor cadence
 
     const u = useUploadStore.getState().uploads[0];
     expect(u).toBeDefined();
@@ -199,13 +199,13 @@ describe("useUploadStore — async-aware contract", () => {
     await vi.advanceTimersByTimeAsync(1);
 
     // First poll: indexed but wiki running -> keep polling.
-    await vi.advanceTimersByTimeAsync(1600);
+    await vi.advanceTimersByTimeAsync(3100); // one poll at the 3s floor cadence
     const after1 = useUploadStore.getState().uploads[0];
     expect(after1.status).toBe("indexed");
     expect(after1.wikiStatus).toBe("running");
 
     // Two more polling cycles to pass the wiki-running snapshot.
-    await vi.advanceTimersByTimeAsync(3500);
+    await vi.advanceTimersByTimeAsync(6300); // second poll at the 6s mid cadence
     const after2 = useUploadStore.getState().uploads[0];
     expect(after2.wikiStatus).toBe("completed");
   });

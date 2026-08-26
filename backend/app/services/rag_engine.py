@@ -2464,6 +2464,20 @@ class RAGEngine:
                 async for chunk in candidate.chat_completion_stream(messages, max_tokens=max_tokens):
                     emitted_content = True
                     yield {"type": "content", "content": chunk}
+
+                # Reasoning models can finish a stream having emitted only
+                # provider-side reasoning_content, which LLMClient correctly
+                # withholds from users. Treat that as a failed visible answer
+                # and continue to the next configured client instead of
+                # persisting a blank assistant message.
+                if not emitted_content:
+                    last_error = LLMError("LLM stream completed without user-visible content")
+                    logger.warning(
+                        "[_stream_llm_response] Empty visible response from %s; trying fallback",
+                        getattr(candidate, "base_url", "<unknown>"),
+                    )
+                    continue
+
                 metrics = dict(getattr(candidate, "last_metrics", {}) or {})
                 if candidate is not target:
                     metrics["fallback_from"] = getattr(target, "base_url", None)

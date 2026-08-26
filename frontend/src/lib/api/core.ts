@@ -1,3 +1,4 @@
+import { APP_BASENAME } from "@/lib/paths";
 import axios, { AxiosRequestHeaders } from "axios";
 import { appPath } from "../paths";
 
@@ -34,13 +35,49 @@ export function getJwtAccessToken(): string | null {
   return _jwtAccessToken;
 }
 
-// Read CSRF token from the non-httpOnly cookie set by the server
+// Read CSRF token from the non-httpOnly cookie set by the server.
+// Shadow-cookie defense: a stale same-name cookie with a broader Path (e.g.
+// a leftover Path=/ cookie from a pre-subpath deployment) can coexist with
+// the current scoped one. document.cookie collapses duplicates last-wins,
+// so the read may surface the stale value. When multiple candidates exist,
+// purge the broader-path shadows and re-read so the scoped cookie wins.
 function getCsrfCookie(): string | null {
-  const match = document.cookie
-    .split('; ')
-    .find(row => row.startsWith('X-CSRF-Token='));
-  // Use split with limit=2 so token values containing '=' (base64 padding) are preserved
-  return match ? decodeURIComponent(match.split('=', 2)[1]) : null;
+  const read = () => {
+    const match = document.cookie
+      .split('; ')
+      .find(row => row.startsWith('X-CSRF-Token='));
+    // Use split with limit=2 so token values containing '=' (base64 padding) are preserved
+    return match ? decodeURIComponent(match.split('=', 2)[1]) : null;
+  };
+  let token = read();
+  if (document.cookie.split('; ').filter(row => row.startsWith('X-CSRF-Token=')).length > 1) {
+    // Duplicate same-name cookies: purge JS-addressable path-variants and
+    // re-read (falls back to the pre-purge read if none survive). If the
+    // purge removed the good cookie too, ensureCsrfToken's network fetch
+    // re-establishes it on the next mutating request.
+    purgeStaleCsrfCookies();
+    token = read() ?? token;
+  }
+  return token;
+}
+
+// Shadow-cookie cleanup for the whole origin: removes stale X-CSRF-Token
+// cookies at common paths so only the scoped one remains. Safe to call
+// anytime; the next token fetch re-establishes the cookie if needed.
+export function purgeStaleCsrfCookies(): void {
+  // The server sets the CSRF cookie at the app-root path (APP_BASENAME —
+  // `/meridian` for a subpath deployment, `/` for a root deployment). That
+  // path is authoritative: the server issues it, so deleting it cannot heal
+  // anything, and in a root deployment it IS the legitimate cookie. Only
+  // strictly broader paths (shadows like a pre-subpath `Path=/` leftover)
+  // and unrelated app-local paths are safe to purge.
+  const appRoot = APP_BASENAME ? APP_BASENAME.replace(/\/+$/, '') : '';
+  const base = new URL(API_BASE_URL, location.origin).pathname.replace(/\/+$/, '');
+  const candidates = ['/', base + '/', location.pathname.replace(/\/[^/]*$/, '') || '/'];
+  for (const p of new Set(candidates)) {
+    if (appRoot !== '' && (p === appRoot || p === appRoot + '/')) continue;
+    document.cookie = `X-CSRF-Token=; path=${p}; max-age=0`;
+  }
 }
 
 // CSRF token cache and deduplication — single source of truth
@@ -60,14 +97,22 @@ export function getCsrfToken(): string | null {
   return _csrfToken;
 }
 
-export async function ensureCsrfToken(): Promise<string> {
-  if (_csrfToken) return _csrfToken;
+export async function ensureCsrfToken(force: boolean = false): Promise<string> {
+  // `force` bypasses the in-memory cache as well as the cookie jar: callers
+  // force exactly when the cached token is known-stale (post-403 retry,
+  // post-refresh rotation), so serving the cache would defeat the point.
+  if (_csrfToken && !force) return _csrfToken;
 
-  // Check cookie first
-  const cookieToken = getCsrfCookie();
-  if (cookieToken) {
-    _csrfToken = cookieToken;
-    return cookieToken;
+  // Check cookie first — unless forced: after a CSRF 403 the cookie may hold
+  // the very token the server just rejected (rotated by login/refresh, or
+  // expired server-side while Max-Age keeps it in the jar). A forced refresh
+  // bypasses the jar and gets a server-issued token + fresh cookie pair.
+  if (!force) {
+    const cookieToken = getCsrfCookie();
+    if (cookieToken) {
+      _csrfToken = cookieToken;
+      return cookieToken;
+    }
   }
 
   if (!_csrfFetchPromise) {
@@ -115,15 +160,29 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
     (resp) => resp,
     async (error) => {
       const config = error.config;
-      const detail = error.response?.data?.detail || "";
+      let detail = error.response?.data?.detail || "";
+      // Blob error bodies (responseType: "blob", e.g. the draft export download)
+      // have no .detail — read the text so CSRF 403 detection still matches.
+      if (
+        error.response?.status === 403 &&
+        typeof Blob !== "undefined" &&
+        error.response.data instanceof Blob
+      ) {
+        try {
+          detail = JSON.parse(await error.response.data.text())?.detail ?? detail;
+        } catch {
+          // non-JSON body — keep detail as-is
+        }
+      }
       const isCsrfError = error.response?.status === 403 && (
         error.response?.headers?.["x-csrf-error"] === "true" ||
         (typeof detail === "string" && detail.toLowerCase().includes("csrf"))
       );
       if (isCsrfError && config && !config._csrfRetry) {
         resetCsrfToken(); // force refresh on next request
+        purgeStaleCsrfCookies(); // drop shadow cookies before refetch
         config._csrfRetry = true;
-        const newToken = await ensureCsrfToken();
+        const newToken = await ensureCsrfToken(true);
         if (!config.headers) {
           config.headers = {};
         }
@@ -166,17 +225,14 @@ async function _doRefresh(): Promise<string | null> {
   try {
     // The /auth/refresh endpoint requires the CSRF token.
     // Read it from the non-httpOnly cookie; if missing, fetch a fresh one.
-    let csrfToken = getCsrfCookie();
-    if (!csrfToken) {
-      try {
-        const csrfResp = await fetch(`${API_BASE_URL}/csrf-token`, { credentials: "include" });
-        if (csrfResp.ok) {
-          const csrfData = await csrfResp.json();
-          csrfToken = csrfData.csrf_token ?? null;
-        }
-      } catch {
-        // proceed without CSRF — server will reject if required
-      }
+    // Force a server-issued token: the jar's cookie may have expired in step
+    // with its Redis TTL (both 900s) while the access token outlived it, which
+    // is exactly when a silent refresh fires.
+    let csrfToken: string | null = null;
+    try {
+      csrfToken = await ensureCsrfToken(true);
+    } catch {
+      // proceed without CSRF — server will reject if required
     }
 
     const headers: Record<string, string> = {};
@@ -190,6 +246,10 @@ async function _doRefresh(): Promise<string | null> {
       headers,
     });
     if (!response.ok) return null;
+    // /auth/refresh rotates the CSRF cookie (issue_csrf_token in the handler).
+    // Drop the cached token so the next mutating request re-reads the cookie
+    // instead of sending the stale pre-refresh token (403 CSRF mismatch).
+    resetCsrfToken();
     const data = await response.json();
     _jwtAccessToken = data.access_token;
     return data.access_token;

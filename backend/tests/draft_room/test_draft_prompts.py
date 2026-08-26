@@ -242,12 +242,12 @@ class TestModelRoutingTable(unittest.TestCase):
     """SPEC §14.2 MVP model routing table, verbatim."""
 
     _EXPECTED = {
-        "research": ("instant", 0.1),
+        "research": ("thinking", 0.1),
         "outline": ("thinking", 0.2),
         "draft": ("thinking", 0.5),
-        "copy": ("thinking", 0.2),
-        "standards": ("thinking", 0.2),
-        "fact": ("thinking", 0.1),
+        "copy": ("editorial", 0.2),
+        "standards": ("editorial", 0.2),
+        "fact": ("editorial", 0.1),
     }
 
     def test_routing_table_matches_spec_exactly(self) -> None:
@@ -261,7 +261,7 @@ class TestModelRoutingTable(unittest.TestCase):
     def test_logical_mode_and_temperature_are_in_range_for_every_stage(self) -> None:
         for stage, prompt in PROMPTS.items():
             with self.subTest(stage=stage):
-                self.assertIn(prompt.logical_mode, ("instant", "thinking"))
+                self.assertIn(prompt.logical_mode, ("instant", "thinking", "editorial"))
                 self.assertGreaterEqual(prompt.temperature, 0.0)
                 self.assertLessEqual(prompt.temperature, 1.0)
 

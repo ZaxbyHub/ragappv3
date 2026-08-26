@@ -198,6 +198,11 @@ class TestCSRFProtection(unittest.TestCase):
             reg_response.status_code, 200, f"Registration failed: {reg_response.json()}"
         )
 
+        # The server rotates the CSRF cookie on protected POSTs (register
+        # above), which desyncs the TestClient jar from the request-level
+        # pair below. Fetch a fresh pair so jar + header transmit in order.
+        csrf_cookie, csrf_token = self._get_csrf_cookie_and_header()
+
         # Login to get refresh cookie
         login_response = self.client.post(
             "/api/auth/login",
@@ -235,6 +240,11 @@ class TestCSRFProtection(unittest.TestCase):
             reg_response.status_code, 200, f"Registration failed: {reg_response.json()}"
         )
 
+        # The server rotates the CSRF cookie on protected POSTs (register
+        # above), which desyncs the TestClient jar from the request-level
+        # pair below. Fetch a fresh pair so jar + header transmit in order.
+        csrf_cookie, csrf_token = self._get_csrf_cookie_and_header()
+
         # Login to get refresh cookie
         login_response = self.client.post(
             "/api/auth/login",
@@ -271,6 +281,11 @@ class TestCSRFProtection(unittest.TestCase):
         self.assertEqual(
             reg_response.status_code, 200, f"Registration failed: {reg_response.json()}"
         )
+
+        # The server rotates the CSRF cookie on protected POSTs (register
+        # above), which desyncs the TestClient jar from the request-level
+        # pair below. Fetch a fresh pair so jar + header transmit in order.
+        csrf_cookie, csrf_token = self._get_csrf_cookie_and_header()
 
         # Login to get access token and new CSRF token
         login_response = self.client.post(
@@ -313,6 +328,9 @@ class TestCSRFProtection(unittest.TestCase):
         self.assertEqual(
             reg_response.status_code, 200, f"Registration failed: {reg_response.json()}"
         )
+        # The server rotates the CSRF cookie on protected POSTs (register
+        # above); fetch a fresh pair so jar + header transmit in order.
+        csrf_cookie, csrf_token = self._get_csrf_cookie_and_header()
         login_response = self.client.post(
             "/api/auth/login",
             json={"username": "cpwcsrf", "password": "Password123"},
@@ -389,17 +407,65 @@ class TestCSRFProtection(unittest.TestCase):
         data = response.json()
         self.assertEqual(data["user"]["username"], "validuser")
 
-    def test_csrf_cookie_mismatch_returns_403(self):
-        """CSRF cookie and header mismatch should return 403."""
-        csrf_cookie1, csrf_token1 = self._get_csrf_cookie_and_header()
-        csrf_cookie2, csrf_token2 = self._get_csrf_cookie_and_header()
+    def _post_with_raw_cookie(self, path, cookie_header, csrf_header, json_body):
+        """POST with an exact raw Cookie header so duplicate-vs-single
+        transmission is fully controlled (the TestClient jar merges and
+        would add its own cookies, defeating precise double-submit tests)."""
+        return self.client.post(
+            path,
+            json=json_body,
+            headers={
+                "X-CSRF-Token": csrf_header,
+                "Cookie": cookie_header,
+            },
+        )
 
-        # Send mismatched cookie and header
-        response = self.client.post(
+    def test_csrf_cookie_mismatch_returns_403(self):
+        """Two server-issued (Redis-valid) tokens; header must equal the
+        transmitted cookie or the request is rejected.
+
+        Both tokens pass validate_token, so only the double-submit
+        comparison can produce the 403 — this is the mutation-live guard
+        for the comparison itself. The raw Cookie header pins exactly one
+        transmitted value (no jar merge).
+        """
+        csrf_cookie1, _ = self._get_csrf_cookie_and_header()
+        _, csrf_token2 = self._get_csrf_cookie_and_header()
+
+        response = self._post_with_raw_cookie(
             "/api/auth/register",
-            json={"username": "mismatch", "password": "Password123"},
-            cookies={"X-CSRF-Token": csrf_cookie1},
-            headers={"X-CSRF-Token": csrf_token2},  # Different token
+            cookie_header=f"X-CSRF-Token={csrf_cookie1}",
+            csrf_header=csrf_token2,
+            json_body={"username": "mismatch", "password": "Password123"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("CSRF", response.json()["detail"])
+
+    def test_csrf_duplicate_cookies_first_transmitted_wins(self):
+        """Under duplicate cookies, the header must match the FIRST
+        transmitted value (RFC 6265 5.4 longest-path-first ordering) —
+        the app-scoped cookie, not a broader-path shadow."""
+        _, csrf_token1 = self._get_csrf_cookie_and_header()
+        _, csrf_token2 = self._get_csrf_cookie_and_header()
+        self.assertNotEqual(csrf_token1, csrf_token2)
+
+        # Header equals the first transmitted (app-scoped) value -> accepted
+        response = self._post_with_raw_cookie(
+            "/api/auth/register",
+            cookie_header=f"X-CSRF-Token={csrf_token1}; X-CSRF-Token={csrf_token2}",
+            csrf_header=csrf_token1,
+            json_body={"username": "dupfirst", "password": "Password123"},
+        )
+        self.assertEqual(response.status_code, 200)
+
+        # Header equals the second (shadow) value only -> rejected; the SPA
+        # heals via its forced token refetch, but the server must not accept
+        # a value that is not the most-specific transmitted cookie.
+        response = self._post_with_raw_cookie(
+            "/api/auth/register",
+            cookie_header=f"X-CSRF-Token={csrf_token1}; X-CSRF-Token={csrf_token2}",
+            csrf_header=csrf_token2,
+            json_body={"username": "dupshadow", "password": "Password123"},
         )
         self.assertEqual(response.status_code, 403)
         self.assertIn("CSRF", response.json()["detail"])

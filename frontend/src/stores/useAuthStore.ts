@@ -209,6 +209,12 @@ export const useAuthStore = create<AuthState>()(
             await get().fetchMe();
           }
 
+          // The login response rotates the CSRF cookie; drop the cached
+          // pre-login token so the first POST after login sends the new pair
+          // instead of a still-valid-but-no-longer-transmitted stale one.
+          resetCsrfToken();
+          await ensureCsrfToken(true).catch(() => undefined);
+
           // Initialize vault state to validate cached activeVaultId
           if (!_vaultsInitialized) {
             _vaultsInitialized = true;

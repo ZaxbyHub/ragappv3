@@ -41,13 +41,13 @@ from pydantic import BaseModel, Field, ValidationInfo, field_validator
 # Bundle version
 # ---------------------------------------------------------------------------
 
-PROMPT_BUNDLE_VERSION = "2026.07.31-draft-prompts-1"
+PROMPT_BUNDLE_VERSION = "2026.08.22-draft-prompts-2"
 
 # ---------------------------------------------------------------------------
 # Shared enums / literals (SPEC §4.4, §11, §12.3, §13)
 # ---------------------------------------------------------------------------
 
-LogicalMode = Literal["instant", "thinking"]
+LogicalMode = Literal["instant", "thinking", "editorial"]
 SourceKind = Literal["document", "wiki", "kms"]
 RetrievalStatus = Literal["ok", "partial", "unavailable"]
 OutlineMode = Literal["rewrite", "compose"]
@@ -398,6 +398,7 @@ def _frame(
     role: str,
     brief_section: str,
     schema_section: str,
+    example_section: str = "",
 ) -> str:
     return (
         f"PROMPT_ID: {prompt_id}\n"
@@ -420,7 +421,8 @@ def _frame(
         f"<untrusted_data name=\"upstream_artifact\">\n"
         f"{{upstream_artifact}}\n</untrusted_data>\n\n"
         f"{schema_section}\n\n"
-        f"{_OUTPUT_CONTRACT_NOTICE}"
+        + (f"{example_section}\n\n" if example_section else "")
+        + f"{_OUTPUT_CONTRACT_NOTICE}"
     )
 
 
@@ -429,7 +431,7 @@ def _frame(
 # ---------------------------------------------------------------------------
 
 _RESEARCH_PROMPT_ID = "draft_room.research.v1"
-_RESEARCH_VERSION = "1.0.0"
+_RESEARCH_VERSION = "1.1.0"
 _RESEARCH_TEMPLATE = _frame(
     prompt_id=_RESEARCH_PROMPT_ID,
     version=_RESEARCH_VERSION,
@@ -462,6 +464,21 @@ _RESEARCH_TEMPLATE = _frame(
         "contradictions[] (evidence_label_a, evidence_label_b, proposition, "
         "explanation), gaps[] (description, impact, blocks_drafting), "
         "source_only (bool)."
+    ),
+    example_section=(
+        "CANONICAL EXAMPLE (structure only — replace every value with real "
+        "content; NEVER copy example values verbatim): "
+        '{{"facets": [{{"facet_id": "F001", "query": "...", '
+        '"source_input_ids": [1, 2], "rationale": "..."}}], '
+        '"retrieval_status": "ok", '
+        '"requested_source_kinds": ["document"], '
+        '"successful_source_kinds": ["document"], '
+        '"failed_source_kinds": [], '
+        '"evidence": [{{"label": "S1", "kind": "document", "title": "...", '
+        '"passage": "...", "chunk_ref": "1:0", '
+        '"observed_at": "2026-01-01T00:00:00Z", '
+        '"retrieval_score": 0.9, "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "file_id": 1}}], '
+        '"contradictions": [], "gaps": [], "source_only": false}}'
     ),
 )
 
@@ -622,7 +639,7 @@ PROMPTS: dict[str, PromptDefinition] = {
     "research": PromptDefinition(
         prompt_id=_RESEARCH_PROMPT_ID,
         version=_RESEARCH_VERSION,
-        logical_mode="instant",
+        logical_mode="thinking",
         template=_RESEARCH_TEMPLATE,
         output_model=ResearchPacket,
         temperature=0.1,
@@ -646,7 +663,7 @@ PROMPTS: dict[str, PromptDefinition] = {
     "copy": PromptDefinition(
         prompt_id=_COPY_PROMPT_ID,
         version=_COPY_VERSION,
-        logical_mode="thinking",
+        logical_mode="editorial",
         template=_COPY_TEMPLATE,
         output_model=CopyReport,
         temperature=0.2,
@@ -654,7 +671,7 @@ PROMPTS: dict[str, PromptDefinition] = {
     "standards": PromptDefinition(
         prompt_id=_STANDARDS_PROMPT_ID,
         version=_STANDARDS_VERSION,
-        logical_mode="thinking",
+        logical_mode="editorial",
         template=_STANDARDS_TEMPLATE,
         output_model=StandardsReport,
         temperature=0.2,
@@ -662,7 +679,7 @@ PROMPTS: dict[str, PromptDefinition] = {
     "fact": PromptDefinition(
         prompt_id=_FACT_PROMPT_ID,
         version=_FACT_VERSION,
-        logical_mode="thinking",
+        logical_mode="editorial",
         template=_FACT_TEMPLATE,
         output_model=FactReport,
         temperature=0.1,

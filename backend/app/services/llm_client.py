@@ -52,6 +52,7 @@ class LLMClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         cb_name: str = "llm",
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the LLM client.
@@ -65,6 +66,9 @@ class LLMClient:
         self.base_url = (base_url or settings.ollama_chat_url).rstrip("/")
         self.model = model or settings.chat_model
         self.timeout = timeout
+        # Per-client template controls (e.g. Gemma 4 Instant no-thinking).
+        # Copy so callers cannot mutate the live request policy after creation.
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         assert_url_safe(base_url or settings.ollama_chat_url)
         self._circuit_breaker = create_llm_circuit_breaker(name=cb_name)
         self._client: Optional[httpx.AsyncClient] = None
@@ -228,6 +232,8 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if self.chat_template_kwargs:
+            payload["chat_template_kwargs"] = self.chat_template_kwargs
         if response_format is not None:
             payload["response_format"] = response_format
 
@@ -313,6 +319,8 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if self.chat_template_kwargs:
+            payload["chat_template_kwargs"] = self.chat_template_kwargs
         started_at = time.perf_counter()
         prompt_tokens = self._prompt_token_estimate(messages)
         completion_chars = 0
@@ -645,11 +653,28 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
     )
 
 
+def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
+    """Client for editorial desk stages (copy/standards/fact).
+
+    Some reasoning-strong chat models loop in reasoning on desk-style
+    structured-edit prompts; deployments can point these stages at a
+    different endpoint (DRAFT_EDITORIAL_CHAT_URL/MODEL) while falling
+    back to the thinking backend when unset.
+    """
+    return LLMClient(
+        timeout=timeout,
+        base_url=settings.editorial_chat_url or settings.ollama_chat_url,
+        model=settings.editorial_chat_model or settings.chat_model,
+        cb_name="llm_editorial",
+    )
+
+
 def create_instant_client(timeout: float = 120.0) -> "LLMClient":
-    """Create an LLMClient configured for the Instant backend (LM Studio / Nemotron 4B)."""
+    """Create the Instant client; Gemma 4 must use no-thinking template mode."""
     return LLMClient(
         timeout=timeout,
         base_url=settings.instant_chat_url,
         model=settings.instant_chat_model,
         cb_name="llm_instant",
+        chat_template_kwargs={"enable_thinking": False},
     )
