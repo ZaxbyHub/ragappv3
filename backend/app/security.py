@@ -497,15 +497,19 @@ def csrf_protect(
     cookie_values = _cookie_candidates(request, CSRF_COOKIE_NAME)
     if not cookie_values or not x_csrf_token:
         raise _csrf_error_detail(request, "CSRF token missing or mismatch")
-    # Strict double-submit when a single cookie value is transmitted: the
-    # header must equal it exactly. Only when duplicates are present (the
-    # shadow-cookie scenario: stale broad-path + current scoped cookie) does
-    # comparison accept a match against ANY transmitted value — the echoed
-    # header is the same-origin proof and Redis validation gates forgery.
-    if len(cookie_values) == 1:
-        matched = x_csrf_token == cookie_values[0]
-    else:
-        matched = x_csrf_token in cookie_values
+    # Strict double-submit against the FIRST transmitted value. RFC 6265
+    # section 5.4 orders cookies longest-path-first, so the first value is
+    # the most path-specific one — in a subpath deployment that is the
+    # app-scoped cookie, not a broader-path shadow, so a stale Path=/
+    # duplicate cannot satisfy the comparison. Comparing against ANY
+    # transmitted value would additionally accept a value an attacker
+    # injected via a cookie write, weakening the check below master's
+    # single-cookie strictness. When the header matches a non-first
+    # duplicate (e.g. the SPA echo of a stale shadow), the request fails
+    # with 403 and the frontend's forced token refetch heals the jar.
+    # validate_token is a bearer existence/TTL check (no session binding),
+    # so the double-submit equality is the binding check and stays strict.
+    matched = x_csrf_token == cookie_values[0]
     if not matched:
         raise _csrf_error_detail(request, "CSRF token missing or mismatch")
     if not csrf_manager.validate_token(x_csrf_token):

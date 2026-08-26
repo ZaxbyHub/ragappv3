@@ -1,3 +1,4 @@
+import { APP_BASENAME } from "@/lib/paths";
 import axios, { AxiosRequestHeaders } from "axios";
 import { appPath } from "../paths";
 
@@ -64,8 +65,17 @@ function getCsrfCookie(): string | null {
 // cookies at common paths so only the scoped one remains. Safe to call
 // anytime; the next token fetch re-establishes the cookie if needed.
 export function purgeStaleCsrfCookies(): void {
+  // The server sets the CSRF cookie at the app-root path (APP_BASENAME —
+  // `/meridian` for a subpath deployment, `/` for a root deployment). That
+  // path is authoritative: the server issues it, so deleting it cannot heal
+  // anything, and in a root deployment it IS the legitimate cookie. Only
+  // strictly broader paths (shadows like a pre-subpath `Path=/` leftover)
+  // and unrelated app-local paths are safe to purge.
+  const appRoot = APP_BASENAME ? APP_BASENAME.replace(/\/+$/, '') : '';
   const base = new URL(API_BASE_URL, location.origin).pathname.replace(/\/+$/, '');
-  for (const p of new Set(['/', base, base + '/', location.pathname.replace(/\/[^/]*$/, '') || '/'])) {
+  const candidates = ['/', base + '/', location.pathname.replace(/\/[^/]*$/, '') || '/'];
+  for (const p of new Set(candidates)) {
+    if (appRoot !== '' && (p === appRoot || p === appRoot + '/')) continue;
     document.cookie = `X-CSRF-Token=; path=${p}; max-age=0`;
   }
 }
@@ -88,7 +98,10 @@ export function getCsrfToken(): string | null {
 }
 
 export async function ensureCsrfToken(force: boolean = false): Promise<string> {
-  if (_csrfToken) return _csrfToken;
+  // `force` bypasses the in-memory cache as well as the cookie jar: callers
+  // force exactly when the cached token is known-stale (post-403 retry,
+  // post-refresh rotation), so serving the cache would defeat the point.
+  if (_csrfToken && !force) return _csrfToken;
 
   // Check cookie first — unless forced: after a CSRF 403 the cookie may hold
   // the very token the server just rejected (rotated by login/refresh, or

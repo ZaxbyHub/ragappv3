@@ -44,11 +44,14 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
       // other polls are lightweight (server serves cached last-known status)
       const params = deep ? { deep: true } : {};
       if (deep) lastDeepAt.current = Date.now();
+
+      const response = await apiClient.get<HealthResponse>("/health", { params });
+      // Success bookkeeping ONLY after the response resolves — resetting the
+      // failure streak before the await would make the catch-side threshold
+      // unreachable (every failure would observe a streak of 0/1).
       isFirstCheck.current = false;
       failStreak.current = 0;
       hadSuccess.current = true;
-
-      const response = await apiClient.get<HealthResponse>("/health", { params });
       const services = response.data.services;
 
       const newBackend = services?.backend ?? response.data.status === "ok";
@@ -66,24 +69,20 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
       // Before the first successful check, surface failure immediately (the
       // initial state is already "down"); afterwards require consecutive
       // failures so transient blips don't flap the banner.
-      if (hadSuccess.current && failStreak.current < FAILURE_THRESHOLD) return;
-      setHealth((prev) => {
-        if (
-          !prev.backend &&
-          !prev.embeddings &&
-          !prev.chat &&
-          !prev.loading
-        ) {
-          return prev;
-        }
-        return {
-          backend: false,
-          embeddings: false,
-          chat: false,
-          loading: false,
-          lastChecked: new Date(),
-        };
-      });
+      if (hadSuccess.current && failStreak.current < FAILURE_THRESHOLD) {
+        // Threshold grace: keep last-known services but still clear the
+        // initial loading flag — a cold start with the backend down must
+        // not spin forever (the banner renders once loading clears).
+        setHealth((prev) => (prev.loading ? { ...prev, loading: false } : prev));
+        return;
+      }
+      setHealth(() => ({
+        backend: false,
+        embeddings: false,
+        chat: false,
+        loading: false,
+        lastChecked: new Date(),
+      }));
     }
   }, []);
 
