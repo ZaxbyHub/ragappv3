@@ -6,12 +6,12 @@
 # Upper bounds mirror requirements.txt so CI resolves the same versions
 # (issue #404 / #391).
 fastapi>=0.141.1,<1.0
-uvicorn[standard]>=0.52.0,<1.0
+uvicorn[standard]>=0.52.4,<1.0
 python-multipart>=0.0.32,<1.0
 httpx>=0.26.0,<1.0
 pydantic>=2.5.0,<3.0
-pydantic-settings>=2.14.2,<3.0
-numpy>=1.26.4,<2.5
+pydantic-settings>=2.15.0,<3.0
+numpy>=2.5.2,<2.6
 aiofiles>=23.2.0,<26.0
 slowapi>=0.1.10,<1.0
 redis>=8.1.0,<9.0
