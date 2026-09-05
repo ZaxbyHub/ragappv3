@@ -1,9 +1,9 @@
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
-pydantic==2.13.4
-torch==2.13.0
+pydantic==2.13.5
+torch==2.14.0
 transformers==5.16.1
 tokenizers==0.23.1
 sentencepiece==0.2.2
 FlagEmbedding==1.4.2
-numpy==2.5.1
+numpy==2.5.2
