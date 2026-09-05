@@ -45,7 +45,7 @@ RUN npm run build
 # Pinned to python 3.11 to match CI (ci.yml python-version "3.11") so a green
 # CI run proves the shipped image builds and runs (B6-2, #289).
 # Digest pin (issue #404 / #391); dependabot (docker, "/") maintains updates.
-FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6 AS backend
+FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4 AS backend
 
 # Install system dependencies for Unstructured
 # Note: libmagic1 needed for python-magic on Linux
