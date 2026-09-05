@@ -1,7 +1,7 @@
 # Digest pin (issue #404 / #391) for supply-chain integrity; dependabot
 # (docker ecosystem, "/backend/embedding_server") maintains updates.
 # Matches the python 3.11 base used by CI and the root Dockerfile.
-FROM python:3.14-slim@sha256:cea0e6040540fb2b965b6e7fb5ffa00871e632eef63719f0ea54bca189ce14a6
+FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4
 
 WORKDIR /app
 
