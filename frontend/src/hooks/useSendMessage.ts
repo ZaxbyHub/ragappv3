@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   chatStream,
   createChatSession,
-  addChatMessage,
+  addChatMessagesBatch,
   type ChatMessage,
   type ChatSessionMessage,
   type WikiReference,
@@ -51,6 +51,11 @@ export function useSendMessage(
   // Atomic guard — prevents double-send from rapid clicks / Enter
   const sendingRef = useRef(false);
 
+  // Generation token (issue #507 / UI-003): captured per send, bumped on Stop.
+  // Checked after every await — when it no longer matches, the send was
+  // cancelled and must not start the stream or append any message.
+  const sendGenRef = useRef(0);
+
   // Coalescing hook for streaming content chunks — reduces store write frequency
   const { append, flush, reset, content } = useCoalescedAppend();
 
@@ -68,6 +73,18 @@ export function useSendMessage(
       if (sendingRef.current) return;
       sendingRef.current = true;
       setIsStreaming(true);
+      const gen = ++sendGenRef.current;
+
+      // UI-003: install the abort handle BEFORE the first await. A Stop
+      // pressed during session creation (while no stream exists to abort)
+      // invalidates this send's generation so generation can never start
+      // afterward with no visible Stop control.
+      setAbortFn(() => {
+        sendGenRef.current += 1;
+        setIsStreaming(false);
+        setAbortFn(null);
+        sendingRef.current = false;
+      });
 
       const currentState = useChatStore.getState();
       let sessionId: number;
@@ -78,6 +95,7 @@ export function useSendMessage(
         if (!activeVaultId) {
           setInputError("Please select a vault before starting a chat.");
           setIsStreaming(false);
+          setAbortFn(null);
           sendingRef.current = false;
           return;
         }
@@ -94,15 +112,28 @@ export function useSendMessage(
               : "Failed to start chat session. Please check your connection."
           );
           setIsStreaming(false);
+          setAbortFn(null);
           sendingRef.current = false;
           return;
         }
       }
 
+      if (sendGenRef.current !== gen) {
+        // Cancelled while the session was being created — do not stream,
+        // do not append any message (no dangling assistant bubble).
+        return;
+      }
+
+      const turnId =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `turn-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
       const userMessage: Message = {
         id: Date.now().toString(),
         role: "user",
         content,
+        turnId,
       };
       const assistantMessageId = (Date.now() + 1).toString();
       // Pre-populate mode from the requested effective mode so the badge shows
@@ -112,6 +143,7 @@ export function useSendMessage(
         id: assistantMessageId,
         role: "assistant",
         content: "",
+        turnId,
       };
 
       const chatMessages: ChatMessage[] = [
@@ -163,6 +195,76 @@ export function useSendMessage(
       reset();
       flush();
       assistantMessageIdRef.current = assistantMessageId;
+
+      // Persist a turn durably (issue #507): one ordered, all-or-nothing batch
+      // per turn. status "complete" on success, "interrupted" for a partially
+      // streamed turn — an interrupted answer is never saved as a successful
+      // one, and empty content is never persisted at all (LIVE-01). A failed
+      // batch commits nothing server-side, so the visible retry below can
+      // never duplicate a successful sibling write (UI-002).
+      const migrateId = (oldId: string, saveResult: ChatSessionMessage) => {
+        const dbId = String(saveResult.id);
+        if (dbId === oldId) {
+          updateMessage(oldId, { saveState: "saved" });
+          return;
+        }
+        const feedbackKey = `chat_feedback_${oldId}`;
+        const feedbackValue = localStorage.getItem(feedbackKey);
+        if (feedbackValue !== null) {
+          localStorage.setItem(`chat_feedback_${dbId}`, feedbackValue);
+          localStorage.removeItem(feedbackKey);
+        }
+        replaceMessageId(oldId, dbId, { created_at: saveResult.created_at, saveState: "saved" });
+      };
+
+      const persistTurn = async (assistantStatus: "complete" | "interrupted") => {
+        const storeState = useChatStore.getState();
+        const assistantMsg = storeState.messagesById[assistantMessageId];
+        const userMsg = storeState.messagesById[userMessage.id];
+        // Abandoned stream (loadChat/newChat cleared the store): skip both
+        // saves so no dangling rows land in the old session (issue #235).
+        if (!assistantMsg || !userMsg) return;
+        if (!assistantMsg.content.trim()) {
+          updateMessage(assistantMessageId, {
+            error: "The model returned an empty response. Try again.",
+          });
+          return;
+        }
+        updateMessage(assistantMessageId, { saveState: "saving" });
+        updateMessage(userMessage.id, { saveState: "saving" });
+        try {
+          const saved = await addChatMessagesBatch(sessionId, [
+            { role: "user", content, turn_id: turnId },
+            {
+              role: "assistant",
+              content: assistantMsg.content,
+              sources: assistantMsg.sources ?? undefined,
+              memories: assistantMsg.memoriesUsed ?? undefined,
+              wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
+              kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
+              mode: assistantMsg.mode,
+              turn_id: turnId,
+              status: assistantStatus,
+              citation_confidence: assistantMsg.citationConfidence,
+              unverifiable_claims: assistantMsg.unverifiableClaims,
+            },
+          ]);
+          const [userSaveResult, assistantSaveResult] = saved;
+          migrateId(userMessage.id, userSaveResult);
+          migrateId(assistantMessageId, assistantSaveResult);
+          await refreshHistory(true);
+          useChatShellStore.getState().requestSessionListRefresh();
+        } catch (err) {
+          console.error("Failed to save chat messages:", err);
+          // UI-002: a failed save must be visible and retryable with the
+          // answer and original input intact — never a silent loss.
+          updateMessage(assistantMessageId, {
+            saveState: "failed",
+            error: "Couldn't save this exchange. Retry to avoid losing it.",
+          });
+          updateMessage(userMessage.id, { saveState: "failed" });
+        }
+      };
 
       const abort = chatStream(
         chatMessages,
@@ -240,10 +342,28 @@ export function useSendMessage(
             const isAbort =
               error.name === "AbortError" || /aborted|abort/i.test(error.message);
             if (isAbort) {
+              // User-cancelled turn: mark stopped, never silently retried,
+              // and not persisted (the partial answer stays visible locally).
               setIsStreaming(false);
               setAbortFn(null);
               setStreamingMessageId(null);
               sendingRef.current = false;
+              return;
+            }
+            if (error.name === "ChatInterruptedError") {
+              // CHAT-004: EOF before the completion marker. Mark the turn
+              // retryable, keep the partial answer visible, and persist it as
+              // "interrupted" — never as a successful answer.
+              updateMessage(assistantMessageId, {
+                status: "interrupted",
+                error: "Response interrupted. You can retry.",
+              });
+              setCurrentStage(null);
+              setIsStreaming(false);
+              setAbortFn(null);
+              setStreamingMessageId(null);
+              sendingRef.current = false;
+              void persistTurn("interrupted");
               return;
             }
             const isNetworkError =
@@ -265,11 +385,6 @@ export function useSendMessage(
             // (UI-PERF-2): rAF-batched appends may not have fired yet when the
             // stream completes, so synchronously drain the buffer to avoid
             // persisting truncated content (the tail would be lost otherwise).
-            // flush() only updates the hook's own React state — the sync to
-            // the store happens in a useEffect on the next render, which is
-            // too late for the synchronous store read a few lines below.
-            // Write the synchronous streamedContent mirror directly instead
-            // (skipped if onFinalContent already finalized this message).
             flush();
             if (assistantMessageIdRef.current !== null) {
               updateMessage(assistantMessageId, { content: streamedContent });
@@ -279,54 +394,7 @@ export function useSendMessage(
             setAbortFn(null);
             setStreamingMessageId(null);
             sendingRef.current = false;
-            try {
-              const storeState = useChatStore.getState();
-              const assistantMsg = storeState.messagesById[assistantMessageId];
-              // If the assistant message is gone from the store, the stream was
-              // abandoned — typically because loadChat/newChat aborted it and
-              // cleared messagesById. The assistant save is already skipped via
-              // the guard below; without this same guard on the user save, the
-              // closure-captured sessionId would persist a dangling user
-              // message to the old session. See issue #235.
-              if (!assistantMsg) return;
-              const saves: Promise<ChatSessionMessage>[] = [
-                addChatMessage(sessionId, { role: "user", content }),
-                addChatMessage(sessionId, {
-                  role: "assistant",
-                  content: assistantMsg.content,
-                  sources: assistantMsg.sources ?? undefined,
-                  memories: assistantMsg.memoriesUsed ?? undefined,
-                  wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
-                  kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
-                  mode: assistantMsg.mode,
-                }),
-              ];
-              const [userSaveResult, assistantSaveResult] = await Promise.all(saves);
-
-              // Atomically migrate temp client IDs to DB-assigned IDs.
-              // Uses replaceMessageId so messageIds, messagesById, and
-              // streamingMessageId remain consistent. Migrates the local
-              // feedback storage key alongside the ID swap.
-              const migrateId = (oldId: string, saveResult: ChatSessionMessage) => {
-                const dbId = String(saveResult.id);
-                if (dbId === oldId) return;
-                const feedbackKey = `chat_feedback_${oldId}`;
-                const feedbackValue = localStorage.getItem(feedbackKey);
-                if (feedbackValue !== null) {
-                  localStorage.setItem(`chat_feedback_${dbId}`, feedbackValue);
-                  localStorage.removeItem(feedbackKey);
-                }
-                replaceMessageId(oldId, dbId, { created_at: saveResult.created_at });
-              };
-
-              migrateId(userMessage.id, userSaveResult);
-              migrateId(assistantMessageId, assistantSaveResult);
-
-              await refreshHistory(true);
-              useChatShellStore.getState().requestSessionListRefresh();
-            } catch (err) {
-              console.error("Failed to save chat messages:", err);
-            }
+            await persistTurn("complete");
           },
         },
         activeVaultId ?? undefined,
@@ -392,6 +460,10 @@ export function useSendMessage(
   );
 
   const handleStop = useCallback(() => {
+    // Invalidate the in-flight generation BEFORE touching the store: a Stop
+    // pressed during session creation has no stream to abort, and without
+    // this bump the send would start generating once creation resolved.
+    sendGenRef.current += 1;
     useChatStore.getState().stopStreaming();
     sendingRef.current = false;
   }, []);

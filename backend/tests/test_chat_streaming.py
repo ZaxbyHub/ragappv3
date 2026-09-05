@@ -3,6 +3,7 @@ Chat streaming endpoint tests using unittest and TestClient.
 
 Tests SSE format, content accumulation, and done event structure.
 """
+import asyncio
 import json
 import os
 import shutil
@@ -10,7 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -61,6 +62,7 @@ from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from app.api.deps import get_current_active_user, get_db, get_rag_engine
+from app.api.routes import chat as chat_routes
 from app.api.routes.chat import ChatStreamRequest, get_stream_auth
 from app.config import settings
 from app.main import app
@@ -767,3 +769,150 @@ data: {"type": "content", "content": "test"}
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeartbeatAndTerminalEvents(unittest.TestCase):
+    """CHAT-002 + ENH-016 regression tests (issue #507).
+
+    The heartbeat keepalive must never cancel the pending ``__anext__``: a slow
+    generation that spans multiple heartbeat intervals must still deliver its
+    complete answer and terminal done event. Every terminal path — including
+    the generic ``except Exception`` branch — must emit the protocol ``done``
+    marker so clients never confuse a handled failure with a stalled stream.
+    """
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        from app.api.deps import get_rag_engine
+        from app.api.routes.chat import get_stream_auth
+        from app.main import app
+        app.dependency_overrides.pop(get_rag_engine, None)
+        app.dependency_overrides.pop(get_current_active_user, None)
+        app.dependency_overrides.pop(get_stream_auth, None)
+        if hasattr(app.state, '_test_services'):
+            for key in list(app.state._test_services):
+                try:
+                    delattr(app.state, key)
+                except KeyError:
+                    pass
+            delattr(app.state, '_test_services')
+
+    def _parse_sse_events(self, response_text: str) -> list:
+        events = []
+        for block in response_text.strip().split("\n\n"):
+            if not block:
+                continue
+            event_data = {}
+            data_lines = []
+            for line in block.split("\n"):
+                if line.startswith("data:"):
+                    prefix_len = 6 if line.startswith("data: ") else 5
+                    data_lines.append(line[prefix_len:])
+                elif line.startswith("event:"):
+                    prefix_len = 7 if line.startswith("event: ") else 6
+                    event_data["event_type"] = line[prefix_len:]
+            if data_lines:
+                event_data["data"] = json.loads("\n".join(data_lines))
+                events.append(event_data)
+        return events
+
+    def _set_mock_rag_engine(self, mock_query_fn):
+        from app.api.deps import get_rag_engine
+        from app.api.routes.chat import get_stream_auth
+        from app.main import app
+
+        mock_engine = MagicMock()
+        mock_engine.query = mock_query_fn
+        app.dependency_overrides[get_rag_engine] = lambda: mock_engine
+
+        mock_user = {
+            "id": "test-user-1",
+            "username": "tester",
+            "email": "",
+            "role": "superadmin",
+        }
+        app.dependency_overrides[get_current_active_user] = lambda: mock_user
+
+        # Signature types are required: FastAPI resolves the override's
+        # parameters from annotations, and untyped ones become query params.
+        async def override_get_stream_auth(request: Request, body: ChatStreamRequest):
+            return mock_user
+
+        app.dependency_overrides[get_stream_auth] = override_get_stream_auth
+
+        if not hasattr(app.state, '_test_services'):
+            app.state._test_services = []
+        for name in ('embedding_service', 'vector_store', 'memory_store', 'llm_client'):
+            if not hasattr(app.state, name):
+                setattr(app.state, name, MagicMock())
+                app.state._test_services.append(name)
+
+    def test_heartbeat_does_not_cancel_slow_generation(self):
+        """A generator silent for >2 heartbeat intervals must deliver its full
+        answer afterwards, with heartbeats emitted and NO upstream cancellation.
+        Reintroducing wait_for cancellation loses the answer and fails."""
+        generator_completed = {"flag": False}
+
+        async def slow_query(*args, **kwargs):
+            try:
+                await asyncio.sleep(0.18)  # > 2x the patched 0.05s interval
+                yield {"type": "content", "content": "Late"}
+                yield {"type": "content", "content": " answer"}
+                yield {"type": "done", "sources": [], "memories_used": []}
+            finally:
+                generator_completed["flag"] = True
+
+        self._set_mock_rag_engine(slow_query)
+
+        with patch.object(chat_routes, "CHAT_HEARTBEAT_INTERVAL", 0.05):
+            response = self.client.post(
+                "/api/chat/stream",
+                json={"messages": [{"role": "user", "content": "slow test"}]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text[:400])
+        heartbeat_count = response.text.count(": heartbeat")
+        self.assertGreaterEqual(
+            heartbeat_count, 2,
+            f"expected >=2 heartbeats during the slow generation, got {heartbeat_count}",
+        )
+
+        events = self._parse_sse_events(response.text)
+        contents = [e["data"].get("content", "") for e in events if e.get("data", {}).get("type") == "content"]
+        self.assertEqual("".join(contents), "Late answer")
+        dones = [e["data"] for e in events if e.get("data", {}).get("type") == "done"]
+        self.assertEqual(len(dones), 1)
+        self.assertTrue(
+            generator_completed["flag"],
+            "upstream generator was cancelled before completing (heartbeat timeout cancelled __anext__)",
+        )
+
+    def test_generic_exception_emits_terminal_done(self):
+        """ENH-016: the generic except-Exception branch must emit the terminal
+        done event after the error event, like every other terminal path."""
+
+        async def failing_query(*args, **kwargs):
+            yield {"type": "content", "content": "partial"}
+            raise RuntimeError("simulated unexpected failure")
+
+        self._set_mock_rag_engine(failing_query)
+
+        response = self.client.post(
+            "/api/chat/stream",
+            json={"messages": [{"role": "user", "content": "boom"}]},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text[:400])
+        events = self._parse_sse_events(response.text)
+        types = [e["data"].get("type") for e in events]
+        self.assertIn("error", types)
+        self.assertIn("done", types)
+        error_idx = types.index("error")
+        done_idx = len(types) - 1 - types[::-1].index("done")
+        self.assertGreater(
+            done_idx, error_idx,
+            "terminal done event must follow the error event",
+        )
+        self.assertEqual(events[error_idx]["data"].get("code"), "INTERNAL_ERROR")

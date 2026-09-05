@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -86,6 +86,56 @@ describe("AssistantMessageActions feedback", () => {
 
     expect(screen.getByLabelText("Good response")).toHaveAttribute("aria-pressed", "false");
     expect(localStorage.removeItem).toHaveBeenCalledWith("chat_feedback_42");
+  });
+
+  it("ignores a stale vote failure after a newer vote succeeded (UI-050)", async () => {
+    // Vote 1 ("up") stays in flight; vote 2 ("down") resolves. When the older
+    // request finally rejects, the per-message sequence guard must swallow it —
+    // the newer saved selection must not roll back.
+    let rejectFirst!: (err: Error) => void;
+    const firstVote = new Promise<never>((_, reject) => {
+      rejectFirst = reject;
+    });
+    vi.mocked(updateMessageFeedback)
+      .mockReset()
+      .mockReturnValueOnce(firstVote)
+      .mockResolvedValueOnce({} as Awaited<ReturnType<typeof updateMessageFeedback>>);
+    const onFeedback = vi.fn();
+
+    render(
+      <AssistantMessageActions
+        content="Answer"
+        sessionId="7"
+        messageId="42"
+        onFeedback={onFeedback}
+      />
+    );
+
+    // Click "up" (request 1 stays pending)...
+    fireEvent.click(screen.getByLabelText("Good response"));
+    expect(screen.getByLabelText("Good response")).toHaveAttribute("aria-pressed", "true");
+    expect(onFeedback).toHaveBeenLastCalledWith("up");
+
+    // ...then click "down" (request 2 resolves and supersedes it).
+    fireEvent.click(screen.getByLabelText("Bad response"));
+    expect(screen.getByLabelText("Bad response")).toHaveAttribute("aria-pressed", "true");
+    expect(onFeedback).toHaveBeenLastCalledWith("down");
+
+    // Now the STALE first request fails.
+    await act(async () => {
+      rejectFirst(new Error("stale vote failure"));
+    });
+
+    // Final selection stays "down" — not reverted to the stale request's view.
+    expect(screen.getByLabelText("Bad response")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("Good response")).toHaveAttribute("aria-pressed", "false");
+    expect(onFeedback).toHaveBeenLastCalledWith("down");
+    // localStorage keeps the newer vote; no rollback write happened.
+    expect(localStorage.setItem).toHaveBeenLastCalledWith("chat_feedback_42", "down");
+    expect(localStorage.setItem).not.toHaveBeenLastCalledWith("chat_feedback_42", "up");
+    expect(localStorage.removeItem).not.toHaveBeenCalledWith("chat_feedback_42");
+    // The stale failure is not surfaced as a user-visible error.
+    expect(toast.error).not.toHaveBeenCalled();
   });
 });
 

@@ -418,4 +418,105 @@ describe("SessionRail filteredSessions debounce behavior", () => {
     expect(screen.queryByText("Beta Conversation")).not.toBeInTheDocument();
     expect(screen.queryByText("Gamma Chat")).not.toBeInTheDocument();
   });
+
+  it("repeats a first-message-content search correctly without remounting (UI-043)", async () => {
+    // Search-by-first-message requires the session details fetch. Only
+    // session 2's first message contains the needle — and no TITLE contains
+    // it, so the match can only come from the fetched details.
+    vi.mocked(api.getChatSession).mockImplementation(async (id: number) => ({
+      id,
+      vault_id: 1,
+      title: null,
+      created_at: "2026-05-01T00:00:00Z",
+      updated_at: "2026-05-01T00:00:00Z",
+      messages: [
+        {
+          id: id * 10,
+          role: "user",
+          content: id === 2 ? "where did I leave the needle" : "an unrelated opening question",
+          sources: null,
+          created_at: "2026-05-01T00:00:00Z",
+        },
+      ],
+    }));
+
+    const { rerender: r } = render(
+      <Wrapper>
+        <SessionRail />
+      </Wrapper>
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // --- First search by first-message content ---
+    storeState.sessionSearchQuery = "needle";
+    await act(async () => {
+      r(
+        <Wrapper>
+          <SessionRail />
+        </Wrapper>
+      );
+    });
+
+    // Advance the debounce and flush the details fetch microtasks.
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Details were fetched once per session; Beta matches via its first message.
+    expect(api.getChatSession).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("Beta Conversation")).toBeInTheDocument();
+    expect(screen.queryByText("Alpha Session")).not.toBeInTheDocument();
+    expect(screen.queryByText("Gamma Chat")).not.toBeInTheDocument();
+
+    // --- Clear the query ---
+    storeState.sessionSearchQuery = "";
+    await act(async () => {
+      r(
+        <Wrapper>
+          <SessionRail />
+        </Wrapper>
+      );
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+    });
+
+    expect(screen.getByText("Alpha Session")).toBeInTheDocument();
+    expect(screen.getByText("Beta Conversation")).toBeInTheDocument();
+    expect(screen.getByText("Gamma Chat")).toBeInTheDocument();
+
+    // --- Search the SAME text again WITHOUT remounting ---
+    storeState.sessionSearchQuery = "needle";
+    await act(async () => {
+      r(
+        <Wrapper>
+          <SessionRail />
+        </Wrapper>
+      );
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // With the old bug — clearing the details map on an empty query while
+    // fetchedIdsRef kept its markers — this second search found nothing.
+    expect(screen.getByText("Beta Conversation")).toBeInTheDocument();
+    expect(screen.queryByText("Alpha Session")).not.toBeInTheDocument();
+    expect(screen.queryByText("Gamma Chat")).not.toBeInTheDocument();
+
+    // Details are retained: getChatSession is NOT called a second time for
+    // any session (still 3 total, exactly one of them for session 2).
+    expect(api.getChatSession).toHaveBeenCalledTimes(3);
+    const callsForSessionTwo = api.getChatSession.mock.calls.filter(
+      (call) => call[0] === 2
+    );
+    expect(callsForSessionTwo).toHaveLength(1);
+  });
 });

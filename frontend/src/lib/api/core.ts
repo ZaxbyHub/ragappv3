@@ -682,6 +682,16 @@ export interface ChatSessionMessage {
   feedback?: "up" | "down" | null;
   /** Chat mode used to generate this assistant message. Null on user rows / legacy data. */
   mode?: "instant" | "thinking" | null;
+  /** Durable per-session message order (issue #507). Null on rows saved before the column existed. */
+  seq?: number | null;
+  /** Client-generated UUID linking a turn's user+assistant rows. Null on legacy rows. */
+  turn_id?: string | null;
+  /** Assistant terminal state. Null on legacy rows renders as complete. */
+  status?: "complete" | "partial" | "interrupted" | "failed" | null;
+  /** Citation confidence scores persisted with the answer (DEEP-D-01). */
+  citation_confidence?: Record<string, number> | null;
+  /** Unverifiable claims persisted with the answer (DEEP-D-01). */
+  unverifiable_claims?: string[] | null;
 }
 
 export interface ChatSessionDetail extends ChatSession {
@@ -701,6 +711,14 @@ export interface AddMessageRequest {
   wiki_refs?: WikiReference[];
   kms_refs?: KMSReference[];
   mode?: "instant" | "thinking";
+  /** Durable turn linkage (issue #507): shared by a turn's user+assistant rows. */
+  turn_id?: string;
+  /** Assistant terminal state persisted with the row. */
+  status?: "complete" | "partial" | "interrupted" | "failed";
+  /** Citation confidence scores persisted with the answer (DEEP-D-01). */
+  citation_confidence?: Record<string, number>;
+  /** Unverifiable claims persisted with the answer (DEEP-D-01). */
+  unverifiable_claims?: string[];
 }
 
 export async function listDocuments(options: ListDocumentsOptions = {}): Promise<ListDocumentsResponse> {

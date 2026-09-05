@@ -23,8 +23,9 @@ export function useKeyboardShortcuts() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Show shortcuts on ? key (but not when typing in inputs)
-      if (e.key === "?" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      // Show shortcuts on ? key (Shift is physically required to type "?" on US
+      // layouts, so it must not be excluded; but not when typing in inputs)
+      if (e.key === "?" && !e.ctrlKey && !e.metaKey) {
         const target = e.target as HTMLElement;
         if (target.tagName !== "INPUT" && target.tagName !== "TEXTAREA" && !target.isContentEditable) {
           e.preventDefault();

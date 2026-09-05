@@ -49,6 +49,13 @@ _background_tasks: Set[asyncio.Task] = set()
 
 router = APIRouter()
 
+# CHAT-002: emit an SSE heartbeat comment during long generation gaps so
+# intermediate proxies with short read timeouts (e.g. the nginx default 60s)
+# don't drop the connection. Per the SSE spec, lines starting with ":" are
+# comments that EventSource clients silently discard. Module-level so tests can
+# compress time; a heartbeat timeout must NEVER cancel the pending __anext__.
+CHAT_HEARTBEAT_INTERVAL = 15.0  # seconds
+
 logger = logging.getLogger(__name__)
 
 
@@ -141,6 +148,44 @@ class AddMessageRequest(BaseModel):
     wiki_refs: Optional[List[dict]] = None
     kms_refs: Optional[List[dict]] = None
     mode: Optional[Literal["instant", "thinking"]] = None
+    # Durable turn lifecycle (issue #507). turn_id links a turn's user+assistant
+    # rows; status records the assistant terminal state; the two assessment
+    # fields round-trip DEEP-D-01 evidence alongside the saved answer.
+    turn_id: Optional[str] = None
+    status: Optional[Literal["complete", "partial", "interrupted", "failed"]] = None
+    citation_confidence: Optional[Dict[str, Any]] = None
+    unverifiable_claims: Optional[List[str]] = None
+
+
+class BatchAddMessagesRequest(BaseModel):
+    """Request model for atomically saving a turn's messages in one transaction.
+
+    Rows are inserted in payload order with per-session monotonic ``seq``
+    values, so a turn's user row is durably ordered before its assistant row
+    regardless of client/network timing (CHAT-005).
+    """
+
+    messages: List[AddMessageRequest] = Field(min_length=1, max_length=10)
+
+
+class TruncateSessionRequest(BaseModel):
+    """Request model for the retry/edit revision operation (CHAT-006).
+
+    Deletes every message with ``seq > keep_count`` so the persisted history
+    matches the locally-trimmed transcript before a retry/edit resend.
+    """
+
+    keep_count: int = Field(ge=0)
+
+
+def _safe_json_loads(raw: Optional[str]) -> Any:
+    """Parse a JSON TEXT column value, returning None for NULL/invalid input."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -291,13 +336,6 @@ def stream_chat_response(
         yield f"data: {json.dumps({'type': 'mode', 'mode': resolved_mode.value})}\n\n"
 
         try:
-            # Heartbeat: emit a periodic SSE comment (": heartbeat\n\n") during
-            # long generation gaps so intermediate proxies with short read
-            # timeouts (e.g. the nginx default 60s) don't drop the connection.
-            # Per the SSE spec, lines starting with ":" are comments that
-            # EventSource clients silently discard.
-            HEARTBEAT_INTERVAL = 15.0  # seconds
-
             rag_gen = rag_engine.query(
                 message, history, stream=True, vault_id=vault_id, mode=mode,
                 require_vault=require_vault, user_id=user_id,
@@ -308,53 +346,67 @@ def stream_chat_response(
             )
             rag_gen_ait = rag_gen.__aiter__()
 
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(
-                        rag_gen_ait.__anext__(), timeout=HEARTBEAT_INTERVAL
+            # CHAT-002: the pending __anext__ runs in a persistent task that is
+            # awaited with a timeout but NEVER cancelled on timeout —
+            # asyncio.wait_for would cancel it, closing the provider generator
+            # and silently truncating slow generations as "normal completion".
+            next_chunk_task = asyncio.create_task(rag_gen_ait.__anext__())
+            try:
+                while True:
+                    done_set, _pending = await asyncio.wait(
+                        {next_chunk_task}, timeout=CHAT_HEARTBEAT_INTERVAL
                     )
-                except asyncio.TimeoutError:
-                    # No data from the model for a full interval — send keepalive.
-                    yield ": heartbeat\n\n"
-                    continue
-                except StopAsyncIteration:
-                    break
+                    if not done_set:
+                        # No data from the model for a full interval — send
+                        # keepalive and keep waiting on the SAME task.
+                        yield ": heartbeat\n\n"
+                        continue
+                    try:
+                        chunk = next_chunk_task.result()
+                    except StopAsyncIteration:
+                        break
+                    next_chunk_task = asyncio.create_task(rag_gen_ait.__anext__())
 
-                chunk_type = chunk.get("type")
+                    chunk_type = chunk.get("type")
 
-                if chunk_type == "content":
-                    content = chunk.get("content", "")
-                    collected_content.append(content)
-                    yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
-                elif chunk_type == "error":
-                    logger.warning("Streaming error chunk received from RAG engine: %s", chunk.get('message', 'unknown'))
-                    yield f"data: {json.dumps({'type': 'error', 'message': 'Chat stream failed', 'code': chunk.get('code', 'UNKNOWN_ERROR')})}\n\n"
-                    yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
-                    return
-                elif chunk_type == "fallback":
-                    content = chunk.get("content", "")
-                    if content:
+                    if chunk_type == "content":
+                        content = chunk.get("content", "")
                         collected_content.append(content)
                         yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
-                elif chunk_type == "stage":
-                    # FR-015: forward pipeline stage events (Searching/Reading/Drafting)
-                    # so the frontend can show progress feedback before content arrives.
-                    yield f"data: {json.dumps({'type': 'stage', 'stage': chunk['stage']})}\n\n"
-                elif chunk_type == "done":
-                    sources = chunk.get("sources", [])
-                    memories_used = chunk.get("memories_used", [])
-                    wiki_used = chunk.get("wiki_used", [])
-                    kms_used = chunk.get("kms_used", [])
-                    score_type = chunk.get("score_type", score_type)
-                    # SC-015/SC-017: extract A/B metadata from done chunk
-                    ab_experiment_id = chunk.get("ab_experiment_id")
-                    ab_variant = chunk.get("ab_variant")
-                    prompt_version = chunk.get("prompt_version")
-                    # SC-009: extract citation confidence + unverifiable claims
-                    citation_confidence = chunk.get("citation_confidence")
-                    unverifiable_claims = chunk.get("unverifiable_claims")
-                    answer_contract = chunk.get("answer_contract")
-                    llm_metrics = chunk.get("llm_metrics")
+                    elif chunk_type == "error":
+                        logger.warning("Streaming error chunk received from RAG engine: %s", chunk.get('message', 'unknown'))
+                        yield f"data: {json.dumps({'type': 'error', 'message': 'Chat stream failed', 'code': chunk.get('code', 'UNKNOWN_ERROR')})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+                        return
+                    elif chunk_type == "fallback":
+                        content = chunk.get("content", "")
+                        if content:
+                            collected_content.append(content)
+                            yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
+                    elif chunk_type == "stage":
+                        # FR-015: forward pipeline stage events (Searching/Reading/Drafting)
+                        # so the frontend can show progress feedback before content arrives.
+                        yield f"data: {json.dumps({'type': 'stage', 'stage': chunk['stage']})}\n\n"
+                    elif chunk_type == "done":
+                        sources = chunk.get("sources", [])
+                        memories_used = chunk.get("memories_used", [])
+                        wiki_used = chunk.get("wiki_used", [])
+                        kms_used = chunk.get("kms_used", [])
+                        score_type = chunk.get("score_type", score_type)
+                        # SC-015/SC-017: extract A/B metadata from done chunk
+                        ab_experiment_id = chunk.get("ab_experiment_id")
+                        ab_variant = chunk.get("ab_variant")
+                        prompt_version = chunk.get("prompt_version")
+                        # SC-009: extract citation confidence + unverifiable claims
+                        citation_confidence = chunk.get("citation_confidence")
+                        unverifiable_claims = chunk.get("unverifiable_claims")
+                        answer_contract = chunk.get("answer_contract")
+                        llm_metrics = chunk.get("llm_metrics")
+            finally:
+                # Client disconnect or terminal return: drop the pending
+                # __anext__ so the provider generator is not left running.
+                if not next_chunk_task.done():
+                    next_chunk_task.cancel()
         except RAGEngineError as exc:
             logger.warning(
                 "RAG engine error in stream_chat_response: %s", exc
@@ -386,6 +438,10 @@ def stream_chat_response(
             # Send safe generic message to client; full details already logged above
             error_msg = "An error occurred during chat processing"
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'INTERNAL_ERROR'})}\n\n"
+            # ENH-016: every terminal path must emit the protocol completion
+            # marker, or clients treating transport close as protocol EOF will
+            # classify the failure as a stalled/interrupted stream.
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
             return
 
         # Citation validation pass: parse the assembled assistant content and
@@ -958,17 +1014,17 @@ async def get_session(
     if has_memories_col and has_wiki_refs_col:
         messages_query = (
             "SELECT id, role, content, sources, memories, wiki_refs, created_at, feedback "
-            "FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC"
+            "FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC"
         )
     elif has_memories_col:
         messages_query = (
             "SELECT id, role, content, sources, memories, created_at, feedback "
-            "FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC"
+            "FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC"
         )
     else:
         messages_query = (
             "SELECT id, role, content, sources, created_at, feedback "
-            "FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC"
+            "FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC"
         )
     messages_result = await asyncio.to_thread(
         conn.execute, messages_query, (session_id,)
@@ -1005,6 +1061,24 @@ async def get_session(
             else:
                 kms_by_id[kid] = None
 
+    # Side-fetch durable turn-lifecycle fields (issue #507) in parallel to
+    # mode/kms so the branched SELECTs above stay untouched. Legacy rows carry
+    # NULLs; the frontend mapper normalizes status NULL -> 'complete'.
+    turn_info_by_id: Dict[int, Dict[str, Any]] = {}
+    turn_result = await asyncio.to_thread(
+        conn.execute,
+        "SELECT id, seq, turn_id, status, citation_confidence, unverifiable_claims "
+        "FROM chat_messages WHERE session_id = ?",
+        (session_id,),
+    )
+    for tid, tseq, tturn, tstatus, tcit, tclaims in await asyncio.to_thread(
+        turn_result.fetchall
+    ):
+        entry: Dict[str, Any] = {"seq": tseq, "turn_id": tturn, "status": tstatus}
+        entry["citation_confidence"] = _safe_json_loads(tcit)
+        entry["unverifiable_claims"] = _safe_json_loads(tclaims)
+        turn_info_by_id[tid] = entry
+
     # Parse messages with JSON sources, memories, wiki_refs, and kms_refs.
     messages = []
     for msg_row in message_rows:
@@ -1040,6 +1114,7 @@ async def get_session(
                     "created_at": msg_row[6],
                     "feedback": msg_row[7],
                     "mode": mode_by_id.get(msg_row[0]),
+                    **turn_info_by_id.get(msg_row[0], {}),
                 }
             )
         elif has_memories_col:
@@ -1061,6 +1136,7 @@ async def get_session(
                     "created_at": msg_row[5],
                     "feedback": msg_row[6],
                     "mode": mode_by_id.get(msg_row[0]),
+                    **turn_info_by_id.get(msg_row[0], {}),
                 }
             )
         else:
@@ -1076,6 +1152,7 @@ async def get_session(
                     "created_at": msg_row[4],
                     "feedback": msg_row[5],
                     "mode": mode_by_id.get(msg_row[0]),
+                    **turn_info_by_id.get(msg_row[0], {}),
                 }
             )
 
@@ -1177,21 +1254,21 @@ async def fork_session(
         messages_result = await asyncio.to_thread(
             conn.execute,
             "SELECT role, content, sources, memories, wiki_refs, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
             (session_id,),
         )
     elif has_memories_col:
         messages_result = await asyncio.to_thread(
             conn.execute,
             "SELECT role, content, sources, memories, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
             (session_id,),
         )
     else:
         messages_result = await asyncio.to_thread(
             conn.execute,
             "SELECT role, content, sources, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
             (session_id,),
         )
     all_rows = await asyncio.to_thread(messages_result.fetchall)
@@ -1210,7 +1287,7 @@ async def fork_session(
     if has_mode_col:
         source_mode_result = await asyncio.to_thread(
             conn.execute,
-            "SELECT mode FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "SELECT mode FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
             (session_id,),
         )
         source_mode_rows = await asyncio.to_thread(source_mode_result.fetchall)
@@ -1222,11 +1299,23 @@ async def fork_session(
     if has_kms_refs_col:
         source_kms_result = await asyncio.to_thread(
             conn.execute,
-            "SELECT kms_refs FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "SELECT kms_refs FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
             (session_id,),
         )
         source_kms_rows = await asyncio.to_thread(source_kms_result.fetchall)
         source_kms_refs = [r[0] for r in source_kms_rows[: body.message_index + 1]]
+
+    # Side-fetch durable turn-lifecycle fields (issue #507) in row order so the
+    # fork preserves turn linkage, terminal status, and assessment evidence.
+    source_turn_rows: List[tuple] = []
+    turn_source_result = await asyncio.to_thread(
+        conn.execute,
+        "SELECT turn_id, status, citation_confidence, unverifiable_claims "
+        "FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
+        (session_id,),
+    )
+    source_turn_all = await asyncio.to_thread(turn_source_result.fetchall)
+    source_turn_rows = source_turn_all[: body.message_index + 1]
 
     # Create new forked session and copy messages atomically.
     fork_title = f"Branch of {session_row[2] or 'conversation'}"
@@ -1270,7 +1359,7 @@ async def fork_session(
         if has_mode_col and source_modes:
             new_id_result = await asyncio.to_thread(
                 conn.execute,
-                "SELECT id FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+                "SELECT id FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
                 (new_session_id,),
             )
             new_id_rows = await asyncio.to_thread(new_id_result.fetchall)
@@ -1286,7 +1375,7 @@ async def fork_session(
         if has_kms_refs_col and source_kms_refs:
             new_id_result_kms = await asyncio.to_thread(
                 conn.execute,
-                "SELECT id FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+                "SELECT id FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
                 (new_session_id,),
             )
             new_id_rows_kms = await asyncio.to_thread(new_id_result_kms.fetchall)
@@ -1297,6 +1386,30 @@ async def fork_session(
                         "UPDATE chat_messages SET kms_refs = ? WHERE id = ?",
                         (kms_val, new_id),
                     )
+
+        # Re-apply durable turn fields positionally and renumber seq 1..n so the
+        # fork preserves ordering, turn linkage, terminal status, and assessment
+        # evidence (issue #507). Contiguity here also keeps fork_message_index
+        # semantics aligned with the source session's row order.
+        new_id_result_turn = await asyncio.to_thread(
+            conn.execute,
+            "SELECT id FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
+            (new_session_id,),
+        )
+        new_id_rows_turn = await asyncio.to_thread(new_id_result_turn.fetchall)
+        for pos, (new_id,) in enumerate(new_id_rows_turn, start=1):
+            turn_vals = (
+                source_turn_rows[pos - 1]
+                if pos - 1 < len(source_turn_rows)
+                else (None, None, None, None)
+            )
+            turn_id_val, status_val, cit_raw, claims_raw = turn_vals
+            await asyncio.to_thread(
+                conn.execute,
+                "UPDATE chat_messages SET seq = ?, turn_id = ?, status = ?, "
+                "citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
+                (pos, turn_id_val, status_val, cit_raw, claims_raw, new_id),
+            )
         await asyncio.to_thread(conn.commit)
     except Exception:
         await asyncio.to_thread(conn.rollback)
@@ -1307,21 +1420,21 @@ async def fork_session(
         copied_result = await asyncio.to_thread(
             conn.execute,
             "SELECT id, role, content, sources, memories, wiki_refs, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
             (new_session_id,),
         )
     elif has_memories_col:
         copied_result = await asyncio.to_thread(
             conn.execute,
             "SELECT id, role, content, sources, memories, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
             (new_session_id,),
         )
     else:
         copied_result = await asyncio.to_thread(
             conn.execute,
             "SELECT id, role, content, sources, created_at FROM chat_messages "
-            "WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+            "WHERE session_id = ? ORDER BY seq ASC, id ASC",
             (new_session_id,),
         )
     copied_rows = await asyncio.to_thread(copied_result.fetchall)
@@ -1351,6 +1464,25 @@ async def fork_session(
                     fork_kms_by_id[kid] = []
             else:
                 fork_kms_by_id[kid] = None
+
+    # Side-fetch durable turn-lifecycle fields for the copied rows (issue #507).
+    fork_turn_by_id: Dict[int, Dict[str, Any]] = {}
+    fork_turn_result = await asyncio.to_thread(
+        conn.execute,
+        "SELECT id, seq, turn_id, status, citation_confidence, unverifiable_claims "
+        "FROM chat_messages WHERE session_id = ?",
+        (new_session_id,),
+    )
+    for ftid, ftseq, ftturn, ftstatus, ftcit, ftclaims in await asyncio.to_thread(
+        fork_turn_result.fetchall
+    ):
+        fork_turn_by_id[ftid] = {
+            "seq": ftseq,
+            "turn_id": ftturn,
+            "status": ftstatus,
+            "citation_confidence": _safe_json_loads(ftcit),
+            "unverifiable_claims": _safe_json_loads(ftclaims),
+        }
 
     messages = []
     for row in copied_rows:
@@ -1385,6 +1517,7 @@ async def fork_session(
                     "created_at": row[6],
                     "feedback": None,
                     "mode": fork_mode_by_id.get(row[0]),
+                    **fork_turn_by_id.get(row[0], {}),
                 }
             )
         elif has_memories_col:
@@ -1406,6 +1539,7 @@ async def fork_session(
                     "created_at": row[5],
                     "feedback": None,
                     "mode": fork_mode_by_id.get(row[0]),
+                    **fork_turn_by_id.get(row[0], {}),
                 }
             )
         else:
@@ -1421,6 +1555,7 @@ async def fork_session(
                     "created_at": row[4],
                     "feedback": None,
                     "mode": fork_mode_by_id.get(row[0]),
+                    **fork_turn_by_id.get(row[0], {}),
                 }
             )
 
@@ -1697,7 +1832,27 @@ async def add_message(
             "UPDATE chat_messages SET kms_refs = ? WHERE id = ?",
             (kms_refs_json, message_id),
         )
+
+    # Persist durable turn-lifecycle fields (issue #507): per-session seq for
+    # stable ordering, turn linkage, terminal status, and DEEP-D-01 assessment
+    # fields. Columns are guaranteed by run_migrations on every connect. The
+    # MAX(seq)+1 subquery runs inside this connection's implicit transaction;
+    # SQLite's single-writer lock serializes concurrent inserts, so seq values
+    # are unique per session.
+    citation_json = json.dumps(body.citation_confidence) if body.citation_confidence else None
+    claims_json = json.dumps(body.unverifiable_claims) if body.unverifiable_claims else None
+    await asyncio.to_thread(
+        conn.execute,
+        "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
+        "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
+        (session_id, body.turn_id, body.status, citation_json, claims_json, message_id),
+    )
     await asyncio.to_thread(conn.commit)
+    seq_result = await asyncio.to_thread(
+        conn.execute, "SELECT seq FROM chat_messages WHERE id = ?", (message_id,)
+    )
+    seq_row = await asyncio.to_thread(seq_result.fetchone)
+    persisted_seq = seq_row[0] if seq_row else None
     if has_memories_col and has_wiki_refs_col:
         select_query = (
             "SELECT id, role, content, sources, memories, wiki_refs, created_at "
@@ -1764,7 +1919,248 @@ async def add_message(
         "kms_refs": kms_refs_out,
         "created_at": created_at,
         "mode": persisted_mode,
+        "seq": persisted_seq,
+        "turn_id": body.turn_id,
+        "status": body.status,
+        "citation_confidence": body.citation_confidence,
+        "unverifiable_claims": body.unverifiable_claims,
     }
+
+
+@router.post("/chat/sessions/{session_id}/messages/batch")
+@limiter.limit(settings.chat_rate_limit)
+async def add_messages_batch(
+    request: Request,
+    session_id: int,
+    body: BatchAddMessagesRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
+    rag_engine: Optional[RAGEngine] = Depends(get_rag_engine),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """
+    Save a turn's messages atomically in payload order (issue #507 / CHAT-005).
+
+    All rows are inserted inside one transaction with per-session monotonic
+    ``seq`` values, so a turn's user row is durably ordered before its assistant
+    row regardless of network timing. Any failure rolls back the whole batch —
+    a retry can never duplicate a successful sibling write.
+    """
+    session_query = "SELECT id, title, vault_id FROM chat_sessions WHERE id = ?"
+    session_result = await asyncio.to_thread(conn.execute, session_query, (session_id,))
+    session_row = await asyncio.to_thread(session_result.fetchone)
+
+    if session_row is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if not await evaluate(user, "vault", session_row[2], "write"):
+        raise HTTPException(status_code=403, detail="No write access to this vault")
+
+    # Validate and prepare every row BEFORE touching the database so a bad row
+    # cannot leave a partially applied turn behind.
+    count_result = await asyncio.to_thread(
+        conn.execute, "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?", (session_id,)
+    )
+    message_count_row = await asyncio.to_thread(count_result.fetchone)
+    is_first_message = message_count_row[0] == 0
+
+    prepared = []
+    for item in body.messages:
+        if not item.content:
+            raise HTTPException(status_code=422, detail="Message content must not be empty")
+        persisted_content = (
+            sanitize_chat_messages_content(item.content)
+            if item.role == "assistant"
+            else item.content
+        )
+        prepared.append(
+            {
+                "role": item.role,
+                "content": persisted_content,
+                "sources_json": json.dumps(item.sources) if item.sources else None,
+                "memories_json": json.dumps(item.memories) if item.memories else None,
+                "wiki_refs_json": json.dumps(item.wiki_refs) if item.wiki_refs else None,
+                "kms_refs_json": json.dumps(item.kms_refs) if item.kms_refs else None,
+                "mode": item.mode if item.role == "assistant" else None,
+                "turn_id": item.turn_id,
+                "status": item.status,
+                "citation_json": json.dumps(item.citation_confidence) if item.citation_confidence else None,
+                "claims_json": json.dumps(item.unverifiable_claims) if item.unverifiable_claims else None,
+            }
+        )
+
+    # Auto-title on the turn that carries the first user message — same guard
+    # and fire-and-forget semantics as the single-message endpoint.
+    if is_first_message and session_row[1] is None and prepared[0]["role"] == "user":
+        if rag_engine and rag_engine.llm_client is not None:
+            task = asyncio.create_task(
+                _auto_name_session(session_id, prepared[0]["content"], rag_engine.llm_client)
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+        else:
+            await asyncio.to_thread(
+                conn.execute,
+                "UPDATE chat_sessions SET title = 'New conversation', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (session_id,),
+            )
+
+    try:
+        # Atomicity follows the add_message model: the pool's connections use
+        # python sqlite3's implicit transactions, so the first INSERT opens
+        # one transaction that the final commit closes; any failure rolls the
+        # whole batch back (never a partial turn on disk).
+        saved_ids: List[int] = []
+        for row in prepared:
+            cursor = await asyncio.to_thread(
+                conn.execute,
+                """
+                INSERT INTO chat_messages
+                    (session_id, role, content, sources, memories, wiki_refs, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    session_id,
+                    row["role"],
+                    row["content"],
+                    row["sources_json"],
+                    row["memories_json"],
+                    row["wiki_refs_json"],
+                ),
+            )
+            new_id = cursor.lastrowid
+            await asyncio.to_thread(
+                conn.execute,
+                "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
+                "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ?, "
+                "mode = ?, kms_refs = ? WHERE id = ?",
+                (
+                    session_id,
+                    row["turn_id"],
+                    row["status"],
+                    row["citation_json"],
+                    row["claims_json"],
+                    row["mode"],
+                    row["kms_refs_json"],
+                    new_id,
+                ),
+            )
+            saved_ids.append(new_id)
+
+        await asyncio.to_thread(
+            conn.execute,
+            "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (session_id,),
+        )
+        await asyncio.to_thread(conn.commit)
+    except Exception:
+        await asyncio.to_thread(conn.rollback)
+        raise
+
+    # Return the saved rows in insertion order with their assigned seq values.
+    placeholders = ",".join("?" for _ in saved_ids)
+    saved_result = await asyncio.to_thread(
+        conn.execute,
+        f"""
+        SELECT id, role, content, sources, memories, wiki_refs, kms_refs, mode,
+               created_at, seq, turn_id, status, citation_confidence, unverifiable_claims
+        FROM chat_messages WHERE id IN ({placeholders}) ORDER BY seq ASC, id ASC
+        """,  # nosec B608 — placeholders is a fixed '?,?,...' literal, values are bound
+        (*saved_ids,),
+    )
+    saved_rows = await asyncio.to_thread(saved_result.fetchall)
+
+    messages_out = []
+    for row in saved_rows:
+        messages_out.append(
+            {
+                "id": row[0],
+                "role": row[1],
+                "content": row[2],
+                "sources": _safe_json_loads(row[3]),
+                "memories": _safe_json_loads(row[4]),
+                "wiki_refs": _safe_json_loads(row[5]),
+                "kms_refs": _safe_json_loads(row[6]),
+                "mode": row[7],
+                "created_at": row[8],
+                "seq": row[9],
+                "turn_id": row[10],
+                "status": row[11],
+                "citation_confidence": _safe_json_loads(row[12]),
+                "unverifiable_claims": _safe_json_loads(row[13]),
+            }
+        )
+
+    return {"messages": messages_out}
+
+
+@router.post("/chat/sessions/{session_id}/truncate")
+@limiter.limit(settings.chat_rate_limit)
+async def truncate_session_messages(
+    request: Request,
+    session_id: int,
+    body: TruncateSessionRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """
+    Persistently trim a session's history after ``keep_count`` messages
+    (issue #507 / CHAT-006 retry/edit revisions).
+
+    Deletes every message with ``seq > keep_count`` in one transaction so the
+    server-side history matches the locally-trimmed transcript before a
+    retry/edit resend. ``keep_count`` >= the current max seq is a no-op success;
+    ``keep_count = 0`` clears all messages.
+    """
+    session_query = "SELECT id, vault_id FROM chat_sessions WHERE id = ?"
+    session_result = await asyncio.to_thread(conn.execute, session_query, (session_id,))
+    session_row = await asyncio.to_thread(session_result.fetchone)
+
+    if session_row is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if not await evaluate(user, "vault", session_row[1], "write"):
+        raise HTTPException(status_code=403, detail="No write access to this vault")
+
+    try:
+        # Implicit-transaction model (see add_messages_batch): the DELETE opens
+        # the transaction, the commit closes it, and a failure rolls the trim
+        # back entirely.
+        delete_result = await asyncio.to_thread(
+            conn.execute,
+            "DELETE FROM chat_messages WHERE session_id = ? AND seq > ?",
+            (session_id, body.keep_count),
+        )
+        deleted = await asyncio.to_thread(lambda: delete_result.rowcount)
+        tail_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT COALESCE(MAX(seq), 0) FROM chat_messages WHERE session_id = ?",
+            (session_id,),
+        )
+        tail_row = await asyncio.to_thread(tail_result.fetchone)
+        tail_seq = tail_row[0] if tail_row else 0
+        count_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?",
+            (session_id,),
+        )
+        count_row = await asyncio.to_thread(count_result.fetchone)
+        remaining = count_row[0] if count_row else 0
+        if deleted:
+            await asyncio.to_thread(
+                conn.execute,
+                "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (session_id,),
+            )
+        await asyncio.to_thread(conn.commit)
+    except Exception:
+        await asyncio.to_thread(conn.rollback)
+        raise
+
+    return {"remaining_count": remaining, "tail_seq": tail_seq}
 
 
 @router.patch("/chat/sessions/{session_id}/messages/{message_id}/feedback")

@@ -29,7 +29,21 @@ export async function parseSSEStream(
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
+    if (done) {
+      // CHAT-004: transport EOF without the protocol completion marker is an
+      // interrupted stream, not a successful completion. Surface it once so
+      // the hook can mark the turn retryable instead of leaving the UI stuck
+      // in isStreaming forever.
+      if (!completed) {
+        completed = true;
+        const interrupted = new Error(
+          "The response stream ended before the answer finished."
+        );
+        interrupted.name = "ChatInterruptedError";
+        callbacks.onError?.(interrupted);
+      }
+      break;
+    }
 
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
@@ -46,6 +60,7 @@ export async function parseSSEStream(
         try {
           const parsed = JSON.parse(data);
           if (parsed.type === 'error') {
+            completed = true; // onError is terminal; never fire it twice
             callbacks.onError?.(new Error(parsed.message || 'Chat stream error'));
             return;
           }
@@ -312,6 +327,40 @@ export async function createChatSession(request: CreateSessionRequest): Promise<
 
 export async function addChatMessage(sessionId: number, request: AddMessageRequest): Promise<ChatSessionMessage> {
   const response = await apiClient.post<ChatSessionMessage>(`/chat/sessions/${sessionId}/messages`, request);
+  return response.data;
+}
+
+/**
+ * Save a turn's messages atomically in payload order (issue #507 / CHAT-005).
+ * The backend inserts every row inside one transaction with monotonic seq
+ * values, so a turn's user row is durably ordered before its assistant row and
+ * a failed batch commits nothing (safe to retry without sibling duplication).
+ */
+export async function addChatMessagesBatch(
+  sessionId: number,
+  messages: AddMessageRequest[]
+): Promise<ChatSessionMessage[]> {
+  const response = await apiClient.post<{ messages: ChatSessionMessage[] }>(
+    `/chat/sessions/${sessionId}/messages/batch`,
+    { messages }
+  );
+  return response.data.messages;
+}
+
+/**
+ * Persistently trim history after keepCount messages (issue #507 / CHAT-006).
+ * The server-side revision operation behind retry/edit: deletes every message
+ * with seq > keepCount so persisted history matches the locally-trimmed
+ * transcript before the resend. keepCount >= max seq is a no-op success.
+ */
+export async function truncateChatSession(
+  sessionId: number,
+  keepCount: number
+): Promise<{ remaining_count: number; tail_seq: number | null }> {
+  const response = await apiClient.post<{ remaining_count: number; tail_seq: number | null }>(
+    `/chat/sessions/${sessionId}/truncate`,
+    { keep_count: keepCount }
+  );
   return response.data;
 }
 

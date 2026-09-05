@@ -10,7 +10,7 @@ from starlette.requests import Request
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.api.routes import chat as chat_routes
-from app.models.database import init_db
+from app.models.database import init_db, run_migrations
 
 
 def _mock_request():
@@ -40,6 +40,7 @@ async def test_fork_response_returns_inserted_message_ids_and_created_at(
 ):
     db_path = tmp_path / "fork-success.db"
     init_db(str(db_path))
+    run_migrations(str(db_path))
     conn = sqlite3.connect(db_path, check_same_thread=False)
     try:
         source_session_id = conn.execute(
@@ -86,9 +87,9 @@ async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
 ):
     db_path = tmp_path / "fork-wiki-refs.db"
     init_db(str(db_path))
+    run_migrations(str(db_path))
     conn = sqlite3.connect(db_path, check_same_thread=False)
     try:
-        conn.execute("ALTER TABLE chat_messages ADD COLUMN wiki_refs TEXT")
         source_session_id = conn.execute(
             "INSERT INTO chat_sessions (vault_id, user_id, title) VALUES (?, ?, ?)",
             (1, 1, "Original"),
@@ -136,6 +137,7 @@ async def test_fork_copies_and_returns_wiki_refs_when_column_exists(
 async def test_fork_rolls_back_session_when_message_copy_fails(tmp_path):
     db_path = tmp_path / "fork-atomicity.db"
     init_db(str(db_path))
+    run_migrations(str(db_path))
     conn = sqlite3.connect(
         db_path,
         check_same_thread=False,

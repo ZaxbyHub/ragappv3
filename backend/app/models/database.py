@@ -1568,6 +1568,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_jobs_retry_count(sqlite_path)
     migrate_add_kms_tables(sqlite_path)
     migrate_add_kms_refs(sqlite_path)
+    migrate_add_chat_turn_columns(sqlite_path)
     migrate_add_document_reindex_jobs(sqlite_path)
     migrate_add_tags_tables(sqlite_path)
     migrate_add_folders(sqlite_path)
@@ -2331,6 +2332,78 @@ def migrate_add_kms_refs(sqlite_path: str) -> None:
         ]
         if "kms_refs" not in existing_msg_cols:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN kms_refs TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
+    """Migration: add durable chat turn columns to ``chat_messages`` (issue #507).
+
+    Adds, idempotently:
+
+    - ``seq`` INTEGER — per-session monotonic message order. Backfilled once
+      for legacy rows (1..n per session in ``created_at, id`` order) inside a
+      single transaction so a partially-numbered state can never persist.
+    - ``turn_id`` TEXT — client-generated UUID linking a turn's user+assistant rows.
+    - ``status`` TEXT — assistant terminal state: 'complete' | 'partial' |
+      'interrupted' | 'failed'. NULL (legacy rows) means complete.
+    - ``citation_confidence`` TEXT — JSON object of citation confidence scores.
+    - ``unverifiable_claims`` TEXT — JSON array of unverifiable claim strings.
+
+    Columns are intentionally NOT in the SCHEMA constant, matching the
+    ``wiki_refs``/``kms_refs``/``feedback`` precedent: ``run_migrations`` runs on
+    every connect, so fresh and existing databases both receive them here.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_msg_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(chat_messages)").fetchall()
+        ]
+        added_seq = False
+        if "seq" not in existing_msg_cols:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN seq INTEGER")
+            added_seq = True
+        for name in ("turn_id", "status", "citation_confidence", "unverifiable_claims"):
+            if name not in existing_msg_cols:
+                conn.execute(f"ALTER TABLE chat_messages ADD COLUMN {name} TEXT")  # nosec B608 — column names are a fixed literal set, not user input
+
+        # Backfill whenever rows still lack a seq. added_seq alone is not a
+        # sufficient guard: ALTER TABLE ADD COLUMN auto-commits outside the
+        # backfill transaction, so a process killed between the ALTER and the
+        # backfill would otherwise leave an all-NULL seq column that a re-run
+        # would never repopulate. Numbering only the NULL rows (after each
+        # session's current max) keeps already-numbered rows — including rows
+        # written between an interrupted attempt and this re-run — stable.
+        needs_backfill = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE seq IS NULL)"
+        ).fetchone()[0] == 1
+        if added_seq or needs_backfill:
+            # One transaction: an interrupted backfill rolls back wholesale.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                WITH null_rows AS (
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY session_id ORDER BY created_at ASC, id ASC
+                    ) AS rn
+                    FROM chat_messages WHERE seq IS NULL
+                )
+                UPDATE chat_messages
+                SET seq = (
+                    SELECT n.rn + COALESCE(
+                        (SELECT MAX(m2.seq) FROM chat_messages m2
+                          WHERE m2.session_id = chat_messages.session_id
+                            AND m2.seq IS NOT NULL
+                            AND m2.id NOT IN (SELECT id FROM null_rows)), 0)
+                    FROM null_rows n WHERE n.id = chat_messages.id
+                )
+                WHERE chat_messages.id IN (SELECT id FROM null_rows)
+                """
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_messages_session_seq ON chat_messages(session_id, seq)"
+        )
         conn.commit()
     finally:
         conn.close()

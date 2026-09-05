@@ -216,6 +216,54 @@ function makeRawReader(chunks: string[]): ReadableStreamDefaultReader<Uint8Array
   return stream.getReader();
 }
 
+describe("parseSSEStream - transport EOF without a completion marker (CHAT-004, issue #507)", () => {
+  // A reader that closes (done=true) without the backend JSON done event or
+  // the [DONE] marker is an INTERRUPTED stream, not a successful completion.
+  // The parser must surface it as a single ChatInterruptedError so the hook
+  // can mark the turn retryable — never fire onComplete, never error twice.
+
+  it("fires onError exactly once when the stream ends without a done marker", async () => {
+    const contents: string[] = [];
+    const errors: Error[] = [];
+    let completeCalls = 0;
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: (c) => contents.push(c),
+      onError: (e) => errors.push(e),
+      onComplete: () => {
+        completeCalls += 1;
+      },
+    };
+
+    // Partial content frame(s), then the reader closes — no done event, no [DONE].
+    await parseSSEStream(makeReader([{ type: "content", content: "partial" }], false), callbacks);
+
+    expect(contents).toEqual(["partial"]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].name).toBe("ChatInterruptedError");
+    expect(errors[0].message).toBe("The response stream ended before the answer finished.");
+    expect(completeCalls).toBe(0);
+  });
+
+  it("fires onError when the reader closes mid-frame", async () => {
+    const errors: Error[] = [];
+    let completeCalls = 0;
+    const callbacks: ChatStreamCallbacks = {
+      onError: (e) => errors.push(e),
+      onComplete: () => {
+        completeCalls += 1;
+      },
+    };
+
+    // A truncated frame (no terminating \n\n) buffered when EOF hits must be
+    // treated as an interrupted stream, not silently dropped as a clean end.
+    await parseSSEStream(makeRawReader(['data: {"type":"con']), callbacks);
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].name).toBe("ChatInterruptedError");
+    expect(completeCalls).toBe(0);
+  });
+});
+
 describe("parseSSEStream - malformed input handling (TEST-FE-003)", () => {
   // The parser is expected to drop a malformed (non-JSON) data chunk and keep
   // streaming rather than throwing or aborting the connection. See

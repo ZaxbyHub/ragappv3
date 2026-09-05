@@ -103,6 +103,14 @@ interface FeedbackActionProps {
   onFeedback?: (feedback: "up" | "down" | null) => void;
 }
 
+// UI-050: per-message request sequence. A stale failure (an older vote
+// request rejecting after a newer one succeeded) must not roll back the
+// newer saved selection. Module-scoped so it survives unmount/navigation.
+// Bounded: stale-protection only needs recent entries, so the map is reset
+// once it exceeds _FEEDBACK_SEQ_CAP entries (one number per voted message).
+const feedbackSeqByMessage = new Map<string, number>();
+const _FEEDBACK_SEQ_CAP = 1000;
+
 function FeedbackActions({
   messageId,
   sessionId,
@@ -155,7 +163,12 @@ function FeedbackActions({
       onFeedback?.(next);
 
       if (sessionId && messageId && !isNaN(Number(messageId))) {
+        const seqKey = String(messageId);
+        if (feedbackSeqByMessage.size >= _FEEDBACK_SEQ_CAP) feedbackSeqByMessage.clear();
+        const mySeq = (feedbackSeqByMessage.get(seqKey) ?? 0) + 1;
+        feedbackSeqByMessage.set(seqKey, mySeq);
         updateMessageFeedback(Number(sessionId), Number(messageId), next).catch(() => {
+          if (feedbackSeqByMessage.get(String(messageId)) !== mySeq) return; // a newer vote superseded this one
           if (externalFeedback === undefined) setInternalFeedback(prev);
           try {
             if (messageId) {

@@ -19,6 +19,12 @@ export interface Message {
   citationConfidence?: Record<string, number>;
   /** Unverifiable claims flagged by the citation validator. */
   unverifiableClaims?: string[];
+  /** Durable turn linkage (issue #507): shared by a turn's user+assistant rows. */
+  turnId?: string;
+  /** Assistant terminal state (issue #507). "complete" is the default; "interrupted"/"partial" render retryable. */
+  status?: "complete" | "partial" | "interrupted" | "failed";
+  /** Durable save acknowledgment, separate from answer completion (UI-002). */
+  saveState?: "saving" | "saved" | "failed";
   stopped?: boolean;
   error?: string;
   created_at?: string;
@@ -184,7 +190,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   stopStreaming: () => {
-    const { abortFn, messageIds, messagesById, streamingMessageId } = get();
+    const { abortFn, messagesById, streamingMessageId } = get();
     if (abortFn) abortFn();
 
     const updates: Partial<ChatState> = {
@@ -193,7 +199,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingMessageId: null,
     };
 
-    const targetId = streamingMessageId ?? messageIds[messageIds.length - 1];
+    const targetId = streamingMessageId;
+    // Only the ACTIVELY streaming message may be marked stopped. Falling back
+    // to the last message when nothing is streaming would stamp a spurious
+    // stopped:true on a previous turn's assistant message when Stop is pressed
+    // during session creation (UI-003).
     if (targetId) {
       const lastMsg = messagesById[targetId];
       if (lastMsg && lastMsg.role === "assistant") {

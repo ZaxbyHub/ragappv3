@@ -8,6 +8,7 @@ import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
 const apiMocks = vi.hoisted(() => ({
   createChatSession: vi.fn(),
   addChatMessage: vi.fn(),
+  addChatMessagesBatch: vi.fn(),
   chatStream: vi.fn(),
   getLlmModeHealth: vi.fn(),
 }));
@@ -15,6 +16,7 @@ const apiMocks = vi.hoisted(() => ({
 vi.mock("@/lib/api", () => ({
   createChatSession: (...args: unknown[]) => apiMocks.createChatSession(...args),
   addChatMessage: (...args: unknown[]) => apiMocks.addChatMessage(...args),
+  addChatMessagesBatch: (...args: unknown[]) => apiMocks.addChatMessagesBatch(...args),
   chatStream: (...args: unknown[]) => apiMocks.chatStream(...args),
   getLlmModeHealth: (...args: unknown[]) => apiMocks.getLlmModeHealth(...args),
 }));
@@ -45,6 +47,18 @@ function installCapturingStreamMock(): { trigger: { error: (e: Error) => void; c
   });
   return {
     trigger: {
+      message: (chunk: string) => {
+        if (!cell.current) throw new Error("chatStream was not invoked yet");
+        cell.current.onMessage(chunk);
+      },
+      citationConfidence: (confidence: Record<string, number>) => {
+        if (!cell.current) throw new Error("chatStream was not invoked yet");
+        cell.current.onCitationConfidence?.(confidence);
+      },
+      unverifiableClaims: (claims: string[]) => {
+        if (!cell.current) throw new Error("chatStream was not invoked yet");
+        cell.current.onUnverifiableClaims?.(claims);
+      },
       error: (e: Error) => {
         if (!cell.current) throw new Error("chatStream was not invoked yet");
         cell.current.onError(e);
@@ -74,9 +88,12 @@ describe("useSendMessage", () => {
     useLlmHealthStore.setState({ thinking: true, instant: true });
     useChatShellStore.setState({ sessionListRefreshToken: 0 });
     apiMocks.createChatSession.mockResolvedValue({ id: 42 });
-    apiMocks.addChatMessage
-      .mockResolvedValueOnce({ id: 100, created_at: "2026-05-12T00:00:00Z" })
-      .mockResolvedValueOnce({ id: 101, created_at: "2026-05-12T00:00:01Z" });
+    // Default batch save: user row gets id 100, assistant row id 101 (issue #507
+    // realignment — the hook persists a turn via one addChatMessagesBatch call).
+    apiMocks.addChatMessagesBatch.mockResolvedValue([
+      { id: 100, created_at: "2026-05-12T00:00:00Z" },
+      { id: 101, created_at: "2026-05-12T00:00:01Z" },
+    ]);
     apiMocks.chatStream.mockImplementation((_messages: unknown, handlers: {
       onMessage: (chunk: string) => void;
       onComplete: () => Promise<void>;
@@ -101,10 +118,13 @@ describe("useSendMessage", () => {
     });
     expect(useChatShellStore.getState().sessionListRefreshToken).toBeGreaterThan(0);
     expect(apiMocks.createChatSession).toHaveBeenCalledWith({ vault_id: 7 });
-    expect(apiMocks.addChatMessage).toHaveBeenCalledWith(42, {
-      role: "user",
-      content: "What changed?",
-    });
+    // Realigned to the issue #507 batch save: one ordered call carrying the
+    // user row then the assistant row.
+    expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledTimes(1);
+    expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledWith(42, [
+      expect.objectContaining({ role: "user", content: "What changed?" }),
+      expect.objectContaining({ role: "assistant" }),
+    ]);
   });
 
   it("persists the FULL streamed assistant content (rAF batching must flush before persist — UI-PERF-2)", async () => {
@@ -125,12 +145,13 @@ describe("useSendMessage", () => {
       expect(refreshHistory).toHaveBeenCalledWith(true);
     });
 
-    // The assistant addChatMessage call must carry the streamed content.
-    const assistantCall = apiMocks.addChatMessage.mock.calls.find(
-      (c) => c[1].role === "assistant",
+    // The assistant payload in the batch must carry the streamed content.
+    const batchArgs = apiMocks.addChatMessagesBatch.mock.calls[0];
+    const assistantPayload = (batchArgs[1] as Array<{ role: string; content: string }>).find(
+      (m) => m.role === "assistant",
     );
-    expect(assistantCall).toBeDefined();
-    expect((assistantCall![1] as { content: string }).content).toContain("hello");
+    expect(assistantPayload).toBeDefined();
+    expect(assistantPayload!.content).toContain("hello");
   });
 
   it("onFinalContent replaces streamed content without re-injecting stripped citations (UI-PERF-2 + rAF buffer)", async () => {
@@ -159,11 +180,12 @@ describe("useSendMessage", () => {
       expect(refreshHistory).toHaveBeenCalled();
     });
 
-    const assistantCall = apiMocks.addChatMessage.mock.calls.find(
-      (c) => c[1].role === "assistant",
+    const batchArgs = apiMocks.addChatMessagesBatch.mock.calls[0];
+    const assistantPayload = (batchArgs[1] as Array<{ role: string; content: string }>).find(
+      (m) => m.role === "assistant",
     );
-    expect(assistantCall).toBeDefined();
-    const persisted = (assistantCall![1] as { content: string }).content;
+    expect(assistantPayload).toBeDefined();
+    const persisted = assistantPayload!.content;
     // Must equal the repaired content exactly (no duplication, no [S5]).
     expect(persisted).toBe("The answer is 42");
     expect(persisted).not.toContain("[S5]");
@@ -511,14 +533,14 @@ describe("useSendMessage", () => {
       });
 
       // Now fire onComplete — it should be a no-op for persistence.
-      apiMocks.addChatMessage.mockClear();
+      apiMocks.addChatMessagesBatch.mockClear();
       await act(async () => {
         capture.trigger.complete();
       });
 
-      // Critical assertion: addChatMessage is NOT called. The orphan stream
+      // Critical assertion: the batch save is NOT invoked. The orphan stream
       // must not persist anything to the old (or any) session.
-      expect(apiMocks.addChatMessage).not.toHaveBeenCalled();
+      expect(apiMocks.addChatMessagesBatch).not.toHaveBeenCalled();
       // refreshHistory must not be called either — no save happened.
       expect(refreshHistory).not.toHaveBeenCalled();
     });
@@ -541,12 +563,12 @@ describe("useSendMessage", () => {
       expect(useChatStore.getState().messagesById).toEqual({});
       expect(useChatStore.getState().messageIds).toEqual([]);
 
-      apiMocks.addChatMessage.mockClear();
+      apiMocks.addChatMessagesBatch.mockClear();
       await act(async () => {
         capture.trigger.complete();
       });
 
-      expect(apiMocks.addChatMessage).not.toHaveBeenCalled();
+      expect(apiMocks.addChatMessagesBatch).not.toHaveBeenCalled();
       expect(refreshHistory).not.toHaveBeenCalled();
     });
 
@@ -556,10 +578,12 @@ describe("useSendMessage", () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
       useChatStore.setState({ activeChatId: "42", input: "normal completion" });
-      apiMocks.addChatMessage
+      apiMocks.addChatMessagesBatch
         .mockReset()
-        .mockResolvedValueOnce({ id: 200, created_at: "2026-06-01T00:00:00Z" })
-        .mockResolvedValueOnce({ id: 201, created_at: "2026-06-01T00:00:01Z" });
+        .mockResolvedValue([
+          { id: 200, created_at: "2026-06-01T00:00:00Z" },
+          { id: 201, created_at: "2026-06-01T00:00:01Z" },
+        ]);
 
       const { result } = renderHook(() => useSendMessage(7, refreshHistory));
 
@@ -567,7 +591,92 @@ describe("useSendMessage", () => {
         await result.current.handleSend();
       });
 
-      // Don't switch sessions — fire onComplete directly.
+      // Don't switch sessions — fire a real chunk then onComplete directly
+      // (empty content is never persisted at all — LIVE-01 — so the negative
+      // control must stream something before completing).
+      await act(async () => {
+        capture.trigger.message("normal completion answer");
+        capture.trigger.complete();
+      });
+
+      await waitFor(() => {
+        expect(refreshHistory).toHaveBeenCalledWith(true);
+      });
+      // Both the user and assistant message must be persisted in ONE ordered
+      // batch call (issue #507), user row first.
+      expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledTimes(1);
+      expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledWith(42, [
+        expect.objectContaining({ role: "user", content: "normal completion" }),
+        expect.objectContaining({ role: "assistant" }),
+      ]);
+    });
+  });
+
+  describe("chat turn lifecycle (issue #507)", () => {
+    it("does not start generation when Stop is pressed during session creation (UI-003)", async () => {
+      // createChatSession stays pending so Stop lands before the stream exists.
+      let resolveCreation!: (session: { id: number }) => void;
+      apiMocks.createChatSession.mockReturnValue(
+        new Promise<{ id: number }>((resolve) => {
+          resolveCreation = resolve;
+        })
+      );
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ input: "stop me mid-creation" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      let sendPromise = Promise.resolve();
+      act(() => {
+        sendPromise = result.current.handleSend();
+      });
+
+      // Stop while the session is still being created — no stream to abort yet.
+      act(() => {
+        result.current.handleStop();
+      });
+
+      // Resolve creation and flush: the cancelled generation must not start.
+      await act(async () => {
+        resolveCreation({ id: 42 });
+        await sendPromise;
+      });
+
+      expect(apiMocks.chatStream).not.toHaveBeenCalled();
+      expect(useChatStore.getState().messageIds).toEqual([]);
+      expect(useChatStore.getState().isStreaming).toBe(false);
+      expect(refreshHistory).not.toHaveBeenCalled();
+
+      // The sending guard must have been reset — a subsequent send works.
+      useChatStore.setState({ input: "second attempt" });
+      await act(async () => {
+        await result.current.handleSend();
+      });
+      expect(apiMocks.chatStream).toHaveBeenCalledTimes(1);
+    });
+
+    it("saves the turn via one ordered batch with a shared turn id", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "batch me" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+
+      const confidence = { S1: 0.9 };
+      const claims = ["claim A", "claim B"];
+      await act(async () => {
+        capture.trigger.message("hello ");
+        capture.trigger.message("world");
+        capture.trigger.citationConfidence(confidence);
+        capture.trigger.unverifiableClaims(claims);
+      });
       await act(async () => {
         capture.trigger.complete();
       });
@@ -575,17 +684,160 @@ describe("useSendMessage", () => {
       await waitFor(() => {
         expect(refreshHistory).toHaveBeenCalledWith(true);
       });
-      // Both the user and assistant message must be persisted.
-      expect(apiMocks.addChatMessage).toHaveBeenCalledTimes(2);
-      expect(apiMocks.addChatMessage).toHaveBeenNthCalledWith(1, 42, {
-        role: "user",
-        content: "normal completion",
+
+      expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledTimes(1);
+      const [sessionIdArg, payloads] = apiMocks.addChatMessagesBatch.mock.calls[0] as [
+        number,
+        Array<{ role: string; content: string; turn_id?: string; status?: string; citation_confidence?: unknown; unverifiable_claims?: unknown }>,
+      ];
+      expect(sessionIdArg).toBe(42);
+      expect(payloads).toHaveLength(2);
+      const [userPayload, assistantPayload] = payloads;
+      // Ordered: user row first, assistant row second.
+      expect(userPayload.role).toBe("user");
+      expect(userPayload.content).toBe("batch me");
+      expect(assistantPayload.role).toBe("assistant");
+      expect(assistantPayload.content).toContain("hello");
+      // Shared durable turn linkage — one turn id on both rows.
+      expect(typeof userPayload.turn_id).toBe("string");
+      expect(userPayload.turn_id!.length).toBeGreaterThan(0);
+      expect(assistantPayload.turn_id).toBe(userPayload.turn_id);
+      // A happy completion is persisted as complete with the assessment
+      // fields forwarded from the stream callbacks.
+      expect(assistantPayload.status).toBe("complete");
+      expect(assistantPayload.citation_confidence).toEqual(confidence);
+      expect(assistantPayload.unverifiable_claims).toEqual(claims);
+
+      // Store: ids migrated to the server ids with saveState "saved".
+      const state = useChatStore.getState();
+      const messages = state.messageIds.map((id) => state.messagesById[id]);
+      const savedUser = messages.find((m) => m.role === "user");
+      const savedAssistant = messages.find((m) => m.role === "assistant");
+      expect(savedUser?.saveState).toBe("saved");
+      expect(savedAssistant?.saveState).toBe("saved");
+      expect(state.messagesById["100"]).toBeDefined();
+      expect(state.messagesById["101"]).toBeDefined();
+      expect(savedUser?.turnId).toBe(savedAssistant?.turnId);
+    });
+
+    it("marks the exchange failed and keeps the answer visible when the batch save rejects (UI-002)", async () => {
+      const capture = installCapturingStreamMock();
+      apiMocks.addChatMessagesBatch.mockRejectedValueOnce(new Error("server exploded"));
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "will fail to save" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
       });
-      expect(apiMocks.addChatMessage).toHaveBeenNthCalledWith(
-        2,
-        42,
-        expect.objectContaining({ role: "assistant" })
-      );
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+
+      await act(async () => {
+        capture.trigger.message("precious answer");
+        capture.trigger.complete();
+      });
+
+      await waitFor(() => {
+        expect(useChatStore.getState().messagesById[streamingId!]?.saveState).toBe("failed");
+      });
+
+      const state = useChatStore.getState();
+      const assistant = state.messagesById[streamingId!];
+      const user = state.messageIds
+        .map((id) => state.messagesById[id])
+        .find((m) => m.role === "user");
+      // Both rows of the failed exchange are visibly marked failed...
+      expect(assistant?.saveState).toBe("failed");
+      expect(assistant?.error).toBe("Couldn't save this exchange. Retry to avoid losing it.");
+      expect(user?.saveState).toBe("failed");
+      // ...and the streamed answer stays visible (never a silent loss).
+      expect(assistant?.content).toContain("precious answer");
+      expect(refreshHistory).not.toHaveBeenCalled();
+    });
+
+    it("persists an interrupted stream as interrupted, not complete (CHAT-004)", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "interrupted turn" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+
+      // Parser-level EOF: partial content, then ChatInterruptedError.
+      await act(async () => {
+        capture.trigger.message("partial");
+        const interrupted = new Error(
+          "The response stream ended before the answer finished."
+        );
+        interrupted.name = "ChatInterruptedError";
+        capture.trigger.error(interrupted);
+      });
+
+      // The interrupted turn is still persisted — as interrupted.
+      await waitFor(() => {
+        expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledTimes(1);
+      });
+      const payloads = apiMocks.addChatMessagesBatch.mock.calls[0][1] as Array<{
+        role: string;
+        content: string;
+        status?: string;
+      }>;
+      const assistantPayload = payloads.find((m) => m.role === "assistant");
+      // An interrupted answer is persisted as interrupted — never as complete.
+      expect(assistantPayload?.status).toBe("interrupted");
+      expect(assistantPayload?.content).toBe("partial");
+
+      // Store state after the save migrated the temp id to server id 101:
+      // the partial answer stays visible and is marked retryable.
+      await waitFor(() => {
+        expect(useChatStore.getState().messagesById["101"]).toBeDefined();
+      });
+      const state = useChatStore.getState();
+      const assistant = state.messagesById["101"];
+      expect(assistant?.status).toBe("interrupted");
+      expect(assistant?.error).toBe("Response interrupted. You can retry.");
+      expect(assistant?.content).toBe("partial");
+      expect(state.isStreaming).toBe(false);
+      expect(state.streamingMessageId).toBeNull();
+    });
+
+    it("does not persist or present an empty response as success", async () => {
+      // Zero onMessage chunks, then a normal onComplete: the empty answer
+      // must neither be saved nor look like a successful turn (LIVE-01).
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "say anything" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+
+      await act(async () => {
+        capture.trigger.complete();
+      });
+
+      // Nothing is persisted for an empty answer.
+      expect(apiMocks.addChatMessagesBatch).not.toHaveBeenCalled();
+      expect(refreshHistory).not.toHaveBeenCalled();
+
+      // The assistant message surfaces the empty response instead of success.
+      const assistant = useChatStore.getState().messagesById[streamingId!];
+      expect(assistant?.error).toBe("The model returned an empty response. Try again.");
+      expect(assistant?.saveState).not.toBe("saved");
     });
   });
 });

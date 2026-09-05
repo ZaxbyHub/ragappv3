@@ -682,7 +682,10 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
   useEffect(() => {
     const fetchSessionDetails = async () => {
       if (!debouncedSearchQuery.trim()) {
-        setSessionDetails(new Map());
+        // Retain fetched details across an empty query: fetchedIdsRef keeps
+        // its markers, so clearing the map here (while the ref kept markers)
+        // made repeat searches by first-message content find nothing until
+        // remount (UI-043).
         return;
       }
 
@@ -753,6 +756,58 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
     overscan: 5,
   });
 
+  // UI-045: move DOM focus (and the roving focused index) to the row wrapper
+  // carrying data-session-index. SessionItem does not forward unknown props to
+  // its focusable root, so the row wrappers own the data attribute and receive
+  // programmatic focus.
+  const moveSessionFocus = useCallback(
+    (targetIndex: number) => {
+      const len = filteredSessions.length;
+      if (len === 0) return;
+      const clamped = Math.max(0, Math.min(targetIndex, len - 1));
+      setFocusedSessionIndex(clamped);
+      // Scroll the virtual window first so the target row exists in the DOM
+      // before we try to focus it (no-op in the non-virtualized fallback).
+      // "auto" is this library's minimal-scroll alignment (virtual-core has no
+      // "nearest"): no scroll when in view, else end/start.
+      if (sessionVirtualizer.getVirtualItems().length > 0) {
+        sessionVirtualizer.scrollToIndex(clamped, { align: "auto" });
+      }
+      requestAnimationFrame(() => {
+        const row = listRef.current?.querySelector<HTMLElement>(
+          `[data-session-index="${clamped}"]`
+        );
+        if (!row) return;
+        row.focus();
+        row.scrollIntoView({ block: "nearest" });
+      });
+    },
+    [filteredSessions.length, sessionVirtualizer]
+  );
+
+  // UI-045: roving keyboard navigation for the live session lists (ArrowUp/
+  // ArrowDown/Home/End, matching the grouped SessionGroup list pattern).
+  const handleSessionListKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      const len = filteredSessions.length;
+      if (len === 0) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        moveSessionFocus(Math.min(focusedSessionIndex + 1, len - 1));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        moveSessionFocus(Math.max(focusedSessionIndex - 1, 0));
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        moveSessionFocus(0);
+      } else if (e.key === "End") {
+        e.preventDefault();
+        moveSessionFocus(len - 1);
+      }
+    },
+    [filteredSessions.length, focusedSessionIndex, moveSessionFocus]
+  );
+
   // Handle new chat
   const handleNewChat = useCallback(() => {
     useChatStore.getState().newChat();
@@ -812,6 +867,10 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
       const wasActive = String(session.id) === activeSessionId;
       if (wasActive) {
         setActiveSessionId(null);
+        // Stop the chat store from targeting the deleted session (UI-044) —
+        // otherwise the transcript keeps writing into a session slated for
+        // deletion until the undo window expires.
+        useChatStore.getState().newChat();
         navigate("/chat");
       }
 
@@ -1024,15 +1083,32 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
           const virtualItems = sessionVirtualizer.getVirtualItems();
           const shouldUseVirtualizer = virtualItems.length > 0;
           return shouldUseVirtualizer ? (
-            <div style={{ height: sessionVirtualizer.getTotalSize(), position: 'relative' }}>
+            // eslint-disable-next-line jsx-a11y-x/no-static-element-interactions -- container uses event delegation for roving-tabindex arrow-key navigation (UI-045); rows carry data-session-index and receive programmatic focus. APG listbox pattern.
+            <div
+              style={{ height: sessionVirtualizer.getTotalSize(), position: 'relative' }}
+              onKeyDown={handleSessionListKeyDown}
+            >
               {virtualItems.map((virtualItem) => {
                 const session = filteredSessions[virtualItem.index];
                 return (
+                  // eslint-disable-next-line jsx-a11y-x/no-static-element-interactions -- focusable row wrapper (SessionItem forwards no unknown props to its root); Enter/Space activate the session when the wrapper holds focus.
                   <div
                     key={virtualItem.key}
                     data-index={virtualItem.index}
+                    data-session-index={virtualItem.index}
+                    tabIndex={-1}
                     ref={sessionVirtualizer.measureElement}
                     style={{ position: 'absolute', top: virtualItem.start, left: 0, right: 0 }}
+                    onKeyDown={(e) => {
+                      // Activation for wrapper-focused rows; when focus sits on
+                      // SessionItem's own root it handles Enter/Space itself.
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        handleSessionClick(session);
+                        setFocusedSessionIndex(virtualItem.index);
+                      }
+                    }}
                   >
                     <SessionItem
                       session={session}
@@ -1054,9 +1130,23 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
           ) : (
             // Fallback: render all items directly (used in JSDOM/test env where
             // scroll container has 0 height and getVirtualItems() returns [])
-            <div>
+            // eslint-disable-next-line jsx-a11y-x/no-static-element-interactions -- container uses event delegation for roving-tabindex arrow-key navigation (UI-045). APG listbox pattern.
+            <div onKeyDown={handleSessionListKeyDown}>
               {filteredSessions.map((session, index) => (
-                <div key={session.id}>
+                // eslint-disable-next-line jsx-a11y-x/no-static-element-interactions -- focusable row wrapper (SessionItem forwards no unknown props to its root); Enter/Space activate the session when the wrapper holds focus.
+                <div
+                  key={session.id}
+                  data-session-index={index}
+                  tabIndex={-1}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      handleSessionClick(session);
+                      setFocusedSessionIndex(index);
+                    }
+                  }}
+                >
                   <SessionItem
                     session={session}
                     isActive={String(session.id) === activeSessionId}

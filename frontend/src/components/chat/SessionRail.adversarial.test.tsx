@@ -932,4 +932,129 @@ describe("SessionRail ADVERSARIAL TESTS", () => {
       });
     });
   });
+
+  // ===========================================================================
+  // Issue #507 regressions
+  // ===========================================================================
+  describe("Issue #507 regressions", () => {
+    const makeSession = (id: number, title: string) => ({
+      id,
+      vault_id: 1,
+      title,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      message_count: 1,
+    });
+
+    it("resets the chat store via newChat when the active session is deleted (UI-044)", async () => {
+      const { useChatStore } = await import("@/stores/useChatStore");
+      vi.mocked(useChatShellStoreModule.useChatShellStore).mockReturnValue(
+        createMockStore({ activeSessionId: "1" })
+      );
+      vi.mocked(api.listChatSessions).mockResolvedValue({
+        sessions: [makeSession(1, "Active Session")],
+      });
+      vi.mocked(api.deleteChatSession).mockResolvedValue(undefined);
+      vi.mocked(mockIsSessionPinned).mockReturnValue(false);
+
+      // The transcript is targeting session 1 when it is deleted.
+      useChatStore.setState({
+        activeChatId: "1",
+        messageIds: ["m1"],
+        messagesById: { m1: { id: "m1", role: "user", content: "hello" } },
+        isStreaming: false,
+        abortFn: null,
+        streamingMessageId: null,
+      });
+
+      render(
+        <Wrapper>
+          <SessionRail />
+        </Wrapper>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("Active Session")).toBeInTheDocument();
+      });
+
+      const row = screen.getByText("Active Session").closest('[role="button"]');
+      fireEvent.mouseEnter(row!);
+      fireEvent.click(within(row! as HTMLElement).getByLabelText("More options"));
+      fireEvent.click(within(row! as HTMLElement).getByLabelText("Delete session"));
+
+      // The chat store must stop targeting the deleted session immediately —
+      // not stay pointed at it until the undo window expires.
+      await waitFor(() => {
+        expect(useChatStore.getState().activeChatId).toBeNull();
+      });
+      expect(useChatStore.getState().messageIds).toEqual([]);
+      expect(useChatStore.getState().messagesById).toEqual({});
+      // The delete API itself is still deferred by the 5s undo window.
+      expect(api.deleteChatSession).not.toHaveBeenCalled();
+    });
+
+    it("moves focus through the live list with ArrowDown/Home/End (UI-045)", async () => {
+      // moveSessionFocus calls row.scrollIntoView — jsdom omits it.
+      Element.prototype.scrollIntoView = vi.fn();
+
+      vi.mocked(api.listChatSessions).mockResolvedValue({
+        sessions: [
+          makeSession(1, "Alpha"),
+          makeSession(2, "Beta"),
+          makeSession(3, "Gamma"),
+        ],
+      });
+      vi.mocked(mockIsSessionPinned).mockReturnValue(false);
+
+      render(
+        <Wrapper>
+          <SessionRail />
+        </Wrapper>
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("Alpha")).toBeInTheDocument();
+      });
+
+      const rows = document.querySelectorAll("[data-session-index]");
+      expect(rows.length).toBe(3);
+
+      // Initial roving index is 0 — the first row is the tabbable one.
+      const tabbable = Array.from(rows).filter(
+        (r) => (r.firstElementChild as HTMLElement)?.tabIndex === 0
+      );
+      expect(tabbable).toHaveLength(1);
+      expect(tabbable[0]).toBe(rows[0]);
+
+      // ArrowDown bubbles from the row wrapper to the container's delegated
+      // handler and moves DOM focus to the next data-session-index row.
+      fireEvent.keyDown(rows[0], { key: "ArrowDown" });
+      await waitFor(() => {
+        expect(document.activeElement?.getAttribute("data-session-index")).toBe("1");
+      });
+
+      fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+      await waitFor(() => {
+        expect(document.activeElement?.getAttribute("data-session-index")).toBe("2");
+      });
+
+      // Clamped at the last row.
+      fireEvent.keyDown(document.activeElement!, { key: "ArrowDown" });
+      await waitFor(() => {
+        expect(document.activeElement?.getAttribute("data-session-index")).toBe("2");
+      });
+
+      // Home returns to the first row.
+      fireEvent.keyDown(document.activeElement!, { key: "Home" });
+      await waitFor(() => {
+        expect(document.activeElement?.getAttribute("data-session-index")).toBe("0");
+      });
+
+      // End jumps to the last row.
+      fireEvent.keyDown(document.activeElement!, { key: "End" });
+      await waitFor(() => {
+        expect(document.activeElement?.getAttribute("data-session-index")).toBe("2");
+      });
+    });
+  });
 });

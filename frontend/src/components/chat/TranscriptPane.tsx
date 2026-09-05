@@ -11,6 +11,7 @@ import {
   GitCompare,
   ListChecks,
   Quote,
+  AlertTriangle,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -30,7 +31,8 @@ import { useAuthStore } from "@/stores/useAuthStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useSendMessage } from "@/hooks/useSendMessage";
 import { useChatHistory } from "@/hooks/useChatHistory";
-import { forkChatSession } from "@/lib/api";
+import { forkChatSession, truncateChatSession } from "@/lib/api";
+import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { toast } from "sonner";
 import type { Message } from "@/stores/useChatStore";
 
@@ -177,28 +179,69 @@ const MessageRow = memo(function MessageRow({
   const isAssistantStreaming = isStreaming && isLast && safeMessage.role === "assistant" && streamingMessageId === messageId;
   const isHighlighted = highlightedId === messageId;
 
+  // Persisted terminal status (issue #507): an interrupted/partial turn must
+  // never look like a successful answer after reload. The live-stream error
+  // paths already stamp `error` on the message (which renders its own retry
+  // banner inside AssistantMessage), so this banner targets the restored
+  // rows — status set, no error string. Never shown while a stream is active.
+  const showInterruptedStatusBanner =
+    safeMessage.role === "assistant" &&
+    !isStreaming &&
+    !safeMessage.error &&
+    (safeMessage.status === "interrupted" || safeMessage.status === "partial");
+
   return (
     <div className={isHighlighted ? "ring-2 ring-primary/50 rounded-xl transition-all duration-500" : undefined}>
       {safeMessage.role === "assistant" ? (
-        <AnimatePresence mode="wait">
-          {isAssistantStreaming && !safeMessage.content && currentStage ? (
-            <StageIndicator key="stage" stage={currentStage as "Searching" | "Reading" | "Drafting"} />
-          ) : isAssistantStreaming && !safeMessage.content ? (
-            <WaitingIndicator key="waiting" />
-          ) : (
-            <AssistantMessage
-              key="message"
-              message={safeMessage}
-              isStreaming={isAssistantStreaming}
-              showDebug={showDebug}
-              onRetry={onRetry}
-              onFork={onFork ? () => onFork(messageId) : undefined}
-              sessionId={String(activeSessionId ?? "")}
-              messageFeedback={safeMessage.feedback}
-              onFeedback={(fb) => onFeedback(messageId, fb)}
-            />
+        <>
+          <AnimatePresence mode="wait">
+            {isAssistantStreaming && !safeMessage.content && currentStage ? (
+              <StageIndicator key="stage" stage={currentStage as "Searching" | "Reading" | "Drafting"} />
+            ) : isAssistantStreaming && !safeMessage.content ? (
+              <WaitingIndicator key="waiting" />
+            ) : (
+              <AssistantMessage
+                key="message"
+                message={safeMessage}
+                isStreaming={isAssistantStreaming}
+                showDebug={showDebug}
+                onRetry={onRetry}
+                onFork={onFork ? () => onFork(messageId) : undefined}
+                sessionId={String(activeSessionId ?? "")}
+                messageFeedback={safeMessage.feedback}
+                onFeedback={(fb) => onFeedback(messageId, fb)}
+              />
+            )}
+          </AnimatePresence>
+          {showInterruptedStatusBanner && (
+            <div
+              className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+              role="status"
+              data-interrupted-status={safeMessage.status}
+            >
+              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" aria-hidden />
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                  {safeMessage.status === "partial"
+                    ? "Response is incomplete — you can retry."
+                    : "Response interrupted — you can retry."}
+                </p>
+                {/* Retry only makes sense for the latest exchange — the shared
+                    handleRetry trims from the last user message. */}
+                {isLast && (
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="h-auto p-0 mt-1 text-amber-700 dark:text-amber-300 text-xs"
+                    onClick={onRetry}
+                  >
+                    Retry
+                  </Button>
+                )}
+              </div>
+            </div>
           )}
-        </AnimatePresence>
+        </>
       ) : (
         <MessageBubble
           message={safeMessage}
@@ -373,15 +416,26 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     setTimeout(() => composerRef.current?.focus(), 0);
   };
 
-  // Retry: find last user message, trim store, call sendDirect
-  const handleRetry = useCallback(() => {
+  // Retry: find last user message, trim persisted history + store, call sendDirect
+  const handleRetry = useCallback(async () => {
     if (isStreaming) return;
-    const { messageIds: ids, messagesById } = useChatStore.getState();
+    const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
     let lastUserIdx = -1;
     for (let i = ids.length - 1; i >= 0; i--) {
       if (messagesById[ids[i]]?.role === "user") { lastUserIdx = i; break; }
     }
     if (lastUserIdx < 0) return;
+
+    // Trim the persisted history first so the server matches the local trim;
+    // on failure bail out before touching the local transcript.
+    if (activeChatId) {
+      try {
+        await truncateChatSession(parseInt(activeChatId), Math.max(0, lastUserIdx));
+      } catch {
+        toast.error("Couldn't update conversation history");
+        return;
+      }
+    }
 
     const userContent = messagesById[ids[lastUserIdx]].content;
     const history = ids.slice(0, lastUserIdx).map((id) => messagesById[id]);
@@ -389,12 +443,20 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     sendDirect(userContent, history);
   }, [isStreaming, removeMessagesFrom, sendDirect]);
 
-  // Edit: trim store from message index, restore content to composer
-  const handleEdit = useCallback((messageId: string, content: string) => {
+  // Edit: trim persisted history + store from message index, restore content to composer
+  const handleEdit = useCallback(async (messageId: string, content: string) => {
     if (isStreaming) return;
-    const { messageIds: ids } = useChatStore.getState();
+    const { messageIds: ids, activeChatId } = useChatStore.getState();
     const idx = ids.indexOf(messageId);
     if (idx < 0) return;
+    if (activeChatId) {
+      try {
+        await truncateChatSession(parseInt(activeChatId), Math.max(0, idx));
+      } catch {
+        toast.error("Couldn't update conversation history");
+        return;
+      }
+    }
     removeMessagesFrom(idx);
     setInput(content);
     composerRef.current?.focus();
@@ -417,16 +479,7 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
         toast.warning("Fork returned no messages — staying on the current session.");
         return;
       }
-      const forkMessages = forked.messages.map((m) => ({
-        id: m.id.toString(),
-        role: m.role as "user" | "assistant",
-        content: m.content,
-        sources: m.sources ?? undefined,
-        memoriesUsed: m.memories ?? undefined,
-        wikiRefs: m.wiki_refs ?? undefined,
-        created_at: m.created_at,
-        feedback: m.feedback ?? null,
-      }));
+      const forkMessages = forked.messages.map(mapSessionMessage);
       loadChat(String(forked.id), forkMessages);
       await refreshHistory();
       navigate(`/chat/${forked.id}`);

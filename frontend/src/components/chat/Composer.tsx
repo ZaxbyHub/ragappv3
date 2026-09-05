@@ -685,7 +685,15 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                     variant="ghost"
                     size="icon"
                     className="h-8 w-8 text-muted-foreground active:scale-95"
-                    onClick={() => { setInput(input + "/"); textareaRef.current?.focus(); }}
+                    onClick={() => {
+                      const next = input + "/";
+                      setInput(next);
+                      persistDraft(next);
+                      setShowSlashMenu(true);
+                      setSlashQuery("");
+                      setSelectedCmd(0);
+                      textareaRef.current?.focus();
+                    }}
                     aria-label="Open slash commands"
                     tabIndex={-1}
                   >
