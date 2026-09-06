@@ -110,9 +110,12 @@ export function AssistantMessage({
   // Validated citation labels: the done event's citation_confidence carries
   // one entry per VALID [S#] label, so its keys are the valid-label set.
   // Undefined when the validator produced nothing — cards then show no badge.
-  const validCitationLabels = message.citationConfidence
-    ? new Set(Object.keys(message.citationConfidence))
-    : undefined;
+  // An empty object means the same thing, so it maps to undefined too (an
+  // empty set would otherwise flip every card to a "Retrieved" badge).
+  const validCitationLabels =
+    message.citationConfidence && Object.keys(message.citationConfidence).length > 0
+      ? new Set(Object.keys(message.citationConfidence))
+      : undefined;
   // Memory cards: show ONLY memories explicitly cited as [M#] in the answer.
   const memoriesForCards = citedMemories;
   // Wiki cards: show ONLY wiki refs explicitly cited as [W#] in the answer.

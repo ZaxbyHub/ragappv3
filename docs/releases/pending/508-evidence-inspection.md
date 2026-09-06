@@ -88,4 +88,7 @@ restoration, responsive drawers that leave the composer usable).
   code-level checks in CI; a live browser matrix remains a manual gate.
 - Support-span highlighting is a literal match; distilled or parent-window contexts that do not
   contain the snippet verbatim show the explicit "not located" note.
+- Spreadsheet sources render "Location unavailable": `sheet_name` exists in chunk metadata but is
+  excluded from the wire metadata whitelist (#480), so the evidence contract cannot display
+  sheet/cell locations until the whitelist is deliberately extended.
 - Evidence selection state intentionally persists across an in-session "clear messages".

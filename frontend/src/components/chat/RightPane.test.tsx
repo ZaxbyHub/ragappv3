@@ -8,6 +8,10 @@ import * as useChatStoreModule from "@/stores/useChatStore";
 import * as useChatShellStoreModule from "@/stores/useChatShellStore";
 import { getChunkContext, getArtifactRawBlob } from "@/lib/api";
 
+// jsdom does not implement scrollIntoView; the evidence-selection scroll
+// effect fires it from a timer, so stub it before any test renders.
+Element.prototype.scrollIntoView = vi.fn();
+
 // Mock the stores
 vi.mock("@/stores/useChatStore", () => {
   const chatStoreMock: any = vi.fn();
@@ -1760,6 +1764,43 @@ print("hello")
           }),
         })
       );
+    });
+
+    it("clears the local source selection when the store selection resets on session switch", async () => {
+      const source = createMockSource({ id: "src-reset", filename: "reset-doc.pdf", snippet: "Content" });
+
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "test" }),
+          createMockMessage({ role: "assistant", content: "response", sources: [source] }),
+        ],
+        expandedSources: new Set(),
+      });
+      (mockUseChatShellStore as ReturnType<typeof vi.fn>).mockReturnValue({
+        selectedEvidenceSource: source,
+        setSelectedEvidenceSource: vi.fn(),
+        activeRightTab: "evidence",
+        setActiveRightTab: vi.fn(),
+      });
+
+      const { rerender } = render(<RightPane />);
+      await waitFor(() => {
+        expect(screen.getByText("Jump to answer")).toBeInTheDocument();
+      });
+
+      // Session switch: the shell store resets the evidence selection to null;
+      // the local selection (and the preview it drives) must clear with it.
+      (mockUseChatShellStore as ReturnType<typeof vi.fn>).mockReturnValue({
+        selectedEvidenceSource: null,
+        setSelectedEvidenceSource: vi.fn(),
+        activeRightTab: "evidence",
+        setActiveRightTab: vi.fn(),
+      });
+      rerender(<RightPane />);
+
+      await waitFor(() => {
+        expect(screen.queryByText("Jump to answer")).not.toBeInTheDocument();
+      });
     });
 
     it("should carry the anchored message id when the selection came from a citation chip", async () => {

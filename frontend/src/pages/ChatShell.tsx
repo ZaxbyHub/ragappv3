@@ -301,6 +301,9 @@ export default function ChatShell() {
     if (!rightPaneOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      // Defer to handlers that already consumed Escape (e.g. SessionRail's
+      // rename input preventDefaults so the window-level listeners stand down).
+      if (event.defaultPrevented) return;
       closeRightPane();
       requestAnimationFrame(() => {
         const chip = evidenceReturnFocusId

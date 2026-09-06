@@ -692,6 +692,11 @@ export function RightPane() {
   useEffect(() => {
     if (selectedEvidenceSource) {
       setSelectedSource(selectedEvidenceSource);
+    } else {
+      // Session switches reset the store selection; without this the local
+      // selection (and the preview rendering it) would outlive the session
+      // it came from.
+      setSelectedSource(null);
     }
   }, [selectedEvidenceSource]);
 

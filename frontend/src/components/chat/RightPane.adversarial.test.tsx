@@ -669,10 +669,10 @@ double closed
       });
     });
 
-    // BUG DISCOVERED: Component crashes when sources array contains null entries
-    // Error: TypeError: Cannot read properties of null (reading 'id')
-    // The component maps over sources without guarding against null/undefined entries
-    it("BUG: crashes with null entries in sources array - should guard against null sources", async () => {
+    // Regression guard: null entries in the sources array must not crash the
+    // component. React renders null-valued fields as empty; this test pins
+    // that behavior (it passes — the component tolerates null entries).
+    it("tolerates null entries in sources array without crashing", async () => {
       (useChatStore as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
         createMockMessages([
           { id: "msg-1", role: "user", content: "test" },

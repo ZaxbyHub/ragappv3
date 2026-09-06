@@ -329,6 +329,28 @@ const citationTreeParser = unified().use(remarkParse);
  * properties, not text-node children), so markers there are never collected.
  */
 function collectCitationLabels(content: string): Set<string> {
+  // Streaming re-invokes this once per coalesced frame with the full (growing)
+  // content; remarkParse is O(n) per call, so cache by content. Bounded LRU:
+  // only the most recent content per streaming message is ever re-requested.
+  const cached = citationLabelsCache.get(content);
+  if (cached) {
+    citationLabelsCache.delete(content);
+    citationLabelsCache.set(content, cached);
+    return cached;
+  }
+  const labels = collectCitationLabelsUncached(content);
+  citationLabelsCache.set(content, labels);
+  if (citationLabelsCache.size > CITATION_LABELS_CACHE_LIMIT) {
+    const oldest = citationLabelsCache.keys().next().value;
+    if (oldest !== undefined) citationLabelsCache.delete(oldest);
+  }
+  return labels;
+}
+
+const CITATION_LABELS_CACHE_LIMIT = 32;
+const citationLabelsCache = new Map<string, Set<string>>();
+
+function collectCitationLabelsUncached(content: string): Set<string> {
   const labels = new Set<string>();
   if (!content) return labels;
   let tree: MdastNode;

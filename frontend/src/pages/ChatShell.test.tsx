@@ -1095,6 +1095,25 @@ describe("Evidence drawer non-modality + Escape focus restore (issue #508 WU-12)
     document.body.removeChild(chipV2);
   });
 
+  it("does not close the pane when Escape was already handled (defaultPrevented)", () => {
+    // SessionRail's rename input preventDefaults Escape to signal that the
+    // event was consumed; the pane handler must stand down (review PRR-009).
+    matchMediaMatches = true;
+    mockStoreState.rightPaneOpen = true;
+
+    render(
+      <BrowserRouter>
+        <ChatShell />
+      </BrowserRouter>
+    );
+
+    const handled = new KeyboardEvent("keydown", { key: "Escape", cancelable: true });
+    handled.preventDefault();
+    window.dispatchEvent(handled);
+
+    expect(mockStoreState.closeRightPane).not.toHaveBeenCalled();
+  });
+
   it("ignores Escape while the pane is closed", () => {
     matchMediaMatches = true;
     mockStoreState.rightPaneOpen = false;

@@ -59,6 +59,15 @@ describe("AssistantMessage citation badge + chip anchor forwarding (issue #508)"
     expect(screen.queryByText("Retrieved")).not.toBeInTheDocument();
   });
 
+  it("renders no badge when citationConfidence is an empty object", () => {
+    // {} and undefined both mean "nothing validated" — neither may show a
+    // badge (an empty set would flip every card to "Retrieved").
+    render(<AssistantMessage message={createMessage({ citationConfidence: {} })} />);
+
+    expect(screen.queryByText("Cited")).not.toBeInTheDocument();
+    expect(screen.queryByText("Retrieved")).not.toBeInTheDocument();
+  });
+
   it("stamps the chip focus anchor with the owning message id", () => {
     render(<AssistantMessage message={createMessage()} />);
 
