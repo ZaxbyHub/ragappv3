@@ -38,7 +38,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # document_assets, ingestion_stage_states, and artifact_delete_pending.
 # 61 -> 62: Multimodal artifact enrichment (issue #461) adds
 # document_atom_enrichments.
-EXPECTED_BASE_TABLE_COUNT = 62
+# 62 -> 64: Versioned canvas (issue #509, 2026-09-06) adds canvas_artifacts and
+# canvas_versions.
+EXPECTED_BASE_TABLE_COUNT = 64
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

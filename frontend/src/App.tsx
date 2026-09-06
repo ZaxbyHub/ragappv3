@@ -39,6 +39,7 @@ const KMSPage = lazy(() => import("@/pages/KMSPage"));
 const KMSDetailPage = lazy(() => import("@/pages/KMSDetailPage"));
 const DraftRoomPage = lazy(() => import("@/pages/DraftRoomPage"));
 const DraftRoomDetailPage = lazy(() => import("@/pages/DraftRoomDetailPage"));
+const CanvasPage = lazy(() => import("@/components/canvas/CanvasPage"));
 
 function PageLoader() {
   return (
@@ -187,6 +188,19 @@ function App() {
                   <ProtectedRoute testMode={TEST_MODE}>
                     <MainAppShell testMode={TEST_MODE}>
                       <ChatShell />
+                    </MainAppShell>
+                  </ProtectedRoute>
+                }
+              />
+              {/* Versioned code/document canvas opened from a chat answer
+                  (issue #509). Same PageShell/protected wrapper as the chat
+                  routes; 404/disabled states render inside CanvasPage. */}
+              <Route
+                path="/chat/:sessionId/canvas/:artifactUid"
+                element={
+                  <ProtectedRoute testMode={TEST_MODE}>
+                    <MainAppShell testMode={TEST_MODE}>
+                      <CanvasPage />
                     </MainAppShell>
                   </ProtectedRoute>
                 }

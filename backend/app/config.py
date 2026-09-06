@@ -465,6 +465,19 @@ class Settings(BaseSettings):
     draft_poll_interval_seconds: float = 2.0
     """Poll interval for the durable Draft Room job processor."""
 
+    # ── Canvas configuration (issue #509) ─────────────────────────────────
+    # Versioned code/document canvas. Purely additive: no chat endpoint,
+    # schema object, or prompt is altered. Every entry point (frontend buttons
+    # and backend routes alike) fails closed, so default-on changes nothing for
+    # users who never open a canvas. Operators wanting the pre-#509 surface
+    # set CANVAS_ENABLED=false (all canvas routes 503, UI hidden).
+    canvas_enabled: bool = True
+    """Master switch for the versioned canvas. When False every canvas route
+    returns 503 canvas_disabled and the frontend entry points stay hidden."""
+    canvas_max_artifact_kb: int = 512
+    """Maximum artifact content size in KB enforced at create and save (413
+    canvas_artifact_too_large beyond it)."""
+
     # ── Draft Room pipeline (issue #436, SPEC.md section 15) ──────────────
     draft_allowed_model_origins: Annotated[list[str], NoDecode] = []
     """Comma-separated exact normalized origins (scheme://host:port) allowed to

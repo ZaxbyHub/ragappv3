@@ -1,20 +1,151 @@
 // frontend/src/components/chat/AssistantMessage.tsx
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useEffect, useImperativeHandle, useRef } from "react";
+import type { RefObject } from "react";
+import { useNavigate } from "react-router-dom";
 import { motion, useReducedMotion } from "framer-motion";
 import { Bot, AlertCircle, Sparkles, Zap } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import type { Message } from "@/stores/useChatStore";
 import type { Source } from "@/lib/api";
+import {
+  createCanvasArtifact,
+  mapFenceLanguageToExtension,
+  type SourceRef,
+} from "@/lib/api/canvas";
+import { useCanvasCapabilities } from "@/hooks/useCanvasCapabilities";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { MarkdownMessage, parseCitationSegments } from "./MarkdownMessage";
 import { SourceCards } from "./SourceCards";
 import { MemoryCards } from "./MemoryCards";
 import { WikiCards } from "./WikiCards";
 import { KMSCards } from "./KMSCards";
-import { AssistantMessageActions } from "./MessageActions";
+import { AssistantMessageActions, stripCitations } from "./MessageActions";
 
 // Re-export for backwards compat with tests
 export { parseCitationSegments as parseCitations };
+
+// ============================================================================
+// Canvas entry points (issue #509)
+// ============================================================================
+
+const CANVAS_NAME_MAX_CHARS = 60;
+
+/** Derives a short artifact name from a language/kind prefix and the first
+ * non-empty line of the content (capped at ~60 chars). */
+export function buildCanvasArtifactName(prefix: string | null, content: string): string {
+  const firstLine =
+    content
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) ?? "";
+  const suffix = firstLine.length > 40 ? `${firstLine.slice(0, 40)}…` : firstLine;
+  const name = prefix && suffix ? `${prefix}: ${suffix}` : prefix ?? suffix;
+  const trimmed = name.trim();
+  return trimmed === "" ? "Untitled canvas" : trimmed.slice(0, CANVAS_NAME_MAX_CHARS);
+}
+
+function toNumericId(value: string | undefined): number | null {
+  if (value == null || value.trim() === "") return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function toCanvasSourceRefs(sources: Source[] | undefined): SourceRef[] {
+  return (sources ?? []).map((source) => ({
+    source_id: source.id ?? null,
+    title: source.filename ?? null,
+  }));
+}
+
+interface CanvasEntryHandle {
+  openCode(code: string, language: string): void;
+  openDocument(): void;
+}
+
+/**
+ * Null-rendering bridge that owns the canvas capability query and the router
+ * navigation. Mounted by AssistantMessage ONLY when both the session id and
+ * message id are valid — messages rendered without a session id (tests,
+ * legacy renders) never mount it, so it adds no provider requirements for
+ * existing callers. The capability query fails closed: the parent renders the
+ * canvas buttons only once this bridge reports `enabled === true`.
+ */
+function CanvasEntryPoints({
+  sessionId,
+  messageId,
+  content,
+  sources,
+  entryRef,
+  onEnabledChange,
+}: {
+  sessionId: number;
+  messageId: number;
+  content: string;
+  sources: Source[] | undefined;
+  entryRef: RefObject<CanvasEntryHandle | null>;
+  onEnabledChange: (enabled: boolean) => void;
+}) {
+  const capabilitiesQuery = useCanvasCapabilities();
+  const navigate = useNavigate();
+  // Fail-closed: undefined while loading/error maps to false.
+  const enabled = capabilitiesQuery.data?.enabled === true;
+
+  useEffect(() => {
+    onEnabledChange(enabled);
+    return () => onEnabledChange(false);
+  }, [enabled, onEnabledChange]);
+
+  const openCanvas = useCallback(
+    async (payload: { kind: "code" | "document"; name: string; language: string | null; content: string }) => {
+      try {
+        const result = await createCanvasArtifact(sessionId, {
+          ...payload,
+          message_id: messageId,
+          source_refs: toCanvasSourceRefs(sources),
+        });
+        toast.success("Opened in canvas");
+        navigate(`/chat/${sessionId}/canvas/${result.artifact.artifact_uid}`);
+      } catch {
+        toast.error("Couldn't open canvas");
+      }
+    },
+    [sessionId, messageId, sources, navigate]
+  );
+
+  const contentRef = useRef(content);
+  contentRef.current = content;
+
+  useImperativeHandle(
+    entryRef,
+    () => ({
+      openCode: (code: string, language: string) => {
+        if (!enabled) return;
+        // Display name keeps the fence language; the stored `language` is the
+        // backend's extension key ("py", not "python" — contract delta #2).
+        void openCanvas({
+          kind: "code",
+          name: buildCanvasArtifactName(language || null, code),
+          language: mapFenceLanguageToExtension(language),
+          content: code,
+        });
+      },
+      openDocument: () => {
+        if (!enabled) return;
+        const clean = stripCitations(contentRef.current);
+        void openCanvas({
+          kind: "document",
+          name: buildCanvasArtifactName(null, clean),
+          language: "md",
+          content: clean,
+        });
+      },
+    }),
+    [enabled, openCanvas]
+  );
+
+  return null;
+}
 
 interface AssistantMessageProps {
   message: Message;
@@ -56,6 +187,25 @@ export function AssistantMessage({
     setActiveRightTab,
   } = useChatShellStore();
   const prefersReducedMotion = useReducedMotion();
+
+  // Canvas entry points (issue #509). The capability query and navigation
+  // live in the CanvasEntryPoints bridge, mounted only when both ids are
+  // valid; `canvasEnabled` stays false until that bridge reports the backend
+  // capability enabled (fail-closed while loading/error).
+  const sessionIdNum = toNumericId(sessionId);
+  const messageIdNum = toNumericId(message.id);
+  const canvasEntryRef = useRef<CanvasEntryHandle | null>(null);
+  const [canvasEnabled, setCanvasEnabled] = useState(false);
+  const handleCanvasEnabledChange = useCallback((enabled: boolean) => setCanvasEnabled(enabled), []);
+  const canvasIdsReady = sessionIdNum != null && messageIdNum != null;
+
+  const handleOpenCodeInCanvas = useCallback((code: string, language: string) => {
+    canvasEntryRef.current?.openCode(code, language);
+  }, []);
+
+  const handleOpenDocumentInCanvas = useCallback(() => {
+    canvasEntryRef.current?.openDocument();
+  }, []);
 
   // Derive cited sources, memories, wiki refs, and KMS refs for evidence cards
   const { citedSources, citedMemories, citedWikis, citedKms } = useMemo(
@@ -179,6 +329,18 @@ export function AssistantMessage({
           citationConfidence={message.citationConfidence}
           unverifiableClaims={message.unverifiableClaims}
           messageId={message.id}
+          canvas={
+            canvasEnabled && canvasIdsReady && sessionId != null
+              ? {
+                  sessionId,
+                  // message.id is a store string; canvasIdsReady guarantees
+                  // toNumericId(message.id) parsed to a positive integer, and
+                  // the bridge re-validates before any API call sends it.
+                  messageId: message.id,
+                  onOpen: handleOpenCodeInCanvas,
+                }
+              : undefined
+          }
         />
 
         {/* Wiki cards — compiled knowledge cited as [W#] */}
@@ -244,6 +406,22 @@ export function AssistantMessage({
             serverFeedback={messageFeedback}
             onFeedback={onFeedback}
             onCopy={onCopy}
+            onOpenDocumentInCanvas={
+              canvasEnabled && canvasIdsReady ? handleOpenDocumentInCanvas : undefined
+            }
+          />
+        )}
+
+        {/* Canvas entry-point bridge — owns the capability query and the
+            post-create navigation; renders nothing itself. */}
+        {canvasIdsReady && (
+          <CanvasEntryPoints
+            sessionId={sessionIdNum as number}
+            messageId={messageIdNum as number}
+            content={message.content}
+            sources={message.sources}
+            entryRef={canvasEntryRef}
+            onEnabledChange={handleCanvasEnabledChange}
           />
         )}
 

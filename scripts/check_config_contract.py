@@ -440,6 +440,43 @@ def main() -> int:
                 f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
             )
 
+    # Canvas (issue #509): the kill switch and the artifact size cap must carry
+    # the same default across backend/app/config.py, .env.example, and
+    # docker-compose.yml. Mirrors the draft_*_settings pattern above.
+    canvas_bool_settings = {
+        "CANVAS_ENABLED": "canvas_enabled",
+    }
+    canvas_int_settings = {
+        "CANVAS_MAX_ARTIFACT_KB": "canvas_max_artifact_kb",
+    }
+    for env_name, field_name, reader in (
+        *(
+            (env_name, field_name, backend_bool_default)
+            for env_name, field_name in canvas_bool_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_int_default)
+            for env_name, field_name in canvas_int_settings.items()
+        ),
+    ):
+        backend_val = reader(backend_config, field_name)
+        env_val = env_value(env_text, env_name)
+        compose_val = compose_default(compose_text, env_name)
+        if backend_val is None:
+            failures.append(
+                f"backend/app/config.py {field_name} default could not be parsed"
+            )
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match "
+                f"backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not "
+                f"match backend default {backend_val!r}"
+            )
+
     for message in failures:
         fail(message)
     if failures:
