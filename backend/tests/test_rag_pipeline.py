@@ -568,8 +568,11 @@ class TestRAGEnginePipeline(unittest.IsolatedAsyncioTestCase):
         async for msg in engine.query("test query", []):
             results.append(msg)
 
-        # Should have content and done messages (stage events may also be present)
-        non_stage_results = [r for r in results if r.get("type") not in ("stage",)]
+        # Should have content and done messages (stage and evidence-candidate
+        # events may also be present)
+        non_stage_results = [
+            r for r in results if r.get("type") not in ("stage", "evidence_candidates")
+        ]
         self.assertEqual(len(non_stage_results), 2)
 
         # Check that we got results

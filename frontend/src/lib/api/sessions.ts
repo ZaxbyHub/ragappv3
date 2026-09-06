@@ -72,6 +72,16 @@ export async function parseSSEStream(
             callbacks.onStage?.(parsed.stage);
             continue;
           }
+          // Versioned candidate evidence (issue #508): only version 1 is
+          // understood. Unknown versions, an absent version, or malformed
+          // candidates are ignored silently — old backends never emit this
+          // event and newer-shape mismatches must degrade without crashing.
+          if (parsed.type === 'evidence') {
+            if (parsed.version === 1 && Array.isArray(parsed.candidates)) {
+              callbacks.onEvidenceCandidates?.(parsed.candidates as Source[]);
+            }
+            continue;
+          }
           // Defense in depth: drop any reasoning/thinking event regardless of
           // whether it appears as ``type`` or as a content field.
           const eventType = typeof parsed.type === "string" ? parsed.type.toLowerCase() : "";

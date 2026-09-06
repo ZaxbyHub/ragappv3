@@ -80,6 +80,13 @@ vi.mock("@/stores/useChatStore", () => {
   });
   const useLastCompletedAssistantWikiRefsMock = vi.fn(() => undefined);
   const useLastCompletedAssistantKmsRefsMock = vi.fn(() => undefined);
+  const useStreamingCandidateSourcesMock = vi.fn(() => {
+    const state = chatStoreMock() ?? {};
+    const id = (state as { streamingMessageId?: string }).streamingMessageId;
+    if (!id) return undefined;
+    const messages = messagesFromMock();
+    return messages.find((m: any) => m?.id === id)?.candidateSources;
+  });
   return {
     useChatStore: chatStoreMock,
     useChatMessages: useChatMessagesMock,
@@ -89,6 +96,7 @@ vi.mock("@/stores/useChatStore", () => {
     useLastUserContent: useLastUserContentMock,
     useSourcesForSourceId: useSourcesForSourceIdMock,
     useCompletedAssistantMessageIdsKey: useCompletedAssistantMessageIdsKeyMock,
+    useStreamingCandidateSources: useStreamingCandidateSourcesMock,
     parseCompletedAssistantIds: (key: string) => {
       if (!key) return [];
       try { const p = JSON.parse(key); return Array.isArray(p) ? p.map(String) : []; } catch { return []; }
@@ -661,10 +669,10 @@ double closed
       });
     });
 
-    // BUG DISCOVERED: Component crashes when sources array contains null entries
-    // Error: TypeError: Cannot read properties of null (reading 'id')
-    // The component maps over sources without guarding against null/undefined entries
-    it("BUG: crashes with null entries in sources array - should guard against null sources", async () => {
+    // Regression guard: null entries in the sources array must not crash the
+    // component. React renders null-valued fields as empty; this test pins
+    // that behavior (it passes — the component tolerates null entries).
+    it("tolerates null entries in sources array without crashing", async () => {
       (useChatStore as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
         createMockMessages([
           { id: "msg-1", role: "user", content: "test" },
@@ -1030,10 +1038,11 @@ Normal text
       const jumpButton = screen.getByText("Jump to answer");
       fireEvent.click(jumpButton);
 
-      // Should dispatch custom event with correct detail
+      // Should dispatch custom event with correct detail (messageId is null
+      // for pane-list selections — legacy first-match fallback).
       expect(mockDispatchEvent).toHaveBeenCalledTimes(1);
       const call = mockDispatchEvent.mock.calls[0][0] as CustomEvent;
-      expect(call.detail).toEqual({ sourceId: "source-123" });
+      expect(call.detail).toEqual({ sourceId: "source-123", messageId: null });
     });
 
     it("should not dispatch event when no source selected", async () => {

@@ -1,0 +1,1 @@
+{"type": "evidence", "version": 1, "phase": "candidates", "candidates": [{"id": "42_default_0", "file_id": "42", "filename": "handbook.pdf", "section": "Maintenance", "source_label": "S1", "page_number": 3, "chunk_bbox": null, "snippet": "The coolant interval is 500 hours.", "score": 0.87, "metadata": {"page_number": 3}}]}

@@ -644,6 +644,11 @@ export interface ChatStreamCallbacks {
   onMode?: (mode: "instant" | "thinking") => void;
   /** Pipeline stage event (Searching / Reading / Drafting) before content streams. */
   onStage?: (stage: string) => void;
+  /**
+   * Retrieved-but-not-yet-cited evidence candidates from the versioned
+   * "evidence" SSE event (issue #508). Fires mid-stream, before content.
+   */
+  onEvidenceCandidates?: (candidates: Source[]) => void;
   onError?: (error: Error) => void;
   onComplete?: () => void;
 }

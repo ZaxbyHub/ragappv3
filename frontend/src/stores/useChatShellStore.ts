@@ -17,6 +17,10 @@ interface ChatShellState {
   pinnedSessionIds: number[];
   // Evidence pane state
   selectedEvidenceSource: Source | null;
+  /** Message the current evidence selection originated from (jump anchor). */
+  selectedEvidenceMessageId: string | null;
+  /** Message whose citation chip should regain focus when the pane closes. */
+  evidenceReturnFocusId: string | null;
   activeRightTab: RightPaneTab;
   toggleSessionRail: () => void;
   toggleRightPane: () => void;
@@ -34,6 +38,10 @@ interface ChatShellState {
   isSessionPinned: (sessionId: number) => boolean;
   // Evidence pane actions
   setSelectedEvidenceSource: (source: Source | null) => void;
+  setSelectedEvidenceMessageId: (id: string | null) => void;
+  setEvidenceReturnFocusId: (id: string | null) => void;
+  /** Clear the whole evidence selection (source, jump anchor, focus target). */
+  resetEvidenceSelection: () => void;
   setActiveRightTab: (tab: RightPaneTab) => void;
 }
 
@@ -89,6 +97,8 @@ export const useChatShellStore = create<ChatShellState>((set, get) => ({
   pinnedSessionIds: loadPinnedSessions(),
   // Evidence pane state
   selectedEvidenceSource: null,
+  selectedEvidenceMessageId: null,
+  evidenceReturnFocusId: null,
   activeRightTab: "evidence",
   toggleSessionRail: () => set((state) => ({ sessionRailOpen: !state.sessionRailOpen })),
   toggleRightPane: () => set((state) => ({ rightPaneOpen: !state.rightPaneOpen })),
@@ -117,5 +127,13 @@ export const useChatShellStore = create<ChatShellState>((set, get) => ({
   },
   // Evidence pane actions
   setSelectedEvidenceSource: (source) => set({ selectedEvidenceSource: source }),
+  setSelectedEvidenceMessageId: (id) => set({ selectedEvidenceMessageId: id }),
+  setEvidenceReturnFocusId: (id) => set({ evidenceReturnFocusId: id }),
+  resetEvidenceSelection: () =>
+    set({
+      selectedEvidenceSource: null,
+      selectedEvidenceMessageId: null,
+      evidenceReturnFocusId: null,
+    }),
   setActiveRightTab: (tab) => set({ activeRightTab: tab }),
 }));

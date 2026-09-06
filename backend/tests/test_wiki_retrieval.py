@@ -232,6 +232,12 @@ class TestWikiEvidenceToDict(unittest.TestCase):
         self.assertEqual(d["page_status"], "draft")
         self.assertEqual(d["claim_status"], "verified")
 
+    def test_to_dict_carries_excerpt(self):
+        ev = self._make_evidence(excerpt="Page summary body text.")
+        d = ev.to_dict()
+        self.assertIn("excerpt", d)
+        self.assertEqual(d["excerpt"], "Page summary body text.")
+
 
 class TestWikiRetrievalServiceNullVault(unittest.TestCase):
     def test_returns_empty_for_none_vault(self):
@@ -949,6 +955,96 @@ class TestWikiRetrievalEntityAndRelationPipeline(unittest.TestCase):
             11, claim_ids,
             "superseded claim must be filtered out of FTS claim search by status predicate",
         )
+
+
+class TestWikiEvidencePageExcerptSerialization(unittest.TestCase):
+    """Page-only wiki evidence (claim_id=None, claim_text=None) must carry the
+    page summary on the wire via to_dict()["excerpt"]; without it, page-only
+    evidence reaches the UI with no body text.
+    """
+
+    SUMMARY_TEXT = "The zlorpfield coolant interval is 500 hours under arctic conditions."
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from queue import Empty, Queue
+
+        from app.models.database import init_db, run_migrations
+
+        self._tmp = tempfile.mkdtemp()
+        db = str(Path(self._tmp) / "app.db")
+        init_db(db)
+        run_migrations(db)
+
+        class _Pool:
+            def __init__(self, path):
+                self._path = path
+                self._q = Queue(maxsize=5)
+
+            def get_connection(self):
+                try:
+                    return self._q.get_nowait()
+                except Empty:
+                    c = sqlite3.connect(self._path, check_same_thread=False)
+                    c.row_factory = sqlite3.Row
+                    return c
+
+            def release_connection(self, c):
+                try:
+                    self._q.put_nowait(c)
+                except Exception:
+                    c.close()
+
+            def close_all(self):
+                while True:
+                    try:
+                        self._q.get_nowait().close()
+                    except Empty:
+                        break
+
+        self._pool = _Pool(db)
+        # Positive threshold so the FTS page-search fallback (phase 4) runs
+        # deterministically with zero claim/entity candidates.
+        self.service = WikiRetrievalService(
+            pool=self._pool, fts_page_search_max_candidates=5
+        )
+
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute("INSERT OR REPLACE INTO vaults (id, name) VALUES (1, 'V1')")
+            # Page with a distinctive summary and NO backing claims — the
+            # page-only FTS fallback is the only path that can surface it.
+            conn.execute(
+                "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, markdown, "
+                "summary, status, confidence) VALUES "
+                "(1, 1, 'coolant', 'Coolant Runbook', 'overview', '# Coolant', "
+                "?, 'verified', 0.9)",
+                (self.SUMMARY_TEXT,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        import shutil
+        self._pool.close_all()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_page_fts_evidence_serializes_summary_as_excerpt(self):
+        results = self.service.retrieve("zlorpfield coolant", vault_id=1)
+        self.assertTrue(
+            results, "expected an FTS page match for 'zlorpfield coolant'"
+        )
+        page_ev = next(
+            (r for r in results if r.score_type == "page_fts"), None
+        )
+        self.assertIsNotNone(page_ev, "page-only FTS evidence must be returned")
+        self.assertIsNone(page_ev.claim_id)
+        self.assertIsNone(page_ev.claim_text)
+        d = page_ev.to_dict()
+        self.assertIn("excerpt", d)
+        self.assertEqual(d["excerpt"], self.SUMMARY_TEXT)
 
 
 if __name__ == "__main__":

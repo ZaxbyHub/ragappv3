@@ -317,6 +317,14 @@ export function useSendMessage(
           onStage: (stage) => {
             setCurrentStage(stage);
           },
+          onEvidenceCandidates: (candidates) => {
+            // Late candidates from a cancelled send must never attach to a
+            // newer message: only the message this stream is actively
+            // streaming may receive them.
+            if (sendGenRef.current !== gen) return;
+            if (useChatStore.getState().streamingMessageId !== assistantMessageId) return;
+            updateMessage(assistantMessageId, { candidateSources: candidates });
+          },
           onFinalContent: (content) => {
             // Backend stripped invalid citations: adopt the cleaned content so
             // the hallucinated [S#] chip is removed from the rendered message
@@ -360,6 +368,7 @@ export function useSendMessage(
             if (isAbort) {
               // User-cancelled turn: mark stopped, never silently retried,
               // and not persisted (the partial answer stays visible locally).
+              updateMessage(assistantMessageId, { candidateSources: undefined });
               setIsStreaming(false);
               setAbortFn(null);
               setStreamingMessageId(null);
@@ -373,6 +382,7 @@ export function useSendMessage(
               updateMessage(assistantMessageId, {
                 status: "interrupted",
                 error: "Response interrupted. You can retry.",
+                candidateSources: undefined,
               });
               setCurrentStage(null);
               setIsStreaming(false);
@@ -395,7 +405,11 @@ export function useSendMessage(
             // pre-content failures unpersisted (LIVE-01), while a partial
             // answer lands durably with status "failed" instead of vanishing
             // on reload.
-            updateMessage(assistantMessageId, { status: "failed", error: friendlyMessage });
+            updateMessage(assistantMessageId, {
+              status: "failed",
+              error: friendlyMessage,
+              candidateSources: undefined,
+            });
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
@@ -412,6 +426,9 @@ export function useSendMessage(
             if (assistantMessageIdRef.current !== null) {
               updateMessage(assistantMessageId, { content: streamedContent });
             }
+            // The done event delivered the final sources — the streaming-only
+            // candidate preview is obsolete.
+            updateMessage(assistantMessageId, { candidateSources: undefined });
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
@@ -431,6 +448,8 @@ export function useSendMessage(
       // button OR a session switch routed through the store (loadChat/newChat) —
       // also clears the hook-local in-flight guard. Without this, aborting via
       // navigation would leave sendingRef stuck true and block the next send.
+      // Stop-path candidate clearing lives in stopStreaming, which owns the
+      // message write in that flow.
       setAbortFn(() => {
         abort();
         sendingRef.current = false;

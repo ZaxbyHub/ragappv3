@@ -22,6 +22,8 @@ Object.assign(navigator, {
 
 const mockOpenRightPane = vi.fn();
 const mockSetSelectedEvidenceSource = vi.fn();
+const mockSetSelectedEvidenceMessageId = vi.fn();
+const mockSetEvidenceReturnFocusId = vi.fn();
 const mockSetActiveRightTab = vi.fn();
 
 // Setup default mock return values
@@ -30,6 +32,8 @@ beforeEach(() => {
   (useChatShellStore as unknown as vi.Mock).mockReturnValue({
     openRightPane: mockOpenRightPane,
     setSelectedEvidenceSource: mockSetSelectedEvidenceSource,
+    setSelectedEvidenceMessageId: mockSetSelectedEvidenceMessageId,
+    setEvidenceReturnFocusId: mockSetEvidenceReturnFocusId,
     setActiveRightTab: mockSetActiveRightTab,
   });
 });
@@ -376,6 +380,22 @@ describe("AssistantMessage - Citations and Sources", () => {
     expect(mockSetSelectedEvidenceSource).toHaveBeenCalledWith(sources[0]);
     expect(mockSetActiveRightTab).toHaveBeenCalledWith("evidence");
     expect(mockOpenRightPane).toHaveBeenCalled();
+  });
+
+  it("records the clicked message as the evidence selection anchor and focus target", () => {
+    const sources = [createSource({ id: "src-1", filename: "doc.pdf" })];
+    const message = createMessage({
+      id: "anchor-msg",
+      content: "See [Source: doc.pdf] for more.",
+      sources,
+    });
+    render(<AssistantMessage message={message} />);
+
+    const citationChips = screen.getAllByLabelText("Source S1: doc.pdf");
+    fireEvent.click(citationChips[0]);
+
+    expect(mockSetSelectedEvidenceMessageId).toHaveBeenCalledWith("anchor-msg");
+    expect(mockSetEvidenceReturnFocusId).toHaveBeenCalledWith("anchor-msg");
   });
 
   it("should render evidence strip with sources", () => {

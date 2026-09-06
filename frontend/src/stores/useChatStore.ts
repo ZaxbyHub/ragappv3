@@ -7,6 +7,12 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   sources?: Source[];
+  /**
+   * Retrieved-but-not-yet-cited evidence candidates delivered mid-stream by
+   * the versioned evidence SSE event (issue #508). Present only while the
+   * message is streaming — cleared at done/stop/error.
+   */
+  candidateSources?: Source[];
   /** Memories the assistant used while generating this message (structured, with [M#] labels). */
   memoriesUsed?: UsedMemory[];
   /** Wiki evidence cited as [W#] in this assistant message. */
@@ -221,7 +227,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (lastMsg && lastMsg.role === "assistant") {
         updates.messagesById = {
           ...messagesById,
-          [targetId]: { ...lastMsg, stopped: true },
+          [targetId]: { ...lastMsg, stopped: true, candidateSources: undefined },
         };
       }
     }
@@ -310,6 +316,19 @@ export const useLastCompletedAssistantSources = (): Source[] | undefined =>
       return undefined;
     })
   );
+
+/**
+ * Candidate evidence of the currently-streaming assistant message (issue #508).
+ * Returns undefined when nothing is streaming or the stream has not delivered
+ * candidates yet. The array reference is stable between token chunks, so the
+ * RightPane only re-renders when the candidate set actually changes.
+ */
+export const useStreamingCandidateSources = (): Source[] | undefined =>
+  useChatStore((s) => {
+    const id = s.streamingMessageId;
+    if (!id) return undefined;
+    return s.messagesById[id]?.candidateSources;
+  });
 
 /**
  * Selector returning the wiki refs of the most recent *completed* assistant

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Library, ChevronDown, ChevronUp, ExternalLink } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { appPath } from "@/lib/paths";
 import type { KMSReference } from "@/lib/api";
 
 interface KMSCardProps {
@@ -15,7 +16,7 @@ function KMSCard({ kmsRef }: KMSCardProps) {
   const statusLabel = kmsRef.status ?? "";
 
   const handleNavigate = () => {
-    window.open(`/kms/${kmsRef.entry_id}`, "_blank", "noopener,noreferrer");
+    window.open(appPath(`/kms/${kmsRef.entry_id}`), "_blank", "noopener,noreferrer");
   };
 
   return (

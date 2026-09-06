@@ -358,11 +358,23 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
   // Single evidence:jump-to-answer listener
   useEffect(() => {
     const handler = (e: Event) => {
-      const { sourceId } = (e as CustomEvent<{ sourceId: string }>).detail;
+      const { sourceId, messageId } = (
+        e as CustomEvent<{ sourceId: string; messageId?: string | null }>
+      ).detail;
       const { messageIds: ids, messagesById } = useChatStore.getState();
-      const idx = ids.findIndex((id) => messagesById[id]?.sources?.some((s) => s.id === sourceId));
-      if (idx >= 0) {
-        const msgId = ids[idx];
+      const citesSource = (id: string) =>
+        messagesById[id]?.sources?.some((s) => s.id === sourceId) ?? false;
+      // Prefer the message the evidence selection came from when it still
+      // exists and actually cites the source; otherwise fall back to the
+      // first message citing it (persisted/forked selections have no anchor).
+      let msgId: string | null = null;
+      if (messageId && messagesById[messageId] && citesSource(messageId)) {
+        msgId = messageId;
+      } else {
+        const idx = ids.findIndex((id) => citesSource(id));
+        if (idx >= 0) msgId = ids[idx];
+      }
+      if (msgId) {
         const el = scrollRef.current?.querySelector(`[data-message-id="${msgId}"]`);
         el?.scrollIntoView({ behavior: "smooth", block: "center" });
         setHighlightedMessageId(msgId);
