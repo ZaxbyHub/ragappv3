@@ -667,7 +667,9 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
           unmount = result.unmount;
         });
       }
-    });
+      // Stress tests render the full DocumentsPage dozens of times; the 5s
+      // default testTimeout is not enough on loaded CI workers.
+    }, 30000);
 
     it("should handle rapid document removals", async () => {
       const { listDocuments } = await import("@/lib/api");
@@ -707,7 +709,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
           result!.rerender(<DocumentsPage />);
         });
       }
-    });
+    }, 30000);
 
     it("should handle document array replaced entirely", async () => {
       const { listDocuments } = await import("@/lib/api");
@@ -729,7 +731,7 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
       await act(async () => {
         render(<DocumentsPage />);
       });
-    });
+    }, 30000);
   });
 
   // ===========================================================================
