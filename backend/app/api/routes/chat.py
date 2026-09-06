@@ -151,10 +151,14 @@ class AddMessageRequest(BaseModel):
     # Durable turn lifecycle (issue #507). turn_id links a turn's user+assistant
     # rows; status records the assistant terminal state; the two assessment
     # fields round-trip DEEP-D-01 evidence alongside the saved answer.
-    turn_id: Optional[str] = None
+    # New in PR feedback: client-supplied strings/lists are size-bounded so a
+    # single message cannot carry an unbounded payload (content/citation_confidence
+    # follow the pre-existing unbounded sources/memories pattern and are not
+    # tightened here to avoid breaking existing payloads).
+    turn_id: Optional[str] = Field(default=None, max_length=64)
     status: Optional[Literal["complete", "partial", "interrupted", "failed"]] = None
     citation_confidence: Optional[Dict[str, Any]] = None
-    unverifiable_claims: Optional[List[str]] = None
+    unverifiable_claims: Optional[List[str]] = Field(default=None, max_length=50)
 
 
 class BatchAddMessagesRequest(BaseModel):
@@ -171,11 +175,19 @@ class BatchAddMessagesRequest(BaseModel):
 class TruncateSessionRequest(BaseModel):
     """Request model for the retry/edit revision operation (CHAT-006).
 
-    Deletes every message with ``seq > keep_count`` so the persisted history
+    Deletes every message with ``seq > boundary`` so the persisted history
     matches the locally-trimmed transcript before a retry/edit resend.
+
+    The boundary is supplied as ``keep_seq`` — the highest durable ``seq``
+    among the rows the client wants to KEEP (PRR-020). Anchoring on the
+    server-issued seq (instead of a client-local array index) keeps the
+    boundary correct whenever local rows were never persisted (Stop,
+    empty response, failed save). ``keep_count`` (positional count) is
+    still accepted for compatibility; exactly one of the two is required.
     """
 
-    keep_count: int = Field(ge=0)
+    keep_count: Optional[int] = Field(default=None, ge=0)
+    keep_seq: Optional[int] = Field(default=None, ge=0)
 
 
 def _safe_json_loads(raw: Optional[str]) -> Any:
@@ -2107,14 +2119,22 @@ async def truncate_session_messages(
     _csrf_token: str = Depends(csrf_protect),
 ):
     """
-    Persistently trim a session's history after ``keep_count`` messages
+    Persistently trim a session's history after ``boundary`` messages
     (issue #507 / CHAT-006 retry/edit revisions).
 
-    Deletes every message with ``seq > keep_count`` in one transaction so the
+    Deletes every message with ``seq > boundary`` in one transaction so the
     server-side history matches the locally-trimmed transcript before a
-    retry/edit resend. ``keep_count`` >= the current max seq is a no-op success;
-    ``keep_count = 0`` clears all messages.
+    retry/edit resend. ``keep_seq`` (the highest durable seq among the rows
+    the client keeps, PRR-020) is preferred over the legacy positional
+    ``keep_count``: a local array index diverges from server seq whenever a
+    turn exists locally but was never persisted. ``boundary`` >= the current
+    max seq is a no-op success; ``boundary = 0`` clears all messages.
     """
+    if body.keep_seq is None and body.keep_count is None:
+        raise HTTPException(
+            status_code=422, detail="Truncate requires keep_seq or keep_count"
+        )
+    boundary = body.keep_seq if body.keep_seq is not None else body.keep_count
     session_query = "SELECT id, vault_id FROM chat_sessions WHERE id = ?"
     session_result = await asyncio.to_thread(conn.execute, session_query, (session_id,))
     session_row = await asyncio.to_thread(session_result.fetchone)
@@ -2132,7 +2152,7 @@ async def truncate_session_messages(
         delete_result = await asyncio.to_thread(
             conn.execute,
             "DELETE FROM chat_messages WHERE session_id = ? AND seq > ?",
-            (session_id, body.keep_count),
+            (session_id, boundary),
         )
         deleted = await asyncio.to_thread(lambda: delete_result.rowcount)
         tail_result = await asyncio.to_thread(

@@ -35,6 +35,7 @@ const mockChatState = vi.hoisted(() => ({
   expandedSources: new Set<string>(),
   activeChatId: null as string | null,
   abortFn: null,
+  pendingTurnPersist: null as Promise<void> | null,
   setInput: vi.fn(),
   setIsStreaming: vi.fn(),
   setAbortFn: vi.fn(),
@@ -197,6 +198,8 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     mockChatState.streamingMessageId = null;
     mockChatState.inputError = null;
     mockChatState.activeChatId = null;
+    // PRR-003: no in-flight durable turn save unless a test installs one.
+    mockChatState.pendingTurnPersist = null;
     mockChatState.setInput = vi.fn();
     mockChatState.setIsStreaming = vi.fn();
     mockChatState.setAbortFn = vi.fn();
@@ -238,11 +241,13 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
   it("retry truncates the persisted history at the LAST user message before trimming the store, then sends directly", async () => {
     mockChatState.activeChatId = "77";
+    // Durable seq on every row: the truncate anchor is the max seq among the
+    // KEPT rows (m1/m2 → seq 2), not a positional count (PRR-020).
     setMockMessages([
-      { id: "m1", role: "user", content: "first question" },
-      { id: "m2", role: "assistant", content: "first answer" },
-      { id: "m3", role: "user", content: "second question" },
-      { id: "m4", role: "assistant", content: "second answer" },
+      { id: "m1", role: "user", content: "first question", seq: 1 },
+      { id: "m2", role: "assistant", content: "first answer", seq: 2 },
+      { id: "m3", role: "user", content: "second question", seq: 3 },
+      { id: "m4", role: "assistant", content: "second answer", seq: 4 },
     ]);
 
     // Hold the truncate pending so the ordering is observable.
@@ -256,7 +261,8 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
     await userEvent.click(screen.getByLabelText("Retry m4"));
 
-    // Server-side trim FIRST, with keepCount = index of the last user message.
+    // Server-side trim FIRST, anchored at the highest durable seq among the
+    // kept rows (m1 seq 1, m2 seq 2 → keepSeq 2).
     expect(truncateChatSession).toHaveBeenCalledTimes(1);
     expect(truncateChatSession).toHaveBeenCalledWith(77, 2);
 
@@ -280,13 +286,78 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
     ]);
   });
 
+  it("retry anchors the truncate at durable seq, not the positional index, when earlier turns were never persisted (PRR-020)", async () => {
+    // Turn 1 exists only locally (no seq — Stop/empty/failed save), turn 2 is
+    // persisted with seq 1/2. The last user message is m3 (positional index 2),
+    // but the kept rows (m1/m2) have NO durable seq — the server anchor must be
+    // 0 (keep nothing durable), never the stale positional 2.
+    mockChatState.activeChatId = "77";
+    setMockMessages([
+      { id: "m1", role: "user", content: "first question" },
+      { id: "m2", role: "assistant", content: "first answer" },
+      { id: "m3", role: "user", content: "second question", seq: 1 },
+      { id: "m4", role: "assistant", content: "second answer", seq: 2 },
+    ]);
+
+    let resolveTruncate!: (value: Awaited<ReturnType<typeof truncateChatSession>>) => void;
+    const truncatePromise = new Promise<Awaited<ReturnType<typeof truncateChatSession>>>((resolve) => {
+      resolveTruncate = resolve;
+    });
+    vi.mocked(truncateChatSession).mockReturnValue(truncatePromise);
+
+    render(<TranscriptPane />);
+
+    await userEvent.click(screen.getByLabelText("Retry m4"));
+
+    expect(truncateChatSession).toHaveBeenCalledTimes(1);
+    // The anchor is the max durable seq among the KEPT rows (m1/m2 have none)
+    // → 0. A positional keep_count of 2 would keep turn 2's rows server-side
+    // and duplicate the Q&A pair after the retry lands.
+    expect(truncateChatSession).toHaveBeenCalledWith(77, 0);
+    expect(truncateChatSession).not.toHaveBeenCalledWith(77, 2);
+
+    resolveTruncate({ remaining_count: 0, tail_seq: null });
+    await waitFor(() => expect(mockSendDirect).toHaveBeenCalledTimes(1));
+    expect(mockSendDirect.mock.calls[0][0]).toBe("second question");
+  });
+
+  it("retry waits for the in-flight durable turn save before truncating (PRR-003)", async () => {
+    mockChatState.activeChatId = "77";
+    setMockMessages([
+      { id: "m1", role: "user", content: "first question", seq: 1 },
+      { id: "m2", role: "assistant", content: "first answer", seq: 2 },
+      { id: "m3", role: "user", content: "second question", seq: 3 },
+      { id: "m4", role: "assistant", content: "second answer", seq: 4 },
+    ]);
+
+    // Manually-controlled in-flight save: a just-interrupted turn's background
+    // batch persist that has not settled yet.
+    let resolvePersist!: () => void;
+    mockChatState.pendingTurnPersist = new Promise<void>((resolve) => {
+      resolvePersist = resolve;
+    });
+    vi.mocked(truncateChatSession).mockResolvedValue({ remaining_count: 2, tail_seq: 2 });
+
+    render(<TranscriptPane />);
+
+    await userEvent.click(screen.getByLabelText("Retry m4"));
+
+    // The truncate must NOT race the pending save — it has not fired yet.
+    expect(truncateChatSession).not.toHaveBeenCalled();
+    expect(mockChatState.removeMessagesFrom).not.toHaveBeenCalled();
+
+    resolvePersist();
+    await waitFor(() => expect(truncateChatSession).toHaveBeenCalledTimes(1));
+    expect(truncateChatSession).toHaveBeenCalledWith(77, 2);
+  });
+
   it("edit truncates the persisted history at the edited message's own index before trimming the store", async () => {
     mockChatState.activeChatId = "77";
     const mockSetInput = vi.fn();
     mockChatState.setInput = mockSetInput;
     setMockMessages([
-      { id: "m1", role: "user", content: "first question" },
-      { id: "m2", role: "assistant", content: "first answer" },
+      { id: "m1", role: "user", content: "first question", seq: 1 },
+      { id: "m2", role: "assistant", content: "first answer", seq: 2 },
     ]);
 
     let resolveTruncate!: (value: Awaited<ReturnType<typeof truncateChatSession>>) => void;
@@ -299,7 +370,8 @@ describe("TranscriptPane revision flows (persisted session, issue #507)", () => 
 
     await userEvent.click(screen.getByLabelText("Edit m1"));
 
-    // keepCount is the edited message's own index (0), not the last user index.
+    // Nothing is kept before the edited message → keepSeq 0 (no durable seq
+    // among zero kept rows), NOT the stale positional index math (PRR-020).
     expect(truncateChatSession).toHaveBeenCalledTimes(1);
     expect(truncateChatSession).toHaveBeenCalledWith(77, 0);
 
@@ -412,6 +484,7 @@ describe("TranscriptPane persisted terminal status banner (issue #507)", () => {
     mockChatState.streamingMessageId = null;
     mockChatState.inputError = null;
     mockChatState.activeChatId = null;
+    mockChatState.pendingTurnPersist = null;
     mockChatState.removeMessagesFrom = vi.fn();
     mockChatState.loadChat = vi.fn();
     (useChatStore as unknown as { getState: () => typeof mockChatState }).getState = () => mockChatState;
@@ -449,6 +522,20 @@ describe("TranscriptPane persisted terminal status banner (issue #507)", () => {
 
     expect(screen.getByText("Response is incomplete — you can retry.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it("renders the failed banner (PRR-001: a durably failed turn never looks like success after reload)", () => {
+    setMockMessages([
+      { id: "m1", role: "user", content: "question" },
+      { id: "m2", role: "assistant", content: "half an answer", status: "failed" },
+    ]);
+
+    render(<TranscriptPane />);
+
+    expect(screen.getByText("Response failed — you can retry.")).toBeInTheDocument();
+    const banner = document.querySelector('[data-interrupted-status="failed"]');
+    expect(banner).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
   });
 
   it("does not render the banner while a stream is active", () => {

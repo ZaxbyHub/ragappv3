@@ -25,6 +25,8 @@ export interface Message {
   status?: "complete" | "partial" | "interrupted" | "failed";
   /** Durable save acknowledgment, separate from answer completion (UI-002). */
   saveState?: "saving" | "saved" | "failed";
+  /** Per-session durable order (issue #507), as returned by the backend. */
+  seq?: number | null;
   stopped?: boolean;
   error?: string;
   created_at?: string;
@@ -43,6 +45,13 @@ export interface ChatState {
   inputError: string | null;
   expandedSources: Set<string>;
   activeChatId: string | null;
+  /**
+   * In-flight durable turn save (issue #507 / PRR-003). Revision operations
+   * (retry/edit truncate, fork) must await this before issuing server-side
+   * history changes so a just-interrupted turn's background batch save can
+   * never land AFTER a truncate and resurrect deleted rows.
+   */
+  pendingTurnPersist: Promise<void> | null;
 
   // Actions
   addMessage: (message: Message) => void;
@@ -65,6 +74,7 @@ export interface ChatState {
   setStreamingMessageId: (id: string | null) => void;
   setAbortFn: (abortFn: (() => void) | null) => void;
   setInputError: (error: string | null) => void;
+  setPendingTurnPersist: (p: Promise<void> | null) => void;
   toggleSource: (sourceId: string) => void;
   clearExpandedSources: () => void;
   stopStreaming: () => void;
@@ -85,6 +95,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   inputError: null,
   expandedSources: new Set(),
   activeChatId: null,
+  pendingTurnPersist: null,
 
   addMessage: (message) => {
     set((state) => ({
@@ -172,6 +183,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setStreamingMessageId: (streamingMessageId) => set({ streamingMessageId }),
   setAbortFn: (abortFn) => set({ abortFn }),
   setInputError: (inputError) => set({ inputError }),
+  setPendingTurnPersist: (p) => set({ pendingTurnPersist: p }),
 
   toggleSource: (sourceId) => {
     set((state) => {

@@ -74,19 +74,33 @@ describe("mapSessionMessage (issue #507)", () => {
       unverifiableClaims: ["claim A", "claim B"],
       turnId: "turn-abc-123",
       status: "complete",
+      seq: 4,
       created_at: "2026-05-12T00:00:00Z",
       feedback: "up",
     });
+    // The durable per-session order rides along on the store Message (issue
+    // #507 / PRR-020 — revision anchors are computed from it).
+    expect(mapped.seq).toBe(4);
   });
 
   it("normalizes status null → \"complete\" (legacy rows)", () => {
-    const legacy = mapSessionMessage({ ...fullRow, status: null });
+    const legacy = mapSessionMessage({ ...fullRow, status: null, seq: null });
     expect(legacy.status).toBe("complete");
+    // Legacy rows with an explicit NULL seq map to seq null (no durable order).
+    expect(legacy.seq).toBeNull();
 
     // A missing status key (older payloads) defaults the same way.
     const omitted = { ...fullRow } as Partial<ChatSessionMessage>;
     delete omitted.status;
     expect(mapSessionMessage(omitted as ChatSessionMessage).status).toBe("complete");
+  });
+
+  it("maps a row MISSING the seq key to seq null (not undefined)", () => {
+    const noSeqKey = { ...fullRow } as Partial<ChatSessionMessage>;
+    delete noSeqKey.seq;
+    const mapped = mapSessionMessage(noSeqKey as ChatSessionMessage);
+    expect(mapped.seq).toBeNull();
+    expect("seq" in mapped).toBe(true);
   });
 
   it("preserves \"interrupted\" when set", () => {
@@ -107,6 +121,7 @@ describe("mapSessionMessage (issue #507)", () => {
       citation_confidence: null,
       unverifiable_claims: null,
       feedback: null,
+      seq: null,
     };
     const mapped = mapSessionMessage(legacyRow);
     expect(mapped.sources).toBeUndefined();
@@ -118,5 +133,6 @@ describe("mapSessionMessage (issue #507)", () => {
     expect(mapped.citationConfidence).toBeUndefined();
     expect(mapped.unverifiableClaims).toBeUndefined();
     expect(mapped.feedback).toBeNull();
+    expect(mapped.seq).toBeNull();
   });
 });

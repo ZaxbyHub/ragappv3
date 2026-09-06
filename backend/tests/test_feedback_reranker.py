@@ -88,6 +88,14 @@ class _SharedDB:
             os.environ.get("TEMP", "/tmp"),
             f"test_fb_reranker_{os.getpid()}_{self._id}.db",
         )
+        # PRR-017: a crashed earlier run can leave a stale file at the same
+        # pid_id path (PIDs recycle); remove it so this instance opens fresh
+        # instead of colliding with leftover rows (UNIQUE constraint).
+        if os.path.exists(self._path):
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
         self._conn = sqlite3.connect(self._path, isolation_level=None)
         self._conn.execute("PRAGMA foreign_keys = ON")
         _make_schema(self._conn)
@@ -115,7 +123,10 @@ class _SharedDB:
         self._conn.close()
         try:
             os.unlink(self._path)
-        except Exception:
+        except OSError:
+            # Windows can hold the file handle briefly after close(); the
+            # pre-existence unlink in __init__ cleans any leftover up on the
+            # next run, so a failed unlink here is not an error worth raising.
             pass
 
 

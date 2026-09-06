@@ -244,6 +244,15 @@ class TestSSEHeartbeat(unittest.TestCase):
         )
         self.assertTrue(heartbeat_found, "No ': heartbeat\\n\\n' comment found in SSE output")
 
+        # PRR-006: the heartbeat alone is not the contract — the stalled
+        # generation must still COMPLETE. Assert the content and the terminal
+        # done event arrived after the simulated stall, so a regression that
+        # cancels the pending task after the first heartbeat fails here.
+        content_found = any(isinstance(r, str) and 'late' in r for r in results)
+        done_found = any(isinstance(r, str) and '"done"' in r for r in results)
+        self.assertTrue(content_found, "Content chunk missing after simulated stall")
+        self.assertTrue(done_found, "Terminal done event missing after simulated stall")
+
 
 class TestAuthSessionIpUsesRequestHelper(unittest.TestCase):
     """Fix 4: auth.py session ip_address uses _request_ip, not raw request.client.host."""

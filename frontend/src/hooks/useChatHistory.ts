@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { listChatSessions, getChatSession, type ChatSession } from "@/lib/api";
+import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { useChatStore, type Message } from "@/stores/useChatStore";
 
 interface CacheEntry {
@@ -58,15 +59,10 @@ export function useChatHistory(activeVaultId: number | null): UseChatHistoryRetu
     if (isStreaming) return;
     try {
       const detail = await getChatSession(session.id);
-      const loadedMessages: Message[] = detail.messages.map((m) => ({
-        id: m.id.toString(),
-        role: m.role as "user" | "assistant",
-        content: m.content,
-        sources: m.sources ?? undefined,
-        memoriesUsed: m.memories ?? undefined,
-        created_at: m.created_at,
-        feedback: m.feedback ?? null,
-      }));
+      // Canonical mapper (PRR-019): the previous inline hand-mapping dropped
+      // every issue-#507 field (kmsRefs/mode/turnId/status/assessment), so any
+      // future consumer of this hook would silently lose them on replay.
+      const loadedMessages: Message[] = (detail.messages ?? []).map(mapSessionMessage);
       useChatStore.getState().loadChat(session.id.toString(), loadedMessages);
     } catch (err) {
       console.error("Failed to load chat session:", err);

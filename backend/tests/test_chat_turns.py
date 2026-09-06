@@ -385,6 +385,183 @@ def test_truncate_rejects_negative_keep_count():
         chat_routes.TruncateSessionRequest(keep_count=-1)
 
 
+def test_batch_rejects_empty_messages_list():
+    """PRR-014: min_length=1 on BatchAddMessagesRequest must reject an empty batch."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        chat_routes.BatchAddMessagesRequest(messages=[])
+
+
+@pytest.mark.asyncio
+async def test_truncate_requires_a_boundary(tmp_path):
+    """PRR-020: with keep_seq now optional, the handler must 422 when the
+    client supplies neither keep_seq nor keep_count."""
+    db_path = tmp_path / "turns-boundary.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        conn.commit()
+        with pytest.raises(chat_routes.HTTPException) as exc_info:
+            await chat_routes.truncate_session_messages(
+                _mock_request(),
+                session_id,
+                chat_routes.TruncateSessionRequest(),
+                conn,
+                {"id": 1},
+                evaluate=_allow,
+                _csrf_token="t",
+            )
+        assert exc_info.value.status_code == 422
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_truncate_keep_seq_anchors_at_durable_seq(tmp_path):
+    """PRR-020: keep_seq anchors the DELETE at the highest durable seq the
+    client keeps. This server-side test covers the boundary mechanics (0
+    clears the session; a mid-history anchor trims exactly the tail above it
+    and new saves continue from the anchor); the scenario where the anchor
+    genuinely diverges from a positional count (locally-unpersisted rows) is
+    falsified end-to-end by TranscriptPane.revision.test.tsx's divergence
+    test, which asserts the stale positional value is NOT sent."""
+    db_path = tmp_path / "turns-keepseq.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        conn.commit()
+        for turn in ("t1", "t2"):
+            await chat_routes.add_messages_batch(
+                _mock_request(),
+                session_id,
+                chat_routes.BatchAddMessagesRequest(
+                    messages=[
+                        _msg("user", f"q-{turn}", turn_id=turn),
+                        _msg("assistant", f"a-{turn}", turn_id=turn, status="complete"),
+                    ]
+                ),
+                conn,
+                {"id": 1},
+                evaluate=_allow,
+                rag_engine=None,
+                _csrf_token="t",
+            )
+
+        # Local store simulates the divergence: rows 1-2 (turn t1) were never
+        # persisted locally-visible... the client keeps only unpersisted rows,
+        # so its durable anchor is 0 — every persisted row must go.
+        cleared = await chat_routes.truncate_session_messages(
+            _mock_request(),
+            session_id,
+            chat_routes.TruncateSessionRequest(keep_seq=0),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            _csrf_token="t",
+        )
+        assert cleared["remaining_count"] == 0
+        assert cleared["tail_seq"] in (0, None)
+
+        # And anchoring mid-history trims only the tail above the anchor.
+        await chat_routes.add_messages_batch(
+            _mock_request(),
+            session_id,
+            chat_routes.BatchAddMessagesRequest(
+                messages=[
+                    _msg("user", "q-a", turn_id="ta"),
+                    _msg("assistant", "a-a", turn_id="ta", status="complete"),
+                    _msg("user", "q-b", turn_id="tb"),
+                    _msg("assistant", "a-b", turn_id="tb", status="complete"),
+                ]
+            ),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            rag_engine=None,
+            _csrf_token="t",
+        )
+        trimmed = await chat_routes.truncate_session_messages(
+            _mock_request(),
+            session_id,
+            chat_routes.TruncateSessionRequest(keep_seq=2),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            _csrf_token="t",
+        )
+        assert trimmed["remaining_count"] == 2
+        assert trimmed["tail_seq"] == 2
+
+        detail = await chat_routes.get_session(session_id, conn, {"id": 1}, evaluate=_allow)
+        assert [m["content"] for m in detail["messages"]] == ["q-a", "a-a"]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_fork_positional_turn_copy_survives_noncontiguous_seq(tmp_path):
+    """PRR-015: fork copies turn fields by positionally matching two SELECTs
+    both ordered (seq ASC, id ASC). Stress the positional invariant with
+    non-contiguous seq values — the aligned case trivially agrees."""
+    db_path = tmp_path / "turns-fork-gap.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        await chat_routes.add_messages_batch(
+            _mock_request(),
+            session_id,
+            chat_routes.BatchAddMessagesRequest(
+                messages=[
+                    _msg("user", "Question", turn_id="turn-9"),
+                    _msg(
+                        "assistant",
+                        "Answer [K1]",
+                        turn_id="turn-9",
+                        status="interrupted",
+                        citation_confidence={"[1]": 0.5},
+                        unverifiable_claims=["claim"],
+                    ),
+                ]
+            ),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            rag_engine=None,
+            _csrf_token="t",
+        )
+        # Diverge seq from the trivial 1..n layout (post-truncate gap style).
+        conn.execute("UPDATE chat_messages SET seq = 7 WHERE content = 'Question'")
+        conn.execute("UPDATE chat_messages SET seq = 42 WHERE content = 'Answer [K1]'")
+        conn.commit()
+
+        response = await chat_routes.fork_session(
+            _mock_request(),
+            session_id,
+            chat_routes.ForkSessionRequest(message_index=1),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+        )
+        forked = response["messages"]
+        # Fork renumbers to 1..n regardless of the source layout.
+        assert [m["seq"] for m in forked] == [1, 2]
+        # Positional matching still pairs each row with its own turn fields.
+        assert forked[0]["turn_id"] == "turn-9"
+        assert forked[1]["turn_id"] == "turn-9"
+        assert forked[1]["status"] == "interrupted"
+        assert forked[1]["citation_confidence"] == {"[1]": 0.5}
+        assert forked[1]["unverifiable_claims"] == ["claim"]
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Fork: turn fields preserved, seq renumbered (UI-039 / DEEP-D-01 / fork alignment)
 # ---------------------------------------------------------------------------

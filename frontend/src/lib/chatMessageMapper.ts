@@ -27,6 +27,7 @@ export function mapSessionMessage(m: ChatSessionMessage): Message {
     unverifiableClaims: m.unverifiable_claims ?? undefined,
     turnId: m.turn_id ?? undefined,
     status: m.status ?? "complete",
+    seq: m.seq ?? null,
     created_at: m.created_at,
     feedback: m.feedback ?? null,
   };

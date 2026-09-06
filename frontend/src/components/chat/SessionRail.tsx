@@ -774,12 +774,19 @@ export function SessionRail({ vaultId, className }: SessionRailProps) {
         sessionVirtualizer.scrollToIndex(clamped, { align: "auto" });
       }
       requestAnimationFrame(() => {
-        const row = listRef.current?.querySelector<HTMLElement>(
-          `[data-session-index="${clamped}"]`
-        );
-        if (!row) return;
-        row.focus();
-        row.scrollIntoView({ block: "nearest" });
+        // PRR-008: tanstack-virtual recalculates its window in its own rAF, so
+        // the target row may not be committed yet on this frame. Retry focus
+        // once on the following frame instead of silently dropping it.
+        const focusRow = () => {
+          const row = listRef.current?.querySelector<HTMLElement>(
+            `[data-session-index="${clamped}"]`
+          );
+          if (!row) return false;
+          row.focus();
+          row.scrollIntoView({ block: "nearest" });
+          return true;
+        };
+        if (!focusRow()) requestAnimationFrame(focusRow);
       });
     },
     [filteredSessions.length, sessionVirtualizer]

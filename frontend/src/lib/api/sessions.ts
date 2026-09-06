@@ -335,31 +335,46 @@ export async function addChatMessage(sessionId: number, request: AddMessageReque
  * The backend inserts every row inside one transaction with monotonic seq
  * values, so a turn's user row is durably ordered before its assistant row and
  * a failed batch commits nothing (safe to retry without sibling duplication).
+ *
+ * PRR-005: against a backend that predates the batch endpoint (rolling
+ * restart), the 404 falls back to sequential single-message saves — weaker
+ * (no all-or-nothing) but keeps turns durable across the deploy window.
  */
 export async function addChatMessagesBatch(
   sessionId: number,
   messages: AddMessageRequest[]
 ): Promise<ChatSessionMessage[]> {
-  const response = await apiClient.post<{ messages: ChatSessionMessage[] }>(
-    `/chat/sessions/${sessionId}/messages/batch`,
-    { messages }
-  );
-  return response.data.messages;
+  try {
+    const response = await apiClient.post<{ messages: ChatSessionMessage[] }>(
+      `/chat/sessions/${sessionId}/messages/batch`,
+      { messages }
+    );
+    return response.data.messages;
+  } catch (err) {
+    const status = (err as { response?: { status?: number } })?.response?.status;
+    if (status !== 404) throw err;
+    const saved: ChatSessionMessage[] = [];
+    for (const message of messages) {
+      saved.push(await addChatMessage(sessionId, message));
+    }
+    return saved;
+  }
 }
 
 /**
- * Persistently trim history after keepCount messages (issue #507 / CHAT-006).
- * The server-side revision operation behind retry/edit: deletes every message
- * with seq > keepCount so persisted history matches the locally-trimmed
- * transcript before the resend. keepCount >= max seq is a no-op success.
+ * Persistently trim history above the given durable seq boundary
+ * (issue #507 / CHAT-006). keepSeq must be the highest server-issued seq the
+ * caller wants to KEEP — anchoring on the server's own seq (not a local array
+ * index, PRR-020) keeps the boundary exact when local rows were never
+ * persisted. keepSeq >= max seq is a no-op success; 0 clears all messages.
  */
 export async function truncateChatSession(
   sessionId: number,
-  keepCount: number
+  keepSeq: number
 ): Promise<{ remaining_count: number; tail_seq: number | null }> {
   const response = await apiClient.post<{ remaining_count: number; tail_seq: number | null }>(
     `/chat/sessions/${sessionId}/truncate`,
-    { keep_count: keepCount }
+    { keep_seq: keepSeq }
   );
   return response.data;
 }

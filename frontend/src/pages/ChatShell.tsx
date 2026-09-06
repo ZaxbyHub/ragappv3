@@ -445,24 +445,29 @@ export default function ChatShell() {
         />
       </aside>
 
-      {/* MOBILE: Session Rail Sheet (slides from left) — only mounted on mobile
-          viewports (mirrors the right sheet's isBelowLg gate) so the always-on
-          Radix portal/overlay cannot leak into the desktop layout (UI-037). */}
-      {isMobile && (
-        <Sheet open={mobileSheetOpen} onOpenChange={(open) => !open && setMobileSheetOpen(false)}>
-          <SheetContent side="left" className="w-[280px] p-0 md:hidden" aria-describedby="chat-sessions-desc">
-            <SheetHeader className="sr-only">
-              <SheetTitle id="chat-sessions-title">Chat Sessions</SheetTitle>
-              <SheetDescription id="chat-sessions-desc">Navigate between chat sessions</SheetDescription>
-            </SheetHeader>
-            <div className="flex h-full flex-col">
-              <ErrorBoundary fallback={sessionsFallback}>
-                <SessionRail />
-              </ErrorBoundary>
-            </div>
-          </SheetContent>
-        </Sheet>
-      )}
+      {/* MOBILE: Session Rail Sheet (slides from left). The Sheet ROOT stays
+          mounted on every viewport (PRR-009): unmounting it on the breakpoint
+          flip used to bypass Radix's close lifecycle, so focus was never
+          restored to the trigger. Driving `open` with mobileSheetOpen &&
+          isMobile keeps the desktop layout clean (UI-037 — closed Radix
+          renders no portal/overlay) while letting the breakpoint flip run
+          Radix's real close path and restore focus. */}
+      <Sheet
+        open={mobileSheetOpen && isMobile}
+        onOpenChange={(open) => !open && setMobileSheetOpen(false)}
+      >
+        <SheetContent side="left" className="w-[280px] p-0 md:hidden" aria-describedby="chat-sessions-desc">
+          <SheetHeader className="sr-only">
+            <SheetTitle id="chat-sessions-title">Chat Sessions</SheetTitle>
+            <SheetDescription id="chat-sessions-desc">Navigate between chat sessions</SheetDescription>
+          </SheetHeader>
+          <div className="flex h-full flex-col">
+            <ErrorBoundary fallback={sessionsFallback}>
+              <SessionRail />
+            </ErrorBoundary>
+          </div>
+        </SheetContent>
+      </Sheet>
 
       {/* MAIN TRANSCRIPT AREA */}
       <main className="flex flex-1 flex-col min-w-0 bg-background">

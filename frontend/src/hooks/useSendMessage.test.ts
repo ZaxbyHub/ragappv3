@@ -84,6 +84,7 @@ describe("useSendMessage", () => {
       inputError: null,
       expandedSources: new Set(),
       activeChatId: null,
+      pendingTurnPersist: null,
     });
     useLlmHealthStore.setState({ thinking: true, instant: true });
     useChatShellStore.setState({ sessionListRefreshToken: 0 });
@@ -426,6 +427,9 @@ describe("useSendMessage", () => {
       expect(useChatStore.getState().isStreaming).toBe(true);
 
       await act(async () => {
+        // PRR-001: a mid-stream network failure with partial content must not
+        // lose the turn — it persists as "failed" instead of vanishing.
+        capture.trigger.message("partial answer");
         capture.trigger.error(new TypeError("Failed to fetch"));
       });
 
@@ -435,15 +439,34 @@ describe("useSendMessage", () => {
       expect(useChatStore.getState().abortFn).toBeNull();
       expect(useChatStore.getState().streamingMessageId).toBeNull();
 
-      const assistant = useChatStore.getState().messagesById[streamingId!];
-      expect(assistant?.error).toBe(
-        "Connection lost. Check your network and try again."
-      );
-      // refreshHistory is only called from onComplete, which never fired.
-      expect(refreshHistory).not.toHaveBeenCalled();
+      // The partial turn is durably saved with the failed terminal status.
+      await waitFor(() => {
+        expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledTimes(1);
+      });
+      const payloads = apiMocks.addChatMessagesBatch.mock.calls[0][1] as Array<{
+        role: string;
+        status?: string;
+      }>;
+      const assistantPayload = payloads.find((m) => m.role === "assistant");
+      expect(assistantPayload?.status).toBe("failed");
+
+      // The friendly network error stays stamped on the assistant row (which
+      // the successful save migrates to its server id — read via the list).
+      await waitFor(() => {
+        const assistant = useChatStore
+          .getState()
+          .messageIds.map((id) => useChatStore.getState().messagesById[id])
+          .find((m) => m.role === "assistant");
+        expect(assistant?.error).toBe("Connection lost. Check your network and try again.");
+        expect(assistant?.status).toBe("failed");
+      });
+      // The failed turn's save landed, so history is force-refreshed.
+      await waitFor(() => {
+        expect(refreshHistory).toHaveBeenCalledWith(true);
+      });
     });
 
-    it("non-network, non-abort error: stamps the raw error.message on the assistant message", async () => {
+    it("non-network, non-abort error before any content: stamps status failed and surfaces the empty-response error (PRR-001 + LIVE-01)", async () => {
       const capture = installCapturingStreamMock();
       const refreshHistory = vi.fn().mockResolvedValue(undefined);
       useChatStore.setState({ activeChatId: "42", input: "Will fail with server error" });
@@ -457,6 +480,10 @@ describe("useSendMessage", () => {
       const streamingId = useChatStore.getState().streamingMessageId;
 
       await act(async () => {
+        // A pre-content server failure: the generic branch stamps status
+        // "failed", but persistTurn's empty-content guard (LIVE-01) keeps the
+        // turn unpersisted and replaces the raw message with the
+        // empty-response error.
         capture.trigger.error(new Error("upstream LLM returned 500"));
       });
 
@@ -464,7 +491,9 @@ describe("useSendMessage", () => {
         expect(useChatStore.getState().isStreaming).toBe(false);
       });
       const assistant = useChatStore.getState().messagesById[streamingId!];
-      expect(assistant?.error).toBe("upstream LLM returned 500");
+      expect(assistant?.status).toBe("failed");
+      expect(assistant?.error).toBe("The model returned an empty response. Try again.");
+      expect(apiMocks.addChatMessagesBatch).not.toHaveBeenCalled();
     });
 
     it("failure rollback: after a non-abort error, sendingRef is reset so a follow-up send is not silently dropped", async () => {
@@ -838,6 +867,121 @@ describe("useSendMessage", () => {
       const assistant = useChatStore.getState().messagesById[streamingId!];
       expect(assistant?.error).toBe("The model returned an empty response. Try again.");
       expect(assistant?.saveState).not.toBe("saved");
+    });
+
+    it("persists a failed stream as failed so a reload never loses the turn (PRR-001)", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "will fail mid-stream" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+
+      // Partial content, then a plain server-side error — the generic onError
+      // branch (network / SSE error frame), not abort and not interruption.
+      await act(async () => {
+        capture.trigger.message("partial answer before the crash");
+        capture.trigger.error(new Error("Chat processing failed"));
+      });
+
+      // The failed turn IS durably persisted — once, as a batch.
+      await waitFor(() => {
+        expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledTimes(1);
+      });
+      const payloads = apiMocks.addChatMessagesBatch.mock.calls[0][1] as Array<{
+        role: string;
+        content: string;
+        status?: string;
+      }>;
+      const assistantPayload = payloads.find((m) => m.role === "assistant");
+      expect(assistantPayload).toBeDefined();
+      expect(assistantPayload!.status).toBe("failed");
+      expect(assistantPayload!.content).toContain("partial answer before the crash");
+
+      // Store: the assistant row carries the failed terminal status and the
+      // raw error message (the save itself succeeds, so nothing overwrites it).
+      await waitFor(() => {
+        const assistant = useChatStore
+          .getState()
+          .messageIds.map((id) => useChatStore.getState().messagesById[id])
+          .find((m) => m.role === "assistant");
+        expect(assistant?.status).toBe("failed");
+        expect(assistant?.error).toBe("Chat processing failed");
+      });
+    });
+
+    it("does not persist a failed stream that produced no content (LIVE-01 under PRR-001)", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "say something" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+
+      await act(async () => {
+        capture.trigger.error(new Error("boom"));
+      });
+
+      // An empty answer — even a failed one — is never persisted.
+      expect(apiMocks.addChatMessagesBatch).not.toHaveBeenCalled();
+      expect(refreshHistory).not.toHaveBeenCalled();
+
+      const assistant = useChatStore.getState().messagesById[streamingId!];
+      expect(assistant?.error).toBe("The model returned an empty response. Try again.");
+    });
+
+    it("exposes the in-flight turn save on the store and clears it when settled (PRR-003)", async () => {
+      const capture = installCapturingStreamMock();
+      let resolveBatch!: (saved: unknown[]) => void;
+      apiMocks.addChatMessagesBatch.mockReturnValueOnce(
+        new Promise<unknown[]>((resolve) => {
+          resolveBatch = resolve;
+        })
+      );
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "slow save" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      await act(async () => {
+        capture.trigger.message("answer");
+        capture.trigger.complete();
+      });
+
+      // While the batch save is in flight it is registered on the store so
+      // revision operations (retry/edit truncate, fork) can await it instead
+      // of racing it.
+      const pending = useChatStore.getState().pendingTurnPersist;
+      expect(pending).toBeInstanceOf(Promise);
+      expect(apiMocks.addChatMessagesBatch).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        resolveBatch([
+          { id: 200, created_at: "2026-06-01T00:00:00Z" },
+          { id: 201, created_at: "2026-06-01T00:00:01Z" },
+        ]);
+        await pending;
+      });
+
+      await waitFor(() => {
+        expect(useChatStore.getState().pendingTurnPersist).toBeNull();
+      });
     });
   });
 });

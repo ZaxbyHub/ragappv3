@@ -179,16 +179,19 @@ const MessageRow = memo(function MessageRow({
   const isAssistantStreaming = isStreaming && isLast && safeMessage.role === "assistant" && streamingMessageId === messageId;
   const isHighlighted = highlightedId === messageId;
 
-  // Persisted terminal status (issue #507): an interrupted/partial turn must
-  // never look like a successful answer after reload. The live-stream error
-  // paths already stamp `error` on the message (which renders its own retry
-  // banner inside AssistantMessage), so this banner targets the restored
-  // rows — status set, no error string. Never shown while a stream is active.
+  // Persisted terminal status (issue #507): an interrupted/partial/failed
+  // turn must never look like a successful answer after reload. The
+  // live-stream error paths already stamp `error` on the message (which
+  // renders its own retry banner inside AssistantMessage), so this banner
+  // targets the restored rows — status set, no error string. Never shown
+  // while a stream is active.
   const showInterruptedStatusBanner =
     safeMessage.role === "assistant" &&
     !isStreaming &&
     !safeMessage.error &&
-    (safeMessage.status === "interrupted" || safeMessage.status === "partial");
+    (safeMessage.status === "interrupted" ||
+      safeMessage.status === "partial" ||
+      safeMessage.status === "failed");
 
   return (
     <div className={isHighlighted ? "ring-2 ring-primary/50 rounded-xl transition-all duration-500" : undefined}>
@@ -224,7 +227,9 @@ const MessageRow = memo(function MessageRow({
                 <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
                   {safeMessage.status === "partial"
                     ? "Response is incomplete — you can retry."
-                    : "Response interrupted — you can retry."}
+                    : safeMessage.status === "failed"
+                      ? "Response failed — you can retry."
+                      : "Response interrupted — you can retry."}
                 </p>
                 {/* Retry only makes sense for the latest exchange — the shared
                     handleRetry trims from the last user message. */}
@@ -416,9 +421,38 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     setTimeout(() => composerRef.current?.focus(), 0);
   };
 
+  // PRR-003: let a just-interrupted turn's background save settle before any
+  // server-side history revision, so the truncate/fork below observes (or
+  // removes) those rows instead of racing them.
+  const awaitPendingPersist = useCallback(async () => {
+    const pending = useChatStore.getState().pendingTurnPersist;
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        // Save failures are already surfaced on the message (UI-002).
+      }
+    }
+  }, []);
+
+  // PRR-020: anchor the server truncate at the highest durable seq among the
+  // KEPT rows instead of a local array index — a local index diverges from
+  // server seq whenever a turn exists locally but was never persisted (Stop,
+  // empty response, failed save), so a positional keep_count would delete the
+  // wrong range and duplicate Q&A pairs after reload.
+  const durableKeepSeq = (keptIds: string[], byId: Record<string, Message>): number => {
+    let keepSeq = 0;
+    for (const id of keptIds) {
+      const seq = byId[id]?.seq;
+      if (typeof seq === "number" && seq > keepSeq) keepSeq = seq;
+    }
+    return keepSeq;
+  };
+
   // Retry: find last user message, trim persisted history + store, call sendDirect
   const handleRetry = useCallback(async () => {
     if (isStreaming) return;
+    await awaitPendingPersist();
     const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
     let lastUserIdx = -1;
     for (let i = ids.length - 1; i >= 0; i--) {
@@ -430,7 +464,10 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     // on failure bail out before touching the local transcript.
     if (activeChatId) {
       try {
-        await truncateChatSession(parseInt(activeChatId), Math.max(0, lastUserIdx));
+        await truncateChatSession(
+          parseInt(activeChatId),
+          durableKeepSeq(ids.slice(0, lastUserIdx), messagesById)
+        );
       } catch {
         toast.error("Couldn't update conversation history");
         return;
@@ -441,17 +478,21 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     const history = ids.slice(0, lastUserIdx).map((id) => messagesById[id]);
     removeMessagesFrom(lastUserIdx);
     sendDirect(userContent, history);
-  }, [isStreaming, removeMessagesFrom, sendDirect]);
+  }, [isStreaming, removeMessagesFrom, sendDirect, awaitPendingPersist]);
 
   // Edit: trim persisted history + store from message index, restore content to composer
   const handleEdit = useCallback(async (messageId: string, content: string) => {
     if (isStreaming) return;
-    const { messageIds: ids, activeChatId } = useChatStore.getState();
+    await awaitPendingPersist();
+    const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
     const idx = ids.indexOf(messageId);
     if (idx < 0) return;
     if (activeChatId) {
       try {
-        await truncateChatSession(parseInt(activeChatId), Math.max(0, idx));
+        await truncateChatSession(
+          parseInt(activeChatId),
+          durableKeepSeq(ids.slice(0, idx), messagesById)
+        );
       } catch {
         toast.error("Couldn't update conversation history");
         return;
@@ -460,13 +501,14 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     removeMessagesFrom(idx);
     setInput(content);
     composerRef.current?.focus();
-  }, [isStreaming, removeMessagesFrom, setInput]);
+  }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist]);
 
   // Fork
   const handleFork = useCallback(async (messageId: string) => {
     if (isForkingRef.current) return;
     const { activeChatId } = useChatStore.getState();
     if (!activeChatId) return;
+    await awaitPendingPersist();
     const { messageIds: ids } = useChatStore.getState();
     const msgIndex = ids.indexOf(messageId);
     if (msgIndex < 0) return;
@@ -490,7 +532,7 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
       isForkingRef.current = false;
       setIsForking(false);
     }
-  }, [loadChat, refreshHistory, navigate]);
+  }, [loadChat, refreshHistory, navigate, awaitPendingPersist]);
 
   const handleFeedback = useCallback((messageId: string, feedback: "up" | "down" | null) => {
     updateMessage(messageId, { feedback });

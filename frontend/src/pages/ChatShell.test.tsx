@@ -36,6 +36,8 @@ let mockStoreState = {
   sessionSearchQuery: "",
   pinnedSessionIds: [] as number[],
   selectedEvidenceSource: null,
+  mobileSheetOpen: false,
+  setMobileSheetOpen: vi.fn(),
   toggleSessionRail: vi.fn(),
   toggleRightPane: vi.fn(),
   setRightPaneWidth: vi.fn(),
@@ -55,10 +57,13 @@ let mockStoreState = {
 };
 
 // Mock the Sheet component from @/components/ui/sheet
-// Always render content so test queries can find DOM nodes; open/close is CSS-controlled
+// Faithful to Radix: the root is ALWAYS mounted, but children (portal/overlay/
+// content) only exist while `open` is truthy — a closed Sheet renders no
+// content (UI-037) yet keeps its root in the DOM so Radix can run the real
+// close lifecycle and restore focus on breakpoint flips (PRR-009).
 vi.mock("@/components/ui/sheet", () => ({
   Sheet: ({ children, open }: { children: React.ReactNode; open?: boolean; onOpenChange?: (open: boolean) => void }) => {
-    return <div data-testid="sheet-mock" data-open={open ? "true" : "false"}>{children}</div>;
+    return <div data-testid="sheet-mock" data-open={open ? "true" : "false"}>{open ? children : null}</div>;
   },
   SheetContent: ({ children, className, side }: { children: React.ReactNode; className?: string; side?: string }) => (
     <div data-testid="sheet-content" data-side={side} className={className}>
@@ -113,6 +118,8 @@ describe("ChatShell Mobile Layout", () => {
       sessionSearchQuery: "",
       pinnedSessionIds: [],
       selectedEvidenceSource: null,
+      mobileSheetOpen: false,
+      setMobileSheetOpen: vi.fn(),
       toggleSessionRail: vi.fn(),
       toggleRightPane: vi.fn(),
       setRightPaneWidth: vi.fn(),
@@ -151,9 +158,10 @@ describe("ChatShell Mobile Layout", () => {
   });
 
   describe("test_session_rail_sheet_renders_when_open", () => {
-    it("session rail Sheet renders on mobile viewports (UI-037: mobile-only mount)", () => {
-      // The left Sheet is only mounted on mobile viewports so the always-on
-      // Radix portal/overlay cannot leak into the desktop layout.
+    it("session rail Sheet renders its left content on mobile when open (UI-037)", () => {
+      // The Sheet root is always mounted; open = mobileSheetOpen && isMobile.
+      // mobileSheetOpen is component-local state, so open it through the real
+      // toggle (on mobile the PanelLeft button drives setMobileSheetOpen).
       matchMediaMatches = true;
       render(
         <BrowserRouter>
@@ -161,24 +169,41 @@ describe("ChatShell Mobile Layout", () => {
         </BrowserRouter>
       );
 
-      const sheetContents = document.querySelectorAll('[data-testid="sheet-content"]');
-      const leftSheets = Array.from(sheetContents).filter((el) => el.getAttribute("data-side") === "left");
-      // On mobile the Sheet (and its left SheetContent) IS mounted.
-      expect(leftSheets.length).toBeGreaterThan(0);
+      fireEvent.click(screen.getByLabelText("Show sessions"));
+
+      const leftContent = document.querySelector(
+        '[data-testid="sheet-content"][data-side="left"]'
+      );
+      // On mobile with the sheet open, the left SheetContent IS rendered.
+      expect(leftContent).not.toBeNull();
+      expect(
+        leftContent?.closest('[data-testid="sheet-mock"]')?.getAttribute("data-open")
+      ).toBe("true");
     });
 
-    it("session rail Sheet is NOT mounted on desktop viewports (UI-037)", () => {
-      // Desktop (no media query matches) => isMobile false => the mobile-only
-      // left Sheet must be absent from the DOM entirely, not just invisible.
+    it("session rail Sheet stays mounted but renders NO left content on desktop (PRR-009 + UI-037)", () => {
+      // Desktop (no media query matches) => isMobile false => open =
+      // mobileSheetOpen && isMobile is false even when the open flag is set,
+      // so a closed Radix Sheet renders no portal/overlay content. The ROOT
+      // must stay in the DOM so Radix can run its real close (focus restore)
+      // when the breakpoint flips (PRR-009).
+      matchMediaMatches = false;
       render(
         <BrowserRouter>
           <ChatShell />
         </BrowserRouter>
       );
 
-      const sheetContents = document.querySelectorAll('[data-testid="sheet-content"]');
-      const leftSheets = Array.from(sheetContents).filter((el) => el.getAttribute("data-side") === "left");
+      const leftSheets = document.querySelectorAll(
+        '[data-testid="sheet-content"][data-side="left"]'
+      );
       expect(leftSheets.length).toBe(0);
+
+      const roots = document.querySelectorAll('[data-testid="sheet-mock"]');
+      // On desktop only the sessions Sheet root is mounted (the right-pane
+      // Sheet is gated on isBelowLg) and it is present-but-closed.
+      expect(roots).toHaveLength(1);
+      expect(roots[0].getAttribute("data-open")).toBe("false");
     });
   });
 
@@ -413,6 +438,9 @@ describe("ChatShell resize handle keyboard + touch parity", () => {
       activeRightTab: "evidence",
       sessionSearchQuery: "",
       pinnedSessionIds: [],
+      selectedEvidenceSource: null,
+      mobileSheetOpen: false,
+      setMobileSheetOpen: vi.fn(),
       toggleSessionRail: vi.fn(),
       toggleRightPane: vi.fn(),
       setRightPaneWidth: vi.fn(),

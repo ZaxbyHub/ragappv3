@@ -198,10 +198,11 @@ export function useSendMessage(
 
       // Persist a turn durably (issue #507): one ordered, all-or-nothing batch
       // per turn. status "complete" on success, "interrupted" for a partially
-      // streamed turn — an interrupted answer is never saved as a successful
-      // one, and empty content is never persisted at all (LIVE-01). A failed
-      // batch commits nothing server-side, so the visible retry below can
-      // never duplicate a successful sibling write (UI-002).
+      // streamed turn, "failed" after a mid-stream server error with partial
+      // content — none of these are ever saved as a successful answer, and
+      // empty content is never persisted at all (LIVE-01). A failed batch
+      // commits nothing server-side, so the visible retry below can never
+      // duplicate a successful sibling write (UI-002).
       const migrateId = (oldId: string, saveResult: ChatSessionMessage) => {
         const dbId = String(saveResult.id);
         if (dbId === oldId) {
@@ -217,53 +218,68 @@ export function useSendMessage(
         replaceMessageId(oldId, dbId, { created_at: saveResult.created_at, saveState: "saved" });
       };
 
-      const persistTurn = async (assistantStatus: "complete" | "interrupted") => {
-        const storeState = useChatStore.getState();
-        const assistantMsg = storeState.messagesById[assistantMessageId];
-        const userMsg = storeState.messagesById[userMessage.id];
-        // Abandoned stream (loadChat/newChat cleared the store): skip both
-        // saves so no dangling rows land in the old session (issue #235).
-        if (!assistantMsg || !userMsg) return;
-        if (!assistantMsg.content.trim()) {
-          updateMessage(assistantMessageId, {
-            error: "The model returned an empty response. Try again.",
-          });
-          return;
-        }
-        updateMessage(assistantMessageId, { saveState: "saving" });
-        updateMessage(userMessage.id, { saveState: "saving" });
-        try {
-          const saved = await addChatMessagesBatch(sessionId, [
-            { role: "user", content, turn_id: turnId },
-            {
-              role: "assistant",
-              content: assistantMsg.content,
-              sources: assistantMsg.sources ?? undefined,
-              memories: assistantMsg.memoriesUsed ?? undefined,
-              wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
-              kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
-              mode: assistantMsg.mode,
-              turn_id: turnId,
-              status: assistantStatus,
-              citation_confidence: assistantMsg.citationConfidence,
-              unverifiable_claims: assistantMsg.unverifiableClaims,
-            },
-          ]);
-          const [userSaveResult, assistantSaveResult] = saved;
-          migrateId(userMessage.id, userSaveResult);
-          migrateId(assistantMessageId, assistantSaveResult);
-          await refreshHistory(true);
-          useChatShellStore.getState().requestSessionListRefresh();
-        } catch (err) {
-          console.error("Failed to save chat messages:", err);
-          // UI-002: a failed save must be visible and retryable with the
-          // answer and original input intact — never a silent loss.
-          updateMessage(assistantMessageId, {
-            saveState: "failed",
-            error: "Couldn't save this exchange. Retry to avoid losing it.",
-          });
-          updateMessage(userMessage.id, { saveState: "failed" });
-        }
+      const persistTurn = (assistantStatus: "complete" | "interrupted" | "failed") => {
+        const persistPromise = (async () => {
+          const storeState = useChatStore.getState();
+          const assistantMsg = storeState.messagesById[assistantMessageId];
+          const userMsg = storeState.messagesById[userMessage.id];
+          // Abandoned stream (loadChat/newChat cleared the store): skip both
+          // saves so no dangling rows land in the old session (issue #235).
+          if (!assistantMsg || !userMsg) return;
+          if (!assistantMsg.content.trim()) {
+            // LIVE-01/PRR-001: an empty answer — including a pre-content
+            // server failure — is never persisted; surface a retryable error
+            // instead of writing empty rows.
+            updateMessage(assistantMessageId, {
+              error: "The model returned an empty response. Try again.",
+            });
+            return;
+          }
+          updateMessage(assistantMessageId, { saveState: "saving" });
+          updateMessage(userMessage.id, { saveState: "saving" });
+          try {
+            const saved = await addChatMessagesBatch(sessionId, [
+              { role: "user", content, turn_id: turnId },
+              {
+                role: "assistant",
+                content: assistantMsg.content,
+                sources: assistantMsg.sources ?? undefined,
+                memories: assistantMsg.memoriesUsed ?? undefined,
+                wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
+                kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
+                mode: assistantMsg.mode,
+                turn_id: turnId,
+                status: assistantStatus,
+                citation_confidence: assistantMsg.citationConfidence,
+                unverifiable_claims: assistantMsg.unverifiableClaims,
+              },
+            ]);
+            const [userSaveResult, assistantSaveResult] = saved;
+            migrateId(userMessage.id, userSaveResult);
+            migrateId(assistantMessageId, assistantSaveResult);
+            await refreshHistory(true);
+            useChatShellStore.getState().requestSessionListRefresh();
+          } catch (err) {
+            console.error("Failed to save chat messages:", err);
+            // UI-002: a failed save must be visible and retryable with the
+            // answer and original input intact — never a silent loss.
+            updateMessage(assistantMessageId, {
+              saveState: "failed",
+              error: "Couldn't save this exchange. Retry to avoid losing it.",
+            });
+            updateMessage(userMessage.id, { saveState: "failed" });
+          }
+        })();
+        // PRR-003: expose the in-flight save so revision operations (retry/
+        // edit truncate, fork) can await it instead of racing it.
+        const { setPendingTurnPersist } = useChatStore.getState();
+        setPendingTurnPersist(persistPromise);
+        void persistPromise.finally(() => {
+          if (useChatStore.getState().pendingTurnPersist === persistPromise) {
+            useChatStore.getState().setPendingTurnPersist(null);
+          }
+        });
+        return persistPromise;
       };
 
       const abort = chatStream(
@@ -373,12 +389,19 @@ export function useSendMessage(
             const friendlyMessage = isNetworkError
               ? "Connection lost. Check your network and try again."
               : error.message;
-            updateMessage(assistantMessageId, { error: friendlyMessage });
+            // PRR-001: a server-side failure (backend error frame or generic
+            // stream exception) must not lose the turn. Stamp the terminal
+            // status and persist it — persistTurn's empty-content guard keeps
+            // pre-content failures unpersisted (LIVE-01), while a partial
+            // answer lands durably with status "failed" instead of vanishing
+            // on reload.
+            updateMessage(assistantMessageId, { status: "failed", error: friendlyMessage });
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);
             setStreamingMessageId(null);
             sendingRef.current = false;
+            void persistTurn("failed");
           },
           onComplete: async () => {
             // Flush any buffered streaming content before reading store state
