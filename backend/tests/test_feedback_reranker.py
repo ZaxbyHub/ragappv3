@@ -80,10 +80,22 @@ class _SharedDB:
             _SharedDB._counter += 1
             self._id = _SharedDB._counter
 
+        # Include the pid: under pytest-xdist each worker is its own process
+        # with its own counter, and the shared %TEMP% dir made
+        # test_fb_reranker_1.db collide across workers once the test
+        # distribution shifted (UNIQUE constraint failed: chat_sessions.id).
         self._path = os.path.join(
             os.environ.get("TEMP", "/tmp"),
-            f"test_fb_reranker_{self._id}.db",
+            f"test_fb_reranker_{os.getpid()}_{self._id}.db",
         )
+        # PRR-017: a crashed earlier run can leave a stale file at the same
+        # pid_id path (PIDs recycle); remove it so this instance opens fresh
+        # instead of colliding with leftover rows (UNIQUE constraint).
+        if os.path.exists(self._path):
+            try:
+                os.unlink(self._path)
+            except OSError:
+                pass
         self._conn = sqlite3.connect(self._path, isolation_level=None)
         self._conn.execute("PRAGMA foreign_keys = ON")
         _make_schema(self._conn)
@@ -111,7 +123,10 @@ class _SharedDB:
         self._conn.close()
         try:
             os.unlink(self._path)
-        except Exception:
+        except OSError:
+            # Windows can hold the file handle briefly after close(); the
+            # pre-existence unlink in __init__ cleans any leftover up on the
+            # next run, so a failed unlink here is not an error worth raising.
             pass
 
 

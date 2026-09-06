@@ -19,6 +19,14 @@ export interface Message {
   citationConfidence?: Record<string, number>;
   /** Unverifiable claims flagged by the citation validator. */
   unverifiableClaims?: string[];
+  /** Durable turn linkage (issue #507): shared by a turn's user+assistant rows. */
+  turnId?: string;
+  /** Assistant terminal state (issue #507). "complete" is the default; "interrupted"/"partial" render retryable. */
+  status?: "complete" | "partial" | "interrupted" | "failed";
+  /** Durable save acknowledgment, separate from answer completion (UI-002). */
+  saveState?: "saving" | "saved" | "failed";
+  /** Per-session durable order (issue #507), as returned by the backend. */
+  seq?: number | null;
   stopped?: boolean;
   error?: string;
   created_at?: string;
@@ -37,6 +45,13 @@ export interface ChatState {
   inputError: string | null;
   expandedSources: Set<string>;
   activeChatId: string | null;
+  /**
+   * In-flight durable turn save (issue #507 / PRR-003). Revision operations
+   * (retry/edit truncate, fork) must await this before issuing server-side
+   * history changes so a just-interrupted turn's background batch save can
+   * never land AFTER a truncate and resurrect deleted rows.
+   */
+  pendingTurnPersist: Promise<void> | null;
 
   // Actions
   addMessage: (message: Message) => void;
@@ -59,6 +74,7 @@ export interface ChatState {
   setStreamingMessageId: (id: string | null) => void;
   setAbortFn: (abortFn: (() => void) | null) => void;
   setInputError: (error: string | null) => void;
+  setPendingTurnPersist: (p: Promise<void> | null) => void;
   toggleSource: (sourceId: string) => void;
   clearExpandedSources: () => void;
   stopStreaming: () => void;
@@ -79,6 +95,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   inputError: null,
   expandedSources: new Set(),
   activeChatId: null,
+  pendingTurnPersist: null,
 
   addMessage: (message) => {
     set((state) => ({
@@ -166,6 +183,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   setStreamingMessageId: (streamingMessageId) => set({ streamingMessageId }),
   setAbortFn: (abortFn) => set({ abortFn }),
   setInputError: (inputError) => set({ inputError }),
+  setPendingTurnPersist: (p) => set({ pendingTurnPersist: p }),
 
   toggleSource: (sourceId) => {
     set((state) => {
@@ -184,7 +202,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   stopStreaming: () => {
-    const { abortFn, messageIds, messagesById, streamingMessageId } = get();
+    const { abortFn, messagesById, streamingMessageId } = get();
     if (abortFn) abortFn();
 
     const updates: Partial<ChatState> = {
@@ -193,7 +211,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       streamingMessageId: null,
     };
 
-    const targetId = streamingMessageId ?? messageIds[messageIds.length - 1];
+    const targetId = streamingMessageId;
+    // Only the ACTIVELY streaming message may be marked stopped. Falling back
+    // to the last message when nothing is streaming would stamp a spurious
+    // stopped:true on a previous turn's assistant message when Stop is pressed
+    // during session creation (UI-003).
     if (targetId) {
       const lastMsg = messagesById[targetId];
       if (lastMsg && lastMsg.role === "assistant") {

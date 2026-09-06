@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { getChatSession } from "@/lib/api";
+import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useChatMessages, useChatStore, type Message } from "@/stores/useChatStore";
 import { useTestMode } from "@/fixtures/TestModeContext";
@@ -240,8 +241,17 @@ export default function ChatShell() {
 
   // RT-04 fix: Load session messages when sessionId changes
   const loadedSessionRef = useRef<string | null>(null);
+  // Monotonic token for in-flight transcript loads so a stale fetch can never
+  // overwrite a newer selection's transcript.
+  const loadSeqRef = useRef(0);
   useEffect(() => {
-    if (!sessionId || sessionId === loadedSessionRef.current) return;
+    if (!sessionId) {
+      // Clear the marker so a delete-then-undo refetch of the same id re-runs
+      // coherently instead of being skipped as "already loaded".
+      loadedSessionRef.current = null;
+      return;
+    }
+    if (sessionId === loadedSessionRef.current) return;
     // Don't reload if we already have messages for this session
     const { activeChatId } = useChatStore.getState();
     if (activeChatId === sessionId) {
@@ -249,6 +259,7 @@ export default function ChatShell() {
       return;
     }
     loadedSessionRef.current = sessionId;
+    const seq = ++loadSeqRef.current;
     (async () => {
       try {
         if (testMode) {
@@ -256,24 +267,21 @@ export default function ChatShell() {
           return;
         }
         const detail = await getChatSession(parseInt(sessionId));
-        const loadedMessages: Message[] = (detail.messages ?? []).map((m) => ({
-          id: m.id.toString(),
-          role: m.role as "user" | "assistant",
-          content: m.content,
-          sources: m.sources ?? undefined,
-          memoriesUsed: m.memories ?? undefined,
-          wikiRefs: m.wiki_refs ?? undefined,
-          kmsRefs: m.kms_refs ?? undefined,
-          mode: m.mode ?? undefined,
-          created_at: m.created_at,
-          feedback: m.feedback ?? null,
-        }));
+        if (seq !== loadSeqRef.current) return; // a newer selection superseded this fetch (UI-001)
+        const loadedMessages: Message[] = (detail.messages ?? []).map(mapSessionMessage);
         useChatStore.getState().loadChat(sessionId, loadedMessages);
       } catch (err) {
         console.error("Failed to load chat session:", err);
       }
     })();
   }, [sessionId, testMode]);
+
+  // UI-037: the mobile Sheet is only mounted on mobile viewports, so its
+  // controlled open state cannot silently re-open the sheet when the viewport
+  // returns to mobile after the sheet was left open.
+  useEffect(() => {
+    if (!isMobile) setMobileSheetOpen(false);
+  }, [isMobile]);
 
   const handleResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -437,8 +445,17 @@ export default function ChatShell() {
         />
       </aside>
 
-      {/* MOBILE: Session Rail Sheet (slides from left) */}
-      <Sheet open={mobileSheetOpen} onOpenChange={(open) => !open && setMobileSheetOpen(false)}>
+      {/* MOBILE: Session Rail Sheet (slides from left). The Sheet ROOT stays
+          mounted on every viewport (PRR-009): unmounting it on the breakpoint
+          flip used to bypass Radix's close lifecycle, so focus was never
+          restored to the trigger. Driving `open` with mobileSheetOpen &&
+          isMobile keeps the desktop layout clean (UI-037 — closed Radix
+          renders no portal/overlay) while letting the breakpoint flip run
+          Radix's real close path and restore focus. */}
+      <Sheet
+        open={mobileSheetOpen && isMobile}
+        onOpenChange={(open) => !open && setMobileSheetOpen(false)}
+      >
         <SheetContent side="left" className="w-[280px] p-0 md:hidden" aria-describedby="chat-sessions-desc">
           <SheetHeader className="sr-only">
             <SheetTitle id="chat-sessions-title">Chat Sessions</SheetTitle>

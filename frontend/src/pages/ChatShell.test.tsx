@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { BrowserRouter } from "react-router-dom";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { BrowserRouter, Routes, Route } from "react-router-dom";
 import ChatShell from "./ChatShell";
 
 // Mock matchMedia for useIsMobile hook. Tests can flip `matchMediaMatches` to
@@ -36,6 +36,8 @@ let mockStoreState = {
   sessionSearchQuery: "",
   pinnedSessionIds: [] as number[],
   selectedEvidenceSource: null,
+  mobileSheetOpen: false,
+  setMobileSheetOpen: vi.fn(),
   toggleSessionRail: vi.fn(),
   toggleRightPane: vi.fn(),
   setRightPaneWidth: vi.fn(),
@@ -55,10 +57,13 @@ let mockStoreState = {
 };
 
 // Mock the Sheet component from @/components/ui/sheet
-// Always render content so test queries can find DOM nodes; open/close is CSS-controlled
+// Faithful to Radix: the root is ALWAYS mounted, but children (portal/overlay/
+// content) only exist while `open` is truthy — a closed Sheet renders no
+// content (UI-037) yet keeps its root in the DOM so Radix can run the real
+// close lifecycle and restore focus on breakpoint flips (PRR-009).
 vi.mock("@/components/ui/sheet", () => ({
   Sheet: ({ children, open }: { children: React.ReactNode; open?: boolean; onOpenChange?: (open: boolean) => void }) => {
-    return <div data-testid="sheet-mock" data-open={open ? "true" : "false"}>{children}</div>;
+    return <div data-testid="sheet-mock" data-open={open ? "true" : "false"}>{open ? children : null}</div>;
   },
   SheetContent: ({ children, className, side }: { children: React.ReactNode; className?: string; side?: string }) => (
     <div data-testid="sheet-content" data-side={side} className={className}>
@@ -88,6 +93,16 @@ vi.mock("@/stores/useChatShellStore", () => ({
   useChatShellStore: vi.fn(() => mockStoreState),
 }));
 
+// Issue #507 (UI-001): override ONLY getChatSession so a test can hold a
+// transcript fetch pending; everything else in the api barrel stays real.
+const chatShellGetChatSession = vi.hoisted(() =>
+  vi.fn(async () => ({ messages: [] }))
+);
+vi.mock("@/lib/api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
+  return { ...actual, getChatSession: chatShellGetChatSession };
+});
+
 describe("ChatShell Mobile Layout", () => {
   beforeEach(() => {
     // Reset mock store state before each test
@@ -103,6 +118,8 @@ describe("ChatShell Mobile Layout", () => {
       sessionSearchQuery: "",
       pinnedSessionIds: [],
       selectedEvidenceSource: null,
+      mobileSheetOpen: false,
+      setMobileSheetOpen: vi.fn(),
       toggleSessionRail: vi.fn(),
       toggleRightPane: vi.fn(),
       setRightPaneWidth: vi.fn(),
@@ -141,24 +158,52 @@ describe("ChatShell Mobile Layout", () => {
   });
 
   describe("test_session_rail_sheet_renders_when_open", () => {
-    it("session rail Sheet renders when mobileSheetOpen is true (controlled by mobile state)", () => {
+    it("session rail Sheet renders its left content on mobile when open (UI-037)", () => {
+      // The Sheet root is always mounted; open = mobileSheetOpen && isMobile.
+      // mobileSheetOpen is component-local state, so open it through the real
+      // toggle (on mobile the PanelLeft button drives setMobileSheetOpen).
+      matchMediaMatches = true;
       render(
         <BrowserRouter>
           <ChatShell />
         </BrowserRouter>
       );
 
-      // Note: mobileSheetOpen is a local React state in ChatShell, not the store.
-      // Since we cannot directly manipulate local state in the rendered component without
-      // extra scaffolding, we verify the Sheet IS present in the component (the SheetContent
-      // with side="left" exists in the component code at ChatShell.tsx:168-178).
-      // On desktop (matchMedia matches desktop), the Sheet is still mounted but invisible
-      // because open=false. We test that the SheetContent with side="left" exists in DOM.
-      const sheetContents = document.querySelectorAll('[data-testid="sheet-content"]');
-      // The component always renders SheetContent for left side, just hidden when not mobile+open
-      const leftSheets = Array.from(sheetContents).filter((el) => el.getAttribute("data-side") === "left");
-      // At least one left SheetContent should be in the DOM (rendered by the component)
-      expect(leftSheets.length).toBeGreaterThan(0);
+      fireEvent.click(screen.getByLabelText("Show sessions"));
+
+      const leftContent = document.querySelector(
+        '[data-testid="sheet-content"][data-side="left"]'
+      );
+      // On mobile with the sheet open, the left SheetContent IS rendered.
+      expect(leftContent).not.toBeNull();
+      expect(
+        leftContent?.closest('[data-testid="sheet-mock"]')?.getAttribute("data-open")
+      ).toBe("true");
+    });
+
+    it("session rail Sheet stays mounted but renders NO left content on desktop (PRR-009 + UI-037)", () => {
+      // Desktop (no media query matches) => isMobile false => open =
+      // mobileSheetOpen && isMobile is false even when the open flag is set,
+      // so a closed Radix Sheet renders no portal/overlay content. The ROOT
+      // must stay in the DOM so Radix can run its real close (focus restore)
+      // when the breakpoint flips (PRR-009).
+      matchMediaMatches = false;
+      render(
+        <BrowserRouter>
+          <ChatShell />
+        </BrowserRouter>
+      );
+
+      const leftSheets = document.querySelectorAll(
+        '[data-testid="sheet-content"][data-side="left"]'
+      );
+      expect(leftSheets.length).toBe(0);
+
+      const roots = document.querySelectorAll('[data-testid="sheet-mock"]');
+      // On desktop only the sessions Sheet root is mounted (the right-pane
+      // Sheet is gated on isBelowLg) and it is present-but-closed.
+      expect(roots).toHaveLength(1);
+      expect(roots[0].getAttribute("data-open")).toBe("false");
     });
   });
 
@@ -393,6 +438,9 @@ describe("ChatShell resize handle keyboard + touch parity", () => {
       activeRightTab: "evidence",
       sessionSearchQuery: "",
       pinnedSessionIds: [],
+      selectedEvidenceSource: null,
+      mobileSheetOpen: false,
+      setMobileSheetOpen: vi.fn(),
       toggleSessionRail: vi.fn(),
       toggleRightPane: vi.fn(),
       setRightPaneWidth: vi.fn(),
@@ -812,5 +860,88 @@ describe("ChatShell resize handle keyboard + touch parity", () => {
       });
       expect(mockStoreState.setSessionRailWidth).not.toHaveBeenCalled();
     });
+  });
+});
+
+// =============================================================================
+// Issue #507 — ChatShell session load regressions
+// =============================================================================
+describe("ChatShell session load — late fetch supersession (UI-001)", () => {
+  it("a stale in-flight transcript fetch never overwrites a newer selection", async () => {
+    const { useChatStore } = await import("@/stores/useChatStore");
+    // Deferred fetch results: session 1's fetch resolves LAST (the stale one).
+    let resolveFetch1!: (detail: { messages: unknown[] }) => void;
+    let resolveFetch2!: (detail: { messages: unknown[] }) => void;
+    const fetch1 = new Promise<{ messages: unknown[] }>((resolve) => {
+      resolveFetch1 = resolve;
+    });
+    const fetch2 = new Promise<{ messages: unknown[] }>((resolve) => {
+      resolveFetch2 = resolve;
+    });
+    chatShellGetChatSession
+      .mockClear()
+      .mockReturnValueOnce(fetch1)
+      .mockReturnValueOnce(fetch2);
+
+    useChatStore.setState({
+      activeChatId: null,
+      messageIds: [],
+      messagesById: {},
+      streamingMessageId: null,
+      isStreaming: false,
+      abortFn: null,
+    });
+
+    window.history.pushState({}, "", "/chat/1");
+    render(
+      <BrowserRouter>
+        <Routes>
+          <Route path="/chat/:sessionId" element={<ChatShell />} />
+        </Routes>
+      </BrowserRouter>
+    );
+    await waitFor(() => {
+      expect(chatShellGetChatSession).toHaveBeenCalledTimes(1);
+    });
+    expect(chatShellGetChatSession).toHaveBeenLastCalledWith(1);
+
+    // Switch to session 2 while fetch 1 is still pending.
+    act(() => {
+      window.history.pushState({}, "", "/chat/2");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await waitFor(() => {
+      expect(chatShellGetChatSession).toHaveBeenCalledTimes(2);
+    });
+    expect(chatShellGetChatSession).toHaveBeenLastCalledWith(2);
+
+    // The newer fetch resolves first and loads its transcript...
+    await act(async () => {
+      resolveFetch2({
+        messages: [{ id: 21, role: "user", content: "session two", created_at: "2026-05-12T00:00:00Z" }],
+      });
+    });
+    await waitFor(() => {
+      expect(useChatStore.getState().activeChatId).toBe("2");
+    });
+    expect(useChatStore.getState().messageIds).toEqual(["21"]);
+
+    // ...then the STALE fetch resolves and must be dropped (UI-001).
+    await act(async () => {
+      resolveFetch1({
+        messages: [{ id: 11, role: "user", content: "session one", created_at: "2026-05-11T00:00:00Z" }],
+      });
+      // Flush microtasks so a wrongly-armed load would have landed.
+      await Promise.resolve();
+    });
+
+    const state = useChatStore.getState();
+    expect(state.activeChatId).toBe("2");
+    expect(state.messageIds).toEqual(["21"]);
+    expect(state.messagesById["11"]).toBeUndefined();
+    expect(state.messagesById["21"]?.content).toBe("session two");
+
+    // Restore the URL for any test that follows.
+    window.history.pushState({}, "", "/");
   });
 });

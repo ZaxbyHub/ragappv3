@@ -101,6 +101,42 @@ describe("useKeyboardShortcuts", () => {
     expect(result.current.open).toBe(true);
   });
 
+  it("opens with Shift+? (the physical US-layout keypress)", () => {
+    // Typing "?" on a US layout is Shift + the "/" key, so the handler must
+    // not exclude shiftKey (the old !shiftKey guard made the shortcut
+    // unopenable on real keyboards).
+    const { result } = renderHook(() => useKeyboardShortcuts());
+    expect(result.current.open).toBe(false);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "?", shiftKey: true, ctrlKey: false, metaKey: false });
+    });
+
+    expect(result.current.open).toBe(true);
+  });
+
+  it("does NOT open when '?' is pressed with ctrl+shift (browser shortcut chord)", () => {
+    const { result } = renderHook(() => useKeyboardShortcuts());
+    expect(result.current.open).toBe(false);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "?", shiftKey: true, ctrlKey: true, metaKey: false });
+    });
+
+    expect(result.current.open).toBe(false);
+  });
+
+  it("does NOT open when '?' is pressed with meta (Cmd) held", () => {
+    const { result } = renderHook(() => useKeyboardShortcuts());
+    expect(result.current.open).toBe(false);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "?", shiftKey: true, ctrlKey: false, metaKey: true });
+    });
+
+    expect(result.current.open).toBe(false);
+  });
+
   it("does NOT open when '?' is pressed inside an INPUT element", () => {
     const { result } = renderHook(() => useKeyboardShortcuts());
     const input = document.createElement("input");

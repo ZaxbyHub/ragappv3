@@ -29,7 +29,21 @@ export async function parseSSEStream(
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
+    if (done) {
+      // CHAT-004: transport EOF without the protocol completion marker is an
+      // interrupted stream, not a successful completion. Surface it once so
+      // the hook can mark the turn retryable instead of leaving the UI stuck
+      // in isStreaming forever.
+      if (!completed) {
+        completed = true;
+        const interrupted = new Error(
+          "The response stream ended before the answer finished."
+        );
+        interrupted.name = "ChatInterruptedError";
+        callbacks.onError?.(interrupted);
+      }
+      break;
+    }
 
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split("\n");
@@ -46,6 +60,7 @@ export async function parseSSEStream(
         try {
           const parsed = JSON.parse(data);
           if (parsed.type === 'error') {
+            completed = true; // onError is terminal; never fire it twice
             callbacks.onError?.(new Error(parsed.message || 'Chat stream error'));
             return;
           }
@@ -312,6 +327,55 @@ export async function createChatSession(request: CreateSessionRequest): Promise<
 
 export async function addChatMessage(sessionId: number, request: AddMessageRequest): Promise<ChatSessionMessage> {
   const response = await apiClient.post<ChatSessionMessage>(`/chat/sessions/${sessionId}/messages`, request);
+  return response.data;
+}
+
+/**
+ * Save a turn's messages atomically in payload order (issue #507 / CHAT-005).
+ * The backend inserts every row inside one transaction with monotonic seq
+ * values, so a turn's user row is durably ordered before its assistant row and
+ * a failed batch commits nothing (safe to retry without sibling duplication).
+ *
+ * PRR-005: against a backend that predates the batch endpoint (rolling
+ * restart), the 404 falls back to sequential single-message saves — weaker
+ * (no all-or-nothing) but keeps turns durable across the deploy window.
+ */
+export async function addChatMessagesBatch(
+  sessionId: number,
+  messages: AddMessageRequest[]
+): Promise<ChatSessionMessage[]> {
+  try {
+    const response = await apiClient.post<{ messages: ChatSessionMessage[] }>(
+      `/chat/sessions/${sessionId}/messages/batch`,
+      { messages }
+    );
+    return response.data.messages;
+  } catch (err) {
+    const status = (err as { response?: { status?: number } })?.response?.status;
+    if (status !== 404) throw err;
+    const saved: ChatSessionMessage[] = [];
+    for (const message of messages) {
+      saved.push(await addChatMessage(sessionId, message));
+    }
+    return saved;
+  }
+}
+
+/**
+ * Persistently trim history above the given durable seq boundary
+ * (issue #507 / CHAT-006). keepSeq must be the highest server-issued seq the
+ * caller wants to KEEP — anchoring on the server's own seq (not a local array
+ * index, PRR-020) keeps the boundary exact when local rows were never
+ * persisted. keepSeq >= max seq is a no-op success; 0 clears all messages.
+ */
+export async function truncateChatSession(
+  sessionId: number,
+  keepSeq: number
+): Promise<{ remaining_count: number; tail_seq: number | null }> {
+  const response = await apiClient.post<{ remaining_count: number; tail_seq: number | null }>(
+    `/chat/sessions/${sessionId}/truncate`,
+    { keep_seq: keepSeq }
+  );
   return response.data;
 }
 
