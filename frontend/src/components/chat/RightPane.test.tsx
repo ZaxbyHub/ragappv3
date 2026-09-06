@@ -1518,18 +1518,21 @@ print("hello")
         "Completely different surrounding parent-window text."
       );
 
-      expect(
-        screen.getByText("Supporting passage not located in expanded context.")
-      ).toBeInTheDocument();
+      // The note only renders once the expanded context has loaded — await it.
+      const note = await screen.findByText(
+        "Supporting passage not located in expanded context."
+      );
+      expect(note).toBeInTheDocument();
       expect(document.querySelector("mark[data-support-span]")).toBeNull();
     });
 
     it("renders the not-located note when the source has no snippet at all", async () => {
       await openPreviewWith(undefined, "Loaded parent-window context text.");
 
-      expect(
-        screen.getByText("Supporting passage not located in expanded context.")
-      ).toBeInTheDocument();
+      const note = await screen.findByText(
+        "Supporting passage not located in expanded context."
+      );
+      expect(note).toBeInTheDocument();
     });
   });
 
