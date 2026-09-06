@@ -36,6 +36,8 @@ let mockStoreState = {
   sessionSearchQuery: "",
   pinnedSessionIds: [] as number[],
   selectedEvidenceSource: null,
+  selectedEvidenceMessageId: null as string | null,
+  evidenceReturnFocusId: null as string | null,
   mobileSheetOpen: false,
   setMobileSheetOpen: vi.fn(),
   toggleSessionRail: vi.fn(),
@@ -54,6 +56,8 @@ let mockStoreState = {
   togglePinSession: vi.fn(),
   isSessionPinned: vi.fn(),
   setSelectedEvidenceSource: vi.fn(),
+  resetEvidenceSelection: vi.fn(),
+  getState: () => mockStoreState,
 };
 
 // Mock the Sheet component from @/components/ui/sheet
@@ -62,11 +66,11 @@ let mockStoreState = {
 // content (UI-037) yet keeps its root in the DOM so Radix can run the real
 // close lifecycle and restore focus on breakpoint flips (PRR-009).
 vi.mock("@/components/ui/sheet", () => ({
-  Sheet: ({ children, open }: { children: React.ReactNode; open?: boolean; onOpenChange?: (open: boolean) => void }) => {
-    return <div data-testid="sheet-mock" data-open={open ? "true" : "false"}>{open ? children : null}</div>;
+  Sheet: ({ children, open, modal }: { children: React.ReactNode; open?: boolean; modal?: boolean; onOpenChange?: (open: boolean) => void }) => {
+    return <div data-testid="sheet-mock" data-open={open ? "true" : "false"} data-modal={modal === false ? "false" : "true"}>{open ? children : null}</div>;
   },
-  SheetContent: ({ children, className, side }: { children: React.ReactNode; className?: string; side?: string }) => (
-    <div data-testid="sheet-content" data-side={side} className={className}>
+  SheetContent: ({ children, className, side, overlay }: { children: React.ReactNode; className?: string; side?: string; overlay?: boolean }) => (
+    <div data-testid="sheet-content" data-side={side} data-overlay={overlay === false ? "false" : "true"} className={className}>
       {children}
     </div>
   ),
@@ -86,12 +90,17 @@ vi.mock("@/components/ui/sheet", () => ({
   ),
 }));
 
-// Mock the store
-vi.mock("@/stores/useChatShellStore", () => ({
-  __esModule: true,
-  default: vi.fn(() => mockStoreState),
-  useChatShellStore: vi.fn(() => mockStoreState),
-}));
+// Mock the store — getState is attached to the hook itself (zustand shape) so
+// ChatShell's useChatShellStore.getState().resetEvidenceSelection() works.
+vi.mock("@/stores/useChatShellStore", () => {
+  const makeHook = () => {
+    const hook = vi.fn(() => mockStoreState);
+    (hook as unknown as { getState: () => typeof mockStoreState }).getState = () => mockStoreState;
+    return hook;
+  };
+  const hook = makeHook();
+  return { __esModule: true, default: hook, useChatShellStore: hook };
+});
 
 // Issue #507 (UI-001): override ONLY getChatSession so a test can hold a
 // transcript fetch pending; everything else in the api barrel stays real.
@@ -118,6 +127,8 @@ describe("ChatShell Mobile Layout", () => {
       sessionSearchQuery: "",
       pinnedSessionIds: [],
       selectedEvidenceSource: null,
+      selectedEvidenceMessageId: null,
+      evidenceReturnFocusId: null,
       mobileSheetOpen: false,
       setMobileSheetOpen: vi.fn(),
       toggleSessionRail: vi.fn(),
@@ -136,6 +147,8 @@ describe("ChatShell Mobile Layout", () => {
       togglePinSession: vi.fn(),
       isSessionPinned: vi.fn(),
       setSelectedEvidenceSource: vi.fn(),
+      resetEvidenceSelection: vi.fn(),
+      getState: () => mockStoreState,
     };
     // Default: desktop viewport (no media queries match => isMobile/isBelowLg=false)
     matchMediaMatches = false;
@@ -439,6 +452,8 @@ describe("ChatShell resize handle keyboard + touch parity", () => {
       sessionSearchQuery: "",
       pinnedSessionIds: [],
       selectedEvidenceSource: null,
+      selectedEvidenceMessageId: null,
+      evidenceReturnFocusId: null,
       mobileSheetOpen: false,
       setMobileSheetOpen: vi.fn(),
       toggleSessionRail: vi.fn(),
@@ -457,6 +472,8 @@ describe("ChatShell resize handle keyboard + touch parity", () => {
       togglePinSession: vi.fn(),
       isSessionPinned: vi.fn(),
       setSelectedEvidenceSource: vi.fn(),
+      resetEvidenceSelection: vi.fn(),
+      getState: () => mockStoreState,
     };
   });
 
@@ -943,5 +960,242 @@ describe("ChatShell session load — late fetch supersession (UI-001)", () => {
 
     // Restore the URL for any test that follows.
     window.history.pushState({}, "", "/");
+  });
+});
+
+// =============================================================================
+// Issue #508 WU-12 — evidence drawer non-modality, Escape focus restore,
+// evidence-selection reset matrix
+// =============================================================================
+const freshShellState = () => ({
+  ...mockStoreState,
+  rightPaneOpen: false,
+  evidenceReturnFocusId: null as string | null,
+  closeRightPane: vi.fn(),
+  resetEvidenceSelection: vi.fn(),
+  getState: () => mockStoreState,
+});
+
+describe("Evidence drawer non-modality + Escape focus restore (issue #508 WU-12)", () => {
+  beforeEach(() => {
+    matchMediaMatches = false;
+    Object.assign(mockStoreState, freshShellState());
+  });
+
+  const flushAnimationFrames = () =>
+    act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    });
+
+  it("mounts the evidence bottom sheet non-modal with no overlay, a visible Evidence title, and the composer still focusable", () => {
+    matchMediaMatches = true; // below-lg viewport: the drawer Sheet is mounted
+    mockStoreState.rightPaneOpen = true;
+
+    render(
+      <BrowserRouter>
+        <ChatShell />
+      </BrowserRouter>
+    );
+
+    const bottom = Array.from(document.querySelectorAll("[data-testid='sheet-content']")).find(
+      (el) => el.getAttribute("data-side") === "bottom"
+    );
+    expect(bottom).toBeDefined();
+    expect(bottom!.getAttribute("data-overlay")).toBe("false");
+    expect(bottom!.closest("[data-testid='sheet-mock']")!.getAttribute("data-modal")).toBe("false");
+
+    const title = Array.from(bottom!.querySelectorAll("[data-testid='sheet-title']")).find(
+      (t) => t.textContent === "Evidence"
+    );
+    expect(title).toBeDefined();
+
+    // Non-modal: the composer remains focusable while the drawer is open.
+    const composer = document.querySelector("textarea");
+    expect(composer).not.toBeNull();
+    act(() => {
+      (composer as HTMLElement).focus();
+    });
+    expect(document.activeElement).toBe(composer);
+  });
+
+  it("Escape closes the pane and restores focus to the citation chip anchor", async () => {
+    matchMediaMatches = true;
+    mockStoreState.rightPaneOpen = true;
+    mockStoreState.evidenceReturnFocusId = "msg-9";
+
+    render(
+      <BrowserRouter>
+        <ChatShell />
+      </BrowserRouter>
+    );
+
+    const chip = document.createElement("span");
+    chip.setAttribute("data-citation-chip-message", "msg-9");
+    chip.tabIndex = -1;
+    document.body.appendChild(chip);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(mockStoreState.closeRightPane).toHaveBeenCalledTimes(1);
+
+    await flushAnimationFrames();
+    expect(document.activeElement).toBe(chip);
+    document.body.removeChild(chip);
+  });
+
+  it("Escape with no matching chip focuses the pane toggle button", async () => {
+    matchMediaMatches = true;
+    mockStoreState.rightPaneOpen = true;
+    mockStoreState.evidenceReturnFocusId = "msg-404"; // no such chip in the DOM
+
+    render(
+      <BrowserRouter>
+        <ChatShell />
+      </BrowserRouter>
+    );
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(mockStoreState.closeRightPane).toHaveBeenCalledTimes(1);
+
+    await flushAnimationFrames();
+    expect(document.activeElement).toBe(screen.getByLabelText("Hide details panel"));
+  });
+
+  it("restores focus to the CURRENT chip node after a mid-stream chip key swap", async () => {
+    matchMediaMatches = true;
+    mockStoreState.rightPaneOpen = true;
+    mockStoreState.evidenceReturnFocusId = "msg-1";
+
+    const { rerender } = render(
+      <BrowserRouter>
+        <ChatShell />
+      </BrowserRouter>
+    );
+
+    const chipV1 = document.createElement("span");
+    chipV1.setAttribute("data-citation-chip-message", "msg-1");
+    chipV1.tabIndex = -1;
+    document.body.appendChild(chipV1);
+
+    // Simulate the chip re-rendering with a new React key mid-stream: the old
+    // DOM node is replaced by a new one carrying the same anchor attribute.
+    rerender(
+      <BrowserRouter>
+        <ChatShell />
+      </BrowserRouter>
+    );
+    const chipV2 = document.createElement("span");
+    chipV2.setAttribute("data-citation-chip-message", "msg-1");
+    chipV2.tabIndex = -1;
+    document.body.replaceChild(chipV2, chipV1);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await flushAnimationFrames();
+    expect(document.activeElement).toBe(chipV2);
+    expect(document.activeElement).not.toBe(chipV1);
+    document.body.removeChild(chipV2);
+  });
+
+  it("ignores Escape while the pane is closed", () => {
+    matchMediaMatches = true;
+    mockStoreState.rightPaneOpen = false;
+
+    render(
+      <BrowserRouter>
+        <ChatShell />
+      </BrowserRouter>
+    );
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(mockStoreState.closeRightPane).not.toHaveBeenCalled();
+  });
+});
+
+describe("Evidence selection reset matrix (issue #508 R3-2)", () => {
+  const renderAtRoute = (ui: React.ReactElement) =>
+    render(
+      <BrowserRouter>
+        <Routes>
+          <Route path="/chat/:sessionId" element={<ChatShell />} />
+          <Route path="/" element={<ChatShell />} />
+        </Routes>
+      </BrowserRouter>
+    );
+
+  beforeEach(async () => {
+    Object.assign(mockStoreState, freshShellState());
+    chatShellGetChatSession.mockClear();
+    const { useChatStore } = await import("@/stores/useChatStore");
+    useChatStore.setState({
+      activeChatId: null,
+      messageIds: [],
+      messagesById: {},
+      streamingMessageId: null,
+      isStreaming: false,
+      abortFn: null,
+    });
+  });
+
+  it("resets the evidence selection when the session changes to a different id", async () => {
+    window.history.pushState({}, "", "/chat/1");
+    renderAtRoute(<ChatShell />);
+    await waitFor(() => {
+      expect(mockStoreState.resetEvidenceSelection).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      window.history.pushState({}, "", "/chat/2");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await waitFor(() => {
+      expect(mockStoreState.resetEvidenceSelection).toHaveBeenCalledTimes(2);
+    });
+
+    window.history.pushState({}, "", "/");
+  });
+
+  it("resets the evidence selection when starting a new chat", async () => {
+    window.history.pushState({}, "", "/chat/1");
+    renderAtRoute(<ChatShell />);
+    await waitFor(() => {
+      expect(mockStoreState.resetEvidenceSelection).toHaveBeenCalledTimes(1);
+    });
+
+    act(() => {
+      window.history.pushState({}, "", "/");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await waitFor(() => {
+      expect(mockStoreState.resetEvidenceSelection).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("does NOT reset when the loaded session id is already active (same-id load)", async () => {
+    const { useChatStore } = await import("@/stores/useChatStore");
+    useChatStore.setState({ activeChatId: "1" });
+    window.history.pushState({}, "", "/chat/1");
+    renderAtRoute(<ChatShell />);
+
+    // Same-id: no fetch is even issued and no reset happens.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(chatShellGetChatSession).not.toHaveBeenCalled();
+    expect(mockStoreState.resetEvidenceSelection).not.toHaveBeenCalled();
+
+    window.history.pushState({}, "", "/");
+  });
+
+  it("does NOT reset on clearMessages (same-session wipe)", async () => {
+    const { useChatStore } = await import("@/stores/useChatStore");
+    renderAtRoute(<ChatShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const baseline = (mockStoreState.resetEvidenceSelection as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    act(() => {
+      useChatStore.getState().clearMessages();
+    });
+    expect((mockStoreState.resetEvidenceSelection as ReturnType<typeof vi.fn>).mock.calls.length).toBe(baseline);
   });
 });

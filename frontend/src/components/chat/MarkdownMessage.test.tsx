@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
+  CITATION_SKIP_NODE_TYPES,
   MarkdownMessage,
   MarkdownMessageTestInternals,
   parseCitationSegments,
@@ -90,6 +91,106 @@ describe("parseCitationSegments - legacy [Source: name]", () => {
       SOURCES
     );
     expect(citedSources.map((s) => s.id)).toEqual(["s1"]);
+  });
+});
+
+describe("parseCitationSegments - markdown-aware citation collection (UI-046)", () => {
+  it("does not derive evidence cards from markers only inside fenced code blocks", () => {
+    const { citedSources } = parseCitationSegments(
+      '```ts\nconst marker = "[S1]";\n```',
+      SOURCES
+    );
+    expect(citedSources).toEqual([]);
+  });
+
+  it("does not derive evidence cards from markers only inside inline code", () => {
+    const { citedSources } = parseCitationSegments("Run `[S2]` first.", SOURCES);
+    expect(citedSources).toEqual([]);
+  });
+
+  it("derives evidence cards from prose markers", () => {
+    const { citedSources } = parseCitationSegments("Per [S1], we conclude.", SOURCES);
+    expect(citedSources.map((s) => s.id)).toEqual(["s1"]);
+  });
+
+  it("collects only the prose marker when prose and code both contain markers", () => {
+    const { citedSources } = parseCitationSegments(
+      "See [S1] and `code [S2]` for details.",
+      SOURCES
+    );
+    expect(citedSources.map((s) => s.id)).toEqual(["s1"]);
+  });
+
+  it("still resolves legacy filename citations in prose", () => {
+    const { citedSources } = parseCitationSegments(
+      "See [Source: a.pdf] for details.",
+      SOURCES
+    );
+    expect(citedSources.map((s) => s.id)).toEqual(["s1"]);
+  });
+
+  it("does not collect legacy filename markers located in fenced code", () => {
+    const { citedSources } = parseCitationSegments("```\n[Source: a.pdf]\n```", SOURCES);
+    expect(citedSources).toEqual([]);
+  });
+
+  it("collects markers inside a markdown link's text (reachable prose child)", () => {
+    const { citedSources } = parseCitationSegments(
+      "Click [hello [S1] world](https://example.com) now.",
+      SOURCES
+    );
+    expect(citedSources.map((s) => s.id)).toEqual(["s1"]);
+  });
+
+  it("does not collect markers from a link title or an HTML comment", () => {
+    const linkTitle = parseCitationSegments(
+      '[t](https://example.com "title [S1]")',
+      SOURCES
+    );
+    expect(linkTitle.citedSources).toEqual([]);
+    const htmlComment = parseCitationSegments("<!-- [S1] -->", SOURCES);
+    expect(htmlComment.citedSources).toEqual([]);
+  });
+});
+
+describe("CITATION_SKIP_NODE_TYPES", () => {
+  it("pins the shared skip list consumed by the remark plugin and the label walker", () => {
+    expect([...CITATION_SKIP_NODE_TYPES]).toEqual(["code", "inlineCode"]);
+  });
+});
+
+describe("MarkdownMessage citation chip focus anchor (issue #508)", () => {
+  it("stamps data-citation-chip-message on document citation chip wrappers", () => {
+    render(<MarkdownMessage content="Per [S1]." sources={SOURCES} messageId="msg-7" />);
+
+    const chip = document.querySelector('[data-citation-chip-message="msg-7"]');
+    expect(chip).not.toBeNull();
+    // Programmatically focusable so ChatShell's focus restore can land on it.
+    expect(chip).toHaveAttribute("tabindex", "-1");
+  });
+
+  it("omits the anchor attribute when no messageId is provided", () => {
+    render(<MarkdownMessage content="Per [S1]." sources={SOURCES} />);
+
+    expect(document.querySelector("[data-citation-chip-message]")).toBeNull();
+  });
+});
+
+describe("MarkdownMessage code-located citation markers", () => {
+  it("renders a prose marker as a citation chip but leaves code-located markers literal", () => {
+    render(<MarkdownMessage content={"Per [S1] and `code [S2]`."} sources={SOURCES} />);
+
+    expect(screen.getAllByLabelText(/Source S1: a\.pdf/i).length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByLabelText(/Source S2: b\.pdf/i)).not.toBeInTheDocument();
+    // The code-located marker stays literal text inside the code element.
+    expect(screen.getByText("code [S2]").tagName).toBe("CODE");
+  });
+
+  it("does not render a citation chip when the marker appears only in fenced code", () => {
+    render(<MarkdownMessage content={'```ts\nconst marker = "[S1]";\n```'} sources={SOURCES} />);
+
+    expect(screen.queryByLabelText(/Source S1: a\.pdf/i)).not.toBeInTheDocument();
+    expect(screen.getByText('const marker = "[S1]";')).toBeInTheDocument();
   });
 });
 

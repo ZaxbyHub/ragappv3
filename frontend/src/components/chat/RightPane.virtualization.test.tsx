@@ -2,6 +2,7 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { StrictMode } from "react";
 import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { RightPane } from "./RightPane";
 import * as useChatStoreModule from "@/stores/useChatStore";
@@ -10,6 +11,7 @@ import * as useChatShellStoreModule from "@/stores/useChatShellStore";
 const apiMocks = vi.hoisted(() => ({
   getChunkContext: vi.fn(),
   getDocumentRawBlob: vi.fn(),
+  getArtifactRawBlob: vi.fn(),
 }));
 
 // Mock @tanstack/react-virtual
@@ -74,6 +76,13 @@ vi.mock("@/stores/useChatStore", () => {
   });
   const useLastCompletedAssistantWikiRefsMock = vi.fn(() => undefined);
   const useLastCompletedAssistantKmsRefsMock = vi.fn(() => undefined);
+  const useStreamingCandidateSourcesMock = vi.fn(() => {
+    const state = chatStoreMock() ?? {};
+    const id = (state as { streamingMessageId?: string }).streamingMessageId;
+    if (!id) return undefined;
+    const messages = messagesFromMock();
+    return messages.find((m: any) => m?.id === id)?.candidateSources;
+  });
   return {
     useChatStore: chatStoreMock,
     useChatMessages: useChatMessagesMock,
@@ -83,6 +92,7 @@ vi.mock("@/stores/useChatStore", () => {
     useLastUserContent: useLastUserContentMock,
     useSourcesForSourceId: useSourcesForSourceIdMock,
     useCompletedAssistantMessageIdsKey: useCompletedAssistantMessageIdsKeyMock,
+    useStreamingCandidateSources: useStreamingCandidateSourcesMock,
     parseCompletedAssistantIds: (key: string) => {
       if (!key) return [];
       try { const p = JSON.parse(key); return Array.isArray(p) ? p.map(String) : []; } catch { return []; }
@@ -97,6 +107,7 @@ vi.mock("@/stores/useChatShellStore", () => ({
 vi.mock("@/lib/api", () => ({
   getChunkContext: (...args: unknown[]) => apiMocks.getChunkContext(...args),
   getDocumentRawBlob: (...args: unknown[]) => apiMocks.getDocumentRawBlob(...args),
+  getArtifactRawBlob: (...args: unknown[]) => apiMocks.getArtifactRawBlob(...args),
 }));
 
 // Mock UI components with proper interactivity
@@ -189,6 +200,9 @@ describe("RightPane virtualization", () => {
     apiMocks.getChunkContext.mockRejectedValue(new Error("No context"));
     apiMocks.getDocumentRawBlob.mockResolvedValue(
       new Blob(["%PDF-1.4\n"], { type: "application/pdf" })
+    );
+    apiMocks.getArtifactRawBlob.mockResolvedValue(
+      new Blob(["fake-png"], { type: "image/png" })
     );
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:preview");
     vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
@@ -658,6 +672,30 @@ describe("RightPane virtualization", () => {
       expect(frame).toHaveAttribute("src", "blob:preview#page=9");
     });
 
+    it("targets no page and does not crash when page_number is null", async () => {
+      const source = createMockSource({
+        id: "src-null-page",
+        file_id: "47",
+        filename: "unpaged.pdf",
+        page_number: null,
+      });
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "unpaged" }),
+          createMockMessage({ role: "assistant", content: "response", sources: [source] }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+      fireEvent.click(screen.getByText("unpaged.pdf").closest("button")!);
+      fireEvent.click(await screen.findByRole("button", { name: /open document/i }));
+
+      const frame = await screen.findByTitle("Preview of unpaged.pdf");
+      // No page target: plain blob URL with no #page fragment.
+      expect(frame).toHaveAttribute("src", "blob:preview");
+    });
+
     it("falls back to downloading the original for non-PDF sources", async () => {
       apiMocks.getDocumentRawBlob.mockResolvedValueOnce(
         new Blob(["<script>window.opener.location='https://evil.example'</script>"], {
@@ -750,6 +788,97 @@ describe("RightPane virtualization", () => {
       });
 
       expect(URL.createObjectURL).not.toHaveBeenCalled();
+    });
+  });
+
+  // ===========================================================================
+  // UI-034 — artifact blob URL lifecycle (issue #508)
+  // ===========================================================================
+  describe("artifact blob URL lifecycle (UI-034)", () => {
+    const renderWithArtifactSource = (source: ReturnType<typeof createMockSource>) => {
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "chart" }),
+          createMockMessage({ role: "assistant", content: "response", sources: [source] }),
+        ],
+        expandedSources: new Set(),
+      });
+      return render(<RightPane />);
+    };
+
+    it("revokes the artifact blob URL exactly once on unmount, under StrictMode", async () => {
+      let seq = 0;
+      vi.mocked(URL.createObjectURL).mockImplementation(() => `blob:artifact-${++seq}`);
+      vi.mocked(URL.revokeObjectURL).mockClear();
+      const source = createMockSource({
+        id: "src-art-strict",
+        filename: "strict-mode.png",
+        modality: "image",
+        artifact_id: "atom-strict",
+      });
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "chart" }),
+          createMockMessage({ role: "assistant", content: "response", sources: [source] }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      const { unmount } = render(
+        <StrictMode>
+          <RightPane />
+        </StrictMode>
+      );
+      fireEvent.click(screen.getByText("strict-mode.png").closest("button")!);
+
+      await waitFor(() => {
+        expect(document.querySelector("img")).not.toBeNull();
+      });
+      // StrictMode double-invokes the effect; only the surviving instance's
+      // fetch creates a URL — exactly one create, later revoked exactly once.
+      expect(seq).toBe(1);
+
+      unmount();
+
+      expect(URL.revokeObjectURL).toHaveBeenCalledTimes(1);
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:artifact-1");
+    });
+
+    it("unmount during an in-flight artifact fetch creates no URL, revokes nothing, and applies no late state", async () => {
+      let resolveBlob!: (blob: Blob) => void;
+      apiMocks.getArtifactRawBlob.mockReturnValueOnce(
+        new Promise<Blob>((resolve) => {
+          resolveBlob = resolve;
+        })
+      );
+      const source = createMockSource({
+        id: "src-art-inflight",
+        filename: "inflight.png",
+        modality: "image",
+        artifact_id: "atom-inflight",
+      });
+
+      const { unmount } = renderWithArtifactSource(source);
+      fireEvent.click(screen.getByText("inflight.png").closest("button")!);
+
+      await waitFor(() => {
+        expect(apiMocks.getArtifactRawBlob).toHaveBeenCalledWith(
+          "atom-inflight",
+          expect.anything()
+        );
+      });
+      unmount();
+      vi.mocked(URL.createObjectURL).mockClear();
+      vi.mocked(URL.revokeObjectURL).mockClear();
+
+      await act(async () => {
+        resolveBlob(new Blob(["late-bytes"], { type: "image/png" }));
+        await Promise.resolve();
+      });
+
+      expect(URL.createObjectURL).not.toHaveBeenCalled();
+      expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+      expect(document.querySelector("img")).toBeNull();
     });
   });
 });

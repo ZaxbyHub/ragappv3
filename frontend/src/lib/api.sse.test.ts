@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { parseSSEStream, type ChatStreamCallbacks } from "./api";
 
 function makeReader(
@@ -179,6 +181,147 @@ describe("parseSSEStream — repaired_content (#217)", () => {
       { type: "done", sources: [], memories_used: [], score_type: "distance" },
     ]);
     expect(out.finalContentCalls).toEqual([]);
+  });
+});
+
+describe("parseSSEStream - evidence candidate events (issue #508)", () => {
+  const CANDIDATES = [
+    {
+      id: "42_default_0",
+      file_id: "42",
+      filename: "handbook.pdf",
+      section: "Maintenance",
+      source_label: "S1",
+      page_number: 3,
+      snippet: "The coolant interval is 500 hours.",
+      score: 0.87,
+      score_type: "rerank",
+      metadata: { page_number: 3 },
+    },
+  ];
+
+  async function runEvidence(events: object[]) {
+    const candidateCalls: unknown[][] = [];
+    const contents: string[] = [];
+    const errors: string[] = [];
+    let completed = false;
+
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: (c) => contents.push(c),
+      onEvidenceCandidates: (c) => candidateCalls.push(c),
+      onError: (e) => errors.push(e.message),
+      onComplete: () => {
+        completed = true;
+      },
+    };
+
+    await parseSSEStream(makeReader(events), callbacks);
+    return { candidateCalls, contents, errors, completed };
+  }
+
+  it("forwards version-1 evidence candidates to onEvidenceCandidates and keeps streaming", async () => {
+    const out = await runEvidence([
+      { type: "evidence", version: 1, phase: "candidates", candidates: CANDIDATES },
+      { type: "content", content: "answer" },
+    ]);
+
+    expect(out.candidateCalls).toHaveLength(1);
+    expect(out.candidateCalls[0]).toEqual(CANDIDATES);
+    expect(out.contents).toEqual(["answer"]);
+    expect(out.completed).toBe(true);
+    expect(out.errors).toEqual([]);
+  });
+
+  it("forwards an empty candidates array without crashing", async () => {
+    const out = await runEvidence([
+      { type: "evidence", version: 1, phase: "candidates", candidates: [] },
+    ]);
+
+    expect(out.candidateCalls).toHaveLength(1);
+    expect(out.candidateCalls[0]).toEqual([]);
+    expect(out.errors).toEqual([]);
+    expect(out.completed).toBe(true);
+  });
+
+  it("ignores evidence events with an unknown version", async () => {
+    const out = await runEvidence([
+      { type: "evidence", version: 2, phase: "candidates", candidates: CANDIDATES },
+    ]);
+
+    expect(out.candidateCalls).toEqual([]);
+    expect(out.errors).toEqual([]);
+  });
+
+  it("ignores evidence events with no version", async () => {
+    const out = await runEvidence([
+      { type: "evidence", phase: "candidates", candidates: CANDIDATES },
+    ]);
+
+    expect(out.candidateCalls).toEqual([]);
+    expect(out.errors).toEqual([]);
+  });
+
+  it("ignores evidence events whose candidates are malformed", async () => {
+    const out = await runEvidence([
+      { type: "evidence", version: 1, phase: "candidates", candidates: "not-an-array" },
+    ]);
+
+    expect(out.candidateCalls).toEqual([]);
+    expect(out.errors).toEqual([]);
+  });
+
+  it("drops a malformed JSON evidence chunk and keeps streaming", async () => {
+    const candidateCalls: unknown[][] = [];
+    const contents: string[] = [];
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: (c) => contents.push(c),
+      onEvidenceCandidates: (c) => candidateCalls.push(c),
+      onComplete: () => {},
+    };
+
+    await parseSSEStream(
+      makeRawReader([
+        'data: {"type": "evidence", "version": 1, "candidates": [bro\n\n',
+        `data: ${JSON.stringify({ type: "content", content: "after-bad-evidence" })}\n\n`,
+        "data: [DONE]\n\n",
+      ]),
+      callbacks
+    );
+
+    expect(candidateCalls).toEqual([]);
+    expect(contents).toEqual(["after-bad-evidence"]);
+  });
+
+  it("drives the real parser from the shared backend fixture line", async () => {
+    const fixturePath = resolve(
+      __dirname,
+      "../../../backend/tests/fixtures/evidence_candidates_sse_line.txt"
+    );
+    const line = readFileSync(fixturePath, "utf8").trimEnd();
+
+    const candidateCalls: unknown[][] = [];
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: () => {},
+      onEvidenceCandidates: (c) => candidateCalls.push(c),
+      onComplete: () => {},
+    };
+
+    await parseSSEStream(makeRawReader([`data: ${line}\n\n`, "data: [DONE]\n\n"]), callbacks);
+
+    expect(candidateCalls).toHaveLength(1);
+    const candidates = candidateCalls[0] as Array<{
+      id: string;
+      filename: string;
+      snippet: string;
+      score: number;
+    }>;
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      id: "42_default_0",
+      filename: "handbook.pdf",
+      snippet: "The coolant interval is 500 hours.",
+      score: 0.87,
+    });
   });
 });
 

@@ -5,6 +5,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { MarkdownMessage } from "@/components/chat/MarkdownMessage";
+import { SourceSpanPopover } from "@/components/chat/SourceSpanPopover";
 import type { Source } from "@/lib/api";
 
 vi.mock("shiki", () => ({
@@ -122,7 +123,7 @@ describe("SC-006 Source span inspection popover", () => {
 });
 
 describe("SC-009 Citation confidence indicators", () => {
-  it("renders a confidence dot when citationConfidence is provided", () => {
+  it("renders an overlap dot when citationConfidence is provided", () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."
@@ -131,12 +132,12 @@ describe("SC-009 Citation confidence indicators", () => {
       />
     );
 
-    // At least one confidence dot should be present (may appear in chip AND popover)
-    const dots = screen.getAllByRole("img", { name: /85% confidence/i });
+    // At least one overlap dot should be present (may appear in chip AND popover)
+    const dots = screen.getAllByRole("img", { name: "85% textual overlap" });
     expect(dots.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("does not render a confidence dot when score is undefined", () => {
+  it("does not render an overlap dot when score is undefined", () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."
@@ -149,7 +150,7 @@ describe("SC-009 Citation confidence indicators", () => {
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 
-  it("renders a high-confidence (green) dot for score >= 0.7", () => {
+  it("renders a high-overlap (green) dot for score >= 0.7", () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."
@@ -159,12 +160,12 @@ describe("SC-009 Citation confidence indicators", () => {
     );
 
     // At least one green dot should be present
-    const dots = screen.getAllByRole("img", { name: /90% confidence/i });
+    const dots = screen.getAllByRole("img", { name: "90% textual overlap" });
     expect(dots.length).toBeGreaterThanOrEqual(1);
     expect(dots[0]).toHaveClass("bg-emerald-500");
   });
 
-  it("renders a medium-confidence (amber) dot for score >= 0.4 and < 0.7", () => {
+  it("renders a medium-overlap (amber) dot for score >= 0.4 and < 0.7", () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."
@@ -174,12 +175,12 @@ describe("SC-009 Citation confidence indicators", () => {
     );
 
     // At least one amber dot should be present
-    const dots = screen.getAllByRole("img", { name: /55% confidence/i });
+    const dots = screen.getAllByRole("img", { name: "55% textual overlap" });
     expect(dots.length).toBeGreaterThanOrEqual(1);
     expect(dots[0]).toHaveClass("bg-amber-500");
   });
 
-  it("renders a low-confidence (red) dot for score < 0.4", () => {
+  it("renders a low-overlap (red) dot for score < 0.4", () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."
@@ -189,12 +190,12 @@ describe("SC-009 Citation confidence indicators", () => {
     );
 
     // At least one red dot should be present
-    const dots = screen.getAllByRole("img", { name: /25% confidence/i });
+    const dots = screen.getAllByRole("img", { name: "25% textual overlap" });
     expect(dots.length).toBeGreaterThanOrEqual(1);
     expect(dots[0]).toHaveClass("bg-red-500");
   });
 
-  it("shows confidence in the popover header when present", async () => {
+  it("shows the overlap indicator in the popover header when present", async () => {
     render(
       <MarkdownMessage
         content="Per [S1], revenue grew."
@@ -207,8 +208,70 @@ describe("SC-009 Citation confidence indicators", () => {
     fireEvent.click(chip);
 
     const popoverContent = screen.getByTestId("popover-content");
-    // The popover should show the confidence indicator
+    // The popover should show the overlap indicator
     expect(popoverContent.querySelector("[role='img']")).toBeInTheDocument();
+  });
+});
+
+describe("honest overlap labeling (CHAT-UX-05)", () => {
+  it("renders the exact 'X% textual overlap' aria-label via the MarkdownMessage call site", () => {
+    render(
+      <MarkdownMessage
+        content="Per [S1], revenue grew."
+        sources={SOURCES}
+        citationConfidence={{ S1: 0.72 }}
+      />
+    );
+
+    expect(screen.getAllByRole("img", { name: "72% textual overlap" }).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("renders the exact 'X% textual overlap' aria-label via the SourceSpanPopover call site", () => {
+    render(
+      <SourceSpanPopover source={SOURCES[0]} label="S1" confidence={0.72}>
+        <button type="button">trigger</button>
+      </SourceSpanPopover>
+    );
+
+    expect(screen.getByRole("img", { name: "72% textual overlap" })).toBeInTheDocument();
+  });
+
+  it("describes the lexical-overlap semantics on the indicator", () => {
+    render(
+      <SourceSpanPopover source={SOURCES[0]} label="S1" confidence={0.72}>
+        <button type="button">trigger</button>
+      </SourceSpanPopover>
+    );
+
+    const dot = screen.getByRole("img", { name: "72% textual overlap" });
+    expect(dot.getAttribute("title")).toContain(
+      "Word overlap between the claim and the cited passage — a lexical measure, not a probability of correctness; distinct from retrieval relevance."
+    );
+  });
+
+  it("never renders the word 'confidence' in the default label", () => {
+    render(
+      <MarkdownMessage
+        content="Per [S1], revenue grew."
+        sources={SOURCES}
+        citationConfidence={{ S1: 0.85 }}
+      />
+    );
+
+    // Both call sites (chip + popover) render their indicators — none of them
+    // may describe the score as "confidence" by default.
+    const dots = screen.getAllByRole("img");
+    expect(dots.length).toBeGreaterThanOrEqual(1);
+    for (const dot of dots) {
+      expect(dot.getAttribute("aria-label")).not.toMatch(/confidence/i);
+      expect(dot.getAttribute("title")).not.toMatch(/confidence/i);
+    }
+  });
+
+  it("still prefers an explicit label prop when one is passed", async () => {
+    const { CitationConfidence } = await import("@/components/chat/CitationConfidence");
+    render(<CitationConfidence score={0.75} label="Custom label" />);
+    expect(screen.getByRole("img", { name: "Custom label" })).toBeInTheDocument();
   });
 });
 
@@ -295,7 +358,7 @@ describe("CitationConfidence component unit tests", () => {
   it("renders with correct accessible label", async () => {
     const { CitationConfidence } = await import("@/components/chat/CitationConfidence");
     render(<CitationConfidence score={0.75} />);
-    expect(screen.getByRole("img", { name: "75% confidence" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "75% textual overlap" })).toBeInTheDocument();
   });
 
   it("accepts custom label", async () => {

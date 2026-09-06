@@ -372,6 +372,103 @@ describe("TranscriptPane", () => {
     });
   });
 
+  describe("jump to answer (message-anchored evidence jump)", () => {
+    let scrollIntoViewTargets: Element[];
+    beforeEach(() => {
+      scrollIntoViewTargets = [];
+      Element.prototype.scrollIntoView = vi.fn(function (this: Element) {
+        scrollIntoViewTargets.push(this);
+      });
+    });
+
+    const SHARED_SOURCE = { id: "shared-src", filename: "shared.pdf", source_label: "S1" };
+    const OTHER_SOURCE = { id: "other-src", filename: "other.pdf", source_label: "S1" };
+
+    const setTwoAnswersSharingOneSource = () => {
+      _mockMessageCount = 2;
+      setMockMessages([
+        {
+          id: "m1",
+          role: "assistant",
+          content: "First answer cites the source.",
+          sources: [SHARED_SOURCE],
+        },
+        {
+          id: "m2",
+          role: "assistant",
+          content: "Second answer cites the same source again.",
+          sources: [SHARED_SOURCE],
+        },
+      ]);
+    };
+
+    // The transcript row wrapper rendered by TranscriptPane carries
+    // data-message-id; its first child is the MessageRow ring div.
+    const ringFor = (msgId: string): HTMLElement => {
+      const wrappers = document.querySelectorAll(`[data-message-id="${msgId}"]`);
+      expect(wrappers.length).toBeGreaterThan(0);
+      return wrappers[0].firstElementChild as HTMLElement;
+    };
+
+    it("highlights the LATER message when the jump carries its messageId", () => {
+      setTwoAnswersSharingOneSource();
+      render(<TranscriptPane />);
+
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent("evidence:jump-to-answer", {
+            detail: { sourceId: "shared-src", messageId: "m2" },
+          })
+        );
+      });
+
+      expect(ringFor("m2")).toHaveClass("ring-2");
+      expect(ringFor("m1")).not.toHaveClass("ring-2");
+      expect(scrollIntoViewTargets).toHaveLength(1);
+      expect(scrollIntoViewTargets[0].getAttribute("data-message-id")).toBe("m2");
+    });
+
+    it("falls back to legacy first-match when no messageId is dispatched", () => {
+      // Persisted/forked selections have no message anchor — the jump must
+      // still resolve to the first message citing the source.
+      setTwoAnswersSharingOneSource();
+      render(<TranscriptPane />);
+
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent("evidence:jump-to-answer", {
+            detail: { sourceId: "shared-src" },
+          })
+        );
+      });
+
+      expect(ringFor("m1")).toHaveClass("ring-2");
+      expect(ringFor("m2")).not.toHaveClass("ring-2");
+      expect(scrollIntoViewTargets[0].getAttribute("data-message-id")).toBe("m1");
+    });
+
+    it("falls back to first-match when the anchored message exists but does not cite the source", () => {
+      _mockMessageCount = 3;
+      setMockMessages([
+        { id: "m1", role: "assistant", content: "First answer.", sources: [SHARED_SOURCE] },
+        { id: "m2", role: "assistant", content: "Second answer.", sources: [SHARED_SOURCE] },
+        { id: "m3", role: "assistant", content: "Unrelated answer.", sources: [OTHER_SOURCE] },
+      ]);
+      render(<TranscriptPane />);
+
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent("evidence:jump-to-answer", {
+            detail: { sourceId: "shared-src", messageId: "m3" },
+          })
+        );
+      });
+
+      expect(ringFor("m1")).toHaveClass("ring-2");
+      expect(scrollIntoViewTargets[0].getAttribute("data-message-id")).toBe("m1");
+    });
+  });
+
   describe("3. Scroll-to-bottom button appears when scrolled up", () => {
     it("TranscriptPane has scroll area element", () => {
       render(<TranscriptPane />);

@@ -30,73 +30,56 @@ if (typeof Element !== "undefined" && !Element.prototype.scrollTo) {
 // MOCK STORES
 // =============================================================================
 
-vi.mock("@/stores/useChatShellStore", () => ({
-  __esModule: true,
-  default: vi.fn((selector?: (s: any) => any) => {
-    const state = {
-      sessionRailOpen: true,
-      rightPaneOpen: true,
-      rightPaneWidth: 360,
-      sessionRailWidth: 260,
-      activeSessionId: "session-1",
-      activeSessionTitle: "Test Session",
-      sessionListRefreshToken: 0,
-      sessionSearchQuery: "",
-      pinnedSessionIds: [] as number[],
-      selectedEvidenceSource: null,
-      activeRightTab: "evidence" as const,
-      toggleSessionRail: vi.fn(),
-      toggleRightPane: vi.fn(),
-      setRightPaneWidth: vi.fn(),
-      setSessionRailWidth: vi.fn(),
-      setActiveSessionId: vi.fn(),
-      setActiveSessionTitle: vi.fn(),
-      requestSessionListRefresh: vi.fn(),
-      openSessionRail: vi.fn(),
-      closeSessionRail: vi.fn(),
-      openRightPane: vi.fn(),
-      closeRightPane: vi.fn(),
-      setSessionSearchQuery: vi.fn(),
-      togglePinSession: vi.fn(),
-      isSessionPinned: vi.fn(() => false),
-      setSelectedEvidenceSource: vi.fn(),
-      setActiveRightTab: vi.fn(),
-    };
-    return typeof selector === "function" ? selector(state) : state;
-  }),
-  useChatShellStore: vi.fn((selector?: (s: any) => any) => {
-    const state = {
-      sessionRailOpen: true,
-      rightPaneOpen: true,
-      rightPaneWidth: 360,
-      sessionRailWidth: 260,
-      activeSessionId: "session-1",
-      activeSessionTitle: "Test Session",
-      sessionListRefreshToken: 0,
-      sessionSearchQuery: "",
-      pinnedSessionIds: [] as number[],
-      selectedEvidenceSource: null,
-      activeRightTab: "evidence" as const,
-      toggleSessionRail: vi.fn(),
-      toggleRightPane: vi.fn(),
-      setRightPaneWidth: vi.fn(),
-      setSessionRailWidth: vi.fn(),
-      setActiveSessionId: vi.fn(),
-      setActiveSessionTitle: vi.fn(),
-      requestSessionListRefresh: vi.fn(),
-      openSessionRail: vi.fn(),
-      closeSessionRail: vi.fn(),
-      openRightPane: vi.fn(),
-      closeRightPane: vi.fn(),
-      setSessionSearchQuery: vi.fn(),
-      togglePinSession: vi.fn(),
-      isSessionPinned: vi.fn(() => false),
-      setSelectedEvidenceSource: vi.fn(),
-      setActiveRightTab: vi.fn(),
-    };
-    return typeof selector === "function" ? selector(state) : state;
-  }),
-}));
+vi.mock("@/stores/useChatShellStore", () => {
+  const makeHook = () => {
+    const hook = vi.fn((selector?: (s: any) => any) => {
+      const state = {
+        sessionRailOpen: true,
+        rightPaneOpen: true,
+        rightPaneWidth: 360,
+        sessionRailWidth: 260,
+        activeSessionId: "session-1",
+        activeSessionTitle: "Test Session",
+        sessionListRefreshToken: 0,
+        sessionSearchQuery: "",
+        pinnedSessionIds: [] as number[],
+        selectedEvidenceSource: null,
+        selectedEvidenceMessageId: null as string | null,
+        evidenceReturnFocusId: null as string | null,
+        activeRightTab: "evidence" as const,
+        toggleSessionRail: vi.fn(),
+        toggleRightPane: vi.fn(),
+        setRightPaneWidth: vi.fn(),
+        setSessionRailWidth: vi.fn(),
+        setActiveSessionId: vi.fn(),
+        setActiveSessionTitle: vi.fn(),
+        requestSessionListRefresh: vi.fn(),
+        openSessionRail: vi.fn(),
+        closeSessionRail: vi.fn(),
+        openRightPane: vi.fn(),
+        closeRightPane: vi.fn(),
+        setSessionSearchQuery: vi.fn(),
+        togglePinSession: vi.fn(),
+        isSessionPinned: vi.fn(() => false),
+        setSelectedEvidenceSource: vi.fn(),
+        setActiveRightTab: vi.fn(),
+        resetEvidenceSelection: vi.fn(),
+      };
+      return typeof selector === "function" ? selector(state) : state;
+    });
+    // zustand-shaped static accessor — ChatShell's session-reset wiring calls
+    // useChatShellStore.getState().resetEvidenceSelection().
+    (hook as unknown as { getState: () => unknown }).getState = () => ({
+      resetEvidenceSelection: vi.fn(),
+    });
+    return hook;
+  };
+  return {
+    __esModule: true,
+    default: makeHook(),
+    useChatShellStore: makeHook(),
+  };
+});
 
 vi.mock("@/stores/useChatStore", () => ({
   useChatStore: vi.fn((selector?: (s: any) => any) => {

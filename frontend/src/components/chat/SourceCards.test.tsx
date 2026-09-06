@@ -83,3 +83,35 @@ describe("SourceCards synthesized badge", () => {
     expect(screen.queryByText("Synthesized")).not.toBeInTheDocument();
   });
 });
+
+describe("SourceCards cited/retrieved badge (issue #508)", () => {
+  const noop = () => {};
+
+  const citedSource: Source = { id: "a", filename: "a.pdf", source_label: "S1" };
+  const retrievedSource: Source = { id: "b", filename: "b.pdf", source_label: "S2" };
+
+  it("shows Cited for labels in the valid set and Retrieved otherwise", () => {
+    render(
+      <SourceCards
+        sources={[citedSource, retrievedSource]}
+        onSourceClick={noop}
+        onViewAll={noop}
+        validCitationLabels={new Set(["S1"])}
+      />
+    );
+
+    expect(screen.getByText("Cited")).toBeInTheDocument();
+    expect(screen.getByText("Retrieved")).toBeInTheDocument();
+    // The badge vocabulary never claims verification.
+    expect(screen.queryByText("verified")).not.toBeInTheDocument();
+  });
+
+  it("renders no badge when validCitationLabels is absent (old callers unchanged)", () => {
+    render(
+      <SourceCards sources={[citedSource]} onSourceClick={noop} onViewAll={noop} />
+    );
+
+    expect(screen.queryByText("Cited")).not.toBeInTheDocument();
+    expect(screen.queryByText("Retrieved")).not.toBeInTheDocument();
+  });
+});

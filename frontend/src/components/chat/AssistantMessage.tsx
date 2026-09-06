@@ -48,7 +48,13 @@ export function AssistantMessage({
   messageFeedback,
 }: AssistantMessageProps) {
   const [isDebugActive, setIsDebugActive] = useState(false);
-  const { openRightPane, setSelectedEvidenceSource, setActiveRightTab } = useChatShellStore();
+  const {
+    openRightPane,
+    setSelectedEvidenceSource,
+    setSelectedEvidenceMessageId,
+    setEvidenceReturnFocusId,
+    setActiveRightTab,
+  } = useChatShellStore();
   const prefersReducedMotion = useReducedMotion();
 
   // Derive cited sources, memories, wiki refs, and KMS refs for evidence cards
@@ -67,11 +73,23 @@ export function AssistantMessage({
   const handleSourceClick = useCallback(
     (source: Source) => {
       setSelectedEvidenceSource(source);
+      // Anchor the selection to THIS message so jumps resolve here even when
+      // a later answer cites the same chunk, and focus can return to its chip.
+      setSelectedEvidenceMessageId(message.id);
+      setEvidenceReturnFocusId(message.id);
       setActiveRightTab("evidence");
       openRightPane();
       onSourceClick?.(source);
     },
-    [setSelectedEvidenceSource, setActiveRightTab, openRightPane, onSourceClick]
+    [
+      setSelectedEvidenceSource,
+      setSelectedEvidenceMessageId,
+      setEvidenceReturnFocusId,
+      setActiveRightTab,
+      openRightPane,
+      onSourceClick,
+      message.id,
+    ]
   );
 
   const handleViewAll = useCallback(() => {
@@ -89,6 +107,12 @@ export function AssistantMessage({
   // Source cards: show ONLY sources explicitly cited as [S#] in the answer.
   // Do NOT fall back to all sources — uncited sources must not appear as evidence.
   const sourcesForCards = citedSources;
+  // Validated citation labels: the done event's citation_confidence carries
+  // one entry per VALID [S#] label, so its keys are the valid-label set.
+  // Undefined when the validator produced nothing — cards then show no badge.
+  const validCitationLabels = message.citationConfidence
+    ? new Set(Object.keys(message.citationConfidence))
+    : undefined;
   // Memory cards: show ONLY memories explicitly cited as [M#] in the answer.
   const memoriesForCards = citedMemories;
   // Wiki cards: show ONLY wiki refs explicitly cited as [W#] in the answer.
@@ -151,6 +175,7 @@ export function AssistantMessage({
           citedSources={citedSources}
           citationConfidence={message.citationConfidence}
           unverifiableClaims={message.unverifiableClaims}
+          messageId={message.id}
         />
 
         {/* Wiki cards — compiled knowledge cited as [W#] */}
@@ -169,6 +194,7 @@ export function AssistantMessage({
             sources={sourcesForCards}
             onSourceClick={handleSourceClick}
             onViewAll={handleViewAll}
+            validCitationLabels={validCitationLabels}
           />
         )}
 

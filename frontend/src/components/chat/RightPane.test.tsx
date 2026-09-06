@@ -5,7 +5,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { RightPane } from "./RightPane";
 import * as useChatStoreModule from "@/stores/useChatStore";
-import * as useChatShellStoreModule from "@/stores/useChatStore";
+import * as useChatShellStoreModule from "@/stores/useChatShellStore";
 import { getChunkContext, getArtifactRawBlob } from "@/lib/api";
 
 // Mock the stores
@@ -58,6 +58,13 @@ vi.mock("@/stores/useChatStore", () => {
   });
   const useLastCompletedAssistantWikiRefsMock = vi.fn(() => undefined);
   const useLastCompletedAssistantKmsRefsMock = vi.fn(() => undefined);
+  const useStreamingCandidateSourcesMock = vi.fn(() => {
+    const state = chatStoreMock() ?? {};
+    const id = (state as { streamingMessageId?: string }).streamingMessageId;
+    if (!id) return undefined;
+    const messages = messagesFromMock();
+    return messages.find((m: any) => m?.id === id)?.candidateSources;
+  });
   return {
     useChatStore: chatStoreMock,
     useChatMessages: useChatMessagesMock,
@@ -67,6 +74,7 @@ vi.mock("@/stores/useChatStore", () => {
     useLastUserContent: useLastUserContentMock,
     useSourcesForSourceId: useSourcesForSourceIdMock,
     useCompletedAssistantMessageIdsKey: useCompletedAssistantMessageIdsKeyMock,
+    useStreamingCandidateSources: useStreamingCandidateSourcesMock,
     parseCompletedAssistantIds: (key: string) => {
       if (!key) return [];
       try { const p = JSON.parse(key); return Array.isArray(p) ? p.map(String) : []; } catch { return []; }
@@ -146,6 +154,10 @@ vi.mock("@/components/ui/button", () => ({
 }));
 
 const mockUseChatStore = useChatStoreModule.useChatStore as unknown as ReturnType<
+  typeof vi.fn
+>;
+
+const mockUseChatShellStore = useChatShellStoreModule.useChatShellStore as unknown as ReturnType<
   typeof vi.fn
 >;
 
@@ -1245,10 +1257,460 @@ print("hello")
   });
 
   // =============================================================================
+  // CHAT-UX-04 — streaming candidate evidence surface (issue #508)
+  // =============================================================================
+  describe("streaming candidate evidence (CHAT-UX-04)", () => {
+    it("shows candidates under a 'Retrieved — not yet cited' heading while streaming, without any cited badge", () => {
+      const candidates = [
+        createMockSource({ id: "cand-1", filename: "candidate-one.pdf" }),
+        createMockSource({ id: "cand-2", filename: "candidate-two.pdf" }),
+      ];
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "question" }),
+          createMockMessage({
+            id: "stream-1",
+            role: "assistant",
+            content: "",
+            candidateSources: candidates,
+          }),
+        ],
+        streamingMessageId: "stream-1",
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+
+      expect(screen.getByText("Retrieved — not yet cited")).toBeInTheDocument();
+      expect(screen.getAllByText("candidate-one.pdf").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("candidate-two.pdf").length).toBeGreaterThan(0);
+      // Candidates are retrieved, never presented as cited/verified evidence.
+      expect(screen.queryByText("Cited")).not.toBeInTheDocument();
+      expect(screen.queryByText("verified")).not.toBeInTheDocument();
+    });
+
+    it("done replaces candidates with the final sources list", () => {
+      const finalSources = [
+        createMockSource({ id: "final-1", filename: "final-source.pdf" }),
+      ];
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "question" }),
+          createMockMessage({
+            id: "done-1",
+            role: "assistant",
+            content: "Answer cites [S1].",
+            sources: finalSources,
+          }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+
+      expect(screen.queryByText("Retrieved — not yet cited")).not.toBeInTheDocument();
+      expect(screen.getAllByText("final-source.pdf").length).toBeGreaterThan(0);
+    });
+
+    it("hides the candidates section when the streaming message delivered an empty candidate list", () => {
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "question" }),
+          createMockMessage({
+            id: "stream-empty",
+            role: "assistant",
+            content: "",
+            candidateSources: [],
+          }),
+        ],
+        streamingMessageId: "stream-empty",
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+
+      expect(screen.queryByText("Retrieved — not yet cited")).not.toBeInTheDocument();
+    });
+
+    it("renders no candidates surface when the message has no candidateSources field (old backend)", () => {
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "question" }),
+          createMockMessage({ id: "stream-none", role: "assistant", content: "" }),
+        ],
+        streamingMessageId: "stream-none",
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+
+      expect(screen.queryByText("Retrieved — not yet cited")).not.toBeInTheDocument();
+    });
+  });
+
+  // =============================================================================
+  // UI-035 — artifact error keeps the expanded text fallback (issue #508)
+  // =============================================================================
+  describe("artifact error keeps expanded text (UI-035)", () => {
+    it("renders the artifact error notice AND the expanded context text together", async () => {
+      vi.mocked(getArtifactRawBlob).mockRejectedValueOnce(new Error("404 Not Found"));
+      const sources = [
+        createMockSource({
+          id: "src-art-err",
+          filename: "broken-chart.png",
+          modality: "image",
+          artifact_id: "atom-err",
+          snippet: "A chart about revenue",
+        }),
+      ];
+
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "chart" }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      render(<RightPane />);
+
+      const sourceButton = screen.getAllByRole("button").find(btn =>
+        btn.textContent?.includes("broken-chart.png")
+      );
+      expect(sourceButton).toBeInTheDocument();
+      fireEvent.click(sourceButton!);
+
+      await waitFor(() => {
+        expect(getArtifactRawBlob).toHaveBeenCalledWith("atom-err", expect.anything());
+      });
+
+      // The artifact failure notice appears...
+      await waitFor(() => {
+        expect(
+          screen.getByText("Asset unavailable; showing text preview only.")
+        ).toBeInTheDocument();
+      });
+      // ...AND the expanded chunk context stays visible below it (not replaced).
+      await waitFor(() => {
+        expect(screen.getByText("Expanded source context")).toBeInTheDocument();
+      });
+    });
+  });
+
+  // =============================================================================
+  // UI-036 — punctuation-bearing query terms highlight (issue #508)
+  // =============================================================================
+  describe("highlightQueryTerms punctuation (UI-036)", () => {
+    const openPreview = async (query: string, contextText: string, snippet: string) => {
+      vi.mocked(getChunkContext).mockResolvedValue({
+        id: "src-1",
+        file_id: "1",
+        filename: "doc.pdf",
+        chunk_index: 0,
+        chunk_text: "Snippet content",
+        context_text: contextText,
+        context_source: "parent_window",
+      });
+      const sources = [
+        createMockSource({ id: "src-1", filename: "doc.pdf", snippet }),
+      ];
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: query }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      const { container } = render(<RightPane />);
+      const sourceButton = screen.getAllByRole("button").find(btn =>
+        btn.textContent?.includes("doc.pdf")
+      );
+      fireEvent.click(sourceButton!);
+      await waitFor(() => {
+        expect(screen.getByText("Jump to answer")).toBeInTheDocument();
+      });
+      const marks = () =>
+        Array.from(
+          container.querySelectorAll("mark:not([data-support-span])")
+        ).map((m) => m.textContent);
+      return { marks };
+    };
+
+    it("marks punctuation-bearing terms (C++ compiler) as search matches", async () => {
+      const { marks } = await openPreview(
+        "C++ compiler",
+        "The C++ compiler optimizes this loop.",
+        "Older notes"
+      );
+      await waitFor(() => {
+        expect(marks()).toContain("C++");
+        expect(marks()).toContain("compiler");
+      });
+    });
+
+    it("marks a dotted filename term (config.json) literally", async () => {
+      const { marks } = await openPreview(
+        "config.json",
+        "Edit the config.json file before shipping.",
+        "Older notes"
+      );
+      await waitFor(() => {
+        expect(marks()).toContain("config.json");
+      });
+    });
+  });
+
+  // =============================================================================
+  // CHAT-UX-02 — support-span highlight + honest not-located note (issue #508)
+  // =============================================================================
+  describe("support-span highlight (CHAT-UX-02)", () => {
+    const openPreviewWith = async (snippet: string | undefined, contextText: string) => {
+      vi.mocked(getChunkContext).mockResolvedValue({
+        id: "src-span",
+        file_id: "1",
+        filename: "doc.pdf",
+        chunk_index: 0,
+        chunk_text: "Snippet content",
+        context_text: contextText,
+        context_source: "parent_window",
+      });
+      const sources = [
+        createMockSource({ id: "src-span", filename: "span-doc.pdf", snippet }),
+      ];
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "" }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(),
+      });
+
+      const { container } = render(<RightPane />);
+      const sourceButton = screen.getAllByRole("button").find(btn =>
+        btn.textContent?.includes("span-doc.pdf")
+      );
+      fireEvent.click(sourceButton!);
+      await waitFor(() => {
+        expect(screen.getByText("Jump to answer")).toBeInTheDocument();
+      });
+      return container;
+    };
+
+    it("marks the first literal occurrence of the snippet in the loaded context as a support span", async () => {
+      const container = await openPreviewWith(
+        "the exact support passage",
+        "Surrounding text. Here is the exact support   passage inside the window. More text."
+      );
+
+      const span = container.querySelector("mark[data-support-span]");
+      expect(span).not.toBeNull();
+      // Whitespace-normalized literal match: the run of spaces collapses.
+      expect(span!.textContent).toBe("the exact support   passage");
+    });
+
+    it("renders the honest not-located note when the snippet is absent from the context", async () => {
+      await openPreviewWith(
+        "a distilled excerpt that is not verbatim in the parent window",
+        "Completely different surrounding parent-window text."
+      );
+
+      expect(
+        screen.getByText("Supporting passage not located in expanded context.")
+      ).toBeInTheDocument();
+      expect(document.querySelector("mark[data-support-span]")).toBeNull();
+    });
+
+    it("renders the not-located note when the source has no snippet at all", async () => {
+      await openPreviewWith(undefined, "Loaded parent-window context text.");
+
+      expect(
+        screen.getByText("Supporting passage not located in expanded context.")
+      ).toBeInTheDocument();
+    });
+  });
+
+  // =============================================================================
+  // CHAT-UX — evidence location line + context retry (issue #508 WU-11)
+  // =============================================================================
+  describe("evidence location line + context retry", () => {
+    const openPreview = async (sources: ReturnType<typeof createMockSource>[]) => {
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "question" }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(),
+      });
+      render(<RightPane />);
+    };
+
+    const clickSource = (filename: string) => {
+      const sourceButton = screen.getAllByRole("button").find(btn =>
+        btn.textContent?.includes(filename)
+      );
+      fireEvent.click(sourceButton!);
+    };
+
+    it("renders the derived location line (Page N) in the preview header", async () => {
+      await openPreview([
+        createMockSource({ id: "src-loc", filename: "located.pdf", page_number: 4, snippet: "A snippet" }),
+      ]);
+      clickSource("located.pdf");
+
+      await waitFor(() => {
+        expect(screen.getByText("Jump to answer")).toBeInTheDocument();
+      });
+      expect(screen.getByText("Page 4")).toBeInTheDocument();
+    });
+
+    it("renders 'Location unavailable' when no location is derivable", async () => {
+      await openPreview([
+        createMockSource({ id: "src-noloc", filename: "unlocated.pdf", snippet: "A snippet" }),
+      ]);
+      clickSource("unlocated.pdf");
+
+      await waitFor(() => {
+        expect(screen.getByText("Location unavailable")).toBeInTheDocument();
+      });
+    });
+
+    it("shows the saved excerpt with an unavailability notice and Retry when the context fetch fails", async () => {
+      vi.mocked(getChunkContext).mockRejectedValueOnce(new Error("404 Not Found"));
+      await openPreview([
+        createMockSource({
+          id: "src-404",
+          filename: "gone.pdf",
+          snippet: "The saved excerpt text",
+        }),
+      ]);
+      clickSource("gone.pdf");
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("Showing saved excerpt — original context unavailable")
+        ).toBeInTheDocument();
+      });
+      expect(screen.getAllByText("The saved excerpt text").length).toBeGreaterThan(0);
+      expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    });
+
+    it("clears the error and renders the context after fail → retry → success", async () => {
+      vi.mocked(getChunkContext)
+        .mockRejectedValueOnce(new Error("503"))
+        .mockResolvedValueOnce({
+          id: "src-retry",
+          file_id: "1",
+          filename: "retry.pdf",
+          chunk_index: 0,
+          chunk_text: "t",
+          context_text: "Retry succeeded context",
+          context_source: "chunk",
+        });
+      await openPreview([
+        createMockSource({ id: "src-retry", filename: "retry.pdf", snippet: "Old excerpt" }),
+      ]);
+      clickSource("retry.pdf");
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("Showing saved excerpt — original context unavailable")
+        ).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+      await waitFor(() => {
+        expect(screen.getByText("Retry succeeded context")).toBeInTheDocument();
+      });
+      expect(
+        screen.queryByText("Showing saved excerpt — original context unavailable")
+      ).not.toBeInTheDocument();
+    });
+
+    it("keeps the excerpt and notice after fail → retry → fail", async () => {
+      vi.mocked(getChunkContext)
+        .mockRejectedValueOnce(new Error("503"))
+        .mockRejectedValueOnce(new Error("504"));
+      await openPreview([
+        createMockSource({ id: "src-2fail", filename: "twofail.pdf", snippet: "Persistent excerpt" }),
+      ]);
+      clickSource("twofail.pdf");
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("Showing saved excerpt — original context unavailable")
+        ).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+      // Second failure keeps the saved excerpt + notice (still retryable).
+      await waitFor(() => {
+        expect(getChunkContext).toHaveBeenCalledTimes(2);
+      });
+      expect(
+        screen.getByText("Showing saved excerpt — original context unavailable")
+      ).toBeInTheDocument();
+      expect(screen.getAllByText("Persistent excerpt").length).toBeGreaterThan(0);
+    });
+
+    it("a retried fetch superseded by a source switch never lands on the new source", async () => {
+      let resolveRetry!: (value: Awaited<ReturnType<typeof getChunkContext>>) => void;
+      vi.mocked(getChunkContext)
+        .mockRejectedValueOnce(new Error("404"))
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              resolveRetry = resolve;
+            })
+        );
+      await openPreview([
+        createMockSource({ id: "src-switch-a", filename: "switch-a.pdf", snippet: "Excerpt A" }),
+        createMockSource({ id: "src-switch-b", filename: "switch-b.pdf", snippet: "Excerpt B" }),
+      ]);
+      clickSource("switch-a.pdf");
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("Showing saved excerpt — original context unavailable")
+        ).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await waitFor(() => {
+        expect(getChunkContext).toHaveBeenCalledWith("src-switch-a");
+      });
+
+      // Switch sources while the retried fetch for A is still in flight.
+      clickSource("switch-b.pdf");
+      await waitFor(() => {
+        expect(getChunkContext).toHaveBeenCalledWith("src-switch-b");
+      });
+      await waitFor(() => {
+        expect(screen.getByText("Expanded source context")).toBeInTheDocument();
+      });
+
+      // The late resolve for A must not overwrite B's context.
+      await act(async () => {
+        resolveRetry({
+          id: "src-switch-a",
+          file_id: "1",
+          filename: "switch-a.pdf",
+          chunk_index: 0,
+          chunk_text: "t",
+          context_text: "STALE CONTEXT FOR A",
+          context_source: "chunk",
+        });
+        await Promise.resolve();
+      });
+      expect(screen.queryByText("STALE CONTEXT FOR A")).not.toBeInTheDocument();
+      expect(screen.getByText("Expanded source context")).toBeInTheDocument();
+    });
+  });
+
+  // =============================================================================
   // Custom event tests
   // =============================================================================
   describe("Jump to answer event dispatching", () => {
-    it("should dispatch custom event on Jump to answer click", async () => {
+    it("should dispatch custom event on Jump to answer click with messageId null for pane-list selections", async () => {
       const dispatchSpy = vi.spyOn(window, "dispatchEvent");
       const sources = [
         createMockSource({ id: "src-1", filename: "doc.pdf", snippet: "Content" }),
@@ -1264,9 +1726,9 @@ print("hello")
 
       render(<RightPane />);
 
-      // Click on source first
+      // Click on source first (pane-list selection — no anchored message)
       const sourceButtons = screen.getAllByRole("button");
-      const sourceButton = sourceButtons.find(btn => 
+      const sourceButton = sourceButtons.find(btn =>
         btn.textContent?.includes("doc.pdf")
       );
       if (sourceButton) {
@@ -1281,12 +1743,58 @@ print("hello")
       const jumpButton = screen.getByText("Jump to answer");
       fireEvent.click(jumpButton);
 
-      // Verify event was dispatched
+      // Verify event was dispatched with a null message anchor (legacy
+      // first-match fallback in TranscriptPane).
       expect(dispatchSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           type: "evidence:jump-to-answer",
           detail: expect.objectContaining({
             sourceId: expect.any(String),
+            messageId: null,
+          }),
+        })
+      );
+    });
+
+    it("should carry the anchored message id when the selection came from a citation chip", async () => {
+      const dispatchSpy = vi.spyOn(window, "dispatchEvent");
+      const sources = [
+        createMockSource({ id: "src-1", filename: "doc.pdf", snippet: "Content" }),
+      ];
+
+      mockUseChatStore.mockReturnValue({
+        messages: [
+          createMockMessage({ role: "user", content: "test" }),
+          createMockMessage({ role: "assistant", content: "response", sources }),
+        ],
+        expandedSources: new Set(),
+      });
+      mockUseChatShellStore.mockReturnValue({
+        selectedEvidenceSource: null,
+        setSelectedEvidenceSource: vi.fn(),
+        activeRightTab: "evidence",
+        setActiveRightTab: vi.fn(),
+        selectedEvidenceMessageId: "msg-42",
+      });
+
+      render(<RightPane />);
+
+      const sourceButton = screen.getAllByRole("button").find(btn =>
+        btn.textContent?.includes("doc.pdf")
+      );
+      fireEvent.click(sourceButton!);
+
+      await waitFor(() => {
+        expect(screen.getByText("Jump to answer")).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByText("Jump to answer"));
+
+      expect(dispatchSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "evidence:jump-to-answer",
+          detail: expect.objectContaining({
+            sourceId: "src-1",
+            messageId: "msg-42",
           }),
         })
       );

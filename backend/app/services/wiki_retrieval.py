@@ -107,6 +107,7 @@ class WikiEvidence:
             "slug": self.slug,
             "page_type": self.page_type,
             "claim_text": self.claim_text,
+            "excerpt": self.excerpt,
             "confidence": self.confidence,
             "page_status": self.page_status,
             "claim_status": self.claim_status,

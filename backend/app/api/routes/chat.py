@@ -279,6 +279,22 @@ async def _enqueue_wiki_compile_job(
         logger.warning("Failed to enqueue wiki compile job for vault %d: %s", vault_id, exc)
 
 
+def _evidence_sse_line(candidates: List[Dict[str, Any]]) -> str:
+    """Build the SSE line for the versioned evidence-candidates event."""
+    return (
+        "data: "
+        + json.dumps(
+            {
+                "type": "evidence",
+                "version": 1,
+                "phase": "candidates",
+                "candidates": candidates,
+            }
+        )
+        + "\n\n"
+    )
+
+
 def stream_chat_response(
     message: str,
     history: List[Dict[str, Any]],
@@ -399,6 +415,8 @@ def stream_chat_response(
                         # FR-015: forward pipeline stage events (Searching/Reading/Drafting)
                         # so the frontend can show progress feedback before content arrives.
                         yield f"data: {json.dumps({'type': 'stage', 'stage': chunk['stage']})}\n\n"
+                    elif chunk_type == "evidence_candidates":
+                        yield _evidence_sse_line(chunk.get("candidates", []))
                     elif chunk_type == "done":
                         sources = chunk.get("sources", [])
                         memories_used = chunk.get("memories_used", [])
@@ -597,6 +615,7 @@ async def non_stream_chat_response(
                 "[non_stream_chat_response] Received chunk type='%s'", chunk_type
             )
 
+            # evidence_candidates is intentionally ignored here — candidates surface only in streaming responses.
             if chunk_type == "content":
                 collected_content.append(chunk.get("content", ""))
             elif chunk_type == "done":

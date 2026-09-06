@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { getRelevanceLabel, type ScoreType } from "@/lib/relevance";
+import { resolveCitedState } from "@/lib/evidence";
 import type { Source } from "@/lib/api";
 
 const ARTIFACT_MODALITIES = new Set(["image", "chart", "table", "equation", "code"]);
@@ -13,6 +14,8 @@ interface SourceCardProps {
   source: Source;
   /** Fallback ordinal for legacy sources without a source_label. */
   fallbackIndex: number;
+  /** Validated citation labels — when present, cards show Cited/Retrieved. */
+  validCitationLabels?: Set<string>;
   onClick: () => void;
 }
 
@@ -26,7 +29,7 @@ export function getSourceBadgeLabel(source: Source, fallbackIndex: number): stri
   return `S${fallbackIndex + 1}`;
 }
 
-function SourceCard({ source, fallbackIndex, onClick }: SourceCardProps) {
+function SourceCard({ source, fallbackIndex, validCitationLabels, onClick }: SourceCardProps) {
   const [expanded, setExpanded] = useState(false);
 
   // Synthesized sources are LLM-condensed summaries of multiple chunks, not a
@@ -45,6 +48,9 @@ function SourceCard({ source, fallbackIndex, onClick }: SourceCardProps) {
   const isLong = snippet.length > 120;
   const displaySnippet = expanded || !isLong ? snippet : snippet.slice(0, 120) + "…";
   const badgeLabel = getSourceBadgeLabel(source, fallbackIndex);
+  // Honest cited-vs-retrieved distinction (issue #508): only render when the
+  // caller supplies validated labels — never claim "verified".
+  const citedState = resolveCitedState(source.source_label, validCitationLabels);
 
   return (
     <div
@@ -96,6 +102,24 @@ function SourceCard({ source, fallbackIndex, onClick }: SourceCardProps) {
               Synthesized
             </Badge>
           )}
+          {validCitationLabels && (
+            <Badge
+              variant="outline"
+              className={cn(
+                "text-[10px] px-1.5 py-0",
+                citedState === "cited"
+                  ? "text-emerald-600 border-emerald-500/30 bg-emerald-500/5"
+                  : "text-muted-foreground"
+              )}
+              aria-label={
+                citedState === "cited"
+                  ? "Cited in the answer"
+                  : "Retrieved but not cited in the answer"
+              }
+            >
+              {citedState === "cited" ? "Cited" : "Retrieved"}
+            </Badge>
+          )}
           {relevance && (
             <Badge variant="outline" className={cn("text-[10px] px-1.5 py-0", relevance.color)}>
               {relevance.text}
@@ -132,9 +156,11 @@ interface SourceCardsProps {
   onViewAll: () => void;
   /** Don't show anything if there are no sources */
   hideIfEmpty?: boolean;
+  /** Validated citation labels — when present, cards show Cited/Retrieved. */
+  validCitationLabels?: Set<string>;
 }
 
-export function SourceCards({ sources, onSourceClick, onViewAll, hideIfEmpty = true }: SourceCardsProps) {
+export function SourceCards({ sources, onSourceClick, onViewAll, hideIfEmpty = true, validCitationLabels }: SourceCardsProps) {
   const [showAll, setShowAll] = useState(false);
   const prefersReducedMotion = useReducedMotion();
 
@@ -182,6 +208,7 @@ export function SourceCards({ sources, onSourceClick, onViewAll, hideIfEmpty = t
               <SourceCard
                 source={source}
                 fallbackIndex={i}
+                validCitationLabels={validCitationLabels}
                 onClick={() => onSourceClick(source)}
               />
             </motion.div>

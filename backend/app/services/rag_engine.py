@@ -1563,6 +1563,17 @@ class RAGEngine:
                         "Query-time vision failed, continuing with proxies: %s", exc
                     )
 
+        # Versioned retrieval-candidate event: emitted after vision enrichment
+        # so candidates serialize identically to done.sources (minus the
+        # done-time evidence_type assignment). Emitted even when the list is
+        # empty — this point is reached only on the standard retrieval
+        # pipeline; the agentic early-return path above bypasses it.
+        yield {
+            "type": "evidence_candidates",
+            "version": 1,
+            "candidates": self._serialize_source_candidates(relevant_chunks),
+        }
+
         # Build messages using prompt builder service.
         # Resolve the org-specific prompt (if any) per-query so different orgs
         # always get their own version without stale caching on the builder.
@@ -2560,6 +2571,17 @@ class RAGEngine:
             out.append(candidate)
         return out
 
+    def _serialize_source_candidates(
+        self, relevant_chunks: List[RAGSource]
+    ) -> List[Dict[str, Any]]:
+        """Serialize chunks exactly as done.sources does: to_source_metadata
+        with 1-based source labels. evidence_type is NOT set here; it is a
+        done-time distinction assigned only to final sources."""
+        return [
+            self.document_retrieval.to_source_metadata(chunk, source_index=idx + 1)
+            for idx, chunk in enumerate(relevant_chunks)
+        ]
+
     def _build_done_message(
         self,
         relevant_chunks: List[RAGSource],
@@ -2615,15 +2637,11 @@ class RAGEngine:
         # Split into primary and supporting (same split as prompt builder)
         primary_count = calculate_primary_count(len(relevant_chunks))
 
-        sources = []
-        for idx, chunk in enumerate(relevant_chunks):
-            source_meta = self.document_retrieval.to_source_metadata(
-                chunk, source_index=idx + 1
-            )
+        sources = self._serialize_source_candidates(relevant_chunks)
+        for idx, source_meta in enumerate(sources):
             source_meta["evidence_type"] = (
                 "primary" if idx < primary_count else "supporting"
             )
-            sources.append(source_meta)
 
         # Build structured memories_used list with stable [M#] labels.
         # Memories are not document sources — they get their own label space.

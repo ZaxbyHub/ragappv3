@@ -3,6 +3,8 @@ import type { ReactNode, HTMLAttributes } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import remarkParse from "remark-parse";
+import { unified } from "unified";
 import rehypeKatex from "rehype-katex";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import type { Schema } from "hast-util-sanitize";
@@ -168,6 +170,10 @@ interface ParsedSegment {
  *
  * Returns text/citation segments so a single ReactMarkdown pass runs per
  * text segment while citations are rendered as interactive chips.
+ *
+ * Evidence-card derivation is markdown-aware: only markers reachable in PROSE
+ * text (per {@link collectCitationLabels}) produce cards. Markers inside
+ * fenced blocks or inline code stay literal text and never become evidence.
  */
 export function parseCitationSegments(
   content: string,
@@ -189,6 +195,7 @@ export function parseCitationSegments(
   //  4. kms number      (e.g. "4" from "[K4]")
   //  5. legacy filename (e.g. "report.pdf" from "[Source: report.pdf]")
   const regex = /\[S(\d+)\]|\[M(\d+)\]|\[W(\d+)\]|\[K(\d+)\]|\[Source:\s*([^\]]+)\]/g;
+  const reachableLabels = collectCitationLabels(content);
   const segments: ParsedSegment[] = [];
   const citedSources: Source[] = [];
   const citedMemories: UsedMemory[] = [];
@@ -215,7 +222,7 @@ export function parseCitationSegments(
         if (sources && idx >= 0 && idx < sources.length) source = sources[idx];
       }
       segments.push({ type: "citation", sourceName: label });
-      if (source && !seenSourceIds.has(source.id)) {
+      if (source && reachableLabels.has(label) && !seenSourceIds.has(source.id)) {
         citedSources.push(source);
         seenSourceIds.add(source.id);
       }
@@ -228,7 +235,7 @@ export function parseCitationSegments(
         if (memories && idx >= 0 && idx < memories.length) memory = memories[idx];
       }
       segments.push({ type: "memory_citation", memoryLabel: label });
-      if (memory && !seenMemoryIds.has(memory.id)) {
+      if (memory && reachableLabels.has(label) && !seenMemoryIds.has(memory.id)) {
         citedMemories.push(memory);
         seenMemoryIds.add(memory.id);
       }
@@ -241,7 +248,7 @@ export function parseCitationSegments(
         if (wikiRefs && idx >= 0 && idx < wikiRefs.length) wiki = wikiRefs[idx];
       }
       segments.push({ type: "wiki_citation", wikiLabel: label });
-      if (wiki && !seenWikiLabels.has(label)) {
+      if (wiki && reachableLabels.has(label) && !seenWikiLabels.has(label)) {
         citedWikis.push(wiki);
         seenWikiLabels.add(label);
       }
@@ -254,7 +261,7 @@ export function parseCitationSegments(
         if (kmsRefs && idx >= 0 && idx < kmsRefs.length) kms = kmsRefs[idx];
       }
       segments.push({ type: "kms_citation", kmsLabel: label });
-      if (kms && !seenKmsLabels.has(label)) {
+      if (kms && reachableLabels.has(label) && !seenKmsLabels.has(label)) {
         citedKms.push(kms);
         seenKmsLabels.add(label);
       }
@@ -263,7 +270,7 @@ export function parseCitationSegments(
       const sourceName = match[5].trim();
       const source = sources?.find((s) => s.filename === sourceName);
       segments.push({ type: "citation", sourceName });
-      if (source && !seenSourceIds.has(source.id)) {
+      if (source && reachableLabels.has(sourceName) && !seenSourceIds.has(source.id)) {
         citedSources.push(source);
         seenSourceIds.add(source.id);
       }
@@ -289,11 +296,67 @@ export function parseCitationSegments(
 
 const CITATION_REGEX = /\[(S|M|W|K)(\d+)\]|\[Source:\s*([^\]]+)\]/g;
 
+/**
+ * mdast node types whose text is CODE, not prose. Citation markers found in
+ * these nodes must stay literal and must never yield chips or evidence cards.
+ * Shared by the inline chip transform (``remarkCitations``) and the evidence
+ * label walker (``collectCitationLabels``) so both traversals skip the exact
+ * same nodes.
+ */
+export const CITATION_SKIP_NODE_TYPES = ["code", "inlineCode"] as const;
+
+function isCitationSkipNodeType(node: MdastNode): boolean {
+  return (CITATION_SKIP_NODE_TYPES as readonly string[]).includes(node.type);
+}
+
 interface MdastNode {
   type: string;
   value?: string;
   children?: MdastNode[];
   data?: Record<string, unknown>;
+}
+
+// Frozen parser for the evidence-label walk — remark-parse is stateless per
+// parse() call, so one processor serves every message.
+const citationTreeParser = unified().use(remarkParse);
+
+/**
+ * Walk the markdown AST and collect every citation label that appears in
+ * REACHABLE PROSE text — the same marker grammar the inline chip transform
+ * recognizes, and the same code-node skip list. Text inside code blocks and
+ * inline code is skipped; link TEXT children are reachable (they are prose);
+ * link titles and raw HTML values are not visited by construction (they are
+ * properties, not text-node children), so markers there are never collected.
+ */
+function collectCitationLabels(content: string): Set<string> {
+  const labels = new Set<string>();
+  if (!content) return labels;
+  let tree: MdastNode;
+  try {
+    tree = citationTreeParser.parse(content) as unknown as MdastNode;
+  } catch {
+    // Unparseable markdown must never break card derivation — fall back to
+    // an empty reachable set (no evidence cards).
+    return labels;
+  }
+  const visit = (node: MdastNode | undefined): void => {
+    if (!node || isCitationSkipNodeType(node)) return;
+    if (node.type === "text") {
+      const text = node.value ?? "";
+      if (text) {
+        CITATION_REGEX.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = CITATION_REGEX.exec(text)) !== null) {
+          labels.add(match[1] ? `${match[1]}${match[2]}` : match[3].trim());
+        }
+      }
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) visit(child);
+    }
+  };
+  visit(tree);
+  return labels;
 }
 
 function remarkCitations() {
@@ -302,7 +365,7 @@ function remarkCitations() {
       if (!node) return;
       // Do not transform inside code spans / code blocks — citation markers
       // there must render as literal text.
-      if (node.type === "code" || node.type === "inlineCode") return;
+      if (isCitationSkipNodeType(node)) return;
       if (Array.isArray(node.children)) {
         for (let i = node.children.length - 1; i >= 0; i--) {
           transformNode(node.children[i], node);
@@ -449,6 +512,12 @@ interface MarkdownMessageProps {
   citedSources?: Source[];
   citationConfidence?: Record<string, number>;
   unverifiableClaims?: string[];
+  /**
+   * Owning message id — stamped on document-citation chip wrappers as
+   * data-citation-chip-message so ChatShell can restore focus to the chip
+   * that opened the evidence pane (issue #508).
+   */
+  messageId?: string;
 }
 
 /**
@@ -478,6 +547,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
   citedSources: externalCitedSources,
   citationConfidence,
   unverifiableClaims,
+  messageId,
 }: MarkdownMessageProps) {
   // Skip the full parseCitationSegments scan when the caller already supplies
   // citedSources (the AssistantMessage production path, which runs the
@@ -613,7 +683,11 @@ export const MarkdownMessage = memo(function MarkdownMessage({
           label={label}
           confidence={confidenceScore}
         >
-          <span className="inline-flex items-center align-baseline">
+          <span
+            className="inline-flex items-center align-baseline"
+            data-citation-chip-message={messageId}
+            tabIndex={messageId ? -1 : undefined}
+          >
             <SourceCitation
               source={source}
               index={dispIdx >= 0 ? dispIdx : 0}

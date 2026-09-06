@@ -58,6 +58,7 @@ export default function ChatShell() {
     setSessionRailWidth,
     setActiveSessionId,
     closeRightPane,
+    evidenceReturnFocusId,
   } = useChatShellStore();
 
   const isMobile = useIsMobile();
@@ -66,6 +67,9 @@ export default function ChatShell() {
   // NOT suppress the fixed inset-0 bg-black/40 overlay — it would dim the whole
   // desktop layout whenever rightPaneOpen flips true on lg+ widths.
   const isBelowLg = useIsMobile(1024);
+  // Fallback focus target when the evidence pane closes without a citation
+  // chip to return to (issue #508 / PRODUCT-ENH-10).
+  const rightPaneToggleRef = useRef<HTMLButtonElement>(null);
   const messages = useChatMessages();
   const { open: shortcutsOpen, setOpen: setShortcutsOpen } = useKeyboardShortcuts();
   // Mobile Sheet uses its own state, toggled by the same button
@@ -249,6 +253,8 @@ export default function ChatShell() {
       // Clear the marker so a delete-then-undo refetch of the same id re-runs
       // coherently instead of being skipped as "already loaded".
       loadedSessionRef.current = null;
+      // New chat: evidence selection belongs to the previous session.
+      useChatShellStore.getState().resetEvidenceSelection();
       return;
     }
     if (sessionId === loadedSessionRef.current) return;
@@ -258,6 +264,10 @@ export default function ChatShell() {
       loadedSessionRef.current = sessionId;
       return;
     }
+    // Switching to a DIFFERENT session: drop the old session's evidence
+    // selection (jump anchor + focus target) before the new transcript loads.
+    // Same-id loads and clearMessages never reach this line.
+    useChatShellStore.getState().resetEvidenceSelection();
     loadedSessionRef.current = sessionId;
     const seq = ++loadSeqRef.current;
     (async () => {
@@ -282,6 +292,30 @@ export default function ChatShell() {
   useEffect(() => {
     if (!isMobile) setMobileSheetOpen(false);
   }, [isMobile]);
+
+  // PRODUCT-ENH-10 (issue #508): Escape closes the evidence pane (desktop
+  // aside or mobile drawer) and restores focus — AFTER the close, via rAF so
+  // the DOM is stable — to the citation chip that opened it, falling back to
+  // the pane toggle button.
+  useEffect(() => {
+    if (!rightPaneOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      closeRightPane();
+      requestAnimationFrame(() => {
+        const chip = evidenceReturnFocusId
+          ? document.querySelector(`[data-citation-chip-message="${evidenceReturnFocusId}"]`)
+          : null;
+        if (chip instanceof HTMLElement) {
+          chip.focus();
+        } else {
+          rightPaneToggleRef.current?.focus();
+        }
+      });
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [rightPaneOpen, closeRightPane, evidenceReturnFocusId]);
 
   const handleResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -494,7 +528,7 @@ export default function ChatShell() {
             aria-label="Export chat">
             <Download className="h-5 w-5" aria-hidden="true" />
           </Button>
-          <Button variant="ghost" size="icon" onClick={toggleRightPane}
+          <Button ref={rightPaneToggleRef} variant="ghost" size="icon" onClick={toggleRightPane}
             aria-label={rightPaneOpen ? "Hide details panel" : "Show details panel"}
             aria-pressed={rightPaneOpen}>
             <PanelRight className="h-5 w-5" aria-hidden="true" />
@@ -541,13 +575,17 @@ export default function ChatShell() {
         </div>
       </aside>
 
-      {/* MOBILE: Right Pane Sheet (slides from bottom, 75vh) */}
+      {/* MOBILE: Right Pane Sheet (slides from bottom, 75vh). Non-modal
+          (PRODUCT-ENH-10): no overlay, no focus trap — composer and transcript
+          stay interactive while the evidence drawer is open. */}
       {isBelowLg && (
-        <Sheet open={rightPaneOpen} onOpenChange={(open) => !open && closeRightPane()}>
-          <SheetContent side="bottom" className="h-[75vh] rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
-            <SheetHeader className="sr-only">
-              <SheetTitle id="evidence-sources-title">Evidence & Sources</SheetTitle>
-              <SheetDescription id="evidence-sources-desc">View retrieved evidence and source documents</SheetDescription>
+        <Sheet modal={false} open={rightPaneOpen} onOpenChange={(open) => !open && closeRightPane()}>
+          <SheetContent side="bottom" overlay={false} className="h-[75vh] rounded-t-xl p-0 lg:hidden" aria-describedby="evidence-sources-desc">
+            <SheetHeader className="px-4 pt-4 pb-2 border-b border-border">
+              <SheetTitle id="evidence-sources-title" className="text-base text-left">Evidence</SheetTitle>
+              <SheetDescription id="evidence-sources-desc" className="sr-only">
+                View retrieved evidence and source documents
+              </SheetDescription>
             </SheetHeader>
             <div className="absolute right-4 top-4 z-10">
               <SheetClose asChild>
@@ -556,7 +594,7 @@ export default function ChatShell() {
                 </Button>
               </SheetClose>
             </div>
-            <div className="flex h-full flex-col p-4 pt-12">
+            <div className="flex h-full flex-col p-4 pt-2">
               <ErrorBoundary fallback={sourcesFallback}>
                 <RightPane />
               </ErrorBoundary>

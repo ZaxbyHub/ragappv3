@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { KMSCards, KMSCard } from "./KMSCards";
 import type { KMSReference } from "@/lib/api";
@@ -64,5 +64,39 @@ describe("KMSCard", () => {
     expect(moreBtn).toBeInTheDocument();
     fireEvent.click(moreBtn);
     expect(screen.getByRole("button", { name: /less/i })).toBeInTheDocument();
+  });
+});
+
+describe("KMSCard — KMS entry deep link basename", () => {
+  // APP_BASENAME is computed at module load from import.meta.env, so the
+  // module under test must be re-imported fresh with the env stubbed.
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it("opens KMS entry with app basename prefix", async () => {
+    vi.resetModules();
+    vi.stubEnv("VITE_APP_BASENAME", "/meridian");
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    const { KMSCard: FreshCard } = await import("./KMSCards");
+
+    render(<FreshCard kmsRef={makeKms({ entry_id: 3 })} />);
+    fireEvent.click(screen.getByRole("button", { name: /Open knowledge entry/i }));
+
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy).toHaveBeenCalledWith("/meridian/kms/3", "_blank", "noopener,noreferrer");
+  });
+
+  it("opens KMS entry without a prefix at the deployment root", async () => {
+    vi.resetModules();
+    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+    const { KMSCard: FreshCard } = await import("./KMSCards");
+
+    render(<FreshCard kmsRef={makeKms({ entry_id: 3 })} />);
+    fireEvent.click(screen.getByRole("button", { name: /Open knowledge entry/i }));
+
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy).toHaveBeenCalledWith("/kms/3", "_blank", "noopener,noreferrer");
   });
 });

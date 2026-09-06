@@ -15,9 +15,11 @@ import {
   useSourcesForSourceId,
   useCompletedAssistantMessageIdsKey,
   parseCompletedAssistantIds,
+  useStreamingCandidateSources,
 } from "@/stores/useChatStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { getChunkContext, getDocumentRawBlob, getArtifactRawBlob, type ChunkContextResponse, type Source } from "@/lib/api";
+import { buildEvidenceView, type EvidenceLocation } from "@/lib/evidence";
 import { WikiCards } from "./WikiCards";
 import { KMSCards } from "./KMSCards";
 import { getRelevanceLabel, type ScoreType } from "@/lib/relevance";
@@ -50,10 +52,13 @@ function highlightQueryTerms(text: string, query: string): React.ReactNode[] {
     return [text];
   }
 
-  const terms = query
+  const rawTerms = query
     .split(/\s+/)
-    .filter((term) => term.length > 0)
-    .map((term) => escapeRegex(term));
+    .filter((term) => term.length > 0);
+  // Only the RegExp needs escaped terms; the split-part equality test must
+  // compare against the RAW terms, or punctuation-bearing matches ("C++",
+  // "config.json") render as plain text instead of marks.
+  const terms = rawTerms.map((term) => escapeRegex(term));
 
   if (terms.length === 0) {
     return [text];
@@ -63,7 +68,7 @@ function highlightQueryTerms(text: string, query: string): React.ReactNode[] {
   const parts = text.split(pattern);
 
   return parts.map((part, index) => {
-    if (terms.some((term) => part.toLowerCase() === term.toLowerCase())) {
+    if (rawTerms.some((term) => part.toLowerCase() === term.toLowerCase())) {
       return (
         <mark
           key={index}
@@ -283,6 +288,36 @@ function SourceListItem({
   );
 }
 
+/**
+ * Locate the first literal (whitespace-normalized) occurrence of the snippet
+ * within the expanded context text. Returns [start, end] character offsets, or
+ * null when the snippet is absent or not found — an expected outcome when the
+ * loaded context is a parent window that only partially covers the chunk.
+ */
+function findSupportSpanRange(
+  contextText: string,
+  snippet: string | undefined
+): [number, number] | null {
+  if (!snippet || !snippet.trim()) return null;
+  const tokens = snippet.trim().split(/\s+/).map((token) => escapeRegex(token));
+  if (tokens.length === 0) return null;
+  const pattern = new RegExp(tokens.join("\\s+"));
+  const match = pattern.exec(contextText);
+  if (!match) return null;
+  return [match.index, match.index + match[0].length];
+}
+
+/**
+ * Human-readable one-liner for an evidence location ("Page 4" / section /
+ * artifact description / honest "Location unavailable").
+ */
+function describeEvidenceLocation(location: EvidenceLocation): string {
+  if (location.kind === "pdf-page") return `Page ${location.pageNumber}`;
+  if (location.kind === "section") return location.section ?? "Section";
+  if (location.kind === "artifact") return location.description ?? "Artifact";
+  return "Location unavailable";
+}
+
 interface SourcePreviewProps {
   source: Source;
   query: string;
@@ -293,6 +328,9 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
   const [chunkContext, setChunkContext] = useState<ChunkContextResponse | null>(null);
   const [isLoadingContext, setIsLoadingContext] = useState(false);
   const [contextError, setContextError] = useState<string | null>(null);
+  // Bumping this token re-runs the context effect (Retry re-fetches ONLY the
+  // chunk-context path; artifact/document affordances own their own retries).
+  const [contextRetryToken, setContextRetryToken] = useState<number>(0);
   const [documentPreview, setDocumentPreview] = useState<{
     url: string;
     isPdf: boolean;
@@ -310,6 +348,13 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
   const highlightedContent = useMemo(
     () => highlightQueryTerms(previewContent, query),
     [previewContent, query]
+  );
+  // Support-span target (CHAT-UX-02): only meaningful against LOADED context —
+  // while loading (or after a fetch failure) there is nothing to locate in.
+  const contextText = chunkContext?.context_text;
+  const supportSpanRange = useMemo<[number, number] | null>(
+    () => (contextText ? findSupportSpanRange(contextText, source.snippet) : null),
+    [contextText, source.snippet]
   );
   // Synthesized sources are LLM-condensed summaries, not concrete documents:
   // no backing file to open, no chunk row to fetch context for, and no
@@ -329,6 +374,12 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
       : typeof source.metadata?.page_number === "number"
         ? source.metadata.page_number
         : null;
+  const evidenceView = buildEvidenceView(
+    source,
+    contextError
+      ? { state: "unavailable", unavailableReason: "context-unavailable" }
+      : undefined
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -356,7 +407,7 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
     return () => {
       cancelled = true;
     };
-  }, [source.id, isSynthesized]);
+  }, [source.id, isSynthesized, contextRetryToken]);
 
   useEffect(() => {
     setDocumentError(null);
@@ -379,29 +430,39 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
   useEffect(() => {
     artifactAbortRef.current?.abort();
     artifactAbortRef.current = null;
-    setArtifactPreview((current) => {
-      if (current) URL.revokeObjectURL(current);
-      return null;
-    });
+    // The previous effect instance's cleanup already revoked the URL it
+    // created (if any); this reset only clears the state reference.
+    setArtifactPreview(null);
     setArtifactError(null);
     if (!isRasterArtifact || isSynthesized) return;
 
     const controller = new AbortController();
     artifactAbortRef.current = controller;
+    // URL created by THIS effect instance — revoked exactly once by the
+    // cleanup below (rerun or unmount), never by the body reset above.
+    let createdUrl: string | null = null;
+    let revoked = false;
     getArtifactRawBlob(source.artifact_id!, controller.signal)
       .then((blob) => {
         if (controller.signal.aborted || artifactAbortRef.current !== controller) return;
         // Blocked/missing assets degrade to the proxy-only text preview
         // rather than breaking the pane: only treat a real HTTP failure as
         // an error, and fall back to the textual description otherwise.
-        setArtifactPreview(URL.createObjectURL(blob));
+        createdUrl = URL.createObjectURL(blob);
+        setArtifactPreview(createdUrl);
       })
       .catch(() => {
         if (controller.signal.aborted) return;
         setArtifactError("Asset unavailable; showing text preview only.");
       });
 
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (createdUrl !== null && !revoked) {
+        revoked = true;
+        URL.revokeObjectURL(createdUrl);
+      }
+    };
   }, [source.id, source.artifact_id, isRasterArtifact, isSynthesized]);
 
   const handleOpenDocument = useCallback(async () => {
@@ -465,6 +526,9 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
             Jump to answer
           </Button>
         </div>
+        <div className="text-xs text-muted-foreground" aria-label="Evidence location">
+          {describeEvidenceLocation(evidenceView.location)}
+        </div>
       </div>
 
       {(source.snippet || chunkContext?.context_source || isLoadingContext || contextError || documentError) && (
@@ -480,8 +544,20 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
               {chunkContext.context_source === "parent_window" ? "Document context" : "Chunk context"}
             </span>
           )}
-          {contextError && (
-            <span className="text-warning-foreground">{contextError}</span>
+          {evidenceView.availability.state === "unavailable" && (
+            <>
+              <span className="text-warning-foreground" role="status">
+                Showing saved excerpt — original context unavailable
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 px-2 text-xs"
+                onClick={() => setContextRetryToken((token) => token + 1)}
+              >
+                Retry
+              </Button>
+            </>
           )}
           {documentError && (
             <span className="text-warning-foreground">{documentError}</span>
@@ -532,9 +608,35 @@ function SourcePreview({ source, query, onJumpToAnswer }: SourcePreviewProps) {
       ) : (
         <ScrollArea className="flex-1 min-h-0 rounded-sm border p-4">
           <div className="text-sm leading-relaxed whitespace-pre-wrap">
-            {artifactError ? (
+            {artifactError && (
               <span className="text-warning-foreground">{artifactError}</span>
-            ) : previewContent ? highlightedContent : "No preview content available."}
+            )}
+            {previewContent ? (
+              supportSpanRange ? (
+                <>
+                  {highlightQueryTerms(previewContent.slice(0, supportSpanRange[0]), query)}
+                  <mark
+                    data-support-span
+                    className="bg-sky-200/70 dark:bg-sky-500/25 rounded-sm px-0.5"
+                    aria-label="Supporting passage"
+                  >
+                    {previewContent.slice(supportSpanRange[0], supportSpanRange[1])}
+                  </mark>
+                  {highlightQueryTerms(previewContent.slice(supportSpanRange[1]), query)}
+                </>
+              ) : (
+                <>
+                  {highlightedContent}
+                  {contextText && (
+                    <p className="mt-3 text-xs italic text-muted-foreground" role="note">
+                      Supporting passage not located in expanded context.
+                    </p>
+                  )}
+                </>
+              )
+            ) : (
+              !artifactError && "No preview content available."
+            )}
           </div>
         </ScrollArea>
       )}
@@ -577,7 +679,11 @@ export function RightPane() {
   const lastCompletedKmsRefs = useLastCompletedAssistantKmsRefs();
   const query = useLastUserContent();
   const completedAssistantIdsKey = useCompletedAssistantMessageIdsKey();
-  const { selectedEvidenceSource, setSelectedEvidenceSource, activeRightTab, setActiveRightTab } = useChatShellStore();
+  // Streaming-only candidate preview (issue #508): the versioned evidence SSE
+  // event delivers retrieved-but-not-yet-cited sources mid-stream. Reference-
+  // stable, so this never re-renders the pane on token growth.
+  const candidateSources = useStreamingCandidateSources();
+  const { selectedEvidenceSource, setSelectedEvidenceSource, activeRightTab, setActiveRightTab, selectedEvidenceMessageId } = useChatShellStore();
   const sourcesForSelected = useSourcesForSourceId(selectedEvidenceSource?.id);
   const [selectedSource, setSelectedSource] = useState<Source | null>(null);
   const [activeTab, setActiveTab] = useState<string>("sources");
@@ -666,17 +772,25 @@ export function RightPane() {
   }, [setSelectedEvidenceSource, setActiveRightTab]);
 
   const handleJumpToAnswer = useCallback(() => {
-    // Dispatch custom event for the transcript pane to handle
+    // Dispatch custom event for the transcript pane to handle. The message
+    // anchor is null when the selection came from the pane's own list — the
+    // transcript falls back to its legacy first-match scan in that case.
     if (selectedSource) {
       window.dispatchEvent(
         new CustomEvent("evidence:jump-to-answer", {
-          detail: { sourceId: selectedSource.id },
+          detail: {
+            sourceId: selectedSource.id,
+            messageId: selectedEvidenceMessageId ?? null,
+          },
         })
       );
     }
-  }, [selectedSource]);
+  }, [selectedSource, selectedEvidenceMessageId]);
 
   const hasSources = sources.length > 0;
+  // Empty candidate lists stay hidden (no heading flicker); absent field
+  // (old backend) never shows the section at all.
+  const hasCandidates = (candidateSources?.length ?? 0) > 0;
   const hasStructuredOutputs = structuredOutputs.length > 0;
   const hasWikiRefs = (lastCompletedWikiRefs?.length ?? 0) > 0;
   const hasKmsRefs = (lastCompletedKmsRefs?.length ?? 0) > 0;
@@ -736,7 +850,7 @@ export function RightPane() {
         </TabsList>
 
         <TabsContent value="sources" className="flex-1 min-h-0 mt-4 shrink-0">
-          {!hasSources ? (
+          {!hasSources && !hasCandidates ? (
             <div className="flex-1 min-w-[320px]">
               <EmptyState
                 icon={BookOpen}
@@ -744,56 +858,81 @@ export function RightPane() {
                 description="Send a message to see retrieved sources."
               />
             </div>
-          ) : shouldVirtualizeSources ? (
-            <div
-              ref={sourcesScrollRef}
-              className="h-full overflow-y-auto w-full min-w-[320px]"
-              aria-label="Sources list"
-              role="list"
-            >
-              <div style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}>
-                {sourcesVirtualizer.getVirtualItems().map((virtualItem) => {
-                  const source = sources[virtualItem.index];
-                  return (
-                    <div
-                      key={source.id}
-                      data-index={virtualItem.index}
-                      ref={sourcesVirtualizer.measureElement}
-                      style={{
-                        position: 'absolute',
-                        top: virtualItem.start,
-                        left: 0,
-                        width: '100%',
-                        paddingTop: '0.5rem',
-                      }}
-                    >
+          ) : (
+            <div className="flex h-full flex-col min-h-0 gap-4">
+              <div className="flex-1 min-h-0">
+                {shouldVirtualizeSources ? (
+                  <div
+                    ref={sourcesScrollRef}
+                    className="h-full overflow-y-auto w-full min-w-[320px]"
+                    aria-label="Sources list"
+                    role="list"
+                  >
+                    <div style={{ height: sourcesVirtualizer.getTotalSize(), position: 'relative' }}>
+                      {sourcesVirtualizer.getVirtualItems().map((virtualItem) => {
+                        const source = sources[virtualItem.index];
+                        return (
+                          <div
+                            key={source.id}
+                            data-index={virtualItem.index}
+                            ref={sourcesVirtualizer.measureElement}
+                            style={{
+                              position: 'absolute',
+                              top: virtualItem.start,
+                              left: 0,
+                              width: '100%',
+                              paddingTop: '0.5rem',
+                            }}
+                          >
+                            <SourceListItem
+                              source={source}
+                              index={virtualItem.index}
+                              isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
+                              scoreType={source.score_type}
+                              onClick={() => handleSourceClick(source)}
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : (
+                  <ScrollArea className="h-full min-w-[320px]">
+                    <div className="space-y-2">
+                      {sources.map((source, index) => (
+                        <SourceListItem
+                          key={source.id}
+                          source={source}
+                          index={index}
+                          isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
+                          scoreType={source.score_type}
+                          onClick={() => handleSourceClick(source)}
+                        />
+                      ))}
+                    </div>
+                  </ScrollArea>
+                )}
+              </div>
+              {hasCandidates && (
+                <div className="shrink-0 min-w-[320px]" data-testid="evidence-candidates">
+                  <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+                    Retrieved — not yet cited
+                  </h3>
+                  <div className="space-y-2">
+                    {candidateSources!.map((source, index) => (
                       <SourceListItem
+                        key={source.id}
                         source={source}
-                        index={virtualItem.index}
+                        index={index}
                         isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
                         scoreType={source.score_type}
                         onClick={() => handleSourceClick(source)}
                       />
-                    </div>
-                  );
-                })}
-              </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
-          ) : (
-            <ScrollArea className="h-full min-w-[320px]">
-              <div className="space-y-2">
-                {sources.map((source, index) => (
-                  <SourceListItem
-                    key={source.id}
-                    source={source}
-                    index={index}
-                    isSelected={selectedSource?.id === source.id || selectedEvidenceSource?.id === source.id}
-                    scoreType={source.score_type}
-                    onClick={() => handleSourceClick(source)}
-                  />
-                ))}
-              </div>
-            </ScrollArea>
           )}
         </TabsContent>
 

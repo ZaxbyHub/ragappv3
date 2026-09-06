@@ -1,16 +1,17 @@
 // frontend/src/components/chat/CitationConfidence.tsx
+import { useId } from "react";
 import { cn } from "@/lib/utils";
 
 interface CitationConfidenceProps {
   /**
-   * Confidence score between 0 and 1.
-   * - >= 0.7 → green (high confidence)
-   * - >= 0.4 → amber (medium confidence)
-   * - < 0.4 → red (low confidence)
+   * Textual-overlap score between 0 and 1.
+   * - >= 0.7 → green (high overlap)
+   * - >= 0.4 → amber (medium overlap)
+   * - < 0.4 → red (low overlap)
    * - undefined/null → no indicator rendered
    */
   score?: number;
-  /** Accessible label for the confidence indicator (defaults to score percentage) */
+  /** Accessible label for the overlap indicator (defaults to the overlap percentage) */
   label?: string;
   className?: string;
 }
@@ -26,6 +27,9 @@ const CONFIDENCE_COLORS = {
   low: "bg-red-500",
 } as const;
 
+const OVERLAP_DESCRIPTION =
+  "Word overlap between the claim and the cited passage — a lexical measure, not a probability of correctness; distinct from retrieval relevance.";
+
 function getConfidenceLevel(score: number): keyof typeof CONFIDENCE_COLORS {
   if (score >= CONFIDENCE_THRESHOLDS.high) return "high";
   if (score >= CONFIDENCE_THRESHOLDS.medium) return "medium";
@@ -33,17 +37,18 @@ function getConfidenceLevel(score: number): keyof typeof CONFIDENCE_COLORS {
 }
 
 /**
- * Renders a small colored dot indicating citation confidence.
- * Gracefully renders nothing when score is absent.
+ * Renders a small colored dot indicating how much of the cited passage's
+ * wording the claim overlaps. Gracefully renders nothing when score is absent.
  */
 export function CitationConfidence({ score, label, className }: CitationConfidenceProps) {
+  const descriptionId = useId();
   if (score === undefined || score === null) {
     return null;
   }
 
   const level = getConfidenceLevel(score);
   const colorClass = CONFIDENCE_COLORS[level];
-  const accessibleLabel = label ?? `${Math.round(score * 100)}% confidence`;
+  const accessibleLabel = label ?? `${Math.round(score * 100)}% textual overlap`;
 
   return (
     <span
@@ -52,9 +57,14 @@ export function CitationConfidence({ score, label, className }: CitationConfiden
         colorClass,
         className
       )}
-      title={accessibleLabel}
+      title={`${accessibleLabel} — ${OVERLAP_DESCRIPTION}`}
       aria-label={accessibleLabel}
+      aria-describedby={descriptionId}
       role="img"
-    />
+    >
+      <span id={descriptionId} className="sr-only">
+        {OVERLAP_DESCRIPTION}
+      </span>
+    </span>
   );
 }
