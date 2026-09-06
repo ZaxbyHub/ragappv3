@@ -193,8 +193,11 @@ class TestSSEHeartbeat(unittest.TestCase):
         import json
 
         # Build a mock RAG engine whose first chunk arrives after a simulated stall.
-        # We patch asyncio.wait_for to raise TimeoutError on the first call to
-        # simulate a 15s gap, then delegate to the real wait_for for subsequent calls.
+        # The stream loop awaits asyncio.wait on a persistent __anext__ task, so we
+        # patch asyncio.wait: the first call reports a full heartbeat interval
+        # elapsed with the task still pending (nothing done), simulating the 15s
+        # gap WITHOUT cancelling the task; subsequent calls delegate to the real
+        # asyncio.wait.
         async def mock_query(*args, **kwargs):
             yield {"type": "content", "content": "late"}
             yield {"type": "done", "sources": [], "memories_used": []}
@@ -204,19 +207,18 @@ class TestSSEHeartbeat(unittest.TestCase):
 
         from app.api.routes.chat import stream_chat_response
 
-        original_wait_for = asyncio.wait_for
+        original_wait = asyncio.wait
         call_count = [0]
 
-        async def mock_wait_for(coro, timeout):
+        async def mock_wait(fs, timeout=None):
             call_count[0] += 1
             if call_count[0] == 1:
-                coro.close()
-                raise asyncio.TimeoutError()
-            return await original_wait_for(coro, timeout)
+                return set(), set(fs)
+            return await original_wait(fs, timeout=timeout)
 
         async def run_test():
             results = []
-            with patch('app.api.routes.chat.asyncio.wait_for', mock_wait_for):
+            with patch('app.api.routes.chat.asyncio.wait', mock_wait):
                 response = stream_chat_response(
                     message="test", history=[], rag_engine=mock_engine
                 )

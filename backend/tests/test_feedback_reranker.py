@@ -80,9 +80,13 @@ class _SharedDB:
             _SharedDB._counter += 1
             self._id = _SharedDB._counter
 
+        # Include the pid: under pytest-xdist each worker is its own process
+        # with its own counter, and the shared %TEMP% dir made
+        # test_fb_reranker_1.db collide across workers once the test
+        # distribution shifted (UNIQUE constraint failed: chat_sessions.id).
         self._path = os.path.join(
             os.environ.get("TEMP", "/tmp"),
-            f"test_fb_reranker_{self._id}.db",
+            f"test_fb_reranker_{os.getpid()}_{self._id}.db",
         )
         self._conn = sqlite3.connect(self._path, isolation_level=None)
         self._conn.execute("PRAGMA foreign_keys = ON")
