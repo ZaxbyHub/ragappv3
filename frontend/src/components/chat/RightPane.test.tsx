@@ -1503,8 +1503,11 @@ print("hello")
         "Surrounding text. Here is the exact support   passage inside the window. More text."
       );
 
-      const span = container.querySelector("mark[data-support-span]");
-      expect(span).not.toBeNull();
+      const span = await waitFor(() => {
+        const mark = container.querySelector("mark[data-support-span]");
+        expect(mark).not.toBeNull();
+        return mark;
+      });
       // Whitespace-normalized literal match: the run of spaces collapses.
       expect(span!.textContent).toBe("the exact support   passage");
     });
