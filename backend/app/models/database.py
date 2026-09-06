@@ -550,6 +550,68 @@ CREATE INDEX IF NOT EXISTS idx_atom_enrichment_file
 """
 
 
+# Versioned code/document canvas (issue #509).
+#
+# Chat-generated output becomes an independently identified, versioned artifact.
+# `canvas_artifacts` carries the stable public identity (`artifact_uid`, minted
+# server-side as "cav_" + token), the originating chat lineage (session/message/
+# turn — message content is NEVER mutated; canvas edits are new version rows),
+# and the cited-sources snapshot taken at create time (`source_refs_json`, a
+# snapshot rather than a live reference because messages can be truncated or
+# deleted). `canvas_versions` is the append-only history: each save, model
+# range-edit, or restore appends a new row; nothing is ever updated or deleted,
+# so history cannot be destroyed. Both tables cascade FROM their owners
+# (chat_sessions / canvas_artifacts) so deleting a session removes its canvas
+# data (deliberate data-lifecycle scoping, documented in the #509 release note).
+#
+# The same constant is executed by migrate_add_canvas_tables(), so a fresh
+# database and a migrated database cannot drift apart.
+_CANVAS_DDL = """
+-- Artifact identity + current-version pointer. `current_version_no` is the
+-- optimistic-concurrency counter guarded by append_version's BEGIN IMMEDIATE
+-- transaction (UPDATE ... WHERE current_version_no = ? -> rowcount check).
+CREATE TABLE IF NOT EXISTS canvas_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_uid TEXT NOT NULL UNIQUE,
+    session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    message_id INTEGER,
+    turn_id TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('code','document')),
+    name TEXT NOT NULL,
+    language TEXT,
+    vault_id INTEGER,
+    current_version_no INTEGER NOT NULL DEFAULT 1,
+    source_refs_json TEXT NOT NULL DEFAULT '[]',
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_canvas_artifacts_session
+    ON canvas_artifacts(session_id);
+
+-- Append-only version history. UNIQUE(artifact_id, version_no) makes a
+-- double-append impossible even under a bug; `origin` distinguishes the create
+-- seed, user saves, model range-edits (whose prompt/range metadata lives in
+-- `model_edit_json`), and restores (which copy content only — model_edit_json
+-- stays NULL so provenance is never fabricated).
+CREATE TABLE IF NOT EXISTS canvas_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_id INTEGER NOT NULL REFERENCES canvas_artifacts(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL,
+    name TEXT,
+    content TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('created','user_edit','model_edit','restore')),
+    model_edit_json TEXT,
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(artifact_id, version_no)
+);
+CREATE INDEX IF NOT EXISTS idx_canvas_versions_artifact
+    ON canvas_versions(artifact_id);
+"""
+
+
 # Database schema definition
 _BASE_SCHEMA = """
 -- Vaults table: stores document collection vaults
@@ -1430,6 +1492,7 @@ SCHEMA = (
     + _DRAFT_ROOM_PROMOTIONS_DDL
     + _MULTIMODAL_ARTIFACT_DDL
     + _ENRICHMENT_DERIVED_DDL
+    + _CANVAS_DDL
 )  # nosec B608
 
 
@@ -1606,6 +1669,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_multimodal_artifact_tables(sqlite_path)
     migrate_add_atom_enrichment_table(sqlite_path)
     migrate_add_vaults_multimodal_provider(sqlite_path)
+    migrate_add_canvas_tables(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -4542,6 +4606,27 @@ def migrate_add_atom_enrichment_table(sqlite_path: str) -> None:
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_ENRICHMENT_DERIVED_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_canvas_tables(sqlite_path: str) -> None:
+    """Migration: add the canvas artifact/version tables (issue #509).
+
+    Creates ``canvas_artifacts`` (stable artifact identity + lineage + sources
+    snapshot) and ``canvas_versions`` (append-only version history).
+
+    Executes ``_CANVAS_DDL`` — the exact same constant appended to ``SCHEMA`` —
+    so a database created by ``init_db`` and a legacy database upgraded by this
+    migration converge on an identical schema (double-definition convention).
+    Every statement is ``CREATE ... IF NOT EXISTS``, so repeat execution is a
+    no-op and existing data is preserved.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript(_CANVAS_DDL)
         conn.commit()
     finally:
         conn.close()

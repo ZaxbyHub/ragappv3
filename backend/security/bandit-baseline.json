@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 70,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 63630,
+      "loc": 64610,
       "nosec": 0,
       "skipped_tests": 25
     },
@@ -63,6 +63,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 941,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/api/routes/canvas.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 585,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -335,7 +348,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1057,
+      "loc": 1063,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -374,7 +387,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 186,
+      "loc": 188,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -452,7 +465,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3844,
+      "loc": 3906,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -570,6 +583,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 1371,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/services/canvas_store.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 325,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -2925,7 +2951,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1195             )\n1196         if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == \"change-me-to-a-random-64-char-string\"):\n1197             raise ValueError(\n",
+      "code": "1208             )\n1209         if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == \"change-me-to-a-random-64-char-string\"):\n1210             raise ValueError(\n",
       "col_offset": 93,
       "end_col_offset": 131,
       "filename": "backend/app/config.py",
@@ -2936,9 +2962,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 1196,
+      "line_number": 1209,
       "line_range": [
-        1196
+        1209
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -3092,7 +3118,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "79     settings.users_enabled\n80     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n81 ):\n",
+      "code": "80     settings.users_enabled\n81     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n82 ):\n",
       "col_offset": 35,
       "end_col_offset": 73,
       "filename": "backend/app/main.py",
@@ -3103,9 +3129,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 80,
+      "line_number": 81,
       "line_range": [
-        80
+        81
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -3133,7 +3159,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "4175             conn.execute(\"ROLLBACK\")\n4176         except Exception:\n4177             pass\n4178         raise\n",
+      "code": "4239             conn.execute(\"ROLLBACK\")\n4240         except Exception:\n4241             pass\n4242         raise\n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/models/database.py",
@@ -3144,10 +3170,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 4176,
+      "line_number": 4240,
       "line_range": [
-        4176,
-        4177
+        4240,
+        4241
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",

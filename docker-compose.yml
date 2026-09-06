@@ -131,6 +131,9 @@ services:
       - MULTIMODAL_IMPL_VERSION=${MULTIMODAL_IMPL_VERSION:-1}
       # Query-time vision master switch (issue #462) — default OFF.
       - MULTIMODAL_QUERY_VISION_ENABLED=${MULTIMODAL_QUERY_VISION_ENABLED:-false}
+      # Canvas (issue #509) — versioned code/document canvas, additive, fail-closed.
+      - CANVAS_ENABLED=${CANVAS_ENABLED:-true}
+      - CANVAS_MAX_ARTIFACT_KB=${CANVAS_MAX_ARTIFACT_KB:-512}
       - DRAFT_MAX_SECTIONS=${DRAFT_MAX_SECTIONS:-12}
       - DRAFT_QA_RETRY_LIMIT=${DRAFT_QA_RETRY_LIMIT:-2}
       - DRAFT_JOB_TIMEOUT_SECONDS=${DRAFT_JOB_TIMEOUT_SECONDS:-1800}

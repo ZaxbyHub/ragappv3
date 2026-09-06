@@ -14,6 +14,7 @@ from starlette.responses import FileResponse
 
 from app.api.routes.admin import router as admin_router
 from app.api.routes.auth import router as auth_router
+from app.api.routes.canvas import router as canvas_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.documents import (
     router as documents_router,
@@ -145,6 +146,7 @@ if settings.allowed_hosts:
 app.include_router(health_router, prefix="/api")
 app.include_router(draft_room_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
+app.include_router(canvas_router, prefix="/api")
 app.include_router(search_router, prefix="/api")
 app.include_router(memories_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
