@@ -106,12 +106,14 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
         async def search_side_effect(query_val, query_type=None):
             if query_type == "vector":
                 m = MagicMock()
+                m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
                 m.where = MagicMock(return_value=m)
                 m.limit = MagicMock(return_value=m)
                 m.to_list = AsyncMock(return_value=self._dense_results(dense_count))
                 return m
             elif query_type == "fts":
                 m = MagicMock()
+                m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
                 m.where = MagicMock(return_value=m)
                 m.limit = MagicMock(return_value=m)
                 m.to_list = AsyncMock(return_value=self._fts_results(fts_count))
@@ -158,6 +160,7 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
         async def search_side_effect(query_val, query_type=None):
             if query_type == "vector":
                 m = MagicMock()
+                m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
                 m.where = MagicMock(return_value=m)
                 m.limit = MagicMock(return_value=m)
                 m.to_list = AsyncMock(return_value=self._dense_results(3))
@@ -210,6 +213,7 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
         async def search_side_effect(query_val, query_type=None):
             if query_type == "vector":
                 m = MagicMock()
+                m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
                 m.where = MagicMock(return_value=m)
                 m.limit = MagicMock(return_value=m)
                 m.to_list = AsyncMock(return_value=self._dense_results(3))
@@ -249,6 +253,7 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
         async def search_side_effect(query_val, query_type=None):
             if query_type == "vector":
                 m = MagicMock()
+                m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
                 m.where = MagicMock(return_value=m)
                 m.limit = MagicMock(return_value=m)
                 m.to_list = AsyncMock(return_value=self._dense_results(3))
@@ -292,12 +297,14 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
         async def search_side_effect(query_val, query_type=None):
             if query_type == "vector":
                 m = MagicMock()
+                m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
                 m.where = MagicMock(return_value=m)
                 m.limit = MagicMock(return_value=m)
                 m.to_list = AsyncMock(return_value=self._dense_results(2))
                 return m
             elif query_type == "fts":
                 m = MagicMock()
+                m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
                 m.where = MagicMock(return_value=m)
                 m.limit = MagicMock(return_value=m)
                 m.to_list = AsyncMock(return_value=self._fts_results(3))
@@ -335,6 +342,7 @@ class HybridLoggingTests(unittest.IsolatedAsyncioTestCase):
         async def search_side_effect(query_val, query_type=None):
             if query_type == "vector":
                 m = MagicMock()
+                m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
                 m.where = MagicMock(return_value=m)
                 m.limit = MagicMock(return_value=m)
                 m.to_list = AsyncMock(return_value=self._dense_results(2))
@@ -440,12 +448,14 @@ async def test_bm25_fts_returns_empty_no_success_log_pytest(caplog):
     async def search_side_effect(query_val, query_type=None):
         if query_type == "vector":
             m = MagicMock()
+            m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
             m.where = MagicMock(return_value=m)
             m.limit = MagicMock(return_value=m)
             m.to_list = AsyncMock(return_value=_standalone_dense_results(3))
             return m
         elif query_type == "fts":
             m = MagicMock()
+            m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
             m.where = MagicMock(return_value=m)
             m.limit = MagicMock(return_value=m)
             m.to_list = AsyncMock(return_value=[])  # Empty FTS
@@ -485,12 +495,14 @@ async def test_search_single_scale_bm25_empty_no_success_log_pytest(caplog):
     async def search_side_effect(query_val, query_type=None):
         if query_type == "vector":
             m = MagicMock()
+            m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
             m.where = MagicMock(return_value=m)
             m.limit = MagicMock(return_value=m)
             m.to_list = AsyncMock(return_value=_standalone_dense_results(2))
             return m
         elif query_type == "fts":
             m = MagicMock()
+            m.distance_type = MagicMock(return_value=m)  # VECTOR-004 chain start
             m.where = MagicMock(return_value=m)
             m.limit = MagicMock(return_value=m)
             m.to_list = AsyncMock(return_value=[])  # Empty

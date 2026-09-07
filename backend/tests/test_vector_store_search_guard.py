@@ -150,6 +150,9 @@ class TestSearchFTSVaultIdExprAPI(unittest.IsolatedAsyncioTestCase):
 
     def _make_dense_mock_builder(self, results):
         mock_builder = MagicMock()
+        # Issue #510 VECTOR-004: dense query chain calls .distance_type(metric)
+        # before .where(...) — keep the mock chained.
+        mock_builder.distance_type.return_value = mock_builder
         mock_builder.where.return_value = mock_builder
         mock_builder.limit.return_value = mock_builder
         mock_builder.to_list = AsyncMock(return_value=results)
@@ -271,6 +274,9 @@ class TestSearchSingleScaleFTSVaultIdExprAPI(unittest.IsolatedAsyncioTestCase):
 
     def _make_dense_mock_builder(self, results):
         mock_builder = MagicMock()
+        # Issue #510 VECTOR-004: dense query chain calls .distance_type(metric)
+        # before .where(...) — keep the mock chained.
+        mock_builder.distance_type.return_value = mock_builder
         mock_builder.where.return_value = mock_builder
         mock_builder.limit.return_value = mock_builder
         mock_builder.to_list = AsyncMock(return_value=results)
@@ -342,6 +348,9 @@ class TestDenseVaultIdStringInterpolation(unittest.IsolatedAsyncioTestCase):
 
     def _make_dense_mock_builder(self, results):
         mock_builder = MagicMock()
+        # Issue #510 VECTOR-004: dense query chain calls .distance_type(metric)
+        # before .where(...) — keep the mock chained.
+        mock_builder.distance_type.return_value = mock_builder
         mock_builder.where.return_value = mock_builder
         mock_builder.limit.return_value = mock_builder
         mock_builder.to_list = AsyncMock(return_value=results)
@@ -446,6 +455,9 @@ class TestDenseArmWithVaultIdAndFilterExpr(unittest.IsolatedAsyncioTestCase):
 
     def _make_dense_mock_builder(self, results):
         mock_builder = MagicMock()
+        # Issue #510 VECTOR-004: dense query chain calls .distance_type(metric)
+        # before .where(...) — keep the mock chained.
+        mock_builder.distance_type.return_value = mock_builder
         mock_builder.where.return_value = mock_builder
         mock_builder.limit.return_value = mock_builder
         mock_builder.to_list = AsyncMock(return_value=results)

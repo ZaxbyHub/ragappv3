@@ -415,6 +415,7 @@ class TestMultiScaleSearchEdgeCases(unittest.IsolatedAsyncioTestCase):
         store.table.list_indices = AsyncMock(return_value=[])
         store.table.count_rows = AsyncMock(return_value=0)
         query_mock = MagicMock()
+        query_mock.distance_type.return_value = query_mock  # VECTOR-004 chain start
         query_mock.where.return_value = query_mock
         query_mock.limit.return_value.to_list = AsyncMock(return_value=[])
         store.table.search = AsyncMock(return_value=query_mock)

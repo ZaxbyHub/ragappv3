@@ -32,6 +32,7 @@ def _table_mock():
     t.list_indices = AsyncMock(return_value=[])
     # Single-scale path: table.search → query with chainable limit().to_list()
     query_mock = MagicMock()
+    query_mock.distance_type.return_value = query_mock
     query_mock.where.return_value = query_mock
     query_mock.limit.return_value.to_list = AsyncMock(return_value=[])
     t.search = AsyncMock(return_value=query_mock)
