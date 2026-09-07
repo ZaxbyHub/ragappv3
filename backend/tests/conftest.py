@@ -336,6 +336,16 @@ if diag_file.exists():
 _MULTIMODAL_VISION_FLAG = "multimodal_query_vision_enabled"
 
 
+def multimodal_vision_flag_leaked(before, after) -> bool:
+    """Shared leak-detection predicate for the query-vision flag guard.
+
+    Single source of truth used BOTH by the autouse fixture below and by
+    ``tests/test_settings_leak_guardrail.py`` (which imports this module), so
+    the guard's detection logic is itself under test — see PRR-003.
+    """
+    return before != after
+
+
 @pytest.fixture(autouse=True)
 def _guard_multimodal_vision_flag():
     """Issue #462 (TEST-004 defect class): fail any test that leaves the
@@ -353,7 +363,7 @@ def _guard_multimodal_vision_flag():
     before = getattr(settings, _MULTIMODAL_VISION_FLAG)
     yield
     after = getattr(settings, _MULTIMODAL_VISION_FLAG)
-    if after != before:
+    if multimodal_vision_flag_leaked(before, after):
         pytest.fail(
             f"test leaked settings.{_MULTIMODAL_VISION_FLAG}: "
             f"{before!r} -> {after!r} (use patch.object(settings, ...) for "

@@ -92,6 +92,27 @@ def test_run_counters_dup_scenario():
     )
 
 
+def test_run_counters_multi_dup_pairs_with_cap():
+    """PRR-012 (PR #525 review): multiple duplicate pairs interacting with the
+    cap — 4 eligible sources in two duplicate pairs, cap 1 -> eligible=4,
+    selected=2, deduped=2, capped=1."""
+    result = _run(
+        [
+            _Src("art1", asset_id="x"),
+            _Src("art1", asset_id="x"),
+            _Src("art2", asset_id="y"),
+            _Src("art2", asset_id="y"),
+        ],
+        cap=1,
+    )
+    assert (result.eligible, result.selected, result.deduped, result.capped) == (
+        4,
+        2,
+        2,
+        1,
+    )
+
+
 def test_run_counters_unique_control():
     """Unique-only control: no duplicates -> deduped stays 0."""
     result = _run([_Src("art1"), _Src("art2")], cap=5)

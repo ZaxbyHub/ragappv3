@@ -254,6 +254,11 @@ class TestRunDegradation(unittest.TestCase):
         self.assertEqual(result.selected, 1)
         self.assertEqual(result.statuses.get("art1"), VISION_POLICY_BLOCKED)
         self.assertEqual(result.policy_blocked, 1)
+        # PRR-007 (PR #525 review): the policy-blocked path must also carry the
+        # OBS-003 counters — deduped is assigned before this early return too.
+        self.assertEqual(result.eligible, 1)
+        self.assertEqual(result.deduped, 0)
+        self.assertEqual(result.capped, 0)
 
     def test_run_amortizes_one_shared_client_across_batch(self) -> None:
         """Issue #480 (D1): run() builds ONE shared MultimodalProviderClient and

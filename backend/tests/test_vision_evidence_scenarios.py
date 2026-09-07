@@ -71,20 +71,19 @@ class _Ctx:
         return False
 
 
-def _svc_patches(svc, *, cap=None, concurrency=None, client_factory=None):
-    """Deterministic fake stack: policy gate open, asset pipeline stubbed to a
-    valid raster so the REAL _process_one pipeline runs end to end through the
-    provider client (matching the TestProcessOneSecurity stubbing pattern)."""
-    async def _can_read_true(user, evaluate, c, vid):
-        return True
+async def _can_read_always_true(user, evaluate, c, vid):
+    return True
 
-    patches = [
+
+def _shared_module_patches():
+    """PRR-001 (PR #525 review): module-GLOBAL patches shared by concurrent
+    batches must be entered exactly once — concurrent per-coroutine ExitStacks
+    double-patching the same globals can restore originals under a still-
+    running sibling and leak patched values across tests."""
+    return [
         patch.object(settings, "multimodal_query_vision_enabled", True),
         patch("app.services.vision_evidence._conn_ctx", lambda: _Ctx(MagicMock())),
-        patch.object(
-            VisionEvidenceService, "_whole_batch_allowed", lambda self, c, v: None
-        ),
-        patch("app.services.vision_evidence._can_read", new=_can_read_true),
+        patch("app.services.vision_evidence._can_read", new=_can_read_always_true),
         patch(
             "app.services.vision_evidence.resolve_confined", lambda *a, **k: object()
         ),
@@ -96,6 +95,21 @@ def _svc_patches(svc, *, cap=None, concurrency=None, client_factory=None):
         patch("app.services.vision_evidence._pixel_dims", lambda data: (10, 10)),
         patch("app.services.vision_evidence.record_security_event"),
     ]
+
+
+def _svc_patches(svc, *, cap=None, concurrency=None, client_factory=None):
+    """Deterministic fake stack: policy gate open, asset pipeline stubbed to a
+    valid raster so the REAL _process_one pipeline runs end to end through the
+    provider client (matching the TestProcessOneSecurity stubbing pattern).
+    Single-batch tests only — concurrent batches must use
+    ``_shared_module_patches()`` (see PRR-001)."""
+    patches = _shared_module_patches()
+    patches.insert(
+        1,
+        patch.object(
+            VisionEvidenceService, "_whole_batch_allowed", lambda self, c, v: None
+        ),
+    )
     if cap is not None:
         patches.append(patch.object(settings, "multimodal_max_assets_per_batch", cap))
     if concurrency is not None:
@@ -200,6 +214,11 @@ def test_mixed_partial_availability():
     assert result.provider_unavailable == 1
     assert result.empty_response == 1
     assert result.observations == {"art-ok": "the chart shows revenue rising"}
+    # PRR-006: outcome statuses must not skew the counter accounting — three
+    # distinct artifacts (no dedup) and a default-high cap mean deduped/capped
+    # stay 0 alongside the mixed statuses.
+    assert result.deduped == 0
+    assert result.capped == 0
     # Rank/label stability under a mixed batch.
     assert [s.artifact_id for s in sources] == ["art-ok", "art-outage", "art-empty"]
 
@@ -252,20 +271,31 @@ async def _cancel_after_enter(coro, entered):
 def test_concurrent_batches_independent():
     """Two concurrent run() batches: each honors its own
     multimodal_concurrency semaphore WITHIN the batch (max in-flight <= cap)
-    and both complete with independent counters."""
+    and both complete with independent counters.
+
+    PRR-001 (PR #525 review): SHARED module-global patches are entered exactly
+    ONCE in the sync test body below — concurrent per-coroutine ExitStacks
+    double-patching the same globals can restore originals under a still-
+    running sibling coroutine and leak patched values across tests. Only
+    per-INSTANCE patches (client factory, instance-level policy gate) stay
+    inside the concurrent coroutines, because instance attributes cannot race
+    between two separate services."""
     client_a = _RecordingClient()
     client_b = _RecordingClient()
-    # Separate service instances per batch: the client factory is an instance
-    # attribute, and two concurrent batches must not share (or race) it.
     svc_a = VisionEvidenceService()
     svc_b = VisionEvidenceService()
     batch_a = [_Src("a1"), _Src("a2")]
     batch_b = [_Src("b1")]
 
     async def _run_batch(svc, sources, client):
+        # Per-instance patches only — no shared module globals here.
+        # NOTE: patch.object on an INSTANCE stores a plain attribute, so the
+        # replacement does NOT receive `self` (unlike a class-level patch).
         with ExitStack() as stack:
-            for p in _svc_patches(svc, concurrency=1,
-                                  client_factory=lambda *a, **k: client):
+            for p in (
+                patch.object(svc, "_whole_batch_allowed", lambda c, v: None),
+                patch.object(svc, "_client_factory", lambda *a, **k: client),
+            ):
                 stack.enter_context(p)
             return await svc.run(query="q", sources=sources, vault_id=1)
 
@@ -274,7 +304,15 @@ def test_concurrent_batches_independent():
             _run_batch(svc_a, batch_a, client_a), _run_batch(svc_b, batch_b, client_b)
         )
 
-    result_a, result_b = asyncio.run(_main())
+    # Shared module-global patches: entered exactly once for BOTH batches.
+    with ExitStack() as shared:
+        for p in (
+            *_shared_module_patches(),
+            patch.object(settings, "multimodal_concurrency", 1),
+        ):
+            shared.enter_context(p)
+        result_a, result_b = asyncio.run(_main())
+
     assert result_a.vlm_used == 2
     assert result_b.vlm_used == 1
     # Within-batch semaphore honored (Round-2 required assertion form).
