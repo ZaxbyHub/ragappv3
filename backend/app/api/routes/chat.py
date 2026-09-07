@@ -360,6 +360,9 @@ def stream_chat_response(
         # SC-009: citation confidence + unverifiable claims
         citation_confidence: Optional[Dict[str, float]] = None
         unverifiable_claims: Optional[list] = None
+        # Issue #510 honesty fields (parity with the nonstream capture)
+        currency_warnings: Optional[list] = None
+        citation_enforcement: Optional[dict] = None
 
         # Resolve the effective mode the same way RAGEngine does and emit it
         # as the first SSE event so the client can show a per-message badge

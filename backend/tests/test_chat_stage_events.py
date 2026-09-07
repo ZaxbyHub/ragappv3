@@ -231,7 +231,7 @@ class FakePromptBuilder:
         relevance_hint: Optional[str] = None,
         wiki_evidence: Optional[Any] = None,
         kms_evidence: Optional[Any] = None,
-        system_prompt_override: Optional[str] = None,
+        system_prompt_override: Optional[str] = None, citation_mode: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         return [{"role": "user", "content": user_input}]
 
