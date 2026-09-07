@@ -157,14 +157,12 @@ class TestApplyVision(unittest.TestCase):
 
 class TestRunDegradation(unittest.TestCase):
     def setUp(self) -> None:
-        # These tests assume the query-vision feature is ON (the config default
-        # is False). Several tests in this class mutate the global; without a
-        # per-test reset, xdist worker assignment could land a test first in a
-        # fresh worker where the global is still the False default, OR leave it
-        # in a mutated state for the next test. setUp/tearDown pin it True so
-        # every test is order-independent. (Pre-existing isolation fix.)
+        # Issue #462 (TEST-004): capture the incoming flag so tearDown can
+        # restore it. Each test below enables/disables the feature for its own
+        # scope via patch.object — the old class-wide setUp True-pin is gone,
+        # and no test body performs a raw global assignment, so every test is
+        # order-independent under xdist and in fresh processes.
         self._orig_qv = settings.multimodal_query_vision_enabled
-        settings.multimodal_query_vision_enabled = True
 
     def tearDown(self) -> None:
         settings.multimodal_query_vision_enabled = self._orig_qv
@@ -176,8 +174,15 @@ class TestRunDegradation(unittest.TestCase):
             _src("art1", modality="code", asset_id="x"),  # code -> ineligible
             _src("art2", modality="code", asset_id="y"),  # also ineligible
         ]
-        with patch.object(
-            svc, "_process_one", side_effect=AssertionError("must not call _process_one")
+        # Explicit scoped enablement (issue #462 TEST-004): this scenario needs
+        # the feature ON to exercise the degrade-to-proxy branch (the production
+        # default is False; without this patch a fresh process hits the
+        # feature-off early return instead).
+        with (
+            patch.object(settings, "multimodal_query_vision_enabled", True),
+            patch.object(
+                svc, "_process_one", side_effect=AssertionError("must not call _process_one")
+            ),
         ):
             result = asyncio.run(
                 svc.run(query="q", sources=sources, vault_id=1)
@@ -190,16 +195,15 @@ class TestRunDegradation(unittest.TestCase):
         """V5: feature off => vision never attempted AND vision_status NOT set."""
         svc = VisionEvidenceService()
         sources = [_src("art1", modality="table", asset_id="y")]
-        settings.multimodal_query_vision_enabled = False
-        try:
-            with patch.object(
+        with (
+            patch.object(settings, "multimodal_query_vision_enabled", False),
+            patch.object(
                 svc, "_process_one", side_effect=AssertionError("must not call")
-            ):
-                result = asyncio.run(
-                    svc.run(query="q", sources=sources, vault_id=1)
-                )
-        finally:
-            settings.multimodal_query_vision_enabled = True
+            ),
+        ):
+            result = asyncio.run(
+                svc.run(query="q", sources=sources, vault_id=1)
+            )
         self.assertEqual(result.selected, 1)
         # No status set, no policy_blocked count — feature-off parity on the wire.
         self.assertEqual(result.statuses, {})
@@ -213,16 +217,15 @@ class TestRunDegradation(unittest.TestCase):
             _src("art1", modality="code", asset_id="x"),  # code -> ineligible
             _src("art2", modality="code", asset_id="y"),
         ]
-        settings.multimodal_query_vision_enabled = False
-        try:
-            with patch.object(
+        with (
+            patch.object(settings, "multimodal_query_vision_enabled", False),
+            patch.object(
                 svc, "_process_one", side_effect=AssertionError("must not call")
-            ):
-                result = asyncio.run(
-                    svc.run(query="q", sources=sources, vault_id=1)
-                )
-        finally:
-            settings.multimodal_query_vision_enabled = True
+            ),
+        ):
+            result = asyncio.run(
+                svc.run(query="q", sources=sources, vault_id=1)
+            )
         self.assertEqual(result.selected, 0)
         # V5: statuses omitted entirely even when nothing is eligible.
         self.assertEqual(result.statuses, {})
@@ -231,24 +234,23 @@ class TestRunDegradation(unittest.TestCase):
     def test_whole_batch_vault_not_opted_in_marks_policy_blocked(self) -> None:
         svc = VisionEvidenceService()
         sources = [_src("art1", modality="table", asset_id="y")]
-        settings.multimodal_query_vision_enabled = True
-        try:
+        # Feature ON for the whole run (scoped, OUTER so the whole-batch policy
+        # gate sees enabled=True while the vault opt-in is patched off).
+        with (
+            patch.object(settings, "multimodal_query_vision_enabled", True),
             # Vault not opted in -> a real block (NOT the feature-off V5 case).
-            with (
-                # Isolate from the real SQLite pool (F-001): this test reaches
-                # _whole_batch_allowed inside run(), so _conn_ctx must be faked like
-                # its siblings or a fresh-clone single-file run opens ./data/app.db.
-                patch("app.services.vision_evidence._conn_ctx", lambda: _AsyncCtx(MagicMock())),
-                patch("app.services.vision_evidence._vault_opted_in", return_value=False),
-                patch.object(
-                    svc, "_process_one", side_effect=AssertionError("must not call")
-                ),
-            ):
-                result = asyncio.run(
-                    svc.run(query="q", sources=sources, vault_id=1)
-                )
-        finally:
-            settings.multimodal_query_vision_enabled = True
+            # Isolate from the real SQLite pool (F-001): this test reaches
+            # _whole_batch_allowed inside run(), so _conn_ctx must be faked like
+            # its siblings or a fresh-clone single-file run opens ./data/app.db.
+            patch("app.services.vision_evidence._conn_ctx", lambda: _AsyncCtx(MagicMock())),
+            patch("app.services.vision_evidence._vault_opted_in", return_value=False),
+            patch.object(
+                svc, "_process_one", side_effect=AssertionError("must not call")
+            ),
+        ):
+            result = asyncio.run(
+                svc.run(query="q", sources=sources, vault_id=1)
+            )
         self.assertEqual(result.selected, 1)
         self.assertEqual(result.statuses.get("art1"), VISION_POLICY_BLOCKED)
         self.assertEqual(result.policy_blocked, 1)
@@ -290,17 +292,14 @@ class TestRunDegradation(unittest.TestCase):
                 await client.chat_multimodal([], max_tokens=1)
             return (src.artifact_id, VISION_USED, "observation")
 
-        settings.multimodal_query_vision_enabled = True
-        try:
-            with (
-                patch("app.services.vision_evidence._conn_ctx", lambda: _AsyncCtx(MagicMock())),
-                patch.object(svc, "_whole_batch_allowed", return_value=None),
-                patch.object(svc, "_client_factory", factory),
-                patch.object(svc, "_process_one", side_effect=_fake_process_one),
-            ):
-                result = asyncio.run(svc.run(query="q", sources=sources, vault_id=1))
-        finally:
-            settings.multimodal_query_vision_enabled = True
+        with (
+            patch.object(settings, "multimodal_query_vision_enabled", True),
+            patch("app.services.vision_evidence._conn_ctx", lambda: _AsyncCtx(MagicMock())),
+            patch.object(svc, "_whole_batch_allowed", return_value=None),
+            patch.object(svc, "_client_factory", factory),
+            patch.object(svc, "_process_one", side_effect=_fake_process_one),
+        ):
+            result = asyncio.run(svc.run(query="q", sources=sources, vault_id=1))
 
         # Exactly one client created, started, and closed.
         self.assertEqual(factory.call_count, 1, "one shared client per batch")
@@ -345,11 +344,6 @@ class TestRunDegradation(unittest.TestCase):
                 return None
 
         fake_http = _FakeHttp()
-        # Set the flag True up front and ALWAYS restore True in finally (the
-        # documented default + this file's convention). Capture-and-restore is
-        # fragile under xdist: if a prior test in the same worker left the global
-        # False, orig_qv would restore False and break later tests.
-        settings.multimodal_query_vision_enabled = True
 
         async def _run():
             # Construct the client INSIDE the running loop so its
@@ -361,8 +355,13 @@ class TestRunDegradation(unittest.TestCase):
 
             # First chat_multimodal: kill switch ON → policy passes (origin/SSRF
             # gate stubbed to a no-op so the call reaches the mocked network).
-            with patch(
-                "app.services.multimodal_enrichment.assert_model_provider_allowed"
+            # Issue #462 (TEST-004): every flag phase is a SCOPED patch.object —
+            # no raw global assignments anywhere in this test.
+            with (
+                patch.object(settings, "multimodal_query_vision_enabled", True),
+                patch(
+                    "app.services.multimodal_enrichment.assert_model_provider_allowed"
+                ),
             ):
                 out = await client.chat_multimodal(
                     [{"role": "user", "content": "q"}], max_tokens=8
@@ -374,22 +373,24 @@ class TestRunDegradation(unittest.TestCase):
             # raise ERR_POLICY from the REAL _assert_policy (which re-reads live
             # settings) BEFORE any network call — the shared client did not cache
             # the prior authorization.
-            settings.multimodal_query_vision_enabled = False
-            raised = False
-            try:
-                await client.chat_multimodal(
-                    [{"role": "user", "content": "q2"}], max_tokens=8
-                )
-            except MultimodalProviderError as exc:
-                raised = exc.code == ERR_POLICY
-            assert raised, "second call must raise ERR_POLICY after the flip"
-            assert fake_http.post_calls == 1, "blocked call must NOT reach the provider"
+            with patch.object(settings, "multimodal_query_vision_enabled", False):
+                raised = False
+                try:
+                    await client.chat_multimodal(
+                        [{"role": "user", "content": "q2"}], max_tokens=8
+                    )
+                except MultimodalProviderError as exc:
+                    raised = exc.code == ERR_POLICY
+                assert raised, "second call must raise ERR_POLICY after the flip"
+                assert fake_http.post_calls == 1, "blocked call must NOT reach the provider"
 
             # Flip back ON — the same shared client clears again (re-check is
             # live per call, not cached).
-            settings.multimodal_query_vision_enabled = True
-            with patch(
-                "app.services.multimodal_enrichment.assert_model_provider_allowed"
+            with (
+                patch.object(settings, "multimodal_query_vision_enabled", True),
+                patch(
+                    "app.services.multimodal_enrichment.assert_model_provider_allowed"
+                ),
             ):
                 out2 = await client.chat_multimodal(
                     [{"role": "user", "content": "q3"}], max_tokens=8
@@ -397,10 +398,7 @@ class TestRunDegradation(unittest.TestCase):
             assert out2 == "ok"
             assert fake_http.post_calls == 2, "third call reached the provider after re-enable"
 
-        try:
-            asyncio.run(_run())
-        finally:
-            settings.multimodal_query_vision_enabled = True
+        asyncio.run(_run())
 
 
 class TestProcessOneSecurity(unittest.TestCase):
