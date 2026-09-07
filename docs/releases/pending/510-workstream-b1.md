@@ -44,6 +44,12 @@ citation wire schema (docs/engineering/source-score-citation-schema.md).
 
 ## Compatibility / rollout / rollback
 
+- BEHAVIOR CHANGE: `retrieval_mode` / `citation_mode` on the chat endpoints
+  were previously free strings accepted and ignored; they are now
+  Literal-validated. Callers sending unsupported values (e.g. `"hybrid"`)
+  will now receive 422 instead of silent no-op. All values the UI ever
+  offered remain valid.
+
 - All API additions are optional request fields and additive response
   fields; previously stored messages deserialize unchanged (guard tests
   cover legacy payloads and feature-off defaults).

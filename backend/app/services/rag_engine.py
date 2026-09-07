@@ -804,19 +804,55 @@ class RAGEngine:
 
                 registry = ToolRegistry()
                 retrieval_tool = RetrievalTool(retrieval_top_k=self.retrieval_top_k, engine=self)
-                synthesis_tool = SynthesisTool(llm_client=self.llm_client)
+                synthesis_tool = SynthesisTool(
+                    llm_client=self.llm_client,
+                    citation_mode=getattr(self, "_active_citation_mode", None),
+                )
                 registry.register(retrieval_tool)
                 registry.register(synthesis_tool)
                 planner = AgenticPlanner(registry, llm_client=self.llm_client)
                 result = await planner.plan_and_execute(user_input, vault_id=vault_id)
                 yield {"type": "content", "content": result.output}
-                yield {
-                    "type": "done",
+                agentic_done: Dict[str, Any] = {
                     "sources": result.all_sources,
                     "total": len(result.all_sources),
                     "memories_used": [],
                     "answer_source_mode": "agentic",
                 }
+                # Honesty-field parity on the agentic path (issue #510
+                # UI-004/AC-17, reviewer finding): currency warnings and
+                # citation enforcement surface here exactly like the standard
+                # pipeline's done message.
+                if result.all_sources:
+                    agentic_file_ids = [
+                        str(src.get("file_id"))
+                        for src in result.all_sources
+                        if src.get("file_id")
+                    ]
+                    agentic_supersession = await self._check_supersession_file_ids(
+                        sorted(set(agentic_file_ids))
+                    )
+                    if agentic_supersession:
+                        agentic_done["currency_warnings"] = [agentic_supersession]
+                if getattr(self, "_active_citation_mode", None) == "required":
+                    from app.services.citation_validator import _CITATION_RE
+
+                    cited_labels = set(_CITATION_RE.findall(result.output or ""))
+                    if cited_labels or not result.all_sources:
+                        agentic_done["citation_enforcement"] = {
+                            "mode": "required",
+                            "status": "satisfied",
+                        }
+                    else:
+                        agentic_done["citation_enforcement"] = {
+                            "mode": "required",
+                            "status": "missing_citations",
+                            "detail": (
+                                "Citations were required but the answer contains "
+                                "no valid citation labels."
+                            ),
+                        }
+                yield {"type": "done", **agentic_done}
                 return
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -3007,6 +3043,27 @@ class RAGEngine:
         except Exception as exc:
             logger.warning("Supersession check failed (suppressed): %s", exc)
         return None
+
+    async def _check_supersession_file_ids(
+        self, file_ids: List[str]
+    ) -> Optional[str]:
+        """Supersession check for already-serialized source dicts (agentic path).
+
+        Same semantics as :meth:`_check_supersession` (including the shared
+        ``_supersedes_column_exists`` cache and its no-caching-on-failure
+        contract from issue #510 RAG-008), but accepts raw file-id strings so
+        the agentic early-return can surface currency warnings without
+        reconstructing RAGSource objects.
+        """
+        if not file_ids:
+            return None
+        # Reuse the RAGSource-based check via a minimal shim so the column
+        # probe cache and failure semantics exist in exactly one place.
+        shim_sources = [
+            RAGSource(text="", file_id=fid, score=0.0, metadata={})
+            for fid in file_ids
+        ]
+        return await self._check_supersession(shim_sources)
 
     def _get_indexed_file_ids(self, vault_id: Optional[int]) -> Optional[Set[str]]:
         """Return the set of file IDs with status='indexed' from SQLite (Issue #13).

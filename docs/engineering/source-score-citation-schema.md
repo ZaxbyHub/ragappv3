@@ -100,10 +100,18 @@ previous behavior):
   streaming and non-streaming generation; omitted keeps the provider default.
 - `retrieval_mode: "auto" | "semantic" | "keyword"` — `semantic` = dense-only
   retrieval; `keyword` = pure lexical (BM25) retrieval; `auto` = configured
-  hybrid. Unknown values are rejected (422).
+  hybrid. Unknown values are rejected (422). NOTE: these fields previously
+  accepted arbitrary strings and ignored them; they are now Literal-validated,
+  so a caller passing an unsupported value (e.g. `"hybrid"`) gets a 422
+  instead of silent no-op behavior.
 - `citation_mode: "enabled" | "disabled" | "required"` — `disabled` removes
   the citation instruction from the prompt; `required` strengthens it and
-  enables the `citation_enforcement` field. Unknown values are rejected (422).
+  enables the `citation_enforcement` field. Unknown values are rejected (422)
+  (same Literal tightening as above). Both controls apply on the standard
+  pipeline AND the agentic path (`agentic_rag_enabled=True`): the agentic
+  synthesis prompt honors `citation_mode`, and the agentic done payload
+  carries `citation_enforcement` / `currency_warnings` with the same
+  semantics.
 - `metadata_filter` — typed, documented subset; **unknown fields are
   rejected (422), never silently ignored**:
 
