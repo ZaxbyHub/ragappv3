@@ -25,6 +25,7 @@ from app.api.deps import (
 from app.config import settings
 from app.limiter import limiter
 from app.services.document_retrieval import (
+    _strip_reupload_hash,
     sanitize_wire_filename,
     whitelist_metadata_for_wire,
 )
@@ -252,7 +253,18 @@ async def get_chunk_context(
     query performance characteristics.
     """
     try:
+        # Exact-match lookup first (preserves precedence for current ids).
         chunks = await vector_store.get_chunks_by_uid([chunk_id])
+        if not chunks:
+            # PRR-010: a caller (e.g. a persisted chat source captured before
+            # a reprocess) may hold an id whose hash segment no longer
+            # matches the stored uid. Retry once with the reupload hash
+            # segment stripped so those legacy-format counterparts resolve
+            # instead of 404ing. Ids without a hash segment are unchanged by
+            # the strip, so the retry is skipped entirely for them.
+            normalized_id = _strip_reupload_hash(chunk_id)
+            if normalized_id != chunk_id:
+                chunks = await vector_store.get_chunks_by_uid([normalized_id])
     except VectorStoreError as e:
         raise HTTPException(status_code=500, detail=f"Vector store error: {str(e)}")
 

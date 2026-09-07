@@ -2414,6 +2414,10 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
       'interrupted' | 'failed'. NULL (legacy rows) means complete.
     - ``citation_confidence`` TEXT — JSON object of citation confidence scores.
     - ``unverifiable_claims`` TEXT — JSON array of unverifiable claim strings.
+    - ``currency_warnings`` TEXT — JSON array of supersession/currency warning
+      strings (issue #510 AC-17: warnings persist across history reloads).
+    - ``citation_enforcement`` TEXT — JSON object of the required-citations
+      enforcement status (issue #510 UI-004).
 
     Columns are intentionally NOT in the SCHEMA constant, matching the
     ``wiki_refs``/``kms_refs``/``feedback`` precedent: ``run_migrations`` runs on
@@ -2428,7 +2432,10 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
         if "seq" not in existing_msg_cols:
             conn.execute("ALTER TABLE chat_messages ADD COLUMN seq INTEGER")
             added_seq = True
-        for name in ("turn_id", "status", "citation_confidence", "unverifiable_claims"):
+        for name in (
+            "turn_id", "status", "citation_confidence", "unverifiable_claims",
+            "currency_warnings", "citation_enforcement",
+        ):
             if name not in existing_msg_cols:
                 conn.execute(f"ALTER TABLE chat_messages ADD COLUMN {name} TEXT")  # nosec B608 — column names are a fixed literal set, not user input
 

@@ -1,4 +1,4 @@
-import { apiClient, API_BASE_URL, _jwtAccessToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry } from "./core";
+import { apiClient, API_BASE_URL, _jwtAccessToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatMetadataFilter, CitationEnforcement, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry } from "./core";
 import { setChatHistory as storageSetChatHistory, getChatHistory as storageGetChatHistory } from "../storage";
 
 // ============================================================================
@@ -157,6 +157,14 @@ export async function parseSSEStream(
           if (Array.isArray(parsed.unverifiable_claims)) {
             callbacks.onUnverifiableClaims?.(parsed.unverifiable_claims as string[]);
           }
+          // Issue #510 (AC-17 / UI-004): currency warnings and the citation
+          // enforcement outcome ride on the done payload; both are optional.
+          if (Array.isArray(parsed.currency_warnings)) {
+            callbacks.onCurrencyWarnings?.(parsed.currency_warnings as string[]);
+          }
+          if (parsed.citation_enforcement && typeof parsed.citation_enforcement === "object") {
+            callbacks.onCitationEnforcement?.(parsed.citation_enforcement as CitationEnforcement);
+          }
           if (eventType === "done") {
             completeOnce();
             return;
@@ -180,6 +188,7 @@ export function chatStream(
   temperature?: number,
   retrievalMode?: string,
   citationMode?: string,
+  metadataFilter?: ChatMetadataFilter,
 ): () => void {
   const abortController = new AbortController();
   // Build the request body once and reuse for both the initial POST and
@@ -191,6 +200,7 @@ export function chatStream(
     ...(temperature != null && { temperature }),
     ...(retrievalMode != null && { retrieval_mode: retrievalMode }),
     ...(citationMode != null && { citation_mode: citationMode }),
+    ...(metadataFilter != null && { metadata_filter: metadataFilter }),
   });
 
   const startStream = async () => {

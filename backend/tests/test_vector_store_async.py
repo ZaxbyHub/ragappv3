@@ -291,6 +291,8 @@ class TestVectorStoreAddChunks(TestVectorStoreAsync):
 
             def search_records(_embedding, query_type="vector"):
                 query = MagicMock()
+                # Issue #510 VECTOR-004: dense chain starts at .distance_type.
+                query.distance_type.return_value = query
                 query.where.return_value = query
                 query.limit.return_value.to_list = AsyncMock(
                     return_value=[row for row in rows if row["file_id"] == "doc_b"]

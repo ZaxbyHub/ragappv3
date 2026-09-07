@@ -54,9 +54,59 @@ class CitationValidationResult:
     unverifiable_claims: Tuple[str, ...] = field(default_factory=lambda: ())
 
 
-def _label_set(prefix: str, count: int) -> set[str]:
-    """Build the set of labels available for the given prefix and count."""
+def _labels_from_count(prefix: str, count: int) -> set[str]:
+    """Build the contiguous label set 1..count for the given prefix."""
     return {f"{prefix}{i}" for i in range(1, count + 1)}
+
+
+_LABEL_FORMAT_RE = re.compile(r"^([SMWKD])(\d+)$")
+
+
+def _labels_from_items(
+    items: Sequence[dict], prefix: str, key: str
+) -> set[str]:
+    """Extract the ACTUAL set of labels present on evidence items.
+
+    Issue #510 AC-15 (#258 ENH-014 / DD-rag-003): citation validity is
+    membership in the real label set, never a contiguous 1..max-index range
+    guessed from the highest number seen — sparse labelings (S2, S4 present)
+    must not make phantom labels (S1, S3) valid.
+    """
+    labels: set[str] = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        label = it.get(key)
+        if not isinstance(label, str):
+            continue
+        m = _LABEL_FORMAT_RE.match(label)
+        if m and m.group(1) == prefix:
+            labels.add(label)
+    return labels
+
+
+_CODE_SPAN_RE = re.compile(
+    r"```.*?```|~~~.*?~~~|~~~~.*?~~~~|`[^`\n]*`",
+    re.DOTALL,
+)
+_CODE_PLACEHOLDER_RE = re.compile("\x00(\\d+)\x01")
+
+
+def _mask_code_regions(text: str) -> tuple[str, list[str]]:
+    """Replace fenced and inline code spans with opaque placeholders."""
+    spans: list[str] = []
+
+    def _stash(match: re.Match) -> str:
+        spans.append(match.group(0))
+        return f"\x00{len(spans) - 1}\x01"
+
+    return _CODE_SPAN_RE.sub(_stash, text), spans
+
+
+def _unmask_code_regions(text: str, spans: list[str]) -> str:
+    return _CODE_PLACEHOLDER_RE.sub(
+        lambda m: spans[int(m.group(1))], text
+    )
 
 
 def _looks_factual(content: str) -> bool:
@@ -89,6 +139,11 @@ def validate_and_repair_citations(
     wiki_count: int = 0,
     kms_count: int = 0,
     draft_count: int = 0,
+    source_labels: Optional[set] = None,
+    memory_labels: Optional[set] = None,
+    wiki_labels: Optional[set] = None,
+    kms_labels: Optional[set] = None,
+    draft_labels: Optional[set] = None,
 ) -> CitationValidationResult:
     """Validate ``[S#]``, ``[M#]``, ``[W#]``, ``[K#]``, and ``[D#]`` citations in ``content``.
 
@@ -108,6 +163,10 @@ def validate_and_repair_citations(
             were before Draft Room support was added. This keeps existing
             chat behavior unchanged; only Draft Room call sites should ever
             pass a non-zero value.
+        source_labels/memory_labels/wiki_labels/kms_labels/draft_labels:
+            Explicit label SETS (issue #510 AC-15). When provided they
+            override the count-derived contiguous ranges, so validity is
+            actual-set membership rather than a guessed 1..max range.
 
     Returns:
         CitationValidationResult with the repaired content, the set of valid
@@ -127,11 +186,17 @@ def validate_and_repair_citations(
             invalid_draft_citations=(),
         )
 
-    valid_s = _label_set("S", source_count)
-    valid_m = _label_set("M", memory_count)
-    valid_w = _label_set("W", wiki_count)
-    valid_k = _label_set("K", kms_count)
-    valid_d = _label_set("D", draft_count)
+    valid_s = source_labels if source_labels is not None else _labels_from_count("S", source_count)
+    valid_m = memory_labels if memory_labels is not None else _labels_from_count("M", memory_count)
+    valid_w = wiki_labels if wiki_labels is not None else _labels_from_count("W", wiki_count)
+    valid_k = kms_labels if kms_labels is not None else _labels_from_count("K", kms_count)
+    valid_d = draft_labels if draft_labels is not None else _labels_from_count("D", draft_count)
+
+    # Mask fenced and inline code BEFORE any repair (issue #510 CITE-001):
+    # a citation-looking token inside code is literal code content, and the
+    # whitespace tidy must never reflow code/string bytes. Code regions are
+    # re-injected verbatim after the repair.
+    masked, code_spans = _mask_code_regions(content)
 
     valid: List[str] = []
     invalid: List[str] = []
@@ -162,17 +227,20 @@ def validate_and_repair_citations(
         # Strip the invalid citation. Leave a single space so words don't merge.
         return ""
 
-    repaired = _CITATION_RE.sub(_replacer, content)
+    repaired = _CITATION_RE.sub(_replacer, masked)
     if invalid:
         # Only tidy whitespace when an invalid citation was actually stripped,
-        # and do it non-destructively. Collapse runs of spaces/tabs only
-        # mid-line (preceded by a non-space char) so leading code indentation is
-        # preserved, and only drop spaces/tabs — never newlines — left before
-        # sentence punctuation. Content with no stripped citations is returned
-        # verbatim (modulo a trailing strip), so code blocks are never mangled.
+        # and do it non-destructively on the code-masked text. Collapse runs
+        # of spaces/tabs only mid-line (preceded by a non-space char) so
+        # leading code indentation is preserved, and only drop spaces/tabs —
+        # never newlines — left before sentence punctuation. Content with no
+        # stripped citations is returned verbatim (modulo a trailing strip),
+        # so code blocks are never mangled (issue #510 CITE-001: fenced and
+        # inline code regions are masked above and re-injected byte-identical
+        # below, so returned/saved code always matches the generated code).
         repaired = re.sub(r"(?<=\S)[ \t]{2,}", " ", repaired)
         repaired = re.sub(r"[ \t]+([.,;:!?])", r"\1", repaired)
-    repaired = repaired.strip()
+    repaired = _unmask_code_regions(repaired.strip(), code_spans)
 
     has_evidence = (
         source_count > 0
@@ -180,6 +248,11 @@ def validate_and_repair_citations(
         or wiki_count > 0
         or kms_count > 0
         or draft_count > 0
+        or bool(valid_s)
+        or bool(valid_m)
+        or bool(valid_w)
+        or bool(valid_k)
+        or bool(valid_d)
     )
     has_any_citation = bool(valid)
     uncited_factual_warning = (
@@ -505,46 +578,41 @@ def repair_against_sources_and_memories(
     kms_evidence: Optional[Sequence[dict]] = None,
     draft_inputs: Optional[Sequence[dict]] = None,
 ) -> CitationValidationResult:
-    """Convenience: derive counts from source/memory/wiki/kms/draft dicts, then validate.
+    """Convenience: derive label SETS from source/memory/wiki/kms/draft dicts, then validate.
 
     Sources are expected to use 1-based ``source_label`` like ``S1``.
     Memories are expected to use 1-based ``memory_label`` like ``M1``.
     Wiki evidence items are expected to use 1-based ``wiki_label`` like ``W1``.
     KMS evidence items are expected to use 1-based ``kms_label`` like ``K1``.
     ``draft_inputs`` items are expected to use 1-based ``draft_label`` like
-    ``D1``; this is an opt-in Draft Room registry. Counts default to the
-    maximum index assigned across the inputs so sparse labelings (e.g. only
-    S2 and S4) still validate correctly.
+    ``D1``; this is an opt-in Draft Room registry.
+
+    Issue #510 AC-15 (#258 ENH-014 / DD-rag-003): validity is the ACTUAL set
+    of labels present on the evidence — sparse labelings (e.g. only S2 and
+    S4) validate exactly those labels; phantom labels in the gaps (S1, S3)
+    are invalid. Previously a max-index count inflated the valid set to a
+    contiguous 1..N range.
 
     ``draft_inputs`` defaults to ``None`` (no Draft input registry), which
-    yields ``draft_count=0`` and preserves existing chat behavior — [D#]
-    citations remain invalid unless a caller explicitly supplies
+    yields an empty draft label set and preserves existing chat behavior —
+    [D#] citations remain invalid unless a caller explicitly supplies
     ``draft_inputs``.
     """
-
-    def _max_index(items: Sequence[dict], prefix: str, key: str) -> int:
-        n = 0
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            label = it.get(key)
-            if not isinstance(label, str):
-                continue
-            if label.startswith(prefix) and label[len(prefix):].isdigit():
-                n = max(n, int(label[len(prefix):]))
-        return n
-
-    wiki_count = _max_index(wiki_evidence or [], "W", "wiki_label")
-    kms_count = _max_index(kms_evidence or [], "K", "kms_label")
-    draft_count = _max_index(draft_inputs or [], "D", "draft_label")
+    source_label_set = _labels_from_items(sources, "S", "source_label")
+    memory_label_set = _labels_from_items(memories, "M", "memory_label")
 
     return validate_and_repair_citations(
         content,
-        source_count=_max_index(sources, "S", "source_label"),
-        memory_count=_max_index(memories, "M", "memory_label"),
-        wiki_count=wiki_count,
-        kms_count=kms_count,
-        draft_count=draft_count,
+        source_count=len(source_label_set),
+        memory_count=len(memory_label_set),
+        wiki_count=len(_labels_from_items(wiki_evidence or [], "W", "wiki_label")),
+        kms_count=len(_labels_from_items(kms_evidence or [], "K", "kms_label")),
+        draft_count=len(_labels_from_items(draft_inputs or [], "D", "draft_label")),
+        source_labels=source_label_set,
+        memory_labels=memory_label_set,
+        wiki_labels=_labels_from_items(wiki_evidence or [], "W", "wiki_label"),
+        kms_labels=_labels_from_items(kms_evidence or [], "K", "kms_label"),
+        draft_labels=_labels_from_items(draft_inputs or [], "D", "draft_label"),
     )
 
 

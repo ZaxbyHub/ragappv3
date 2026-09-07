@@ -256,66 +256,79 @@ class QueryTransformer:
         # Generate cache key for step-back transformation
         cache_key = self._make_cache_key(self._cache_model, "step_back", query)
 
+        # Cache stores the step-back transformation only. The returned variant
+        # list is composed on EVERY request from the cached components plus
+        # the CURRENT feature flags (issue #510 QUERY-001): a cache hit must
+        # behave identically to a cold call with the same settings, and the
+        # cached step-back value is never mutated by HyDE enable/disable.
+        cached_variants: Optional[List[Tuple[str, str]]] = None
+
         # Try Redis cache first
         if self._redis_client:
             try:
                 cached = self._redis_client.get(cache_key)
                 if cached:
                     logger.debug("Cache HIT (Redis) for query transformation")
-                    return json.loads(cached)
+                    cached_variants = json.loads(cached)
             except Exception as e:
                 logger.warning("Redis cache get failed: %s", e)
 
         # Try LRU cache
-        lru_cached = self._lru_get(cache_key)
-        if lru_cached:
-            logger.debug("Cache HIT (LRU) for query transformation")
-            return lru_cached
+        if cached_variants is None:
+            lru_cached = self._lru_get(cache_key)
+            if lru_cached:
+                logger.debug("Cache HIT (LRU) for query transformation")
+                cached_variants = lru_cached
 
-        # Cache miss - proceed with transformation
-        try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a query transformation assistant. Your task is to generate "
-                        "a broader, more general version of the user's question that captures "
-                        "the high-level intent and underlying concepts."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Generate a broader, more general version of this question that "
-                        f"captures the underlying concept:\n"
-                        f"Original: <user_query>{_xml_escape(query)}</user_query>\n"
-                        f"Step-back:"
-                    ),
-                },
-            ]
+        if cached_variants is not None:
+            # Copy: the returned list may gain the HyDE variant below and must
+            # never mutate the object the LRU cache holds.
+            variants: List[Tuple[str, str]] = list(cached_variants)
+        else:
+            # Cache miss - proceed with transformation
+            try:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a query transformation assistant. Your task is to generate "
+                            "a broader, more general version of the user's question that captures "
+                            "the high-level intent and underlying concepts."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Generate a broader, more general version of this question that "
+                            f"captures the underlying concept:\n"
+                            f"Original: <user_query>{_xml_escape(query)}</user_query>\n"
+                            f"Step-back:"
+                        ),
+                    },
+                ]
 
-            step_back = await self._llm_client.chat_completion(
-                messages=messages, max_tokens=100, temperature=settings.query_transform_temperature
-            )
-
-            if step_back and step_back.strip():
-                logger.debug(
-                    "Query transformation: original='%s', step_back='%s'",
-                    query,
-                    step_back,
+                step_back = await self._llm_client.chat_completion(
+                    messages=messages, max_tokens=100, temperature=settings.query_transform_temperature
                 )
-                variants: List[Tuple[str, str]] = [('original', query), ('step_back', step_back.strip())]
-            else:
+
+                if step_back and step_back.strip():
+                    logger.debug(
+                        "Query transformation: original='%s', step_back='%s'",
+                        query,
+                        step_back,
+                    )
+                    variants: List[Tuple[str, str]] = [('original', query), ('step_back', step_back.strip())]
+                else:
+                    logger.warning(
+                        "Query transformation returned empty response, using original only"
+                    )
+                    variants: List[Tuple[str, str]] = [('original', query)]
+
+            except Exception as e:
                 logger.warning(
-                    "Query transformation returned empty response, using original only"
+                    "Query transformation failed: %s, using original query only", e
                 )
-                variants: List[Tuple[str, str]] = [('original', query)]
-
-        except Exception as e:
-            logger.warning(
-                "Query transformation failed: %s, using original query only", e
-            )
-            variants = [('original', query)]
+                variants = [('original', query)]
 
         # Store in Redis if available
         if self._redis_client:
@@ -328,8 +341,9 @@ class QueryTransformer:
             except Exception as e:
                 logger.warning("Redis cache set failed: %s", e)
 
-        # Store in LRU cache
-        self._lru_set(cache_key, variants)
+        # Store in LRU cache — a COPY, so the HyDE append below never
+        # mutates the cached step-back value (issue #510 QUERY-001).
+        self._lru_set(cache_key, list(variants))
 
         # Optionally append HyDE passage as third query variant
         if settings.hyde_enabled:

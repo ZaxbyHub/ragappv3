@@ -165,6 +165,64 @@ def test_answer_contract_includes_wiki_and_kms_citations():
     ]
 
 
+def test_answer_contract_abstention_reflects_explicit_decision():
+    """Issue #510 RAG-007: abstention is an explicit decision, never a
+    substring guess — an answer that merely QUOTES "don't know" from a
+    document is not abstaining when the pipeline decided it answered.
+    """
+    # decision=False + prose containing "don't know" → abstained False.
+    contract = build_answer_contract(
+        'The runbook states the operator should respond "I don\'t know" when '
+        "the sensor reading is missing, then escalate to on-call.",
+        sources=[{"source_label": "S1"}],
+        memories_used=[],
+        wiki_used=[],
+        kms_used=[],
+        abstention_decision=False,
+    )
+    assert contract["abstained"] is False
+    assert contract["abstention_basis"] == "decision"
+
+    # decision=True → abstained True, still basis "decision".
+    contract = build_answer_contract(
+        "I don't know based on the provided context.",
+        sources=[],
+        memories_used=[],
+        wiki_used=[],
+        kms_used=[],
+        abstention_decision=True,
+    )
+    assert contract["abstained"] is True
+    assert contract["abstention_basis"] == "decision"
+
+
+def test_answer_contract_no_decision_marks_basis_unavailable():
+    """Without a pipeline decision the flag is False and the basis marks it
+    unavailable (legacy callers) — the substring heuristic is gone.
+    """
+    contract = build_answer_contract(
+        "I don't know based on the provided context.",
+        sources=[{"source_label": "S1"}],
+        memories_used=[],
+        wiki_used=[],
+        kms_used=[],
+        abstention_decision=None,
+    )
+    assert contract["abstained"] is False
+    assert contract["abstention_basis"] == "unavailable"
+
+    # Default (no kwarg) behaves identically.
+    contract_default = build_answer_contract(
+        "I don't know based on the provided context.",
+        sources=[],
+        memories_used=[],
+        wiki_used=[],
+        kms_used=[],
+    )
+    assert contract_default["abstained"] is False
+    assert contract_default["abstention_basis"] == "unavailable"
+
+
 class DummyLLMClient:
     def __init__(self, name, *, fail=False, content=""):
         self.base_url = name

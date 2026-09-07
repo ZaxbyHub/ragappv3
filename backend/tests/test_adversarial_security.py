@@ -824,6 +824,9 @@ class TestVectorStoreAdversarial:
 
         # Mock table.search to return a mock query object (search is awaited)
         mock_query = MagicMock()
+        # Issue #510 VECTOR-004: the dense query chain now calls
+        # .distance_type(metric) before .where(...) — keep the mock chained.
+        mock_query.distance_type.return_value = mock_query
         mock_query.where.return_value = mock_query
         mock_query.limit.return_value = mock_query
         mock_query.to_list = AsyncMock(return_value=[])
@@ -852,6 +855,9 @@ class TestVectorStoreAdversarial:
         store.table.list_indices = AsyncMock(return_value=[])
 
         mock_query = MagicMock()
+        # Issue #510 VECTOR-004: the dense query chain now calls
+        # .distance_type(metric) before .where(...) — keep the mock chained.
+        mock_query.distance_type.return_value = mock_query
         mock_query.where.return_value = mock_query
         mock_query.limit.return_value = mock_query
         mock_query.to_list = AsyncMock(return_value=[])
@@ -879,6 +885,9 @@ class TestVectorStoreAdversarial:
         store.table.list_indices = AsyncMock(return_value=[])
 
         mock_query = MagicMock()
+        # Issue #510 VECTOR-004: the dense query chain now calls
+        # .distance_type(metric) before .where(...) — keep the mock chained.
+        mock_query.distance_type.return_value = mock_query
         mock_query.where.return_value = mock_query
         mock_query.limit.return_value = mock_query
         mock_query.to_list = AsyncMock(return_value=[])

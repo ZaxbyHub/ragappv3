@@ -321,6 +321,121 @@ class TestDeduplicate:
             await distiller._deduplicate(sources, threshold=0.92)
 
 
+class TestOriginallyShortSourceGuard:
+    """Issue #510 RAG-003: the <50-char guard must only catch chunks EMPTIED
+    by duplicate removal — a source that was ALREADY short (a date, a code)
+    with surviving text is evidence and must be kept, while a short source
+    whose every sentence was a duplicate is still dropped.
+    """
+
+    @pytest.fixture
+    def mock_embedding_service(self):
+        mock = MagicMock()
+        mock.embed_batch = AsyncMock()
+        return mock
+
+    @pytest.mark.asyncio
+    async def test_unique_short_source_survives_with_provenance(
+        self, mock_embedding_service
+    ):
+        """A unique 24-char source survives WITH provenance span."""
+        short_text = "Unlock code: 4451-AB."  # 22 chars — well under 50
+        sources = [
+            RAGSource(
+                text="The rotation policy runs nightly across all managed vaults.",
+                file_id="file1",
+                score=0.9,
+                metadata={},
+            ),
+            RAGSource(
+                text=short_text,
+                file_id="file2",
+                score=0.8,
+                metadata={},
+            ),
+        ]
+        # Orthogonal embeddings: nothing is a duplicate of anything.
+        mock_embedding_service.embed_batch.return_value = [
+            [1.0, 0.0, 0.0],  # file1 sentence
+            [0.0, 1.0, 0.0],  # file2 sentence (unique)
+        ]
+
+        distiller = ContextDistiller(mock_embedding_service)
+        result = await distiller._deduplicate(sources, threshold=0.92)
+
+        assert len(result.sources) == 2, (
+            "An originally-short unique source must survive the <50-char guard"
+        )
+        assert result.sources[1].text == short_text
+        assert result.sources[1].file_id == "file2"
+        # Provenance entry with correct source index and exact char span.
+        short_prov = [p for p in result.sentence_provenance if p.source_index == 1]
+        assert len(short_prov) == 1
+        assert short_prov[0].sentence_text == short_text
+        assert short_prov[0].source_file_id == "file2"
+        span = (short_prov[0].char_start, short_prov[0].char_end)
+        assert short_text[span[0]:span[1]] == short_text
+
+    @pytest.mark.asyncio
+    async def test_duplicate_only_short_source_dropped(
+        self, mock_embedding_service
+    ):
+        """A lower-ranked SHORT source whose only sentence duplicated a
+        higher-ranked chunk is empty after dedup and must still be dropped.
+        """
+        dup_text = "Duplicate short fact."  # < 50 chars originally
+        sources = [
+            RAGSource(
+                text="Provisioning completed on schedule. Duplicate short fact.",
+                file_id="file1",
+                score=0.9,
+                metadata={},
+            ),
+            RAGSource(
+                text=dup_text,
+                file_id="file2",
+                score=0.8,
+                metadata={},
+            ),
+        ]
+        # file2's sentence embeds identically to file1's second sentence.
+        mock_embedding_service.embed_batch.return_value = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],  # kept (first source always wins)
+            [0.0, 1.0, 0.0],  # duplicate → stripped
+        ]
+
+        distiller = ContextDistiller(mock_embedding_service)
+        result = await distiller._deduplicate(sources, threshold=0.92)
+
+        assert len(result.sources) == 1
+        assert result.sources[0].file_id == "file1"
+        assert all(p.source_index == 0 for p in result.sentence_provenance)
+
+    @pytest.mark.asyncio
+    async def test_all_unique_short_set_nonempty(self, mock_embedding_service):
+        """A set of only-short unique sources is not emptied by the guard."""
+        sources = [
+            RAGSource(text="API key rotation: 30 days.", file_id="f1", score=0.9, metadata={}),
+            RAGSource(text="Maintenance window: 02:00 UTC.", file_id="f2", score=0.8, metadata={}),
+            RAGSource(text="Quota limit: 500 req/min.", file_id="f3", score=0.7, metadata={}),
+        ]
+        mock_embedding_service.embed_batch.return_value = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+
+        distiller = ContextDistiller(mock_embedding_service)
+        result = await distiller._deduplicate(sources, threshold=0.92)
+
+        assert len(result.sources) == 3, (
+            "All-unique short sources must survive; the guard exists only to "
+            "catch chunks emptied by dedup"
+        )
+        assert {p.source_index for p in result.sentence_provenance} == {0, 1, 2}
+
+
 class TestSynthesize:
     """Tests for _synthesize method."""
 

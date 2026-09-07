@@ -20,6 +20,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -123,6 +124,14 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const setRetrievalMode = useChatModeStore((s) => s.setRetrievalMode);
   const citationMode = useChatModeStore((s) => s.citationMode);
   const setCitationMode = useChatModeStore((s) => s.setCitationMode);
+  const metadataFilterDateFrom = useChatModeStore((s) => s.metadataFilterDateFrom);
+  const setMetadataFilterDateFrom = useChatModeStore((s) => s.setMetadataFilterDateFrom);
+  const metadataFilterDateTo = useChatModeStore((s) => s.metadataFilterDateTo);
+  const setMetadataFilterDateTo = useChatModeStore((s) => s.setMetadataFilterDateTo);
+  const metadataFilterTags = useChatModeStore((s) => s.metadataFilterTags);
+  const setMetadataFilterTags = useChatModeStore((s) => s.setMetadataFilterTags);
+  const metadataFilterAuthor = useChatModeStore((s) => s.metadataFilterAuthor);
+  const setMetadataFilterAuthor = useChatModeStore((s) => s.setMetadataFilterAuthor);
   const defaultChatMode = useSettingsStore((s) => s.formData.default_chat_mode);
   const thinkingHealthy = useLlmHealthStore((s) => s.thinking);
   const instantHealthy = useLlmHealthStore((s) => s.instant);
@@ -845,6 +854,47 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                     <SelectItem value="required">Cite: Req</SelectItem>
                   </SelectContent>
                 </Select>
+
+                {/* Metadata filter (issue #510 AC-16) — retrieval date/tags/author constraints.
+                    Compact inputs matching the selector row's h-8 text-xs visual language. */}
+                <Input
+                  type="date"
+                  value={metadataFilterDateFrom}
+                  onChange={(e) => setMetadataFilterDateFrom(e.target.value)}
+                  disabled={isStreaming}
+                  aria-label="Filter from date"
+                  title="Filter sources from this date"
+                  className="h-8 w-[118px] text-xs px-2"
+                />
+                <Input
+                  type="date"
+                  value={metadataFilterDateTo}
+                  onChange={(e) => setMetadataFilterDateTo(e.target.value)}
+                  disabled={isStreaming}
+                  aria-label="Filter to date"
+                  title="Filter sources up to this date"
+                  className="h-8 w-[118px] text-xs px-2"
+                />
+                <Input
+                  type="text"
+                  value={metadataFilterTags}
+                  onChange={(e) => setMetadataFilterTags(e.target.value)}
+                  disabled={isStreaming}
+                  aria-label="Filter tags"
+                  placeholder="Tags"
+                  title="Comma-separated source tags"
+                  className="h-8 w-[90px] text-xs px-2"
+                />
+                <Input
+                  type="text"
+                  value={metadataFilterAuthor}
+                  onChange={(e) => setMetadataFilterAuthor(e.target.value)}
+                  disabled={isStreaming}
+                  aria-label="Filter author"
+                  placeholder="Author"
+                  title="Filter by source author"
+                  className="h-8 w-[90px] text-xs px-2"
+                />
               </div>
               {isFallenBack && (
                 <span

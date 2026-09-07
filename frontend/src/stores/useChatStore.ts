@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { useShallow } from "zustand/shallow";
-import type { Source, UsedMemory, WikiReference, KMSReference } from "@/lib/api";
+import type { Source, UsedMemory, WikiReference, KMSReference, CitationEnforcement } from "@/lib/api";
 
 export interface Message {
   id: string;
@@ -25,6 +25,10 @@ export interface Message {
   citationConfidence?: Record<string, number>;
   /** Unverifiable claims flagged by the citation validator. */
   unverifiableClaims?: string[];
+  /** Currency/supersession warnings from the done event (issue #510 AC-17). */
+  currencyWarnings?: string[];
+  /** Citation-mode enforcement outcome from the done event (issue #510 UI-004). */
+  citationEnforcement?: CitationEnforcement;
   /** Durable turn linkage (issue #507): shared by a turn's user+assistant rows. */
   turnId?: string;
   /** Assistant terminal state (issue #507). "complete" is the default; "interrupted"/"partial" render retryable. */

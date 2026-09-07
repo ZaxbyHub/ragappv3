@@ -330,9 +330,15 @@ class ContextDistiller:
         surviving_indices: set = set()
         for src_idx, source in enumerate(sources):
             new_text = " ".join(source_sentences[src_idx])
+            original_len = len(source.text or "")
             if len(new_text) < 50:
-                # Drop chunks reduced to near-nothing after dedup
-                continue
+                # Drop chunks reduced to near-nothing by duplicate removal —
+                # but never drop a source that was ALREADY short (issue #510
+                # RAG-003): an originally-short unique fact (a date, a code)
+                # is evidence, not noise, and the guard exists only to catch
+                # chunks whose text was emptied by dedup.
+                if original_len >= 50 or not new_text.strip():
+                    continue
             from app.services.rag_engine import RAGSource
 
             deduped.append(

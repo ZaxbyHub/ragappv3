@@ -34,6 +34,9 @@ def _make_fts_mock_builder(results, to_list_side_effect=None):
 def _make_dense_mock_builder(results):
     """Create a mock search builder chain for dense vector search."""
     mock_builder = MagicMock()
+    # Issue #510 VECTOR-004: dense query chain calls .distance_type(metric)
+    # before .where(...) — keep the mock chained.
+    mock_builder.distance_type.return_value = mock_builder
     mock_builder.where.return_value = mock_builder
     mock_builder.limit.return_value = mock_builder
     mock_builder.to_list = AsyncMock(return_value=results)

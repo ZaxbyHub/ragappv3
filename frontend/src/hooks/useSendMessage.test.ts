@@ -31,6 +31,8 @@ type StreamHandlers = {
   onFinalContent?: (content: string) => void;
   onCitationConfidence?: (confidence: unknown) => void;
   onUnverifiableClaims?: (claims: unknown[]) => void;
+  onCurrencyWarnings?: (warnings: string[]) => void;
+  onCitationEnforcement?: (enforcement: unknown) => void;
   onError: (error: Error) => void;
   onComplete: () => Promise<void> | void;
 };
@@ -58,6 +60,14 @@ function installCapturingStreamMock(): { trigger: { error: (e: Error) => void; c
       unverifiableClaims: (claims: string[]) => {
         if (!cell.current) throw new Error("chatStream was not invoked yet");
         cell.current.onUnverifiableClaims?.(claims);
+      },
+      currencyWarnings: (warnings: string[]) => {
+        if (!cell.current) throw new Error("chatStream was not invoked yet");
+        cell.current.onCurrencyWarnings?.(warnings);
+      },
+      citationEnforcement: (enforcement: { mode: string; status: string }) => {
+        if (!cell.current) throw new Error("chatStream was not invoked yet");
+        cell.current.onCitationEnforcement?.(enforcement);
       },
       error: (e: Error) => {
         if (!cell.current) throw new Error("chatStream was not invoked yet");
@@ -747,6 +757,37 @@ describe("useSendMessage", () => {
       expect(state.messagesById["100"]).toBeDefined();
       expect(state.messagesById["101"]).toBeDefined();
       expect(savedUser?.turnId).toBe(savedAssistant?.turnId);
+    });
+
+    it("maps done-payload currency warnings and citation enforcement onto the streaming message (issue #510)", async () => {
+      const capture = installCapturingStreamMock();
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ activeChatId: "42", input: "fresh sources only" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      const streamingId = useChatStore.getState().streamingMessageId;
+      expect(streamingId).toBeTruthy();
+
+      await act(async () => {
+        capture.trigger.currencyWarnings(["S1 may be superseded by S2"]);
+        capture.trigger.citationEnforcement({ mode: "required", status: "missing_citations" });
+      });
+
+      const assistant = useChatStore.getState().messagesById[streamingId!];
+      expect(assistant.currencyWarnings).toEqual(["S1 may be superseded by S2"]);
+      expect(assistant.citationEnforcement).toEqual({
+        mode: "required",
+        status: "missing_citations",
+      });
+
+      act(() => {
+        result.current.handleStop();
+      });
     });
 
     it("marks the exchange failed and keeps the answer visible when the batch save rejects (UI-002)", async () => {

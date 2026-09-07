@@ -272,10 +272,18 @@ class TestSupersedesColumnCache(unittest.IsolatedAsyncioTestCase):
         # And cache was set correctly
         self.assertTrue(engine._supersedes_column_exists)
 
+    # REALIGNMENT (issue #510 RAG-008): the two tests that previously asserted
+    # "except → cache False" were superseded. A transient probe failure (pool
+    # exhaustion, locked DB) must NOT be cached as "column absent" — the cache
+    # stays None (unknown) so the next query re-probes. Only a SUCCESSFUL
+    # observation may populate the cache (a successful absent-column probe may
+    # still cache False — covered by test_cache_set_after_first_call_when_column_missing
+    # and test_cache_prevents_pragma_call_when_column_missing above).
+
     @patch("app.services.rag_engine.asyncio.to_thread")
     @patch("app.services.rag_engine._get_pool")
-    async def test_cache_set_to_false_when_probe_raises_exception(self, mock_get_pool, mock_to_thread):
-        """When asyncio.to_thread raises, cache is set to False (error suppression)."""
+    async def test_probe_exception_leaves_cache_none(self, mock_get_pool, mock_to_thread):
+        """A probe exception is suppressed but caches NOTHING (stays None)."""
         mock_to_thread.side_effect = RuntimeError("Pool connection failed")
 
         engine = RAGEngine()
@@ -287,36 +295,62 @@ class TestSupersedesColumnCache(unittest.IsolatedAsyncioTestCase):
         # Call should not raise - errors are suppressed
         result = await engine._check_supersession(sources)
 
-        # Result should be None (skipped due to cache=False)
+        # Result should be None (check skipped)
         self.assertIsNone(result)
-        # Cache should be False (error suppression set it to False)
-        self.assertFalse(engine._supersedes_column_exists)
+        # Cache must remain None (unknown) — a transient failure must never
+        # be recorded as "column absent".
+        self.assertIsNone(engine._supersedes_column_exists)
 
     @patch("app.services.rag_engine.asyncio.to_thread")
     @patch("app.services.rag_engine._get_pool")
-    async def test_probe_exception_allows_subsequent_calls_to_use_cache(self, mock_get_pool, mock_to_thread):
-        """After probe exception sets cache to False, subsequent calls use the cached False value."""
-        call_count = [0]
+    async def test_probe_exception_does_not_permanently_cache_absence(
+        self, mock_get_pool, mock_to_thread
+    ):
+        """After a transient probe failure the next call RE-PROBES; once the
+        pool recovers, the supersession warning is actually returned."""
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        mock_pool.connection.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_pool.connection.return_value.__exit__ = MagicMock(return_value=False)
+        mock_get_pool.return_value = mock_pool
 
-        def run_sync_with_count(fn):
-            call_count[0] += 1
-            raise RuntimeError("Pool connection failed")
+        # PRAGMA result WITH supersedes_file_id + a newer file row.
+        mock_cursor_pragma = MagicMock()
+        mock_cursor_pragma.fetchall.return_value = [
+            (0, "id", "TEXT", 0, None, 0),
+            (1, "file_name", "TEXT", 0, None, 0),
+            (2, "supersedes_file_id", "TEXT", 0, None, 0),
+            (3, "status", "TEXT", 0, None, 0),
+        ]
+        mock_cursor_query = MagicMock()
+        mock_cursor_query.fetchall.return_value = [("report_v2.pdf",)]
+        mock_conn.execute.side_effect = [mock_cursor_pragma, mock_cursor_query]
 
-        mock_to_thread.side_effect = run_sync_with_count
+        to_thread_calls = []
+
+        def run_sync(fn):
+            to_thread_calls.append(fn)
+            if len(to_thread_calls) == 1:
+                raise RuntimeError("Pool connection failed")  # transient only
+            return fn()
+
+        mock_to_thread.side_effect = run_sync
 
         engine = RAGEngine()
         sources = [make_source("file123")]
 
-        # First call - sets cache to False due to exception
-        await engine._check_supersession(sources)
-        self.assertFalse(engine._supersedes_column_exists)
-        self.assertEqual(1, call_count[0])
+        # First call: probe fails transiently — no warning, cache unknown.
+        first = await engine._check_supersession(sources)
+        self.assertIsNone(first)
+        self.assertIsNone(engine._supersedes_column_exists)
 
-        # Second call - should use cache, not call probe again
-        await engine._check_supersession(sources)
-        self.assertFalse(engine._supersedes_column_exists)
-        # Should NOT have called to_thread again
-        self.assertEqual(1, call_count[0])
+        # Second call: re-probes (NOT satisfied by a stale cached absence).
+        second = await engine._check_supersession(sources)
+        # After recovery the warning is returned.
+        self.assertIsNotNone(second)
+        self.assertIn("superseded", second)
+        # Probe ran again, then the supersession query: 3 to_thread calls total.
+        self.assertEqual(3, len(to_thread_calls))
 
     @patch("app.services.rag_engine._get_pool")
     async def test_empty_sources_returns_none_without_probe(self, mock_get_pool):

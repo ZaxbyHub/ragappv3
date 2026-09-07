@@ -11,6 +11,7 @@ from app.services.agentic_tools import (
     ToolRegistry,
     ToolResult,
 )
+from app.services.rag_engine import RAGEngine
 
 # ---------------------------------------------------------------------------
 # ToolResult shape
@@ -202,7 +203,7 @@ class TestRetrievalTool:
             "metadata": mock_chunk.metadata,
         }
 
-        mock_engine = MagicMock()
+        mock_engine = MagicMock(spec=RAGEngine)
         mock_engine.embedding_service = MagicMock()
         mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 768)
         mock_engine._execute_retrieval = AsyncMock(
@@ -233,7 +234,7 @@ class TestRetrievalTool:
 
     @pytest.mark.asyncio
     async def test_execute_returns_empty_on_no_results(self):
-        mock_engine = MagicMock()
+        mock_engine = MagicMock(spec=RAGEngine)
         mock_engine.embedding_service = MagicMock()
         mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 768)
         mock_engine._execute_retrieval = AsyncMock(
@@ -270,7 +271,7 @@ class TestRetrievalTool:
     @pytest.mark.asyncio
     async def test_execute_uses_top_k_param(self):
         """top_k parameter overrides the default retrieval_top_k."""
-        mock_engine = MagicMock()
+        mock_engine = MagicMock(spec=RAGEngine)
         mock_engine.retrieval_top_k = 0  # will be set to 20 by execute
         mock_engine.embedding_service = MagicMock()
         mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 768)
@@ -290,6 +291,191 @@ class TestRetrievalTool:
         # Verify engine was constructed and retrieval_top_k was set
         mock_constructor.assert_called_once()
         assert mock_engine.retrieval_top_k == 20
+
+
+# ---------------------------------------------------------------------------
+# RetrievalTool — rerank status, cumulative labels, engine-state filter (510)
+# ---------------------------------------------------------------------------
+
+
+class _RealDRSEngineFactory:
+    """Mock engine whose document_retrieval is a REAL DocumentRetrievalService.
+
+    The real service makes reranked=True observably skip the distance filter
+    and surface _rerank_score as the source score, and produces real
+    source_label values from to_source_metadata.
+    """
+
+    @staticmethod
+    def make(vector_results, rerank_success):
+        from app.services.document_retrieval import DocumentRetrievalService
+
+        mock_engine = MagicMock(spec=RAGEngine)
+        mock_engine.embedding_service = MagicMock()
+        mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 3)
+        mock_engine._execute_retrieval = AsyncMock(
+            return_value=(
+                vector_results,
+                None,  # relevance_hint
+                "CONFIDENT",  # eval_result
+                rerank_success,  # rerank_success — 4th of the 11-tuple
+                "rerank" if rerank_success else "distance",
+                "disabled",
+                0,
+                "ok" if rerank_success else "disabled",
+                [],
+                False,
+                {},
+            )
+        )
+        # Real service: threshold 0.5 so an over-threshold _distance is only
+        # survivable when reranked=True (distance filter skipped).
+        drs = DocumentRetrievalService(
+            vector_store=None,
+            max_distance_threshold=0.5,
+            retrieval_top_k=10,
+            retrieval_window=0,
+        )
+        reranked_calls = {}
+        original = drs.filter_relevant
+
+        async def _spy(results, top_k=None, reranked=False, indexed_file_ids=None):
+            reranked_calls["reranked"] = reranked
+            return await original(
+                results, top_k=top_k, reranked=reranked, indexed_file_ids=indexed_file_ids
+            )
+
+        drs.filter_relevant = _spy
+        mock_engine.document_retrieval = drs
+        mock_engine._sync_document_retrieval_settings = MagicMock()
+        mock_engine._reranked_calls = reranked_calls
+        return mock_engine
+
+
+class TestRetrievalToolRerankAndLabels:
+    """Issue #510 RAG-006 / CITE-002: rerank status and cumulative labels."""
+
+    def _record(self, distance, rerank_score=None):
+        record = {
+            "id": "7_0",
+            "file_id": "7",
+            "text": "Paris is the capital of France and a major European city.",
+            "_distance": distance,
+            "metadata": {},
+        }
+        if rerank_score is not None:
+            record["_rerank_score"] = rerank_score
+        return record
+
+    @pytest.mark.asyncio
+    async def test_rerank_success_true_passes_reranked_and_surfaces_score(self):
+        """rerank_success=True (4th tuple element) → filter_relevant(reranked=True)
+        and the reranker score (0.95) becomes the source score even though the
+        raw _distance (0.99) exceeds the distance threshold."""
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.99, rerank_score=0.95)], rerank_success=True
+        )
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        result = await tool.execute(query="capital of France")
+
+        assert result.success is True
+        assert engine._reranked_calls["reranked"] is True
+        assert len(result.sources) == 1, (
+            "reranked=True must skip the distance filter (raw _distance 0.99 > 0.5)"
+        )
+        assert result.sources[0]["score"] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_rerank_success_none_passes_reranked_false(self):
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10, rerank_score=0.95)], rerank_success=None
+        )
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        result = await tool.execute(query="capital of France")
+
+        assert engine._reranked_calls["reranked"] is False
+        assert len(result.sources) == 1
+        # Distance is the score signal when not reranked.
+        assert result.sources[0]["score"] == 0.10
+
+    @pytest.mark.asyncio
+    async def test_rerank_success_false_passes_reranked_false(self):
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10, rerank_score=0.95)], rerank_success=False
+        )
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        result = await tool.execute(query="capital of France")
+
+        assert engine._reranked_calls["reranked"] is False
+        assert len(result.sources) == 1
+        assert result.sources[0]["score"] == 0.10
+
+    @pytest.mark.asyncio
+    async def test_sequential_executes_label_sources_globally_unique(self):
+        """Two execute() calls on ONE tool instance produce S1 then S2."""
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10)], rerank_success=None
+        )
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        first = await tool.execute(query="capital of France")
+        second = await tool.execute(query="capital of France")
+
+        assert first.sources[0]["source_label"] == "S1"
+        assert second.sources[0]["source_label"] == "S2", (
+            "Labels must extend one cumulative S1..Sn sequence across rounds, "
+            "not restart at S1"
+        )
+        assert tool._next_label == 3
+
+    @pytest.mark.asyncio
+    async def test_constructor_controls_forwarded_explicitly(self):
+        """RetrievalTool forwards its constructor controls explicitly.
+
+        Per-request controls are captured at construction from the enclosing
+        query()'s locals (PR #523 review PRR-001: no per-request engine
+        state — instance attributes raced across concurrent requests). The
+        stubbed ``engine._execute_retrieval`` call must carry exactly the
+        controls the tool was built with.
+        """
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10)], rerank_success=None
+        )
+        tool = RetrievalTool(
+            retrieval_top_k=5,
+            engine=engine,
+            retrieval_mode="keyword",
+            filter_expr="file_id IN ('7')",
+        )
+
+        await tool.execute(query="capital of France", vault_id=1)
+
+        call_kwargs = engine._execute_retrieval.call_args.kwargs
+        assert call_kwargs.get("filter_expr") == "file_id IN ('7')"
+        assert call_kwargs.get("retrieval_mode") == "keyword"
+
+    @pytest.mark.asyncio
+    async def test_tool_without_controls_passes_none_for_engine_defaults(self):
+        """A tool constructed without controls passes None explicitly.
+
+        Standalone tool usage (no enclosing query()) gets engine defaults —
+        never a stale reading of engine instance state.
+        """
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10)], rerank_success=None
+        )
+        engine._active_filter_expr = "file_id IN ('999')"  # stale garbage
+        engine._active_retrieval_mode = "semantic"
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        await tool.execute(query="capital of France", vault_id=1)
+
+        call_kwargs = engine._execute_retrieval.call_args.kwargs
+        assert call_kwargs.get("filter_expr") is None
+        assert call_kwargs.get("retrieval_mode") is None
 
 
 # ---------------------------------------------------------------------------

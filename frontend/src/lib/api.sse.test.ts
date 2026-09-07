@@ -325,6 +325,52 @@ describe("parseSSEStream - evidence candidate events (issue #508)", () => {
   });
 });
 
+describe("parseSSEStream - issue #510 done-payload fields", () => {
+  it("forwards currency_warnings and citation_enforcement from the done event", async () => {
+    const currencyCalls: string[][] = [];
+    const enforcementCalls: unknown[] = [];
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: () => {},
+      onCurrencyWarnings: (w) => currencyCalls.push(w),
+      onCitationEnforcement: (e) => enforcementCalls.push(e),
+      onComplete: () => {},
+    };
+
+    await parseSSEStream(
+      makeReader([
+        {
+          type: "done",
+          sources: [],
+          currency_warnings: ["S1 may be superseded by S2"],
+          citation_enforcement: { mode: "required", status: "missing_citations" },
+        },
+      ]),
+      callbacks
+    );
+
+    expect(currencyCalls).toEqual([["S1 may be superseded by S2"]]);
+    expect(enforcementCalls).toEqual([
+      { mode: "required", status: "missing_citations" },
+    ]);
+  });
+
+  it("fires neither callback when the done payload omits both fields", async () => {
+    const currencyCalls: string[][] = [];
+    const enforcementCalls: unknown[] = [];
+    const callbacks: ChatStreamCallbacks = {
+      onMessage: () => {},
+      onCurrencyWarnings: (w) => currencyCalls.push(w),
+      onCitationEnforcement: (e) => enforcementCalls.push(e),
+      onComplete: () => {},
+    };
+
+    await parseSSEStream(makeReader([{ type: "done", sources: [] }]), callbacks);
+
+    expect(currencyCalls).toEqual([]);
+    expect(enforcementCalls).toEqual([]);
+  });
+});
+
 describe("parseSSEStream - regression: backend done completes once (F-001)", () => {
   it("calls onComplete once for the backend JSON done event without requiring [DONE]", async () => {
     let completeCalls = 0;

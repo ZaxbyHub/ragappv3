@@ -318,6 +318,8 @@ class TestAddChunksCallsOptimize:
         store._index_mutation_generation = 0
 
         query = MagicMock()
+        # Issue #510 VECTOR-004: dense chain starts at .distance_type(metric).
+        query.distance_type.return_value = query
         query.limit.return_value.to_list = AsyncMock(return_value=[])
 
         mock_table = _make_mock_table(row_count=999, has_ivfpq=True)
@@ -348,6 +350,8 @@ class TestAddChunksCallsOptimize:
         store._embedding_dim = 4
 
         query = MagicMock()
+        # Issue #510 VECTOR-004: dense chain starts at .distance_type(metric).
+        query.distance_type.return_value = query
         query.bypass_vector_index = MagicMock(return_value=query)
         query.limit.return_value.to_list = AsyncMock(
             return_value=[{"id": "doc_b_0", "file_id": "doc_b"}]

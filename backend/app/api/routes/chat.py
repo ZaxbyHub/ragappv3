@@ -34,6 +34,7 @@ from app.models.chat_mode import ChatMode
 from app.models.database import get_pool
 from app.security import csrf_protect
 from app.services.citation_validator import repair_against_sources_and_memories
+from app.services.metadata_filter import MetadataFilter
 from app.services.rag_engine import RAGEngine, RAGEngineError
 from app.services.vector_store import SearchSemaphoreTimeoutError
 from app.services.vision_evidence import VisionEvidenceService, VisionRunContext
@@ -58,6 +59,13 @@ CHAT_HEARTBEAT_INTERVAL = 15.0  # seconds
 
 logger = logging.getLogger(__name__)
 
+# Inline generation-control modes (issue #510). Hoisted to module-level
+# aliases (PRR-022) so the request models and the stream/non-stream helper
+# signatures share one source of truth — the helpers accept exactly the
+# values the models validate.
+RetrievalMode = Literal["auto", "semantic", "keyword"]
+CitationMode = Literal["enabled", "disabled", "required"]
+
 
 class ChatRequest(BaseModel):
     """Request model for chat endpoint."""
@@ -67,10 +75,13 @@ class ChatRequest(BaseModel):
     stream: bool = False
     vault_id: Optional[int] = None
     mode: Optional[Literal["instant", "thinking"]] = None
-    # Inline generation controls (forward-compatible v1: accepted + logged).
+    # Inline generation controls (issue #510: implemented end to end).
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
-    retrieval_mode: Optional[str] = None
-    citation_mode: Optional[str] = None
+    retrieval_mode: Optional[RetrievalMode] = None
+    citation_mode: Optional[CitationMode] = None
+    # Typed metadata filter (date/tag/author subset; unknown fields are
+    # rejected by MetadataFilter's extra="forbid" — never silently ignored).
+    metadata_filter: Optional[MetadataFilter] = None
 
 
 class UsedMemory(BaseModel):
@@ -104,6 +115,9 @@ class ChatResponse(BaseModel):
     kms_used: List[Dict[str, Any]] = Field(default_factory=list)
     answer_contract: Optional[Dict[str, Any]] = None
     llm_metrics: Optional[Dict[str, Any]] = None
+    # Issue #510 honesty fields (parity with the streaming done payload).
+    currency_warnings: Optional[List[str]] = None
+    citation_enforcement: Optional[Dict[str, Any]] = None
     # "distance" | "rerank" | "rrf" — tells the client how to interpret `score`
     # values in each source (polarity + thresholds). Default "distance" keeps
     # older clients on the safe path if the engine omits it.
@@ -125,10 +139,11 @@ class ChatStreamRequest(BaseModel):
     messages: List[ChatMessage]
     vault_id: Optional[int] = None
     mode: Optional[Literal["instant", "thinking"]] = None
-    # Inline generation controls (forward-compatible v1: accepted + logged).
+    # Inline generation controls (issue #510: implemented end to end).
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
-    retrieval_mode: Optional[str] = None
-    citation_mode: Optional[str] = None
+    retrieval_mode: Optional[RetrievalMode] = None
+    citation_mode: Optional[CitationMode] = None
+    metadata_filter: Optional[MetadataFilter] = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -159,6 +174,10 @@ class AddMessageRequest(BaseModel):
     status: Optional[Literal["complete", "partial", "interrupted", "failed"]] = None
     citation_confidence: Optional[Dict[str, Any]] = None
     unverifiable_claims: Optional[List[str]] = Field(default=None, max_length=50)
+    # Issue #510 AC-17/UI-004: advisory honesty fields round-trip history so
+    # warnings persist across reloads (same bounded-payload approach).
+    currency_warnings: Optional[List[str]] = Field(default=None, max_length=50)
+    citation_enforcement: Optional[Dict[str, Any]] = None
 
 
 class BatchAddMessagesRequest(BaseModel):
@@ -301,11 +320,12 @@ def stream_chat_response(
     rag_engine: Optional[RAGEngine],
     vault_id: Optional[int] = None,
     mode: Optional[ChatMode] = None,
+    metadata_filter: Optional[MetadataFilter] = None,
     user_id: Optional[int] = None,
     require_vault: bool = False,
     temperature: Optional[float] = None,
-    retrieval_mode: Optional[str] = None,
-    citation_mode: Optional[str] = None,
+    retrieval_mode: Optional[RetrievalMode] = None,
+    citation_mode: Optional[CitationMode] = None,
     include_global: bool = False,
     can_write_memory: bool = False,
     vision_context: Optional[VisionRunContext] = None,
@@ -347,6 +367,9 @@ def stream_chat_response(
         # SC-009: citation confidence + unverifiable claims
         citation_confidence: Optional[Dict[str, float]] = None
         unverifiable_claims: Optional[list] = None
+        # Issue #510 honesty fields (parity with the nonstream capture)
+        currency_warnings: Optional[list] = None
+        citation_enforcement: Optional[dict] = None
 
         # Resolve the effective mode the same way RAGEngine does and emit it
         # as the first SSE event so the client can show a per-message badge
@@ -368,7 +391,7 @@ def stream_chat_response(
                 message, history, stream=True, vault_id=vault_id, mode=mode,
                 require_vault=require_vault, user_id=user_id,
                 temperature=temperature, retrieval_mode=retrieval_mode,
-                citation_mode=citation_mode,
+                citation_mode=citation_mode, metadata_filter=metadata_filter,
                 include_global=include_global, can_write_memory=can_write_memory,
                 vision_context=vision_context,
             )
@@ -430,6 +453,8 @@ def stream_chat_response(
                         # SC-009: extract citation confidence + unverifiable claims
                         citation_confidence = chunk.get("citation_confidence")
                         unverifiable_claims = chunk.get("unverifiable_claims")
+                        currency_warnings = chunk.get("currency_warnings")
+                        citation_enforcement = chunk.get("citation_enforcement")
                         answer_contract = chunk.get("answer_contract")
                         llm_metrics = chunk.get("llm_metrics")
             finally:
@@ -535,6 +560,10 @@ def stream_chat_response(
             done_payload["citation_confidence"] = citation_confidence
         if unverifiable_claims is not None:
             done_payload["unverifiable_claims"] = unverifiable_claims
+        if currency_warnings is not None:
+            done_payload["currency_warnings"] = currency_warnings
+        if citation_enforcement is not None:
+            done_payload["citation_enforcement"] = citation_enforcement
         yield f"data: {json.dumps(done_payload)}\n\n"
 
         # Enqueue post-answer wiki compile job (non-blocking).
@@ -565,11 +594,12 @@ async def non_stream_chat_response(
     rag_engine: Optional[RAGEngine],
     vault_id: Optional[int] = None,
     mode: Optional[ChatMode] = None,
+    metadata_filter: Optional[MetadataFilter] = None,
     require_vault: bool = False,
     user_id: Optional[int] = None,
     temperature: Optional[float] = None,
-    retrieval_mode: Optional[str] = None,
-    citation_mode: Optional[str] = None,
+    retrieval_mode: Optional[RetrievalMode] = None,
+    citation_mode: Optional[CitationMode] = None,
     include_global: bool = False,
     can_write_memory: bool = False,
     vision_context: Optional[VisionRunContext] = None,
@@ -600,13 +630,15 @@ async def non_stream_chat_response(
     prompt_version: Optional[str] = None
     answer_contract = None
     llm_metrics = None
+    currency_warnings = None
+    citation_enforcement = None
 
     try:
         async for chunk in rag_engine.query(
             message, history, stream=False, vault_id=vault_id, mode=mode,
             require_vault=require_vault, user_id=user_id,
             temperature=temperature, retrieval_mode=retrieval_mode,
-            citation_mode=citation_mode,
+            citation_mode=citation_mode, metadata_filter=metadata_filter,
             include_global=include_global, can_write_memory=can_write_memory,
             vision_context=vision_context,
         ):
@@ -628,6 +660,8 @@ async def non_stream_chat_response(
                 ab_experiment_id = chunk.get("ab_experiment_id")
                 ab_variant = chunk.get("ab_variant")
                 prompt_version = chunk.get("prompt_version")
+                currency_warnings = chunk.get("currency_warnings")
+                citation_enforcement = chunk.get("citation_enforcement")
                 answer_contract = chunk.get("answer_contract")
                 llm_metrics = chunk.get("llm_metrics")
     except RAGEngineError as exc:
@@ -697,6 +731,8 @@ async def non_stream_chat_response(
         ab_variant=ab_variant,
         answer_contract=answer_contract,
         llm_metrics=llm_metrics,
+        currency_warnings=currency_warnings,
+        citation_enforcement=citation_enforcement,
     )
 
 
@@ -790,6 +826,7 @@ async def chat(
             temperature=body.temperature,
             retrieval_mode=body.retrieval_mode,
             citation_mode=body.citation_mode,
+            metadata_filter=body.metadata_filter,
             vision_context=vision_context,
         )
     except Exception:
@@ -908,6 +945,7 @@ async def chat_stream(
         temperature=body.temperature,
         retrieval_mode=body.retrieval_mode,
         citation_mode=body.citation_mode,
+        metadata_filter=body.metadata_filter,
         include_global=include_global,
         can_write_memory=can_write_memory,
         vision_context=vision_context,
@@ -1098,16 +1136,19 @@ async def get_session(
     turn_info_by_id: Dict[int, Dict[str, Any]] = {}
     turn_result = await asyncio.to_thread(
         conn.execute,
-        "SELECT id, seq, turn_id, status, citation_confidence, unverifiable_claims "
+        "SELECT id, seq, turn_id, status, citation_confidence, unverifiable_claims, "
+        "currency_warnings, citation_enforcement "
         "FROM chat_messages WHERE session_id = ?",
         (session_id,),
     )
-    for tid, tseq, tturn, tstatus, tcit, tclaims in await asyncio.to_thread(
-        turn_result.fetchall
+    for tid, tseq, tturn, tstatus, tcit, tclaims, tcurrency, tenf in (
+        await asyncio.to_thread(turn_result.fetchall)
     ):
         entry: Dict[str, Any] = {"seq": tseq, "turn_id": tturn, "status": tstatus}
         entry["citation_confidence"] = _safe_json_loads(tcit)
         entry["unverifiable_claims"] = _safe_json_loads(tclaims)
+        entry["currency_warnings"] = _safe_json_loads(tcurrency)
+        entry["citation_enforcement"] = _safe_json_loads(tenf)
         turn_info_by_id[tid] = entry
 
     # Parse messages with JSON sources, memories, wiki_refs, and kms_refs.
@@ -1279,6 +1320,10 @@ async def fork_session(
     has_wiki_refs_col = "wiki_refs" in fork_col_names
     has_kms_refs_col = "kms_refs" in fork_col_names
     has_mode_col = "mode" in fork_col_names
+    has_fork_honesty_cols = (
+        "currency_warnings" in fork_col_names
+        and "citation_enforcement" in fork_col_names
+    )
 
     # Fetch messages up to message_index, including all available columns.
     if has_memories_col and has_wiki_refs_col:
@@ -1336,12 +1381,14 @@ async def fork_session(
         source_kms_rows = await asyncio.to_thread(source_kms_result.fetchall)
         source_kms_refs = [r[0] for r in source_kms_rows[: body.message_index + 1]]
 
-    # Side-fetch durable turn-lifecycle fields (issue #507) in row order so the
-    # fork preserves turn linkage, terminal status, and assessment evidence.
+    # Side-fetch durable turn-lifecycle fields (issue #507, extended by
+    # issue #510 AC-17/UI-004) in row order so the fork preserves turn
+    # linkage, terminal status, assessment evidence, and the honesty fields.
     source_turn_rows: List[tuple] = []
     turn_source_result = await asyncio.to_thread(
         conn.execute,
-        "SELECT turn_id, status, citation_confidence, unverifiable_claims "
+        "SELECT turn_id, status, citation_confidence, unverifiable_claims, "
+        "currency_warnings, citation_enforcement "
         "FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
         (session_id,),
     )
@@ -1432,15 +1479,25 @@ async def fork_session(
             turn_vals = (
                 source_turn_rows[pos - 1]
                 if pos - 1 < len(source_turn_rows)
-                else (None, None, None, None)
+                else (None, None, None, None, None, None)
             )
-            turn_id_val, status_val, cit_raw, claims_raw = turn_vals
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE chat_messages SET seq = ?, turn_id = ?, status = ?, "
-                "citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
-                (pos, turn_id_val, status_val, cit_raw, claims_raw, new_id),
-            )
+            turn_id_val, status_val, cit_raw, claims_raw, currency_raw, enforcement_raw = turn_vals
+            if has_fork_honesty_cols:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "UPDATE chat_messages SET seq = ?, turn_id = ?, status = ?, "
+                    "citation_confidence = ?, unverifiable_claims = ?, "
+                    "currency_warnings = ?, citation_enforcement = ? WHERE id = ?",
+                    (pos, turn_id_val, status_val, cit_raw, claims_raw,
+                     currency_raw, enforcement_raw, new_id),
+                )
+            else:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "UPDATE chat_messages SET seq = ?, turn_id = ?, status = ?, "
+                    "citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
+                    (pos, turn_id_val, status_val, cit_raw, claims_raw, new_id),
+                )
         await asyncio.to_thread(conn.commit)
     except Exception:
         await asyncio.to_thread(conn.rollback)
@@ -1500,12 +1557,13 @@ async def fork_session(
     fork_turn_by_id: Dict[int, Dict[str, Any]] = {}
     fork_turn_result = await asyncio.to_thread(
         conn.execute,
-        "SELECT id, seq, turn_id, status, citation_confidence, unverifiable_claims "
+        "SELECT id, seq, turn_id, status, citation_confidence, unverifiable_claims, "
+        "currency_warnings, citation_enforcement "
         "FROM chat_messages WHERE session_id = ?",
         (new_session_id,),
     )
-    for ftid, ftseq, ftturn, ftstatus, ftcit, ftclaims in await asyncio.to_thread(
-        fork_turn_result.fetchall
+    for ftid, ftseq, ftturn, ftstatus, ftcit, ftclaims, ftcurrency, ftenf in (
+        await asyncio.to_thread(fork_turn_result.fetchall)
     ):
         fork_turn_by_id[ftid] = {
             "seq": ftseq,
@@ -1513,6 +1571,8 @@ async def fork_session(
             "status": ftstatus,
             "citation_confidence": _safe_json_loads(ftcit),
             "unverifiable_claims": _safe_json_loads(ftclaims),
+            "currency_warnings": _safe_json_loads(ftcurrency),
+            "citation_enforcement": _safe_json_loads(ftenf),
         }
 
     messages = []
@@ -1872,12 +1932,38 @@ async def add_message(
     # are unique per session.
     citation_json = json.dumps(body.citation_confidence) if body.citation_confidence else None
     claims_json = json.dumps(body.unverifiable_claims) if body.unverifiable_claims else None
-    await asyncio.to_thread(
-        conn.execute,
-        "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
-        "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
-        (session_id, body.turn_id, body.status, citation_json, claims_json, message_id),
+    currency_json = json.dumps(body.currency_warnings) if body.currency_warnings else None
+    enforcement_json = json.dumps(body.citation_enforcement) if body.citation_enforcement else None
+    # PRR-019: guard the honesty columns on this UPDATE too — the INSERT
+    # branch above already tolerates older deployments lacking optional
+    # columns, and an unguarded UPDATE would break them identically. Both
+    # columns ship in a single migration, so one flag covers the pair.
+    has_honesty_cols = (
+        "currency_warnings" in col_names_add
+        and "citation_enforcement" in col_names_add
     )
+    if has_honesty_cols:
+        await asyncio.to_thread(
+            conn.execute,
+            "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
+            "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ?, "
+            "currency_warnings = ?, citation_enforcement = ? WHERE id = ?",
+            (
+                session_id, body.turn_id, body.status, citation_json, claims_json,
+                currency_json, enforcement_json, message_id,
+            ),
+        )
+    else:
+        # Original #507 field set (pre-honesty-columns deployments).
+        await asyncio.to_thread(
+            conn.execute,
+            "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
+            "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
+            (
+                session_id, body.turn_id, body.status, citation_json, claims_json,
+                message_id,
+            ),
+        )
     await asyncio.to_thread(conn.commit)
     seq_result = await asyncio.to_thread(
         conn.execute, "SELECT seq FROM chat_messages WHERE id = ?", (message_id,)
@@ -1955,6 +2041,8 @@ async def add_message(
         "status": body.status,
         "citation_confidence": body.citation_confidence,
         "unverifiable_claims": body.unverifiable_claims,
+        "currency_warnings": body.currency_warnings,
+        "citation_enforcement": body.citation_enforcement,
     }
 
 
@@ -2018,6 +2106,8 @@ async def add_messages_batch(
                 "status": item.status,
                 "citation_json": json.dumps(item.citation_confidence) if item.citation_confidence else None,
                 "claims_json": json.dumps(item.unverifiable_claims) if item.unverifiable_claims else None,
+                "currency_json": json.dumps(item.currency_warnings) if item.currency_warnings else None,
+                "enforcement_json": json.dumps(item.citation_enforcement) if item.citation_enforcement else None,
             }
         )
 
@@ -2065,6 +2155,7 @@ async def add_messages_batch(
                 conn.execute,
                 "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
                 "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ?, "
+                "currency_warnings = ?, citation_enforcement = ?, "
                 "mode = ?, kms_refs = ? WHERE id = ?",
                 (
                     session_id,
@@ -2072,6 +2163,8 @@ async def add_messages_batch(
                     row["status"],
                     row["citation_json"],
                     row["claims_json"],
+                    row["currency_json"],
+                    row["enforcement_json"],
                     row["mode"],
                     row["kms_refs_json"],
                     new_id,
@@ -2095,7 +2188,8 @@ async def add_messages_batch(
         conn.execute,
         f"""
         SELECT id, role, content, sources, memories, wiki_refs, kms_refs, mode,
-               created_at, seq, turn_id, status, citation_confidence, unverifiable_claims
+               created_at, seq, turn_id, status, citation_confidence, unverifiable_claims,
+               currency_warnings, citation_enforcement
         FROM chat_messages WHERE id IN ({placeholders}) ORDER BY seq ASC, id ASC
         """,  # nosec B608 — placeholders is a fixed '?,?,...' literal, values are bound
         (*saved_ids,),
@@ -2120,6 +2214,8 @@ async def add_messages_batch(
                 "status": row[11],
                 "citation_confidence": _safe_json_loads(row[12]),
                 "unverifiable_claims": _safe_json_loads(row[13]),
+                "currency_warnings": _safe_json_loads(row[14]),
+                "citation_enforcement": _safe_json_loads(row[15]),
             }
         )
 
