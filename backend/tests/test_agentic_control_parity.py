@@ -66,6 +66,17 @@ class TestAgenticDoneParity(unittest.TestCase):
         from app.config import settings
         from app.services.rag_engine import RAGEngine
 
+        # settings is a process-wide singleton: every write here must be
+        # restored or later tests in the same worker inherit the agentic
+        # pipeline (CI round 2 on d55001a: order-dependent failures across
+        # test_rag_engine / test_wiki_routes / vector-store suites).
+        snapshot = {}
+
+        def _set(attr, value):
+            if hasattr(settings, attr):
+                snapshot[attr] = getattr(settings, attr)
+                setattr(settings, attr, value)
+
         for attr in (
             "hybrid_search_enabled",
             "context_distillation_enabled",
@@ -79,10 +90,15 @@ class TestAgenticDoneParity(unittest.TestCase):
             "instant_skip_retrieval_evaluation",
             "instant_skip_query_transformation",
         ):
-            if hasattr(settings, attr):
-                setattr(settings, attr, False)
-        settings.retrieval_top_k = 5
-        settings.agentic_rag_enabled = True
+            _set(attr, False)
+        _set("retrieval_top_k", 5)
+        _set("agentic_rag_enabled", True)
+
+        def _restore():
+            for attr, value in snapshot.items():
+                setattr(settings, attr, value)
+
+        self.addCleanup(_restore)
 
         engine = RAGEngine(
             embedding_service=_FakeEmbeddingService(),
