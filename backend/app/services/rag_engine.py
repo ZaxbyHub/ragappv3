@@ -837,7 +837,19 @@ class RAGEngine:
                 if getattr(self, "_active_citation_mode", None) == "required":
                     from app.services.citation_validator import _CITATION_RE
 
-                    cited_labels = set(_CITATION_RE.findall(result.output or ""))
+                    # Same semantics as the standard path: a label is a valid
+                    # citation only if it names an actually-provided source
+                    # (label-set membership, not mere regex presence).
+                    available_labels = {
+                        str(src.get("source_label"))
+                        for src in result.all_sources
+                        if src.get("source_label")
+                    }
+                    cited_labels = {
+                        label
+                        for label in _CITATION_RE.findall(result.output or "")
+                        if label in available_labels
+                    }
                     if cited_labels or not result.all_sources:
                         agentic_done["citation_enforcement"] = {
                             "mode": "required",

@@ -113,7 +113,7 @@ class TestAgenticDoneParity(unittest.TestCase):
             from app.services.agentic_planner import AgenticResult
 
             return AgenticResult(
-                output="Plain uncited answer with no labels.",
+                output="Plain answer citing a phantom label [S9].",
                 all_sources=[
                     {
                         "id": "42_ab12cd34_default_0",

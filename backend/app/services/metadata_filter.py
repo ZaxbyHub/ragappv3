@@ -136,10 +136,13 @@ def _resolve_file_ids(
         conditions.append(f"t.name IN ({placeholders})")
         params.extend(parsed.tags)
 
+    # All interpolated fragments are fixed literal SQL (column/table names,
+    # join clauses, fixed condition templates); every value is bound via "?"
+    # parameters. Bandit cannot see that, hence the targeted suppression.
     where = " AND ".join(conditions) if conditions else "1=1"
     query = (
         "SELECT DISTINCT f.id FROM files f"
-        f"{join_clause} WHERE {where}"
+        f"{join_clause} WHERE {where}"  # nosec B608 — literals only; values parameterized
     )
 
     try:
