@@ -714,6 +714,7 @@ class RAGEngine:
         temperature: Optional[float] = None,
         retrieval_mode: Optional[str] = None,
         citation_mode: Optional[str] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
         include_global: bool = False,
         can_write_memory: bool = False,
         vision_context: Optional[VisionRunContext] = None,
@@ -748,18 +749,32 @@ class RAGEngine:
             vault_id,
             stream,
         )
-        # v1 forward-compatible: accept retrieval_mode and citation_mode but only log them.
-        # Backend implements auto-retrieval only; non-auto values are accepted for API
-        # future-compatibility without changing behavior.
-        if retrieval_mode is not None:
-            logger.info(
-                "[query] retrieval_mode=%s — v1 forward-compatible (accepted, not implemented)",
-                retrieval_mode,
+        # Per-query controls (issue #510): retrieval_mode / citation_mode are
+        # implemented controls now — resolve once, store as per-query engine
+        # state so every retrieval call inside this query (single, fused
+        # sub-queries, agentic RetrievalTool) inherits the same mode with
+        # parity. metadata_filter resolves to a vault-scoped filter_expr
+        # (never silently ignored; zero-match yields the sentinel expression).
+        self._active_retrieval_mode = retrieval_mode
+        self._active_citation_mode = citation_mode
+        try:
+            from app.services.metadata_filter import resolve_metadata_filter
+
+            self._active_filter_expr = resolve_metadata_filter(
+                metadata_filter, vault_id
             )
+        except Exception as exc:  # noqa: BLE001 — validation errors surface above
+            self._active_filter_expr = None
+            logger.warning("[query] metadata_filter rejected: %s", exc)
+            raise
+        if retrieval_mode is not None:
+            logger.info("[query] retrieval_mode=%s", retrieval_mode)
         if citation_mode is not None:
+            logger.info("[query] citation_mode=%s", citation_mode)
+        if self._active_filter_expr is not None:
             logger.info(
-                "[query] citation_mode=%s — v1 forward-compatible (accepted, not implemented)",
-                citation_mode,
+                "[query] metadata_filter applied (expr len=%d)",
+                len(self._active_filter_expr),
             )
 
         # ------------------------------------------------------------------
@@ -1260,10 +1275,18 @@ class RAGEngine:
             # evidence was genuinely irrelevant. Default to CONFIDENT on
             # evaluator outage (fail-open, matching the single-query path).
             eval_result = "CONFIDENT"
+            # Mode-specific evaluation skip (issue #510 RAG-005): Instant mode
+            # with instant_skip_retrieval_evaluation must skip the evaluator on
+            # the FUSED path too, exactly like the single-query path does.
+            skip_fused_evaluation = (
+                mode == ChatMode.INSTANT
+                and settings.instant_skip_retrieval_evaluation
+            )
             if (
                 settings.retrieval_evaluation_enabled
                 and active_client is not None
                 and vector_results
+                and not skip_fused_evaluation
             ):
                 try:
                     evaluator_key = id(active_client)
@@ -1488,9 +1511,11 @@ class RAGEngine:
             relevance_hint = "Note: The retrieved documents may not be directly relevant to your query. The system found no chunks within the relevance threshold."
 
         # Supersession check: warn if retrieved files have newer versions
+        currency_warnings: List[str] = []
         if relevant_chunks:
             supersession_warning = await self._check_supersession(relevant_chunks)
             if supersession_warning:
+                currency_warnings.append(supersession_warning)
                 if relevance_hint:
                     relevance_hint = supersession_warning + "\n" + relevance_hint
                 else:
@@ -1592,6 +1617,7 @@ class RAGEngine:
             wiki_evidence=wiki_evidence if wiki_evidence else None,
             kms_evidence=kms_evidence if kms_evidence else None,
             system_prompt_override=effective_prompt_override,
+            citation_mode=getattr(self, "_active_citation_mode", None),
         )
 
         # Stream or non-stream LLM response. Capture the assembled
@@ -1662,13 +1688,49 @@ class RAGEngine:
             kms_candidates=kms_evidence,
             cited_kms_labels=set(cited_kms),
         )
+        # Abstention decision (issue #510 RAG-007) — explicit and structural,
+        # never a substring guess over the prose: a true abstention is an
+        # answer with NO citations AND no citable evidence; any citation
+        # means the model answered from evidence; anything else is
+        # "unavailable" (flag not meaningful) rather than guessed.
+        if cited_sources or cited_memories or cited_wikis or cited_kms:
+            abstention_decision: Optional[bool] = False
+        elif not done_msg.get("sources") and not done_msg.get("memories_used") \
+                and not done_msg.get("wiki_used") and not done_msg.get("kms_used"):
+            abstention_decision = True
+        else:
+            abstention_decision = None
         done_msg["answer_contract"] = build_answer_contract(
             full_response,
             sources=done_msg.get("sources", []),
             memories_used=done_msg.get("memories_used", []),
             wiki_used=done_msg.get("wiki_used", []),
             kms_used=done_msg.get("kms_used", []),
+            abstention_decision=abstention_decision,
         )
+        # Currency warnings surface in the serialized answer payload (issue
+        # #510 AC-17) so freshness is user-visible, not only a prompt hint.
+        if currency_warnings:
+            done_msg["currency_warnings"] = list(currency_warnings)
+        # Citation-mode enforcement (issue #510 UI-004): "required" must not
+        # silently return an ordinary uncited answer — emit an explicit
+        # enforcement status consumers can display.
+        if getattr(self, "_active_citation_mode", None) == "required":
+            if not cited_sources and not cited_memories and not cited_wikis \
+                    and not cited_kms and done_msg.get("sources"):
+                done_msg["citation_enforcement"] = {
+                    "mode": "required",
+                    "status": "missing_citations",
+                    "detail": (
+                        "Citations were required but the answer contains no "
+                        "valid citation labels."
+                    ),
+                }
+            else:
+                done_msg["citation_enforcement"] = {
+                    "mode": "required",
+                    "status": "satisfied",
+                }
         done_msg["llm_metrics"] = dict(self._last_llm_metrics or {})
         # Populate final-source labels on the trace for evaluation tooling.
         trace.final_sources = [
@@ -2028,6 +2090,8 @@ class RAGEngine:
         active_client: Optional[LLMClient] = None,
         mode: Optional["ChatMode"] = None,
         skip_evaluation: bool = False,
+        retrieval_mode: Optional[str] = None,
+        filter_expr: Optional[str] = None,
     ) -> tuple[List[Dict[str, Any]], Optional[str], str, Optional[bool], str, str, int, str, List[str], bool, Dict[str, int]]:
         """Execute vector search and retrieval evaluation.
 
@@ -2037,6 +2101,13 @@ class RAGEngine:
             vault_id: Optional vault ID to filter by
             effective_alpha: Hybrid search alpha weight
             variants_dropped: List of variant types that failed embedding (e.g., step_back, hyde)
+            retrieval_mode: Per-query retrieval control (issue #510 UI-004);
+                "semantic" = dense-only, "keyword" = pure BM25 (alpha 0.0),
+                None/"auto" = settings-driven hybrid. Defaults to the
+                per-query engine state set by query().
+            filter_expr: LanceDB filter expression (issue #510 AC-16).
+                Defaults to the per-query engine state (resolved
+                metadata_filter) set by query().
 
         Returns:
             Tuple of (vector_results, relevance_hint, eval_result, rerank_success, score_type,
@@ -2049,6 +2120,13 @@ class RAGEngine:
             self.retrieval_top_k,
             len(query_embeddings),
         )
+        # Per-query engine state (set by query()) is the default so every
+        # retrieval call inside one query — single, fused sub-queries, and
+        # the agentic RetrievalTool — applies the same mode and filter.
+        if retrieval_mode is None:
+            retrieval_mode = getattr(self, "_active_retrieval_mode", None)
+        if filter_expr is None:
+            filter_expr = getattr(self, "_active_filter_expr", None)
         # Ensure variants_dropped is always a list (never None)
         if variants_dropped is None:
             variants_dropped = []
@@ -2072,7 +2150,20 @@ class RAGEngine:
             )
             top_k_value = fetch_k if fetch_k is not None else self.retrieval_top_k
 
-            # Search with all query embeddings concurrently and fuse results
+            # Search with all query embeddings concurrently and fuse results.
+            # retrieval_mode (issue #510 UI-004) overrides the hybrid
+            # settings per query: "semantic" = dense-only (hybrid off),
+            # "keyword" = pure lexical (hybrid on, alpha 0.0 → BM25-only
+            # RRF weighting); None/"auto" keeps the configured behavior.
+            if retrieval_mode == "semantic":
+                _hybrid = False
+                _alpha = effective_alpha
+            elif retrieval_mode == "keyword":
+                _hybrid = True
+                _alpha = 0.0
+            else:
+                _hybrid = self.hybrid_search_enabled
+                _alpha = effective_alpha
             _top_k = int(top_k_value) if top_k_value is not None else 10
             _vault = str(vault_id) if vault_id is not None else None
             search_tasks = [
@@ -2081,8 +2172,9 @@ class RAGEngine:
                     _top_k,
                     vault_id=_vault,
                     query_text=user_input,
-                    hybrid=self.hybrid_search_enabled,
-                    hybrid_alpha=effective_alpha,
+                    hybrid=_hybrid,
+                    hybrid_alpha=_alpha,
+                    filter_expr=filter_expr,
                 )
                 for embedding_tuple in query_embeddings
             ]
@@ -2472,7 +2564,14 @@ class RAGEngine:
         for candidate in self._fallback_clients(target):
             emitted_content = False
             try:
-                async for chunk in candidate.chat_completion_stream(messages, max_tokens=max_tokens):
+                # Forward an explicit per-request temperature when provided
+                # (issue #510 CHAT-003); omitted keeps the provider default.
+                stream_kwargs: Dict[str, Any] = {"max_tokens": max_tokens}
+                if temperature is not None:
+                    stream_kwargs["temperature"] = temperature
+                async for chunk in candidate.chat_completion_stream(
+                    messages, **stream_kwargs
+                ):
                     emitted_content = True
                     yield {"type": "content", "content": chunk}
 
@@ -2534,7 +2633,14 @@ class RAGEngine:
         last_error: Optional[LLMError] = None
         for candidate in self._fallback_clients(target):
             try:
-                content = await candidate.chat_completion(messages, max_tokens=max_tokens)
+                # Forward an explicit per-request temperature when provided
+                # (issue #510 CHAT-003); omitted keeps the provider default.
+                completion_kwargs: Dict[str, Any] = {"max_tokens": max_tokens}
+                if temperature is not None:
+                    completion_kwargs["temperature"] = temperature
+                content = await candidate.chat_completion(
+                    messages, **completion_kwargs
+                )
                 metrics = dict(getattr(candidate, "last_metrics", {}) or {})
                 if candidate is not target:
                     metrics["fallback_from"] = getattr(target, "base_url", None)
@@ -2855,10 +2961,16 @@ class RAGEngine:
             try:
                 self._supersedes_column_exists = await asyncio.to_thread(_probe)
             except Exception as exc:
+                # Transient failure (pool exhaustion, locked DB) must NOT be
+                # cached as "column absent" — leave the state unknown so the
+                # next query re-probes (issue #510 RAG-008). Only successful
+                # observations may populate the cache; a successful probe of
+                # an absent column may still cache False.
                 logger.warning(
-                    "Supersession probe failed (suppressed): %s", exc
+                    "Supersession probe failed (will retry next query; suppressed): %s",
+                    exc,
                 )
-                self._supersedes_column_exists = False
+                # self._supersedes_column_exists stays None (unknown).
 
         if not self._supersedes_column_exists:
             logger.debug(
@@ -3217,7 +3329,22 @@ class RAGEngine:
                 exc,
             )
 
-        vector_results, _, _, _, _, _, _, _, _, _, _ = await self._execute_retrieval(
+        # Carry the ACTUAL rerank status into the retrieval-only path too
+        # (issue #510 RAG-006 defect class: never hardcode reranked=False
+        # when _execute_retrieval already reported whether reranking ran).
+        (
+            vector_results,
+            _retrieve_relevance_hint,
+            _retrieve_eval_result,
+            rerank_success,
+            _retrieve_score_type,
+            _retrieve_hybrid_status,
+            _retrieve_fts_exceptions,
+            _retrieve_rerank_status,
+            _retrieve_variants_dropped,
+            _retrieve_exact_match,
+            _retrieve_token_pack,
+        ) = await self._execute_retrieval(
             query_embeddings,
             query,
             vault_id,
@@ -3234,7 +3361,7 @@ class RAGEngine:
         self._sync_document_retrieval_settings()
         relevant_chunks = await self.document_retrieval.filter_relevant(
             vector_results,
-            reranked=False,
+            reranked=rerank_success if rerank_success is not None else False,
             indexed_file_ids=indexed_file_ids,
         )
         return relevant_chunks[:limit]

@@ -3,6 +3,8 @@
 Handles building system prompts, user messages, and formatting context for LLM.
 """
 
+import dataclasses
+import re
 import sqlite3
 from html import escape as _xml_escape
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -14,6 +16,14 @@ from app.services.memory_store import MemoryRecord
 if TYPE_CHECKING:
     from app.services.kms_retrieval import KMSEvidence
     from app.services.wiki_retrieval import WikiEvidence
+
+# Sentence splitter for wiki-overlap suppression (issue #510 RAG-004).
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_into_sentences(text: str) -> List[str]:
+    """Split text into sentences, matching the distiller's split convention."""
+    return [s for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
 
 # Sentinel to distinguish "not passed" from "explicitly None"
 _UNSET = object()
@@ -223,6 +233,7 @@ class PromptBuilderService:
         wiki_evidence: Optional[List["WikiEvidence"]] = None,
         kms_evidence: Optional[List["KMSEvidence"]] = None,
         system_prompt_override: Optional[str] = None,
+        citation_mode: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """Build the complete message list for LLM completion.
 
@@ -248,13 +259,66 @@ class PromptBuilderService:
         primary_chunks = chunks[:primary_count]
         supporting_chunks = chunks[primary_count:]
 
-        # Format with stable source labels [S1], [S2], etc.
+        # Wiki-overlap suppression (issue #510 RAG-004): remove only the
+        # sentences of a document chunk that are covered by a wiki claim —
+        # never the whole chunk when unique facts remain. Source labels stay
+        # positional across the FULL chunk list (gaps where a fully-covered
+        # chunk was dropped) so prompt labels keep matching the serialized
+        # source cards.
+        wiki_texts = {
+            (ev.claim_text or "").lower().strip()
+            for ev in (wiki_evidence or [])
+            if ev.claim_text
+        }
+
+        def _sentence_is_covered(sentence: str) -> bool:
+            lower = sentence.lower()
+            return any(wt in lower for wt in wiki_texts if len(wt) > 40)
+
+        def _suppress_covered_sentences(text: Optional[str]) -> Optional[str]:
+            if not text or not wiki_texts:
+                return text
+            sentences = _split_into_sentences(text)
+            kept = [s for s in sentences if not _sentence_is_covered(s)]
+            if not kept:
+                return None
+            suppressed = " ".join(kept)
+            return suppressed if suppressed.strip() else None
+
+        def _format_if_unique(
+            chunk: "RAGSource", label_index: int
+        ) -> Optional[str]:
+            suppressed_text = _suppress_covered_sentences(chunk.text)
+            suppressed_parent = _suppress_covered_sentences(
+                chunk.parent_window_text
+            )
+            if suppressed_text is None and suppressed_parent is None:
+                # Both the chunk text and its parent window are fully covered
+                # by wiki evidence — the chunk's whole substantive content is
+                # already represented, so it contributes nothing unique.
+                return None
+            adjusted = dataclasses.replace(
+                chunk,
+                text=suppressed_text or "",
+                parent_window_text=suppressed_parent,
+            )
+            return self.format_chunk(adjusted, label_index)
+
         primary_sections = [
-            self.format_chunk(ch, idx + 1) for idx, ch in enumerate(primary_chunks)
+            section
+            for section in (
+                _format_if_unique(ch, idx + 1)
+                for idx, ch in enumerate(primary_chunks)
+            )
+            if section is not None
         ]
         supporting_sections = [
-            self.format_chunk(ch, idx + primary_count + 1)
-            for idx, ch in enumerate(supporting_chunks)
+            section
+            for section in (
+                _format_if_unique(ch, idx + primary_count + 1)
+                for idx, ch in enumerate(supporting_chunks)
+            )
+            if section is not None
         ]
 
         # Format memories with stable [M#] labels so the LLM can cite them
@@ -273,6 +337,21 @@ class PromptBuilderService:
             if system_prompt_override is not None
             else self.system_prompt
         )
+        # Citation mode (issue #510 UI-004): "disabled" removes the citation
+        # instruction block from whatever prompt chain resolved (default,
+        # DB-cached, or override); "required" strengthens it. "enabled"/None
+        # leaves the prompt exactly as before.
+        if citation_mode == "disabled":
+            effective_prompt = effective_prompt.replace(CITATION_INSTRUCTION, "")
+        elif citation_mode == "required":
+            if CITATION_INSTRUCTION not in effective_prompt:
+                effective_prompt = effective_prompt + CITATION_INSTRUCTION
+            effective_prompt = (
+                effective_prompt
+                + "\n\nCitations are REQUIRED for this answer: support every "
+                "factual claim with at least one [S#]/[W#]/[K#]/[M#] label "
+                "from the provided evidence."
+            )
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": effective_prompt},
         ]
@@ -312,18 +391,10 @@ class PromptBuilderService:
                 + "\n\n".join(kms_sections)
             )
 
-        # Dedup: skip document chunks whose text substantially overlaps wiki claims
-        if wiki_evidence:
-            wiki_texts = {
-                (ev.claim_text or "").lower().strip()
-                for ev in wiki_evidence
-                if ev.claim_text
-            }
-            def _covered_by_wiki(section_text: str) -> bool:
-                lower = section_text.lower()
-                return any(wt in lower for wt in wiki_texts if len(wt) > 40)
-            primary_sections = [s for s in primary_sections if not _covered_by_wiki(s)]
-            supporting_sections = [s for s in supporting_sections if not _covered_by_wiki(s)]
+        # (Wiki-overlap suppression now happens at chunk level BEFORE
+        # rendering — see `_format_if_unique` above — so only the covered
+        # sentences are removed and unique facts survive with their stable
+        # source labels. Issue #510 RAG-004.)
 
         if primary_sections:
             primary_text = "\n\n".join(primary_sections)

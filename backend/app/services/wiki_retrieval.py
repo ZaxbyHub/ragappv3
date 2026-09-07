@@ -305,7 +305,10 @@ class WikiRetrievalService(DualPoolMixin):
         # 4. FTS page search (fallback, lower score). Threshold is
         #    configurable via wiki_fts_page_search_max_candidates (issue #101);
         #    a value of 0 forces this fallback to run for every query.
-        if normalized_query and len(candidates) < self._fts_page_search_max_candidates:
+        if normalized_query and (
+            self._fts_page_search_max_candidates == 0
+            or len(candidates) < self._fts_page_search_max_candidates
+        ):
             fts_page_results = self._fts_page_search(conn, normalized_query, vault_id)
             for ev in fts_page_results:
                 if _expanded_entity_texts:

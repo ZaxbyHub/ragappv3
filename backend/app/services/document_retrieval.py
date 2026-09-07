@@ -73,15 +73,36 @@ def _extract_reupload_hash(chunk_id: str, file_id: str) -> Optional[str]:
     return candidate if _RE_HASH8.fullmatch(candidate) else None
 
 
+def _strip_reupload_hash(uid: str) -> str:
+    """Remove the reupload-safe hash segment from a current-format chunk id.
+
+    Current-format ids: {file_id}_{hash8}_{scale}_{index}
+    Legacy ids:         {file_id}_{scale}_{index} or {file_id}_{index}
+
+    Stripping the hash8 segment lets a current-format id and its legacy
+    counterpart normalize to the same dedup key. Ids without a hash segment
+    (legacy, or a 3-segment file id whose second segment is not hex8) are
+    returned unchanged.
+    """
+    parts = uid.split("_")
+    if len(parts) >= 4 and _RE_HASH8.fullmatch(parts[-3]):
+        return "_".join(parts[:-3] + parts[-2:])
+    return uid
+
+
 def _normalize_uid_for_dedup(uid: str) -> str:
-    """Strip scale suffix from multi-scale chunk UIDs for deduplication.
+    """Strip hash and scale suffixes from chunk UIDs for deduplication.
 
     Multi-scale UIDs have format: {file_id}_{scale}_{index}
     Default UIDs have format: {file_id}_{index}
+    Reupload-safe UIDs have format: {file_id}_{hash8}_{scale}_{index}
 
-    This function strips the scale component so that "doc1_512_3" and "doc1_3"
-    are treated as the same chunk for deduplication purposes.
+    This function first strips the reupload hash segment (new-format ids),
+    then the scale component, so that "doc1_512_3" and "doc1_3" — and their
+    hash-prefixed counterparts — are treated as the same chunk for
+    deduplication purposes.
     """
+    uid = _strip_reupload_hash(uid)
     # Try to parse as multi-scale: {file_id}_{scale}_{index}
     # The last segment should be a number (chunk_index)
     parts = uid.rsplit("_", 2)
@@ -582,11 +603,25 @@ class DocumentRetrievalService:
             expanded_sources: List[RAGSource] = []
             seen_uids: set = set()
 
-            # First, add the original sources
+            # First, add the original sources. Derive the dedup uid from the
+            # source's persisted record identity (metadata `_chunk_id` /
+            # `chunk_uid`) — the same identity `to_source_metadata` serializes —
+            # falling back to legacy construction only when no persisted id
+            # exists. Reconstructing a hash-less uid for a current-format
+            # (hash-prefixed) record would never collide with the adjacent-fetch
+            # uid of the same row, duplicating the center passage (issue #510
+            # RAG-002).
             for source in sources:
                 chunk_index = source.metadata.get("chunk_index", 0)
                 chunk_scale = source.metadata.get("chunk_scale", "default")
-                if chunk_scale and chunk_scale != "default":
+                stored_uid = (
+                    source.metadata.get("_chunk_id")
+                    or source.metadata.get("chunk_uid")
+                    or ""
+                )
+                if stored_uid:
+                    uid = str(stored_uid)
+                elif chunk_scale and chunk_scale != "default":
                     uid = f"{source.file_id}_{chunk_scale}_{chunk_index}"
                 else:
                     uid = f"{source.file_id}_{chunk_index}"
@@ -627,6 +662,13 @@ class DocumentRetrievalService:
                     metadata = self._normalize_metadata(chunk.get("metadata"))
                     if chunk_scale:
                         metadata["chunk_scale"] = chunk_scale
+                    # Carry the actual LanceDB record id so the serialized
+                    # source id resolves through the exact-ID preview lookup
+                    # (issue #510 RAG-002) — never reconstruct a legacy id for
+                    # a content-hash record.
+                    stored_chunk_id = chunk.get("id", "")
+                    if stored_chunk_id:
+                        metadata["_chunk_id"] = stored_chunk_id
 
                     # Use file_id from the record, not parsed from the UID string
                     # (UID parsing breaks with hash-prefixed new-format IDs)

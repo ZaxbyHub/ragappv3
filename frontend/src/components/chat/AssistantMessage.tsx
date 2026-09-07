@@ -3,7 +3,7 @@ import { useState, useMemo, useCallback, useEffect, useImperativeHandle, useRef 
 import type { RefObject } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion, useReducedMotion } from "framer-motion";
-import { Bot, AlertCircle, Sparkles, Zap } from "lucide-react";
+import { Bot, AlertCircle, AlertTriangle, Sparkles, Zap } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import type { Message } from "@/stores/useChatStore";
@@ -341,6 +341,47 @@ export function AssistantMessage({
               : undefined
           }
         />
+
+        {/* Currency warnings (issue #510 AC-17) — freshness advisories from
+            the done payload; mirrors MarkdownMessage's amber alert pattern. */}
+        {message.currencyWarnings && message.currencyWarnings.length > 0 && (
+          <div
+            className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+            role="alert"
+          >
+            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" aria-hidden />
+            <div className="flex flex-col gap-1">
+              <p className="text-xs font-semibold text-amber-600 dark:text-amber-400">
+                Currency Warnings
+              </p>
+              {message.currencyWarnings.map((warning, i) => (
+                <p key={i} className="text-xs text-amber-600/80 dark:text-amber-400/80">
+                  {warning}
+                </p>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Citation enforcement (issue #510 UI-004) — "required" mode with no
+            valid citations must not pass as an ordinary uncited answer;
+            "satisfied" stays silent. */}
+        {message.citationEnforcement?.status === "missing_citations" && (
+          <div
+            className="mt-3 flex items-start gap-2 rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2"
+            role="alert"
+          >
+            <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500 mt-0.5" aria-hidden />
+            <div className="flex flex-col gap-1">
+              <p className="text-xs font-semibold text-amber-600 dark:text-amber-400">
+                Citations Required
+              </p>
+              <p className="text-xs text-amber-600/80 dark:text-amber-400/80">
+                Citations were required but none were found in this answer
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Wiki cards — compiled knowledge cited as [W#] */}
         {!isStreaming && wikiRefsForCards.length > 0 && (

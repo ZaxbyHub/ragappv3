@@ -293,6 +293,220 @@ class TestRetrievalTool:
 
 
 # ---------------------------------------------------------------------------
+# RetrievalTool — rerank status, cumulative labels, engine-state filter (510)
+# ---------------------------------------------------------------------------
+
+
+class _RealDRSEngineFactory:
+    """Mock engine whose document_retrieval is a REAL DocumentRetrievalService.
+
+    The real service makes reranked=True observably skip the distance filter
+    and surface _rerank_score as the source score, and produces real
+    source_label values from to_source_metadata.
+    """
+
+    @staticmethod
+    def make(vector_results, rerank_success):
+        from app.services.document_retrieval import DocumentRetrievalService
+
+        mock_engine = MagicMock()
+        mock_engine.embedding_service = MagicMock()
+        mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 3)
+        mock_engine._execute_retrieval = AsyncMock(
+            return_value=(
+                vector_results,
+                None,  # relevance_hint
+                "CONFIDENT",  # eval_result
+                rerank_success,  # rerank_success — 4th of the 11-tuple
+                "rerank" if rerank_success else "distance",
+                "disabled",
+                0,
+                "ok" if rerank_success else "disabled",
+                [],
+                False,
+                {},
+            )
+        )
+        # Real service: threshold 0.5 so an over-threshold _distance is only
+        # survivable when reranked=True (distance filter skipped).
+        drs = DocumentRetrievalService(
+            vector_store=None,
+            max_distance_threshold=0.5,
+            retrieval_top_k=10,
+            retrieval_window=0,
+        )
+        reranked_calls = {}
+        original = drs.filter_relevant
+
+        async def _spy(results, top_k=None, reranked=False, indexed_file_ids=None):
+            reranked_calls["reranked"] = reranked
+            return await original(
+                results, top_k=top_k, reranked=reranked, indexed_file_ids=indexed_file_ids
+            )
+
+        drs.filter_relevant = _spy
+        mock_engine.document_retrieval = drs
+        mock_engine._sync_document_retrieval_settings = MagicMock()
+        mock_engine._reranked_calls = reranked_calls
+        return mock_engine
+
+
+class TestRetrievalToolRerankAndLabels:
+    """Issue #510 RAG-006 / CITE-002: rerank status and cumulative labels."""
+
+    def _record(self, distance, rerank_score=None):
+        record = {
+            "id": "7_0",
+            "file_id": "7",
+            "text": "Paris is the capital of France and a major European city.",
+            "_distance": distance,
+            "metadata": {},
+        }
+        if rerank_score is not None:
+            record["_rerank_score"] = rerank_score
+        return record
+
+    @pytest.mark.asyncio
+    async def test_rerank_success_true_passes_reranked_and_surfaces_score(self):
+        """rerank_success=True (4th tuple element) → filter_relevant(reranked=True)
+        and the reranker score (0.95) becomes the source score even though the
+        raw _distance (0.99) exceeds the distance threshold."""
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.99, rerank_score=0.95)], rerank_success=True
+        )
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        result = await tool.execute(query="capital of France")
+
+        assert result.success is True
+        assert engine._reranked_calls["reranked"] is True
+        assert len(result.sources) == 1, (
+            "reranked=True must skip the distance filter (raw _distance 0.99 > 0.5)"
+        )
+        assert result.sources[0]["score"] == 0.95
+
+    @pytest.mark.asyncio
+    async def test_rerank_success_none_passes_reranked_false(self):
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10, rerank_score=0.95)], rerank_success=None
+        )
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        result = await tool.execute(query="capital of France")
+
+        assert engine._reranked_calls["reranked"] is False
+        assert len(result.sources) == 1
+        # Distance is the score signal when not reranked.
+        assert result.sources[0]["score"] == 0.10
+
+    @pytest.mark.asyncio
+    async def test_rerank_success_false_passes_reranked_false(self):
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10, rerank_score=0.95)], rerank_success=False
+        )
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        result = await tool.execute(query="capital of France")
+
+        assert engine._reranked_calls["reranked"] is False
+        assert len(result.sources) == 1
+        assert result.sources[0]["score"] == 0.10
+
+    @pytest.mark.asyncio
+    async def test_sequential_executes_label_sources_globally_unique(self):
+        """Two execute() calls on ONE tool instance produce S1 then S2."""
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10)], rerank_success=None
+        )
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        first = await tool.execute(query="capital of France")
+        second = await tool.execute(query="capital of France")
+
+        assert first.sources[0]["source_label"] == "S1"
+        assert second.sources[0]["source_label"] == "S2", (
+            "Labels must extend one cumulative S1..Sn sequence across rounds, "
+            "not restart at S1"
+        )
+        assert tool._next_label == 3
+
+    @pytest.mark.asyncio
+    async def test_engine_state_defaults_retrieval_without_explicit_params(self):
+        """RetrievalTool must NOT override the engine's per-query state.
+
+        The tool calls ``engine._execute_retrieval(query_embeddings, query,
+        vault_id)`` with no retrieval_mode/filter_expr, delegating to the
+        production defaults — ``getattr(engine, "_active_retrieval_mode")`` /
+        ``getattr(engine, "_active_filter_expr")`` — so an agentic retrieval
+        inside a query(metadata_filter=..., retrieval_mode=...) inherits the
+        same controls. Assert the delegation explicitly: the stubbed call
+        carries neither kwarg.
+        """
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10)], rerank_success=None
+        )
+        engine._active_filter_expr = "file_id IN ('7')"
+        engine._active_retrieval_mode = "keyword"
+        tool = RetrievalTool(retrieval_top_k=5, engine=engine)
+
+        await tool.execute(query="capital of France", vault_id=1)
+
+        call_kwargs = engine._execute_retrieval.call_args.kwargs
+        assert "filter_expr" not in call_kwargs, (
+            "RetrievalTool must let _execute_retrieval fall back to engine state"
+        )
+        assert "retrieval_mode" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_engine_state_filter_expr_reaches_vector_store(self):
+        """The engine-state fallback the tool relies on: with
+        ``engine._active_filter_expr`` set, a parameter-less
+        ``_execute_retrieval`` call applies that filter to vector_store.search."""
+        from app.services.rag_engine import RAGEngine
+
+        class _CapturingStore:
+            def __init__(self):
+                self.calls = []
+
+            async def search(self, embedding, limit, vault_id=None, query_text="",
+                             hybrid=True, hybrid_alpha=0.5, filter_expr=None, **kw):
+                self.calls.append({"filter_expr": filter_expr, "hybrid": hybrid,
+                                   "hybrid_alpha": hybrid_alpha})
+                return [{
+                    "id": "7_0", "file_id": "7",
+                    "text": "Paris is the capital of France.",
+                    "_distance": 0.1, "metadata": {},
+                }]
+
+            def get_fts_exceptions(self):
+                return 0
+
+        store = _CapturingStore()
+        engine = RAGEngine.__new__(RAGEngine)
+        engine.vector_store = store
+        engine.reranking_service = None
+        engine._retrieval_evaluators = {}
+        engine._active_filter_expr = "file_id IN ('7')"
+        engine._active_retrieval_mode = "keyword"
+
+        with patch("app.services.rag_engine.settings") as mock_settings:
+            mock_settings.retrieval_recency_weight = 0.0
+            mock_settings.rrf_legacy_mode = False
+            mock_settings.exact_match_promote = False
+            mock_settings.reranking_enabled = False
+            mock_settings.hybrid_search_enabled = False
+            mock_settings.context_max_tokens = 0
+            mock_settings.retrieval_top_k = 10
+            await engine._execute_retrieval(
+                [("original", [0.1, 0.2, 0.3])], "capital", vault_id=1
+            )
+
+        assert store.calls[0]["filter_expr"] == "file_id IN ('7')"
+        assert store.calls[0]["hybrid"] is True
+        assert store.calls[0]["hybrid_alpha"] == 0.0
+
+
+# ---------------------------------------------------------------------------
 # SynthesisTool — XML escaping and prompt structure regression tests
 # ---------------------------------------------------------------------------
 

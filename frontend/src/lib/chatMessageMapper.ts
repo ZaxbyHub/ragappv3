@@ -25,6 +25,8 @@ export function mapSessionMessage(m: ChatSessionMessage): Message {
     mode: m.mode ?? undefined,
     citationConfidence: m.citation_confidence ?? undefined,
     unverifiableClaims: m.unverifiable_claims ?? undefined,
+    currencyWarnings: m.currency_warnings ?? undefined,
+    citationEnforcement: m.citation_enforcement ?? undefined,
     turnId: m.turn_id ?? undefined,
     status: m.status ?? "complete",
     seq: m.seq ?? null,

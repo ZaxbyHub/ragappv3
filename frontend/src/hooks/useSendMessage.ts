@@ -4,6 +4,7 @@ import {
   createChatSession,
   addChatMessagesBatch,
   type ChatMessage,
+  type ChatMetadataFilter,
   type ChatSessionMessage,
   type WikiReference,
   type KMSReference,
@@ -252,6 +253,8 @@ export function useSendMessage(
                 status: assistantStatus,
                 citation_confidence: assistantMsg.citationConfidence,
                 unverifiable_claims: assistantMsg.unverifiableClaims,
+                currency_warnings: assistantMsg.currencyWarnings,
+                citation_enforcement: assistantMsg.citationEnforcement,
               },
             ]);
             const [userSaveResult, assistantSaveResult] = saved;
@@ -281,6 +284,29 @@ export function useSendMessage(
         });
         return persistPromise;
       };
+
+      // Metadata filter (issue #510 AC-16): snapshot at send time from the
+      // same store the Composer edits. Only non-empty fields are forwarded;
+      // the whole object is omitted (undefined) when nothing is set so the
+      // request body never carries an empty metadata_filter.
+      const modeStoreState = useChatModeStore.getState();
+      const filterTags = modeStoreState.metadataFilterTags
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0);
+      const metadataFilter: ChatMetadataFilter = {};
+      if (modeStoreState.metadataFilterDateFrom) {
+        metadataFilter.date_from = modeStoreState.metadataFilterDateFrom;
+      }
+      if (modeStoreState.metadataFilterDateTo) {
+        metadataFilter.date_to = modeStoreState.metadataFilterDateTo;
+      }
+      if (filterTags.length > 0) {
+        metadataFilter.tags = filterTags;
+      }
+      if (modeStoreState.metadataFilterAuthor) {
+        metadataFilter.author = modeStoreState.metadataFilterAuthor;
+      }
 
       const abort = chatStream(
         chatMessages,
@@ -348,6 +374,16 @@ export function useSendMessage(
           },
           onUnverifiableClaims: (claims) => {
             updateMessage(assistantMessageId, { unverifiableClaims: claims });
+          },
+          // Issue #510 (AC-17 / UI-004): currency warnings and citation
+          // enforcement outcome from the done event. Live-stream display
+          // only — the backend does not persist these fields on the message
+          // row, so they are intentionally absent from persistTurn.
+          onCurrencyWarnings: (warnings) => {
+            updateMessage(assistantMessageId, { currencyWarnings: warnings });
+          },
+          onCitationEnforcement: (enforcement) => {
+            updateMessage(assistantMessageId, { citationEnforcement: enforcement });
           },
           onError: (error) => {
             // Flush any buffered streaming content before reading store state
@@ -442,6 +478,7 @@ export function useSendMessage(
         useChatModeStore.getState().temperature,
         useChatModeStore.getState().retrievalMode,
         useChatModeStore.getState().citationMode,
+        Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
       );
 
       // Wrap the raw abort so any caller that aborts the stream — the Stop

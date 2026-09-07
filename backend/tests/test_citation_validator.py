@@ -114,6 +114,98 @@ class TestValidateAndRepair(unittest.TestCase):
         self.assertFalse(result.uncited_factual_warning)
 
 
+class TestCodeRegionMasking(unittest.TestCase):
+    """Issue #510 CITE-001: code regions are masked before strip+tidy and
+    re-injected verbatim, so repair never reflows generated code bytes."""
+
+    def test_fenced_code_block_byte_identical_when_invalid_stripped(self):
+        fenced = (
+            "```python\n"
+            "def  f( x ):   return  x  ,  y .\n"
+            "```"
+        )
+        content = f"Broken citation [S9] below.\n\n{fenced}"
+        result = validate_and_repair_citations(
+            content, source_count=1, memory_count=0
+        )
+        self.assertNotIn("[S9]", result.repaired_content)
+        # The fenced block is byte-identical: double spaces and the space
+        # before the period INSIDE the code survive untouched.
+        self.assertIn(fenced, result.repaired_content)
+        self.assertIn("def  f( x ):   return  x  ,  y .", result.repaired_content)
+
+    def test_inline_code_byte_identical_when_invalid_stripped(self):
+        inline = "`a  b  c .`"
+        content = f"Bad [S9] but keep {inline} intact."
+        result = validate_and_repair_citations(
+            content, source_count=1, memory_count=0
+        )
+        self.assertNotIn("[S9]", result.repaired_content)
+        self.assertIn(inline, result.repaired_content)
+
+    def test_citation_token_inside_code_is_not_stripped(self):
+        # A citation-looking token inside inline code is literal code content.
+        content = "Run `[S99] --verbose` in your shell."
+        result = validate_and_repair_citations(
+            content, source_count=0, memory_count=0
+        )
+        self.assertIn("[S99]", result.repaired_content)
+        self.assertEqual(result.invalid_citations, ())
+
+    def test_citation_token_inside_fenced_code_is_not_stripped(self):
+        content = "Explanation.\n```js\nconst labels = [\"[S9]\", \"[W7]\"];\n```"
+        result = validate_and_repair_citations(
+            content, source_count=1, memory_count=0
+        )
+        self.assertIn("[S9]", result.repaired_content)
+        self.assertIn("[W7]", result.repaired_content)
+        self.assertEqual(result.invalid_citations, ())
+
+
+class TestExplicitLabelSetValidation(unittest.TestCase):
+    """Issue #510 AC-15: validity is ACTUAL label-set membership — sparse
+    labelings (S2, S4) must not make phantom labels (S1, S3) valid.
+    """
+
+    def test_phantom_labels_invalid_for_sparse_source_set(self):
+        sources = [
+            {"source_label": "S2", "id": "x"},
+            {"source_label": "S4", "id": "y"},
+        ]
+        result = repair_against_sources_and_memories(
+            "Phantom [S1] gap [S3] real [S2] real [S4].",
+            sources=sources,
+            memories=[],
+        )
+        self.assertIn("[S2]", result.repaired_content)
+        self.assertIn("[S4]", result.repaired_content)
+        self.assertNotIn("[S1]", result.repaired_content)
+        self.assertNotIn("[S3]", result.repaired_content)
+        self.assertEqual(set(result.invalid_citations), {"S1", "S3"})
+        self.assertEqual(set(result.valid_citations), {"S2", "S4"})
+
+    def test_explicit_label_sets_override_counts(self):
+        result = validate_and_repair_citations(
+            "Use [S2] and [S4].",
+            source_count=5,  # contiguous S1..S5 would include S2/S4 anyway —
+            memory_count=0,  # but the explicit set narrows to exactly these.
+            source_labels={"S2", "S4"},
+        )
+        self.assertEqual(set(result.valid_citations), {"S2", "S4"})
+        self.assertIn("[S2]", result.repaired_content)
+        self.assertIn("[S4]", result.repaired_content)
+
+    def test_valid_under_explicit_set_but_invalid_under_count(self):
+        # S9 is inside the explicit set but outside a count-derived range.
+        ok = validate_and_repair_citations(
+            "[S9]", source_count=2, memory_count=0, source_labels={"S9"}
+        )
+        self.assertIn("[S9]", ok.repaired_content)
+        self.assertEqual(ok.invalid_citations, ())
+        bad = validate_and_repair_citations("[S9]", source_count=2, memory_count=0)
+        self.assertNotIn("[S9]", bad.repaired_content)
+
+
 class TestParseCitations(unittest.TestCase):
     def test_separate_namespaces(self):
         sources, memories = parse_citations("[S1] and [M1] and [S2]")

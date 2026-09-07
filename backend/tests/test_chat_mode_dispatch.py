@@ -317,6 +317,171 @@ class TestQueryLevelTransformationGating:
         qt_cls.assert_called_once()
 
 
+class _OkEmbeddingService:
+    """Embedding stub that succeeds (lets query() run to the done message)."""
+
+    async def embed_single(self, text):
+        return [0.1, 0.2, 0.3]
+
+    async def embed_passage(self, text):
+        return [0.1, 0.2, 0.3]
+
+
+class _OkVectorStore:
+    """Vector store fake serving one relevant chunk per search."""
+
+    def __init__(self):
+        self.search_calls = 0
+
+    async def search(self, embedding, limit, vault_id=None, query_text="",
+                     hybrid=True, hybrid_alpha=0.5, filter_expr=None, **kw):
+        self.search_calls += 1
+        return [{
+            "id": "1_0",
+            "file_id": "1",
+            "text": "Paris is the capital of France.",
+            "_distance": 0.1,
+            "metadata": {},
+        }]
+
+    def get_fts_exceptions(self):
+        return 0
+
+    def is_connected(self):
+        return True
+
+
+class _AnswerLLMClient:
+    base_url = "answer-stub"
+    model = "answer-stub"
+
+    def __init__(self):
+        self.last_metrics = {}
+
+    async def chat_completion(self, messages, **kw):
+        return "The capital of France is Paris, a city known for its landmarks."
+
+    async def chat_completion_stream(self, messages, **kw):
+        yield "The capital of France is Paris, a city known for its landmarks."
+
+
+class _FakePlanner:
+    """QueryPlanner stub with an injected plan."""
+
+    plan_result: list = []
+
+    def __init__(self, client):
+        self.client = client
+
+    async def plan(self, query):
+        return list(_FakePlanner.plan_result)
+
+
+class TestInstantFusedEvaluationSkip:
+    """Issue #510 RAG-005: Instant + instant_skip_retrieval_evaluation must
+    skip the retrieval evaluator on the FUSED multi-sub-query path too.
+    """
+
+    def _settings(self, mock, *, skip_eval):
+        _query_settings(mock)
+        mock.instant_initial_retrieval_top_k = 10
+        mock.instant_reranker_top_n = 5
+        mock.instant_memory_context_top_k = 5
+        mock.instant_max_tokens = 512
+        mock.instant_skip_retrieval_evaluation = skip_eval
+        # Window expansion would need get_chunks_by_uid on the fake store.
+        mock.retrieval_window = 0
+        return mock
+
+    def _make_engine(self):
+        return RAGEngine(
+            embedding_service=_OkEmbeddingService(),
+            vector_store=_OkVectorStore(),
+            memory_store=_StubMemoryStore(),
+            llm_client=_AnswerLLMClient(),
+            reranking_service=None,
+            instant_client=_AnswerLLMClient(),
+            thinking_client=_AnswerLLMClient(),
+        )
+
+    async def _drive_to_done(self, engine):
+        done = None
+        async for chunk in engine.query(
+            "compare the capital and population of france",
+            [],
+            stream=False,
+            vault_id=None,
+            mode=ChatMode.INSTANT,
+        ):
+            if chunk.get("type") == "done":
+                done = chunk
+        assert done is not None
+        return done
+
+    @pytest.mark.asyncio
+    async def test_instant_multi_subquery_plan_skips_fused_evaluation(self):
+        """INSTANT + skip=True + multi-subquery plan → ZERO evaluator calls."""
+        engine = self._make_engine()
+        _FakePlanner.plan_result = [
+            "what is the capital of france",
+            "what is the population of france",
+        ]
+        with patch("app.services.rag_engine.settings") as mock_settings, patch(
+            "app.services.rag_engine.QueryPlanner", _FakePlanner
+        ), patch(
+            "app.services.rag_engine.RetrievalEvaluator"
+        ) as evaluator_cls, patch(
+            "app.services.rag_engine._get_pool",
+            side_effect=RuntimeError("no db in test"),
+        ):
+            self._settings(mock_settings, skip_eval=True)
+            done = await self._drive_to_done(engine)
+
+        evaluator_cls.assert_not_called()
+        assert done.get("sources"), "test requires the fused path to return sources"
+
+    @pytest.mark.asyncio
+    async def test_instant_single_subquery_plan_skips_evaluation(self):
+        engine = self._make_engine()
+        _FakePlanner.plan_result = ["what is the capital of france"]
+        with patch("app.services.rag_engine.settings") as mock_settings, patch(
+            "app.services.rag_engine.QueryPlanner", _FakePlanner
+        ), patch(
+            "app.services.rag_engine.RetrievalEvaluator"
+        ) as evaluator_cls, patch(
+            "app.services.rag_engine._get_pool",
+            side_effect=RuntimeError("no db in test"),
+        ):
+            self._settings(mock_settings, skip_eval=True)
+            await self._drive_to_done(engine)
+
+        evaluator_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_instant_multi_subquery_with_skip_disabled_invokes_evaluation(self):
+        engine = self._make_engine()
+        _FakePlanner.plan_result = [
+            "what is the capital of france",
+            "what is the population of france",
+        ]
+        fake_evaluator = MagicMock()
+        fake_evaluator.evaluate = AsyncMock(return_value="CONFIDENT")
+        with patch("app.services.rag_engine.settings") as mock_settings, patch(
+            "app.services.rag_engine.QueryPlanner", _FakePlanner
+        ), patch(
+            "app.services.rag_engine.RetrievalEvaluator",
+            return_value=fake_evaluator,
+        ) as evaluator_cls, patch(
+            "app.services.rag_engine._get_pool",
+            side_effect=RuntimeError("no db in test"),
+        ):
+            self._settings(mock_settings, skip_eval=False)
+            await self._drive_to_done(engine)
+
+        evaluator_cls.assert_called_once()
+        fake_evaluator.evaluate.assert_awaited_once()
+
+
 class TestFollowupRewriteModeGating:
     """Instant follow-up rewrite is on by default but operator-skippable."""
 

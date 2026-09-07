@@ -325,6 +325,170 @@ class TestHyDE:
             assert mock_llm_client.chat_completion.call_count == 2
 
 
+class TestHyDECacheCompositionPerSettings:
+    """Issue #510 QUERY-001: the step-back cache stores COMPONENTS; a cache
+    hit must recompose the variant list from the CURRENT ``hyde_enabled``
+    flag — disabling/enabling HyDE must take effect on warm calls without any
+    cache clearing, and the cached value must never be mutated by the HyDE
+    append.
+    """
+
+    QUERY = "What is gradient descent in neural networks?"
+    STEP_BACK = "What are the general concepts in machine learning?"
+    HYDE = (
+        "Gradient descent is an optimization algorithm used to minimize loss "
+        "functions in machine learning by iteratively moving toward the "
+        "steepest descent direction."
+    )
+
+    @pytest.fixture
+    def mock_llm_client(self):
+        """Create a mock LLM client."""
+        return MagicMock(spec=LLMClient)
+
+    def _settings(self, mock_settings, hyde_enabled: bool):
+        mock_settings.hyde_enabled = hyde_enabled
+        mock_settings.stepback_enabled = True
+        mock_settings.query_transform_temperature = 0.0
+        mock_settings.redis_url = None
+        mock_settings.chat_model = "test-model"
+        return mock_settings
+
+    @pytest.mark.asyncio
+    async def test_lru_cold_and_warm_identical_with_hyde(self, mock_llm_client):
+        """Cold vs warm calls return identical variant types/values (hyde on)."""
+        mock_llm_client.chat_completion = AsyncMock(
+            side_effect=[self.STEP_BACK, self.HYDE]
+        )
+
+        with patch("app.services.query_transformer.settings") as mock_settings:
+            self._settings(mock_settings, hyde_enabled=True)
+            transformer = QueryTransformer(mock_llm_client)
+
+            cold = await transformer.transform(self.QUERY)
+            assert [v[0] for v in cold] == ["original", "step_back", "hyde"]
+            assert cold[1] == ("step_back", self.STEP_BACK)
+            assert cold[2][1] == self.HYDE
+            assert mock_llm_client.chat_completion.call_count == 2
+
+            warm = await transformer.transform(self.QUERY)
+            assert [v[0] for v in warm] == ["original", "step_back", "hyde"]
+            assert warm == cold
+            # Warm hit: no additional LLM calls.
+            assert mock_llm_client.chat_completion.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_disabling_hyde_takes_effect_on_warm_cache_hit(
+        self, mock_llm_client
+    ):
+        """After warming with hyde ON, a warm call with hyde_enabled=False has
+        NO hyde variant — without clearing any cache."""
+        mock_llm_client.chat_completion = AsyncMock(
+            side_effect=[self.STEP_BACK, self.HYDE]
+        )
+
+        with patch("app.services.query_transformer.settings") as mock_settings:
+            self._settings(mock_settings, hyde_enabled=True)
+            transformer = QueryTransformer(mock_llm_client)
+            await transformer.transform(self.QUERY)  # warm both caches
+            assert mock_llm_client.chat_completion.call_count == 2
+
+            mock_settings.hyde_enabled = False
+            disabled = await transformer.transform(self.QUERY)
+            assert [v[0] for v in disabled] == ["original", "step_back"], (
+                "A warm hit must recompose variants from the CURRENT hyde flag; "
+                f"got {[v[0] for v in disabled]}"
+            )
+            assert disabled[1] == ("step_back", self.STEP_BACK)
+            # Still no new LLM calls.
+            assert mock_llm_client.chat_completion.call_count == 2
+
+            # Re-enabling restores the hyde variant from its own cache.
+            mock_settings.hyde_enabled = True
+            reenabled = await transformer.transform(self.QUERY)
+            assert [v[0] for v in reenabled] == ["original", "step_back", "hyde"]
+            assert reenabled[2][1] == self.HYDE
+            assert mock_llm_client.chat_completion.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_warm_hit_does_not_mutate_cached_components(self, mock_llm_client):
+        """The hyde append on a warm hit must never leak into the cached list."""
+        mock_llm_client.chat_completion = AsyncMock(
+            side_effect=[self.STEP_BACK, self.HYDE]
+        )
+
+        with patch("app.services.query_transformer.settings") as mock_settings:
+            self._settings(mock_settings, hyde_enabled=True)
+            transformer = QueryTransformer(mock_llm_client)
+            first = await transformer.transform(self.QUERY)
+            # Mutating the returned list must not corrupt the cache entry.
+            first.append(("tampered", "payload"))
+            second = await transformer.transform(self.QUERY)
+            assert [v[0] for v in second] == ["original", "step_back", "hyde"]
+            third = await transformer.transform(self.QUERY)
+            assert [v[0] for v in third] == ["original", "step_back", "hyde"]
+
+
+class FakeRedisCache:
+    """Minimal redis client fake: dict-backed get/setex."""
+
+    def __init__(self):
+        self.store = {}
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def setex(self, key, ttl, value):
+        self.store[key] = value
+
+
+class TestHyDEFakeRedisCache:
+    """Fake-redis warm path composes HyDE per current settings."""
+
+    QUERY = "What is gradient descent in neural networks?"
+    STEP_BACK = "What are the general concepts in machine learning?"
+    HYDE = (
+        "Gradient descent is an optimization algorithm used to minimize loss "
+        "functions in machine learning by iteratively moving toward the "
+        "steepest descent direction."
+    )
+
+    @pytest.fixture
+    def mock_llm_client(self):
+        """Create a mock LLM client."""
+        return MagicMock(spec=LLMClient)
+
+    @pytest.mark.asyncio
+    async def test_fake_redis_warm_includes_hyde(self, mock_llm_client):
+        mock_llm_client.chat_completion = AsyncMock(
+            side_effect=[self.STEP_BACK, self.HYDE]
+        )
+        fake_redis = FakeRedisCache()
+
+        with patch("app.services.query_transformer.settings") as mock_settings:
+            mock_settings.hyde_enabled = True
+            mock_settings.stepback_enabled = True
+            mock_settings.query_transform_temperature = 0.0
+            mock_settings.redis_url = None  # construct without real redis
+            mock_settings.query_transform_cache_ttl_sec = 3600
+            mock_settings.chat_model = "test-model"
+            transformer = QueryTransformer(mock_llm_client)
+            transformer._redis_client = fake_redis  # attach the fake
+
+            cold = await transformer.transform(self.QUERY)
+            assert [v[0] for v in cold] == ["original", "step_back", "hyde"]
+            assert mock_llm_client.chat_completion.call_count == 2
+            # Redis holds the step-back COMPONENTS and the hyde passage.
+            assert len(fake_redis.store) == 2
+
+            warm = await transformer.transform(self.QUERY)
+            assert [v[0] for v in warm] == ["original", "step_back", "hyde"]
+            assert warm[1][1] == self.STEP_BACK
+            assert warm[2][1] == self.HYDE
+            # Warm: served entirely from redis — no further LLM calls.
+            assert mock_llm_client.chat_completion.call_count == 2
+
+
 class TestIsExactOrDocumentQuery:
     """Tests for _is_exact_or_document_query function."""
 

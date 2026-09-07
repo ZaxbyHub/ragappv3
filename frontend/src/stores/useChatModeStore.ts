@@ -20,6 +20,22 @@ export interface ComposerControlsState {
   /** Citation enforcement level. */
   citationMode: CitationMode;
   setCitationMode: (m: CitationMode) => void;
+  /**
+   * Metadata filter (issue #510 AC-16). Inclusive retrieval date bounds as
+   * ISO yyyy-mm-dd strings; empty string means unset. Session-scoped query
+   * context — intentionally not persisted (see `partialize` below).
+   */
+  metadataFilterDateFrom: string;
+  setMetadataFilterDateFrom: (v: string) => void;
+  metadataFilterDateTo: string;
+  setMetadataFilterDateTo: (v: string) => void;
+  /** Comma-separated tag input; split/trimmed at send time. */
+  metadataFilterTags: string;
+  setMetadataFilterTags: (v: string) => void;
+  metadataFilterAuthor: string;
+  setMetadataFilterAuthor: (v: string) => void;
+  /** Clear every metadata-filter field. */
+  resetMetadataFilter: () => void;
 }
 
 export const useChatModeStore = create<ComposerControlsState>()(
@@ -34,7 +50,36 @@ export const useChatModeStore = create<ComposerControlsState>()(
       setRetrievalMode: (retrievalMode) => set({ retrievalMode }),
       citationMode: "enabled",
       setCitationMode: (citationMode) => set({ citationMode }),
+      metadataFilterDateFrom: "",
+      setMetadataFilterDateFrom: (metadataFilterDateFrom) =>
+        set({ metadataFilterDateFrom }),
+      metadataFilterDateTo: "",
+      setMetadataFilterDateTo: (metadataFilterDateTo) =>
+        set({ metadataFilterDateTo }),
+      metadataFilterTags: "",
+      setMetadataFilterTags: (metadataFilterTags) => set({ metadataFilterTags }),
+      metadataFilterAuthor: "",
+      setMetadataFilterAuthor: (metadataFilterAuthor) =>
+        set({ metadataFilterAuthor }),
+      resetMetadataFilter: () =>
+        set({
+          metadataFilterDateFrom: "",
+          metadataFilterDateTo: "",
+          metadataFilterTags: "",
+          metadataFilterAuthor: "",
+        }),
     }),
-    { name: "ragapp_chat_mode" }
+    {
+      name: "ragapp_chat_mode",
+      // The metadata filter is per-query context, not a durable preference —
+      // a stale date/author filter surviving a reload would silently hide
+      // results. Pin persistence to the original preference fields only.
+      partialize: (state) => ({
+        chatMode: state.chatMode,
+        temperature: state.temperature,
+        retrievalMode: state.retrievalMode,
+        citationMode: state.citationMode,
+      }),
+    }
   )
 );

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +17,13 @@ class StructuredAnswer(BaseModel):
     answer: str
     citations: List[AnswerCitation] = Field(default_factory=list)
     abstained: bool = False
+    # Issue #510 RAG-007 — provenance of the abstention flag:
+    #   "decision"    : an explicit generation-side decision was provided
+    #                   (abstention_decision was not None).
+    #   "unavailable" : no decision was available (legacy prose); the flag is
+    #                   NOT guessed from the answer text, so consumers must not
+    #                   read abstained as meaningful in that state.
+    abstention_basis: str = "unavailable"
 
 
 _CITATION_RE = re.compile(r"\[(S\d+|M\d+|W\d+|K\d+)\]")
@@ -29,6 +36,7 @@ def build_answer_contract(
     memories_used: List[Dict[str, Any]],
     wiki_used: List[Dict[str, Any]],
     kms_used: List[Dict[str, Any]],
+    abstention_decision: Optional[bool] = None,
 ) -> Dict[str, Any]:
     source_labels = {s.get("source_label") for s in sources}
     memory_labels = {m.get("memory_label") for m in memories_used}
@@ -60,9 +68,21 @@ def build_answer_contract(
             citations.append(AnswerCitation(label=label, evidence_type="wiki"))
         elif label in kms_labels:
             citations.append(AnswerCitation(label=label, evidence_type="kms"))
-    abstained = "don't know" in content.lower() or "do not know" in content.lower()
+    # Issue #510 RAG-007 — abstention reflects an explicit decision from the
+    # response pipeline, never a substring guess over the prose. A factual
+    # answer that QUOTES "don't know" from a document is not abstaining; a
+    # genuine refusal only counts when the pipeline decided it abstained.
+    # Without a decision (legacy callers), the flag is False and the basis
+    # marks it unavailable rather than pretending to know.
+    if abstention_decision is not None:
+        abstained = bool(abstention_decision)
+        abstention_basis = "decision"
+    else:
+        abstained = False
+        abstention_basis = "unavailable"
     return StructuredAnswer(
         answer=content,
         citations=citations,
         abstained=abstained,
+        abstention_basis=abstention_basis,
     ).model_dump()

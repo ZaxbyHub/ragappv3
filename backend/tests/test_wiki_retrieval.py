@@ -490,6 +490,149 @@ class TestWikiRetrievalServiceFtsPageSearchThreshold(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestWikiFtsPageFallbackThresholdEdges(unittest.TestCase):
+    """Issue #510 WIKI edges: threshold 0 forces the page fallback even with
+    zero candidates, and 2 candidates against a threshold of 3 still runs it.
+    """
+
+    def _make_pool(self, db):
+        from queue import Empty, Queue
+
+        class _Pool:
+            def __init__(self, path):
+                self._path = path
+                self._q = Queue(maxsize=5)
+
+            def get_connection(self):
+                try:
+                    return self._q.get_nowait()
+                except Empty:
+                    c = sqlite3.connect(self._path, check_same_thread=False)
+                    c.row_factory = sqlite3.Row
+                    return c
+
+            def release_connection(self, c):
+                try:
+                    self._q.put_nowait(c)
+                except Exception:
+                    c.close()
+
+            def close_all(self):
+                while True:
+                    try:
+                        self._q.get_nowait().close()
+                    except Empty:
+                        break
+
+        return _Pool(db)
+
+    def _setup_db(self, vault_id, claims):
+        import tempfile
+        from pathlib import Path
+
+        from app.models.database import init_db, run_migrations
+
+        tmp = tempfile.mkdtemp()
+        db = str(Path(tmp) / "app.db")
+        init_db(db)
+        run_migrations(db)
+        conn = sqlite3.connect(db)
+        try:
+            conn.execute(
+                "INSERT INTO vaults (id, name) VALUES (?, ?)",
+                (vault_id, f"Vault{vault_id}"),
+            )
+            for cid, txt in claims:
+                conn.execute(
+                    "INSERT INTO wiki_claims (id, vault_id, page_id, "
+                    "claim_text, claim_type, source_type, status, confidence) "
+                    "VALUES (?, ?, ?, ?, 'fact', 'document', 'active', 0.9)",
+                    (cid, vault_id, cid, txt),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return tmp, db
+
+    def test_threshold_zero_returns_page_only_fts_match(self):
+        """threshold=0 + page-only FTS match → the page IS returned even with
+        zero claim candidates (phase 4 must run for every query)."""
+        tmp, db = self._setup_db(9990, claims=[])
+        try:
+            pool = self._make_pool(db)
+            conn = sqlite3.connect(db)
+            try:
+                # A page whose summary matches the query, with NO claims —
+                # only the FTS page fallback can surface it.
+                conn.execute(
+                    "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, "
+                    "markdown, summary, status) VALUES (1, 9990, 'quorum', "
+                    "'Quorplex Runbook', 'overview', '# Quorplex', "
+                    "'The quorplex alignment procedure requires a warm boot.', "
+                    "'verified')"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            svc = WikiRetrievalService(pool=pool, fts_page_search_max_candidates=0)
+            results = svc.retrieve("quorplex alignment", vault_id=9990)
+
+            self.assertTrue(
+                results,
+                "threshold=0 must run the FTS page fallback even with zero candidates",
+            )
+            page_ev = [r for r in results if r.score_type == "page_fts"]
+            self.assertTrue(page_ev, "expected page_fts evidence from the fallback")
+            self.assertEqual(results[0].label_placeholder, "W1")
+            pool.close_all()
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_threshold_three_two_candidates_still_runs_phase4(self):
+        """threshold=3 with exactly 2 claim candidates → phase 4 must run."""
+        tmp, db = self._setup_db(
+            9991,
+            claims=[
+                (1, "vorpalis encoder calibration alpha"),
+                (2, "vorpalis encoder calibration beta"),
+            ],
+        )
+        try:
+            pool = self._make_pool(db)
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    "INSERT INTO wiki_pages (id, vault_id, slug, title, page_type, "
+                    "markdown, status) VALUES (1, 9991, 'v', 'Vorpalis', "
+                    "'overview', '# V', 'verified')"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            svc = WikiRetrievalService(pool=pool, fts_page_search_max_candidates=3)
+            phase4_calls = {"n": 0}
+
+            def spy(*args, **kwargs):
+                phase4_calls["n"] += 1
+                return []
+
+            svc._fts_page_search = spy
+            results = svc.retrieve("vorpalis encoder", vault_id=9991)
+
+            self.assertEqual(len(results), 2, "phase 3 should yield exactly 2 candidates")
+            self.assertGreaterEqual(
+                phase4_calls["n"], 1,
+                "2 candidates below a threshold of 3 must still trigger phase 4",
+            )
+            pool.close_all()
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestWikiRetrievalServiceEmptyDb(unittest.TestCase):
     def _make_service_with_conn(self):
         conn = sqlite3.connect(":memory:")

@@ -101,6 +101,12 @@ class RetrievalTool(AgenticTool):
     ) -> None:
         self._retrieval_top_k = retrieval_top_k
         self._engine = engine
+        # Cumulative global source labeling (issue #510 CITE-002): one tool
+        # instance spans one planner run, so each execute() labels its
+        # sources from the running counter and advances it. Rounds therefore
+        # extend a single S1..Sn sequence matching SynthesisTool's global
+        # numbering of all_sources.
+        self._next_label = 1
 
     @property
     def name(self) -> str:
@@ -148,8 +154,23 @@ class RetrievalTool(AgenticTool):
             embedding = await embedding_service.embed_single(query)
             query_embeddings: List[tuple[str, List[float]]] = [("original", embedding)]
 
-            # Execute retrieval
-            vector_results, _, _, _, _, _, _, _, _, _, _ = await engine._execute_retrieval(
+            # Execute retrieval. rerank_success is the 4th element of the
+            # 11-tuple — carry the ACTUAL rerank status into filter_relevant
+            # (issue #510 RAG-006) so reranked results keep reranker scores
+            # and skip distance filtering exactly like the standard path.
+            (
+                vector_results,
+                _relevance_hint,
+                _eval_result,
+                rerank_success,
+                _score_type,
+                _hybrid_status,
+                _fts_exceptions,
+                _rerank_status,
+                _variants_dropped,
+                _exact_match_promoted,
+                _token_pack_stats,
+            ) = await engine._execute_retrieval(
                 query_embeddings,
                 query,
                 vault_id,
@@ -159,14 +180,17 @@ class RetrievalTool(AgenticTool):
             engine._sync_document_retrieval_settings()
             relevant_chunks = await engine.document_retrieval.filter_relevant(
                 vector_results,
-                reranked=False,
+                reranked=rerank_success if rerank_success is not None else False,
                 indexed_file_ids=None,
             )
 
             sources = [
-                engine.document_retrieval.to_source_metadata(chunk, source_index=idx + 1)
+                engine.document_retrieval.to_source_metadata(
+                    chunk, source_index=self._next_label + idx
+                )
                 for idx, chunk in enumerate(relevant_chunks)
             ]
+            self._next_label += len(sources)
 
             return ToolResult(
                 output=f"Retrieved {len(sources)} sources for query: {query}",

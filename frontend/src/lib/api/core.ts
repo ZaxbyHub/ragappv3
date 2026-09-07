@@ -623,6 +623,29 @@ export interface KMSReference {
   score_type: string | null;
 }
 
+/**
+ * Retrieval metadata filter (issue #510 AC-16). Sent as ``metadata_filter``
+ * on the chat stream request; only non-empty fields are serialized.
+ */
+export interface ChatMetadataFilter {
+  /** Inclusive lower date bound, ISO yyyy-mm-dd. */
+  date_from?: string;
+  /** Inclusive upper date bound, ISO yyyy-mm-dd. */
+  date_to?: string;
+  tags?: string[];
+  author?: string;
+}
+
+/**
+ * Citation-mode enforcement outcome from the done event (issue #510 UI-004).
+ * Emitted only when the request ran with citation_mode "required".
+ */
+export interface CitationEnforcement {
+  mode: string;
+  status: "satisfied" | "missing_citations";
+  detail?: string;
+}
+
 export interface ChatStreamCallbacks {
   onMessage: (chunk: string) => void;
   onSources?: (sources: Source[]) => void;
@@ -640,6 +663,10 @@ export interface ChatStreamCallbacks {
   onCitationConfidence?: (confidence: Record<string, number>) => void;
   /** Unverifiable claims flagged by the citation validator from the done event (FR-004). */
   onUnverifiableClaims?: (claims: string[]) => void;
+  /** Currency/supersession warnings from the done event (issue #510 AC-17). */
+  onCurrencyWarnings?: (warnings: string[]) => void;
+  /** Citation-mode enforcement outcome from the done event (issue #510 UI-004). */
+  onCitationEnforcement?: (enforcement: CitationEnforcement) => void;
   /** Resolved chat mode reported by the backend at the start of the stream. */
   onMode?: (mode: "instant" | "thinking") => void;
   /** Pipeline stage event (Searching / Reading / Drafting) before content streams. */
@@ -697,6 +724,10 @@ export interface ChatSessionMessage {
   citation_confidence?: Record<string, number> | null;
   /** Unverifiable claims persisted with the answer (DEEP-D-01). */
   unverifiable_claims?: string[] | null;
+  /** Supersession/currency advisories persisted with the answer (issue #510). */
+  currency_warnings?: string[] | null;
+  /** Required-citations enforcement status persisted with the answer (issue #510). */
+  citation_enforcement?: CitationEnforcement | null;
 }
 
 export interface ChatSessionDetail extends ChatSession {
@@ -724,6 +755,10 @@ export interface AddMessageRequest {
   citation_confidence?: Record<string, number>;
   /** Unverifiable claims persisted with the answer (DEEP-D-01). */
   unverifiable_claims?: string[];
+  /** Supersession/currency advisories persisted with the answer (issue #510). */
+  currency_warnings?: string[];
+  /** Required-citations enforcement status persisted with the answer (issue #510). */
+  citation_enforcement?: CitationEnforcement;
 }
 
 export async function listDocuments(options: ListDocumentsOptions = {}): Promise<ListDocumentsResponse> {

@@ -1022,6 +1022,12 @@ class VectorStore:
 
         async def _run_dense() -> List[Dict[str, Any]]:
             query = await self.table.search(embedding_np, query_type="vector")
+            # Explicit distance type on EVERY dense query (issue #510
+            # VECTOR-004): flat/brute-force scans otherwise default to L2 even
+            # when vector_metric is cosine, so cosine-calibrated thresholds
+            # discard valid matches. Must agree with ANN index creation.
+            if hasattr(query, "distance_type"):
+                query = query.distance_type(settings.vector_metric)
             if bypass_vector_index and hasattr(query, "bypass_vector_index"):
                 query = query.bypass_vector_index()
             if combined_filter:
@@ -1284,6 +1290,10 @@ class VectorStore:
 
             async def _run_dense() -> List[Dict[str, Any]]:
                 query = await self.table.search(embedding_np, query_type="vector")
+                # Explicit distance type on EVERY dense query (issue #510
+                # VECTOR-004) — see the comment on the single-scale path.
+                if hasattr(query, "distance_type"):
+                    query = query.distance_type(settings.vector_metric)
                 if bypass_vector_index and hasattr(query, "bypass_vector_index"):
                     query = query.bypass_vector_index()
                 if _filter_expr:
