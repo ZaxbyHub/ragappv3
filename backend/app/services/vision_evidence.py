@@ -485,6 +485,13 @@ class VisionEvidenceService:
         )
         selected = self._select(sources)
         result.selected = len(selected)
+        # OBS-003 (issue #462 B3): deduped = eligible − unique-selected, computed
+        # BEFORE the independent cap. eligible counts duplicate eligible sources;
+        # _select() dedups by (artifact_id, asset_id), so anything that entered
+        # eligibility but did not survive selection was removed as a duplicate.
+        # Assigned before the feature-off early return so the counter is truthful
+        # on every path (counting is pure — no I/O happens here).
+        result.deduped = result.eligible - len(selected)
 
         # V5 feature-off non-regression (F-03): when query-time vision is disabled
         # (the default), return an empty result BEFORE the `not selected` branch so

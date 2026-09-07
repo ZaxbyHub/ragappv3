@@ -331,3 +331,41 @@ import pathlib
 diag_file = pathlib.Path(__file__).parent / "_conftest_diag.txt"
 if diag_file.exists():
     diag_file.unlink(missing_ok=True)
+
+
+_MULTIMODAL_VISION_FLAG = "multimodal_query_vision_enabled"
+
+
+def multimodal_vision_flag_leaked(before, after) -> bool:
+    """Shared leak-detection predicate for the query-vision flag guard.
+
+    Single source of truth used BOTH by the autouse fixture below and by
+    ``tests/test_settings_leak_guardrail.py`` (which imports this module), so
+    the guard's detection logic is itself under test — see PRR-003.
+    """
+    return before != after
+
+
+@pytest.fixture(autouse=True)
+def _guard_multimodal_vision_flag():
+    """Issue #462 (TEST-004 defect class): fail any test that leaves the
+    query-vision feature flag mutated on the shared settings singleton.
+
+    The historical defect: raw ``settings.multimodal_query_vision_enabled = X``
+    assignments in test bodies leak feature state across tests in the same
+    worker/process (xdist workers start from the config default). The sanctioned
+    forms are ``patch.object(settings, ...)`` scopes and the save/tearDown
+    restore pair in the owning test class — all of which restore the value
+    before this fixture's after-check runs.
+    """
+    from app.config import settings
+
+    before = getattr(settings, _MULTIMODAL_VISION_FLAG)
+    yield
+    after = getattr(settings, _MULTIMODAL_VISION_FLAG)
+    if multimodal_vision_flag_leaked(before, after):
+        pytest.fail(
+            f"test leaked settings.{_MULTIMODAL_VISION_FLAG}: "
+            f"{before!r} -> {after!r} (use patch.object(settings, ...) for "
+            "scoped flag mutations — see tests/test_settings_leak_guardrail.py)"
+        )
