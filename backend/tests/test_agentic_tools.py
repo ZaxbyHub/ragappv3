@@ -11,6 +11,7 @@ from app.services.agentic_tools import (
     ToolRegistry,
     ToolResult,
 )
+from app.services.rag_engine import RAGEngine
 
 # ---------------------------------------------------------------------------
 # ToolResult shape
@@ -202,7 +203,7 @@ class TestRetrievalTool:
             "metadata": mock_chunk.metadata,
         }
 
-        mock_engine = MagicMock()
+        mock_engine = MagicMock(spec=RAGEngine)
         mock_engine.embedding_service = MagicMock()
         mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 768)
         mock_engine._execute_retrieval = AsyncMock(
@@ -233,7 +234,7 @@ class TestRetrievalTool:
 
     @pytest.mark.asyncio
     async def test_execute_returns_empty_on_no_results(self):
-        mock_engine = MagicMock()
+        mock_engine = MagicMock(spec=RAGEngine)
         mock_engine.embedding_service = MagicMock()
         mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 768)
         mock_engine._execute_retrieval = AsyncMock(
@@ -270,7 +271,7 @@ class TestRetrievalTool:
     @pytest.mark.asyncio
     async def test_execute_uses_top_k_param(self):
         """top_k parameter overrides the default retrieval_top_k."""
-        mock_engine = MagicMock()
+        mock_engine = MagicMock(spec=RAGEngine)
         mock_engine.retrieval_top_k = 0  # will be set to 20 by execute
         mock_engine.embedding_service = MagicMock()
         mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 768)
@@ -309,7 +310,7 @@ class _RealDRSEngineFactory:
     def make(vector_results, rerank_success):
         from app.services.document_retrieval import DocumentRetrievalService
 
-        mock_engine = MagicMock()
+        mock_engine = MagicMock(spec=RAGEngine)
         mock_engine.embedding_service = MagicMock()
         mock_engine.embedding_service.embed_single = AsyncMock(return_value=[0.1] * 3)
         mock_engine._execute_retrieval = AsyncMock(
@@ -431,79 +432,50 @@ class TestRetrievalToolRerankAndLabels:
         assert tool._next_label == 3
 
     @pytest.mark.asyncio
-    async def test_engine_state_defaults_retrieval_without_explicit_params(self):
-        """RetrievalTool must NOT override the engine's per-query state.
+    async def test_constructor_controls_forwarded_explicitly(self):
+        """RetrievalTool forwards its constructor controls explicitly.
 
-        The tool calls ``engine._execute_retrieval(query_embeddings, query,
-        vault_id)`` with no retrieval_mode/filter_expr, delegating to the
-        production defaults — ``getattr(engine, "_active_retrieval_mode")`` /
-        ``getattr(engine, "_active_filter_expr")`` — so an agentic retrieval
-        inside a query(metadata_filter=..., retrieval_mode=...) inherits the
-        same controls. Assert the delegation explicitly: the stubbed call
-        carries neither kwarg.
+        Per-request controls are captured at construction from the enclosing
+        query()'s locals (PR #523 review PRR-001: no per-request engine
+        state — instance attributes raced across concurrent requests). The
+        stubbed ``engine._execute_retrieval`` call must carry exactly the
+        controls the tool was built with.
         """
         engine = _RealDRSEngineFactory.make(
             [self._record(distance=0.10)], rerank_success=None
         )
-        engine._active_filter_expr = "file_id IN ('7')"
-        engine._active_retrieval_mode = "keyword"
+        tool = RetrievalTool(
+            retrieval_top_k=5,
+            engine=engine,
+            retrieval_mode="keyword",
+            filter_expr="file_id IN ('7')",
+        )
+
+        await tool.execute(query="capital of France", vault_id=1)
+
+        call_kwargs = engine._execute_retrieval.call_args.kwargs
+        assert call_kwargs.get("filter_expr") == "file_id IN ('7')"
+        assert call_kwargs.get("retrieval_mode") == "keyword"
+
+    @pytest.mark.asyncio
+    async def test_tool_without_controls_passes_none_for_engine_defaults(self):
+        """A tool constructed without controls passes None explicitly.
+
+        Standalone tool usage (no enclosing query()) gets engine defaults —
+        never a stale reading of engine instance state.
+        """
+        engine = _RealDRSEngineFactory.make(
+            [self._record(distance=0.10)], rerank_success=None
+        )
+        engine._active_filter_expr = "file_id IN ('999')"  # stale garbage
+        engine._active_retrieval_mode = "semantic"
         tool = RetrievalTool(retrieval_top_k=5, engine=engine)
 
         await tool.execute(query="capital of France", vault_id=1)
 
         call_kwargs = engine._execute_retrieval.call_args.kwargs
-        assert "filter_expr" not in call_kwargs, (
-            "RetrievalTool must let _execute_retrieval fall back to engine state"
-        )
-        assert "retrieval_mode" not in call_kwargs
-
-    @pytest.mark.asyncio
-    async def test_engine_state_filter_expr_reaches_vector_store(self):
-        """The engine-state fallback the tool relies on: with
-        ``engine._active_filter_expr`` set, a parameter-less
-        ``_execute_retrieval`` call applies that filter to vector_store.search."""
-        from app.services.rag_engine import RAGEngine
-
-        class _CapturingStore:
-            def __init__(self):
-                self.calls = []
-
-            async def search(self, embedding, limit, vault_id=None, query_text="",
-                             hybrid=True, hybrid_alpha=0.5, filter_expr=None, **kw):
-                self.calls.append({"filter_expr": filter_expr, "hybrid": hybrid,
-                                   "hybrid_alpha": hybrid_alpha})
-                return [{
-                    "id": "7_0", "file_id": "7",
-                    "text": "Paris is the capital of France.",
-                    "_distance": 0.1, "metadata": {},
-                }]
-
-            def get_fts_exceptions(self):
-                return 0
-
-        store = _CapturingStore()
-        engine = RAGEngine.__new__(RAGEngine)
-        engine.vector_store = store
-        engine.reranking_service = None
-        engine._retrieval_evaluators = {}
-        engine._active_filter_expr = "file_id IN ('7')"
-        engine._active_retrieval_mode = "keyword"
-
-        with patch("app.services.rag_engine.settings") as mock_settings:
-            mock_settings.retrieval_recency_weight = 0.0
-            mock_settings.rrf_legacy_mode = False
-            mock_settings.exact_match_promote = False
-            mock_settings.reranking_enabled = False
-            mock_settings.hybrid_search_enabled = False
-            mock_settings.context_max_tokens = 0
-            mock_settings.retrieval_top_k = 10
-            await engine._execute_retrieval(
-                [("original", [0.1, 0.2, 0.3])], "capital", vault_id=1
-            )
-
-        assert store.calls[0]["filter_expr"] == "file_id IN ('7')"
-        assert store.calls[0]["hybrid"] is True
-        assert store.calls[0]["hybrid_alpha"] == 0.0
+        assert call_kwargs.get("filter_expr") is None
+        assert call_kwargs.get("retrieval_mode") is None
 
 
 # ---------------------------------------------------------------------------

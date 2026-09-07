@@ -376,9 +376,11 @@ export function useSendMessage(
             updateMessage(assistantMessageId, { unverifiableClaims: claims });
           },
           // Issue #510 (AC-17 / UI-004): currency warnings and citation
-          // enforcement outcome from the done event. Live-stream display
-          // only — the backend does not persist these fields on the message
-          // row, so they are intentionally absent from persistTurn.
+          // enforcement outcome from the done event. These ARE persisted —
+          // persistTurn (addChatMessagesBatch) writes them onto the
+          // assistant message row via the currency_warnings /
+          // citation_enforcement columns, so they re-render on session
+          // reload.
           onCurrencyWarnings: (warnings) => {
             updateMessage(assistantMessageId, { currencyWarnings: warnings });
           },

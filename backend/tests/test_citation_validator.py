@@ -408,3 +408,25 @@ class TestBackwardCompatibility(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTildeFenceMasking(unittest.TestCase):
+    def test_citation_token_inside_tilde_fenced_code_is_not_stripped(self):
+        """Tilde fences (PRR-007) are masked like backtick fences: a
+        citation-shaped token inside a ~~~ code block must survive repair
+        untouched (and must not count as a valid or invalid citation)."""
+        content = "Run this:\n~~~js\nconst x = [S9];\n~~~\nDone."
+        result = validate_and_repair_citations(
+            content, source_count=1, memory_count=0
+        )
+        self.assertIn("const x = [S9];", result.repaired_content)
+        self.assertNotIn("[S9]", " ".join(result.invalid_citations))
+        self.assertFalse(result.invalid_stripped)
+
+    def test_citation_token_inside_quadruple_tilde_fence_survives(self):
+        content = "~~~~\nref [S5]\n~~~~\n"
+        result = validate_and_repair_citations(
+            content, source_count=1, memory_count=0
+        )
+        self.assertIn("[S5]", result.repaired_content)
+

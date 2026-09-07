@@ -10,8 +10,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
-# Matches the 8-hex-char hash produced by reupload_safe_order ID scheme
-_RE_HASH8 = re.compile(r"^[0-9a-f]{8}$")
+# Matches the 8-hex-char hash produced by reupload_safe_order ID scheme.
+# Requires at least one [a-f] letter so a purely numeric legacy chunk-scale
+# segment (e.g. an 8-digit multi_scale_chunk_sizes value) can never be
+# mistaken for a hash (PR #523 review PRR-008).
+_RE_HASH8 = re.compile(r"^(?=[0-9a-f]{8}$)(?=[0-9a-f]*[a-f])[0-9a-f]{8}$")
 
 from app.config import settings  # noqa: E402
 

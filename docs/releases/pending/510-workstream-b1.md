@@ -53,11 +53,16 @@ citation wire schema (docs/engineering/source-score-citation-schema.md).
 - All API additions are optional request fields and additive response
   fields; previously stored messages deserialize unchanged (guard tests
   cover legacy payloads and feature-off defaults).
-- No migrations, no new environment variables, no dependency changes.
+- One additive, idempotent migration (auto-applied by `run_migrations` on
+  startup) adds two nullable `chat_messages` columns — `currency_warnings`
+  and `citation_enforcement`. No new environment variables, no dependency
+  changes.
 - Keyword/semantic retrieval modes change results only for callers that
   explicitly select them; default (`auto`/absent) ranking is unchanged and
   covered by control tests.
-- Rollback: revert the PR; no data migrations to undo.
+- Rollback: revert the PR. The two nullable columns are inert without the
+  code that reads them, so no data migration is needed to undo — they can
+  be left in place or dropped manually.
 
 ## Evidence
 

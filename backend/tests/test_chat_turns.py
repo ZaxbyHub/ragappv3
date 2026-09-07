@@ -867,3 +867,92 @@ async def test_turn_survives_reopen_from_disk(tmp_path):
         assert [m["seq"] for m in msgs] == [1, 2]
     finally:
         conn2.close()
+
+
+# ---------------------------------------------------------------------------
+# Honesty-field durability (issue #510 AC-17/UI-004, review PRR-002/PRR-003)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_message_echoes_persisted_honesty_fields(tmp_path):
+    """PRR-003: the single-message endpoint must echo the honesty fields it
+    persists, matching the batch endpoint's response surface."""
+    db_path = tmp_path / "echo.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        warnings = ["Superseded by a newer version."]
+        enforcement = {"mode": "required", "status": "missing_citations"}
+        response = await chat_routes.add_message(
+            _mock_request(),
+            session_id,
+            chat_routes.AddMessageRequest(
+                role="assistant",
+                content="Answer.",
+                currency_warnings=warnings,
+                citation_enforcement=enforcement,
+            ),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            rag_engine=None,
+            _csrf_token="t",
+        )
+        assert response["currency_warnings"] == warnings
+        assert response["citation_enforcement"] == enforcement
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_fork_preserves_honesty_fields_across_reload(tmp_path):
+    """PRR-002: fork_session must carry currency_warnings and
+    citation_enforcement into the forked rows so a forked-session reload
+    keeps the original turn's honesty evidence."""
+    db_path = tmp_path / "fork-honesty.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        warnings = ["Superseded by a newer version."]
+        enforcement = {"mode": "required", "status": "satisfied"}
+        await chat_routes.add_messages_batch(
+            _mock_request(),
+            session_id,
+            chat_routes.BatchAddMessagesRequest(
+                messages=[
+                    _msg("user", "Question", turn_id="turn-1"),
+                    _msg(
+                        "assistant",
+                        "Answer [S1].",
+                        turn_id="turn-1",
+                        status="complete",
+                        currency_warnings=warnings,
+                        citation_enforcement=enforcement,
+                    ),
+                ]
+            ),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            rag_engine=None,
+            _csrf_token="t",
+        )
+
+        response = await chat_routes.fork_session(
+            _mock_request(),
+            session_id,
+            chat_routes.ForkSessionRequest(message_index=1),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+        )
+        forked = response["messages"]
+        assert forked[1]["currency_warnings"] == warnings
+        assert forked[1]["citation_enforcement"] == enforcement
+    finally:
+        conn.close()

@@ -13,6 +13,7 @@ import pytest
 from app.models.chat_mode import ChatMode
 from app.services.embeddings import EmbeddingError
 from app.services.rag_engine import RAGEngine, RAGEngineError
+from app.services.retrieval_evaluator import RetrievalEvaluator
 
 
 def _make_engine_for_retrieval():
@@ -79,7 +80,7 @@ class TestRetrievalEvaluationModeGating:
         """Thinking mode keeps the full pipeline: evaluator IS invoked."""
         engine = _make_engine_for_retrieval()
         thinking_client = MagicMock()
-        fake_evaluator = MagicMock()
+        fake_evaluator = MagicMock(spec=RetrievalEvaluator)
         fake_evaluator.evaluate = AsyncMock(return_value="CONFIDENT")
 
         with patch(
@@ -102,7 +103,7 @@ class TestRetrievalEvaluationModeGating:
         """Back-compat: when mode is unset, evaluation still runs (no skip)."""
         engine = _make_engine_for_retrieval()
         client = MagicMock()
-        fake_evaluator = MagicMock()
+        fake_evaluator = MagicMock(spec=RetrievalEvaluator)
         fake_evaluator.evaluate = AsyncMock(return_value="CONFIDENT")
 
         with patch(
@@ -126,7 +127,7 @@ class TestRetrievalEvaluationModeGating:
         mock_settings.instant_skip_retrieval_evaluation = False
         engine = _make_engine_for_retrieval()
         client = MagicMock()
-        fake_evaluator = MagicMock()
+        fake_evaluator = MagicMock(spec=RetrievalEvaluator)
         fake_evaluator.evaluate = AsyncMock(return_value="CONFIDENT")
 
         with patch(
@@ -464,7 +465,7 @@ class TestInstantFusedEvaluationSkip:
             "what is the capital of france",
             "what is the population of france",
         ]
-        fake_evaluator = MagicMock()
+        fake_evaluator = MagicMock(spec=RetrievalEvaluator)
         fake_evaluator.evaluate = AsyncMock(return_value="CONFIDENT")
         with patch("app.services.rag_engine.settings") as mock_settings, patch(
             "app.services.rag_engine.QueryPlanner", _FakePlanner

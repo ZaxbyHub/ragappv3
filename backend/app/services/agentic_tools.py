@@ -98,9 +98,17 @@ class RetrievalTool(AgenticTool):
         self,
         retrieval_top_k: int = 10,
         engine: Optional["RAGEngine"] = None,
+        retrieval_mode: Optional[str] = None,
+        filter_expr: Optional[str] = None,
     ) -> None:
         self._retrieval_top_k = retrieval_top_k
         self._engine = engine
+        # Per-request retrieval controls (issue #510 UI-004/AC-16), captured
+        # at construction from the enclosing query()'s locals so the tool
+        # never reads engine instance state (PR #523 review PRR-001: shared
+        # singleton instance state raced across concurrent requests).
+        self._retrieval_mode = retrieval_mode
+        self._filter_expr = filter_expr
         # Cumulative global source labeling (issue #510 CITE-002): one tool
         # instance spans one planner run, so each execute() labels its
         # sources from the running counter and advances it. Rounds therefore
@@ -174,6 +182,8 @@ class RetrievalTool(AgenticTool):
                 query_embeddings,
                 query,
                 vault_id,
+                retrieval_mode=self._retrieval_mode,
+                filter_expr=self._filter_expr,
             )
 
             # Filter to relevant chunks and convert to source metadata

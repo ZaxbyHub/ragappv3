@@ -85,7 +85,10 @@ def _labels_from_items(
     return labels
 
 
-_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+_CODE_SPAN_RE = re.compile(
+    r"```.*?```|~~~.*?~~~|~~~~.*?~~~~|`[^`\n]*`",
+    re.DOTALL,
+)
 _CODE_PLACEHOLDER_RE = re.compile("\x00(\\d+)\x01")
 
 

@@ -336,3 +336,26 @@ class TestNormalizeUidForDedupHashSemantics:
     def test_idempotent_on_current_format(self):
         once = _normalize_uid_for_dedup(f"42_{_HASH}_default_0")
         assert _normalize_uid_for_dedup(once) == once
+
+
+import unittest  # noqa: E402
+
+
+class TestStripReuploadHashNegativeCases(unittest.TestCase):
+    """PRR-008: a purely numeric 8-char legacy scale segment must never be
+    mistaken for a reupload hash (regex requires at least one [a-f] letter)."""
+
+    def test_all_digit_eight_char_scale_segment_not_stripped(self):
+        from app.services.document_retrieval import _strip_reupload_hash
+
+        self.assertEqual(
+            _strip_reupload_hash("file1_12345678_99_3"), "file1_12345678_99_3"
+        )
+
+    def test_real_hash8_segment_still_stripped(self):
+        from app.services.document_retrieval import _strip_reupload_hash
+
+        self.assertEqual(
+            _strip_reupload_hash("file1_ab12cd34_default_0"),
+            "file1_default_0",
+        )

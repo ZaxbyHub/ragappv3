@@ -212,20 +212,27 @@ class TestRetrievalModeSearchSignatures:
             assert sig[4] == 10
 
     @pytest.mark.asyncio
-    async def test_engine_state_used_when_param_omitted(self):
-        """_execute_retrieval defaults to query()'s per-query engine state."""
+    async def test_stale_engine_state_attributes_are_ignored(self):
+        """PRR-001 regression pin: no per-request engine state exists.
+
+        _execute_retrieval takes controls ONLY from explicit parameters.
+        Stale ``engine._active_*`` attributes (as a prior implementation
+        would have left behind from another concurrent request) must be
+        ignored — the call below runs with engine defaults (settings-driven
+        hybrid), not the stale "keyword".
+        """
         with patch("app.services.rag_engine.settings") as mock_settings:
             _apply_settings(mock_settings)
             store = RecordingVectorStore()
             engine = self._engine(store)
-            engine._active_retrieval_mode = "keyword"
+            engine._active_retrieval_mode = "keyword"  # stale, must be ignored
             await engine._execute_retrieval(
                 [("original", [0.1, 0.2, 0.3])],
                 "what is the capital",
                 vault_id=1,
             )
         sig = _signature(store)
-        assert sig[0] is True and sig[1] == 0.0
+        assert sig[0] is True and sig[1] == 0.6
 
     @pytest.mark.asyncio
     async def test_none_mode_falls_back_to_settings_hybrid(self):

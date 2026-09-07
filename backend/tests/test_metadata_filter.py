@@ -136,6 +136,16 @@ class TestResolveMetadataFilterEdgeCases:
         assert expr is not None, "A user filter must never be silently dropped"
         assert expr == ZERO_MATCH_FILTER_EXPR == "file_id IN ('')"
 
+    def test_empty_string_tag_resolves_to_zero_match_sentinel(self, pool_patched):
+        """An empty-string tag IS accepted by the typed model (a str is a
+        valid list element), but no tag is named "" — resolution therefore
+        yields the zero-match sentinel: a visible "no documents match",
+        never a silently dropped filter and never a match-everything."""
+        parsed = MetadataFilter(tags=[""])
+        assert parsed.tags == [""]
+        expr = resolve_metadata_filter({"tags": [""]}, vault_id=1)
+        assert expr == ZERO_MATCH_FILTER_EXPR
+
     def test_resolution_failure_yields_sentinel_not_none(self, monkeypatch):
         """If the metadata DB is unavailable the sentinel still applies — the
         filter is not silently ignored."""
@@ -156,6 +166,12 @@ class TestMetadataFilterModelValidation:
     def test_bad_date_rejected(self):
         with pytest.raises(ValidationError):
             MetadataFilter(date_from="not-a-date")
+
+    def test_non_list_tags_rejected(self):
+        """tags must be a list of strings — a bare string is rejected by
+        pydantic rather than coerced into a one-element list."""
+        with pytest.raises(ValidationError):
+            MetadataFilter(tags="ops")
 
     def test_valid_fields_accepted(self):
         parsed = MetadataFilter(

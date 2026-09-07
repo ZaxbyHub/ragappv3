@@ -59,6 +59,13 @@ CHAT_HEARTBEAT_INTERVAL = 15.0  # seconds
 
 logger = logging.getLogger(__name__)
 
+# Inline generation-control modes (issue #510). Hoisted to module-level
+# aliases (PRR-022) so the request models and the stream/non-stream helper
+# signatures share one source of truth — the helpers accept exactly the
+# values the models validate.
+RetrievalMode = Literal["auto", "semantic", "keyword"]
+CitationMode = Literal["enabled", "disabled", "required"]
+
 
 class ChatRequest(BaseModel):
     """Request model for chat endpoint."""
@@ -70,8 +77,8 @@ class ChatRequest(BaseModel):
     mode: Optional[Literal["instant", "thinking"]] = None
     # Inline generation controls (issue #510: implemented end to end).
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
-    retrieval_mode: Optional[Literal["auto", "semantic", "keyword"]] = None
-    citation_mode: Optional[Literal["enabled", "disabled", "required"]] = None
+    retrieval_mode: Optional[RetrievalMode] = None
+    citation_mode: Optional[CitationMode] = None
     # Typed metadata filter (date/tag/author subset; unknown fields are
     # rejected by MetadataFilter's extra="forbid" — never silently ignored).
     metadata_filter: Optional[MetadataFilter] = None
@@ -134,8 +141,8 @@ class ChatStreamRequest(BaseModel):
     mode: Optional[Literal["instant", "thinking"]] = None
     # Inline generation controls (issue #510: implemented end to end).
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
-    retrieval_mode: Optional[Literal["auto", "semantic", "keyword"]] = None
-    citation_mode: Optional[Literal["enabled", "disabled", "required"]] = None
+    retrieval_mode: Optional[RetrievalMode] = None
+    citation_mode: Optional[CitationMode] = None
     metadata_filter: Optional[MetadataFilter] = None
 
 
@@ -317,8 +324,8 @@ def stream_chat_response(
     user_id: Optional[int] = None,
     require_vault: bool = False,
     temperature: Optional[float] = None,
-    retrieval_mode: Optional[str] = None,
-    citation_mode: Optional[str] = None,
+    retrieval_mode: Optional[RetrievalMode] = None,
+    citation_mode: Optional[CitationMode] = None,
     include_global: bool = False,
     can_write_memory: bool = False,
     vision_context: Optional[VisionRunContext] = None,
@@ -591,8 +598,8 @@ async def non_stream_chat_response(
     require_vault: bool = False,
     user_id: Optional[int] = None,
     temperature: Optional[float] = None,
-    retrieval_mode: Optional[str] = None,
-    citation_mode: Optional[str] = None,
+    retrieval_mode: Optional[RetrievalMode] = None,
+    citation_mode: Optional[CitationMode] = None,
     include_global: bool = False,
     can_write_memory: bool = False,
     vision_context: Optional[VisionRunContext] = None,
@@ -1313,6 +1320,10 @@ async def fork_session(
     has_wiki_refs_col = "wiki_refs" in fork_col_names
     has_kms_refs_col = "kms_refs" in fork_col_names
     has_mode_col = "mode" in fork_col_names
+    has_fork_honesty_cols = (
+        "currency_warnings" in fork_col_names
+        and "citation_enforcement" in fork_col_names
+    )
 
     # Fetch messages up to message_index, including all available columns.
     if has_memories_col and has_wiki_refs_col:
@@ -1370,12 +1381,14 @@ async def fork_session(
         source_kms_rows = await asyncio.to_thread(source_kms_result.fetchall)
         source_kms_refs = [r[0] for r in source_kms_rows[: body.message_index + 1]]
 
-    # Side-fetch durable turn-lifecycle fields (issue #507) in row order so the
-    # fork preserves turn linkage, terminal status, and assessment evidence.
+    # Side-fetch durable turn-lifecycle fields (issue #507, extended by
+    # issue #510 AC-17/UI-004) in row order so the fork preserves turn
+    # linkage, terminal status, assessment evidence, and the honesty fields.
     source_turn_rows: List[tuple] = []
     turn_source_result = await asyncio.to_thread(
         conn.execute,
-        "SELECT turn_id, status, citation_confidence, unverifiable_claims "
+        "SELECT turn_id, status, citation_confidence, unverifiable_claims, "
+        "currency_warnings, citation_enforcement "
         "FROM chat_messages WHERE session_id = ? ORDER BY seq ASC, id ASC",
         (session_id,),
     )
@@ -1466,15 +1479,25 @@ async def fork_session(
             turn_vals = (
                 source_turn_rows[pos - 1]
                 if pos - 1 < len(source_turn_rows)
-                else (None, None, None, None)
+                else (None, None, None, None, None, None)
             )
-            turn_id_val, status_val, cit_raw, claims_raw = turn_vals
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE chat_messages SET seq = ?, turn_id = ?, status = ?, "
-                "citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
-                (pos, turn_id_val, status_val, cit_raw, claims_raw, new_id),
-            )
+            turn_id_val, status_val, cit_raw, claims_raw, currency_raw, enforcement_raw = turn_vals
+            if has_fork_honesty_cols:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "UPDATE chat_messages SET seq = ?, turn_id = ?, status = ?, "
+                    "citation_confidence = ?, unverifiable_claims = ?, "
+                    "currency_warnings = ?, citation_enforcement = ? WHERE id = ?",
+                    (pos, turn_id_val, status_val, cit_raw, claims_raw,
+                     currency_raw, enforcement_raw, new_id),
+                )
+            else:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "UPDATE chat_messages SET seq = ?, turn_id = ?, status = ?, "
+                    "citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
+                    (pos, turn_id_val, status_val, cit_raw, claims_raw, new_id),
+                )
         await asyncio.to_thread(conn.commit)
     except Exception:
         await asyncio.to_thread(conn.rollback)
@@ -1911,16 +1934,36 @@ async def add_message(
     claims_json = json.dumps(body.unverifiable_claims) if body.unverifiable_claims else None
     currency_json = json.dumps(body.currency_warnings) if body.currency_warnings else None
     enforcement_json = json.dumps(body.citation_enforcement) if body.citation_enforcement else None
-    await asyncio.to_thread(
-        conn.execute,
-        "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
-        "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ?, "
-        "currency_warnings = ?, citation_enforcement = ? WHERE id = ?",
-        (
-            session_id, body.turn_id, body.status, citation_json, claims_json,
-            currency_json, enforcement_json, message_id,
-        ),
+    # PRR-019: guard the honesty columns on this UPDATE too — the INSERT
+    # branch above already tolerates older deployments lacking optional
+    # columns, and an unguarded UPDATE would break them identically. Both
+    # columns ship in a single migration, so one flag covers the pair.
+    has_honesty_cols = (
+        "currency_warnings" in col_names_add
+        and "citation_enforcement" in col_names_add
     )
+    if has_honesty_cols:
+        await asyncio.to_thread(
+            conn.execute,
+            "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
+            "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ?, "
+            "currency_warnings = ?, citation_enforcement = ? WHERE id = ?",
+            (
+                session_id, body.turn_id, body.status, citation_json, claims_json,
+                currency_json, enforcement_json, message_id,
+            ),
+        )
+    else:
+        # Original #507 field set (pre-honesty-columns deployments).
+        await asyncio.to_thread(
+            conn.execute,
+            "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages WHERE session_id = ?), "
+            "turn_id = ?, status = ?, citation_confidence = ?, unverifiable_claims = ? WHERE id = ?",
+            (
+                session_id, body.turn_id, body.status, citation_json, claims_json,
+                message_id,
+            ),
+        )
     await asyncio.to_thread(conn.commit)
     seq_result = await asyncio.to_thread(
         conn.execute, "SELECT seq FROM chat_messages WHERE id = ?", (message_id,)
@@ -1998,6 +2041,8 @@ async def add_message(
         "status": body.status,
         "citation_confidence": body.citation_confidence,
         "unverifiable_claims": body.unverifiable_claims,
+        "currency_warnings": body.currency_warnings,
+        "citation_enforcement": body.citation_enforcement,
     }
 
 

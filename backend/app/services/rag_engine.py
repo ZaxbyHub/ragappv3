@@ -750,31 +750,33 @@ class RAGEngine:
             stream,
         )
         # Per-query controls (issue #510): retrieval_mode / citation_mode are
-        # implemented controls now — resolve once, store as per-query engine
-        # state so every retrieval call inside this query (single, fused
-        # sub-queries, agentic RetrievalTool) inherits the same mode with
-        # parity. metadata_filter resolves to a vault-scoped filter_expr
-        # (never silently ignored; zero-match yields the sentinel expression).
-        self._active_retrieval_mode = retrieval_mode
-        self._active_citation_mode = citation_mode
+        # implemented controls now — resolve once into LOCAL variables and
+        # thread explicitly through every retrieval call inside this query
+        # (single, fused sub-queries, agentic RetrievalTool) so each request's
+        # controls stay isolated even with concurrent query() calls on the
+        # shared engine singleton (PR #523 review PRR-001: instance state
+        # raced across requests). metadata_filter resolves to a vault-scoped
+        # filter_expr (never silently ignored; zero-match yields the sentinel
+        # expression).
+        active_retrieval_mode = retrieval_mode
+        active_citation_mode = citation_mode
         try:
             from app.services.metadata_filter import resolve_metadata_filter
 
-            self._active_filter_expr = resolve_metadata_filter(
+            active_filter_expr = resolve_metadata_filter(
                 metadata_filter, vault_id
             )
         except Exception as exc:  # noqa: BLE001 — validation errors surface above
-            self._active_filter_expr = None
             logger.warning("[query] metadata_filter rejected: %s", exc)
             raise
         if retrieval_mode is not None:
             logger.info("[query] retrieval_mode=%s", retrieval_mode)
         if citation_mode is not None:
             logger.info("[query] citation_mode=%s", citation_mode)
-        if self._active_filter_expr is not None:
+        if active_filter_expr is not None:
             logger.info(
                 "[query] metadata_filter applied (expr len=%d)",
-                len(self._active_filter_expr),
+                len(active_filter_expr),
             )
 
         # ------------------------------------------------------------------
@@ -803,10 +805,15 @@ class RAGEngine:
                 from app.services.agentic_tools import RetrievalTool, SynthesisTool
 
                 registry = ToolRegistry()
-                retrieval_tool = RetrievalTool(retrieval_top_k=self.retrieval_top_k, engine=self)
+                retrieval_tool = RetrievalTool(
+                    retrieval_top_k=self.retrieval_top_k,
+                    engine=self,
+                    retrieval_mode=active_retrieval_mode,
+                    filter_expr=active_filter_expr,
+                )
                 synthesis_tool = SynthesisTool(
                     llm_client=self.llm_client,
-                    citation_mode=getattr(self, "_active_citation_mode", None),
+                    citation_mode=active_citation_mode,
                 )
                 registry.register(retrieval_tool)
                 registry.register(synthesis_tool)
@@ -834,7 +841,7 @@ class RAGEngine:
                     )
                     if agentic_supersession:
                         agentic_done["currency_warnings"] = [agentic_supersession]
-                if getattr(self, "_active_citation_mode", None) == "required":
+                if active_citation_mode == "required":
                     from app.services.citation_validator import _CITATION_RE
 
                     # Same semantics as the standard path: a label is a valid
@@ -845,11 +852,17 @@ class RAGEngine:
                         for src in result.all_sources
                         if src.get("source_label")
                     }
-                    cited_labels = {
-                        label
-                        for label in _CITATION_RE.findall(result.output or "")
-                        if label in available_labels
+                    # _CITATION_RE has TWO capture groups (kind, number), so
+                    # findall yields tuples like ("S", "1") — not bare label
+                    # strings. Normalize each match back to its label ("S1")
+                    # before the membership check, otherwise the intersection
+                    # below never matches and real citations are flagged
+                    # missing_citations.
+                    extracted_labels = {
+                        f"{kind}{num}"
+                        for kind, num in _CITATION_RE.findall(result.output or "")
                     }
+                    cited_labels = extracted_labels & available_labels
                     if cited_labels or not result.all_sources:
                         agentic_done["citation_enforcement"] = {
                             "mode": "required",
@@ -864,6 +877,18 @@ class RAGEngine:
                                 "no valid citation labels."
                             ),
                         }
+                # PRR-012: emit the same versioned retrieval-candidate event
+                # the standard pipeline emits, built from the agentic
+                # result's accumulated sources, so clients receive evidence
+                # candidates on this path too. Only when sources exist — an
+                # empty candidate list carries no signal here (the agentic
+                # path is only reached after planner execution).
+                if result.all_sources:
+                    yield {
+                        "type": "evidence_candidates",
+                        "version": 1,
+                        "candidates": list(result.all_sources),
+                    }
                 yield {"type": "done", **agentic_done}
                 return
             except Exception as exc:  # noqa: BLE001
@@ -1275,6 +1300,8 @@ class RAGEngine:
                     effective_reranker_top_n=effective_reranker_top_n,
                     active_client=active_client,
                     mode=mode,
+                    retrieval_mode=active_retrieval_mode,
+                    filter_expr=active_filter_expr,
                 )
                 _skip_standard_retrieval = True
                 _multi_sub_query_results = vector_results
@@ -1392,6 +1419,8 @@ class RAGEngine:
                         override_reranker_top_n=effective_reranker_top_n,
                         active_client=active_client,
                         mode=mode,
+                        retrieval_mode=active_retrieval_mode,
+                        filter_expr=active_filter_expr,
                     )
                     logger.info(
                         "[query] _execute_retrieval returned: result_count=%d, first_3_distances=%s",
@@ -1665,7 +1694,7 @@ class RAGEngine:
             wiki_evidence=wiki_evidence if wiki_evidence else None,
             kms_evidence=kms_evidence if kms_evidence else None,
             system_prompt_override=effective_prompt_override,
-            citation_mode=getattr(self, "_active_citation_mode", None),
+            citation_mode=active_citation_mode,
         )
 
         # Stream or non-stream LLM response. Capture the assembled
@@ -1763,7 +1792,7 @@ class RAGEngine:
         # Citation-mode enforcement (issue #510 UI-004): "required" must not
         # silently return an ordinary uncited answer — emit an explicit
         # enforcement status consumers can display.
-        if getattr(self, "_active_citation_mode", None) == "required":
+        if active_citation_mode == "required":
             if not cited_sources and not cited_memories and not cited_wikis \
                     and not cited_kms and done_msg.get("sources"):
                 done_msg["citation_enforcement"] = {
@@ -1873,6 +1902,8 @@ class RAGEngine:
         effective_reranker_top_n: int,
         active_client: Optional[Any],
         mode: Optional[Any],
+        retrieval_mode: Optional[str] = None,
+        filter_expr: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], bool, List[str], str, Optional[str], Optional[bool], str, str]:
         """Dispatch independent retrieval for each sub-query and fuse via RRF.
 
@@ -1979,6 +2010,8 @@ class RAGEngine:
                 override_reranker_top_n=effective_reranker_top_n,
                 active_client=active_client,
                 mode=mode,
+                retrieval_mode=retrieval_mode,
+                filter_expr=filter_expr,
             )
             return vector_results, False, failed_sub_queries, score_type, relevance_hint, rerank_success, hybrid_status, rerank_status
 
@@ -1997,6 +2030,8 @@ class RAGEngine:
                     active_client=active_client,
                     mode=mode,
                     skip_evaluation=True,
+                    retrieval_mode=retrieval_mode,
+                    filter_expr=filter_expr,
                 )
             )
             retrieval_tasks.append((sq, task))
@@ -2050,6 +2085,8 @@ class RAGEngine:
                 override_reranker_top_n=effective_reranker_top_n,
                 active_client=active_client,
                 mode=mode,
+                retrieval_mode=retrieval_mode,
+                filter_expr=filter_expr,
             )
             return vector_results, False, failed_sub_queries, score_type, relevance_hint, rerank_success, hybrid_status, rerank_status
 
@@ -2151,11 +2188,14 @@ class RAGEngine:
             variants_dropped: List of variant types that failed embedding (e.g., step_back, hyde)
             retrieval_mode: Per-query retrieval control (issue #510 UI-004);
                 "semantic" = dense-only, "keyword" = pure BM25 (alpha 0.0),
-                None/"auto" = settings-driven hybrid. Defaults to the
-                per-query engine state set by query().
+                None/"auto" = settings-driven hybrid. Callers inside query()
+                pass the request's controls explicitly (PR #523 review
+                PRR-001: no per-request engine state — instance attributes
+                raced across concurrent requests on the shared singleton).
             filter_expr: LanceDB filter expression (issue #510 AC-16).
-                Defaults to the per-query engine state (resolved
-                metadata_filter) set by query().
+                Passed explicitly by query()-internal callers; standalone
+                retrieval surfaces (retrieve_sources, eval) pass None for
+                engine defaults.
 
         Returns:
             Tuple of (vector_results, relevance_hint, eval_result, rerank_success, score_type,
@@ -2168,13 +2208,10 @@ class RAGEngine:
             self.retrieval_top_k,
             len(query_embeddings),
         )
-        # Per-query engine state (set by query()) is the default so every
-        # retrieval call inside one query — single, fused sub-queries, and
-        # the agentic RetrievalTool — applies the same mode and filter.
-        if retrieval_mode is None:
-            retrieval_mode = getattr(self, "_active_retrieval_mode", None)
-        if filter_expr is None:
-            filter_expr = getattr(self, "_active_filter_expr", None)
+        # Controls arrive exclusively via explicit parameters (PR #523 review
+        # PRR-001): the former per-query engine-state fallback read
+        # self._active_* instance attributes that raced across concurrent
+        # requests on the shared singleton.
         # Ensure variants_dropped is always a list (never None)
         if variants_dropped is None:
             variants_dropped = []

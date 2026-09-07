@@ -11,8 +11,11 @@ into a LanceDB ``filter_expr`` over chunk ``file_id`` columns:
   recorded only for email-sourced documents, which is documented rather than
   silently ignored).
 
-Vault scoping: every resolution query is constrained to the requesting vault,
-so the resolved file-id set can never cross vault boundaries.
+Vault scoping: when ``vault_id`` is provided, every resolution query is
+constrained to that vault, so the resolved file-id set can never cross vault
+boundaries. When ``vault_id`` is None (the admin "All Vaults" surface), the
+resolution is intentionally unscoped — admin callers already hold cross-vault
+read authority, and the filter narrows within the full corpus.
 
 Zero-match semantics: when no file satisfies the filter — or the metadata
 tables are unavailable — the resolver returns the zero-match sentinel
