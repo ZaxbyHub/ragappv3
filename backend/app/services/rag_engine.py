@@ -1793,8 +1793,27 @@ class RAGEngine:
         # silently return an ordinary uncited answer — emit an explicit
         # enforcement status consumers can display.
         if active_citation_mode == "required":
-            if not cited_sources and not cited_memories and not cited_wikis \
-                    and not cited_kms and done_msg.get("sources"):
+            # Label-set membership (Copilot review thread + prior probe): a
+            # phantom [S99] in the raw parse output must not count as
+            # "satisfied" — validity requires the label to name an
+            # actually-provided source, matching the agentic path's semantics.
+            from app.services.citation_validator import _CITATION_RE
+
+            source_labels = {
+                s.get("source_label")
+                for s in done_msg.get("sources", [])
+                if s.get("source_label")
+            }
+            parsed_source_labels = {
+                f"{kind}{num}"
+                for kind, num in _CITATION_RE.findall(full_response or "")
+            }
+            has_valid_source_citation = bool(parsed_source_labels & source_labels)
+            if (
+                not has_valid_source_citation
+                and not cited_memories and not cited_wikis
+                and not cited_kms and done_msg.get("sources")
+            ):
                 done_msg["citation_enforcement"] = {
                     "mode": "required",
                     "status": "missing_citations",

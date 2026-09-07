@@ -316,6 +316,37 @@ class TestCitationModeEnforcement:
             done, _ = await _collect(engine, stream=False)
         assert "citation_enforcement" not in done
 
+    @pytest.mark.asyncio
+    async def test_phantom_source_label_does_not_count_as_satisfied(self):
+        """Copilot thread + prior probe: a phantom [S99] must not make a
+        required-citation answer 'satisfied' — validity requires label-set
+        membership against actually-provided sources."""
+        client = _StubLLMClient(answer="Fabricated citation [S99] only.")
+        store = RecordingVectorStore()
+        engine = _make_engine(client, store)
+        with patch("app.services.rag_engine.settings") as mock_settings, patch(
+            "app.services.rag_engine._get_pool",
+            side_effect=RuntimeError("no db in test"),
+        ):
+            _apply_settings(mock_settings)
+            done, _ = await _collect(engine, stream=False, citation_mode="required")
+
+        assert done.get("sources"), "test requires at least one retrieved source"
+        assert done["citation_enforcement"]["status"] == "missing_citations"
+
+    @pytest.mark.asyncio
+    async def test_real_source_label_still_satisfied_after_tuple_normalization(self):
+        client = _StubLLMClient(answer=CITED_ANSWER)
+        store = RecordingVectorStore()
+        engine = _make_engine(client, store)
+        with patch("app.services.rag_engine.settings") as mock_settings, patch(
+            "app.services.rag_engine._get_pool",
+            side_effect=RuntimeError("no db in test"),
+        ):
+            _apply_settings(mock_settings)
+            done, _ = await _collect(engine, stream=False, citation_mode="required")
+        assert done["citation_enforcement"]["status"] == "satisfied"
+
 
 class TestCitationModeDisabledPrompt:
     @pytest.mark.asyncio
