@@ -99,9 +99,18 @@ function loadHighlighter(): Promise<HighlightFn> {
 interface CodeBlockProps {
   language: string;
   code: string;
+  /** Canvas entry point (issue #509): the "Open in canvas" button renders
+   * only when BOTH this flag and `onOpenInCanvas` are provided. */
+  canvasEnabled?: boolean;
+  onOpenInCanvas?: () => void;
 }
 
-const CodeBlock = memo(function CodeBlock({ language, code }: CodeBlockProps) {
+const CodeBlock = memo(function CodeBlock({
+  language,
+  code,
+  canvasEnabled,
+  onOpenInCanvas,
+}: CodeBlockProps) {
   const [html, setHtml] = useState<string | null>(null);
 
   useEffect(() => {
@@ -114,20 +123,48 @@ const CodeBlock = memo(function CodeBlock({ language, code }: CodeBlockProps) {
     return () => { cancelled = true; };
   }, [code, language]);
 
+  const showCanvasButton = canvasEnabled === true && onOpenInCanvas != null;
+
   return (
     <div className="relative my-3 rounded-sm overflow-hidden border border-border group/code">
       {language && (
         <div className="flex items-center justify-between px-4 py-1.5 bg-muted border-b border-border">
           <span className="text-[11px] text-muted-foreground font-mono">{language}</span>
-          <CopyButton text={code} label="Copy code" className="h-6 w-6 opacity-60 hover:opacity-100" />
+          <div className="flex items-center gap-1">
+            {showCanvasButton && (
+              <button
+                type="button"
+                onClick={onOpenInCanvas}
+                aria-label="Open in canvas"
+                data-testid="codeblock-open-in-canvas"
+                className="h-6 rounded-sm px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Open in canvas
+              </button>
+            )}
+            <CopyButton text={code} label="Copy code" className="h-6 w-6 opacity-60 hover:opacity-100" />
+          </div>
         </div>
       )}
       {!language && (
-        <CopyButton
-          text={code}
-          label="Copy code"
-          className="absolute top-2 right-2 h-6 w-6 opacity-0 group-hover/code:opacity-100 focus:opacity-100 transition-opacity z-10"
-        />
+        <div className="absolute top-2 right-2 z-10 flex items-center gap-1 opacity-0 group-hover/code:opacity-100 focus-within:opacity-100 transition-opacity">
+          {showCanvasButton && (
+            <button
+              type="button"
+              onClick={onOpenInCanvas}
+              aria-label="Open in canvas"
+              data-testid="codeblock-open-in-canvas"
+              className="h-6 rounded-sm bg-background/80 px-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Open in canvas
+            </button>
+          )}
+          <CopyButton
+            text={code}
+            label="Copy code"
+            className="h-6 w-6 opacity-0 group-hover/code:opacity-100 focus:opacity-100 transition-opacity"
+          />
+        </div>
       )}
       {html ? (
         <div
@@ -540,6 +577,17 @@ interface MarkdownMessageProps {
    * that opened the evidence pane (issue #508).
    */
   messageId?: string;
+  /**
+   * Canvas entry point (issue #509). When provided, every fenced code block
+   * renders an "Open in canvas" button that calls `onOpen(code, language)`.
+   * Optional and omitted entirely when the canvas capability is off — zero
+   * behavior change for existing callers.
+   */
+  canvas?: {
+    sessionId: string;
+    messageId: string;
+    onOpen: (code: string, language: string) => void;
+  };
 }
 
 /**
@@ -570,6 +618,7 @@ export const MarkdownMessage = memo(function MarkdownMessage({
   citationConfidence,
   unverifiableClaims,
   messageId,
+  canvas,
 }: MarkdownMessageProps) {
   // Skip the full parseCitationSegments scan when the caller already supplies
   // citedSources (the AssistantMessage production path, which runs the
@@ -767,11 +816,21 @@ export const MarkdownMessage = memo(function MarkdownMessage({
             const lang = className?.startsWith("language-")
               ? className.replace("language-", "")
               : "";
-            const codeText = codeChildrenToText(codeElement.props.children).replace(/\n$/, "");
+            // Canvas gets the raw text (byte-exact, trailing newline included);
+            // display/copy keep the pre-existing trailing-newline strip.
+            const rawCodeText = codeChildrenToText(codeElement.props.children);
+            const codeText = rawCodeText.replace(/\n$/, "");
             if (lang === "mermaid") {
               return <MermaidDiagram chart={codeText} />;
             }
-            return <CodeBlock language={lang} code={codeText} />;
+            return (
+              <CodeBlock
+                language={lang}
+                code={codeText}
+                canvasEnabled={canvas != null}
+                onOpenInCanvas={canvas ? () => canvas.onOpen(rawCodeText, lang) : undefined}
+              />
+            );
           },
           table: ({ children }) => (
             <div className="overflow-x-auto my-3">

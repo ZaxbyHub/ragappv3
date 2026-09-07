@@ -9,12 +9,27 @@ import {
   AlertCircle,
   GitBranch,
   Pencil,
+  FileText,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { updateMessageFeedback } from "@/lib/api";
+
+// =============================================================================
+// stripCitations — remove [S1] / [Source:…] markers from message text
+// =============================================================================
+
+/** Strips `[S#]` and legacy `[Source: …]` citation markers and trims. Used by
+ * the copy action and by the canvas "Open as document" entry point (issue #509),
+ * which creates a clean document from the answer body. */
+export function stripCitations(content: string): string {
+  return content
+    .replace(/\[Source:[^\]]+\]/g, "")
+    .replace(/\[S\d+\]/g, "")
+    .trim();
+}
 
 // =============================================================================
 // CopyButton with toast feedback
@@ -34,13 +49,11 @@ interface CopyActionProps {
   onCopy?: () => void;
 }
 
-function CopyAction({ content, stripCitations = false, onCopy }: CopyActionProps) {
+function CopyAction({ content, stripCitations: stripMarkers = false, onCopy }: CopyActionProps) {
   const [state, setState] = useState<"idle" | "copied" | "error">("idle");
 
   const handleCopy = useCallback(async () => {
-    const text = stripCitations
-      ? content.replace(/\[Source:[^\]]+\]/g, "").replace(/\[S\d+\]/g, "").trim()
-      : content;
+    const text = stripMarkers ? stripCitations(content) : content;
     try {
       if (navigator.clipboard) {
         await navigator.clipboard.writeText(text);
@@ -63,7 +76,7 @@ function CopyAction({ content, stripCitations = false, onCopy }: CopyActionProps
       toast.error("Couldn't copy to clipboard");
       setTimeout(() => setState("idle"), 2000);
     }
-  }, [content, stripCitations, onCopy]);
+  }, [content, stripMarkers, onCopy]);
 
   return (
     <Tooltip>
@@ -244,6 +257,12 @@ interface AssistantMessageActionsProps {
   serverFeedback?: "up" | "down" | null;
   onFeedback?: (feedback: "up" | "down" | null) => void;
   onCopy?: () => void;
+  /**
+   * Canvas entry point (issue #509): when provided, renders the "Open as
+   * document" action. Callers pass it only when the canvas capability query
+   * reports enabled (fail-closed); omitted entirely otherwise.
+   */
+  onOpenDocumentInCanvas?: () => void;
 }
 
 export function AssistantMessageActions({
@@ -259,11 +278,30 @@ export function AssistantMessageActions({
   serverFeedback,
   onFeedback,
   onCopy,
+  onOpenDocumentInCanvas,
 }: AssistantMessageActionsProps) {
   return (
     <div className="flex items-center gap-0.5 mt-3 opacity-60 group-hover:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity duration-200">
       <TooltipProvider>
         <CopyAction content={content} stripCitations onCopy={onCopy} />
+
+        {onOpenDocumentInCanvas && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className={TOUCH_TARGET_44}
+                onClick={onOpenDocumentInCanvas}
+                aria-label="Open as document"
+                data-testid="open-as-document-button"
+              >
+                <FileText className="h-3.5 w-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent><p>Open as document</p></TooltipContent>
+          </Tooltip>
+        )}
 
         {onRetry && (
           <Tooltip>
