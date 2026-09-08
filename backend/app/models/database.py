@@ -13,6 +13,12 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 
 from app.config import settings
+from app.models.migration_journal import (
+    MIGRATION_JOURNAL_DDL,
+    invalidate_derived_data,
+    record_migration_outcome,
+    record_schema_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1493,6 +1499,11 @@ SCHEMA = (
     + _MULTIMODAL_ARTIFACT_DDL
     + _ENRICHMENT_DERIVED_DDL
     + _CANVAS_DDL
+    # Recovery journal (issue #512): records migration phase/outcome, schema
+    # version and authoritative index generation. Defined in
+    # app.models.migration_journal and also created by
+    # migrate_add_migration_journal (repo double-definition pattern).
+    + MIGRATION_JOURNAL_DDL
 )  # nosec B608
 
 
@@ -1569,6 +1580,7 @@ def run_migrations(sqlite_path: str) -> None:
         None
     """
     init_db(sqlite_path)
+    migrate_add_migration_journal(sqlite_path)
 
     # Migrate refresh token index from non-unique to unique
     conn = sqlite3.connect(sqlite_path)
@@ -1689,6 +1701,35 @@ def run_migrations(sqlite_path: str) -> None:
             e,
         )
         conn.rollback()
+    finally:
+        conn.close()
+
+    # Record the schema version the database has been brought to (issue #512
+    # recovery journal; see app.models.migration_journal).
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        record_schema_version(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_migration_journal(sqlite_path: str) -> None:
+    """Migration: add the ``migration_journal`` recovery journal (issue #512).
+
+    The journal records schema version, migration phase/outcome, derived-data
+    invalidations and the authoritative vector-index generation. The table is
+    also part of the SCHEMA constant (fresh databases get it from init_db);
+    this migration exists so the owning DDL has a single definition in
+    ``app.models.migration_journal`` and upgraded databases gain the table
+    even when only individual migrations are invoked.
+
+    Idempotent — CREATE TABLE IF NOT EXISTS.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute(MIGRATION_JOURNAL_DDL)
+        conn.commit()
     finally:
         conn.close()
 
@@ -2752,7 +2793,12 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
     # implicit transaction. This matches the behaviour we verified in
     # the SQLite reproduction case at PR-C reviewer time.
     conn.isolation_level = None
+    _journal = "migrate_add_curator_claim_support"
+    recovered = False
     try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         # Recovery: if a previous run crashed mid-migration, the old
         # table may still be present alongside (or instead of) the new
         # one. Restore the canonical name before doing anything else.
@@ -2772,39 +2818,101 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
             conn.execute("PRAGMA legacy_alter_table = ON")
             conn.execute("ALTER TABLE wiki_claims_old RENAME TO wiki_claims")
             conn.execute("PRAGMA legacy_alter_table = OFF")
+            recovered = True
             new_present = True
+            # The backup no longer exists under its own name — clear the
+            # probe so the both-present branch below cannot reference it.
+            old_present = None
 
         # Skip if wiki_claims doesn't exist yet (fresh install path will
         # create it via migrate_add_wiki_tables, which already includes
         # the new schema after this function lands).
         if not new_present:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="wiki_claims table absent",
+            )
             return
 
         existing_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(wiki_claims)").fetchall()
         }
         if "created_by_kind" in existing_cols:
-            # Migration already applied; nothing to do — but if a stray
-            # wiki_claims_old somehow lingers (shouldn't, given the
-            # recovery branch above), drop it now.
+            # Migration already applied. A lingering wiki_claims_old is only
+            # safe to drop when the canonical table contains every backup id
+            # and at least as many rows (row-identity parity, issue #512
+            # DB-001: never delete the only preserved source on a retry).
+            # Otherwise the backup is authoritative — restore it and fall
+            # through so the main path re-runs on the restored table.
             if old_present:
-                conn.execute("DROP TABLE IF EXISTS wiki_claims_old")
-            return
+                dest_count = conn.execute("SELECT COUNT(*) FROM wiki_claims").fetchone()[0]
+                backup_count = conn.execute(
+                    "SELECT COUNT(*) FROM wiki_claims_old"
+                ).fetchone()[0]
+                missing_ids = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT id FROM wiki_claims_old"
+                    " EXCEPT SELECT id FROM wiki_claims)"
+                ).fetchone()[0]
+                if dest_count >= backup_count and missing_ids == 0:
+                    conn.execute("DROP TABLE IF EXISTS wiki_claims_old")
+                    record_migration_outcome(
+                        conn, migration_name=_journal, phase="succeeded",
+                        outcome="noop",
+                        detail="created_by_kind already present; stale backup dropped",
+                    )
+                    return
+                logger.warning(
+                    "migrate_add_curator_claim_support: backup holds rows the "
+                    "destination lacks; restoring from wiki_claims_old."
+                )
+                conn.execute("DROP TABLE wiki_claims")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute("ALTER TABLE wiki_claims_old RENAME TO wiki_claims")
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+                recovered = True
+                # The backup no longer exists under its own name — clear the
+                # probe so the both-present branch below cannot reference it —
+                # and fall through: the restored table is old-shaped, so the
+                # main swap path below must re-run on it.
+                old_present = None
+            else:
+                record_migration_outcome(
+                    conn, migration_name=_journal, phase="succeeded",
+                    outcome="noop", detail="created_by_kind already present",
+                )
+                return
 
-        # Third recovery branch (per PR-C critic Fix #1): both tables
-        # exist and wiki_claims is the OLD shape (no created_by_kind).
-        # This means a previous run completed the rename, started the
-        # new CREATE TABLE, but somehow ended up with both tables.
-        # The safe move is to drop the stale wiki_claims_old before the
-        # main path runs — otherwise the next ALTER ... RENAME TO
-        # wiki_claims_old below will fail with "table already exists".
+        # Third recovery branch: both tables exist and wiki_claims is the OLD
+        # shape (no created_by_kind). The destination is only trusted when it
+        # contains every backup id and at least as many rows; a strict subset
+        # is a failed partial copy and the backup is authoritative (issue
+        # #512 DB-001).
         if old_present:
-            logger.warning(
-                "migrate_add_curator_claim_support: detected stale "
-                "wiki_claims_old alongside pre-PR-C wiki_claims; "
-                "dropping the stale table before re-running migration."
-            )
-            conn.execute("DROP TABLE IF EXISTS wiki_claims_old")
+            dest_count = conn.execute("SELECT COUNT(*) FROM wiki_claims").fetchone()[0]
+            backup_count = conn.execute(
+                "SELECT COUNT(*) FROM wiki_claims_old"
+            ).fetchone()[0]
+            missing_ids = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM wiki_claims_old"
+                " EXCEPT SELECT id FROM wiki_claims)"
+            ).fetchone()[0]
+            if dest_count >= backup_count and missing_ids == 0:
+                logger.warning(
+                    "migrate_add_curator_claim_support: detected stale "
+                    "wiki_claims_old alongside pre-PR-C wiki_claims; "
+                    "dropping the stale table before re-running migration."
+                )
+                conn.execute("DROP TABLE IF EXISTS wiki_claims_old")
+            else:
+                logger.warning(
+                    "migrate_add_curator_claim_support: detected failed partial "
+                    "copy in wiki_claims; restoring authoritative wiki_claims_old."
+                )
+                conn.execute("DROP TABLE wiki_claims")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute("ALTER TABLE wiki_claims_old RENAME TO wiki_claims")
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+                recovered = True
 
         # Snapshot row count for parity check.
         before_count = conn.execute("SELECT COUNT(*) FROM wiki_claims").fetchone()[0]
@@ -2814,6 +2922,14 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
         # textually pointing at the canonical table name.
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("PRAGMA legacy_alter_table = ON")
+        # Atomicity (issue #512 DB-001): this connection is in autocommit
+        # mode (isolation_level = None) and the previous implementation mixed
+        # DDL, DML and executescript (which implicitly commits any pending
+        # transaction) — a crash mid-copy left a committed empty destination
+        # that the retry then destroyed. The whole swap now runs inside ONE
+        # explicit BEGIN IMMEDIATE transaction using execute() only, so any
+        # failure rolls back to the pre-swap state (backup table included).
+        conn.execute("BEGIN IMMEDIATE")
         try:
             # Drop FTS triggers — they reference wiki_claims by name.
             for trig in (
@@ -2881,26 +2997,35 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
 
             conn.execute("DROP TABLE wiki_claims_old")
 
-            # Recreate the FTS triggers exactly as in the original schema.
-            conn.executescript(
+            # Recreate the FTS triggers exactly as in the original schema
+            # (individual execute() calls: executescript would commit).
+            conn.execute(
                 """
                 CREATE TRIGGER IF NOT EXISTS wiki_claims_fts_insert
                 AFTER INSERT ON wiki_claims BEGIN
                     INSERT INTO wiki_claims_fts(rowid, claim_text, subject, predicate, object)
                     VALUES (new.id, new.claim_text, new.subject, new.predicate, new.object);
-                END;
+                END
+                """
+            )
+            conn.execute(
+                """
                 CREATE TRIGGER IF NOT EXISTS wiki_claims_fts_delete
                 AFTER DELETE ON wiki_claims BEGIN
                     INSERT INTO wiki_claims_fts(wiki_claims_fts, rowid, claim_text, subject, predicate, object)
                     VALUES ('delete', old.id, old.claim_text, old.subject, old.predicate, old.object);
-                END;
+                END
+                """
+            )
+            conn.execute(
+                """
                 CREATE TRIGGER IF NOT EXISTS wiki_claims_fts_update
                 AFTER UPDATE ON wiki_claims BEGIN
                     INSERT INTO wiki_claims_fts(wiki_claims_fts, rowid, claim_text, subject, predicate, object)
                     VALUES ('delete', old.id, old.claim_text, old.subject, old.predicate, old.object);
                     INSERT INTO wiki_claims_fts(rowid, claim_text, subject, predicate, object)
                     VALUES (new.id, new.claim_text, new.subject, new.predicate, new.object);
-                END;
+                END
                 """
             )
 
@@ -2916,6 +3041,14 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_wiki_claims_vault_page_status "
                 "ON wiki_claims(vault_id, page_id, status)"
             )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
         finally:
             # Restore both PRAGMAs unconditionally; new connections
             # otherwise inherit the legacy_alter_table=ON behaviour
@@ -2927,11 +3060,33 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
         # produced a broken DB; fail loudly so an operator notices.
         violations = conn.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"foreign_key_check violations: {len(violations)}",
+            )
             raise RuntimeError(
                 f"migrate_add_curator_claim_support: foreign_key_check "
                 f"reported {len(violations)} violation(s) post-swap: "
                 f"{violations[:5]}"
             )
+
+        # The swap rebuilt the claims table and its FTS projection — record
+        # the derived-data invalidation and the final outcome.
+        invalidate_derived_data(
+            conn,
+            reason="wiki_claims swap rebuilt claims + FTS (created_by_kind migration)",
+            migration_name=_journal,
+        )
+        if recovered:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="recovered",
+                outcome="recovered_from_backup",
+                detail="wiki_claims restored from wiki_claims_old before swap",
+            )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"rows={before_count}",
+        )
     finally:
         conn.close()
 
@@ -3399,7 +3554,15 @@ migrate_add_files_content_fts('/path/to/app.db')"
     Idempotent — safe to run multiple times.
     """
     conn = sqlite3.connect(sqlite_path)
+    # Autocommit mode so the journal rows below commit immediately and the
+    # explicit BEGIN IMMEDIATE below is never nested inside an implicit
+    # transaction (issue #512 SEARCH-005).
+    conn.isolation_level = None
+    _journal = "migrate_add_files_content_fts"
     try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         existing_cols = [
             row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
         ]
@@ -3407,54 +3570,61 @@ migrate_add_files_content_fts('/path/to/app.db')"
             # Defensive: normally added by migrate_add_files_parsed_text first.
             conn.execute("ALTER TABLE files ADD COLUMN parsed_text TEXT")
 
-        # Check before running executescript so we know whether the table is
-        # being created for the first time (rebuild needed) or already exists
-        # (no rebuild — triggers keep the index in sync at runtime).
-        table_is_new = (
+        # Non-destructive retry semantics (issue #512 SEARCH-005): creation and
+        # backfill run inside ONE explicit transaction using individual
+        # execute() calls (executescript would implicitly commit any pending
+        # transaction first and split the operation). A failure anywhere
+        # rolls back the virtual table, the triggers AND the backfill, so a
+        # retry re-runs the whole sequence instead of silently skipping the
+        # backfill because the table now exists.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
             conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master"
-                " WHERE type='table' AND name='files_content_fts'"
-            ).fetchone()[0]
-            == 0
-        )
-
-        conn.executescript(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS files_content_fts USING fts5(
-                parsed_text,
-                content='files',
-                content_rowid='id'
-            );
-
-            CREATE TRIGGER IF NOT EXISTS files_content_fts_insert AFTER INSERT ON files BEGIN
-                INSERT INTO files_content_fts(rowid, parsed_text)
-                VALUES (new.id, new.parsed_text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS files_content_fts_delete AFTER DELETE ON files BEGIN
-                INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)
-                VALUES ('delete', old.id, old.parsed_text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS files_content_fts_update AFTER UPDATE ON files
-            WHEN new.parsed_text IS NOT old.parsed_text BEGIN
-                INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)
-                VALUES ('delete', old.id, old.parsed_text);
-                INSERT INTO files_content_fts(rowid, parsed_text)
-                VALUES (new.id, new.parsed_text);
-            END;
-            """
-        )
-        if table_is_new:
-            # Backfill existing rows — only needed on first creation.
-            # On subsequent startups the triggers keep the index current.
+                "CREATE VIRTUAL TABLE IF NOT EXISTS files_content_fts USING fts5("
+                "parsed_text, content='files', content_rowid='id')"
+            )
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS files_content_fts_insert AFTER INSERT ON files BEGIN"
+                " INSERT INTO files_content_fts(rowid, parsed_text)"
+                " VALUES (new.id, new.parsed_text); END"
+            )
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS files_content_fts_delete AFTER DELETE ON files BEGIN"
+                " INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)"
+                " VALUES ('delete', old.id, old.parsed_text); END"
+            )
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS files_content_fts_update AFTER UPDATE ON files"
+                " WHEN new.parsed_text IS NOT old.parsed_text BEGIN"
+                " INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)"
+                " VALUES ('delete', old.id, old.parsed_text);"
+                " INSERT INTO files_content_fts(rowid, parsed_text)"
+                " VALUES (new.id, new.parsed_text); END"
+            )
+            # Backfill on every run: idempotent full rebuild of the external
+            # content table, so a first-run failure leaves nothing behind and
+            # a retry restores completeness.
             conn.execute(
                 "INSERT INTO files_content_fts(files_content_fts) VALUES('rebuild')"
             )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        # The FTS index is derived state that was just (re)built from
+        # files.parsed_text — record the invalidation interface event.
+        invalidate_derived_data(
+            conn,
+            reason="files_content_fts created + backfilled from files.parsed_text",
+            migration_name=_journal,
+        )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok"
+        )
     finally:
         conn.close()
 
@@ -3473,33 +3643,98 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
     """
     conn = sqlite3.connect(sqlite_path)
     conn.isolation_level = None
+    _journal = "migrate_widen_wiki_claim_sources_source_kind"
     try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
+        # Recovery first (issue #512 DB-002): probe the backup BEFORE the
+        # canonical-table early return, or a crash-after-rename state can
+        # never be restored. Renamed-only → restore the canonical name.
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_claim_sources'"
         ).fetchone()
-        if not tbl:
-            return
-
         old_present = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_claim_sources_old'"
         ).fetchone()
+        recovered = False
         if old_present and not tbl:
             conn.execute("PRAGMA legacy_alter_table = ON")
             conn.execute("ALTER TABLE wiki_claim_sources_old RENAME TO wiki_claim_sources")
             conn.execute("PRAGMA legacy_alter_table = OFF")
+            recovered = True
         elif old_present:
-            conn.execute("DROP TABLE IF EXISTS wiki_claim_sources_old")
+            # Both tables exist. The destination is only trusted when it is
+            # new-shaped and contains every backup id with at least as many
+            # rows; otherwise it is a failed partial copy and the backup is
+            # authoritative.
+            # The widened 'wiki' enum value lives in the destination's CHECK
+            # constraint (CREATE TABLE SQL), not in table_info column names —
+            # probe sqlite_master like the lint-migration analog below.
+            dest_sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='wiki_claim_sources'"
+            ).fetchone()
+            dest_new_shape = "'wiki'" in (dest_sql_row[0] if dest_sql_row else "")
+            dest_count = conn.execute("SELECT COUNT(*) FROM wiki_claim_sources").fetchone()[0]
+            backup_count = conn.execute(
+                "SELECT COUNT(*) FROM wiki_claim_sources_old"
+            ).fetchone()[0]
+            missing_ids = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM wiki_claim_sources_old"
+                " EXCEPT SELECT id FROM wiki_claim_sources)"
+            ).fetchone()[0]
+            dest_complete = (
+                dest_new_shape
+                and dest_count >= backup_count
+                and missing_ids == 0
+            )
+            if not dest_complete:
+                conn.execute("DROP TABLE wiki_claim_sources")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute("ALTER TABLE wiki_claim_sources_old RENAME TO wiki_claim_sources")
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+                recovered = True
+            else:
+                conn.execute("DROP TABLE wiki_claim_sources_old")
+
+        if not tbl and not old_present:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="wiki_claim_sources table absent",
+            )
+            return
+
+        if recovered:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="recovered",
+                outcome="recovered_from_backup",
+                detail="wiki_claim_sources restored from wiki_claim_sources_old",
+            )
+            invalidate_derived_data(
+                conn,
+                reason="wiki_claim_sources restored from backup (source_kind widen)",
+                migration_name=_journal,
+            )
 
         create_sql = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='wiki_claim_sources'"
         ).fetchone()
         if create_sql and "'wiki'" in create_sql[0]:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="source_kind CHECK already widened",
+            )
             return
 
         before_count = conn.execute("SELECT COUNT(*) FROM wiki_claim_sources").fetchone()[0]
 
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("PRAGMA legacy_alter_table = ON")
+        # Atomicity (issue #512 DB-002): the swap runs inside ONE explicit
+        # BEGIN IMMEDIATE transaction using execute() only, so a crash or
+        # copy failure rolls back to the pre-swap state (backup included)
+        # instead of leaving a committed empty destination.
+        conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute("ALTER TABLE wiki_claim_sources RENAME TO wiki_claim_sources_old")
 
@@ -3552,17 +3787,39 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_wiki_claim_sources_claim_id "
                 "ON wiki_claim_sources(claim_id)"
             )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
         finally:
             conn.execute("PRAGMA legacy_alter_table = OFF")
             conn.execute("PRAGMA foreign_keys = ON")
 
         violations = conn.execute("PRAGMA foreign_key_check(wiki_claim_sources)").fetchall()
         if violations:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"foreign_key_check violations: {len(violations)}",
+            )
             raise RuntimeError(
                 f"migrate_widen_wiki_claim_sources_source_kind: "
                 f"foreign_key_check reported {len(violations)} violation(s): "
                 f"{violations[:5]}"
             )
+
+        invalidate_derived_data(
+            conn,
+            reason="wiki_claim_sources rebuilt with widened source_kind CHECK",
+            migration_name=_journal,
+        )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"rows={before_count}",
+        )
     finally:
         conn.close()
 
@@ -3609,31 +3866,104 @@ def migrate_add_wiki_claims_unique_claim_text(sqlite_path: str) -> None:
     then creates a unique index.  Idempotent.
     """
     conn = sqlite3.connect(sqlite_path)
+    conn.isolation_level = None
+    _journal = "migrate_add_wiki_claims_unique_claim_text"
     try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_claims'"
         ).fetchone()
         if not tbl:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="wiki_claims table absent",
+            )
             return
 
         idx = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_claims_unique_vault_claim'"
         ).fetchone()
         if idx:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="unique index already present",
+            )
             return
 
-        # Remove duplicate rows (keep the latest / highest-id per vault+claim pair)
-        conn.execute(
-            """DELETE FROM wiki_claims WHERE id NOT IN (
-                SELECT MAX(id) FROM wiki_claims
-                GROUP BY vault_id, claim_text
-            )"""
+        # Enable FK enforcement BEFORE the transaction (a PRAGMA issued
+        # inside one is a no-op) so the DELETE below runs under the real
+        # constraint after the remap, per the sibling precedent in
+        # migrate_add_curator_claim_support.
+        conn.execute("PRAGMA foreign_keys = ON")
+        # wiki_claim_sources is the only table referencing wiki_claims(id)
+        # (schema grep, issue #512 DB-003) — but guard its existence so a
+        # database predating the wiki tables can still be deduplicated.
+        sources_present = conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE type='table' AND name='wiki_claim_sources'"
+        ).fetchone()
+        # Remap dependent evidence before deleting duplicates (issue #512
+        # DB-003): every wiki_claim_sources row pointing at a doomed twin is
+        # re-pointed at the surviving MAX(id) twin first, so no evidence is
+        # orphaned (or silently cascade-deleted) by the dedup. The remap +
+        # delete + index run inside ONE explicit transaction; a failure
+        # (including the foreign_key_check below) rolls everything back.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if sources_present:
+                conn.execute(
+                    """UPDATE wiki_claim_sources
+                    SET claim_id = (
+                        SELECT MAX(keep.id) FROM wiki_claims AS keep
+                        WHERE keep.vault_id = (
+                            SELECT doomed.vault_id FROM wiki_claims AS doomed
+                            WHERE doomed.id = wiki_claim_sources.claim_id
+                        )
+                        AND keep.claim_text = (
+                            SELECT doomed.claim_text FROM wiki_claims AS doomed
+                            WHERE doomed.id = wiki_claim_sources.claim_id
+                        )
+                    )
+                    WHERE claim_id NOT IN (
+                        SELECT MAX(id) FROM wiki_claims
+                        GROUP BY vault_id, claim_text
+                    )"""
+                )
+            # Remove duplicate rows (keep the latest / highest-id per vault+claim pair)
+            conn.execute(
+                """DELETE FROM wiki_claims WHERE id NOT IN (
+                    SELECT MAX(id) FROM wiki_claims
+                    GROUP BY vault_id, claim_text
+                )"""
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX idx_wiki_claims_unique_vault_claim "
+                "ON wiki_claims(vault_id, claim_text)"
+            )
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"migrate_add_wiki_claims_unique_claim_text: foreign_key_check "
+                    f"reported {len(violations)} violation(s) after dedup: {violations[:5]}"
+                )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        invalidate_derived_data(
+            conn,
+            reason="wiki_claims deduplicated + claim sources remapped (unique_claim_text)",
+            migration_name=_journal,
         )
-        conn.execute(
-            "CREATE UNIQUE INDEX idx_wiki_claims_unique_vault_claim "
-            "ON wiki_claims(vault_id, claim_text)"
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok"
         )
-        conn.commit()
     finally:
         conn.close()
 
@@ -4137,8 +4467,13 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
     # migrate_widen_wiki_claim_sources.
     conn = sqlite3.connect(sqlite_path)
     conn.isolation_level = None
+    _journal = "migrate_add_wiki_lint_findings_json_check"
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
+        recovered = False
 
         # Recovery prologue: if a prior run crashed after RENAME but before
         # COMMIT, _wiki_lint_findings_old may be present alongside an empty
@@ -4159,20 +4494,56 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
                 "migrate_add_wiki_lint_findings_json_check: detected "
                 "_wiki_lint_findings_old without wiki_lint_findings; restoring."
             )
+            conn.execute("PRAGMA legacy_alter_table = ON")
             conn.execute(
                 "ALTER TABLE _wiki_lint_findings_old "
                 "RENAME TO wiki_lint_findings"
             )
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            recovered = True
             old_present = None
         elif old_present and new_present:
-            # Both tables exist: a prior INSERT failed after DDL committed.
-            # Drop the stale backup so the RENAME below won't collide.
-            logger.warning(
-                "migrate_add_wiki_lint_findings_json_check: detected stale "
-                "_wiki_lint_findings_old alongside wiki_lint_findings; "
-                "dropping stale table before re-running migration."
-            )
-            conn.execute("DROP TABLE _wiki_lint_findings_old")
+            # Both tables exist: a prior run failed mid-copy. The destination
+            # is only trusted when it is new-shaped and contains every backup
+            # id with at least as many rows; a strict subset is a failed
+            # partial copy and the backup is authoritative (issue #512 DB-001
+            # lint analog — never drop the only preserved source on a retry).
+            dest_sql = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='wiki_lint_findings'"
+            ).fetchone()[0]
+            dest_new_shape = "json_type(related_page_ids_json)" in (dest_sql or "")
+            dest_count = conn.execute(
+                "SELECT COUNT(*) FROM wiki_lint_findings"
+            ).fetchone()[0]
+            backup_count = conn.execute(
+                "SELECT COUNT(*) FROM _wiki_lint_findings_old"
+            ).fetchone()[0]
+            missing_ids = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM _wiki_lint_findings_old"
+                " EXCEPT SELECT id FROM wiki_lint_findings)"
+            ).fetchone()[0]
+            if dest_new_shape and dest_count >= backup_count and missing_ids == 0:
+                logger.warning(
+                    "migrate_add_wiki_lint_findings_json_check: detected stale "
+                    "_wiki_lint_findings_old alongside complete wiki_lint_findings; "
+                    "dropping stale table."
+                )
+                conn.execute("DROP TABLE _wiki_lint_findings_old")
+            else:
+                logger.warning(
+                    "migrate_add_wiki_lint_findings_json_check: detected failed "
+                    "partial copy in wiki_lint_findings; restoring authoritative "
+                    "_wiki_lint_findings_old."
+                )
+                conn.execute("DROP TABLE wiki_lint_findings")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute(
+                    "ALTER TABLE _wiki_lint_findings_old "
+                    "RENAME TO wiki_lint_findings"
+                )
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+                recovered = True
             old_present = None
 
         # Check if the table exists at all
@@ -4181,72 +4552,132 @@ def migrate_add_wiki_lint_findings_json_check(sqlite_path: str) -> None:
             "WHERE type='table' AND name='wiki_lint_findings'"
         ).fetchone()
         if not row:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="wiki_lint_findings table absent",
+            )
             return
         if "json_type(related_page_ids_json)" in row[0]:
             # CHECK constraints already present — nothing to do.
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="CHECK constraints already present",
+            )
             return
 
+        # Snapshot row count for the parity check.
+        before_count = conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings"
+        ).fetchone()[0]
+
         # Wrap the entire RENAME → CREATE → INSERT → DROP sequence in one
-        # explicit transaction so a mid-migration failure is fully atomic.
-        conn.execute("BEGIN")
-        conn.execute(
-            "ALTER TABLE wiki_lint_findings RENAME TO _wiki_lint_findings_old"
-        )
-        conn.execute("""
-            CREATE TABLE wiki_lint_findings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                vault_id INTEGER NOT NULL,
-                finding_type TEXT NOT NULL CHECK (finding_type IN (
-                    'contradiction','stale','orphan','missing_page',
-                    'unsupported_claim','duplicate_entity','weak_provenance')),
-                severity TEXT NOT NULL DEFAULT 'medium' CHECK (severity IN (
-                    'low','medium','high','critical')),
-                title TEXT NOT NULL,
-                details TEXT DEFAULT '',
-                related_page_ids_json TEXT NOT NULL DEFAULT '[]'
-                    CHECK (json_type(related_page_ids_json) = 'array'),
-                related_claim_ids_json TEXT NOT NULL DEFAULT '[]'
-                    CHECK (json_type(related_claim_ids_json) = 'array'),
-                status TEXT NOT NULL DEFAULT 'open' CHECK (status IN (
-                    'open','acknowledged','resolved','dismissed')),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Normalise: any value that is not a valid JSON array (NULL, empty
-        # string, JSON null, object, scalar, or malformed JSON) is coerced to
-        # '[]'.  json_valid() is used as the outer guard because json_type()
-        # raises OperationalError on malformed JSON (e.g. 'not-json'), while
-        # json_valid() returns 0 without raising for all invalid inputs.
-        conn.execute("""
-            INSERT INTO wiki_lint_findings
-                (id, vault_id, finding_type, severity, title, details,
-                 related_page_ids_json, related_claim_ids_json,
-                 status, created_at, updated_at)
-            SELECT
-                id, vault_id, finding_type, severity, title, details,
-                CASE WHEN json_valid(related_page_ids_json)
-                          AND json_type(related_page_ids_json) = 'array'
-                     THEN related_page_ids_json ELSE '[]' END,
-                CASE WHEN json_valid(related_claim_ids_json)
-                          AND json_type(related_claim_ids_json) = 'array'
-                     THEN related_claim_ids_json ELSE '[]' END,
-                status, created_at, updated_at
-            FROM _wiki_lint_findings_old
-        """)
-        conn.execute("DROP TABLE _wiki_lint_findings_old")
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_wiki_lint_findings_vault_status_severity
-            ON wiki_lint_findings(vault_id, status, severity)
-        """)
-        conn.execute("COMMIT")
-        logger.info("Added CHECK constraints to wiki_lint_findings JSON columns")
-    except Exception:
+        # explicit BEGIN IMMEDIATE transaction using execute() only
+        # (executescript would implicitly commit any pending transaction),
+        # matching the issue #512 DB-001 pattern.
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
+            conn.execute(
+                "ALTER TABLE wiki_lint_findings RENAME TO _wiki_lint_findings_old"
+            )
+            conn.execute("""
+                CREATE TABLE wiki_lint_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id INTEGER NOT NULL,
+                    finding_type TEXT NOT NULL CHECK (finding_type IN (
+                        'contradiction','stale','orphan','missing_page',
+                        'unsupported_claim','duplicate_entity','weak_provenance')),
+                    severity TEXT NOT NULL DEFAULT 'medium' CHECK (severity IN (
+                        'low','medium','high','critical')),
+                    title TEXT NOT NULL,
+                    details TEXT DEFAULT '',
+                    related_page_ids_json TEXT NOT NULL DEFAULT '[]'
+                        CHECK (json_type(related_page_ids_json) = 'array'),
+                    related_claim_ids_json TEXT NOT NULL DEFAULT '[]'
+                        CHECK (json_type(related_claim_ids_json) = 'array'),
+                    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN (
+                        'open','acknowledged','resolved','dismissed')),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # Normalise: any value that is not a valid JSON array (NULL, empty
+            # string, JSON null, object, scalar, or malformed JSON) is coerced
+            # to '[]'.  json_valid() is used as the outer guard because
+            # json_type() raises OperationalError on malformed JSON (e.g.
+            # 'not-json'), while json_valid() returns 0 without raising for all
+            # invalid inputs.
+            conn.execute("""
+                INSERT INTO wiki_lint_findings
+                    (id, vault_id, finding_type, severity, title, details,
+                     related_page_ids_json, related_claim_ids_json,
+                     status, created_at, updated_at)
+                SELECT
+                    id, vault_id, finding_type, severity, title, details,
+                    CASE WHEN json_valid(related_page_ids_json)
+                              AND json_type(related_page_ids_json) = 'array'
+                         THEN related_page_ids_json ELSE '[]' END,
+                    CASE WHEN json_valid(related_claim_ids_json)
+                              AND json_type(related_claim_ids_json) = 'array'
+                         THEN related_claim_ids_json ELSE '[]' END,
+                    status, created_at, updated_at
+                FROM _wiki_lint_findings_old
+            """)
+            # Verify row parity before dropping the backup (the transaction
+            # rolls back to the pre-swap state — backup included — on any
+            # failure, so this raise is belt-and-braces for the log message).
+            after_count = conn.execute(
+                "SELECT COUNT(*) FROM wiki_lint_findings"
+            ).fetchone()[0]
+            if after_count != before_count:
+                raise RuntimeError(
+                    f"migrate_add_wiki_lint_findings_json_check: row-count parity "
+                    f"failed ({before_count} -> {after_count}). "
+                    f"_wiki_lint_findings_old has been preserved."
+                )
+            conn.execute("DROP TABLE _wiki_lint_findings_old")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_wiki_lint_findings_vault_status_severity
+                ON wiki_lint_findings(vault_id, status, severity)
+            """)
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        logger.info("Added CHECK constraints to wiki_lint_findings JSON columns")
+
+        # Validate FK integrity post-swap. Any violation means we produced a
+        # broken DB; fail loudly so an operator notices.
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"foreign_key_check violations: {len(violations)}",
+            )
+            raise RuntimeError(
+                f"migrate_add_wiki_lint_findings_json_check: foreign_key_check "
+                f"reported {len(violations)} violation(s) post-swap: "
+                f"{violations[:5]}"
+            )
+
+        invalidate_derived_data(
+            conn,
+            reason="wiki_lint_findings rebuilt with JSON CHECK constraints",
+            migration_name=_journal,
+        )
+        if recovered:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="recovered",
+                outcome="recovered_from_backup",
+                detail="wiki_lint_findings restored from _wiki_lint_findings_old",
+            )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"rows={before_count}",
+        )
     finally:
         conn.close()
 

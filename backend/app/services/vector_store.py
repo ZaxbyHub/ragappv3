@@ -20,6 +20,7 @@ from lancedb.expr import col, lit
 from lancedb.index import FTS, IvfPq
 
 from app.config import settings
+from app.models import migration_journal
 from app.utils.fusion import rrf_fuse
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,39 @@ class SearchSemaphoreTimeoutError(VectorStoreError):
     """Exception raised when search semaphore acquisition times out."""
 
     pass
+
+
+def publish_index_generation(
+    *,
+    store: str = "vector_store",
+    table_name: str = "chunks",
+    detail: str,
+) -> int:
+    """Publish the authoritative index generation to the recovery journal.
+
+    Index-generation publication interface (issue #512 AC10): opens its own
+    sqlite3 connection to ``settings.sqlite_path`` and appends one generation
+    row via ``app.models.migration_journal.publish_index_generation``; the
+    returned monotonic journal id is the authoritative generation for that
+    (store, table). May raise on journal failure — callers on success paths
+    guard the call so a journal problem never undoes a completed swap.
+    """
+    conn = sqlite3.connect(str(settings.sqlite_path))
+    try:
+        generation = migration_journal.publish_index_generation(
+            conn, store=store, table_name=table_name, detail=detail
+        )
+        conn.commit()
+        return generation
+    finally:
+        conn.close()
+
+
+# Staging table used by the non-destructive chunks rewrite swaps (issue #512
+# VECTOR-001b). Shared by every migrate_add_* rewrite: written BEFORE the
+# canonical table is dropped and deleted only after the replacement validates
+# (see VectorStore._swap_chunks_table).
+CHUNKS_STAGING_TABLE = "chunks_rebuild"
 
 
 class VectorStore:
@@ -393,46 +427,47 @@ class VectorStore:
             if "chunks" in table_names:
                 try:
                     self.table = await self.db.open_table("chunks")
-                    # Seed churn baseline so post-delete rebuild fires on existing indexes.
-                    # Without this, _last_index_build_row_count stays 0 after restart
-                    # and the churn-based rebuild path never triggers.
-                    try:
-                        existing_indices = await self.table.list_indices()
-                        # Detect the existing ANN index by NAME, consistent with
-                        # every other index check in this class. LanceDB names a
-                        # vector index on the "embedding" column "embedding_idx"
-                        # by default. The previous check matched the literal
-                        # "IVF_PQ" against idx.index_type, but LanceDB reports the
-                        # type as "IvfPq" (mixed-case, no underscore) — so the
-                        # check was ALWAYS False, leaving _last_index_build_row_count
-                        # at 0 and forcing a full IVF_PQ rebuild on the first search
-                        # after every startup (a multi-second to multi-minute stall
-                        # on large tables).
-                        has_ivfpq = any(
-                            getattr(idx, "name", None) == "embedding_idx"
-                            for idx in existing_indices
-                        )
-                        if has_ivfpq:
-                            self._last_index_build_row_count = await self.table.count_rows()
-                            self._last_index_build_generation = (
-                                self._index_mutation_generation
-                            )
-                            logger.debug(
-                                "Seeded _last_index_build_row_count=%d from existing IVF_PQ index",
-                                self._last_index_build_row_count,
-                            )
-                    except Exception as _seed_exc:
-                        logger.debug("Could not seed index row count baseline: %s", _seed_exc)
-                except (OSError, RuntimeError, ValueError):
-                    # Stale table reference — drop and recreate
-                    try:
-                        await self.db.drop_table("chunks")
-                    except (OSError, RuntimeError, ValueError):
-                        pass
-                    self.table = await self.db.create_table(
-                        "chunks", schema=schema, mode="overwrite"
+                except (OSError, RuntimeError, ValueError) as e:
+                    # Non-destructive init contract (issue #512 VECTOR-001a):
+                    # an OSError/RuntimeError/ValueError from open_table is a
+                    # TRANSIENT failure (I/O blip, lock, version skew), not
+                    # evidence the authoritative table is stale. Never drop
+                    # and recreate over it — report the failure so startup
+                    # can retry or fail fast. The table is preserved on disk.
+                    raise VectorStoreConnectionError(
+                        f"Failed to open existing 'chunks' table: {e}. "
+                        f"The existing table was preserved (no drop/recreate attempted)."
+                    ) from e
+                # Seed churn baseline so post-delete rebuild fires on existing indexes.
+                # Without this, _last_index_build_row_count stays 0 after restart
+                # and the churn-based rebuild path never triggers.
+                try:
+                    existing_indices = await self.table.list_indices()
+                    # Detect the existing ANN index by NAME, consistent with
+                    # every other index check in this class. LanceDB names a
+                    # vector index on the "embedding" column "embedding_idx"
+                    # by default. The previous check matched the literal
+                    # "IVF_PQ" against idx.index_type, but LanceDB reports the
+                    # type as "IvfPq" (mixed-case, no underscore) — so the
+                    # check was ALWAYS False, leaving _last_index_build_row_count
+                    # at 0 and forcing a full IVF_PQ rebuild on the first search
+                    # after every startup (a multi-second to multi-minute stall
+                    # on large tables).
+                    has_ivfpq = any(
+                        getattr(idx, "name", None) == "embedding_idx"
+                        for idx in existing_indices
                     )
-                    table_just_created = True
+                    if has_ivfpq:
+                        self._last_index_build_row_count = await self.table.count_rows()
+                        self._last_index_build_generation = (
+                            self._index_mutation_generation
+                        )
+                        logger.debug(
+                            "Seeded _last_index_build_row_count=%d from existing IVF_PQ index",
+                            self._last_index_build_row_count,
+                        )
+                except Exception as _seed_exc:
+                    logger.debug("Could not seed index row count baseline: %s", _seed_exc)
             else:
                 self.table = await self.db.create_table("chunks", schema=schema)
                 table_just_created = True
@@ -1674,333 +1709,170 @@ class VectorStore:
 
         return await table.to_pandas()
 
-    async def migrate_add_vault_id(self) -> int:
-        """
-        Migration: Assign vault_id to legacy chunks that lack it.
+    async def _reconcile_chunks_rebuild_state(self, *, migration_name: str) -> None:
+        """Recovery-first reconciliation of a crashed ``chunks`` table swap.
 
-        LanceDB doesn't support ALTER TABLE or UPDATE, so this reads all data,
-        adds the vault_id field, and rewrites the table. This is idempotent —
-        safe to call multiple times (no-op if all records already have vault_id).
+        A prior failed run of any ``migrate_add_*`` rewrite may have left the
+        staging table (``chunks_rebuild``) on disk. Re-entry NEVER assumes a
+        clean state; every migration calls this before probing the canonical
+        table (issue #512 VECTOR-001b):
 
-        Returns:
-            Number of records migrated. 0 if no migration was needed.
+        - staging absent → nothing to do;
+        - canonical present → validate the canonical table holds at least the
+          staging row count (the swap validates the final create BEFORE
+          deleting staging, so a surviving canonical table is complete), then
+          drop the stale staging table;
+        - canonical absent → the staging table holds the last durable copy of
+          the data: rebuild the canonical table from its data, validate row
+          parity, then drop staging.
+
+        Any failure logs CRITICAL naming the recoverable table and raises —
+        this helper never reports success on failure.
         """
         if self.db is None:
-            await self.connect()
+            return
+        table_names = await self.db.table_names()
+        if CHUNKS_STAGING_TABLE not in table_names:
+            return
 
-        if self.db is None:
-            logger.info("LanceDB vault_id migration: no connection available")
-            return 0
-
-        try:
-            table_names = await self.db.table_names()
-        except (OSError, RuntimeError, ValueError) as e:
-            logger.warning(f"LanceDB vault_id migration failed: {e}")
-            return 0
-
-        if "chunks" not in table_names:
-            logger.info("LanceDB vault_id migration: no table exists")
-            return 0
-
-        try:
-            table = await self.db.open_table("chunks")
-        except (OSError, RuntimeError, ValueError) as e:
-            logger.warning(f"LanceDB vault_id migration failed: {e}")
-            return 0
-
-        # Check if vault_id column exists in schema
-        schema = await table.schema()
-        field_names = [schema.field(i).name for i in range(len(schema))]
-
-        if "vault_id" in field_names:
-            # Column exists — check if any rows have null vault_id
-            try:
-                df = await self._safe_table_to_pandas(table, "vault_id migration")
-                null_count = df["vault_id"].isna().sum()
-                if null_count == 0:
-                    logger.info("LanceDB vault_id migration: no migration needed")
-                    return 0  # All records already have vault_id
-
-                # Backfill null vault_ids with empty string (truly unassigned)
-                df["vault_id"] = df["vault_id"].fillna("")
-                count = int(null_count)
-
-                # Drop and recreate table with updated data
-                await self.db.drop_table("chunks")
-                try:
-                    self.table = await self.db.create_table("chunks", data=df)
-                except (OSError, RuntimeError, ValueError) as create_err:
-                    logger.critical(
-                        f"LanceDB vault_id migration: table dropped but recreate failed: {create_err}. Data may need manual recovery from backup."
-                    )
-                    raise
-                logger.info(f"LanceDB vault_id migration: backfilled {count} records")
-                return count
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(f"LanceDB vault_id migration failed: {e}")
-                return 0
-        else:
-            # Column doesn't exist — add it to all records
-            try:
-                df = await self._safe_table_to_pandas(
-                    table, "vault_id migration (add column)"
-                )
-                if len(df) == 0:
-                    # Empty table — just drop and recreate with new schema
-                    # Try to get embedding_dim from existing schema before dropping
-                    if self._embedding_dim is None:
-                        try:
-                            schema = await table.schema()
-                            embedding_field = schema.field("embedding")
-                            if hasattr(embedding_field.type, "list_size"):
-                                self._embedding_dim = embedding_field.type.list_size
-                        except (AttributeError, KeyError, IndexError, TypeError):
-                            # If we can't determine embedding_dim, leave it as None
-                            pass
-
-                    await self.db.drop_table("chunks")
-                    try:
-                        if self._embedding_dim:
-                            await self.init_table(self._embedding_dim)
-                    except (OSError, RuntimeError, ValueError) as create_err:
-                        logger.critical(
-                            f"LanceDB vault_id migration: empty table dropped but recreate failed: {create_err}"
-                        )
-                        raise
-                    logger.info(
-                        "LanceDB vault_id migration: empty table, recreated with new schema"
-                    )
-                    return 0
-
-                # Add vault_id column — legacy chunks are unassigned (vault unknown)
-                df["vault_id"] = ""
-                migrated_count = len(df)
-
-                # Drop and recreate table with updated data
-                await self.db.drop_table("chunks")
-                try:
-                    self.table = await self.db.create_table("chunks", data=df)
-                except (OSError, RuntimeError, ValueError) as create_err:
-                    logger.critical(
-                        f"LanceDB vault_id migration: table dropped but recreate failed: {create_err}. Data may need manual recovery from backup."
-                    )
-                    raise
+        if "chunks" in table_names:
+            canonical = await self.db.open_table("chunks")
+            staging = await self.db.open_table(CHUNKS_STAGING_TABLE)
+            canonical_rows = await canonical.count_rows()
+            staging_rows = await staging.count_rows()
+            if canonical_rows >= staging_rows:
+                await self.db.drop_table(CHUNKS_STAGING_TABLE)
                 logger.info(
-                    f"LanceDB vault_id migration: backfilled {migrated_count} records"
+                    "%s: dropped stale staging table '%s' (canonical 'chunks' "
+                    "has %d rows >= staging %d)",
+                    migration_name,
+                    CHUNKS_STAGING_TABLE,
+                    canonical_rows,
+                    staging_rows,
                 )
-                return migrated_count
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(f"LanceDB vault_id migration failed: {e}")
-                return 0
-
-    async def migrate_add_chunk_scale(self) -> int:
-        """
-        Migration: Backfill chunk_scale='default' on existing chunks that lack it.
-
-        LanceDB doesn't support ALTER TABLE or UPDATE, so this reads all data,
-        adds the chunk_scale field, and rewrites the table. This is idempotent —
-        safe to call multiple times (no-op if all records already have chunk_scale).
-
-        Returns:
-            Number of records migrated. 0 if no migration was needed.
-        """
-        if self.db is None:
-            await self.connect()
-
-        if self.db is None:
-            logger.info("LanceDB chunk_scale migration: no connection available")
-            return 0
-
-        try:
-            table_names = await self.db.table_names()
-        except (OSError, RuntimeError, ValueError) as e:
-            logger.warning(f"LanceDB chunk_scale migration failed: {e}")
-            return 0
-
-        if "chunks" not in table_names:
-            logger.info("LanceDB chunk_scale migration: no table exists")
-            return 0
-
-        try:
-            table = await self.db.open_table("chunks")
-        except (OSError, RuntimeError, ValueError) as e:
-            logger.warning(f"LanceDB chunk_scale migration failed: {e}")
-            return 0
-
-        # Check if chunk_scale column exists in schema
-        schema = await table.schema()
-        field_names = [schema.field(i).name for i in range(len(schema))]
-
-        if "chunk_scale" in field_names:
-            # Column exists — check if any rows have null chunk_scale
-            try:
-                df = await self._safe_table_to_pandas(table, "chunk_scale migration")
-                null_count = df["chunk_scale"].isna().sum()
-                if null_count == 0:
-                    logger.info("LanceDB chunk_scale migration: no migration needed")
-                    return 0  # All records already have chunk_scale
-
-                # Backfill null chunk_scales with "default"
-                df["chunk_scale"] = df["chunk_scale"].fillna("default")
-                count = int(null_count)
-
-                # Drop and recreate table with updated data
-                await self.db.drop_table("chunks")
-                try:
-                    self.table = await self.db.create_table("chunks", data=df)
-                except (OSError, RuntimeError, ValueError) as create_err:
-                    logger.critical(
-                        f"LanceDB chunk_scale migration: table dropped but recreate failed: {create_err}. Data may need manual recovery from backup."
-                    )
-                    raise
-                logger.info(
-                    f"LanceDB chunk_scale migration: backfilled {count} records"
-                )
-                return count
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(f"LanceDB chunk_scale migration failed: {e}")
-                return 0
-        else:
-            # Column doesn't exist — add it to all records
-            try:
-                df = await self._safe_table_to_pandas(
-                    table, "chunk_scale migration (add column)"
-                )
-                if len(df) == 0:
-                    # Empty table — just drop and recreate with new schema
-                    # Try to get embedding_dim from existing schema before dropping
-                    if self._embedding_dim is None:
-                        try:
-                            schema = await table.schema()
-                            embedding_field = schema.field("embedding")
-                            if hasattr(embedding_field.type, "list_size"):
-                                self._embedding_dim = embedding_field.type.list_size
-                        except (AttributeError, KeyError, IndexError, TypeError):
-                            # If we can't determine embedding_dim, leave it as None
-                            pass
-
-                    await self.db.drop_table("chunks")
-                    try:
-                        if self._embedding_dim:
-                            await self.init_table(self._embedding_dim)
-                    except (OSError, RuntimeError, ValueError) as create_err:
-                        logger.critical(
-                            f"LanceDB chunk_scale migration: empty table dropped but recreate failed: {create_err}"
-                        )
-                        raise
-                    logger.info(
-                        "LanceDB chunk_scale migration: empty table, recreated with new schema"
-                    )
-                    return 0
-
-                # Add chunk_scale column with default "default"
-                df["chunk_scale"] = "default"
-                migrated_count = len(df)
-
-                # Drop and recreate table with updated data
-                await self.db.drop_table("chunks")
-                try:
-                    self.table = await self.db.create_table("chunks", data=df)
-                except (OSError, RuntimeError, ValueError) as create_err:
-                    logger.critical(
-                        f"LanceDB chunk_scale migration: table dropped but recreate failed: {create_err}. Data may need manual recovery from backup."
-                    )
-                    raise
-                logger.info(
-                    f"LanceDB chunk_scale migration: backfilled {migrated_count} records"
-                )
-                return migrated_count
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(f"LanceDB chunk_scale migration failed: {e}")
-                return 0
-
-    async def migrate_add_sparse_embedding(self) -> int:
-        """
-        Migration: Add sparse_embedding column to existing chunks table.
-
-        LanceDB doesn't support ALTER TABLE, so this reads all data,
-        adds the sparse_embedding field (default null), and rewrites the table.
-        This is idempotent — safe to call multiple times.
-
-        Returns:
-            Number of records migrated. 0 if no migration was needed.
-        """
-        if self.db is None:
-            await self.connect()
-
-        if self.db is None:
-            logger.info("LanceDB sparse_embedding migration: no connection available")
-            return 0
-
-        try:
-            table_names = await self.db.table_names()
-        except (OSError, RuntimeError, ValueError) as e:
-            logger.warning(f"LanceDB sparse_embedding migration failed: {e}")
-            return 0
-
-        if "chunks" not in table_names:
-            logger.info("LanceDB sparse_embedding migration: no table exists")
-            return 0
-
-        try:
-            table = await self.db.open_table("chunks")
-        except (OSError, RuntimeError, ValueError) as e:
-            logger.warning(f"LanceDB sparse_embedding migration failed: {e}")
-            return 0
-
-        # Check if sparse_embedding column exists in schema
-        schema = await table.schema()
-        field_names = [schema.field(i).name for i in range(len(schema))]
-
-        if "sparse_embedding" in field_names:
-            logger.info("LanceDB sparse_embedding migration: column already exists")
-            return 0
-
-        # Column doesn't exist — add it to all records (default None/null)
-        try:
-            df = await self._safe_table_to_pandas(table, "sparse_embedding migration")
-            if len(df) == 0:
-                # Empty table — just drop and recreate with new schema
-                if self._embedding_dim is None:
-                    try:
-                        schema = await table.schema()
-                        embedding_field = schema.field("embedding")
-                        if hasattr(embedding_field.type, "list_size"):
-                            self._embedding_dim = embedding_field.type.list_size
-                    except (AttributeError, KeyError, IndexError, TypeError):
-                        # If we can't determine embedding_dim, leave it as None
-                        pass
-
-                # Explicit error if embedding_dim cannot be determined
-                if self._embedding_dim is None:
-                    raise VectorStoreError(
-                        "Cannot determine embedding dimension for migration"
-                    )
-
-                await self.db.drop_table("chunks")
-                try:
-                    if self._embedding_dim:
-                        await self.init_table(self._embedding_dim)
-                except (OSError, RuntimeError, ValueError) as create_err:
-                    logger.critical(
-                        f"LanceDB sparse_embedding migration: empty table dropped but recreate failed: {create_err}"
-                    )
-                    raise
-                logger.info(
-                    "LanceDB sparse_embedding migration: empty table, recreated with new schema"
-                )
-                return 0
-
-            # Add sparse_embedding column with default None (null)
-            df["sparse_embedding"] = None
-            migrated_count = len(df)
-
-            # Drop and recreate table with updated data
+                return
+            # Canonical incomplete — the staging copy is authoritative.
+            staging_df = await self._safe_table_to_pandas(
+                staging, f"{migration_name} (staging recovery)"
+            )
             await self.db.drop_table("chunks")
-            try:
-                self.table = await self.db.create_table("chunks", data=df)
-                # Recreate vector index
-                num_sub_vectors = settings.embedding_dim // 8
+            self.table = await self.db.create_table("chunks", data=staging_df)
+            recovered_rows = await self.table.count_rows()
+            if recovered_rows != len(staging_df):
+                logger.critical(
+                    "%s: parity check failed rebuilding 'chunks' from '%s' "
+                    "(%d -> %d); staging table preserved for manual recovery.",
+                    migration_name,
+                    CHUNKS_STAGING_TABLE,
+                    len(staging_df),
+                    recovered_rows,
+                )
+                raise VectorStoreError(
+                    f"{migration_name}: canonical 'chunks' rebuild from "
+                    f"'{CHUNKS_STAGING_TABLE}' failed row parity "
+                    f"({len(staging_df)} -> {recovered_rows})."
+                )
+            await self.db.drop_table(CHUNKS_STAGING_TABLE)
+            logger.warning(
+                "%s: restored incomplete 'chunks' from staging table '%s'",
+                migration_name,
+                CHUNKS_STAGING_TABLE,
+            )
+            return
+
+        # Canonical absent: the staging table is the only durable copy.
+        staging = await self.db.open_table(CHUNKS_STAGING_TABLE)
+        staging_df = await self._safe_table_to_pandas(
+            staging, f"{migration_name} (staging recovery)"
+        )
+        self.table = await self.db.create_table("chunks", data=staging_df)
+        recovered_rows = await self.table.count_rows()
+        if recovered_rows != len(staging_df):
+            logger.critical(
+                "%s: parity check failed rebuilding 'chunks' from '%s' "
+                "(%d -> %d); staging table preserved for manual recovery.",
+                migration_name,
+                CHUNKS_STAGING_TABLE,
+                len(staging_df),
+                recovered_rows,
+            )
+            raise VectorStoreError(
+                f"{migration_name}: canonical 'chunks' rebuild from "
+                f"'{CHUNKS_STAGING_TABLE}' failed row parity "
+                f"({len(staging_df)} -> {recovered_rows})."
+            )
+        await self.db.drop_table(CHUNKS_STAGING_TABLE)
+        logger.warning(
+            "%s: recovered canonical 'chunks' (%d rows) from staging table '%s'",
+            migration_name,
+            recovered_rows,
+            CHUNKS_STAGING_TABLE,
+        )
+
+    async def _swap_chunks_table(self, df, *, migration_name: str) -> None:
+        """Non-destructive rewrite of the ``chunks`` table (issue #512 VECTOR-001b).
+
+        State machine — every entry begins with reconciliation, never assumes
+        an already-migrated or clean state:
+
+        (a) recovery-first: reconcile any leftover ``chunks_rebuild`` from a
+            prior failed run (see ``_reconcile_chunks_rebuild_state``);
+        (b) write the replacement to the staging table ``chunks_rebuild``
+            FIRST — BEFORE any drop — and validate its row count equals
+            ``len(df)`` (this is the load-bearing non-destructive invariant);
+        (c) validated swap: drop ``chunks`` → create ``chunks`` from the same
+            in-memory df → validate row parity → restore the FTS (always) and
+            ANN (≥ VECTOR_INDEX_MIN_ROWS) indices → drop staging → publish the
+            new index generation to the recovery journal;
+        (d) any failure at any point logs CRITICAL naming the recoverable
+            table — the original before the drop, or the staging table after
+            it — and RAISES. Failures are never reported as success-as-zero.
+
+        API surface is strictly the db-level ``table_names / open_table /
+        drop_table / create_table(schema=|data=)`` and table-level
+        ``schema / count_rows / to_pandas`` calls (via
+        ``_safe_table_to_pandas``): no rename_table, which the recovery
+        contract does not provide.
+        """
+        if self.db is None:
+            raise VectorStoreConnectionError("Database connection is not available.")
+
+        # (a) recovery-first.
+        await self._reconcile_chunks_rebuild_state(migration_name=migration_name)
+
+        # (b) staging FIRST — before any drop.
+        try:
+            staging = await self.db.create_table(CHUNKS_STAGING_TABLE, data=df)
+            staging_rows = await staging.count_rows()
+            if staging_rows != len(df):
+                raise VectorStoreError(
+                    f"{migration_name}: staging table row count {staging_rows} "
+                    f"!= expected {len(df)} — aborting before any drop."
+                )
+        except Exception as exc:
+            logger.critical(
+                "%s: staging table '%s' create/validate failed BEFORE any "
+                "drop — the original 'chunks' table is intact (%s).",
+                migration_name,
+                CHUNKS_STAGING_TABLE,
+                exc,
+            )
+            raise
+
+        # (c) validated swap. From here on, a failure leaves the replacement
+        # data durably recoverable in the staging table.
+        try:
+            await self.db.drop_table("chunks")
+            self.table = await self.db.create_table("chunks", data=df)
+            final_rows = await self.table.count_rows()
+            if final_rows != len(df):
+                raise VectorStoreError(
+                    f"{migration_name}: final 'chunks' row count {final_rows} "
+                    f"!= expected {len(df)}."
+                )
+            await self.table.create_index(column="text", config=FTS(), replace=True)
+            num_sub_vectors = (self._embedding_dim or settings.embedding_dim) // 8
+            if final_rows >= VECTOR_INDEX_MIN_ROWS:
                 await self.table.create_index(
                     column="embedding",
                     config=IvfPq(
@@ -2012,30 +1884,322 @@ class VectorStore:
                     ),
                     replace=True,
                 )
-                self._last_index_build_row_count = migrated_count
+                self._last_index_build_row_count = final_rows
                 self._last_index_build_generation = self._index_mutation_generation
-                logger.info(
-                    f"Vector index recreated with metric={settings.vector_metric}"
-                )
-                # Recreate FTS index
-                await self.table.create_index(
-                    column="text",
-                    config=FTS(),
-                    replace=True,
-                )
-                logger.info("Full-text search index recreated on 'text' column")
-            except (OSError, RuntimeError, ValueError) as create_err:
-                logger.critical(
-                    f"LanceDB sparse_embedding migration: table dropped but recreate failed: {create_err}"
-                )
-                raise
-            logger.info(
-                f"LanceDB sparse_embedding migration: added column to {migrated_count} records"
+        except Exception as exc:
+            logger.critical(
+                "%s: 'chunks' swap failed after the original table was dropped "
+                "(%s). The replacement data is durably preserved in the "
+                "recoverable staging table '%s' — re-running the migration "
+                "restores 'chunks' from it.",
+                migration_name,
+                exc,
+                CHUNKS_STAGING_TABLE,
             )
-            return migrated_count
+            raise
+
+        await self.db.drop_table(CHUNKS_STAGING_TABLE)
+
+        # Publish the authoritative generation; a journal failure must never
+        # break an already-completed swap.
+        try:
+            publish_index_generation(
+                detail=(
+                    f"{migration_name}: 'chunks' swapped via staging table "
+                    f"'{CHUNKS_STAGING_TABLE}' ({len(df)} rows)"
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "%s: index-generation publication failed (swap already "
+                "complete): %s",
+                migration_name,
+                exc,
+            )
+
+    async def migrate_add_vault_id(self) -> int:
+        """
+        Migration: Assign vault_id to legacy chunks that lack it.
+
+        LanceDB doesn't support ALTER TABLE or UPDATE, so this reads all data,
+        adds the vault_id field, and rewrites the table through the validated
+        staging swap (``_swap_chunks_table`` — non-destructive, restart-safe;
+        issue #512 VECTOR-001b). Idempotent — safe to call multiple times
+        (no-op if all records already have vault_id). Failures RAISE; only
+        genuine no-ops (no connection, no table, nothing to backfill) return 0.
+
+        Returns:
+            Number of records migrated. 0 if no migration was needed.
+        """
+        if self.db is None:
+            await self.connect()
+
+        if self.db is None:
+            logger.info("LanceDB vault_id migration: no connection available")
+            return 0
+
+        # Recovery-first: reconcile any crashed swap from a prior run before
+        # probing the canonical table (issue #512).
+        await self._reconcile_chunks_rebuild_state(migration_name="LanceDB vault_id migration")
+
+        try:
+            table_names = await self.db.table_names()
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning(f"LanceDB vault_id migration failed: {e}")
+            raise
+
+        if "chunks" not in table_names:
+            logger.info("LanceDB vault_id migration: no table exists")
+            return 0
+
+        try:
+            table = await self.db.open_table("chunks")
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning(f"LanceDB vault_id migration failed: {e}")
+            raise
+
+        # Check if vault_id column exists in schema
+        schema = await table.schema()
+        field_names = [schema.field(i).name for i in range(len(schema))]
+
+        if "vault_id" in field_names:
+            # Column exists — check if any rows have null vault_id
+            df = await self._safe_table_to_pandas(table, "vault_id migration")
+            null_count = df["vault_id"].isna().sum()
+            if null_count == 0:
+                logger.info("LanceDB vault_id migration: no migration needed")
+                return 0  # All records already have vault_id
+
+            # Backfill null vault_ids with empty string (truly unassigned)
+            df["vault_id"] = df["vault_id"].fillna("")
+            count = int(null_count)
+
+            await self._swap_chunks_table(df, migration_name="LanceDB vault_id migration")
+            logger.info(f"LanceDB vault_id migration: backfilled {count} records")
+            return count
+
+        # Column doesn't exist — add it to all records
+        df = await self._safe_table_to_pandas(
+            table, "vault_id migration (add column)"
+        )
+        if len(df) == 0:
+            # Empty table — just drop and recreate with new schema
+            # (zero rows: no data at risk). Try to get embedding_dim from
+            # the existing schema before dropping.
+            if self._embedding_dim is None:
+                try:
+                    schema = await table.schema()
+                    embedding_field = schema.field("embedding")
+                    if hasattr(embedding_field.type, "list_size"):
+                        self._embedding_dim = embedding_field.type.list_size
+                except (AttributeError, KeyError, IndexError, TypeError):
+                    # If we can't determine embedding_dim, leave it as None
+                    pass
+
+            await self.db.drop_table("chunks")
+            if self._embedding_dim:
+                await self.init_table(self._embedding_dim)
+            logger.info(
+                "LanceDB vault_id migration: empty table, recreated with new schema"
+            )
+            return 0
+
+        # Add vault_id column — legacy chunks are unassigned (vault unknown)
+        df["vault_id"] = ""
+        migrated_count = len(df)
+
+        await self._swap_chunks_table(df, migration_name="LanceDB vault_id migration")
+        logger.info(
+            f"LanceDB vault_id migration: backfilled {migrated_count} records"
+        )
+        return migrated_count
+
+    async def migrate_add_chunk_scale(self) -> int:
+        """
+        Migration: Backfill chunk_scale='default' on existing chunks that lack it.
+
+        LanceDB doesn't support ALTER TABLE or UPDATE, so this reads all data,
+        adds the chunk_scale field, and rewrites the table through the validated
+        staging swap (``_swap_chunks_table`` — non-destructive, restart-safe;
+        issue #512 VECTOR-001b). Idempotent — safe to call multiple times
+        (no-op if all records already have chunk_scale). Failures RAISE; only
+        genuine no-ops return 0.
+
+        Returns:
+            Number of records migrated. 0 if no migration was needed.
+        """
+        if self.db is None:
+            await self.connect()
+
+        if self.db is None:
+            logger.info("LanceDB chunk_scale migration: no connection available")
+            return 0
+
+        # Recovery-first: reconcile any crashed swap from a prior run.
+        await self._reconcile_chunks_rebuild_state(migration_name="LanceDB chunk_scale migration")
+
+        try:
+            table_names = await self.db.table_names()
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning(f"LanceDB chunk_scale migration failed: {e}")
+            raise
+
+        if "chunks" not in table_names:
+            logger.info("LanceDB chunk_scale migration: no table exists")
+            return 0
+
+        try:
+            table = await self.db.open_table("chunks")
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning(f"LanceDB chunk_scale migration failed: {e}")
+            raise
+
+        # Check if chunk_scale column exists in schema
+        schema = await table.schema()
+        field_names = [schema.field(i).name for i in range(len(schema))]
+
+        if "chunk_scale" in field_names:
+            # Column exists — check if any rows have null chunk_scale
+            df = await self._safe_table_to_pandas(table, "chunk_scale migration")
+            null_count = df["chunk_scale"].isna().sum()
+            if null_count == 0:
+                logger.info("LanceDB chunk_scale migration: no migration needed")
+                return 0  # All records already have chunk_scale
+
+            # Backfill null chunk_scales with "default"
+            df["chunk_scale"] = df["chunk_scale"].fillna("default")
+            count = int(null_count)
+
+            await self._swap_chunks_table(df, migration_name="LanceDB chunk_scale migration")
+            logger.info(
+                f"LanceDB chunk_scale migration: backfilled {count} records"
+            )
+            return count
+
+        # Column doesn't exist — add it to all records
+        df = await self._safe_table_to_pandas(
+            table, "chunk_scale migration (add column)"
+        )
+        if len(df) == 0:
+            # Empty table — just drop and recreate with new schema
+            # (zero rows: no data at risk). Try to get embedding_dim from
+            # the existing schema before dropping.
+            if self._embedding_dim is None:
+                try:
+                    schema = await table.schema()
+                    embedding_field = schema.field("embedding")
+                    if hasattr(embedding_field.type, "list_size"):
+                        self._embedding_dim = embedding_field.type.list_size
+                except (AttributeError, KeyError, IndexError, TypeError):
+                    # If we can't determine embedding_dim, leave it as None
+                    pass
+
+            await self.db.drop_table("chunks")
+            if self._embedding_dim:
+                await self.init_table(self._embedding_dim)
+            logger.info(
+                "LanceDB chunk_scale migration: empty table, recreated with new schema"
+            )
+            return 0
+
+        # Add chunk_scale column with default "default"
+        df["chunk_scale"] = "default"
+        migrated_count = len(df)
+
+        await self._swap_chunks_table(df, migration_name="LanceDB chunk_scale migration")
+        logger.info(
+            f"LanceDB chunk_scale migration: backfilled {migrated_count} records"
+        )
+        return migrated_count
+
+    async def migrate_add_sparse_embedding(self) -> int:
+        """
+        Migration: Add sparse_embedding column to existing chunks table.
+
+        LanceDB doesn't support ALTER TABLE, so this reads all data,
+        adds the sparse_embedding field (default null), and rewrites the table
+        through the validated staging swap (``_swap_chunks_table`` —
+        non-destructive, restart-safe; issue #512 VECTOR-001b). Idempotent —
+        safe to call multiple times. Failures RAISE; only genuine no-ops
+        return 0.
+
+        Returns:
+            Number of records migrated. 0 if no migration was needed.
+        """
+        if self.db is None:
+            await self.connect()
+
+        if self.db is None:
+            logger.info("LanceDB sparse_embedding migration: no connection available")
+            return 0
+
+        # Recovery-first: reconcile any crashed swap from a prior run.
+        await self._reconcile_chunks_rebuild_state(migration_name="LanceDB sparse_embedding migration")
+
+        try:
+            table_names = await self.db.table_names()
         except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"LanceDB sparse_embedding migration failed: {e}")
+            raise
+
+        if "chunks" not in table_names:
+            logger.info("LanceDB sparse_embedding migration: no table exists")
             return 0
+
+        try:
+            table = await self.db.open_table("chunks")
+        except (OSError, RuntimeError, ValueError) as e:
+            logger.warning(f"LanceDB sparse_embedding migration failed: {e}")
+            raise
+
+        # Check if sparse_embedding column exists in schema
+        schema = await table.schema()
+        field_names = [schema.field(i).name for i in range(len(schema))]
+
+        if "sparse_embedding" in field_names:
+            logger.info("LanceDB sparse_embedding migration: column already exists")
+            return 0
+
+        # Column doesn't exist — add it to all records (default None/null)
+        df = await self._safe_table_to_pandas(table, "sparse_embedding migration")
+        if len(df) == 0:
+            # Empty table — just drop and recreate with new schema
+            if self._embedding_dim is None:
+                try:
+                    schema = await table.schema()
+                    embedding_field = schema.field("embedding")
+                    if hasattr(embedding_field.type, "list_size"):
+                        self._embedding_dim = embedding_field.type.list_size
+                except (AttributeError, KeyError, IndexError, TypeError):
+                    # If we can't determine embedding_dim, leave it as None
+                    pass
+
+            # Explicit error if embedding_dim cannot be determined
+            if self._embedding_dim is None:
+                raise VectorStoreError(
+                    "Cannot determine embedding dimension for migration"
+                )
+
+            await self.db.drop_table("chunks")
+            if self._embedding_dim:
+                await self.init_table(self._embedding_dim)
+            logger.info(
+                "LanceDB sparse_embedding migration: empty table, recreated with new schema"
+            )
+            return 0
+
+        # Add sparse_embedding column with default None (null)
+        df["sparse_embedding"] = None
+        migrated_count = len(df)
+
+        # Validated staging swap: recreate the table AND restore the FTS/ANN
+        # indices (ANN only at ≥ VECTOR_INDEX_MIN_ROWS, matching the deferred
+        # index-creation policy FR-013).
+        await self._swap_chunks_table(df, migration_name="LanceDB sparse_embedding migration")
+        logger.info(
+            f"LanceDB sparse_embedding migration: added column to {migrated_count} records"
+        )
+        return migrated_count
 
     async def migrate_add_parent_window(self, dry_run: bool = False) -> int:
         """Migration: Add parent_doc_id, parent_window_start, parent_window_end, and
@@ -2046,6 +2210,14 @@ class VectorStore:
         - parent_window_start = None (backfilled to 0 for first chunk of each file)
         - parent_window_end = None
         - chunk_position = chunk_index (sequential index already stored)
+
+        The rewrite goes through the validated staging swap
+        (``_swap_chunks_table`` — non-destructive, restart-safe; issue #512
+        VECTOR-001b). An EMPTY legacy table gets the current schema applied
+        immediately via ``init_table`` instead of being skipped (issue #512
+        VECTOR-005 — "applied on first ingest" left the legacy schema in
+        place and the next new-format write failed). Failures RAISE; only
+        genuine no-ops return 0.
 
         Args:
             dry_run: If True, report rows that would be updated but make no changes.
@@ -2060,11 +2232,14 @@ class VectorStore:
             logger.info("LanceDB parent_window migration: no connection available")
             return 0
 
+        # Recovery-first: reconcile any crashed swap from a prior run.
+        await self._reconcile_chunks_rebuild_state(migration_name="LanceDB parent_window migration")
+
         try:
             table_names = await self.db.table_names()
         except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"LanceDB parent_window migration failed: {e}")
-            return 0
+            raise
 
         if "chunks" not in table_names:
             logger.info("LanceDB parent_window migration: no table exists — nothing to migrate")
@@ -2074,7 +2249,7 @@ class VectorStore:
             table = await self.db.open_table("chunks")
         except (OSError, RuntimeError, ValueError) as e:
             logger.warning(f"LanceDB parent_window migration failed to open table: {e}")
-            return 0
+            raise
 
         schema = await table.schema()
         field_names = [schema.field(i).name for i in range(len(schema))]
@@ -2083,99 +2258,83 @@ class VectorStore:
 
         if not missing_cols:
             # All columns present — check if any rows still have null parent_doc_id
-            try:
-                df = await self._safe_table_to_pandas(table, "parent_window migration (check)")
-                null_count = int(df["parent_doc_id"].isna().sum())
-                if null_count == 0:
-                    logger.info("LanceDB parent_window migration: all rows already backfilled")
-                    return 0
-                if dry_run:
-                    logger.info(
-                        "[DRY RUN] parent_window migration: %d rows would be backfilled "
-                        "(parent_doc_id is null)", null_count
-                    )
-                    return null_count
-                # Backfill rows where parent_doc_id is null
-                mask = df["parent_doc_id"].isna()
-                df.loc[mask, "parent_doc_id"] = df.loc[mask, "file_id"]
-                df.loc[mask, "chunk_position"] = df.loc[mask, "chunk_index"]
-                # parent_window_start/end remain null — populated on next re-ingest
-                await self.db.drop_table("chunks")
-                self.table = await self.db.create_table("chunks", data=df)
-                logger.info(
-                    "LanceDB parent_window migration: backfilled parent_doc_id on %d rows",
-                    null_count,
-                )
-                return null_count
-            except (OSError, RuntimeError, ValueError) as e:
-                logger.warning(f"LanceDB parent_window migration check failed: {e}")
+            df = await self._safe_table_to_pandas(table, "parent_window migration (check)")
+            null_count = int(df["parent_doc_id"].isna().sum())
+            if null_count == 0:
+                logger.info("LanceDB parent_window migration: all rows already backfilled")
                 return 0
-
-        # Some columns are missing — add them all
-        try:
-            df = await self._safe_table_to_pandas(table, "parent_window migration (add columns)")
-            if len(df) == 0:
-                logger.info(
-                    "LanceDB parent_window migration: empty table — new schema will be "
-                    "applied on first ingest"
-                )
-                return 0
-
-            migrated_count = len(df)
             if dry_run:
                 logger.info(
-                    "[DRY RUN] parent_window migration: %d rows would receive new columns: %s",
-                    migrated_count,
-                    ", ".join(sorted(missing_cols)),
+                    "[DRY RUN] parent_window migration: %d rows would be backfilled "
+                    "(parent_doc_id is null)", null_count
                 )
-                return migrated_count
+                return null_count
+            # Backfill rows where parent_doc_id is null
+            mask = df["parent_doc_id"].isna()
+            df.loc[mask, "parent_doc_id"] = df.loc[mask, "file_id"]
+            df.loc[mask, "chunk_position"] = df.loc[mask, "chunk_index"]
+            # parent_window_start/end remain null — populated on next re-ingest
+            await self._swap_chunks_table(df, migration_name="LanceDB parent_window migration")
+            logger.info(
+                "LanceDB parent_window migration: backfilled parent_doc_id on %d rows",
+                null_count,
+            )
+            return null_count
 
-            # Add missing columns with sensible defaults
-            if "parent_doc_id" in missing_cols:
-                df["parent_doc_id"] = df["file_id"]
-            if "chunk_position" in missing_cols:
-                df["chunk_position"] = df["chunk_index"]
-            # parent_window_start / end remain null — populated on next re-ingest
-            for col in ("parent_window_start", "parent_window_end"):
-                if col in missing_cols:
-                    df[col] = None
+        # Some columns are missing — add them all
+        df = await self._safe_table_to_pandas(table, "parent_window migration (add columns)")
+        if len(df) == 0:
+            # Empty table: apply the CURRENT schema now instead of deferring to
+            # first ingest (issue #512 VECTOR-005). Zero rows means no data at
+            # risk. Read the embedding dim from the legacy schema first and
+            # recreate via init_table, mirroring the sibling empty-branches in
+            # migrate_add_vault_id / chunk_scale / sparse_embedding.
+            if self._embedding_dim is None:
+                try:
+                    schema = await table.schema()
+                    embedding_field = schema.field("embedding")
+                    if hasattr(embedding_field.type, "list_size"):
+                        self._embedding_dim = embedding_field.type.list_size
+                except (AttributeError, KeyError, IndexError, TypeError):
+                    # If we can't determine embedding_dim, fall back to the
+                    # configured dim below (existing behavior).
+                    pass
 
             await self.db.drop_table("chunks")
-            try:
-                self.table = await self.db.create_table("chunks", data=df)
-                # Restore indices
-                await self.table.create_index(column="text", config=FTS(), replace=True)
-                num_sub_vectors = (self._embedding_dim or settings.embedding_dim) // 8
-                if migrated_count >= VECTOR_INDEX_MIN_ROWS:
-                    await self.table.create_index(
-                        column="embedding",
-                        config=IvfPq(
-                            distance_type=cast(
-                                "Literal['l2', 'cosine', 'dot']", settings.vector_metric
-                            ),
-                            num_partitions=256,
-                            num_sub_vectors=num_sub_vectors,
-                        ),
-                        replace=True,
-                    )
-                    self._last_index_build_row_count = migrated_count
-                    self._last_index_build_generation = (
-                        self._index_mutation_generation
-                    )
-            except (OSError, RuntimeError, ValueError) as create_err:
-                logger.critical(
-                    "parent_window migration: table dropped but recreate failed: %s. "
-                    "Data may need manual recovery from backup.",
-                    create_err,
-                )
-                raise
+            if self._embedding_dim:
+                await self.init_table(self._embedding_dim)
+            elif settings.embedding_dim:
+                await self.init_table(settings.embedding_dim)
             logger.info(
-                "LanceDB parent_window migration: added columns to %d rows", migrated_count
+                "LanceDB parent_window migration: empty table — recreated with "
+                "the current schema (parent-window columns applied)"
+            )
+            return 0
+
+        migrated_count = len(df)
+        if dry_run:
+            logger.info(
+                "[DRY RUN] parent_window migration: %d rows would receive new columns: %s",
+                migrated_count,
+                ", ".join(sorted(missing_cols)),
             )
             return migrated_count
-        except (OSError, RuntimeError, ValueError) as e:
-            logger.warning(f"LanceDB parent_window migration failed: {e}")
-            return 0
+
+        # Add missing columns with sensible defaults
+        if "parent_doc_id" in missing_cols:
+            df["parent_doc_id"] = df["file_id"]
+        if "chunk_position" in missing_cols:
+            df["chunk_position"] = df["chunk_index"]
+        # parent_window_start / end remain null — populated on next re-ingest
+        for _pw_col in ("parent_window_start", "parent_window_end"):
+            if _pw_col in missing_cols:
+                df[_pw_col] = None
+
+        await self._swap_chunks_table(df, migration_name="LanceDB parent_window migration")
+        logger.info(
+            "LanceDB parent_window migration: added columns to %d rows", migrated_count
+        )
+        return migrated_count
 
     async def get_chunks_by_uid(self, chunk_uids: List[str]) -> List[Dict[str, Any]]:
         """

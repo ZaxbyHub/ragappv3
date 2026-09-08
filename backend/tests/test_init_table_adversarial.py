@@ -4,7 +4,10 @@ Adversarial tests for table_just_created tracking in vector_store.py init_table(
 Attack surfaces tested:
 1. Unexpected exception types from db.table_names() (not OSError/RuntimeError/ValueError)
 2. Corrupt table: open_table succeeds but list_indices fails
-3. Overwrite path failure during drop_table
+3. Transient open_table failure raises VectorStoreConnectionError and makes
+   NO drop_table/create_table calls (issue #512 VECTOR-001a no-drop contract;
+   realigned from the old drop+overwrite behavior, which the issue mandates
+   removing)
 4. Concurrency: init_table called twice rapidly
 5. embedding_dim boundary: 0, negative, extreme values
 6. Table schema completely different from expected
@@ -205,73 +208,64 @@ class TestAdversarialCorruptTable(unittest.IsolatedAsyncioTestCase):
 
 class TestAdversarialOverwritePathFailures(unittest.IsolatedAsyncioTestCase):
     """
-    Test edge cases in the overwrite path (drop_table + create_table).
+    Transient open_table failure handling (issue #512 VECTOR-001a contract).
 
-    Attack vectors:
-    - drop_table fails during overwrite
-    - create_table fails after drop_table succeeds
+    Realigned from the old overwrite-path tests: a transient open failure must
+    raise VectorStoreConnectionError and make NO drop_table / create_table
+    calls — the authoritative table is preserved untouched. The old behavior
+    (drop + recreate via mode='overwrite') destroyed the index over
+    transient I/O errors and is mandated removed by issue #512.
     """
 
     async def test_drop_table_fails_during_overwrite_path(self):
         """
         ATTACK VECTOR: open_table fails, drop_table also fails.
 
-        This tests the nested exception handling in the overwrite path.
+        Realigned expectation: init_table raises VectorStoreConnectionError
+        naming the open failure; the drop_table error is never even reached
+        (no drop is attempted). Zero create_table calls.
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
 
-        # open_table fails, triggering overwrite path
+        # open_table fails transiently
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Stale table"))
 
-        # drop_table also fails (but should be caught silently)
         mock_db.drop_table = AsyncMock(side_effect=OSError("Cannot drop"))
+        mock_db.create_table = AsyncMock()
 
-        mock_table = MagicMock()
-        mock_table.list_indices = AsyncMock(return_value=[])
-        mock_table.create_index = AsyncMock()
-
-        mock_db.create_table = AsyncMock(return_value=mock_table)
         store.db = mock_db
 
         with patch("app.services.vector_store.pa") as mock_pa:
             mock_pa.schema.return_value = MagicMock()
 
-            with patch("app.services.vector_store.settings") as mock_settings:
-                mock_settings.vector_metric = "cosine"
-                mock_settings.write_lock_timeout_seconds = 30
+            with self.assertRaises(VectorStoreConnectionError) as context:
+                await store.init_table(embedding_dim=384)
 
-                with patch("app.services.vector_store.FTS") as mock_fts:
-                    mock_fts.return_value = MagicMock()
-
-                    with patch("app.services.vector_store.logger"):
-                        # Should NOT raise - drop_table failure is caught silently
-                        await store.init_table(embedding_dim=384)
-
-                        # Verify create_table was still called after drop failure
-                        mock_db.create_table.assert_called_once()
-                        # Verify mode="overwrite" was used
-                        call_kwargs = mock_db.create_table.call_args[1]
-                        self.assertEqual(call_kwargs.get("mode"), "overwrite")
+            self.assertIn("Stale table", str(context.exception))
+            mock_db.drop_table.assert_not_called()
+            mock_db.create_table.assert_not_called()
 
     async def test_create_table_fails_after_successful_drop(self):
         """
-        ATTACK VECTOR: drop_table succeeds but create_table fails in overwrite path.
+        ATTACK VECTOR (retired): create_table failure after a drop.
 
-        This tests the exception handling when recreation fails.
+        Under the no-drop contract the drop never happens: the open failure
+        itself raises VectorStoreConnectionError, drop_table is never called
+        and the authoritative table survives regardless of create_table's
+        health.
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
 
-        # open_table fails, triggering overwrite
+        # open_table fails transiently
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Stale table"))
         mock_db.drop_table = AsyncMock()
 
-        # create_table fails after successful drop
         mock_db.create_table = AsyncMock(
             side_effect=RuntimeError("Cannot create after drop")
         )
@@ -281,11 +275,14 @@ class TestAdversarialOverwritePathFailures(unittest.IsolatedAsyncioTestCase):
         with patch("app.services.vector_store.pa") as mock_pa:
             mock_pa.schema.return_value = MagicMock()
 
-            # RuntimeError is caught, should raise VectorStoreConnectionError
             with self.assertRaises(VectorStoreConnectionError) as context:
                 await store.init_table(embedding_dim=384)
 
-            self.assertIn("Cannot create after drop", str(context.exception))
+            # The reported failure is the transient OPEN error; the table was
+            # preserved, so the create path was never reached.
+            self.assertIn("Stale table", str(context.exception))
+            mock_db.drop_table.assert_not_called()
+            mock_db.create_table.assert_not_called()
 
 
 class TestAdversarialConcurrency(unittest.IsolatedAsyncioTestCase):
@@ -767,24 +764,20 @@ class TestAdversarialTableJustCreatedState(unittest.IsolatedAsyncioTestCase):
         """
         ATTACK VECTOR: Ensure table_just_created doesn't get set True prematurely.
 
-        When open_table fails and drop_table also fails, the overwrite path
-        should still work (drop_table failure is silently caught).
+        Realigned to the no-drop contract (issue #512 VECTOR-001a): the
+        transient open failure raises before any destructive call, so
+        table_just_created is never set and neither drop_table nor
+        create_table runs.
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
         mock_db = MagicMock()
 
         mock_db.table_names = AsyncMock(return_value=["chunks"])
-        # open_table fails, triggering overwrite path
+        # open_table fails transiently
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Cannot open"))
-        # drop_table fails but should be silently caught
         mock_db.drop_table = AsyncMock(side_effect=OSError("Cannot drop"))
-
-        mock_table = MagicMock()
-        mock_table.list_indices = AsyncMock(return_value=[])
-        mock_table.create_index = AsyncMock()
-
-        mock_db.create_table = AsyncMock(return_value=mock_table)
+        mock_db.create_table = AsyncMock()
 
         store.db = mock_db
 
@@ -795,21 +788,22 @@ class TestAdversarialTableJustCreatedState(unittest.IsolatedAsyncioTestCase):
                 mock_settings.vector_metric = "cosine"
                 mock_settings.write_lock_timeout_seconds = 30
 
-            with patch("app.services.vector_store.FTS") as mock_fts:
-                mock_fts.return_value = MagicMock()
-
-                with patch("app.services.vector_store.logger"):
-                    # Should NOT raise - drop_table failure is caught silently
+                with self.assertRaises(VectorStoreConnectionError):
                     await store.init_table(embedding_dim=384)
 
-                    # Verify create_table was called (overwrite path)
-                    mock_db.create_table.assert_called_once()
-                    call_kwargs = mock_db.create_table.call_args[1]
-                    self.assertEqual(call_kwargs.get("mode"), "overwrite")
+                mock_db.drop_table.assert_not_called()
+                mock_db.create_table.assert_not_called()
+                # table_just_created stayed False: store.table was never assigned
+                # a recreated table.
+                self.assertIsNone(store.table)
 
     async def test_overwrite_path_sets_table_just_created_true(self):
         """
-        Verify that the overwrite path correctly sets table_just_created=True.
+        Realigned (issue #512 VECTOR-001a): the transient-open-failure path no
+        longer recreates the table, so table_just_created stays False —
+        verified by the deferred-index log NOT firing and zero destructive
+        calls. The deferred-index log for genuinely new tables is covered by
+        test_init_table_guard.py.
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -817,12 +811,8 @@ class TestAdversarialTableJustCreatedState(unittest.IsolatedAsyncioTestCase):
         mock_db.table_names = AsyncMock(return_value=["chunks"])
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Stale"))
         mock_db.drop_table = AsyncMock()
+        mock_db.create_table = AsyncMock()
 
-        mock_table = MagicMock()
-        mock_table.list_indices = AsyncMock(return_value=[])
-        mock_table.create_index = AsyncMock()
-
-        mock_db.create_table = AsyncMock(return_value=mock_table)
         store.db = mock_db
 
         with patch("app.services.vector_store.pa") as mock_pa:
@@ -832,21 +822,22 @@ class TestAdversarialTableJustCreatedState(unittest.IsolatedAsyncioTestCase):
                 mock_settings.vector_metric = "cosine"
                 mock_settings.write_lock_timeout_seconds = 30
 
-            with patch("app.services.vector_store.FTS") as mock_fts:
-                mock_fts.return_value = MagicMock()
-
-                with patch("app.services.vector_store.logger") as mock_logger:
+            with patch("app.services.vector_store.logger") as mock_logger:
+                with self.assertRaises(VectorStoreConnectionError):
                     await store.init_table(embedding_dim=384)
 
-                    # Verify deferred-index log fired (proof table_just_created=True)
-                    info_calls = [str(c) for c in mock_logger.info.call_args_list]
-                    deferred_found = any(
-                        "vector index deferred" in c.lower() for c in info_calls
-                    )
-                    self.assertTrue(
-                        deferred_found,
-                        "Deferred-index log should fire for overwrite path",
-                    )
+                mock_db.drop_table.assert_not_called()
+                mock_db.create_table.assert_not_called()
+
+                # table_just_created was never set: no deferred-index log.
+                info_calls = [str(c) for c in mock_logger.info.call_args_list]
+                deferred_found = any(
+                    "vector index deferred" in c.lower() for c in info_calls
+                )
+                self.assertFalse(
+                    deferred_found,
+                    "Deferred-index log must not fire when the table was preserved",
+                )
 
 
 class TestAdversarialInputInjection(unittest.IsolatedAsyncioTestCase):

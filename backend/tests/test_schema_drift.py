@@ -13,6 +13,9 @@ the application's logical schema, and their count can vary by SQLite version.
 
 Baseline measured at HEAD 7070fde: 44 base tables (excluding FTS shadows),
 79 total tables (including 35 FTS shadows).
+Current baseline (2026-09-07): EXPECTED_BASE_TABLE_COUNT below tracks every
+intentional base-table change since that measurement; see the dated history
+comments on the constant.
 """
 import os
 import sqlite3
@@ -40,7 +43,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # document_atom_enrichments.
 # 62 -> 64: Versioned canvas (issue #509, 2026-09-06) adds canvas_artifacts and
 # canvas_versions.
-EXPECTED_BASE_TABLE_COUNT = 64
+# 64 -> 65: issue #512 added migration_journal (recovery journal)
+EXPECTED_BASE_TABLE_COUNT = 65
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.
