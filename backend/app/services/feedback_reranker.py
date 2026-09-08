@@ -99,44 +99,63 @@ class FeedbackReranker:
           1. Joins chat_messages → chat_sessions to obtain vault_id.
           2. Filters assistant messages with non-null, non-empty feedback.
           3. Parses the JSON sources array to extract individual file_id entries.
-          4. Aggregates up/down votes per file_id per vault.
+          4. Collapses duplicate citations with a DISTINCT (message, file) inner
+             subquery so ONE rated message contributes at most ONE vote per
+             document (RERANK-002, issue #511) — a message citing the same
+             file via several passages must not count several times.
+          5. Aggregates up/down votes per file_id per vault over those
+             distinct (message, document) pairs.
 
         Returns a row for every (vault_id, file_id) pair with:
-          - up_votes   : COUNT of messages with feedback = 'up'
-          - down_votes : COUNT of messages with feedback = 'down'
+          - up_votes   : COUNT of distinct messages with feedback = 'up'
+          - down_votes : COUNT of distinct messages with feedback = 'down'
         """
         if vault_scope:
             select_clause = """
                 SELECT
-                    cs.vault_id,
-                    json_extract(src.value, '$.file_id') AS file_id,
-                    SUM(CASE WHEN cm.feedback = 'up'   THEN 1 ELSE 0 END) AS up_votes,
-                    SUM(CASE WHEN cm.feedback = 'down' THEN 1 ELSE 0 END) AS down_votes
-                FROM chat_messages cm
-                JOIN chat_sessions cs ON cs.id = cm.session_id
-                JOIN json_each(cm.sources) AS src
-                WHERE cm.role = 'assistant'
-                  AND cm.feedback IS NOT NULL
-                  AND cm.feedback != ''
-                  AND json_extract(src.value, '$.file_id') IS NOT NULL
-                  AND json_extract(src.value, '$.file_id') != ''
-                GROUP BY cs.vault_id, json_extract(src.value, '$.file_id')
+                    votes.vault_id,
+                    votes.file_id,
+                    SUM(CASE WHEN votes.feedback = 'up'   THEN 1 ELSE 0 END) AS up_votes,
+                    SUM(CASE WHEN votes.feedback = 'down' THEN 1 ELSE 0 END) AS down_votes
+                FROM (
+                    SELECT DISTINCT
+                        cm.id AS msg_id,
+                        cs.vault_id,
+                        cm.feedback,
+                        json_extract(src.value, '$.file_id') AS file_id
+                    FROM chat_messages cm
+                    JOIN chat_sessions cs ON cs.id = cm.session_id
+                    JOIN json_each(cm.sources) AS src
+                    WHERE cm.role = 'assistant'
+                      AND cm.feedback IS NOT NULL
+                      AND cm.feedback != ''
+                      AND json_extract(src.value, '$.file_id') IS NOT NULL
+                      AND json_extract(src.value, '$.file_id') != ''
+                ) AS votes
+                GROUP BY votes.vault_id, votes.file_id
             """
         else:
             select_clause = """
                 SELECT
                     NULL AS vault_id,
-                    json_extract(src.value, '$.file_id') AS file_id,
-                    SUM(CASE WHEN cm.feedback = 'up'   THEN 1 ELSE 0 END) AS up_votes,
-                    SUM(CASE WHEN cm.feedback = 'down' THEN 1 ELSE 0 END) AS down_votes
-                FROM chat_messages cm
-                JOIN json_each(cm.sources) AS src
-                WHERE cm.role = 'assistant'
-                  AND cm.feedback IS NOT NULL
-                  AND cm.feedback != ''
-                  AND json_extract(src.value, '$.file_id') IS NOT NULL
-                  AND json_extract(src.value, '$.file_id') != ''
-                GROUP BY json_extract(src.value, '$.file_id')
+                    votes.file_id,
+                    SUM(CASE WHEN votes.feedback = 'up'   THEN 1 ELSE 0 END) AS up_votes,
+                    SUM(CASE WHEN votes.feedback = 'down' THEN 1 ELSE 0 END) AS down_votes
+                FROM (
+                    SELECT DISTINCT
+                        cm.id AS msg_id,
+                        NULL AS vault_id,
+                        cm.feedback,
+                        json_extract(src.value, '$.file_id') AS file_id
+                    FROM chat_messages cm
+                    JOIN json_each(cm.sources) AS src
+                    WHERE cm.role = 'assistant'
+                      AND cm.feedback IS NOT NULL
+                      AND cm.feedback != ''
+                      AND json_extract(src.value, '$.file_id') IS NOT NULL
+                      AND json_extract(src.value, '$.file_id') != ''
+                ) AS votes
+                GROUP BY votes.file_id
             """
         return select_clause, ()
 

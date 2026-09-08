@@ -96,7 +96,7 @@ class TestFailFast:
 
         # Return error for one batch, success for another
         call_count = 0
-        async def mock_batch_api(batch_texts):
+        async def mock_batch_api(batch_texts, config=None):
             nonlocal call_count
             call_count += 1
             if call_count == 2:  # Second batch fails
@@ -164,7 +164,7 @@ class TestParallelOverflowRetry:
         # to verify order is preserved through concatenation
         call_count = [0]
 
-        async def mock_embed_with_retry(client, batch_texts, max_retries, min_sub_size, retry_count=0):
+        async def mock_embed_with_retry(client, batch_texts, max_retries, min_sub_size, retry_count=0, config=None):
             call_count[0] += 1
             # First call with 20 items -> overflow
             if len(batch_texts) == 20 and call_count[0] == 1:

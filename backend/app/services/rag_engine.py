@@ -1088,68 +1088,6 @@ class RAGEngine:
                 trace.query_plan = []
                 plan = []
 
-        # Embed all transformed queries concurrently
-        # query_embeddings will be List[Tuple[str, List[float]]] where tuple is (variant_type, embedding)
-        query_embeddings: List[Tuple[str, List[float]]] = []
-        variants_dropped: List[str] = []
-
-        async def _embed_one(vtype: str, text: str) -> List[float]:
-            if vtype == 'hyde':
-                return await self.embedding_service.embed_passage(text)
-            return await self.embedding_service.embed_single(text)
-
-        embed_tasks = [_embed_one(vt, t) for vt, t in transformed_queries]
-        raw_embeddings = await asyncio.gather(*embed_tasks, return_exceptions=True)
-
-        for (variant_type, _), result in zip(transformed_queries, raw_embeddings):
-            if isinstance(result, EmbeddingError):
-                if variant_type == 'original':
-                    logger.error(
-                        "Query embedding failure for original query: %s", result
-                    )
-                    if stream:
-                        yield {
-                            "type": "error",
-                            "message": f"Original query embedding failed: {result}",
-                            "code": "EMBEDDING_ERROR",
-                        }
-                        return
-                    raise RAGEngineError(f"Original query embedding failed: {result}")
-                logger.warning(
-                    "Query embedding failure for variant '%s': %s", variant_type, result
-                )
-                variants_dropped.append(variant_type)
-            elif isinstance(result, BaseException):
-                if variant_type == 'original':
-                    logger.error("Query embedding failure for original query: %s", result)
-                    if stream:
-                        yield {
-                            "type": "error",
-                            "message": f"Original query embedding failed: {result}",
-                            "code": "EMBEDDING_ERROR",
-                        }
-                        return
-                    raise RAGEngineError(f"Original query embedding failed: {result}")
-                variants_dropped.append(variant_type)
-            else:
-                query_embeddings.append((variant_type, result))
-
-        if not query_embeddings:
-            error_msg = "Unable to encode any query variants"
-            logger.error(
-                "[query] No query embeddings produced — all embedding attempts failed"
-            )
-            if stream:
-                yield {"type": "error", "message": error_msg, "code": "EMBEDDING_ERROR"}
-                return
-            raise RAGEngineError(error_msg)
-
-        logger.info(
-            "[query] query_embeddings: count=%d, dim=%s",
-            len(query_embeddings),
-            len(query_embeddings[0][1]) if query_embeddings else "N/A",
-        )
-
         effective_alpha = self.hybrid_alpha
 
         # Launch memory retrieval concurrently with the document pipeline.
@@ -1186,7 +1124,15 @@ class RAGEngine:
 
             memory_task = asyncio.create_task(_memory_retrieve())
 
-        # Wiki + KMS retrieval: run in parallel when both are enabled.
+        # Wiki + KMS retrieval. Wiki is awaited BEFORE the raw-RAG gate
+        # below — its evidence decides whether raw document RAG runs at all
+        # (real precedence). KMS evidence is only consumed at prompt
+        # building and gates nothing, so when ``retrieval_kms_overlap`` is
+        # enabled (RAG-DEEP-03, issue #511 B2) its retrieval runs as a task
+        # launched alongside the memory task and is awaited only where its
+        # evidence is consumed, overlapping the document pipeline instead
+        # of serializing ahead of it. With the flag off, the legacy
+        # wiki+KMS gather is preserved exactly.
         async def _wiki_retrieve() -> List[Any]:
             if self._wiki_retrieval is None or vault_id is None:
                 return []
@@ -1217,9 +1163,31 @@ class RAGEngine:
                 logger.warning("KMS retrieval failed: %s", exc)
                 return []
 
-        wiki_evidence, kms_evidence = await asyncio.gather(
-            _wiki_retrieve(), _kms_retrieve()
-        )
+        kms_task: Optional[asyncio.Task] = None
+        kms_evidence: List[Any] = []
+        if settings.retrieval_kms_overlap:
+            # The inner coroutine swallows all errors (→ []), so awaiting
+            # this task never raises — the same contract as the memory
+            # task above.
+            kms_task = asyncio.create_task(_kms_retrieve())
+            wiki_evidence = await _wiki_retrieve()
+        else:
+            wiki_evidence, kms_evidence = await asyncio.gather(
+                _wiki_retrieve(), _kms_retrieve()
+            )
+
+        def _cancel_overlap_tasks() -> None:
+            """Cancel in-flight overlap tasks on early exits (RAG-DEEP-03).
+
+            Both the memory task and the KMS task swallow errors internally
+            and their results are not needed on an error exit; cancelling
+            keeps the early return non-blocking and avoids orphaned pending
+            tasks (a cancelled task never reports an unretrieved
+            exception).
+            """
+            for overlap_task in (memory_task, kms_task):
+                if overlap_task is not None and not overlap_task.done():
+                    overlap_task.cancel()
 
         # Update trace with wiki results
         query_type = _classify_query(retrieval_query)
@@ -1238,6 +1206,103 @@ class RAGEngine:
         # FR-015: Signal "Searching" stage to the SSE stream so the user sees
         # feedback before the first content token arrives.
         yield {"type": "stage", "stage": STAGE_SEARCHING}
+
+        # ------------------------------------------------------------------
+        # RAG-DEEP-01 (issue #511 B2): lazy variant embeddings. The embed
+        # block runs AFTER the wiki gather + raw-RAG decision so that:
+        #   - a wiki-answerable query computes NO embeddings at all;
+        #   - the decomposition route (len(plan) > 1) embeds ONLY the
+        #     original retrieval query — the multi-sub-query orchestration
+        #     embeds each sub-query itself and never consumes the
+        #     step_back/hyde variants;
+        #   - the standard route embeds all variants exactly as before.
+        # The embedding-failure guards below therefore fire only when raw
+        # RAG will actually run, with the same user-visible error behavior.
+        # ------------------------------------------------------------------
+        query_embeddings: List[Tuple[str, List[float]]] = []
+        variants_dropped: List[str] = []
+
+        async def _embed_one(vtype: str, text: str) -> List[float]:
+            if vtype == 'hyde':
+                return await self.embedding_service.embed_passage(text)
+            return await self.embedding_service.embed_single(text)
+
+        # Set when the original retrieval query was embedded; handed to the
+        # sub-query orchestration so a sub-query with the same text reuses
+        # it instead of embedding the same string twice.
+        original_query_text: Optional[str] = None
+        original_query_embedding: Optional[List[float]] = None
+
+        if raw_rag_needed:
+            variants_to_embed = transformed_queries
+            if len(plan) > 1:
+                variants_to_embed = [
+                    (vt, text)
+                    for vt, text in transformed_queries
+                    if vt == 'original'
+                ] or [('original', retrieval_query)]
+            embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
+            raw_embeddings = await asyncio.gather(*embed_tasks, return_exceptions=True)
+
+            for (variant_type, _), result in zip(variants_to_embed, raw_embeddings):
+                if isinstance(result, EmbeddingError):
+                    if variant_type == 'original':
+                        logger.error(
+                            "Query embedding failure for original query: %s", result
+                        )
+                        _cancel_overlap_tasks()
+                        if stream:
+                            yield {
+                                "type": "error",
+                                "message": f"Original query embedding failed: {result}",
+                                "code": "EMBEDDING_ERROR",
+                            }
+                            return
+                        raise RAGEngineError(f"Original query embedding failed: {result}")
+                    logger.warning(
+                        "Query embedding failure for variant '%s': %s", variant_type, result
+                    )
+                    variants_dropped.append(variant_type)
+                elif isinstance(result, BaseException):
+                    if variant_type == 'original':
+                        logger.error("Query embedding failure for original query: %s", result)
+                        _cancel_overlap_tasks()
+                        if stream:
+                            yield {
+                                "type": "error",
+                                "message": f"Original query embedding failed: {result}",
+                                "code": "EMBEDDING_ERROR",
+                            }
+                            return
+                        raise RAGEngineError(f"Original query embedding failed: {result}")
+                    variants_dropped.append(variant_type)
+                else:
+                    query_embeddings.append((variant_type, result))
+
+            if not query_embeddings:
+                error_msg = "Unable to encode any query variants"
+                logger.error(
+                    "[query] No query embeddings produced — all embedding attempts failed"
+                )
+                _cancel_overlap_tasks()
+                if stream:
+                    yield {"type": "error", "message": error_msg, "code": "EMBEDDING_ERROR"}
+                    return
+                raise RAGEngineError(error_msg)
+
+            for variant_type, text in variants_to_embed:
+                if variant_type == 'original':
+                    original_query_text = text
+                    break
+            original_query_embedding = next(
+                (emb for vt, emb in query_embeddings if vt == 'original'), None
+            )
+
+            logger.info(
+                "[query] query_embeddings: count=%d, dim=%s",
+                len(query_embeddings),
+                len(query_embeddings[0][1]) if query_embeddings else "N/A",
+            )
 
         # Execute retrieval and evaluation
         fallback_reason: Optional[str] = None
@@ -1279,7 +1344,7 @@ class RAGEngine:
         _multi_sub_rerank_success: Optional[bool] = None
         _multi_sub_hybrid_status: str = "disabled"
         _multi_sub_rerank_status: str = "disabled"
-        if len(plan) > 1:
+        if raw_rag_needed and len(plan) > 1:
             try:
                 (
                     vector_results,
@@ -1302,6 +1367,8 @@ class RAGEngine:
                     mode=mode,
                     retrieval_mode=active_retrieval_mode,
                     filter_expr=active_filter_expr,
+                    original_query_text=original_query_text,
+                    original_query_embedding=original_query_embedding,
                 )
                 _skip_standard_retrieval = True
                 _multi_sub_query_results = vector_results
@@ -1319,6 +1386,7 @@ class RAGEngine:
                         [sq[:40] for sq in sub_queries_failed],
                     )
             except SearchSemaphoreTimeoutError:
+                _cancel_overlap_tasks()
                 raise
             except Exception as exc:
                 logger.warning(
@@ -1430,6 +1498,7 @@ class RAGEngine:
                         else "N/A",
                     )
                 except SearchSemaphoreTimeoutError:
+                    _cancel_overlap_tasks()
                     raise
                 except Exception as exc:
                     fallback_reason = str(exc)
@@ -1568,6 +1637,7 @@ class RAGEngine:
                         "token_pack_truncated", trace.token_pack_truncated
                     )
             except SearchSemaphoreTimeoutError:
+                _cancel_overlap_tasks()
                 raise
             except Exception as exc:
                 logger.warning("Context distillation failed, continuing: %s", exc)
@@ -1689,6 +1759,13 @@ class RAGEngine:
             trace.ab_variant = ab_var
         if p_version is not None:
             trace.prompt_version = p_version
+        # RAG-DEEP-03: KMS evidence is consumed here (prompt building) —
+        # the overlap task launched before the wiki gate is awaited at
+        # this point, after the retrieval phase has had the whole document
+        # pipeline to run concurrently with it. The inner coroutine
+        # swallows all errors, so awaiting never raises.
+        if kms_task is not None:
+            kms_evidence = await kms_task
         messages = self.prompt_builder.build_messages(
             user_input, chat_history, relevant_chunks, memories, relevance_hint,
             wiki_evidence=wiki_evidence if wiki_evidence else None,
@@ -1700,6 +1777,11 @@ class RAGEngine:
         # Stream or non-stream LLM response. Capture the assembled
         # content so citation labels can be parsed for the trace.
         assembled_response: List[str] = []
+        # PRR-004 (PR #528 review): the LLM helpers snapshot finish_reason
+        # synchronously at stream completion into this per-call dict, so the
+        # post-yield read cannot observe a concurrent request's metrics on
+        # the shared client singleton.
+        llm_finish_reason_capture: Dict[str, Optional[str]] = {}
 
         # FR-015: Signal "Drafting" stage — the LLM is now generating tokens.
         yield {"type": "stage", "stage": STAGE_DRAFTING}
@@ -1708,6 +1790,7 @@ class RAGEngine:
             async for chunk in self._stream_llm_response(
                 messages, client=active_client, max_tokens=effective_max_tokens,
                 temperature=temperature,
+                finish_reason_capture=llm_finish_reason_capture,
             ):
                 chunk_type = chunk.get("type", "unknown")
                 logger.debug("[query] Yielding '%s' chunk (stream)", chunk_type)
@@ -1718,12 +1801,30 @@ class RAGEngine:
             async for chunk in self._get_llm_response(
                 messages, client=active_client, max_tokens=effective_max_tokens,
                 temperature=temperature,
+                finish_reason_capture=llm_finish_reason_capture,
             ):
                 chunk_type = chunk.get("type", "unknown")
                 logger.debug("[query] Yielding '%s' chunk (non-stream)", chunk_type)
                 if chunk_type == "content":
                     assembled_response.append(chunk.get("content", ""))
                 yield chunk
+
+        # FULL-ENH-01 (issue #511 B2): surface the provider-reported
+        # finish_reason (e.g. "length" — the answer was cut by the output
+        # token budget) from the active client's metrics: log it at INFO
+        # (value only, no content) and record it on the trace. No new SSE
+        # event types — trace/log surfacing only.
+        llm_finish_reason = llm_finish_reason_capture.get(
+            "finish_reason"
+        )
+        if llm_finish_reason is None:
+            # Fallback for mocked clients that bypass the helper capture.
+            llm_finish_reason = (
+                getattr(active_client, "last_metrics", None) or {}
+            ).get("finish_reason")
+        if llm_finish_reason:
+            logger.info("LLM finish_reason=%s", llm_finish_reason)
+            trace.finish_reason = llm_finish_reason
 
         # Citation parsing for the trace (does not modify content; the
         # chat route does the user-visible repair).
@@ -1923,13 +2024,24 @@ class RAGEngine:
         mode: Optional[Any],
         retrieval_mode: Optional[str] = None,
         filter_expr: Optional[str] = None,
+        original_query_text: Optional[str] = None,
+        original_query_embedding: Optional[List[float]] = None,
     ) -> Tuple[List[Dict[str, Any]], bool, List[str], str, Optional[str], Optional[bool], str, str]:
         """Dispatch independent retrieval for each sub-query and fuse via RRF.
 
         Called when ``len(plan) > 1`` after query planning (FR-002 part 1).
         Each sub-query is embedded and retrieved independently; results are
         fused using Reciprocal Rank Fusion (RRF, k=60) and deduplicated by
-        ``(file_id, text)`` before being returned for downstream distillation.
+        identity (``source_dedup_key``) before being returned for downstream
+        distillation.
+
+        RAG-DEEP-02 (issue #511 B2): identical plan strings are deduplicated
+        before fan-out (order preserved), and when
+        ``settings.retrieval_consolidated_rerank`` is enabled the fan-out
+        retrievals run with ``defer_rerank=True`` so that ONE consolidated
+        rerank call runs after fusion + identity dedup + the top-k cap
+        instead of N per-sub-query rerank calls against the same user
+        question.
 
         Args:
             plan: List of sub-query strings from QueryPlanner.plan().
@@ -1941,6 +2053,11 @@ class RAGEngine:
             effective_reranker_top_n: Reranker top-n.
             active_client: LLM client for reranking/CRAG evaluation.
             mode: Chat mode.
+            original_query_text: Text of the original retrieval query as
+                embedded by query() (RAG-DEEP-01); used to detect reuse.
+            original_query_embedding: Embedding of ``original_query_text``
+                computed by query(); a sub-query with the same text reuses
+                it instead of embedding the same string twice.
 
         Returns:
             Tuple of (fused_vector_results, fusion_applied, failed_sub_queries,
@@ -1948,18 +2065,51 @@ class RAGEngine:
             rerank_status). ``fusion_applied`` is True when RRF was applied;
             False when falling back to single-query retrieval.
             ``failed_sub_queries`` lists sub-query strings that failed.
-            ``rerank_success`` is True if any sub-query had rerank_success=True.
+            ``rerank_success`` reflects the single consolidated rerank call
+            when consolidation is enabled (True/False from that call, None
+            when unattempted/disabled); otherwise True if any sub-query had
+            rerank_success=True.
             ``hybrid_status`` is the most-enabled hybrid status across sub-queries.
             ``rerank_status`` is "ok" if any sub-query had "ok", else "fallback"
             if any had "fallback", else "disabled".
         """
+        # Deduplicate identical plan strings before fan-out, preserving
+        # order: string-identical sub-queries produce identical embeddings,
+        # searches and (without consolidation) rerank calls — pure repeated
+        # provider work with no additional evidence (RAG-DEEP-02).
+        unique_plan: List[str] = []
+        seen_plan: Set[str] = set()
+        for sq in plan:
+            if sq in seen_plan:
+                continue
+            seen_plan.add(sq)
+            unique_plan.append(sq)
+        if len(unique_plan) < len(plan):
+            logger.info(
+                "[_orchestrate_sub_query_retrieval] %d sub-queries → %d after "
+                "deduplicating identical plan strings",
+                len(plan),
+                len(unique_plan),
+            )
+
+        consolidated_rerank = bool(settings.retrieval_consolidated_rerank)
+
         logger.info(
             "[_orchestrate_sub_query_retrieval] %d sub-queries to orchestrate",
-            len(plan),
+            len(unique_plan),
         )
 
         # Phase 1: Embed each sub-query independently.
         async def _embed_sub_query(sq: str) -> Tuple[str, Optional[List[float]], Optional[str]]:
+            if (
+                original_query_embedding is not None
+                and original_query_text is not None
+                and sq == original_query_text
+            ):
+                # RAG-DEEP-01: the original retrieval query was already
+                # embedded by query() — reuse that embedding instead of
+                # embedding the same string a second time.
+                return sq, original_query_embedding, None
             try:
                 emb = await self.embedding_service.embed_single(sq)
                 return sq, emb, None
@@ -1971,7 +2121,7 @@ class RAGEngine:
                 )
                 return sq, None, str(exc)
 
-        embed_tasks = [_embed_sub_query(sq) for sq in plan]
+        embed_tasks = [_embed_sub_query(sq) for sq in unique_plan]
         embed_results = await asyncio.gather(*embed_tasks, return_exceptions=True)
 
         # Collect successful embeddings; track failures.
@@ -1979,7 +2129,7 @@ class RAGEngine:
         failed_sub_queries: List[str] = []
         for i, result in enumerate(embed_results):
             if isinstance(result, BaseException):
-                sq = plan[i] if i < len(plan) else f"<sub_query_{i}>"
+                sq = unique_plan[i] if i < len(unique_plan) else f"<sub_query_{i}>"
                 failed_sub_queries.append(sq)
                 logger.warning(
                     "[_orchestrate_sub_query_retrieval] embed task %d (%s) raised: %s",
@@ -2000,13 +2150,25 @@ class RAGEngine:
                 else:
                     sub_query_embeddings.append((sq, emb))
 
+        # Fallback embedding of the original user query for the two
+        # all-failed paths below — reuse the query()-level original
+        # embedding when the text matches (RAG-DEEP-01).
+        async def _fallback_embedding() -> List[float]:
+            if (
+                original_query_embedding is not None
+                and original_query_text is not None
+                and user_input == original_query_text
+            ):
+                return original_query_embedding
+            return await self.embedding_service.embed_single(user_input)
+
         # If ALL sub-query embeddings failed, fall back to single-query retrieval.
         if not sub_query_embeddings:
             logger.warning(
                 "[_orchestrate_sub_query_retrieval] all sub-query embeddings failed, "
                 "falling back to single-query retrieval",
             )
-            single_emb = await self.embedding_service.embed_single(user_input)
+            single_emb = await _fallback_embedding()
             (
                 vector_results,
                 relevance_hint,
@@ -2035,6 +2197,9 @@ class RAGEngine:
             return vector_results, False, failed_sub_queries, score_type, relevance_hint, rerank_success, hybrid_status, rerank_status
 
         # Phase 2: Run retrieval for each sub-query independently.
+        # RAG-DEEP-02: with consolidation enabled, the fan-out skips the
+        # per-sub-query rerank (defer_rerank=True) — ONE consolidated rerank
+        # runs after fusion (Phase 4 below) instead.
         retrieval_tasks: List[Tuple[str, asyncio.Task]] = []
         for sq, emb in sub_query_embeddings:
             task = asyncio.create_task(
@@ -2049,6 +2214,7 @@ class RAGEngine:
                     active_client=active_client,
                     mode=mode,
                     skip_evaluation=True,
+                    defer_rerank=consolidated_rerank,
                     retrieval_mode=retrieval_mode,
                     filter_expr=filter_expr,
                 )
@@ -2081,7 +2247,7 @@ class RAGEngine:
                 "[_orchestrate_sub_query_retrieval] all sub-query retrievals failed, "
                 "falling back to single-query retrieval",
             )
-            single_emb = await self.embedding_service.embed_single(user_input)
+            single_emb = await _fallback_embedding()
             (
                 vector_results,
                 relevance_hint,
@@ -2180,6 +2346,49 @@ class RAGEngine:
             elif rrs == "fallback" and agg_rerank_status == "disabled":
                 agg_rerank_status = "fallback"
 
+        # Phase 4 (RAG-DEEP-02): one consolidated rerank over the fused,
+        # identity-deduped, capped set. The fan-out above ran with
+        # defer_rerank=True, so this single call against the user's actual
+        # question decides rerank_success/score_type/rerank_status for the
+        # whole orchestration (same derivation rules as _execute_retrieval:
+        # True → "rerank"/"ok", False → "distance"/"fallback",
+        # None → "distance"/"disabled").
+        if consolidated_rerank:
+            agg_rerank_success = None
+            if self.reranking_enabled and self.reranking_service and deduped:
+                try:
+                    reranked_chunks, consolidated_success = (
+                        await self.reranking_service.rerank(
+                            query=user_input,
+                            chunks=deduped,
+                            top_n=effective_reranker_top_n,
+                        )
+                    )
+                    if reranked_chunks:
+                        deduped = reranked_chunks
+                    agg_rerank_success = consolidated_success
+                    logger.info(
+                        "[_orchestrate_sub_query_retrieval] consolidated rerank: "
+                        "%d chunks in → %d out (success=%s)",
+                        len(fused),
+                        len(deduped),
+                        consolidated_success,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[_orchestrate_sub_query_retrieval] consolidated rerank "
+                        "failed, keeping fused order: %s",
+                        exc,
+                    )
+                    agg_rerank_success = None
+            score_type = "rerank" if agg_rerank_success else "distance"
+            if agg_rerank_success is True:
+                agg_rerank_status = "ok"
+            elif agg_rerank_success is False:
+                agg_rerank_status = "fallback"
+            else:
+                agg_rerank_status = "disabled"
+
         return deduped, True, failed_sub_queries, score_type, relevance_hint, agg_rerank_success, agg_hybrid_status, agg_rerank_status
 
     async def _execute_retrieval(
@@ -2194,6 +2403,7 @@ class RAGEngine:
         active_client: Optional[LLMClient] = None,
         mode: Optional["ChatMode"] = None,
         skip_evaluation: bool = False,
+        defer_rerank: bool = False,
         retrieval_mode: Optional[str] = None,
         filter_expr: Optional[str] = None,
     ) -> tuple[List[Dict[str, Any]], Optional[str], str, Optional[bool], str, str, int, str, List[str], bool, Dict[str, int]]:
@@ -2205,6 +2415,11 @@ class RAGEngine:
             vault_id: Optional vault ID to filter by
             effective_alpha: Hybrid search alpha weight
             variants_dropped: List of variant types that failed embedding (e.g., step_back, hyde)
+            defer_rerank: Skip the Phase 1b rerank and return with
+                rerank_success=None / score_type="distance" (RAG-DEEP-02,
+                issue #511 B2). Used by the multi-sub-query orchestration,
+                which reranks ONCE over the consolidated fused set after
+                fan-out; the return-tuple shape is unchanged.
             retrieval_mode: Per-query retrieval control (issue #510 UI-004);
                 "semantic" = dense-only, "keyword" = pure BM25 (alpha 0.0),
                 None/"auto" = settings-driven hybrid. Callers inside query()
@@ -2424,8 +2639,17 @@ class RAGEngine:
                 else "N/A",
             )
 
-            # Phase 1b: Reranking (if enabled) - also part of search phase
-            if self.reranking_enabled and self.reranking_service and vector_results:
+            # Phase 1b: Reranking (if enabled) - also part of search phase.
+            # defer_rerank: the orchestration caller reranks the consolidated
+            # fused set itself, so the per-call rerank is skipped here and
+            # rerank_success stays None (score_type "distance") until the
+            # caller's single consolidated call derives the final values.
+            if (
+                self.reranking_enabled
+                and self.reranking_service
+                and vector_results
+                and not defer_rerank
+            ):
                 try:
                     reranked_chunks, rerank_success = await self.reranking_service.rerank(
                         query=user_input,
@@ -2646,6 +2870,7 @@ class RAGEngine:
         client: Optional[LLMClient] = None,
         max_tokens: int = 32768,
         temperature: Optional[float] = None,
+        finish_reason_capture: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stream LLM response chunks.
 
@@ -2696,6 +2921,10 @@ class RAGEngine:
                 if candidate is not target:
                     metrics["fallback_from"] = getattr(target, "base_url", None)
                 self._last_llm_metrics = metrics
+                if finish_reason_capture is not None:
+                    finish_reason_capture["finish_reason"] = metrics.get(
+                        "finish_reason"
+                    )
                 return
             except LLMError as exc:
                 last_error = exc
@@ -2717,6 +2946,7 @@ class RAGEngine:
         client: Optional[LLMClient] = None,
         max_tokens: int = 32768,
         temperature: Optional[float] = None,
+        finish_reason_capture: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Get non-streaming LLM response.
 
@@ -2754,6 +2984,10 @@ class RAGEngine:
                         getattr(candidate, "base_url", "<unknown>"),
                     )
                 self._last_llm_metrics = metrics
+                if finish_reason_capture is not None:
+                    finish_reason_capture["finish_reason"] = metrics.get(
+                        "finish_reason"
+                    )
                 yield {"type": "content", "content": content}
                 return
             except LLMError as exc:

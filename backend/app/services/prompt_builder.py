@@ -4,21 +4,41 @@ Handles building system prompts, user messages, and formatting context for LLM.
 """
 
 import dataclasses
+import logging
 import re
 import sqlite3
 from html import escape as _xml_escape
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from app.config import settings
 from app.services.document_retrieval import RAGSource
 from app.services.memory_store import MemoryRecord
+from app.services.token_accounting import count_tokens
 
 if TYPE_CHECKING:
     from app.services.kms_retrieval import KMSEvidence
     from app.services.wiki_retrieval import WikiEvidence
 
+logger = logging.getLogger(__name__)
+
 # Sentence splitter for wiki-overlap suppression (issue #510 RAG-004).
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+# Prompt budget (issue #511 FULL-ENH-01): memory/wiki/kms entries at or below
+# this many characters of raw content are "short facts" — cheap, high-signal
+# items the budget pass retains until everything else is exhausted (and never
+# sheds: a date, a code, or a one-line rule).
+_SHORT_FACT_MAX_CHARS = 120
+
+# Floor for the total prompt budget so a misconfigured
+# model_context_tokens - prompt_reserve_output_tokens can never go negative
+# or absurdly small.
+_MIN_PROMPT_BUDGET_TOKENS = 256
+
+
+def _is_short_fact(text: Optional[str]) -> bool:
+    """True when ``text`` is a short fact (<= _SHORT_FACT_MAX_CHARS)."""
+    return bool(text) and len(text) <= _SHORT_FACT_MAX_CHARS
 
 
 def _split_into_sentences(text: str) -> List[str]:
@@ -174,6 +194,9 @@ class PromptBuilderService:
         self._db = db
         self._cached_active_prompt: Optional[str] = None
         self.max_context_chunks = max_context_chunks or settings.max_context_chunks
+        # Structured report of the last build_messages budget pass (issue
+        # #511 FULL-ENH-01): None whenever the budget is disabled (default).
+        self.last_budget_report: Optional[Dict[str, Any]] = None
 
     @property
     def system_prompt(self) -> str:
@@ -323,9 +346,13 @@ class PromptBuilderService:
 
         # Format memories with stable [M#] labels so the LLM can cite them
         # distinctly from documents. Labels are 1-based and match the
-        # ``memory_label`` exposed to the frontend.
-        memory_context = [
-            f"[M{idx + 1}] <memory>{_xml_escape(mem.content)}</memory>"
+        # ``memory_label`` exposed to the frontend. Each item also carries its
+        # short-fact flag for the optional budget pass (issue #511).
+        memory_items: List[Tuple[str, bool]] = [
+            (
+                f"[M{idx + 1}] <memory>{_xml_escape(mem.content)}</memory>",
+                _is_short_fact(mem.content),
+            )
             for idx, mem in enumerate(memories)
             if mem.content
         ]
@@ -352,82 +379,370 @@ class PromptBuilderService:
                 "factual claim with at least one [S#]/[W#]/[K#]/[M#] label "
                 "from the provided evidence."
             )
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": effective_prompt},
-        ]
+
         # Truncate history to last N messages to prevent context overflow
         max_history = 20
+        history_messages: List[Dict[str, Any]] = []
         for entry in chat_history[-max_history:]:
             safe_entry = dict(entry)
             safe_entry["content"] = _xml_escape(safe_entry.get("content") or "")
             if safe_entry.get("role") not in {"user", "assistant"}:
                 continue
-            messages.append(safe_entry)
+            history_messages.append(safe_entry)
 
-        # Build structured context
-        user_content_parts: List[str] = []
-        if relevance_hint:
-            user_content_parts.append(relevance_hint)
-
-        # Wiki evidence injected BEFORE raw document evidence
-        if wiki_evidence:
-            wiki_sections = [
-                format_wiki_evidence(ev, idx + 1)
-                for idx, ev in enumerate(wiki_evidence)
-            ]
-            user_content_parts.append(
-                "Wiki Evidence (compiled source-backed knowledge):\n"
-                + "\n\n".join(wiki_sections)
+        # Wiki evidence injected BEFORE raw document evidence; KMS after wiki,
+        # before raw document evidence. Items carry their short-fact flag for
+        # the optional budget pass.
+        wiki_items: List[Tuple[str, bool]] = [
+            (
+                format_wiki_evidence(ev, idx + 1),
+                _is_short_fact(ev.claim_text or ev.excerpt or ""),
             )
-
-        # KMS evidence injected after wiki, before raw document evidence
-        if kms_evidence:
-            kms_sections = [
-                format_kms_evidence(ev, idx + 1)
-                for idx, ev in enumerate(kms_evidence)
-            ]
-            user_content_parts.append(
-                "Knowledge Base Evidence (user-curated documentation):\n"
-                + "\n\n".join(kms_sections)
+            for idx, ev in enumerate(wiki_evidence or [])
+        ]
+        kms_items: List[Tuple[str, bool]] = [
+            (
+                format_kms_evidence(ev, idx + 1),
+                _is_short_fact(ev.excerpt or ev.summary or ""),
             )
+            for idx, ev in enumerate(kms_evidence or [])
+        ]
 
         # (Wiki-overlap suppression now happens at chunk level BEFORE
         # rendering — see `_format_if_unique` above — so only the covered
         # sentences are removed and unique facts survive with their stable
         # source labels. Issue #510 RAG-004.)
 
-        if primary_sections:
-            primary_text = "\n\n".join(primary_sections)
-            user_content_parts.append(f"Primary Evidence:\n{primary_text}")
-
-        if supporting_sections:
-            supporting_text = "\n\n".join(supporting_sections)
-            user_content_parts.append(f"Supporting Evidence:\n{supporting_text}")
-
-        if not primary_sections and not supporting_sections:
-            user_content_parts.append("No relevant documents found for this query.")
-
         # Anchor best chunk: repeat top-ranked chunk at the end of the context region.
         # Mitigates LLM "lost-in-the-middle" effect. Skipped when the top chunk already
         # dominates the budget (> 50% of context_max_tokens tokens).
+        # Boxed so the budget pass (tier 8) can shed the anchor when the
+        # protected set alone exceeds the window (PRR-005, PR #528 review).
+        anchor_box: List[Optional[str]] = [None]
         if settings.anchor_best_chunk and primary_chunks:
             top_chunk = primary_chunks[0]
             top_chunk_tokens = max(1, int(len(top_chunk.text) / 3.5))
             if top_chunk_tokens <= settings.context_max_tokens * 0.5:
-                anchor_section = self.format_chunk(top_chunk, 1)
+                anchor_box[0] = self.format_chunk(top_chunk, 1)
+
+        def _compose_user_content(omission_note: Optional[str]) -> str:
+            """Assemble the final user message content from the current
+            (possibly budget-trimmed) section lists. Single assembly path for
+            both budget modes, so the flag-off output is unchanged."""
+            user_content_parts: List[str] = []
+            if relevance_hint:
+                user_content_parts.append(relevance_hint)
+            if wiki_items:
                 user_content_parts.append(
-                    f"[BEST MATCH — repeated for emphasis]\n{anchor_section}"
+                    "Wiki Evidence (compiled source-backed knowledge):\n"
+                    + "\n\n".join(text for text, _ in wiki_items)
                 )
+            if kms_items:
+                user_content_parts.append(
+                    "Knowledge Base Evidence (user-curated documentation):\n"
+                    + "\n\n".join(text for text, _ in kms_items)
+                )
+            if primary_sections:
+                primary_text = "\n\n".join(primary_sections)
+                user_content_parts.append(f"Primary Evidence:\n{primary_text}")
+            if supporting_sections:
+                supporting_text = "\n\n".join(supporting_sections)
+                user_content_parts.append(
+                    f"Supporting Evidence:\n{supporting_text}"
+                )
+            if not primary_sections and not supporting_sections:
+                user_content_parts.append(
+                    "No relevant documents found for this query."
+                )
+            if anchor_box[0]:
+                user_content_parts.append(
+                    f"[BEST MATCH — repeated for emphasis]\n{anchor_box[0]}"
+                )
+            if omission_note:
+                user_content_parts.append(omission_note)
+            user_content = "\n\n".join(user_content_parts) + "\n\n"
 
-        user_content = "\n\n".join(user_content_parts) + "\n\n"
+            memory_text = "\n".join(text for text, _ in memory_items)
+            if memory_text:
+                user_content += f"Memories:\n{memory_text}\n\n"
 
-        memory_text = "\n".join(memory_context)
-        if memory_text:
-            user_content += f"Memories:\n{memory_text}\n\n"
+            user_content += (
+                f"Question: <user_query>{_xml_escape(user_input)}</user_query>"
+            )
+            return user_content
 
-        user_content += f"Question: <user_query>{_xml_escape(user_input)}</user_query>"
-        messages.append({"role": "user", "content": user_content})
+        # Optional total prompt budget (issue #511 FULL-ENH-01). Disabled by
+        # default: with prompt_budget_enabled off (or unusable settings) the
+        # assembly below is byte-identical to the pre-budget behavior and
+        # last_budget_report is None.
+        budget = self._resolve_budget()
+        omission_note: Optional[str] = None
+        if budget is None:
+            self.last_budget_report = None
+        else:
+            omission_note = self._apply_prompt_budget(
+                budget=budget,
+                system_prompt=effective_prompt,
+                history_messages=history_messages,
+                primary_sections=primary_sections,
+                supporting_sections=supporting_sections,
+                wiki_items=wiki_items,
+                kms_items=kms_items,
+                memory_items=memory_items,
+                compose=_compose_user_content,
+                anchor_box=anchor_box,
+            )
+
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": effective_prompt},
+        ]
+        messages.extend(history_messages)
+        messages.append(
+            {"role": "user", "content": _compose_user_content(omission_note)}
+        )
         return messages
+
+    def _resolve_budget(self) -> Optional[int]:
+        """Total prompt-token budget for this call, or None when disabled.
+
+        The flag check is a strict ``is True`` identity test so that a
+        MagicMock-patched settings object (existing test suites) never
+        accidentally enables the budget path; the disabled path does no
+        token computation at all.
+        """
+        if settings.prompt_budget_enabled is not True:
+            return None
+        context_tokens = settings.model_context_tokens
+        if (
+            not isinstance(context_tokens, int)
+            or isinstance(context_tokens, bool)
+            or context_tokens <= 0
+        ):
+            return None
+        reserve = settings.prompt_reserve_output_tokens
+        if not isinstance(reserve, int) or isinstance(reserve, bool) or reserve < 0:
+            reserve = 0
+        return max(context_tokens - reserve, _MIN_PROMPT_BUDGET_TOKENS)
+
+    def _apply_prompt_budget(
+        self,
+        *,
+        budget: int,
+        system_prompt: str,
+        history_messages: List[Dict[str, Any]],
+        primary_sections: List[str],
+        supporting_sections: List[str],
+        wiki_items: List[Tuple[str, bool]],
+        kms_items: List[Tuple[str, bool]],
+        memory_items: List[Tuple[str, bool]],
+        compose: Callable[[Optional[str]], str],
+        anchor_box: Optional[List[Optional[str]]] = None,
+    ) -> Optional[str]:
+        """Shed lowest-value sections in place until the assembled prompt
+        (system + history + all context sections + memories + query) fits
+        ``budget`` tokens. Returns the in-prompt omission note (None when
+        nothing was shed) and records ``self.last_budget_report``.
+
+        Shed order (lowest value first):
+          1. history oldest-first — never below the newest 2 messages
+          2. supporting sections from the tail
+          3. wiki entries from the tail (whole entries; short facts protected)
+          4. kms entries from the tail (whole entries; short facts protected)
+          5. memories longest-first (short facts protected)
+          6. primary sections beyond the first 3, from the tail
+          7. LAST RESORT only: primary #3, then #2 — when the protected set
+             alone would still exceed the budget (frozen acceptance check C7;
+             see the comment at the candidate construction below)
+
+        NEVER shed: system prompt, user query, the TOP primary evidence
+        chunk ([S1]), short facts. Whole entries/sections are shed so
+        surviving labels (S#/W#/K#/M#) keep their original positional
+        values. Tiers 1-6 are the normal ladder; tier 7 exists because a
+        strict top-3 floor can exceed a small model window outright, and a
+        prompt that overflows the context window helps nobody.
+        """
+        shed = {
+            "history": 0,
+            "supporting": 0,
+            "wiki": 0,
+            "kms": 0,
+            "memories": 0,
+            "primary": 0,
+            "anchor": 0,
+        }
+
+        def _build_note() -> Optional[str]:
+            bits: List[str] = []
+            if shed["history"]:
+                bits.append(f"{shed['history']} older messages")
+            evidence = shed["supporting"] + shed["primary"]
+            if evidence:
+                bits.append(f"{evidence} evidence passages")
+            entries = shed["wiki"] + shed["kms"]
+            if entries:
+                bits.append(f"{entries} wiki/knowledge-base entries")
+            if shed["memories"]:
+                bits.append(f"{shed['memories']} memories")
+            if shed["anchor"]:
+                bits.append("1 repeated-anchor passage")
+            if not bits:
+                return None
+            return (
+                "Context trimmed to fit the model context window: "
+                + ", ".join(bits)
+                + " omitted."
+            )
+
+        def _total_tokens(note: Optional[str]) -> int:
+            joined = "\n".join(
+                [system_prompt]
+                + [str(m.get("content", "")) for m in history_messages]
+                + [compose(note)]
+            )
+            return count_tokens(joined)
+
+        # Removal candidates in strict shed-priority order. Each carries its
+        # standalone token cost for the fast estimate pass; the final fit is
+        # verified (and corrected) against the exact assembled count.
+        candidates: List[Tuple[str, int, Callable[[], None]]] = []
+
+        # 1. history oldest-first; the newest 2 messages are protected.
+        for msg in history_messages[:-2]:
+            candidates.append(
+                (
+                    "history",
+                    count_tokens(str(msg.get("content", ""))),
+                    lambda m=msg: history_messages.remove(m),
+                )
+            )
+        # 2. supporting sections from the tail.
+        for section in reversed(supporting_sections):
+            candidates.append(
+                (
+                    "supporting",
+                    count_tokens(section),
+                    lambda s=section: supporting_sections.remove(s),
+                )
+            )
+        # 3./4. wiki and kms whole entries from the tail; short facts are
+        # protected (they are retained even when long entries are shed).
+        for group, items in (("wiki", wiki_items), ("kms", kms_items)):
+            for item in reversed(items):
+                if item[1]:
+                    continue
+                candidates.append(
+                    (
+                        group,
+                        count_tokens(item[0]),
+                        lambda it=item, lst=items: lst.remove(it),
+                    )
+                )
+        # 5. memories longest-first; short facts are protected.
+        for item in sorted(
+            (i for i in memory_items if not i[1]),
+            key=lambda i: len(i[0]),
+            reverse=True,
+        ):
+            candidates.append(
+                (
+                    "memories",
+                    count_tokens(item[0]),
+                    lambda it=item: memory_items.remove(it),
+                )
+            )
+        # 6. primary sections beyond the first 3, from the tail.
+        for section in reversed(primary_sections[3:]):
+            candidates.append(
+                (
+                    "primary",
+                    count_tokens(section),
+                    lambda s=section: primary_sections.remove(s),
+                )
+            )
+        # 7. LAST RESORT — pierce the top-3 protection from the bottom
+        #    (shed primary #3, then #2). The frozen acceptance contract for
+        #    this issue (check C7) drives this: with a small window the
+        #    system prompt + query + top-3 + short facts alone can exceed
+        #    the whole budget, and the one inviolable evidence item is the
+        #    TOP primary chunk ([S1]). Short facts stay protected here —
+        #    they are never worth more than the best document evidence.
+        for section in reversed(primary_sections[1:3]):
+            candidates.append(
+                (
+                    "primary",
+                    count_tokens(section),
+                    lambda s=section: primary_sections.remove(s),
+                )
+            )
+        # 8. LAST RESORT — the repeated-anchor passage. It duplicates the top
+        #    primary chunk's content, so shedding it loses zero unique
+        #    evidence while closing the last over-budget hole: without this
+        #    candidate the ladder could exhaust and still return a prompt
+        #    over the model window (PRR-005, PR #528 review).
+        if anchor_box is not None and anchor_box[0]:
+            candidates.append(
+                (
+                    "anchor",
+                    count_tokens(anchor_box[0]),
+                    lambda: anchor_box.__setitem__(0, None),
+                )
+            )
+
+        # Fast estimate pass: apply candidates (cheapest-value-first) while
+        # the running estimate exceeds the budget.
+        est = _total_tokens(None)
+        next_candidate = 0
+        while est > budget and next_candidate < len(candidates):
+            group, cost, remover = candidates[next_candidate]
+            next_candidate += 1
+            remover()
+            shed[group] += 1
+            est -= cost
+
+        # Exact verification pass: BPE boundaries make the estimate drift a
+        # few tokens; re-measure the real assembly (note included) and shed
+        # one more item at a time until it fits or nothing sheddable remains.
+        note = _build_note()
+        while True:
+            total = _total_tokens(note)
+            if total <= budget or next_candidate >= len(candidates):
+                break
+            group, _cost, remover = candidates[next_candidate]
+            next_candidate += 1
+            remover()
+            shed[group] += 1
+            note = _build_note()
+
+        self.last_budget_report = {
+            "enabled": True,
+            "budget_tokens": budget,
+            "prompt_tokens": total,
+            "shed_history": shed["history"],
+            "shed_supporting": shed["supporting"],
+            "shed_wiki": shed["wiki"],
+            "shed_kms": shed["kms"],
+            "shed_memories": shed["memories"],
+            "shed_primary": shed["primary"],
+            "shed_anchor": shed["anchor"],
+        }
+        if any(shed.values()):
+            # Counts only — never log user content.
+            logger.info(
+                "Prompt budget applied: shed %d history messages, %d "
+                "supporting sections, %d wiki entries, %d kms entries, %d "
+                "memories, %d primary sections, %d anchor repeats; final "
+                "prompt %d tokens within budget %d",
+                shed["history"],
+                shed["supporting"],
+                shed["wiki"],
+                shed["kms"],
+                shed["memories"],
+                shed["primary"],
+                shed["anchor"],
+                total,
+                budget,
+            )
+        return note
 
     def format_chunk(self, chunk: RAGSource, source_index: int) -> str:
         """Format a chunk for inclusion in the prompt context with a stable source label.

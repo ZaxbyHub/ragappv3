@@ -40,8 +40,11 @@ class TestEmbeddingBatching:
         self.mock_settings = self.mock_settings_patcher.start()
         self.mock_ssrf_patcher.start()
 
-        # Configure mock settings
-        self.mock_settings.ollama_embedding_url = "http://localhost:11434/api/embeddings"
+        # Configure mock settings. Adaptive batching speaks the batched-input
+        # dialect, which on Ollama is the MODERN /api/embed route (issue #511,
+        # EMBED-001: the legacy /api/embeddings route accepts only per-item
+        # {"model", "prompt"} bodies, so it no longer receives batch payloads).
+        self.mock_settings.ollama_embedding_url = "http://localhost:11434/api/embed"
         self.mock_settings.embedding_model = "nomic-embed-text"
         self.mock_settings.embedding_doc_prefix = ""
         self.mock_settings.embedding_query_prefix = ""
@@ -62,7 +65,7 @@ class TestEmbeddingBatching:
         self.mock_ssrf_patcher.stop()
 
     def _create_mock_response(self, embeddings):
-        """Create a mock HTTP response with embeddings (Ollama format)."""
+        """Create a mock HTTP response with embeddings (modern Ollama format)."""
         response = MagicMock()
         response.status_code = 200
         response.json.return_value = {

@@ -249,6 +249,10 @@ class LLMClient:
 
             message = data["choices"][0].get("message", {})
             content = message.get("content", "")
+            # Why the generation stopped — "length" means the answer was cut
+            # off by the token limit (issue #511 FULL-ENH-01). None when the
+            # provider omits the field.
+            finish_reason = data["choices"][0].get("finish_reason")
 
             # Log connection pool metrics
             self._log_pool_stats()
@@ -260,6 +264,7 @@ class LLMClient:
                 "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
                 "prompt_tokens_estimate": prompt_tokens,
                 "completion_tokens_estimate": self._approx_tokens(content),
+                "finish_reason": finish_reason,
                 "status": "ok",
             }
             return content
@@ -367,6 +372,12 @@ class LLMClient:
         # active anywhere.
         _content_emitted = False
 
+        # Last non-null finish_reason observed on the SSE choice deltas
+        # (issue #511 FULL-ENH-01). Providers send it on a final, often
+        # delta-only chunk (e.g. {"delta": {}, "finish_reason": "length"}),
+        # so it must be captured even when no content is streamed.
+        _finish_reason: Optional[str] = None
+
         stream_succeeded = False
         try:
             async with client.stream("POST", url, json=payload) as response:
@@ -419,6 +430,14 @@ class LLMClient:
                             # We never expose it to users — drop it entirely
                             # and only stream ``content`` deltas.
                             content = delta.get("content") or ""
+
+                            # finish_reason lives on the choice object, not
+                            # the delta — read it BEFORE the empty-content
+                            # skip below, otherwise the delta-only final
+                            # chunk that carries it is never inspected.
+                            chunk_finish_reason = choices[0].get("finish_reason")
+                            if chunk_finish_reason:
+                                _finish_reason = chunk_finish_reason
 
                             if not content:
                                 # Pure reasoning chunk (or empty) — skip.
@@ -610,6 +629,7 @@ class LLMClient:
                     "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
                     "prompt_tokens_estimate": prompt_tokens,
                     "completion_tokens_estimate": max(1, completion_chars // 4) if completion_chars else 0,
+                    "finish_reason": _finish_reason,
                     "status": "ok",
                     "stream": True,
                 }

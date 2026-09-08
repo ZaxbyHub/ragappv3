@@ -8,6 +8,7 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -20,6 +21,7 @@ except ImportError:  # pragma: no cover
 
 from app.config import settings
 from app.services.circuit_breaker import CircuitBreakerError, embeddings_cb
+from app.services.redis_io import redis_call
 from app.services.ssrf import assert_url_safe
 from app.utils.secrets import redact_url
 
@@ -100,6 +102,25 @@ class EmbeddingDimensionMismatchError(EmbeddingError):
         super().__init__(
             f"Embedding dimension mismatch: expected {expected}, got {got}"
         )
+
+
+@dataclass(frozen=True)
+class _EmbeddingRequestConfig:
+    """Frozen per-request embedding configuration (EMBED-002, issue #511).
+
+    Captured once at the start of an embed call (single or batch) so a
+    concurrent settings change (Settings UI write) cannot mix provider
+    dialects within one in-flight request: payload building, the request
+    URL, response parsing, cache-key fingerprints, and last_metrics all
+    read this snapshot instead of live settings.
+    """
+
+    url: str
+    mode: str  # "ollama" | "openai" | "tei"
+    ollama_style: Optional[str]  # "modern" | "legacy" | None (non-ollama)
+    model: str
+    doc_prefix: str
+    query_prefix: str
 
 
 class EmbeddingService:
@@ -273,18 +294,66 @@ class EmbeddingService:
         self._resolved_cache = (base_url, resolved)
         return resolved
 
+    @staticmethod
+    def _ollama_endpoint_style(url: str) -> Optional[str]:
+        """Classify an Ollama-mode endpoint's request dialect.
+
+        Modern Ollama exposes ``POST /api/embed`` accepting
+        ``{"model", "input"}`` bodies (scalar or list); legacy Ollama exposes
+        ``POST /api/embeddings`` accepting only per-item
+        ``{"model", "prompt"}`` bodies. Bare/default Ollama URLs resolve to
+        the legacy dialect. Returns ``None`` for URLs that are not
+        Ollama-mode endpoints (OpenAI/TEI paths).
+
+        Args:
+            url: The resolved embeddings endpoint URL.
+
+        Returns:
+            "modern", "legacy", or None for non-Ollama endpoints.
+        """
+        path = urlparse(url).path
+        if "/api/embeddings" in path:
+            return "legacy"
+        if path.rstrip("/").endswith("/api/embed"):
+            return "modern"
+        if "/v1/embeddings" in path or path.rstrip("/").endswith("/embed"):
+            # Explicit OpenAI / native TEI paths are not Ollama endpoints.
+            return None
+        # No explicit path (bare host) — the resolver appends the legacy
+        # /api/embeddings route for those, so treat them as legacy dialect.
+        return "legacy"
+
+    def _request_config(self) -> _EmbeddingRequestConfig:
+        """Capture the live embedding configuration as a frozen snapshot.
+
+        Reads every request-relevant setting exactly once (URL, provider
+        mode, Ollama dialect, model, prefixes) so the caller completes under
+        the configuration that issued the request even when an admin flips
+        settings mid-flight (EMBED-002, issue #511).
+        """
+        mode, url = self._resolved_url_and_mode()
+        return _EmbeddingRequestConfig(
+            url=url,
+            mode=mode,
+            ollama_style=self._ollama_endpoint_style(url) if mode == "ollama" else None,
+            model=self.embedding_model,
+            doc_prefix=self.embedding_doc_prefix,
+            query_prefix=self.embedding_query_prefix,
+        )
+
     def _detect_provider_mode(self, base_url: str) -> tuple:
         """
         Detect which embedding provider mode to use based on URL path.
 
         Detection strategy:
-        - If URL path includes '/api/embeddings' -> Ollama mode
+        - If URL path includes '/api/embeddings' -> legacy Ollama mode
+        - If URL path ends with '/api/embed' -> modern Ollama mode
         - If URL path includes '/v1/embeddings' -> OpenAI mode
         - If URL path ends with '/embed' -> native TEI mode
         - If no explicit embeddings path:
           - Port 1234 -> OpenAI mode (LM Studio default)
           - Port 8080 -> native TEI mode (Text Embeddings Inference default)
-          - Otherwise -> Ollama mode
+          - Otherwise -> Ollama mode (legacy dialect)
 
         Native TEI servers (HuggingFace Text Embeddings Inference) always expose
         the route ``POST /embed`` with an ``{"inputs": ...}`` payload, but only
@@ -292,6 +361,13 @@ class EmbeddingService:
         ``/v1/embeddings`` route. A bare ``host:8080`` URL is therefore resolved
         to the native ``/embed`` route so it works against any TEI build, while
         an explicit ``/v1/embeddings`` path still selects OpenAI mode.
+
+        Both Ollama generations keep the same "ollama" provider mode; the
+        modern-vs-legacy endpoint style is derived separately via
+        :meth:`_ollama_endpoint_style` because their request/response dialects
+        differ (EMBED-001, issue #511): modern ``/api/embed`` accepts
+        ``{"model", "input"}`` bodies, legacy ``/api/embeddings`` only
+        per-item ``{"model", "prompt"}`` bodies.
 
         Args:
             base_url: The configured embedding URL
@@ -304,7 +380,10 @@ class EmbeddingService:
 
         # Check for explicit paths
         if "/api/embeddings" in path:
-            # Already has Ollama path, use as-is
+            # Already has legacy Ollama path, use as-is
+            return ("ollama", base_url)
+        elif path.rstrip("/").endswith("/api/embed"):
+            # Modern Ollama /api/embed route, use as-is
             return ("ollama", base_url)
         elif "/v1/embeddings" in path:
             # Already has OpenAI path, use as-is
@@ -324,35 +403,46 @@ class EmbeddingService:
             base_url = base_url.rstrip("/") + "/embed"
             return ("tei", base_url)
         else:
-            # Default to Ollama mode
+            # Default to Ollama mode (legacy dialect)
             base_url = base_url.rstrip("/") + "/api/embeddings"
             return ("ollama", base_url)
 
-    def _build_payload(self, text: str) -> dict:
+    def _build_payload(self, text: str, config: Optional[_EmbeddingRequestConfig] = None) -> dict:
         """
         Build the API request payload based on provider mode.
 
         Args:
             text: The text to embed
+            config: Frozen request configuration. When omitted, a snapshot is
+                captured from the live settings (single-request callers).
 
         Returns:
             Dictionary payload for the API request
         """
-        if self.provider_mode == "openai":
-            return {"model": self.embedding_model, "input": text}
-        elif self.provider_mode == "tei":
+        if config is None:
+            config = self._request_config()
+        if config.mode == "openai":
+            return {"model": config.model, "input": text}
+        elif config.mode == "tei":
             # Native TEI serves a single model, so no model field is sent.
             return {"inputs": text}
-        else:  # ollama mode
-            return {"model": self.embedding_model, "prompt": text}
+        elif config.ollama_style == "modern":
+            # Modern /api/embed speaks the "input" dialect.
+            return {"model": config.model, "input": text}
+        else:  # legacy ollama mode
+            return {"model": config.model, "prompt": text}
 
-    def _extract_embedding(self, data) -> List[float]:
+    def _extract_embedding(
+        self, data, config: Optional[_EmbeddingRequestConfig] = None
+    ) -> List[float]:
         """
         Extract embedding vector from API response based on provider mode.
 
         Args:
             data: Parsed JSON response from the API. A mapping for OpenAI/Ollama
                 modes, or a list-of-lists for native TEI mode.
+            config: Frozen request configuration. When omitted, a snapshot is
+                captured from the live settings (single-request callers).
 
         Returns:
             List of float values representing the embedding vector
@@ -360,7 +450,9 @@ class EmbeddingService:
         Raises:
             EmbeddingError: If embedding cannot be extracted
         """
-        if self.provider_mode == "openai":
+        if config is None:
+            config = self._request_config()
+        if config.mode == "openai":
             # OpenAI format: data[0].embedding
             if "data" not in data:
                 logger.error(
@@ -378,7 +470,7 @@ class EmbeddingService:
                     "Embedding API response missing 'data[0].embedding' field in OpenAI mode"
                 )
                 raise EmbeddingError("Embedding API response is invalid")
-        elif self.provider_mode == "tei":
+        elif config.mode == "tei":
             # Native TEI returns a raw JSON array of embedding arrays, e.g.
             # [[...]]. Some TEI-compatible servers wrap it as
             # {"embeddings": [[...]]}; accept both shapes.
@@ -396,7 +488,20 @@ class EmbeddingService:
                     "Embedding API response first element is not a list in TEI mode"
                 )
                 raise EmbeddingError("Embedding API response is invalid")
-        else:  # ollama mode
+        elif config.ollama_style == "modern":
+            # Modern /api/embed returns {"embeddings": [[...]]} for scalar
+            # inputs; accept the legacy {"embedding": [...]} shape too.
+            rows = data.get("embeddings")
+            if isinstance(rows, list) and rows and isinstance(rows[0], list):
+                embedding = rows[0]
+            else:
+                embedding = data.get("embedding")
+                if embedding is None:
+                    logger.error(
+                        "Embedding API response missing 'embedding' field in Ollama mode"
+                    )
+                    raise EmbeddingError("Embedding API response is invalid")
+        else:  # legacy ollama mode
             # Ollama format: embedding
             embedding = data.get("embedding")
             if embedding is None:
@@ -407,7 +512,12 @@ class EmbeddingService:
 
         return embedding
 
-    async def _embed_with_prefix(self, text: str, prefix: str) -> List[float]:
+    async def _embed_with_prefix(
+        self,
+        text: str,
+        prefix: str,
+        config: Optional[_EmbeddingRequestConfig] = None,
+    ) -> List[float]:
         """
         Shared embedding logic with prefix application.
 
@@ -416,9 +526,16 @@ class EmbeddingService:
         It validates input, applies the provided prefix, checks cache, calls the
         embedding API, extracts the embedding, and stores it in cache.
 
+        The provider configuration is frozen into `config` at the start of the
+        call (EMBED-002): nothing after the first settings read re-reads live
+        settings, so the payload, request URL, response parsing, cache key, and
+        metrics all describe the configuration that issued the request.
+
         Args:
             text: The text to embed (plain text, without prefix applied).
             prefix: The prefix to prepend to the text (query or document prefix).
+            config: Frozen request configuration; captured from live settings
+                when omitted.
 
         Returns:
             List of float values representing the embedding vector.
@@ -426,6 +543,10 @@ class EmbeddingService:
         Raises:
             EmbeddingError: If the API request fails or returns non-200 status.
         """
+        # EMBED-002: freeze the provider configuration for this request.
+        if config is None:
+            config = self._request_config()
+
         # Validate text input
         if text is None:
             raise EmbeddingError("Text cannot be None")
@@ -435,9 +556,10 @@ class EmbeddingService:
         # Apply prefix to text
         text_to_embed = prefix + text if prefix else text
 
-        # Build cache key with model + url + prefix fingerprints
-        model_fingerprint = hashlib.md5(self.embedding_model.encode("utf-8")).hexdigest()[:8]
-        url_fingerprint = hashlib.md5(self.embeddings_url.encode("utf-8")).hexdigest()[:8]
+        # Build cache key with model + url + prefix fingerprints (from the
+        # frozen snapshot so the key describes the issuing configuration).
+        model_fingerprint = hashlib.md5(config.model.encode("utf-8")).hexdigest()[:8]
+        url_fingerprint = hashlib.md5(config.url.encode("utf-8")).hexdigest()[:8]
         prefix_fingerprint = hashlib.md5((prefix or "").encode("utf-8")).hexdigest()[:8]
         cache_key = f"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}"
 
@@ -446,11 +568,13 @@ class EmbeddingService:
         if cached is not None:
             return cached
 
-        # L2: check Redis shared cache
+        # L2: check Redis shared cache. redis_call runs the sync client call in
+        # a worker thread under a bounded timeout so a slow Redis degrades to
+        # a cache miss instead of stalling the event loop (FULL-ENH-04).
         redis_key = f"emb:{cache_key}"
         if self._redis_client is not None:
             try:
-                raw = self._redis_client.get(redis_key)
+                raw = await redis_call(self._redis_client.get, redis_key)
                 if raw is not None:
                     embedding = json.loads(raw)
                     self._redis_hits += 1
@@ -466,12 +590,12 @@ class EmbeddingService:
         _embed_started = time.perf_counter()
         try:
             response = await embeddings_cb(self._client.post)(
-                self.embeddings_url, json=self._build_payload(text_to_embed)
+                config.url, json=self._build_payload(text_to_embed, config)
             )
 
             if response.status_code != 200:
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {self.provider_mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
                 )
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
@@ -481,15 +605,15 @@ class EmbeddingService:
                 data = response.json()
             except ValueError as e:
                 logger.warning(
-                    f"Invalid JSON response from embedding API for {self.provider_mode} mode: {e}, response: {response.text}"
+                    f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {response.text}"
                 )
                 raise EmbeddingError("Invalid response from embedding service")
 
-            embedding = self._extract_embedding(data)
+            embedding = self._extract_embedding(data, config)
 
             self.last_metrics = {
-                "provider_url": self.embeddings_url,
-                "mode": self.provider_mode,
+                "provider_url": config.url,
+                "mode": config.mode,
                 "latency_ms": round((time.perf_counter() - _embed_started) * 1000, 2),
                 "status": "ok",
             }
@@ -501,7 +625,12 @@ class EmbeddingService:
             if self._redis_client is not None:
                 try:
                     redis_key = f"emb:{cache_key}"
-                    self._redis_client.setex(redis_key, self._cache_ttl, json.dumps(embedding))
+                    await redis_call(
+                        self._redis_client.setex,
+                        redis_key,
+                        self._cache_ttl,
+                        json.dumps(embedding),
+                    )
                 except Exception as e:
                     logger.warning("Redis L2 cache set failed (entry still in L1): %s", e)
 
@@ -510,34 +639,34 @@ class EmbeddingService:
         except CircuitBreakerError as e:
             logger.warning(
                 "Embedding request failed (mode=%s): circuit breaker open: %s",
-                self.provider_mode,
+                config.mode,
                 e,
             )
             self.last_metrics = {
-                "provider_url": self.embeddings_url,
-                "mode": self.provider_mode,
+                "provider_url": config.url,
+                "mode": config.mode,
                 "latency_ms": round((time.perf_counter() - _embed_started) * 1000, 2),
                 "status": "circuit_open",
             }
             raise EmbeddingError(f"Embedding service circuit breaker is open: {e}") from e
         except httpx.TimeoutException as e:
             logger.warning(
-                "Embedding request timed out (mode=%s): %s", self.provider_mode, e
+                "Embedding request timed out (mode=%s): %s", config.mode, e
             )
             self.last_metrics = {
-                "provider_url": self.embeddings_url,
-                "mode": self.provider_mode,
+                "provider_url": config.url,
+                "mode": config.mode,
                 "latency_ms": round((time.perf_counter() - _embed_started) * 1000, 2),
                 "status": "timeout",
             }
             raise EmbeddingError("Embedding request timed out") from e
         except httpx.HTTPError as e:
             logger.warning(
-                "Embedding HTTP error (mode=%s): %s", self.provider_mode, e
+                "Embedding HTTP error (mode=%s): %s", config.mode, e
             )
             self.last_metrics = {
-                "provider_url": self.embeddings_url,
-                "mode": self.provider_mode,
+                "provider_url": config.url,
+                "mode": config.mode,
                 "latency_ms": round((time.perf_counter() - _embed_started) * 1000, 2),
                 "status": "http_error",
             }
@@ -646,8 +775,13 @@ class EmbeddingService:
         if not texts:
             return [] if fail_fast else ([], [])
 
+        # EMBED-002: freeze the provider configuration once for the whole
+        # batch call so every per-batch request, payload, and parse runs under
+        # the configuration that issued the call.
+        config = self._request_config()
+
         # Input validation guards
-        prefix_len = len(self.embedding_doc_prefix) if self.embedding_doc_prefix else 0
+        prefix_len = len(config.doc_prefix) if config.doc_prefix else 0
         effective_max = self.MAX_TEXT_LENGTH - prefix_len
 
         for idx, text in enumerate(texts):
@@ -670,8 +804,8 @@ class EmbeddingService:
         # Apply document prefix to all texts
         texts_to_embed = []
         for text in texts:
-            if self.embedding_doc_prefix:
-                texts_to_embed.append(self.embedding_doc_prefix + text)
+            if config.doc_prefix:
+                texts_to_embed.append(config.doc_prefix + text)
             else:
                 texts_to_embed.append(text)
 
@@ -680,9 +814,17 @@ class EmbeddingService:
         sem = asyncio.Semaphore(settings.embedding_concurrent_batches)
 
         async def _process_batch(batch_texts: List[str]) -> List[List[float]]:
+            if config.mode == "ollama" and config.ollama_style == "legacy":
+                # Legacy fan-out: the per-call semaphore bounds the fan-out as
+                # one unit; each per-item request acquires the process-wide
+                # batch admission semaphore inside _embed_legacy_batch. The
+                # parent must NOT hold a global slot here — the items take
+                # their own, and asyncio.Semaphore is not reentrant.
+                async with sem:
+                    return await self._embed_batch_api(batch_texts, config)
             async with sem:
                 async with self._get_global_batch_semaphore():
-                    return await self._embed_batch_api(batch_texts)
+                    return await self._embed_batch_api(batch_texts, config)
 
         batch_tasks = []
         for i in range(0, len(texts_to_embed), batch_size):
@@ -713,15 +855,24 @@ class EmbeddingService:
                     all_embeddings_with_nones.extend(result)
             return all_embeddings_with_nones, failed_indices
 
-    async def _embed_batch_api(self, texts: List[str]) -> List[List[float]]:
+    async def _embed_batch_api(
+        self, texts: List[str], config: Optional[_EmbeddingRequestConfig] = None
+    ) -> List[List[float]]:
         """
         Send a batch of texts to the embedding API in a single request.
 
         Implements adaptive batching: automatically retries with smaller sub-batches
         when llama.cpp token overflow errors occur.
 
+        On the legacy Ollama dialect there is no native batch route: the texts
+        are fanned out as one ``{"model", "prompt"}`` request per item (see
+        :meth:`_embed_legacy_batch`), preserving input order and per-item
+        retry semantics (EMBED-001, issue #511).
+
         Args:
             texts: List of texts to embed (already prefixed).
+            config: Frozen request configuration; captured from live settings
+                when omitted (single-request callers).
 
         Returns:
             List of embedding vectors in the same order as input texts.
@@ -731,10 +882,63 @@ class EmbeddingService:
         """
         max_retries = settings.embedding_batch_max_retries
         min_sub_size = settings.embedding_batch_min_sub_size
+        if config is None:
+            config = self._request_config()
+
+        if config.mode == "ollama" and config.ollama_style == "legacy":
+            return await self._embed_legacy_batch(texts, config, max_retries, min_sub_size)
 
         return await self._embed_batch_with_retry(
-            self._client, texts, max_retries, min_sub_size
+            self._client, texts, max_retries, min_sub_size, config=config
         )
+
+    async def _embed_legacy_batch(
+        self,
+        texts: List[str],
+        config: _EmbeddingRequestConfig,
+        max_retries: int,
+        min_sub_size: int,
+    ) -> List[List[float]]:
+        """
+        Fan a batch out over the legacy Ollama ``/api/embeddings`` route.
+
+        The legacy endpoint accepts exactly one ``{"model", "prompt"}`` body
+        per request, so one request is issued per text and gathered
+        concurrently; results are concatenated in input order. Each item is a
+        single-item ``_embed_batch_with_retry`` call, so it keeps the existing
+        single-item timeout/backoff (and token-overflow split) retry
+        semantics. The per-call semaphore bounds the fan-out as one unit and
+        each item request acquires the process-wide batch admission semaphore
+        on its own (it is an HTTP request).
+
+        A failed item raises, which embed_batch's existing batch-failure
+        handling turns into fail_fast=true errors or recorded batch indices —
+        identical to today's batch semantics.
+
+        Args:
+            texts: List of texts to embed (already prefixed).
+            config: Frozen request configuration for the whole fan-out.
+            max_retries: Maximum retry attempts per item.
+            min_sub_size: Minimum sub-batch size for overflow splits.
+
+        Returns:
+            List of embedding vectors in the same order as input texts.
+
+        Raises:
+            EmbeddingError: If any item fails after all retries.
+        """
+        if not texts:
+            return []
+
+        async def _embed_one(text: str) -> List[float]:
+            async with self._get_global_batch_semaphore():
+                single = await self._embed_batch_with_retry(
+                    self._client, [text], max_retries, min_sub_size, config=config
+                )
+                return single[0]
+
+        gathered = await asyncio.gather(*(_embed_one(text) for text in texts))
+        return list(gathered)
 
     def _log_pool_stats(self, client: httpx.AsyncClient) -> None:
         """Log connection pool and cache statistics for monitoring."""
@@ -790,6 +994,7 @@ class EmbeddingService:
         max_retries: int,
         min_sub_size: int,
         retry_count: int = 0,
+        config: Optional[_EmbeddingRequestConfig] = None,
     ) -> List[List[float]]:
         """
         Internal method that handles the retry logic for adaptive batching.
@@ -799,6 +1004,10 @@ class EmbeddingService:
             texts: List of texts to embed
             max_retries: Maximum number of retry attempts
             min_sub_size: Minimum sub-batch size before giving up
+            retry_count: Current retry attempt count
+            config: Frozen request configuration; captured from live settings
+                when omitted (single-request callers). Every retry reuses the
+                same snapshot the original call was issued under (EMBED-002).
 
         Returns:
             List of embedding vectors
@@ -810,20 +1019,35 @@ class EmbeddingService:
         if not texts:
             return []
 
+        if config is None:
+            config = self._request_config()
+
         try:
             # Build payload with array of inputs
-            if self.provider_mode == "openai":
-                payload = {"model": self.embedding_model, "input": texts}
-            elif self.provider_mode == "tei":
+            if config.mode == "openai":
+                payload = {"model": config.model, "input": texts}
+            elif config.mode == "tei":
                 # Native TEI accepts a list under "inputs" and returns a raw
                 # array of embedding arrays in the same order.
                 payload = {"inputs": texts}
-            else:  # ollama mode
-                payload = {"model": self.embedding_model, "input": texts}
+            elif config.ollama_style == "modern":
+                # Modern /api/embed accepts a list under "input" and returns
+                # {"embeddings": [[...]]} in the same order.
+                payload = {"model": config.model, "input": texts}
+            else:
+                # Legacy ollama mode: single-prompt bodies only. The per-item
+                # fan-out in _embed_legacy_batch guarantees exactly one text
+                # here (the overflow/timeout retry helpers preserve that
+                # invariant when splitting single items).
+                if len(texts) != 1:
+                    raise EmbeddingError(
+                        "Legacy Ollama /api/embeddings accepts one prompt per request"
+                    )
+                payload = {"model": config.model, "prompt": texts[0]}
 
             try:
                 response = await embeddings_cb(client.post)(
-                    self.embeddings_url, json=payload
+                    config.url, json=payload
                 )
             except CircuitBreakerError as e:
                 raise EmbeddingError(f"Embedding service circuit breaker is open: {e}")
@@ -833,16 +1057,16 @@ class EmbeddingService:
                 error_text = response.text.lower()
                 if self._is_token_overflow_error(error_text):
                     logger.warning(
-                        f"Token overflow error for {self.provider_mode} mode: {response.text}"
+                        f"Token overflow error for {config.mode} mode: {response.text}"
                     )
                     # Handle overflow using the shared helper
                     return await self._handle_overflow_retry(
-                        client, texts, max_retries, min_sub_size, retry_count
+                        client, texts, max_retries, min_sub_size, retry_count, config
                     )
 
             if response.status_code != 200:
                 logger.warning(
-                    f"Embedding API returned status {response.status_code} for {self.provider_mode} mode: {response.text}"
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
                 )
                 raise EmbeddingError(
                     f"Embedding API returned status {response.status_code}"
@@ -851,10 +1075,10 @@ class EmbeddingService:
             data = response.json()
 
             # Extract embeddings from response
-            if self.provider_mode == "openai":
+            if config.mode == "openai":
                 # OpenAI format: data[].embedding
                 embeddings = [item["embedding"] for item in data["data"]]
-            elif self.provider_mode == "tei":
+            elif config.mode == "tei":
                 # Native TEI returns a raw JSON array of embedding arrays. Some
                 # TEI-compatible servers wrap it as {"embeddings": [[...]]};
                 # accept both shapes.
@@ -863,7 +1087,7 @@ class EmbeddingService:
                 )
                 if not isinstance(embeddings, list):
                     logger.error(
-                        f"Unexpected response format for {self.provider_mode} mode: "
+                        f"Unexpected response format for {config.mode} mode: "
                         f"expected a list or {{'embeddings': [...]}}, got "
                         f"{type(data).__name__}"
                     )
@@ -877,7 +1101,7 @@ class EmbeddingService:
                     embeddings = [data["embedding"]]
                 else:
                     logger.error(
-                        f"Unexpected response format for {self.provider_mode} mode: {data.keys()}"
+                        f"Unexpected response format for {config.mode} mode: {data.keys()}"
                     )
                     raise EmbeddingError("Unexpected response from embedding service")
 
@@ -897,7 +1121,7 @@ class EmbeddingService:
             # Validate embedding count matches input count
             if len(embeddings) != len(texts):
                 logger.error(
-                    f"Embedding count mismatch for {self.provider_mode} mode: expected {len(texts)}, got {len(embeddings)}"
+                    f"Embedding count mismatch for {config.mode} mode: expected {len(texts)}, got {len(embeddings)}"
                 )
                 raise EmbeddingError(
                     f"Embedding count mismatch: expected {len(texts)}, got {len(embeddings)}"
@@ -910,7 +1134,7 @@ class EmbeddingService:
 
         except httpx.TimeoutException as e:
             logger.warning(
-                f"Embedding batch request timed out for {self.provider_mode} mode: {e}"
+                f"Embedding batch request timed out for {config.mode} mode: {e}"
             )
             # For multi-item batches: split and retry each half so the server
             # gets smaller workloads — same recovery strategy as token overflow.
@@ -920,7 +1144,7 @@ class EmbeddingService:
                     f"(attempt {retry_count + 1}/{max_retries})"
                 )
                 return await self._handle_overflow_retry(
-                    client, texts, max_retries, min_sub_size, retry_count
+                    client, texts, max_retries, min_sub_size, retry_count, config
                 )
             # For single-item batches: simple backoff retry
             if retry_count < max_retries:
@@ -930,7 +1154,7 @@ class EmbeddingService:
                 )
                 await asyncio.sleep(backoff_delay)
                 return await self._embed_batch_with_retry(
-                    client, texts, max_retries, min_sub_size, retry_count + 1
+                    client, texts, max_retries, min_sub_size, retry_count + 1, config
                 )
             raise EmbeddingError(
                 f"Embedding request timed out after {max_retries} retries"
@@ -953,16 +1177,16 @@ class EmbeddingService:
                 error_msg
             ) or self._is_token_overflow_error(response_text):
                 logger.warning(
-                    f"Token overflow error for {self.provider_mode} mode: {response_text}"
+                    f"Token overflow error for {config.mode} mode: {response_text}"
                 )
                 # Handle overflow using the shared helper
                 return await self._handle_overflow_retry(
-                    client, texts, max_retries, min_sub_size, retry_count
+                    client, texts, max_retries, min_sub_size, retry_count, config
                 )
             else:
                 # Not a token overflow error, re-raise
                 logger.error(
-                    f"Embedding batch HTTP error for {self.provider_mode} mode: {e}"
+                    f"Embedding batch HTTP error for {config.mode} mode: {e}"
                 )
                 raise EmbeddingError("Embedding batch HTTP error occurred")
 
@@ -1058,6 +1282,7 @@ class EmbeddingService:
         max_retries: int,
         min_sub_size: int,
         retry_count: int,
+        config: Optional[_EmbeddingRequestConfig] = None,
     ) -> List[List[float]]:
         """
         Helper method to handle overflow retry logic with bounded retries and minimum split size.
@@ -1071,6 +1296,9 @@ class EmbeddingService:
             max_retries: Maximum number of retry attempts
             min_sub_size: Minimum sub-batch size before giving up
             retry_count: Current retry attempt count
+            config: Frozen request configuration; captured from live settings
+                when omitted. Retries keep the configuration the original call
+                was issued under (EMBED-002).
 
         Returns:
             List of embedding vectors
@@ -1078,10 +1306,13 @@ class EmbeddingService:
         Raises:
             EmbeddingError: If bounded retries exhausted or split size too small
         """
+        if config is None:
+            config = self._request_config()
+
         # Check if we've exhausted retries
         if retry_count > max_retries:
             logger.error(
-                f"Max retries ({max_retries}) exhausted for embedding batch in {self.provider_mode} mode"
+                f"Max retries ({max_retries}) exhausted for embedding batch in {config.mode} mode"
             )
             raise EmbeddingError(
                 f"Max retries ({max_retries}) exhausted for embedding batch"
@@ -1094,7 +1325,7 @@ class EmbeddingService:
             # Check if text is too short to split - raise actionable error
             if len(single_text) < self.MIN_SPLIT_CHARS:
                 logger.warning(
-                    f"Single input ({len(single_text)} chars) is below minimum split threshold ({self.MIN_SPLIT_CHARS}) in {self.provider_mode} mode"
+                    f"Single input ({len(single_text)} chars) is below minimum split threshold ({self.MIN_SPLIT_CHARS}) in {config.mode} mode"
                 )
                 raise EmbeddingError(
                     f"Single input ({len(single_text)} chars) exceeds token limit and is too short to split. "
@@ -1130,6 +1361,7 @@ class EmbeddingService:
                 max_retries,
                 min_sub_size,
                 retry_count=retry_count + 1,
+                config=config,
             )
             right_embeddings = await self._embed_batch_with_retry(
                 client,
@@ -1137,6 +1369,7 @@ class EmbeddingService:
                 max_retries,
                 min_sub_size,
                 retry_count=retry_count + 1,
+                config=config,
             )
 
             # Mean-pool the two embeddings into one
@@ -1150,7 +1383,7 @@ class EmbeddingService:
         # Check if we've reached minimum split size
         if len(texts) <= min_sub_size:
             logger.warning(
-                f"Cannot split batch further in {self.provider_mode} mode: {len(texts)} items below minimum split size ({min_sub_size})"
+                f"Cannot split batch further in {config.mode} mode: {len(texts)} items below minimum split size ({min_sub_size})"
             )
             raise EmbeddingError(
                 f"Cannot split batch further: {len(texts)} items below minimum split size"
@@ -1167,10 +1400,10 @@ class EmbeddingService:
 
         # Process left and right sub-batches concurrently, then concatenate in order
         left_task = self._embed_batch_with_retry(
-            client, left_texts, max_retries, min_sub_size, retry_count=retry_count + 1
+            client, left_texts, max_retries, min_sub_size, retry_count=retry_count + 1, config=config
         )
         right_task = self._embed_batch_with_retry(
-            client, right_texts, max_retries, min_sub_size, retry_count=retry_count + 1
+            client, right_texts, max_retries, min_sub_size, retry_count=retry_count + 1, config=config
         )
 
         try:
@@ -1180,10 +1413,10 @@ class EmbeddingService:
             # Fallback: sequential if gather fails
             logger.warning("Parallel overflow retry failed, falling back to sequential")
             left_embeddings = await self._embed_batch_with_retry(
-                client, left_texts, max_retries, min_sub_size, retry_count=retry_count + 1
+                client, left_texts, max_retries, min_sub_size, retry_count=retry_count + 1, config=config
             )
             right_embeddings = await self._embed_batch_with_retry(
-                client, right_texts, max_retries, min_sub_size, retry_count=retry_count + 1
+                client, right_texts, max_retries, min_sub_size, retry_count=retry_count + 1, config=config
             )
             return left_embeddings + right_embeddings
 

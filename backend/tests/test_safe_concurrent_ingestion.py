@@ -178,7 +178,9 @@ async def test_embedding_global_semaphore_limits_batches_across_documents():
     first_entered = asyncio.Event()
     release_first = asyncio.Event()
 
-    async def fake_embed_batch_api(self, texts):
+    # _embed_batch_api carries the frozen per-request config snapshot since
+    # issue #511 (EMBED-002); the fake accepts and ignores it.
+    async def fake_embed_batch_api(self, texts, config=None):
         nonlocal active, max_active
         active += 1
         max_active = max(max_active, active)

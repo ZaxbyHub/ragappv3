@@ -43,6 +43,15 @@ class SettingsUpdate(BaseModel):
     reranker_top_n: Optional[int] = None
     initial_retrieval_top_k: Optional[int] = None
 
+    # Retrieval scheduling + prompt budget (issue #511)
+    retrieval_consolidated_rerank: Optional[bool] = None
+    retrieval_kms_overlap: Optional[bool] = None
+    prompt_budget_enabled: Optional[bool] = None
+    model_context_tokens: Optional[int] = None
+    prompt_reserve_output_tokens: Optional[int] = None
+    redis_io_timeout_seconds: Optional[float] = None
+    context_distiller_max_sentences: Optional[int] = None
+
     # Hybrid search config
     hybrid_search_enabled: Optional[bool] = None
     hybrid_alpha: Optional[float] = None
@@ -245,6 +254,34 @@ class SettingsUpdate(BaseModel):
     def validate_reranker_top_n(cls, v):
         if v is not None and v <= 0:
             raise ValueError("reranker_top_n must be a positive integer")
+        return v
+
+    @field_validator("model_context_tokens")
+    @classmethod
+    def validate_model_context_tokens(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("model_context_tokens must be a positive integer")
+        return v
+
+    @field_validator("prompt_reserve_output_tokens")
+    @classmethod
+    def validate_prompt_reserve_output_tokens(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("prompt_reserve_output_tokens must be >= 0")
+        return v
+
+    @field_validator("redis_io_timeout_seconds")
+    @classmethod
+    def validate_redis_io_timeout_seconds(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("redis_io_timeout_seconds must be > 0")
+        return v
+
+    @field_validator("context_distiller_max_sentences")
+    @classmethod
+    def validate_context_distiller_max_sentences(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("context_distiller_max_sentences must be a positive integer")
         return v
 
     @field_validator("initial_retrieval_top_k")
@@ -460,6 +497,14 @@ ALLOWED_FIELDS = [
     "reranking_enabled",
     "reranker_top_n",
     "initial_retrieval_top_k",
+    # Retrieval scheduling + prompt budget (issue #511)
+    "retrieval_consolidated_rerank",
+    "retrieval_kms_overlap",
+    "prompt_budget_enabled",
+    "model_context_tokens",
+    "prompt_reserve_output_tokens",
+    "redis_io_timeout_seconds",
+    "context_distiller_max_sentences",
     "hybrid_search_enabled",
     "hybrid_alpha",
     "ollama_embedding_url",
@@ -708,6 +753,15 @@ class SettingsResponse(BaseModel):
     hybrid_search_enabled: bool = True
     hybrid_alpha: float = 0.5
 
+    # Retrieval scheduling + prompt budget (issue #511)
+    retrieval_consolidated_rerank: bool = True
+    retrieval_kms_overlap: bool = True
+    prompt_budget_enabled: bool = False
+    model_context_tokens: int = 8192
+    prompt_reserve_output_tokens: int = 2048
+    redis_io_timeout_seconds: float = 1.0
+    context_distiller_max_sentences: int = 600
+
     # Wiki / Knowledge Compiler config
     wiki_enabled: bool = True
     wiki_compile_on_ingest: bool = True
@@ -831,6 +885,14 @@ def _build_settings_dict() -> dict:
         "reranking_enabled": settings.reranking_enabled,
         "reranker_top_n": settings.reranker_top_n,
         "initial_retrieval_top_k": settings.initial_retrieval_top_k,
+        # Retrieval scheduling + prompt budget (issue #511)
+        "retrieval_consolidated_rerank": settings.retrieval_consolidated_rerank,
+        "retrieval_kms_overlap": settings.retrieval_kms_overlap,
+        "prompt_budget_enabled": settings.prompt_budget_enabled,
+        "model_context_tokens": settings.model_context_tokens,
+        "prompt_reserve_output_tokens": settings.prompt_reserve_output_tokens,
+        "redis_io_timeout_seconds": settings.redis_io_timeout_seconds,
+        "context_distiller_max_sentences": settings.context_distiller_max_sentences,
         "hybrid_search_enabled": settings.hybrid_search_enabled,
         "hybrid_alpha": settings.hybrid_alpha,
         # Wiki / Knowledge Compiler
