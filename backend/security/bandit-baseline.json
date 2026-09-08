@@ -4398,7 +4398,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "2710         # Create a deterministic seed from the text\n2711         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n2712         random.seed(seed_value)\n",
+      "code": "2711         # Create a deterministic seed from the text\n2712         seed_value = int(hashlib.md5(text.encode(\"utf-8\")).hexdigest(), 16) % (2**32)\n2713         random.seed(seed_value)\n",
       "col_offset": 25,
       "end_col_offset": 58,
       "filename": "backend/app/services/vector_store.py",
@@ -4409,9 +4409,9 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 2711,
+      "line_number": 2712,
       "line_range": [
-        2711
+        2712
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
