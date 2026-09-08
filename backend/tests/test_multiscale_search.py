@@ -15,7 +15,6 @@ import asyncio
 import os
 import shutil
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -251,12 +250,18 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(max_concurrent, 4)
 
     @pytest.mark.asyncio
-    async def test_semaphore_parallel_execution_timing(self):
+    async def test_semaphore_admits_parallel_execution(self):
         """
         Test that semaphore enables parallel execution.
-        With 6 tasks of 0.01s each, total wall-clock should be < 0.06s (proving parallel execution).
+        With 6 tasks gated by a 4-permit semaphore, at least 2 tasks must be
+        in-flight at once (proving parallel execution). Deliberately asserts on
+        scheduling observability rather than wall-clock time: a time bound is a
+        load-dependent flake (see issue #524).
         """
         store = self.create_vector_store()
+
+        max_concurrent = 0
+        current_concurrent = 0
 
         async def mock_search_single_scale(
             embedding,
@@ -269,8 +274,15 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
             hybrid_alpha=0.5,
             **kwargs,
         ):
+            nonlocal max_concurrent, current_concurrent
+
+            current_concurrent += 1
+            max_concurrent = max(max_concurrent, current_concurrent)
+
             # Each task takes 0.01s
             await asyncio.sleep(0.01)
+
+            current_concurrent -= 1
             return [{"id": f"doc_{scale}", "text": f"From {scale}", "_rrf_score": 0.5}]
 
         store._search_single_scale = mock_search_single_scale
@@ -289,20 +301,18 @@ class TestMultiScaleSemaphoreConcurrency(unittest.IsolatedAsyncioTestCase):
             mock_settings.multi_scale_chunk_sizes = "256,512,768,1024,1536,2048"
             mock_settings.search_semaphore_timeout_seconds = 30.0
 
-            start_time = time.perf_counter()
             await store.search(
                 embedding=[0.0] * self.embedding_dim,
                 limit=10,
             )
-            elapsed_time = time.perf_counter() - start_time
 
-        # With parallel execution (semaphore=4), 6 tasks should take ~0.02s (2 batches of 4)
-        # With serial execution, it would take ~0.06s (6 * 0.01)
-        # Allow some overhead, but should be well under 0.06s
-        self.assertLess(
-            elapsed_time,
-            0.06,
-            f"Parallel execution should complete in < 0.06s, but took {elapsed_time:.3f}s",
+        # With a 4-permit semaphore and 6 scales, the first batch admits 4
+        # concurrent tasks; strictly serial execution would never exceed 1.
+        self.assertGreaterEqual(
+            max_concurrent,
+            2,
+            "Semaphore should admit parallel execution "
+            f"(observed max concurrent scale searches: {max_concurrent})",
         )
 
     @pytest.mark.asyncio
