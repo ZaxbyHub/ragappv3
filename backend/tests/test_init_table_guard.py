@@ -4,7 +4,9 @@ Tests for table_just_created tracking and deferred-index logging in init_table()
 This module tests:
 1. table_just_created = False initially
 2. table_just_created = True when brand new table is created
-3. table_just_created = True when table is recreated via overwrite path
+3. A transient open_table failure raises VectorStoreConnectionError and
+   preserves the existing table (issue #512 VECTOR-001a no-drop contract;
+   previously the table was dropped and recreated via mode='overwrite')
 4. table_just_created remains False when opening existing table
 5. Deferred-index log fires only when table_just_created is True
 6. Deferred-index log does NOT fire when opening existing table
@@ -19,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.services.vector_store import (
     VECTOR_INDEX_MIN_ROWS,
     VectorStore,
+    VectorStoreConnectionError,
 )
 
 
@@ -71,12 +74,17 @@ class TestTableJustCreatedTracking(unittest.IsolatedAsyncioTestCase):
             "Deferred-index log should fire when brand new table is created",
         )
 
-    async def test_deferred_log_fires_when_table_recreated_via_overwrite(self):
+    async def test_open_failure_raises_and_preserves_table(self):
         """
-        Test that deferred-index log fires when table is recreated via overwrite path.
+        Test that an open_table failure raises and never drops/recreates.
 
-        This tests the code path where 'chunks' table exists but open_table fails,
-        triggering drop_table and create_table with mode='overwrite'.
+        Realigned to the non-destructive init contract (issue #512
+        VECTOR-001a): when 'chunks' exists but open_table raises a transient
+        OSError/RuntimeError/ValueError, init_table must raise
+        VectorStoreConnectionError and make NO drop_table/create_table calls —
+        the authoritative table is preserved. The old behavior (drop +
+        create(mode='overwrite') + deferred-index log) destroyed the index
+        over a transient error.
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -84,16 +92,10 @@ class TestTableJustCreatedTracking(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=["chunks"])
 
-        # open_table fails, triggering overwrite path
+        # open_table fails transiently
         mock_db.open_table = AsyncMock(side_effect=RuntimeError("Stale table"))
         mock_db.drop_table = AsyncMock()
-
-        # Mock table for overwrite creation
-        mock_table = MagicMock()
-        mock_table.list_indices = AsyncMock(return_value=[])
-        mock_table.create_index = AsyncMock()
-
-        mock_db.create_table = AsyncMock(return_value=mock_table)
+        mock_db.create_table = AsyncMock()
 
         store.db = mock_db
 
@@ -104,21 +106,13 @@ class TestTableJustCreatedTracking(unittest.IsolatedAsyncioTestCase):
                 mock_settings.vector_metric = "cosine"
                 mock_settings.write_lock_timeout_seconds = 30
 
-                with patch("app.services.vector_store.FTS") as mock_fts:
-                    mock_fts.return_value = MagicMock()
+                with self.assertRaises(VectorStoreConnectionError) as ctx:
+                    await store.init_table(embedding_dim=384)
 
-                    with patch("app.services.vector_store.logger") as mock_logger:
-                        await store.init_table(embedding_dim=384)
-
-        # Verify deferred-index log was called (table_just_created was True)
-        log_calls = [str(call) for call in mock_logger.info.call_args_list]
-        deferred_log_found = any(
-            "vector index deferred" in str(call).lower() for call in log_calls
-        )
-        self.assertTrue(
-            deferred_log_found,
-            "Deferred-index log should fire when table is recreated via overwrite",
-        )
+        self.assertIn("Stale table", str(ctx.exception))
+        self.assertIn("preserved", str(ctx.exception))
+        mock_db.drop_table.assert_not_called()
+        mock_db.create_table.assert_not_called()
 
     async def test_deferred_log_does_not_fire_when_opening_existing_table(self):
         """

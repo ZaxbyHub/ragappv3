@@ -60,42 +60,45 @@ logger = logging.getLogger(__name__)
 def _detect_stored_dim(lancedb_path: Path) -> int | None:
     """Return the embedding dimension stored in the LanceDB chunks table, or None.
 
-    Uses pyarrow directly rather than lancedb to avoid async complexity in a
-    plain sync script.
+    Primary path uses the INSTALLED LanceDB API (issue #512 VECTOR-006) —
+    it mirrors production ``VectorStore._get_expected_embedding_dim``:
+    connect, open the "chunks" table and read the fixed-size-list length
+    from the arrow schema. A raw ``pyarrow.dataset`` read is kept only as
+    a fallback for environments without the lancedb package.
     """
     lance_dir = lancedb_path / "chunks.lance"
     if not lance_dir.exists():
         return None
 
+    # Primary: installed LanceDB sync API. pyarrow.dataset cannot parse the
+    # table layout written by current lancedb versions, which is exactly how
+    # a compatible index used to be mis-detected as "unknown dimension".
+    try:
+        import lancedb as _ldb  # type: ignore
+
+        db = _ldb.connect(str(lancedb_path))
+        if "chunks" not in db.table_names():
+            return None
+        tbl = db.open_table("chunks")
+        schema = tbl.schema
+        embedding_field = schema.field("embedding")
+        # LanceDB stores fixed-size list embeddings as FixedSizeList type
+        if hasattr(embedding_field.type, "list_size"):
+            return int(embedding_field.type.list_size)
+    except Exception as exc:
+        logger.debug("Could not read stored embedding dim via lancedb: %s", exc)
+
+    # Fallback: raw pyarrow dataset read (no lancedb package available).
     try:
         import pyarrow.dataset as ds
 
         dataset = ds.dataset(str(lance_dir), format="lance")
         schema = dataset.schema
         embedding_field = schema.field("embedding")
-        # LanceDB stores fixed-size list embeddings as FixedSizeList type
-        if hasattr(embedding_field.type, "list_size"):
-            return embedding_field.type.list_size
-        # Fallback: list type length from value_type hint
         if hasattr(embedding_field.type, "list_size"):
             return embedding_field.type.list_size
     except Exception as exc:
         logger.debug("Could not read stored embedding dim via pyarrow: %s", exc)
-
-    # Fallback: read first row via lancedb sync API
-    try:
-        import lancedb as _ldb  # type: ignore
-        db = _ldb.connect(str(lancedb_path))
-        if "chunks" not in db.table_names():
-            return None
-        tbl = db.open_table("chunks")
-        df = tbl.to_pandas(columns=["embedding"]).head(1)
-        if not df.empty:
-            first_emb = df["embedding"].iloc[0]
-            if hasattr(first_emb, "__len__"):
-                return len(first_emb)
-    except Exception as exc:
-        logger.debug("Fallback dimension detection failed: %s", exc)
 
     return None
 
@@ -205,7 +208,29 @@ def run_migration(
 
     if stored_dim is None:
         if lancedb_path.exists() and any(lancedb_path.iterdir()):
-            logger.info("Could not detect stored embedding dimension — assuming migration needed.")
+            # VECTOR-006 (issue #512): an undetectable dimension on a
+            # NON-EMPTY index used to be treated as "assuming migration
+            # needed" and wiped an index that may have been perfectly
+            # compatible. Refuse instead: nothing destructive runs until an
+            # operator has diagnosed the index (or explicitly --force'd).
+            if force:
+                print(
+                    "WARNING: --force set — proceeding despite undetectable "
+                    "stored dimension.\n"
+                )
+            else:
+                print(
+                    "ERROR: Could not detect the stored embedding dimension of "
+                    "the existing LanceDB index at:\n"
+                    f"  {lancedb_path}\n"
+                    "The index directory is not empty, so NO wipe was performed "
+                    "and NO file statuses were reset.\n"
+                    "Diagnose the index before re-running: open it with the "
+                    "installed lancedb and inspect the 'chunks' table schema "
+                    "(e.g. lancedb.connect(path).open_table('chunks').schema). "
+                    "If the index is genuinely stale, re-run with --force.\n"
+                )
+                raise SystemExit(3)
         else:
             logger.info("LanceDB directory is empty or absent — no migration needed.")
             if not force:

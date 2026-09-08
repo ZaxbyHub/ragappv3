@@ -376,6 +376,24 @@ async def lifespan(app: FastAPI):
             "Database migration failed: %s — app will start with degraded database state",
             e,
         )
+    # Operator visibility (issue #512 recovery journal): one summary line
+    # with the latest migration/recovery outcomes so a prior failed or
+    # recovered migration is visible without querying the journal table.
+    try:
+        from app.models.migration_journal import latest_outcomes
+
+        _recent = latest_outcomes(str(settings.sqlite_path), limit=3)
+        if _recent:
+            logger.info(
+                "Migration journal (latest %d): %s",
+                len(_recent),
+                "; ".join(
+                    f"{row['migration_name']}[{row['phase']}:{row['outcome']}]"
+                    for row in _recent
+                ),
+            )
+    except Exception as e:  # pragma: no cover - journal is best-effort
+        logger.debug("Could not read migration journal at startup: %s", e)
     _load_persisted_settings(str(settings.sqlite_path))
 
     # Seed the application DB pool BEFORE any other get_pool() caller can run.
