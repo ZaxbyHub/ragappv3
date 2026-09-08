@@ -1134,6 +1134,37 @@ class Settings(BaseSettings):
             raise ValueError("RRF k must be >= 1")
         return v
 
+    @field_validator(
+        "model_context_tokens",
+        "context_distiller_max_sentences",
+        mode="after",
+    )
+    @classmethod
+    def validate_issue511_positive_ints(cls, v: int) -> int:
+        """Positive-int guards for issue #511 settings. context_distiller_max_sentences<=0
+        would disable the O(n^2) dedup input cap, and a non-positive model context
+        window is meaningless — fail fast at startup/env-parse instead."""
+        if v <= 0:
+            raise ValueError("issue #511 int settings must be > 0")
+        return v
+
+    @field_validator("prompt_reserve_output_tokens", mode="after")
+    @classmethod
+    def validate_prompt_reserve_output_tokens(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("prompt_reserve_output_tokens must be >= 0")
+        return v
+
+    @field_validator("redis_io_timeout_seconds", mode="after")
+    @classmethod
+    def validate_redis_io_timeout_seconds(cls, v: float) -> float:
+        """A value <= 0 makes asyncio.wait_for time out every optional Redis
+        cache call instantly, silently degrading embeddings/query-transform
+        caching to always-miss — fail fast at startup instead."""
+        if v <= 0:
+            raise ValueError("redis_io_timeout_seconds must be > 0")
+        return v
+
     @field_validator("reranker_timeout_seconds", mode="after")
     @classmethod
     def validate_reranker_timeout_seconds(cls, v: float) -> float:

@@ -256,6 +256,34 @@ class SettingsUpdate(BaseModel):
             raise ValueError("reranker_top_n must be a positive integer")
         return v
 
+    @field_validator("model_context_tokens")
+    @classmethod
+    def validate_model_context_tokens(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("model_context_tokens must be a positive integer")
+        return v
+
+    @field_validator("prompt_reserve_output_tokens")
+    @classmethod
+    def validate_prompt_reserve_output_tokens(cls, v):
+        if v is not None and v < 0:
+            raise ValueError("prompt_reserve_output_tokens must be >= 0")
+        return v
+
+    @field_validator("redis_io_timeout_seconds")
+    @classmethod
+    def validate_redis_io_timeout_seconds(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("redis_io_timeout_seconds must be > 0")
+        return v
+
+    @field_validator("context_distiller_max_sentences")
+    @classmethod
+    def validate_context_distiller_max_sentences(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("context_distiller_max_sentences must be a positive integer")
+        return v
+
     @field_validator("initial_retrieval_top_k")
     @classmethod
     def validate_initial_retrieval_top_k(cls, v):

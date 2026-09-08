@@ -416,12 +416,14 @@ class PromptBuilderService:
         # Anchor best chunk: repeat top-ranked chunk at the end of the context region.
         # Mitigates LLM "lost-in-the-middle" effect. Skipped when the top chunk already
         # dominates the budget (> 50% of context_max_tokens tokens).
-        anchor_section: Optional[str] = None
+        # Boxed so the budget pass (tier 8) can shed the anchor when the
+        # protected set alone exceeds the window (PRR-005, PR #528 review).
+        anchor_box: List[Optional[str]] = [None]
         if settings.anchor_best_chunk and primary_chunks:
             top_chunk = primary_chunks[0]
             top_chunk_tokens = max(1, int(len(top_chunk.text) / 3.5))
             if top_chunk_tokens <= settings.context_max_tokens * 0.5:
-                anchor_section = self.format_chunk(top_chunk, 1)
+                anchor_box[0] = self.format_chunk(top_chunk, 1)
 
         def _compose_user_content(omission_note: Optional[str]) -> str:
             """Assemble the final user message content from the current
@@ -452,9 +454,9 @@ class PromptBuilderService:
                 user_content_parts.append(
                     "No relevant documents found for this query."
                 )
-            if anchor_section:
+            if anchor_box[0]:
                 user_content_parts.append(
-                    f"[BEST MATCH — repeated for emphasis]\n{anchor_section}"
+                    f"[BEST MATCH — repeated for emphasis]\n{anchor_box[0]}"
                 )
             if omission_note:
                 user_content_parts.append(omission_note)
@@ -488,6 +490,7 @@ class PromptBuilderService:
                 kms_items=kms_items,
                 memory_items=memory_items,
                 compose=_compose_user_content,
+                anchor_box=anchor_box,
             )
 
         messages: List[Dict[str, str]] = [
@@ -533,6 +536,7 @@ class PromptBuilderService:
         kms_items: List[Tuple[str, bool]],
         memory_items: List[Tuple[str, bool]],
         compose: Callable[[Optional[str]], str],
+        anchor_box: Optional[List[Optional[str]]] = None,
     ) -> Optional[str]:
         """Shed lowest-value sections in place until the assembled prompt
         (system + history + all context sections + memories + query) fits
@@ -564,6 +568,7 @@ class PromptBuilderService:
             "kms": 0,
             "memories": 0,
             "primary": 0,
+            "anchor": 0,
         }
 
         def _build_note() -> Optional[str]:
@@ -578,6 +583,8 @@ class PromptBuilderService:
                 bits.append(f"{entries} wiki/knowledge-base entries")
             if shed["memories"]:
                 bits.append(f"{shed['memories']} memories")
+            if shed["anchor"]:
+                bits.append("1 repeated-anchor passage")
             if not bits:
                 return None
             return (
@@ -667,6 +674,19 @@ class PromptBuilderService:
                     lambda s=section: primary_sections.remove(s),
                 )
             )
+        # 8. LAST RESORT — the repeated-anchor passage. It duplicates the top
+        #    primary chunk's content, so shedding it loses zero unique
+        #    evidence while closing the last over-budget hole: without this
+        #    candidate the ladder could exhaust and still return a prompt
+        #    over the model window (PRR-005, PR #528 review).
+        if anchor_box is not None and anchor_box[0]:
+            candidates.append(
+                (
+                    "anchor",
+                    count_tokens(anchor_box[0]),
+                    lambda: anchor_box.__setitem__(0, None),
+                )
+            )
 
         # Fast estimate pass: apply candidates (cheapest-value-first) while
         # the running estimate exceeds the budget.
@@ -703,20 +723,22 @@ class PromptBuilderService:
             "shed_kms": shed["kms"],
             "shed_memories": shed["memories"],
             "shed_primary": shed["primary"],
+            "shed_anchor": shed["anchor"],
         }
         if any(shed.values()):
             # Counts only — never log user content.
             logger.info(
                 "Prompt budget applied: shed %d history messages, %d "
                 "supporting sections, %d wiki entries, %d kms entries, %d "
-                "memories, %d primary sections; final prompt %d tokens "
-                "within budget %d",
+                "memories, %d primary sections, %d anchor repeats; final "
+                "prompt %d tokens within budget %d",
                 shed["history"],
                 shed["supporting"],
                 shed["wiki"],
                 shed["kms"],
                 shed["memories"],
                 shed["primary"],
+                shed["anchor"],
                 total,
                 budget,
             )

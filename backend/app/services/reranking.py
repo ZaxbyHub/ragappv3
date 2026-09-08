@@ -55,10 +55,17 @@ def _iter_local_model_ids():
 
 
 def _safe_sigmoid(logit: float) -> float:
-    """Unconditional sigmoid with overflow protection for BGE-M3 logits."""
+    """Unconditional sigmoid with overflow protection for BGE-M3 logits.
+
+    A NaN logit (malformed/hostile TEI response) maps to 0.0 — the lowest
+    relevance — instead of poisoning the score with NaN, which would break
+    every downstream numeric comparison silently (PRR-010, PR #528 review).
+    """
     if logit > 709:
         return 1.0
     if logit < -709:
+        return 0.0
+    if math.isnan(logit):
         return 0.0
     return 1.0 / (1.0 + math.exp(-logit))
 
@@ -80,9 +87,10 @@ def _get_local_model(model_id: str):
             _local_models.move_to_end(model_id)
             return model
 
-        # Double-check pattern: re-check after (re)acquiring the lock above;
-        # the miss path constructs while holding the lock so racing threads
-        # cannot construct duplicates.
+        # Construct while holding the lock so racing threads cannot build
+        # duplicate instances for the same identity. (Single check under the
+        # lock — there is no lock-free fast path, so this is not classic
+        # double-checked locking.)
         try:
             from sentence_transformers import CrossEncoder
             logger.info(f"Loading local CrossEncoder reranker: {model_id}")

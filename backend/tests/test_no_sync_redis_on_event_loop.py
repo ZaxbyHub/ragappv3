@@ -29,6 +29,9 @@ import pytest
 
 SERVICES_DIR = Path(__file__).resolve().parents[1] / "app" / "services"
 
+# Assumption: these attribute names hold SYNC redis clients in this repo.
+# A future async client reusing these names would false-positive this AST
+# guard — rename the attribute or extend the matching here (PRR-020d).
 _SYNC_CLIENT_ATTRS = {"_redis_client", "_redis"}
 _BANNED_METHODS = {"get", "set", "setex", "delete", "expire", "hget", "hset"}
 

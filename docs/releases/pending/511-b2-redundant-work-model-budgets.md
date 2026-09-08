@@ -69,7 +69,8 @@
   primary evidence chunk are never shed — primary evidence #2/#3 are shed
   only as a last resort when the protected set alone would exceed the window)
   and the prompt carries a visible omission
-  note plus a structured budget report for tracing. Default OFF: prompts are
+  note plus an in-process structured budget report
+  (`PromptBuilderService.last_budget_report`) for diagnostics. Default OFF: prompts are
   built exactly as before.
 
 - **Event-loop hygiene (FULL-ENH-03/04)** —

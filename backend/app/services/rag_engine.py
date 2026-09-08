@@ -1777,6 +1777,11 @@ class RAGEngine:
         # Stream or non-stream LLM response. Capture the assembled
         # content so citation labels can be parsed for the trace.
         assembled_response: List[str] = []
+        # PRR-004 (PR #528 review): the LLM helpers snapshot finish_reason
+        # synchronously at stream completion into this per-call dict, so the
+        # post-yield read cannot observe a concurrent request's metrics on
+        # the shared client singleton.
+        llm_finish_reason_capture: Dict[str, Optional[str]] = {}
 
         # FR-015: Signal "Drafting" stage — the LLM is now generating tokens.
         yield {"type": "stage", "stage": STAGE_DRAFTING}
@@ -1785,6 +1790,7 @@ class RAGEngine:
             async for chunk in self._stream_llm_response(
                 messages, client=active_client, max_tokens=effective_max_tokens,
                 temperature=temperature,
+                finish_reason_capture=llm_finish_reason_capture,
             ):
                 chunk_type = chunk.get("type", "unknown")
                 logger.debug("[query] Yielding '%s' chunk (stream)", chunk_type)
@@ -1795,6 +1801,7 @@ class RAGEngine:
             async for chunk in self._get_llm_response(
                 messages, client=active_client, max_tokens=effective_max_tokens,
                 temperature=temperature,
+                finish_reason_capture=llm_finish_reason_capture,
             ):
                 chunk_type = chunk.get("type", "unknown")
                 logger.debug("[query] Yielding '%s' chunk (non-stream)", chunk_type)
@@ -1807,9 +1814,14 @@ class RAGEngine:
         # token budget) from the active client's metrics: log it at INFO
         # (value only, no content) and record it on the trace. No new SSE
         # event types — trace/log surfacing only.
-        llm_finish_reason = (
-            getattr(active_client, "last_metrics", None) or {}
-        ).get("finish_reason")
+        llm_finish_reason = llm_finish_reason_capture.get(
+            "finish_reason"
+        )
+        if llm_finish_reason is None:
+            # Fallback for mocked clients that bypass the helper capture.
+            llm_finish_reason = (
+                getattr(active_client, "last_metrics", None) or {}
+            ).get("finish_reason")
         if llm_finish_reason:
             logger.info("LLM finish_reason=%s", llm_finish_reason)
             trace.finish_reason = llm_finish_reason
@@ -2858,6 +2870,7 @@ class RAGEngine:
         client: Optional[LLMClient] = None,
         max_tokens: int = 32768,
         temperature: Optional[float] = None,
+        finish_reason_capture: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stream LLM response chunks.
 
@@ -2908,6 +2921,10 @@ class RAGEngine:
                 if candidate is not target:
                     metrics["fallback_from"] = getattr(target, "base_url", None)
                 self._last_llm_metrics = metrics
+                if finish_reason_capture is not None:
+                    finish_reason_capture["finish_reason"] = metrics.get(
+                        "finish_reason"
+                    )
                 return
             except LLMError as exc:
                 last_error = exc
@@ -2929,6 +2946,7 @@ class RAGEngine:
         client: Optional[LLMClient] = None,
         max_tokens: int = 32768,
         temperature: Optional[float] = None,
+        finish_reason_capture: Optional[Dict[str, Any]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Get non-streaming LLM response.
 
@@ -2966,6 +2984,10 @@ class RAGEngine:
                         getattr(candidate, "base_url", "<unknown>"),
                     )
                 self._last_llm_metrics = metrics
+                if finish_reason_capture is not None:
+                    finish_reason_capture["finish_reason"] = metrics.get(
+                        "finish_reason"
+                    )
                 yield {"type": "content", "content": content}
                 return
             except LLMError as exc:
