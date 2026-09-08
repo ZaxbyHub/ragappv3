@@ -6,7 +6,8 @@ Tests cover:
 2. On success: all chunks have _rerank_score in [0, 1] (sigmoid-normalized)
 3. On exception/fallback: returns (chunks[:n], False) — no _rerank_score
 4. Empty chunks → returns ([], True)
-5. Single chunk → returns (chunks, True)
+5. Single chunk → returns (chunks, False): scoring is bypassed (RERANK-003,
+   issue #511)
 6. Sigmoid normalization properties (via _safe_sigmoid)
 7. Unconditional sigmoid: all scores are normalized, no double-norm prevention
 8. _rerank_via_endpoint and _rerank_local both use unconditional _safe_sigmoid
@@ -188,18 +189,25 @@ async def test_rerank_empty_chunks_returns_empty_list_true(service_with_url):
 
 
 # ---------------------------------------------------------------------------
-# 5. Single chunk → returns (chunks, True) without calling reranker
+# 5. Single chunk → bypasses the reranker and reports success=False
+#    (RERANK-003, issue #511: a scoring bypass must not claim success —
+#    otherwise downstream consumers label an unscored chunk's raw distance
+#    with rerank-score semantics).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_rerank_single_chunk_bypasses_reranker(service_with_url, sample_chunks):
-    """A single chunk is returned immediately without invoking the reranker."""
+    """A single chunk is returned immediately without invoking the reranker.
+
+    Scoring is bypassed, so the call reports success=False with the chunk
+    unchanged and no fabricated _rerank_score.
+    """
     with patch("httpx.AsyncClient") as MockClient:
         MockClient.return_value = MagicMock()
 
         chunks, success = await service_with_url.rerank("test query", [sample_chunks[0]])
 
-    assert success is True
+    assert success is False
     assert len(chunks) == 1
     assert chunks[0]["text"] == "The quick brown fox"
     assert "_rerank_score" not in chunks[0], (

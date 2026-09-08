@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 
 from app.config import settings
 from app.services.llm_client import LLMClient
+from app.services.redis_io import redis_call
 
 logger = logging.getLogger(__name__)
 
@@ -263,10 +264,11 @@ class QueryTransformer:
         # cached step-back value is never mutated by HyDE enable/disable.
         cached_variants: Optional[List[Tuple[str, str]]] = None
 
-        # Try Redis cache first
+        # Try Redis cache first (bounded, off-loop — see redis_call; a
+        # timeout or error degrades to the LRU/LLM path below).
         if self._redis_client:
             try:
-                cached = self._redis_client.get(cache_key)
+                cached = await redis_call(self._redis_client.get, cache_key)
                 if cached:
                     logger.debug("Cache HIT (Redis) for query transformation")
                     cached_variants = json.loads(cached)
@@ -330,13 +332,14 @@ class QueryTransformer:
                 )
                 variants = [('original', query)]
 
-        # Store in Redis if available
+        # Store in Redis if available (bounded, off-loop)
         if self._redis_client:
             try:
-                self._redis_client.setex(
+                await redis_call(
+                    self._redis_client.setex,
                     cache_key,
                     settings.query_transform_cache_ttl_sec,
-                    json.dumps(variants)
+                    json.dumps(variants),
                 )
             except Exception as e:
                 logger.warning("Redis cache set failed: %s", e)
@@ -351,10 +354,12 @@ class QueryTransformer:
             hyde_cache_key = self._make_cache_key(self._cache_model, "hyde", query)
             hyde_passage = None
 
-            # Try Redis first
+            # Try Redis first (bounded, off-loop)
             if self._redis_client:
                 try:
-                    cached_hyde = self._redis_client.get(hyde_cache_key)
+                    cached_hyde = await redis_call(
+                        self._redis_client.get, hyde_cache_key
+                    )
                     if cached_hyde:
                         hyde_passage = json.loads(cached_hyde)
                 except Exception as e:
@@ -367,13 +372,14 @@ class QueryTransformer:
             if hyde_passage is None:
                 hyde_passage = await self.generate_hyde(query)
                 if hyde_passage:
-                    # Store in Redis if available
+                    # Store in Redis if available (bounded, off-loop)
                     if self._redis_client:
                         try:
-                            self._redis_client.setex(
+                            await redis_call(
+                                self._redis_client.setex,
                                 hyde_cache_key,
                                 settings.query_transform_cache_ttl_sec,
-                                json.dumps(hyde_passage)
+                                json.dumps(hyde_passage),
                             )
                         except Exception as e:
                             logger.warning("Redis HyDE cache set failed: %s", e)
@@ -691,7 +697,7 @@ class QueryPlanner:
         cache_key = self._make_cache_key(query)
         if self._redis_client:
             try:
-                cached = self._redis_client.get(cache_key)
+                cached = await redis_call(self._redis_client.get, cache_key)
                 if cached:
                     logger.debug("QueryPlanner cache HIT (Redis) for query '%s'", query[:40])
                     plan = json.loads(cached)
@@ -769,10 +775,11 @@ class QueryPlanner:
             )
             sub_queries = sub_queries[:MAX_PLAN_SUBQUERIES]
 
-        # Cache the result
+        # Cache the result (Redis bounded/off-loop, then LRU)
         if self._redis_client:
             try:
-                self._redis_client.setex(
+                await redis_call(
+                    self._redis_client.setex,
                     cache_key,
                     settings.query_transform_cache_ttl_sec,
                     json.dumps(sub_queries),

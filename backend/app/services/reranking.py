@@ -3,16 +3,20 @@ Cross-encoder reranking service for KnowledgeVault.
 
 Supports two backends:
   1. TEI endpoint (if reranker_url is set): POST {url}/rerank
-     Expected request:  {"query": str, "texts": [str], "top_n": int, "truncate": true}
-     Expected response: [{"index": int, "score": float}, ...]
+     Expected request:  {"query": str, "texts": [str], "top_n": int,
+                         "truncate": true, "raw_scores": true}
+     Expected response: [{"index": int, "score": float}, ...] (raw logits;
+                         the client sigmoid-normalizes them exactly once)
   2. Local sentence-transformers CrossEncoder (if reranker_url is empty).
-     Model is loaded lazily on first use and cached.
+     Models are loaded lazily on first use and cached per model identity
+     (LRU, capped) so distinct reranker models never share a scorer.
 """
 
 import asyncio
 import logging
 import math
 import threading
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -23,8 +27,31 @@ from app.services.ssrf import assert_url_safe
 
 logger = logging.getLogger(__name__)
 
-_local_model = None  # lazy-loaded CrossEncoder instance
+# Model-identity-keyed cache of loaded CrossEncoder instances (RERANK-001,
+# issue #511). Keyed by model_id so two configured reranker identities never
+# share a scorer, LRU-ordered, and capped so at most _LOCAL_MODEL_CACHE_MAX
+# models stay resident (bounded memory; eviction just drops the reference).
+_LOCAL_MODEL_CACHE_MAX = 2
+_local_models: "OrderedDict[str, Any]" = OrderedDict()
 _model_lock = threading.Lock()  # lock for thread-safe lazy initialization
+
+
+def _reset_local_model_cache() -> None:
+    """Drop every cached local reranker model (test/support helper)."""
+    with _model_lock:
+        _local_models.clear()
+
+
+def _loaded_local_model_count() -> int:
+    """Return how many local reranker models are currently resident."""
+    with _model_lock:
+        return len(_local_models)
+
+
+def _iter_local_model_ids():
+    """Return a snapshot of the cached reranker model identities, LRU order."""
+    with _model_lock:
+        return list(_local_models.keys())
 
 
 def _safe_sigmoid(logit: float) -> float:
@@ -37,24 +64,47 @@ def _safe_sigmoid(logit: float) -> float:
 
 
 def _get_local_model(model_id: str):
-    """Lazy-load and cache a sentence-transformers CrossEncoder."""
-    global _local_model
-    if _local_model is None:
-        with _model_lock:
-            # Double-check after acquiring lock
-            if _local_model is None:
-                try:
-                    from sentence_transformers import CrossEncoder
-                    logger.info(f"Loading local CrossEncoder reranker: {model_id}")
-                    _local_model = CrossEncoder(model_id)
-                    logger.info("Local reranker loaded successfully")
-                except ImportError:
-                    raise RuntimeError(
-                        "sentence-transformers is not installed. "
-                        "Either set RERANKER_URL to a TEI endpoint, or add "
-                        "'sentence-transformers>=2.7.0' to requirements.txt."
-                    )
-    return _local_model
+    """Lazy-load and cache a sentence-transformers CrossEncoder per model identity.
+
+    The cache is keyed by ``model_id`` (LRU, capped at
+    ``_LOCAL_MODEL_CACHE_MAX`` resident models): a second configured identity
+    loads its own instance instead of silently reusing the first one, and a
+    repeat call for an already-loaded identity never reloads. Loads happen
+    under ``_model_lock`` with a double-check so concurrent first loads of
+    one identity construct exactly one instance.
+    """
+    with _model_lock:
+        model = _local_models.get(model_id)
+        if model is not None:
+            # Touch recency so the LRU eviction order reflects use.
+            _local_models.move_to_end(model_id)
+            return model
+
+        # Double-check pattern: re-check after (re)acquiring the lock above;
+        # the miss path constructs while holding the lock so racing threads
+        # cannot construct duplicates.
+        try:
+            from sentence_transformers import CrossEncoder
+            logger.info(f"Loading local CrossEncoder reranker: {model_id}")
+            model = CrossEncoder(model_id)
+            logger.info("Local reranker loaded successfully")
+        except ImportError:
+            raise RuntimeError(
+                "sentence-transformers is not installed. "
+                "Either set RERANKER_URL to a TEI endpoint, or add "
+                "'sentence-transformers>=2.7.0' to requirements.txt."
+            )
+
+        _local_models[model_id] = model
+        # Evict least-recently-used identities beyond the cap. Unloading is
+        # just dropping the reference — the GC reclaims the weights.
+        while len(_local_models) > _LOCAL_MODEL_CACHE_MAX:
+            evicted_id, _ = _local_models.popitem(last=False)
+            logger.info(
+                "Evicted least-recently-used local reranker model from cache: %s",
+                evicted_id,
+            )
+        return model
 
 
 class RerankingService:
@@ -146,7 +196,11 @@ class RerankingService:
         if not chunks:
             return ([], True)
         if len(chunks) <= 1:
-            return (chunks, True)
+            # Scoring is bypassed for a single chunk, so report success=False:
+            # a lone chunk has no relative ordering to compute and must not be
+            # labeled with rerank-score semantics downstream (RERANK-003,
+            # issue #511). The chunk is returned unchanged, no _rerank_score.
+            return (chunks, False)
 
         texts = [c.get("text", "") for c in chunks]
 
@@ -199,7 +253,8 @@ class RerankingService:
 
         TEI format:
           POST /rerank
-          Body: {"query": str, "texts": [str], "top_n": int, "truncate": true}
+          Body: {"query": str, "texts": [str], "top_n": int, "truncate": true,
+                 "raw_scores": true}
           Response: [{"index": int, "score": float}, ...]
         """
         url = f"{self.reranker_url}/rerank"
@@ -208,6 +263,14 @@ class RerankingService:
             "texts": texts,
             "top_n": top_n,
             "truncate": True,
+            # Score protocol (RERANK-004, issue #511): TEI's default config
+            # returns sigmoid-normalized 0..1 scores, but servers can be
+            # configured to return raw logits. Requesting raw_scores=true
+            # makes the response explicit logits, so the single client-side
+            # _safe_sigmoid below converts exactly once regardless of the
+            # server's default normalization — the same single-conversion
+            # semantics as the local CrossEncoder path.
+            "raw_scores": True,
         }
         await asyncio.to_thread(assert_url_safe, self.reranker_url)
         if self._http_client is None:

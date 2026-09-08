@@ -96,6 +96,11 @@ class RAGTrace:
     vision_empty_response: int = 0  # issue #480 (B2)
     vision_latency_ms: Optional[float] = None
     vision_payload_bytes: int = 0
+    # Issue #511 B2 (FULL-ENH-01): provider-reported generation stop reason
+    # (e.g. "length" — the answer was cut by the output-token budget) read
+    # from the active LLM client's last_metrics after generation. Additive
+    # field: None when the provider did not report one.
+    finish_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -152,6 +157,7 @@ class RAGTrace:
             "vision_empty_response": self.vision_empty_response,
             "vision_latency_ms": self.vision_latency_ms,
             "vision_payload_bytes": self.vision_payload_bytes,
+            "finish_reason": self.finish_reason,
         }
 
     def to_log_dict(self) -> Dict[str, Any]:

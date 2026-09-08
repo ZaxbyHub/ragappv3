@@ -21,6 +21,62 @@ from app.services.llm_client import LLMClient, LLMError
 
 logger = logging.getLogger(__name__)
 
+# Hard caps for per-field list enrichment values (unchanged from the original
+# truncation lengths).
+_MAX_QUESTIONS = 5
+_MAX_ENTITIES = 10
+_MAX_ALIASES = 10
+
+
+def _validated_summary(value: Any, chunk_id: str) -> str:
+    """Coerce an LLM-provided summary to str ("" on non-str input).
+
+    A non-str value logs a warning naming the field but never aborts the
+    remaining fields.
+    """
+    if isinstance(value, str):
+        return value
+    logger.warning(
+        "Enrichment field 'summary' for chunk %s is malformed (got %s, expected a "
+        "string); dropping the value",
+        chunk_id,
+        type(value).__name__,
+    )
+    return ""
+
+
+def _validated_str_list(value: Any, cap: int, field_name: str, chunk_id: str) -> List[str]:
+    """Validate an LLM-provided list field independently of its siblings.
+
+    Accepts only a list of strings: non-list values are dropped to [] and
+    non-string entries are removed; the surviving entries are capped at
+    ``cap``. A malformed value logs a warning naming the field but never
+    aborts the remaining fields (FULL-ENH-05, issue #511).
+    """
+    if not isinstance(value, list):
+        if value is not None:
+            logger.warning(
+                "Enrichment field %r for chunk %s is malformed (got %s, expected a "
+                "list of strings); dropping the value",
+                field_name,
+                chunk_id,
+                type(value).__name__,
+            )
+        return []
+    kept = [entry for entry in value if isinstance(entry, str)]
+    dropped = len(value) - len(kept)
+    if dropped:
+        logger.warning(
+            "Enrichment field %r for chunk %s contained %d non-string entr%s; "
+            "dropping %s",
+            field_name,
+            chunk_id,
+            dropped,
+            "y" if dropped == 1 else "ies",
+            "it" if dropped == 1 else "them",
+        )
+    return kept[:cap]
+
 
 def _header_escape(value: str) -> str:
     """Escape a header field for safe interpolation outside XML wrappers.
@@ -179,15 +235,33 @@ class ChunkEnrichmentService:
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
             data = json.loads(cleaned)
+            if not isinstance(data, dict):
+                # A valid JSON document that is not an object carries no
+                # field data — treat it as a parse failure (existing error
+                # path for non-dict payloads).
+                raise TypeError(
+                    f"expected a JSON object, got {type(data).__name__}"
+                )
 
+            # Each field is validated/coerced independently: a malformed
+            # field is dropped (with a warning naming it) and never aborts
+            # the remaining fields (FULL-ENH-05, issue #511).
             if "summary" in self._fields:
-                enrichment.summary = data.get("summary", "")
+                enrichment.summary = _validated_summary(
+                    data.get("summary", ""), chunk_id
+                )
             if "questions" in self._fields:
-                enrichment.questions = data.get("questions", [])[:5]
+                enrichment.questions = _validated_str_list(
+                    data.get("questions", []), _MAX_QUESTIONS, "questions", chunk_id
+                )
             if "entities" in self._fields:
-                enrichment.entities = data.get("entities", [])[:10]
+                enrichment.entities = _validated_str_list(
+                    data.get("entities", []), _MAX_ENTITIES, "entities", chunk_id
+                )
             if "aliases" in self._fields:
-                enrichment.aliases = data.get("aliases", [])[:10]
+                enrichment.aliases = _validated_str_list(
+                    data.get("aliases", []), _MAX_ALIASES, "aliases", chunk_id
+                )
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             logger.warning(
                 "Failed to parse enrichment JSON for chunk %s: %s", chunk_id, e

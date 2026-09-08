@@ -307,7 +307,14 @@ class TestRerankingService(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rerank_success)
 
     async def test_rerank_with_endpoint_single_chunk(self):
-        """Test reranking with single chunk returns unchanged."""
+        """Test reranking with single chunk returns unchanged.
+
+        Scoring is bypassed for a single chunk, so the call reports
+        success=False with the chunk unchanged and no fabricated
+        _rerank_score (issue #511, RERANK-003): success=True would make
+        downstream consumers label the unscored chunk's raw distance with
+        rerank-score semantics.
+        """
         service = RerankingService(
             reranker_url="http://localhost:8000",
             reranker_model="cross-encoder/ms-marco-MiniLM-L-6-v2",
@@ -317,9 +324,10 @@ class TestRerankingService(unittest.IsolatedAsyncioTestCase):
         chunks = [{"text": "Single chunk"}]
         reranked_chunks, rerank_success = await service.rerank("test query", chunks)
 
-        # Single chunk bypasses reranker: returns (chunks, True)
+        # Single chunk bypasses reranker: returns (chunks, False)
         self.assertEqual(reranked_chunks, chunks)
-        self.assertTrue(rerank_success)
+        self.assertFalse(rerank_success)
+        self.assertNotIn("_rerank_score", reranked_chunks[0])
 
     async def test_rerank_local_fallback(self):
         """Test reranking with local sentence-transformers fallback."""

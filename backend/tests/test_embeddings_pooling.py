@@ -289,11 +289,13 @@ class TestEmbedBatchApiUsesClient:
         """embed_batch should use self._client for all API calls."""
         service = EmbeddingService()
 
-        # Create mock responses for multiple batches
+        # Legacy Ollama dialect fixture (the fixture URL): the mock answers
+        # every per-item fan-out request with the single-embedding shape
+        # {"embedding": [...]} (issue #511, EMBED-001).
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
-            "embeddings": [[0.1] * 768, [0.2] * 768]
+            "embedding": [0.1] * 768
         }
 
         # Track the client instance before the call

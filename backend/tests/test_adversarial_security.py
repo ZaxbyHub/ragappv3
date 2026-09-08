@@ -370,6 +370,14 @@ class TestEmbeddingsAdversarial:
     @pytest.mark.asyncio
     async def test_embed_batch_with_oversized_batch(self, mock_settings):
         """Attack: Batch size exceeding MAX_BATCH_SIZE."""
+        # This mock models a BATCHED provider endpoint (one request carrying
+        # many texts, one embedding per text back). On Ollama that dialect
+        # belongs to the modern /api/embed route — the legacy /api/embeddings
+        # route the fixture's bare URL resolves to accepts only per-item
+        # {"model", "prompt"} bodies (issue #511, EMBED-001). Point this test
+        # at the modern route so the clamping safeguard below is exercised
+        # against the dialect its mock actually speaks.
+        mock_settings.ollama_embedding_url = "http://localhost:11434/api/embed"
         service = EmbeddingService()
 
         # Create batch larger than MAX_BATCH_SIZE

@@ -1,5 +1,6 @@
 """Context distillation: sentence-level deduplication and optional LLM synthesis."""
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -194,6 +195,44 @@ def _is_no_content_response(result: str) -> bool:
     return any(pat.search(stripped) for pat in _REFUSAL_PATTERNS)
 
 
+def _greedy_dedup(
+    embeddings: List[List[float]],
+    sentence_map: List[tuple],
+    threshold: float,
+) -> List[bool]:
+    """Pure sync greedy pairwise-cosine dedup (issue #511 FULL-ENH-03).
+
+    Kept as a module-level sync function so ``_deduplicate`` can run it via
+    ``asyncio.to_thread`` — the O(K^2) comparison loop must never run on the
+    event loop (a 1200-sentence batch blocks it for ~0.5-0.9s and stalls every
+    concurrent request). Returns an ``is_dup`` flag list parallel to
+    ``embeddings``: sentence i is a near-duplicate of some earlier KEPT
+    sentence. Sentences whose ``sentence_map[i][0] == 0`` (first/highest-ranked
+    source) are always kept.
+    """
+    kept_embeddings: List[List[float]] = []
+    is_dup: List[bool] = [False] * len(embeddings)
+
+    for i, emb in enumerate(embeddings):
+        src_idx, _ = sentence_map[i]
+        # First source's sentences are always kept (highest-ranked chunk wins)
+        if src_idx == 0:
+            kept_embeddings.append(emb)
+            continue
+        # Check similarity against all kept sentences
+        dup = False
+        for kept_emb in kept_embeddings:
+            if _cosine_similarity(emb, kept_emb) > threshold:
+                dup = True
+                break
+        if dup:
+            is_dup[i] = True
+        else:
+            kept_embeddings.append(emb)
+
+    return is_dup
+
+
 class ContextDistiller:
     """
     Post-retrieval context distillation.
@@ -267,9 +306,23 @@ class ContextDistiller:
         Returns DistillResult with the deduplicated sources and per-sentence
         provenance (char offsets in original source text).
 
+        The input is capped at ``settings.context_distiller_max_sentences``
+        BEFORE dedup (issue #511 FULL-ENH-03): a pathological retrieval set
+        cannot grow the O(K^2) loop (or the embedding batch) without bound.
+        Earliest sources' sentences are kept first (the list is already in
+        source order, so truncation preserves the current ordering
+        semantics); one INFO line records the truncation. Under-cap inputs
+        behave exactly as before.
+
+        The greedy comparison loop itself runs in a worker thread
+        (``asyncio.to_thread``) so the event loop stays responsive; the
+        await is cancellable (an abandoned thread's result is discarded).
+
         Note: sentence_provenance contains entries only for sources that survived
         the < 50-char guard. Entries are grouped by source, in source order.
         """
+        from app.config import settings
+
         # Collect all sentences with their source index and char spans
         all_sentences: List[str] = []
         sentence_spans: List[SentenceSpan] = []  # parallel to all_sentences
@@ -285,29 +338,34 @@ class ContextDistiller:
         if not all_sentences:
             return DistillResult(sources=sources, sentence_provenance=[])
 
+        # Bound the input before any per-sentence work (embedding + the
+        # K^2 loop). Non-int settings (e.g. a MagicMock patch in existing
+        # test suites) disable the cap rather than misbehave.
+        max_sentences = getattr(settings, "context_distiller_max_sentences", None)
+        if (
+            isinstance(max_sentences, int)
+            and not isinstance(max_sentences, bool)
+            and max_sentences > 0
+            and len(all_sentences) > max_sentences
+        ):
+            logger.info(
+                "Context distiller sentence cap: %d sentences truncated to %d "
+                "before dedup (earliest sources kept first)",
+                len(all_sentences),
+                max_sentences,
+            )
+            all_sentences = all_sentences[:max_sentences]
+            sentence_spans = sentence_spans[:max_sentences]
+            sentence_map = sentence_map[:max_sentences]
+
         # Embed all sentences in one batch call
         embeddings = await self._embedding_service.embed_batch(all_sentences)
 
-        # Greedy dedup: keep sentence if not too similar to any previously kept sentence
-        kept_embeddings: List[List[float]] = []
-        is_dup: List[bool] = [False] * len(all_sentences)
-
-        for i, emb in enumerate(embeddings):
-            src_idx, _ = sentence_map[i]
-            # First source's sentences are always kept (highest-ranked chunk wins)
-            if src_idx == 0:
-                kept_embeddings.append(emb)
-                continue
-            # Check similarity against all kept sentences
-            dup = False
-            for kept_emb in kept_embeddings:
-                if _cosine_similarity(emb, kept_emb) > threshold:
-                    dup = True
-                    break
-            if dup:
-                is_dup[i] = True
-            else:
-                kept_embeddings.append(emb)
+        # Greedy dedup: keep sentence if not too similar to any previously
+        # kept sentence. Runs OFF the event loop — see _greedy_dedup.
+        is_dup: List[bool] = await asyncio.to_thread(
+            _greedy_dedup, embeddings, sentence_map, threshold
+        )
 
         # Reconstruct sources with duplicate sentences removed
         source_sentences: List[List[str]] = [[] for _ in sources]

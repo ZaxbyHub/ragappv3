@@ -241,6 +241,16 @@ class Settings(BaseSettings):
     stepback_enabled: bool = True
     """Enable step-back prompting: generate a broader, more general version of the query to improve recall."""
 
+    retrieval_consolidated_rerank: bool = True
+    """Sub-query orchestration (issue #511): fuse + dedupe evidence from all sub-queries BEFORE one
+    final rerank call instead of reranking every sub-query separately. Set False to restore the
+    legacy per-sub-query rerank behavior (rollback switch)."""
+
+    retrieval_kms_overlap: bool = True
+    """Start KMS retrieval concurrently with the document pipeline (issue #511) instead of awaiting
+    wiki+KMS before document retrieval; wiki evidence still gates raw RAG (precedence preserved).
+    Set False to restore the legacy serialized wiki/KMS gather (rollback switch)."""
+
     query_transform_temperature: float = 0.0
     """Temperature for LLM calls during query transformation (step-back). Set to 0.0 for deterministic results."""
 
@@ -304,6 +314,24 @@ class Settings(BaseSettings):
     token_pack_strategy: str = "reserved_best_fit"
     """Token packing strategy: 'reserved_best_fit' reserves top-3 (never skipped) and uses best-fit for
     remaining chunks (no early break). 'greedy' is the legacy first-fit with early break."""
+
+    prompt_budget_enabled: bool = False
+    """Optional TOTAL model-aware prompt budget (issue #511). When False (default) prompts are built
+    exactly as before. When True the assembled prompt (system, history, evidence, memories, wiki/KMS,
+    visual observations) plus reserved answer tokens is kept within model_context_tokens."""
+
+    model_context_tokens: int = 8192
+    """Total context window of the selected chat model, in tokens. Operators MUST set this to match
+    the deployed model; 8192 is a deliberately conservative default. Only used when
+    prompt_budget_enabled is True."""
+
+    prompt_reserve_output_tokens: int = 2048
+    """Answer tokens reserved out of model_context_tokens before the prompt budget is computed.
+    Only used when prompt_budget_enabled is True."""
+
+    context_distiller_max_sentences: int = 600
+    """Hard cap on sentences admitted to context-distiller dedup (issue #511). The greedy
+    similarity loop is O(n^2); inputs above the cap are truncated with a logged note."""
 
     # ── Chunking strategy ──────────────────────────────────────────────
     semantic_chunking_strategy: str = "title"
@@ -587,6 +615,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     embedding_cache_ttl_seconds: int = 604800
     """Time-to-live in seconds for cached embeddings in Redis. Default 7 days."""
+
+    redis_io_timeout_seconds: float = 1.0
+    """Bounded timeout for OPTIONAL Redis cache reads/writes on request paths (issue #511): the sync
+    client call runs in a worker thread and is abandoned past this timeout, degrading to cache-miss.
+    Does not apply to auth-critical Redis use (CSRF)."""
     csrf_token_ttl: int = 900
     admin_rate_limit: str = "10/minute"
 
