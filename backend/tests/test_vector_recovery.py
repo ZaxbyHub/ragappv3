@@ -116,6 +116,13 @@ class FakeTable:
         return self._schema
 
     async def count_rows(self, where=None):
+        if where:
+            # Production passes simple equality predicates ("col = 'value'");
+            # honor them so a filtered-count regression cannot pass silently.
+            col, sep, value = where.strip().partition(" = ")
+            if sep:
+                wanted = value.strip().strip("'")
+                return sum(1 for r in self.rows if r.get(col) == wanted)
         return len(self.rows)
 
     async def list_indices(self):
@@ -178,6 +185,9 @@ class FakeDB:
         self.calls = {"open_table": [], "drop_table": [], "create_table": []}
         self.fail_create_with_data = False
         self.fail_chunks_data_create = False
+        # When nonzero, create_table(data=...) silently stores that many
+        # fewer rows - exercises the staging row-parity guard (PRR-013).
+        self.create_data_row_loss = 0
 
     async def table_names(self):
         return list(self._tables.keys())
@@ -203,6 +213,8 @@ class FakeDB:
                 raise RuntimeError("simulated FINAL create failure after drop")
             schema = FakeArrowLikeSchema(list(data.columns))
             rows = data.to_dict("records")
+            if self.create_data_row_loss and rows:
+                rows = rows[: len(rows) - self.create_data_row_loss]
         else:
             rows = []
         table = FakeTable(name, schema)
@@ -432,6 +444,13 @@ class TestFinalCreateFailureAndStagingRecovery(unittest.IsolatedAsyncioTestCase)
         self.assertTrue(
             {"parent_doc_id", "chunk_position"}.issubset(schema_names)
         )
+        # PRR-001: the recovered canonical table must not be index-degraded —
+        # reconciliation restores FTS before releasing the staging copy.
+        recovered = await fake_db.open_table("chunks")
+        self.assertTrue(
+            [c for c in recovered.calls["create_index"] if c["column"] == "text"],
+            "recovered table must have FTS restored by reconciliation",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +538,117 @@ class TestStaleStagingReconciliation(unittest.IsolatedAsyncioTestCase):
         # itself creates+deletes its own staging table — both are expected.
         self.assertGreaterEqual(
             fake_db.calls["drop_table"].count(CHUNKS_STAGING_TABLE), 1
+        )
+
+    async def test_canonical_incomplete_rebuilds_from_staging_and_restores_fts(self):
+        """Canonical present but holding fewer rows than staging: the staging
+        copy is authoritative - reconciliation rebuilds canonical from it and
+        releases the staging copy. (FTS here comes from the migration's
+        follow-up swap; the reconcile-level index restore is load-bearing on
+        the canonical-absent path, pinned by the retry test above.)"""
+        import tempfile
+
+        tmp = tempfile.mkdtemp(prefix="vecincomplete_")
+        # Canonical is ALREADY new-format (so the migration early-returns
+        # after reconciliation and no swap re-creates the indices) but holds
+        # fewer rows than staging: the staging copy is authoritative.
+        canonical = FakeTable(
+            "chunks", FakeArrowLikeSchema(FULL_NEW_FORMAT_FIELDS)
+        )
+        canonical.rows = [_legacy_row("keep_a")]
+        staging = FakeTable(
+            CHUNKS_STAGING_TABLE, FakeArrowLikeSchema(FULL_NEW_FORMAT_FIELDS)
+        )
+        staging.rows = [_legacy_row(i) for i in ("keep_a", "keep_b", "keep_c")]
+        fake_db = FakeDB({"chunks": canonical, CHUNKS_STAGING_TABLE: staging})
+        store = _make_store(fake_db, tmp)
+
+        restore = _isolate_settings_data_dir(tmp)
+        try:
+            migrated = await store.migrate_add_parent_window()
+        finally:
+            restore()
+
+        # The migration probed the pre-reconcile canonical (legacy, 1 row),
+        # so after reconciliation restored all 3 rows it completed the swap:
+        # 3 rows migrated onto the restored table.
+        self.assertEqual(migrated, 3)
+        names = set(await fake_db.table_names())
+        self.assertIn("chunks", names)
+        self.assertNotIn(CHUNKS_STAGING_TABLE, names)
+        self.assertEqual(
+            await _table_ids(fake_db, "chunks"), {"keep_a", "keep_b", "keep_c"}
+        )
+        recovered = await fake_db.open_table("chunks")
+        self.assertTrue(
+            [c for c in recovered.calls["create_index"] if c["column"] == "text"],
+            "reconciled table must have FTS restored (PRR-001)",
+        )
+
+
+class TestStagingParityAndPublishFailure(unittest.IsolatedAsyncioTestCase):
+    """PRR-013/PRR-015 (PR #526 review): the two untested swap guards."""
+
+    async def test_staging_row_parity_mismatch_aborts_before_any_drop(self):
+        """Staging created with a wrong row count must abort the swap BEFORE
+        dropping the canonical table - the load-bearing non-destructive
+        invariant (vector_store.py staging parity check)."""
+        import tempfile
+
+        from app.services.vector_store import VectorStoreError
+
+        tmp = Path(tempfile.mkdtemp(prefix="vecparity_"))
+        original_ids = {"keep_a", "keep_b", "keep_c"}
+        legacy = _legacy_table([_legacy_row(i) for i in sorted(original_ids)])
+        fake_db = FakeDB({"chunks": legacy})
+        fake_db.create_data_row_loss = 1
+        store = _make_store(fake_db, tmp)
+
+        restore = _isolate_settings_data_dir(tmp)
+        try:
+            with self.assertRaises(VectorStoreError):
+                await store.migrate_add_parent_window()
+        finally:
+            restore()
+
+        # The canonical table was never dropped and its rows are intact.
+        self.assertNotIn("chunks", fake_db.calls["drop_table"])
+        self.assertEqual(await _table_ids(fake_db, "chunks"), original_ids)
+
+    async def test_publish_failure_keeps_completed_swap(self):
+        """A journal failure after the completed swap logs a warning but must
+        not undo the swap (staging dropped, canonical intact with FTS)."""
+        import tempfile
+        from unittest import mock
+
+        import app.services.vector_store as vector_store_module
+
+        tmp = Path(tempfile.mkdtemp(prefix="vecpublish_"))
+        original_ids = {"keep_a", "keep_b"}
+        legacy = _legacy_table([_legacy_row(i) for i in sorted(original_ids)])
+        fake_db = FakeDB({"chunks": legacy})
+        store = _make_store(fake_db, tmp)
+
+        restore = _isolate_settings_data_dir(tmp)
+        try:
+            with mock.patch.object(
+                vector_store_module,
+                "publish_index_generation",
+                side_effect=RuntimeError("journal down"),
+            ):
+                migrated = await store.migrate_add_parent_window()
+        finally:
+            restore()
+
+        self.assertEqual(migrated, len(original_ids))
+        names = set(await fake_db.table_names())
+        self.assertIn("chunks", names)
+        self.assertNotIn(CHUNKS_STAGING_TABLE, names)
+        self.assertEqual(await _table_ids(fake_db, "chunks"), original_ids)
+        canonical = await fake_db.open_table("chunks")
+        self.assertTrue(
+            [c for c in canonical.calls["create_index"] if c["column"] == "text"],
+            "FTS index must exist even when generation publication failed",
         )
 
 

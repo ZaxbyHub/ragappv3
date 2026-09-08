@@ -94,8 +94,13 @@ class TestJournalTableCreation(unittest.TestCase):
     def test_migration_is_idempotent(self):
         db_path = _temp_db("journal_idem_")
         migrate_add_migration_journal(db_path)
+        rows_before = _journal_rows(db_path)
         migrate_add_migration_journal(db_path)  # must not raise
-        self.assertIsNotNone(_journal_rows(db_path) or True)
+        rows_after = _journal_rows(db_path)
+        # Re-running the migration must not raise and must not add
+        # duplicate rows (the DDL migration itself journals nothing; if it
+        # ever does, a re-run must stay row-stable).
+        self.assertEqual(len(rows_after), len(rows_before))
 
 
 class TestJournalRoundTrips(unittest.TestCase):

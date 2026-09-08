@@ -122,6 +122,13 @@ class FakeFTSTable:
         return self._schema
 
     async def count_rows(self, where=None):
+        if where:
+            # Production passes simple equality predicates ("col = 'value'");
+            # honor them so a filtered-count regression cannot pass silently.
+            col, sep, value = where.strip().partition(" = ")
+            if sep:
+                wanted = value.strip().strip("'")
+                return sum(1 for r in self.rows if r.get(col) == wanted)
         return len(self.rows)
 
     async def list_indices(self):

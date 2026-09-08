@@ -1709,6 +1709,31 @@ class VectorStore:
 
         return await table.to_pandas()
 
+    async def _restore_default_indices(self, *, migration_name: str) -> None:
+        """Recreate FTS (always) and ANN (rows >= threshold) on ``self.table``.
+
+        Mirrors the staging swap's index step: a table recovered from the
+        staging copy must not stay index-degraded until the next write or
+        search happens to self-heal it (PRR-001, PR #526 review). Raises on
+        failure so the caller preserves the staging table for another
+        recovery attempt instead of dropping it.
+        """
+        await self.table.create_index(column="text", config=FTS(), replace=True)
+        row_count = await self.table.count_rows()
+        if row_count >= VECTOR_INDEX_MIN_ROWS:
+            num_sub_vectors = (self._embedding_dim or settings.embedding_dim) // 8
+            await self.table.create_index(
+                column="embedding",
+                config=IvfPq(
+                    distance_type=cast(
+                        "Literal['l2', 'cosine', 'dot']", settings.vector_metric
+                    ),
+                    num_partitions=256,
+                    num_sub_vectors=num_sub_vectors,
+                ),
+                replace=True,
+            )
+
     async def _reconcile_chunks_rebuild_state(self, *, migration_name: str) -> None:
         """Recovery-first reconciliation of a crashed ``chunks`` table swap.
 
@@ -1755,6 +1780,9 @@ class VectorStore:
             staging_df = await self._safe_table_to_pandas(
                 staging, f"{migration_name} (staging recovery)"
             )
+            # Rebind outside _write_lock: recovery runs during lifespan
+            # startup before the app serves requests; acquiring the lock here
+            # would risk re-entrant deadlock if a future caller holds it.
             await self.db.drop_table("chunks")
             self.table = await self.db.create_table("chunks", data=staging_df)
             recovered_rows = await self.table.count_rows()
@@ -1772,6 +1800,12 @@ class VectorStore:
                     f"'{CHUNKS_STAGING_TABLE}' failed row parity "
                     f"({len(staging_df)} -> {recovered_rows})."
                 )
+            # No index restore here (NF-A, PR #526 feedback): when the
+            # calling migration's swap follows, the swap recreates the
+            # indices itself; in the worst case where every migration then
+            # early-returns, init_table heals FTS later in the same startup
+            # and ANN self-heals on first search. The canonical-absent path
+            # below is where the restore is load-bearing (no swap follows).
             await self.db.drop_table(CHUNKS_STAGING_TABLE)
             logger.warning(
                 "%s: restored incomplete 'chunks' from staging table '%s'",
@@ -1785,6 +1819,8 @@ class VectorStore:
         staging_df = await self._safe_table_to_pandas(
             staging, f"{migration_name} (staging recovery)"
         )
+        # Rebind outside _write_lock — see the sibling recovery path above
+        # (startup-only; lock acquisition would risk re-entrant deadlock).
         self.table = await self.db.create_table("chunks", data=staging_df)
         recovered_rows = await self.table.count_rows()
         if recovered_rows != len(staging_df):
@@ -1801,6 +1837,8 @@ class VectorStore:
                 f"'{CHUNKS_STAGING_TABLE}' failed row parity "
                 f"({len(staging_df)} -> {recovered_rows})."
             )
+        # Restore FTS/ANN before releasing the staging copy (PRR-001).
+        await self._restore_default_indices(migration_name=migration_name)
         await self.db.drop_table(CHUNKS_STAGING_TABLE)
         logger.warning(
             "%s: recovered canonical 'chunks' (%d rows) from staging table '%s'",
@@ -1863,6 +1901,8 @@ class VectorStore:
         # data durably recoverable in the staging table.
         try:
             await self.db.drop_table("chunks")
+            # Rebind outside _write_lock: swaps run during lifespan startup
+            # before the app serves requests (see the recovery paths above).
             self.table = await self.db.create_table("chunks", data=df)
             final_rows = await self.table.count_rows()
             if final_rows != len(df):

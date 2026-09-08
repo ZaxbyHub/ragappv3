@@ -57,9 +57,11 @@ def record_migration_outcome(
 ) -> None:
     """Append one journal row for a migration phase/outcome transition.
 
-    Never raises: journaling must not take a recovering migration down. The
-    connection's active transaction (if any) owns the row, so a rolled-back
-    swap also rolls back its journal entries.
+    Never raises: journaling must not take a recovering migration down. Rows
+    commit independently of the caller's swap transaction (migrations run
+    with ``isolation_level = None`` and journal outside ``BEGIN
+    IMMEDIATE``), so a rolled-back swap still records its failure — the
+    recovery journal must describe attempts, not only completions.
     """
     try:
         _ensure_table(conn)
@@ -77,13 +79,29 @@ def record_schema_version(
     *,
     schema_version: int = MIGRATION_SCHEMA_VERSION,
 ) -> None:
-    """Record the schema version the database is being brought to."""
+    """Record the schema version the database is being brought to.
+
+    Append-only per distinct version: re-running migrations at an unchanged
+    version (every startup) adds no row, so the journal records version
+    transitions rather than process starts.
+    """
+    detail = f"schema_version={schema_version}"
+    try:
+        _ensure_table(conn)
+        row = conn.execute(
+            "SELECT detail FROM migration_journal"
+            " WHERE migration_name = 'schema' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is not None and row[0] == detail:
+            return
+    except sqlite3.Error as exc:  # pragma: no cover - defensive
+        logger.warning("migration_journal: could not read schema version: %s", exc)
     record_migration_outcome(
         conn,
         migration_name="schema",
         phase="succeeded",
         outcome="ok",
-        detail=f"schema_version={schema_version}",
+        detail=detail,
     )
 
 

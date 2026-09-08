@@ -315,5 +315,33 @@ class TestRunMigrationRealEngine(unittest.TestCase):
         self.assertEqual(_files_status(sqlite_path), "indexed")
 
 
+
+
+class TestRunMigrationUnknownDimEmptyIndex(unittest.TestCase):
+    def test_unknown_dim_empty_index_is_a_safe_noop(self):
+        """PRR-018 (PR #526 review): undetectable dimension on an EMPTY or
+        absent index is a safe no-op (exit 0, no wipe, no status reset) -
+        distinct from the non-empty SystemExit(3) case."""
+        tmp = Path(tempfile.mkdtemp(prefix="dimempty_"))
+        lancedb_path = tmp / "lancedb"  # absent: the empty-index case
+        sqlite_path = tmp / "app.db"
+        _make_sqlite(sqlite_path)
+
+        with patch.object(script, "_detect_stored_dim", lambda p: None):
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "migrate_embeddings.py",
+                    "--lancedb-path",
+                    str(lancedb_path),
+                    "--sqlite-path",
+                    str(sqlite_path),
+                ],
+            ):
+                self.assertIsNone(script.main())  # success: no sys.exit
+        self.assertEqual(_files_status(sqlite_path), "indexed")
+        self.assertFalse(lancedb_path.exists(), "nothing may be created/wiped")
+
 if __name__ == "__main__":
     unittest.main()
