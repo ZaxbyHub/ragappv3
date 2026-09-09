@@ -82,6 +82,11 @@ class ChatRequest(BaseModel):
     # Typed metadata filter (date/tag/author subset; unknown fields are
     # rejected by MetadataFilter's extra="forbid" — never silently ignored).
     metadata_filter: Optional[MetadataFilter] = None
+    # Document scope ("ask about this document", issue #514 PRODUCT-ENH-05):
+    # restrict retrieval to the named file ids. Enforced server-side by
+    # threading the scope into the RAG engine's retrieval seam, where it ANDs
+    # with vault scoping and can never widen access beyond the vault.
+    document_ids: Optional[List[int]] = None
 
 
 class UsedMemory(BaseModel):
@@ -144,6 +149,9 @@ class ChatStreamRequest(BaseModel):
     retrieval_mode: Optional[RetrievalMode] = None
     citation_mode: Optional[CitationMode] = None
     metadata_filter: Optional[MetadataFilter] = None
+    # Document scope ("ask about this document", issue #514 PRODUCT-ENH-05):
+    # same server-side retrieval restriction as ChatRequest.document_ids.
+    document_ids: Optional[List[int]] = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -329,6 +337,7 @@ def stream_chat_response(
     include_global: bool = False,
     can_write_memory: bool = False,
     vision_context: Optional[VisionRunContext] = None,
+    document_ids: Optional[List[int]] = None,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
@@ -393,7 +402,7 @@ def stream_chat_response(
                 temperature=temperature, retrieval_mode=retrieval_mode,
                 citation_mode=citation_mode, metadata_filter=metadata_filter,
                 include_global=include_global, can_write_memory=can_write_memory,
-                vision_context=vision_context,
+                vision_context=vision_context, document_ids=document_ids,
             )
             rag_gen_ait = rag_gen.__aiter__()
 
@@ -603,6 +612,7 @@ async def non_stream_chat_response(
     include_global: bool = False,
     can_write_memory: bool = False,
     vision_context: Optional[VisionRunContext] = None,
+    document_ids: Optional[List[int]] = None,
 ) -> ChatResponse:
     """
     Generate a non-streaming chat response.
@@ -640,7 +650,7 @@ async def non_stream_chat_response(
             temperature=temperature, retrieval_mode=retrieval_mode,
             citation_mode=citation_mode, metadata_filter=metadata_filter,
             include_global=include_global, can_write_memory=can_write_memory,
-            vision_context=vision_context,
+            vision_context=vision_context, document_ids=document_ids,
         ):
             chunk_type = chunk.get("type")
             logger.debug(
@@ -828,6 +838,7 @@ async def chat(
             citation_mode=body.citation_mode,
             metadata_filter=body.metadata_filter,
             vision_context=vision_context,
+            document_ids=body.document_ids,
         )
     except Exception:
         logger.exception("[chat] UNHANDLED EXCEPTION during chat processing")
@@ -949,6 +960,7 @@ async def chat_stream(
         include_global=include_global,
         can_write_memory=can_write_memory,
         vision_context=vision_context,
+        document_ids=body.document_ids,
     )
 
 

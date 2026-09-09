@@ -685,6 +685,12 @@ CREATE TABLE IF NOT EXISTS files (
     enrichment_updated_at TIMESTAMP,
     enrichment_enabled INTEGER,
     -- NULL = inherit vault/global; 1 = on; 0 = off (per-file override)
+    -- Structured parse-quality diagnostics (issue #514 PRODUCT-ENH-06): JSON
+    -- written by the parse stage via build_extraction_diagnostics (page
+    -- coverage, low-content pages, OCR use, tables/captions recovered).
+    -- NULL until a diagnostics-aware parse has run for the file. Also added
+    -- to existing databases by migrate_add_files_extraction_diagnostics.
+    extraction_diagnostics TEXT,
     folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
     FOREIGN KEY (vault_id) REFERENCES vaults(id)
 );
@@ -1726,6 +1732,12 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_widen_files_status(sqlite_path)
     migrate_widen_document_reindex_jobs_status(sqlite_path)
     migrate_add_document_near_dups(sqlite_path)
+    # Issue #514 (PRODUCT-ENH-06). Registered AFTER migrate_widen_files_status:
+    # that rebuild enumerates the full canonical files column set explicitly,
+    # so a column-adding migration registered before it would have its column
+    # dropped by the rebuild on pre-widen databases. After the rebuild (or its
+    # early noop return) the ALTER is durable.
+    migrate_add_files_extraction_diagnostics(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -2795,6 +2807,34 @@ def migrate_add_files_parsed_text(sqlite_path: str) -> None:
         ]
         if "parsed_text" not in existing_cols:
             conn.execute("ALTER TABLE files ADD COLUMN parsed_text TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_files_extraction_diagnostics(sqlite_path: str) -> None:
+    """Migration: add the nullable ``extraction_diagnostics`` JSON column to
+    the files table (issue #514 PRODUCT-ENH-06).
+
+    Holds the parse-stage diagnostics produced by
+    ``app.services.document_extraction.build_extraction_diagnostics`` (page
+    coverage, low-content pages, OCR use, tables/captions recovered) so the
+    per-file status payload can reveal parse omissions even when embedding
+    succeeded. Nullable: rows predating a diagnostics-aware parse stay NULL.
+
+    Must be registered in ``run_migrations`` AFTER ``migrate_widen_files_status``
+    (the files rebuild enumerates the canonical column set explicitly and would
+    drop a column added before it on pre-widen databases).
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()
+        ]
+        if "extraction_diagnostics" not in existing_cols:
+            conn.execute("ALTER TABLE files ADD COLUMN extraction_diagnostics TEXT")
         conn.commit()
     finally:
         conn.close()

@@ -238,6 +238,20 @@ def _raw_rag_required(query_type: str, wiki_evidence: List[Any]) -> bool:
     return True
 
 
+def _document_scope_filter_expr(document_ids: List[int]) -> str:
+    """LanceDB filter expression restricting retrieval to the given file ids.
+
+    Companion of the metadata_filter resolution (issue #514 PRODUCT-ENH-05):
+    chunk ``file_id`` values are stored as strings, so the ids are quoted the
+    same way ``metadata_filter`` quotes its resolved set. An empty scope yields
+    the zero-match sentinel — a supplied scope is never silently dropped.
+    """
+    quoted = ", ".join(f"'{int(file_id)}'" for file_id in document_ids)
+    if not quoted:
+        return "file_id IN ('')"
+    return f"file_id IN ({quoted})"
+
+
 class RAGEngine:
     """Coordinates embeddings, vector search, memory search, and LLM responses."""
 
@@ -718,6 +732,7 @@ class RAGEngine:
         include_global: bool = False,
         can_write_memory: bool = False,
         vision_context: Optional[VisionRunContext] = None,
+        document_ids: Optional[List[int]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute a RAG query: embed, search, build prompt, call LLM.
 
@@ -738,6 +753,13 @@ class RAGEngine:
                 user gets a feedback chunk instead. Callers MUST verify the
                 user has write access to ``vault_id`` (or is an admin when
                 ``vault_id is None``) before passing True (issue #404).
+            document_ids: Optional document scope ("ask about this document",
+                issue #514 PRODUCT-ENH-05). Restricts retrieval to the named
+                file ids by ANDing a ``file_id IN (...)`` expression into the
+                same filter the metadata_filter resolves to. Never widens
+                access: vector_store.search applies the vault scope
+                independently, so a scope naming ids outside the vault simply
+                retrieves nothing for them (fail-closed).
         """
         if require_vault and vault_id is None:
             raise ValueError(
@@ -769,6 +791,22 @@ class RAGEngine:
         except Exception as exc:  # noqa: BLE001 — validation errors surface above
             logger.warning("[query] metadata_filter rejected: %s", exc)
             raise
+        # Document scope (issue #514 PRODUCT-ENH-05): resolved into the SAME
+        # local filter expression so every retrieval seam below — the agentic
+        # RetrievalTool, multi-sub-query orchestration, and the standard
+        # single-query path — inherits the restriction without any per-seam
+        # threading. Local by the same PRR-001 rule as the controls above.
+        if document_ids:
+            scope_expr = _document_scope_filter_expr(document_ids)
+            active_filter_expr = (
+                f"{active_filter_expr} AND {scope_expr}"
+                if active_filter_expr is not None
+                else scope_expr
+            )
+            logger.info(
+                "[query] document scope applied (%d ids)",
+                len(document_ids),
+            )
         if retrieval_mode is not None:
             logger.info("[query] retrieval_mode=%s", retrieval_mode)
         if citation_mode is not None:

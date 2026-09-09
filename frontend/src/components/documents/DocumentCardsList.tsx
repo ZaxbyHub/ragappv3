@@ -54,8 +54,12 @@ export function DocumentCardsList({
                 onDelete={(id) => onDelete(String(id))}
                 onDownload={() => onDownload(doc)}
                 canDelete={canMutateDocuments}
-                isSelected={selectedIds.has(doc.id)}
-                onSelectionChange={canMutateDocuments ? onSelectOne : undefined}
+                isSelected={selectedIds.has(String(doc.id))}
+                onSelectionChange={
+                  canMutateDocuments
+                    ? (id, checked) => onSelectOne(String(id), checked)
+                    : undefined
+                }
               />
             </div>
           );

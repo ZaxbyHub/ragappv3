@@ -2,6 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useSendMessage } from "./useSendMessage";
 import { useChatStore } from "@/stores/useChatStore";
+import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
 
@@ -98,6 +99,7 @@ describe("useSendMessage", () => {
     });
     useLlmHealthStore.setState({ thinking: true, instant: true });
     useChatShellStore.setState({ sessionListRefreshToken: 0 });
+    useChatModeStore.setState({ scopeDocumentIds: null });
     apiMocks.createChatSession.mockResolvedValue({ id: 42 });
     // Default batch save: user row gets id 100, assistant row id 101 (issue #507
     // realignment — the hook persists a turn via one addChatMessagesBatch call).
@@ -1023,6 +1025,48 @@ describe("useSendMessage", () => {
       await waitFor(() => {
         expect(useChatStore.getState().pendingTurnPersist).toBeNull();
       });
+    });
+  });
+
+  describe("document scope (issue #514 AC-23)", () => {
+    it("sends document_ids from the chat mode store and clears the scope after the send", async () => {
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatModeStore.setState({ scopeDocumentIds: [42] });
+      useChatStore.setState({ input: "Summarize this document" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      await waitFor(() => {
+        expect(apiMocks.chatStream).toHaveBeenCalled();
+      });
+      // documentIds is the 9th positional argument (after messages,
+      // callbacks, vaultId, mode, temperature, retrievalMode, citationMode,
+      // metadataFilter).
+      const firstCall = apiMocks.chatStream.mock.calls[0];
+      expect(firstCall[8]).toEqual([42]);
+      // One-shot scope: consumed by this send, never leaked to the next question.
+      expect(useChatModeStore.getState().scopeDocumentIds).toBeNull();
+    });
+
+    it("omits document_ids when no scope is set", async () => {
+      const refreshHistory = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ input: "Unscoped question" });
+
+      const { result } = renderHook(() => useSendMessage(7, refreshHistory));
+
+      await act(async () => {
+        await result.current.handleSend();
+      });
+
+      await waitFor(() => {
+        expect(apiMocks.chatStream).toHaveBeenCalled();
+      });
+      const firstCall = apiMocks.chatStream.mock.calls[0];
+      expect(firstCall[8]).toBeUndefined();
     });
   });
 });

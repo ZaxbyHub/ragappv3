@@ -199,68 +199,76 @@ class FolderStore:
         description: Optional[str] = None,
         parent_folder_id: Any = _UNSET,
     ) -> Optional[Folder]:
-        current = self.get_folder(folder_id, vault_id)
-        if not current:
-            return None
+        # BEGIN IMMEDIATE before ANY read (FOLDER-001, issue #514): the
+        # current folder, parent existence, descendant (cycle) walk, and
+        # name-uniqueness checks must all run INSIDE the write transaction.
+        # With the checks outside, two concurrent opposing moves (A under B
+        # while B under A) both validate against the original hierarchy, both
+        # transactions commit, and the folders table ends with a parent cycle
+        # that detaches both folders from the root tree. Holding the write
+        # lock from the first read forces the loser to observe the winner's
+        # committed hierarchy and fail its cycle check.
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.get_folder(folder_id, vault_id)
+            if not current:
+                # No-op transaction, but BEGIN IMMEDIATE already took the
+                # write lock — release it so the pooled connection does not
+                # block other writers.
+                self._db.rollback()
+                return None
 
-        updates: dict = {}
-        new_parent = current.parent_folder_id
-        if parent_folder_id is not _UNSET:
-            if parent_folder_id == folder_id:
-                raise FolderCycleError("A folder cannot be its own parent")
-            if parent_folder_id is not None:
-                self._require_folder_in_vault(vault_id, parent_folder_id)
-                if parent_folder_id in self._descendant_ids(vault_id, folder_id):
-                    raise FolderCycleError(
-                        "Cannot move a folder into its own descendant"
-                    )
-            updates["parent_folder_id"] = parent_folder_id
-            new_parent = parent_folder_id
+            updates: dict = {}
+            new_parent = current.parent_folder_id
+            if parent_folder_id is not _UNSET:
+                if parent_folder_id == folder_id:
+                    raise FolderCycleError("A folder cannot be its own parent")
+                if parent_folder_id is not None:
+                    self._require_folder_in_vault(vault_id, parent_folder_id)
+                    if parent_folder_id in self._descendant_ids(vault_id, folder_id):
+                        raise FolderCycleError(
+                            "Cannot move a folder into its own descendant"
+                        )
+                updates["parent_folder_id"] = parent_folder_id
+                new_parent = parent_folder_id
 
-        new_name = current.name
-        if name is not None:
-            name = name.strip()
-            if not name:
-                raise ValueError("Folder name must not be empty")
-            updates["name"] = name
-            new_name = name
+            new_name = current.name
+            if name is not None:
+                name = name.strip()
+                if not name:
+                    raise ValueError("Folder name must not be empty")
+                updates["name"] = name
+                new_name = name
 
-        if description is not None:
-            updates["description"] = description
+            if description is not None:
+                updates["description"] = description
 
-        if not updates:
-            return current
+            if not updates:
+                # Nothing to write; end the (read-only) transaction before
+                # returning so the connection comes back clean.
+                self._db.rollback()
+                return current
 
-        updates["updated_at"] = datetime.utcnow().isoformat()
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        values = list(updates.values()) + [folder_id, vault_id]
+            updates["updated_at"] = datetime.utcnow().isoformat()
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            values = list(updates.values()) + [folder_id, vault_id]
 
-        if "name" in updates or "parent_folder_id" in updates:
-            # BEGIN IMMEDIATE: name-uniqueness check + UPDATE must be atomic so two
-            # concurrent renames/reparents cannot both pass the check before either
-            # commits.
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                if self._name_exists(
-                    vault_id, new_parent, new_name, exclude_id=folder_id
-                ):
+            # Name-uniqueness check + UPDATE stay atomic inside the already
+            # open transaction, so two concurrent renames/reparents cannot
+            # both pass the check before either commits.
+            if "name" in updates or "parent_folder_id" in updates:
+                if self._name_exists(vault_id, new_parent, new_name, exclude_id=folder_id):
                     raise FolderDuplicateError(
                         f"Folder {new_name!r} already exists in this location"
                     )
-                self._db.execute(
-                    f"UPDATE folders SET {set_clause} WHERE id = ? AND vault_id = ?",
-                    values,
-                )
-                self._db.commit()
-            except Exception:
-                self._db.rollback()
-                raise
-        else:
             self._db.execute(
                 f"UPDATE folders SET {set_clause} WHERE id = ? AND vault_id = ?",
                 values,
             )
             self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         return self.get_folder(folder_id, vault_id)
 
     def delete_folder(self, folder_id: int, vault_id: int) -> bool:

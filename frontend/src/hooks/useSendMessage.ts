@@ -308,10 +308,13 @@ export function useSendMessage(
         metadataFilter.author = modeStoreState.metadataFilterAuthor;
       }
 
+      // Document scope (issue #514 AC-23): snapshot at send time — it scopes
+      // exactly THIS question.
+      const scopeDocumentIds = modeStoreState.scopeDocumentIds;
+
       const abort = chatStream(
         chatMessages,
-        {
-          onMessage: (chunk) => {
+        {          onMessage: (chunk) => {
             setCurrentStage(null);
             // Coalesce SSE appends behind requestAnimationFrame (UI-PERF-2):
             // without this, every token chunk updates the store, re-renders
@@ -481,7 +484,14 @@ export function useSendMessage(
         useChatModeStore.getState().retrievalMode,
         useChatModeStore.getState().citationMode,
         Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
+        scopeDocumentIds ?? undefined,
       );
+
+      // The scope applied to this question only — it is consumed once the
+      // message has been sent so it never leaks into a later question.
+      if (scopeDocumentIds) {
+        useChatModeStore.getState().clearScopeDocumentIds();
+      }
 
       // Wrap the raw abort so any caller that aborts the stream — the Stop
       // button OR a session switch routed through the store (loadChat/newChat) —

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
-import { ArrowLeft, Download, Loader2, Save } from "lucide-react";
+import { ArrowLeft, Download, Loader2, MessageSquare, Save } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -10,7 +10,10 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { FileIcon } from "@/lib/fileIcon";
 import { StatusBadge } from "@/components/shared/StatusBadge";
+import { ParseQualityPanel } from "@/components/documents/ParseQualityPanel";
+import { documentField } from "@/components/documents/documentProgress";
 import { formatFileSize, formatDate } from "@/lib/formatters";
+import { useChatModeStore } from "@/stores/useChatModeStore";
 import {
   getDocument,
   getDocumentRawBlob,
@@ -44,29 +47,60 @@ export default function DocumentDetailPage() {
   const [previewText, setPreviewText] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
+  const setScopeDocumentIds = useChatModeStore((state) => state.setScopeDocumentIds);
+
+  // Generation token (issue #514 / UI-011): bumped on every load so a late
+  // response for a previously-navigated document id can never commit state
+  // for the document currently shown. Checked after EVERY await.
+  const loadGenRef = useRef(0);
+  // Latest in-flight preview request — cancelled on unmount so no preview
+  // request outlives the page.
+  const previewInFlightRef = useRef<{ controller: AbortController; gen: number } | null>(null);
+  useEffect(() => () => previewInFlightRef.current?.controller.abort(), []);
+
+  // The preview follows the most recently RESOLVED document (any generation),
+  // so the blob fetch always runs against the payload actually in hand; its
+  // COMMITS are generation-guarded below, which is what keeps a stale blob
+  // from overwriting the current document's preview (UI-011).
+  const [previewSource, setPreviewSource] = useState<{ doc: Document; gen: number } | null>(null);
+
   const load = useCallback(async () => {
     if (!Number.isFinite(id)) {
       setError("Invalid document id");
       setLoading(false);
       return;
     }
+    const gen = ++loadGenRef.current;
     setLoading(true);
     setError(null);
     try {
       const d = await getDocument(id);
-      setDoc(d);
-      setSelectedTagIds(new Set((d.tags ?? []).map((t) => t.id)));
+      // UI-011: a stale getDocument response (for a document the user
+      // navigated away from) must not overwrite the current document, its
+      // tags, or the vault tag list.
+      if (loadGenRef.current === gen) {
+        setDoc(d);
+        setSelectedTagIds(new Set((d.tags ?? []).map((t) => t.id)));
+      }
+      setPreviewSource({ doc: d, gen });
       if (d.vault_id != null) {
         try {
-          setAllTags(await listTags(d.vault_id));
+          const tags = await listTags(d.vault_id);
+          if (loadGenRef.current === gen) {
+            setAllTags(tags);
+          }
         } catch {
           // Tag editing is best-effort; ignore load failures.
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load document");
+      if (loadGenRef.current === gen) {
+        setError(err instanceof Error ? err.message : "Failed to load document");
+      }
     } finally {
-      setLoading(false);
+      if (loadGenRef.current === gen) {
+        setLoading(false);
+      }
     }
   }, [id]);
 
@@ -76,8 +110,9 @@ export default function DocumentDetailPage() {
 
   // Inline preview for text-like and PDF documents.
   useEffect(() => {
-    if (!doc) return;
-    const ext = extensionOf(doc.filename);
+    if (!previewSource) return;
+    const { doc: previewDoc, gen } = previewSource;
+    const ext = extensionOf(previewDoc.filename);
     const isText = TEXT_EXTENSIONS.includes(ext);
     const isPdf = ext === "pdf";
     if (!isText && !isPdf) return;
@@ -85,22 +120,40 @@ export default function DocumentDetailPage() {
     // Guard against loading huge text files into a JS string (F-004). PDFs are
     // streamed into an object URL by the browser, so only text needs the cap.
     const MAX_TEXT_PREVIEW_BYTES = 5 * 1024 * 1024;
-    if (isText && typeof doc.size === "number" && doc.size > MAX_TEXT_PREVIEW_BYTES) {
-      setPreviewText(
-        `File too large to preview (${formatFileSize(doc.size)}). Download to view.`
-      );
+    if (isText && typeof previewDoc.size === "number" && previewDoc.size > MAX_TEXT_PREVIEW_BYTES) {
+      if (loadGenRef.current === gen) {
+        setPreviewText(
+          `File too large to preview (${formatFileSize(previewDoc.size)}). Download to view.`
+        );
+      }
       return;
     }
 
     let revoked: string | null = null;
     const controller = new AbortController();
+    // Supersede the previous preview request — but only when THIS run is the
+    // newer load. When a stale document's late resolution started this run,
+    // the current document's in-flight preview must survive (UI-011); its own
+    // commit is generation-guarded below anyway.
+    const previous = previewInFlightRef.current;
+    if (previous && gen > previous.gen) previous.controller.abort();
+    previewInFlightRef.current = { controller, gen };
     (async () => {
       try {
-        const blob = await getDocumentRawBlob(doc.id, controller.signal);
+        const blob = await getDocumentRawBlob(previewDoc.id, controller.signal);
+        // UI-011: check after EVERY await — a blob belonging to a superseded
+        // load generation must never commit preview state.
+        if (loadGenRef.current !== gen) return;
         if (isText) {
-          setPreviewText(await blob.text());
+          const text = await blob.text();
+          if (loadGenRef.current !== gen) return;
+          setPreviewText(text);
         } else {
           const url = URL.createObjectURL(blob);
+          if (loadGenRef.current !== gen) {
+            URL.revokeObjectURL(url);
+            return;
+          }
           revoked = url;
           setPreviewUrl(url);
         }
@@ -109,12 +162,11 @@ export default function DocumentDetailPage() {
       }
     })();
     return () => {
-      controller.abort();
       if (revoked) URL.revokeObjectURL(revoked);
       setPreviewText(null);
       setPreviewUrl(null);
     };
-  }, [doc]);
+  }, [previewSource]);
 
   const tagsDirty = useMemo(() => {
     if (!doc) return false;
@@ -172,6 +224,23 @@ export default function DocumentDetailPage() {
 
   const status = (doc.metadata?.status as string | undefined) ?? "";
   const chunkCount = Number(doc.metadata?.chunk_count ?? 0);
+  // Searchable once chunks are embedded: "indexed", or "partial" (LIVE-03 —
+  // completed with embedding failures; the embedded chunks still retrieve).
+  const isSearchable = status === "indexed" || status === "partial";
+  const chunksFailed = Number(doc.metadata?.chunks_failed ?? 0);
+  const failureMessage =
+    documentField<string>(doc, "error_message") ??
+    (chunksFailed > 0 ? `${chunksFailed} chunks failed to embed` : null);
+  const partialDescription =
+    status === "partial" ? (failureMessage ?? "Completed with failures") : null;
+
+  const handleAskAboutDocument = () => {
+    if (!doc || !isSearchable) return;
+    // Scope the NEXT chat question to this document (issue #514 AC-23), then
+    // route into the chat surface carrying the document id.
+    setScopeDocumentIds([Number(doc.id)]);
+    navigate({ pathname: "/chat", search: `?document_ids=${doc.id}` });
+  };
 
   return (
     <ScrollArea className="h-full">
@@ -187,10 +256,26 @@ export default function DocumentDetailPage() {
               {doc.filename}
             </h1>
           </div>
-          <Button variant="outline" size="sm" onClick={handleDownload}>
-            <Download className="w-4 h-4 mr-1" />
-            Download
-          </Button>
+          <div className="flex items-center gap-2 shrink-0">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleAskAboutDocument}
+              disabled={!isSearchable}
+              title={
+                isSearchable
+                  ? "Ask questions scoped to this document"
+                  : "Waiting until indexed — available once the document is searchable"
+              }
+            >
+              <MessageSquare className="w-4 h-4 mr-1" />
+              Ask about this document
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleDownload}>
+              <Download className="w-4 h-4 mr-1" />
+              Download
+            </Button>
+          </div>
         </div>
 
         {/* Metadata */}
@@ -202,6 +287,9 @@ export default function DocumentDetailPage() {
             <div>
               <p className="text-muted-foreground">Status</p>
               <StatusBadge status={status} chunksFailed={Number(doc.metadata?.chunks_failed ?? 0)} />
+              {partialDescription && (
+                <p className="text-xs text-warning mt-1">{partialDescription}</p>
+              )}
             </div>
             <div>
               <p className="text-muted-foreground">Chunks</p>
@@ -217,6 +305,9 @@ export default function DocumentDetailPage() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Parse quality — extraction diagnostics (issue #514 / PRODUCT-ENH-06) */}
+        <ParseQualityPanel doc={doc} />
 
         {/* Tags */}
         <Card>

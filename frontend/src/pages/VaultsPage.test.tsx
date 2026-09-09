@@ -35,6 +35,7 @@ const vaultStoreMock = vi.hoisted(() => ({
     },
   ],
   loading: false,
+  error: null as string | null,
   fetchVaults: vi.fn(),
   addVault: vi.fn(),
   editVault: vi.fn(),
@@ -123,6 +124,7 @@ vi.mock("@/components/ui/select", () => ({
 }));
 
 vi.mock("lucide-react", () => ({
+  AlertCircle: () => <span />,
   Brain: () => <span />,
   Database: () => <span />,
   FileText: () => <span />,
@@ -246,5 +248,44 @@ describe("VaultsPage dialog forms", () => {
         description: "",
       });
     });
+  });
+});
+
+describe("VaultsPage error state vs empty state (UI-053)", () => {
+  const originalVaults = vaultStoreMock.vaults;
+  const originalError = vaultStoreMock.error;
+
+  afterEach(() => {
+    vaultStoreMock.vaults = originalVaults;
+    vaultStoreMock.error = originalError;
+    vaultStoreMock.loading = false;
+  });
+
+  it("renders a retriable error surface (not the empty state) when the load failed", () => {
+    vaultStoreMock.vaults = [];
+    vaultStoreMock.error = "vault API down";
+    vaultStoreMock.loading = false;
+
+    render(<VaultsPage />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(/failed to load vaults/i);
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+    // A failed load must never read as "you have no vaults".
+    expect(screen.queryByText("No vaults yet")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+    expect(vaultStoreMock.fetchVaults).toHaveBeenCalled();
+  });
+
+  it("keeps the empty state (and no alert) on a successful empty load", async () => {
+    vaultStoreMock.vaults = [];
+    vaultStoreMock.error = null;
+    vaultStoreMock.loading = false;
+
+    render(<VaultsPage />);
+
+    expect(await screen.findByText("No vaults yet")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });

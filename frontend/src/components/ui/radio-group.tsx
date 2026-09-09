@@ -108,7 +108,10 @@ const RadioGroupItem = React.forwardRef<
   const isDisabled = itemDisabled !== undefined ? itemDisabled : context.disabled
 
   return (
-    <div className="flex items-center">
+    <label
+      htmlFor={finalId}
+      className={cn("flex items-center", isDisabled ? "cursor-not-allowed" : "cursor-pointer")}
+    >
       <input
         ref={ref}
         type="radio"
@@ -140,7 +143,7 @@ const RadioGroupItem = React.forwardRef<
           )}
         />
       </div>
-    </div>
+    </label>
   )
 })
 RadioGroupItem.displayName = "RadioGroupItem"

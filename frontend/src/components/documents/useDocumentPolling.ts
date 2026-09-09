@@ -56,8 +56,13 @@ export function useDocumentPolling({
   const [pageSize, setPageSize] = useState(PAGE_SIZE);
   const pollIntervalMsRef = useRef(2_000);
   const initialLoadDone = useRef(false);
+  // Monotonic generation for list fetches: only the most recently issued
+  // fetchDocuments may commit. A late response (success or rejection) for an
+  // abandoned query must never overwrite or clear a newer query's results.
+  const fetchGenerationRef = useRef(0);
 
   const fetchDocuments = useCallback(async () => {
+    const generation = ++fetchGenerationRef.current;
     try {
       const response = await listDocuments({
         vaultId: activeVaultId ?? undefined,
@@ -68,9 +73,11 @@ export function useDocumentPolling({
         folderId: folderFilterId ?? undefined,
         perPage: pageSize,
       });
+      if (fetchGenerationRef.current !== generation) return;
       setDocuments(response?.documents || []);
       setTotal(response?.total ?? 0);
     } catch (err) {
+      if (fetchGenerationRef.current !== generation) return;
       console.error("Failed to fetch documents:", err);
       toast.error(err instanceof Error ? err.message : "Failed to load documents");
       setDocuments([]);
@@ -207,20 +214,54 @@ export function useDocumentPolling({
   // the ID join — NOT the array identity — so the adaptive status poll's
   // fetchDocuments() refresh (new array, same IDs) doesn't refire a wiki GET
   // per document on every cycle. Only docs with no cached status or a
-  // transient status (compiling/promoting) are re-polled; terminal wiki
-  // statuses don't change without user action.
+  // transient status (compiling) are re-polled; terminal wiki statuses don't
+  // change without user action.
   const wikiDocKey = documents.map((d) => String(d.id)).join(",");
   useEffect(() => {
     if (documents.length === 0) return;
     const need = documents.filter((d) => {
       if (d.metadata?.status !== "indexed") return false;
       const w = wikiStatusMap[String(d.id)];
-      const transient = w?.wiki_status === "compiling";
-      return !w || transient;
+      return !w || isTransientWikiStatus(w.wiki_status);
     });
     if (need.length > 0) fetchWikiStatuses(need);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wikiDocKey, fetchWikiStatuses]);
+
+  // Independent poll-to-terminal for transient wiki statuses (e.g. compiling):
+  // while any listed doc's CACHED wiki status is transient, re-run the batched
+  // fetchWikiStatuses on a fixed ~5s cadence until every transient status
+  // reaches a terminal state. This is decoupled from document-list changes and
+  // from the indexing poller above — a compiling wiki can finish long after
+  // the document itself is indexed, and the list must not be refetched for the
+  // wiki cell to advance. One fetch per tick, skipped while a fetch is already
+  // in flight, and the interval is cancelled on unmount or when nothing is
+  // transient anymore.
+  const WIKI_POLL_INTERVAL_MS = 5_000;
+  const transientWikiKey = documents
+    .filter(
+      (d) =>
+        d.metadata?.status === "indexed" &&
+        isTransientWikiStatus(wikiStatusMap[String(d.id)]?.wiki_status)
+    )
+    .map((d) => String(d.id))
+    .join(",");
+  const wikiFetchInFlightRef = useRef(false);
+  useEffect(() => {
+    if (!transientWikiKey) return;
+    const transientDocs = documents.filter((d) =>
+      transientWikiKey.split(",").includes(String(d.id))
+    );
+    const timer = setInterval(() => {
+      if (wikiFetchInFlightRef.current) return;
+      wikiFetchInFlightRef.current = true;
+      void fetchWikiStatuses(transientDocs).finally(() => {
+        wikiFetchInFlightRef.current = false;
+      });
+    }, WIKI_POLL_INTERVAL_MS);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transientWikiKey, fetchWikiStatuses]);
 
   // Refresh documents shortly after uploads finish indexing.
   useEffect(() => {
@@ -249,4 +290,13 @@ export function useDocumentPolling({
     hasMore,
     loadMore,
   };
+}
+
+/**
+ * Transient wiki statuses are still moving toward a terminal state and must be
+ * re-polled; terminal statuses (compiled/failed/not_compiled/skipped) only
+ * change through user action.
+ */
+function isTransientWikiStatus(status: string | null | undefined): boolean {
+  return status === "compiling" || status === "running";
 }

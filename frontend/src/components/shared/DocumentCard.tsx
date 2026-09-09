@@ -1,5 +1,6 @@
 // src/components/shared/DocumentCard.tsx
 
+import { Link } from "react-router-dom";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -63,6 +64,9 @@ export function DocumentCard({
   isSelected = false,
   onSelectionChange,
 }: DocumentCardProps) {
+  // Canonical string id — backend responses can carry numeric ids, and the
+  // shared bulk-selection set is string-keyed.
+  const docId = String(document.id);
   const status = document.metadata?.status as string | undefined;
   const chunkCount = document.metadata?.chunk_count as number | undefined;
   const phase =
@@ -113,9 +117,7 @@ export function DocumentCard({
             {onSelectionChange && (
               <Checkbox
                 checked={!!isSelected}
-                onCheckedChange={(checked) =>
-                  onSelectionChange(document.id, !!checked)
-                }
+                onCheckedChange={(checked) => onSelectionChange(docId, !!checked)}
                 aria-label={`Select ${document.filename}`}
                 className="shrink-0"
               />
@@ -127,13 +129,16 @@ export function DocumentCard({
               <FileIcon filename={document.filename} className="w-5 h-5" />
             </div>
             <div className="min-w-0">
+              {/* Same detail-route affordance as the desktop table's filename
+                  cell (AC2) — the mobile card is not a dead end. */}
               <h3
                 className="font-medium text-foreground truncate"
                 title={document.filename}
               >
-                {document.filename}
+                <Link to={`/documents/${docId}`} className="hover:underline">
+                  {document.filename}
+                </Link>
               </h3>
-  
             </div>
           </div>
 
@@ -154,7 +159,7 @@ export function DocumentCard({
               <DropdownMenuContent align="end" className="w-48">
                 {onDownload && (
                   <DropdownMenuItem
-                    onClick={() => onDownload(document.id)}
+                    onClick={() => onDownload(docId)}
                     aria-label={`Download ${document.filename}`}
                   >
                     <Download className="w-4 h-4 mr-2" />
@@ -163,7 +168,7 @@ export function DocumentCard({
                 )}
                 {canDelete && (
                   <DropdownMenuItem
-                    onClick={() => onDelete(document.id)}
+                    onClick={() => onDelete(docId)}
                     disabled={isDeleting}
                     className="text-destructive focus:text-destructive bg-destructive/10 hover:bg-destructive/20!"
                     aria-label={`Delete ${document.filename}`}
@@ -236,7 +241,7 @@ export function DocumentCard({
               variant="destructive"
               size="sm"
               className="h-11 w-full"
-              onClick={() => onDelete(document.id)}
+              onClick={() => onDelete(docId)}
               disabled={isDeleting}
               aria-label={`Delete ${document.filename}`}
               aria-busy={isDeleting}

@@ -3,7 +3,8 @@ import { useDropzone, type FileRejection } from "react-dropzone";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Upload, Info } from "lucide-react";
-import { MAX_UPLOAD_FILE_SIZE_BYTES, formatUploadSizeLimit } from "@/lib/uploadLimits";
+import { useSettingsStore } from "@/stores/useSettingsStore";
+import { MAX_UPLOAD_FILE_SIZE_MB, formatUploadSizeLimit } from "@/lib/uploadLimits";
 
 interface UploadDropzoneProps {
   hasSelectedVault: boolean;
@@ -20,6 +21,13 @@ export function UploadDropzone({
   onFiles,
   onRejected,
 }: UploadDropzoneProps) {
+  // Effective upload limit: server-configured max_file_size_mb once settings
+  // have loaded (the settings store is the only fetch path), else the client
+  // fallback. Drives both react-dropzone's maxSize and the label.
+  const maxFileSizeMb =
+    useSettingsStore((s) => s.settings?.max_file_size_mb) ?? MAX_UPLOAD_FILE_SIZE_MB;
+  const maxFileSizeBytes = maxFileSizeMb * 1024 * 1024;
+
   const onDrop = useCallback(
     (acceptedFiles: File[]) => {
       if (acceptedFiles.length === 0) return;
@@ -41,7 +49,7 @@ export function UploadDropzone({
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     onDropRejected,
-    maxSize: MAX_UPLOAD_FILE_SIZE_BYTES,
+    maxSize: maxFileSizeBytes,
     disabled: !hasSelectedVault || !canWriteActiveVault,
   });
 
@@ -62,7 +70,7 @@ export function UploadDropzone({
         <div className="flex flex-col items-center justify-center text-center">
           <Badge variant="secondary" className="mb-3 gap-1.5 text-xs font-medium">
             <Info className="h-3 w-3" aria-hidden="true" />
-            Max {formatUploadSizeLimit()}
+            Max {formatUploadSizeLimit(maxFileSizeMb)}
           </Badge>
           <Upload className="w-12 h-12 text-muted-foreground mb-4" />
           <p className="text-lg font-medium">
@@ -73,7 +81,7 @@ export function UploadDropzone({
                 : "Drag & drop files here, or click to select"}
           </p>
           <p className="text-sm text-muted-foreground mt-1">
-            Supports PDF, DOCX, TXT, MD files (max {formatUploadSizeLimit()} each). Uploads continue in background.
+            Supports PDF, DOCX, TXT, MD files (max {formatUploadSizeLimit(maxFileSizeMb)} each). Uploads continue in background.
           </p>
         </div>
       </CardContent>

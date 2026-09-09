@@ -157,6 +157,13 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
     if (pathname.startsWith("/admin/users")) return "users";
     if (pathname.startsWith("/admin/organizations")) return "organizations";
     if (pathname.startsWith("/profile")) return "profile";
+    // Detail routes keep their parent nav item selected (UI-047) — navigating
+    // from the list to /documents/<id> (or /kms/<id>, /memory/<id>, /wiki/<id>)
+    // must not drop the section highlight.
+    if (pathname.startsWith("/documents/")) return "documents";
+    if (pathname.startsWith("/kms/")) return "kms";
+    if (pathname.startsWith("/memory/")) return "memory";
+    if (pathname.startsWith("/wiki/")) return "wiki";
     return null;
   };
 

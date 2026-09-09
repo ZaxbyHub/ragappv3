@@ -58,6 +58,17 @@ export function BulkTagDialog({
       onTagsChanged();
       toast.success(`Created tag "${tag.name}"`);
     } catch (err) {
+      // Create-or-reuse: when the server reports the tag already exists
+      // (409/duplicate), the tag already exists in the loaded list — check it
+      // and continue with the success-path UX instead of surfacing an error.
+      const message = err instanceof Error ? err.message : "";
+      const isDuplicate = /409|already exists|duplicate/i.test(message);
+      const existing = tags.find((t) => t.name.toLowerCase() === name.toLowerCase());
+      if (isDuplicate && existing) {
+        setNewTagName("");
+        setChecked((prev) => new Set(prev).add(existing.id));
+        return;
+      }
       toast.error(err instanceof Error ? err.message : "Failed to create tag");
     } finally {
       setCreating(false);
@@ -113,6 +124,7 @@ export function BulkTagDialog({
               size="sm"
               onClick={handleCreateTag}
               disabled={creating || !newTagName.trim()}
+              aria-label="Create tag"
             >
               {creating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
             </Button>

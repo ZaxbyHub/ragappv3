@@ -774,6 +774,36 @@ class DocumentProcessor:
         self._contextual_chunker = None
         self._chunk_enrichment_service = None
 
+    def _persist_extraction_diagnostics(
+        self, file_id: Optional[int], diagnostics: Optional[dict]
+    ) -> None:
+        """Persist parse-quality diagnostics on ``files.extraction_diagnostics``
+        (issue #514 PRODUCT-ENH-06).
+
+        Best-effort by contract, mirroring the phase-progress writes: the
+        diagnostics are advisory parse metadata and must never abort indexing,
+        so DB/pool failures log and drop. Lazy import because
+        ``document_extraction`` imports this module (the producer lives there
+        per its documented home).
+        """
+        if file_id is None or diagnostics is None:
+            return
+        try:
+            with self.pool.connection() as conn:
+                conn.execute(
+                    "UPDATE files SET extraction_diagnostics = ? WHERE id = ?",
+                    (json.dumps(diagnostics), file_id),
+                )
+                conn.commit()
+        except (sqlite3.Error, RuntimeError) as exc:
+            # RuntimeError = expected pool-checkout failure (exhaustion/closed
+            # pool) — same best-effort contract as set_phase (issue #513 W2).
+            logger.warning(
+                "Extraction diagnostics persist failed for file_id=%s: %s",
+                file_id,
+                exc,
+            )
+
     @asynccontextmanager
     async def _write_session(self) -> Iterator[sqlite3.Connection]:
         """Yield a pooled connection under the shared SQLite write permit.
@@ -2537,6 +2567,46 @@ class DocumentProcessor:
         # on `.success` (issue #460 defect 2).
         image_result: ImageProcessingResult = await process_image(file_path)
 
+        filename = Path(file_path).name
+        searchable_text = (
+            build_searchable_text(image_result, filename)
+            if image_result.success
+            else ""
+        )
+
+        # Parse-quality diagnostics (issue #514 PRODUCT-ENH-06): this IS the
+        # OCR seam — the raster page is reported through the shared producer
+        # with ocr_used=True (a synthetic single-page element carries the OCR
+        # text), so an unreadable or text-less image reveals its zero-text
+        # page in the same payload that reports chunk/index state. Computed
+        # before the degradation returns so failed parses are recorded too.
+        try:
+            from types import SimpleNamespace as _SimpleNamespace
+
+            from app.services.document_extraction import (
+                build_extraction_diagnostics,
+            )
+
+            self._persist_extraction_diagnostics(
+                file_id,
+                build_extraction_diagnostics(
+                    [
+                        _SimpleNamespace(
+                            category="Image",
+                            text=searchable_text,
+                            metadata=_SimpleNamespace(page_number=1),
+                        )
+                    ],
+                    ocr_used=True,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory parse metadata only
+            logger.warning(
+                "Extraction diagnostics build failed for file_id=%s: %s",
+                file_id,
+                exc,
+            )
+
         if not image_result.success:
             logger.warning(
                 "Image processing failed for %s: %s. "
@@ -2545,9 +2615,6 @@ class DocumentProcessor:
                 image_result.error,
             )
             return [], "", ParsedDocument(atoms=(), parser_fingerprint=parser_fingerprint)
-
-        filename = Path(file_path).name
-        searchable_text = build_searchable_text(image_result, filename)
 
         if not searchable_text or not searchable_text.strip():
             logger.warning(
@@ -2682,6 +2749,26 @@ class DocumentProcessor:
         finally:
             if stage_timings is not None:
                 _add_elapsed_ms(stage_timings, "parse_ms", parse_started_at)
+        # Parse-quality diagnostics (issue #514 PRODUCT-ENH-06): derived from
+        # the elements this parse actually produced and persisted as JSON so
+        # the status payload can reveal omissions (low-content pages, dropped
+        # structures) even when every chunk embeds. ocr_used stays False on
+        # this seam — the honest OCR fact is threaded from the image pipeline
+        # seam (_process_image_file), not inferred here.
+        try:
+            from app.services.document_extraction import (
+                build_extraction_diagnostics,
+            )
+
+            self._persist_extraction_diagnostics(
+                file_id, build_extraction_diagnostics(elements)
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory parse metadata only
+            logger.warning(
+                "Extraction diagnostics build failed for file_id=%s: %s",
+                file_id,
+                exc,
+            )
         # Join all element texts for use as context in contextual chunking.
         # Unchanged raw join: parent-window offsets and retrieval depend on it
         # byte-for-byte (issue #460 preserves existing text retrieval behavior).

@@ -36,7 +36,9 @@ import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useLlmHealthStore } from "@/stores/useLlmHealthStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useVaultStore } from "@/stores/useVaultStore";
-import { uploadDocument, getDocumentStatus } from "@/lib/api";
+import { useUploadStore } from "@/stores/useUploadStore";
+import type { UploadFile } from "@/stores/useUploadStore";
+import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import { computeEffectiveChatMode } from "@/lib/chatMode";
 import { MAX_INPUT_LENGTH } from "@/hooks/useSendMessage";
 import { useEscapeToStop } from "@/hooks/useEscapeToStop";
@@ -54,8 +56,8 @@ interface SlashCommand {
 }
 
 /**
- * State machine for an attachment from the moment the user drops it onto
- * the composer until it is fully indexed and searchable by RAG:
+ * State machine for an attachment chip from the moment the user drops it
+ * onto the composer until it is fully indexed and searchable by RAG:
  *
  *   uploading → uploaded → indexing → indexed
  *                                  ↳ error (terminal, with message)
@@ -63,26 +65,36 @@ interface SlashCommand {
  * The user can submit a query containing an attachment that is still in
  * the ``uploading``, ``uploaded``, or ``indexing`` states, but the UI shows
  * a warning that the file is not yet searchable. Failures surface the
- * backend error message and stay removable.
+ * backend error message and stay removable. Attachment state lives in the
+ * shared upload store, so chips survive composer unmount/remount and their
+ * indexing progress is driven by the shared batched status monitor.
  */
-type AttachmentStatus =
+type AttachmentChipStatus =
   | "uploading"
   | "uploaded"
   | "indexing"
   | "indexed"
   | "error";
 
-interface PendingAttachment {
-  id: string;
-  file: File;
-  /** Server-assigned file id once upload completes (used for status polling). */
-  fileId?: string;
-  progress: number;
-  status: AttachmentStatus;
-  /** Backend chunk_count once indexing succeeds (informational). */
-  chunkCount?: number;
-  /** Error text shown beneath the chip when status === "error". */
-  error?: string;
+/**
+ * `uploading` covers queued + in-flight byte transfers; `uploaded` means the
+ * server accepted the bytes but no status snapshot has arrived yet; once the
+ * monitor applies a non-terminal snapshot the chip shows `indexing`.
+ */
+function attachmentChipStatus(upload: UploadFile): AttachmentChipStatus {
+  switch (upload.status) {
+    case "pending":
+    case "uploading":
+      return "uploading";
+    case "indexed":
+      return "indexed";
+    case "error":
+    case "cancelled":
+      return "error";
+    default:
+      // processing / indexing: bytes accepted.
+      return upload.statusSeen ? "indexing" : "uploaded";
+  }
 }
 
 interface ComposerProps {
@@ -170,19 +182,24 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     setSelectedCmd(0);
   }, []);
 
-  // File attachments
-  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
-  // Track active polling intervals so we can cancel on unmount or removal.
-  const pollersRef = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
+  // File attachments — shared upload store. Transfers run in the store's
+  // bounded pool and indexing is monitored by the shared batched status
+  // poller, so chips (and their progress) survive unmount/remount.
+  const uploads = useUploadStore((s) => s.uploads);
+  const chatAttachmentIds = useUploadStore((s) => s.chatAttachmentIds);
+  const addUploads = useUploadStore((s) => s.addUploads);
+  const attachToChat = useUploadStore((s) => s.attachToChat);
+  const detachFromChat = useUploadStore((s) => s.detachFromChat);
+  const removeUpload = useUploadStore((s) => s.removeUpload);
+  useUploadMonitoring();
 
-  // Cancel all pollers on unmount.
-  useEffect(() => {
-    const pollers = pollersRef.current;
-    return () => {
-      for (const [, handle] of pollers) clearInterval(handle);
-      pollers.clear();
-    };
-  }, []);
+  const attachments: UploadFile[] = chatAttachmentIds
+    .map((id) => uploads.find((u) => u.id === id))
+    .filter((u): u is UploadFile => u !== undefined);
+  const attachmentChips = attachments.map((upload) => ({
+    upload,
+    status: attachmentChipStatus(upload),
+  }));
 
   // Draft — restore on session change, write on input changes
   const lastLoadedRef = useRef<string | null>(null);
@@ -272,21 +289,21 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     // no file id yet to reference. Indexing-in-progress is a soft warning
     // only (the file may still be partially searchable, and we don't want
     // to block the user indefinitely if indexing is slow).
-    if (attachments.some((a) => a.status === "uploading")) {
+    if (attachmentChips.some((c) => c.status === "uploading")) {
       toast.error("Please wait for file uploads to complete.");
       return;
     }
-    const indexingAttachments = attachments.filter(
-      (a) => a.status === "indexing" || a.status === "uploaded"
+    const indexingChips = attachmentChips.filter(
+      (c) => c.status === "indexing" || c.status === "uploaded"
     );
-    if (indexingAttachments.length > 0) {
-      const indexingIds = new Set(indexingAttachments.map((a) => a.id));
+    if (indexingChips.length > 0) {
+      const indexingIds = new Set(indexingChips.map((c) => c.upload.id));
       toast.warning("Some files are still indexing", {
-        description: `${indexingAttachments.map((a) => a.file.name).join(", ")} may not be searchable yet.`,
+        description: `${indexingChips.map((c) => c.upload.file.name).join(", ")} may not be searchable yet.`,
         action: {
           label: "Send without these files",
           onClick: () => {
-            setAttachments((prev) => prev.filter((a) => !indexingIds.has(a.id)));
+            indexingIds.forEach((id) => detachFromChat(id));
             persistDraft("");
             closeSlashMenu();
             onSend();
@@ -298,178 +315,33 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     persistDraft("");
     closeSlashMenu();
     onSend();
-    // Keep attachments in the tray after send only if they are still
-    // indexing or in error — fully indexed/uploading-failed files have
-    // either been used or surfaced their error already.
-    setAttachments((prev) => prev.filter((a) => a.status === "error"));
+    // Keep attachments in the tray after send only if they failed —
+    // fully indexed files have been used and empty-state chips add noise.
+    attachmentChips
+      .filter((c) => c.status !== "error")
+      .forEach((c) => detachFromChat(c.upload.id));
   };
 
   // =============================================================================
   // File upload
   // =============================================================================
 
-  /**
-   * Begin polling the backend indexing status for an attachment that
-   * finished uploading. The async upload route returns immediately with
-   * ``status="pending"`` and ``phase="queued"``; the worker advances the
-   * row through the canonical 4-value status enum
-   * (pending -> processing -> indexed | error). Phase strings
-   * (queued/parsing/embedding/...) are treated as mid-pipeline by mapping
-   * to the chip's "indexing" state.
-   *
-   * No frontend timeout: large files legitimately take many minutes. A
-   * 4-hour absolute cap stops a runaway poller. Transient fetch errors
-   * are tolerated until many consecutive failures.
-   */
-  const startIndexPoll = useCallback((rowId: string, fileId: string) => {
-    const startedAt = Date.now();
-    const HARD_CAP_MS = 4 * 60 * 60 * 1000;
-    let consecutiveFailures = 0;
-    const handle = setInterval(async () => {
-      const elapsedMs = Date.now() - startedAt;
-      try {
-        const status = await getDocumentStatus(fileId);
-        consecutiveFailures = 0;
-        if (status.status === "indexed") {
-          clearInterval(handle);
-          pollersRef.current.delete(rowId);
-          setAttachments((prev) =>
-            prev.map((a) =>
-              a.id === rowId
-                ? { ...a, status: "indexed", chunkCount: status.chunk_count }
-                : a
-            )
-          );
-        } else if (status.status === "error") {
-          clearInterval(handle);
-          pollersRef.current.delete(rowId);
-          const msg = status.error_message || "Indexing failed";
-          setAttachments((prev) =>
-            prev.map((a) =>
-              a.id === rowId ? { ...a, status: "error", error: msg } : a
-            )
-          );
-          toast.error(`Indexing failed for ${fileId}`, { description: msg });
-        } else {
-          // "pending" / "processing" / any other non-terminal status
-          // means the worker is mid-pipeline. Phase string detail
-          // (queued/parsing/...) doesn't change the chip but is a
-          // healthy heartbeat from the backend.
-          setAttachments((prev) =>
-            prev.map((a) =>
-              a.id === rowId && a.status !== "indexing"
-                ? { ...a, status: "indexing" }
-                : a
-            )
-          );
-          if (elapsedMs >= HARD_CAP_MS) {
-            clearInterval(handle);
-            pollersRef.current.delete(rowId);
-            // Don't mark "error" — backend may still be working; just
-            // stop polling and let the chip show a soft notice.
-            setAttachments((prev) =>
-              prev.map((a) =>
-                a.id === rowId
-                  ? {
-                      ...a,
-                      error:
-                        "Indexing is taking longer than expected. The file may still be processing — refresh to recheck.",
-                    }
-                  : a
-              )
-            );
-          }
-        }
-      } catch (err) {
-        consecutiveFailures += 1;
-        // 30 consecutive 1-second-spaced failures = ~30s of network
-        // blackout before the chat chip flips to error. Chosen to ride
-        // through brief LAN drops without blocking the user; any longer
-        // and the UX feels stuck. Tunable independently of the upload
-        // store's adaptive cadence (which uses the same constant but
-        // 1.5/3/6s spacing => much larger real-world tolerance).
-        if (consecutiveFailures >= 30 || elapsedMs >= HARD_CAP_MS) {
-          clearInterval(handle);
-          pollersRef.current.delete(rowId);
-          const msg = err instanceof Error ? err.message : "Status check failed";
-          setAttachments((prev) =>
-            prev.map((a) =>
-              a.id === rowId ? { ...a, status: "error", error: msg } : a
-            )
-          );
-        }
-      }
-    }, 1000);
-    pollersRef.current.set(rowId, handle);
-  }, []);
-
-  const uploadFile = useCallback(
-    async (file: File) => {
-      if (!activeVaultId) {
-        toast.error(
-          "No active vault. Please select a vault before uploading files.",
-          { description: "Go to Documents to manage vaults." }
-        );
-        return;
-      }
-
-      const id = `${Date.now()}-${Math.random()}`;
-      const pending: PendingAttachment = {
-        id,
-        file,
-        progress: 0,
-        status: "uploading",
-      };
-      setAttachments((prev) => [...prev, pending]);
-
-      try {
-        const resp = await uploadDocument(
-          file,
-          (progress) => {
-            setAttachments((prev) =>
-              prev.map((a) => (a.id === id ? { ...a, progress } : a))
-            );
-          },
-          activeVaultId
-        );
-        const fileId = String(resp.id);
-        // The async upload route returns immediately with status="pending".
-        // We transition the chip to "uploaded" as the bridge state and let
-        // startIndexPoll drive subsequent transitions. The "indexed"
-        // short-circuit is preserved for any client that still sees the
-        // legacy synchronous response.
-        const initialStatus: AttachmentStatus =
-          resp.status === "indexed" ? "indexed" : "uploaded";
-        setAttachments((prev) =>
-          prev.map((a) =>
-            a.id === id
-              ? { ...a, fileId, progress: 100, status: initialStatus }
-              : a
-          )
-        );
-        if (initialStatus !== "indexed") {
-          startIndexPoll(id, fileId);
-        }
-        toast.success(
-          `${file.name} uploaded to ${activeVault?.name ?? "vault"}`
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "Upload failed";
-        setAttachments((prev) =>
-          prev.map((a) =>
-            a.id === id ? { ...a, status: "error", error: msg } : a
-          )
-        );
-        toast.error(`Failed to upload ${file.name}`, { description: msg });
-      }
+  // Paste/drop enqueue through the shared upload store's bounded transfer
+  // pool; the returned ids register the files as chat attachments so the
+  // chips live in the store (surviving navigation) instead of this mount.
+  const enqueueFiles = useCallback(
+    (files: File[]) => {
+      if (files.length === 0) return;
+      const queuedIds = addUploads(files, activeVaultId ?? undefined);
+      queuedIds.forEach((id) => attachToChat(id));
     },
-    [activeVaultId, activeVault, startIndexPoll]
+    [activeVaultId, addUploads, attachToChat]
   );
 
   const { getRootProps, getInputProps, isDragActive, open: openFilePicker } = useDropzone({
     noClick: true,
     noKeyboard: true,
-    onDrop: (files) => files.forEach(uploadFile),
+    onDrop: enqueueFiles,
   });
 
   // Handle paste with files
@@ -477,22 +349,18 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     const files = Array.from(e.clipboardData.files);
     if (files.length > 0) {
       e.preventDefault();
-      files.forEach(uploadFile);
+      enqueueFiles(files);
     }
   };
 
   const removeAttachment = (id: string) => {
-    const handle = pollersRef.current.get(id);
-    if (handle) {
-      clearInterval(handle);
-      pollersRef.current.delete(id);
-    }
-    setAttachments((prev) => prev.filter((a) => a.id !== id));
+    removeUpload(id);
+    detachFromChat(id);
   };
 
-  const hasUploading = attachments.some((a) => a.status === "uploading");
-  const hasIndexing = attachments.some(
-    (a) => a.status === "indexing" || a.status === "uploaded"
+  const hasUploading = attachmentChips.some((c) => c.status === "uploading");
+  const hasIndexing = attachmentChips.some(
+    (c) => c.status === "indexing" || c.status === "uploaded"
   );
 
   // =============================================================================
@@ -524,13 +392,13 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
         </span>
 
         {/* Attachment tray */}
-        {attachments.length > 0 && (
+        {attachmentChips.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-2" data-testid="attachment-tray">
-            {attachments.map((att) => {
+            {attachmentChips.map(({ upload: att, status }) => {
               const statusText = (() => {
-                switch (att.status) {
+                switch (status) {
                   case "uploading":
-                    return `Uploading ${att.progress}%`;
+                    return `Uploading ${att.uploadProgress}%`;
                   case "uploaded":
                     return "Uploaded · waiting for indexer";
                   case "indexing":
@@ -540,24 +408,24 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                       ? `Indexed · ${att.chunkCount} chunks`
                       : "Ready · indexed";
                   case "error":
-                    return att.error || "Failed";
+                    return att.error ?? (att.status === "cancelled" ? "Cancelled" : "Failed");
                 }
               })();
               return (
                 <div
                   key={att.id}
-                  data-testid={`attachment-${att.status}`}
+                  data-testid={`attachment-${status}`}
                   className={cn(
                     "flex items-center gap-2 rounded-sm border px-2 py-1.5 text-xs",
-                    att.status === "error" && "border-destructive/50 bg-destructive/5",
-                    att.status === "indexed" && "border-success/50 bg-success/5",
-                    att.status === "uploaded" && "border-amber-500/40 bg-amber-500/5",
-                    att.status === "indexing" && "border-amber-500/40 bg-amber-500/5",
-                    att.status === "uploading" && "border-border bg-muted/50"
+                    status === "error" && "border-destructive/50 bg-destructive/5",
+                    status === "indexed" && "border-success/50 bg-success/5",
+                    status === "uploaded" && "border-amber-500/40 bg-amber-500/5",
+                    status === "indexing" && "border-amber-500/40 bg-amber-500/5",
+                    status === "uploading" && "border-border bg-muted/50"
                   )}
                   aria-label={`Attachment ${att.file.name}: ${statusText}`}
                 >
-                  {att.status === "error" ? (
+                  {status === "error" ? (
                     <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
                   ) : (
                     <FileText className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
@@ -565,17 +433,17 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                   <span className="max-w-[120px] truncate" title={att.file.name}>
                     {att.file.name}
                   </span>
-                  {att.status === "uploading" && (
-                    <Progress value={att.progress} className="h-1 w-16" />
+                  {status === "uploading" && (
+                    <Progress value={att.uploadProgress} className="h-1 w-16" />
                   )}
                   <span
                     className={cn(
                       "text-[10px]",
-                      att.status === "error" && "text-destructive",
-                      att.status === "indexed" && "text-success",
-                      (att.status === "uploaded" || att.status === "indexing") &&
+                      status === "error" && "text-destructive",
+                      status === "indexed" && "text-success",
+                      (status === "uploaded" || status === "indexing") &&
                         "text-amber-700 dark:text-amber-300",
-                      att.status === "uploading" && "text-muted-foreground"
+                      status === "uploading" && "text-muted-foreground"
                     )}
                   >
                     {statusText}

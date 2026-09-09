@@ -348,7 +348,7 @@ export function FolderTree({
         onClick={() => onSelect(null)}
       >
         <Library className="h-4 w-4 shrink-0 text-muted-foreground" />
-        <span>All documents</span>
+        All documents
       </button>
 
       {tree.map((node) => (
