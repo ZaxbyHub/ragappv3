@@ -32,6 +32,7 @@ import {
   type SortOrder,
 } from "@/lib/api";
 import { useDebounce } from "@/hooks/useDebounce";
+import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useUploadStore } from "@/stores/useUploadStore";
@@ -222,6 +223,10 @@ export default function DocumentsPage() {
 
   const { uploads, addUploads, cancelUpload, removeUpload, clearCompleted, retryUpload } =
     useUploadStore();
+  // Monitor upload/wiki status for uploads initiated from this page even
+  // when the user is not in chat (batched, attempt-ordered, auto-stops when
+  // nothing is in flight).
+  useUploadMonitoring();
   const { vaults, activeVaultId } = useVaultStore();
   const settings = useSettingsStore((state) => state.settings);
   const activeVault = vaults.find((vault) => vault.id === activeVaultId);

@@ -94,16 +94,20 @@ vi.mock('@/stores/useVaultStore', () => ({
   })),
 }));
 
-// Mock useUploadStore
+// Mock useUploadStore (getState: the mounted useUploadMonitoring hook reads it)
 vi.mock('@/stores/useUploadStore', () => ({
-  useUploadStore: vi.fn(() => ({
-    uploads: [],
-    addUploads: vi.fn(),
-    cancelUpload: vi.fn(),
-    removeUpload: vi.fn(),
-    clearCompleted: vi.fn(),
-    retryUpload: vi.fn(),
-  })),
+  uploadNeedsMonitoring: () => false,
+  useUploadStore: Object.assign(
+    vi.fn(() => ({
+      uploads: [],
+      addUploads: vi.fn(),
+      cancelUpload: vi.fn(),
+      removeUpload: vi.fn(),
+      clearCompleted: vi.fn(),
+      retryUpload: vi.fn(),
+    })),
+    { getState: () => ({ uploads: [] }) }
+  ),
 }));
 
 // Mock UI components

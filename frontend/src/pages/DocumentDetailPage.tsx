@@ -58,10 +58,10 @@ export default function DocumentDetailPage() {
   const previewInFlightRef = useRef<{ controller: AbortController; gen: number } | null>(null);
   useEffect(() => () => previewInFlightRef.current?.controller.abort(), []);
 
-  // The preview follows the most recently RESOLVED document (any generation),
-  // so the blob fetch always runs against the payload actually in hand; its
-  // COMMITS are generation-guarded below, which is what keeps a stale blob
-  // from overwriting the current document's preview (UI-011).
+  // The preview follows the most recent CURRENT load's payload (stale loads
+  // are dropped in `load`, never reaching here); its COMMITS are additionally
+  // generation-guarded below, which is what keeps a late blob from
+  // overwriting the current document's preview (UI-011).
   const [previewSource, setPreviewSource] = useState<{ doc: Document; gen: number } | null>(null);
 
   const load = useCallback(async () => {
@@ -81,8 +81,12 @@ export default function DocumentDetailPage() {
       if (loadGenRef.current === gen) {
         setDoc(d);
         setSelectedTagIds(new Set((d.tags ?? []).map((t) => t.id)));
+        // UI-011: the preview follows only the CURRENT load's payload. A
+        // stale load must not re-trigger the preview effect: the effect's
+        // cleanup would tear down the preview the user is looking at even
+        // though the stale blob itself can never commit.
+        setPreviewSource({ doc: d, gen });
       }
-      setPreviewSource({ doc: d, gen });
       if (d.vault_id != null) {
         try {
           const tags = await listTags(d.vault_id);
