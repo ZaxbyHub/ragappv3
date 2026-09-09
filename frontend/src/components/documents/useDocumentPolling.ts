@@ -60,6 +60,9 @@ export function useDocumentPolling({
   // fetchDocuments may commit. A late response (success or rejection) for an
   // abandoned query must never overwrite or clear a newer query's results.
   const fetchGenerationRef = useRef(0);
+  // Same ordering guarantee for wiki-status fetches (hydration effect vs the
+  // poll-to-terminal interval; post-unmount commits are dropped).
+  const wikiFetchAttemptRef = useRef(0);
 
   const fetchDocuments = useCallback(async () => {
     const generation = ++fetchGenerationRef.current;
@@ -111,6 +114,12 @@ export function useDocumentPolling({
   const fetchWikiStatuses = useCallback(
     async (docs: Document[]) => {
       if (!activeVaultId) return;
+      // Monotonic attempt token (mirrors fetchDocuments' generation guard):
+      // only the most recently issued fetchWikiStatuses may commit, so a
+      // hydration effect and the poll-to-terminal interval can interleave
+      // without a stale response regressing a newer wiki status, and an
+      // in-flight fetch that resolves after unmount commits nothing.
+      const attempt = ++wikiFetchAttemptRef.current;
       const indexed = docs.filter((d) => d.metadata?.status === "indexed");
       // Bound concurrency so a large vault (hundreds of indexed docs) cannot
       // fire one request per document simultaneously on every refresh (F-003).
@@ -130,6 +139,7 @@ export function useDocumentPolling({
       await Promise.all(
         Array.from({ length: Math.min(CONCURRENCY, indexed.length) }, worker)
       );
+      if (wikiFetchAttemptRef.current !== attempt) return;
       setWikiStatusMap((prev) => {
         const next = { ...prev };
         indexed.forEach((d, i) => {

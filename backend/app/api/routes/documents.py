@@ -1063,6 +1063,7 @@ class DocumentBatchedStatusEntry(BaseModel):
 
     id: int
     status: Optional[str] = None
+    filename: Optional[str] = None  # parity with the per-file status payload
     searchable: Optional[bool] = None  # True iff status == "indexed"
     chunk_count: int = 0
     phase: Optional[str] = None
@@ -1153,6 +1154,11 @@ async def get_documents_status_batched(
     on the int parse.
     """
     tokens = [token.strip() for token in ids.split(",") if token.strip()]
+    if not tokens:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one file id is required",
+        )
     if len(tokens) > BATCHED_STATUS_MAX_IDS:
         raise HTTPException(
             status_code=400,
@@ -1179,9 +1185,9 @@ async def get_documents_status_batched(
     cursor = await asyncio.to_thread(
         conn.execute,
         f"""
-        SELECT id, vault_id, status, chunk_count, phase, progress_percent,
-               wiki_pending, error_message, partial_embeddings,
-               extraction_diagnostics
+        SELECT id, file_name AS filename, vault_id, status, chunk_count, phase,
+               progress_percent, wiki_pending, error_message,
+               partial_embeddings, extraction_diagnostics
         FROM files WHERE id IN ({placeholders})
         """,
         tuple(deduped),
@@ -1212,9 +1218,11 @@ async def get_documents_status_batched(
             # rather than disclosing cross-vault existence.
             entry = DocumentBatchedStatusEntry(id=fid, error="Document not found")
         elif not vault_read.get(row["vault_id"], False):
-            entry = DocumentBatchedStatusEntry(
-                id=fid, error="No read access to this vault"
-            )
+            # Same uniform wording as "not found": the batch never reveals
+            # whether an unreadable id exists (the one-at-a-time per-file route
+            # keeps its pre-existing 404/403 split, so this batched endpoint
+            # must not become a 100-at-a-time existence oracle).
+            entry = DocumentBatchedStatusEntry(id=fid, error="Document not found")
         else:
             wiki_status = wiki_statuses.get(fid)
             if wiki_status is None and row["wiki_pending"]:
@@ -1224,6 +1232,12 @@ async def get_documents_status_batched(
             entry = DocumentBatchedStatusEntry(
                 id=fid,
                 status=row["status"],
+                filename=row["filename"],
+                # ``searchable`` means fully indexed. A ``partial`` document is
+                # not searchable in unscoped retrieval (Issue #13 atomic
+                # visibility), but its embedded segments remain chat-eligible
+                # when explicitly named in a document scope — see RAGEngine
+                # query()'s scoped-partial admission in rag_engine.py.
                 searchable=row["status"] == "indexed",
                 chunk_count=row["chunk_count"] or 0,
                 phase=row["phase"],

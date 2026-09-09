@@ -282,3 +282,131 @@ describe("DocumentsPage upload monitoring (issue #514 — monitored while off ch
     expect(getDocumentStatusMock).not.toHaveBeenCalled();
   });
 });
+
+describe("DocumentsPage upload monitoring — backoff ceiling and 4h cap (issue #514)", () => {
+  /** Seed one monitored upload (document 77, non-terminal) while the page is mounted. */
+  async function seedMonitoredUpload() {
+    uploadDocumentMock.mockResolvedValue({ id: 77, status: "pending" });
+    await act(async () => {
+      render(
+        <MemoryRouter>
+          <DocumentsPage />
+        </MemoryRouter>
+      );
+    });
+    await act(async () => {
+      useUploadStore.getState().addUploads(
+        [new File([new Uint8Array(8)], "notes.txt", { type: "text/plain" })],
+        1
+      );
+    });
+    expect(useUploadStore.getState().uploads[0].documentId).toBe("77");
+  }
+
+  it("doubles the poll interval on failures up to the 8s ceiling, then resets to 1s after a success", async () => {
+    await seedMonitoredUpload();
+    getDocumentStatusesMock.mockRejectedValue(new Error("network down"));
+
+    // Failed ticks fire at t=1000, 2000, 4000, 8000 (1s -> 2s -> 4s -> 8s
+    // backoff — each fire re-arms with the interval produced by the PREVIOUS
+    // outcome, so the deltas double one tick behind).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(getDocumentStatusesMock).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(getDocumentStatusesMock).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(getDocumentStatusesMock).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000);
+    });
+    expect(getDocumentStatusesMock).toHaveBeenCalledTimes(4);
+
+    // Ceiling (MAX_POLL_INTERVAL_MS = 8s): 7s after the 4th failed tick
+    // fires NOTHING...
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(7000);
+    });
+    expect(getDocumentStatusesMock).toHaveBeenCalledTimes(4);
+    // ...the 8th second fires the next request.
+    getDocumentStatusesMock.mockResolvedValue({
+      results: [{ id: 77, status: "processing", chunk_count: 0, phase: "queued" }],
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(getDocumentStatusesMock).toHaveBeenCalledTimes(5);
+    // The succeeding poll applied its snapshot (cadence reset proof part 1).
+    expect(useUploadStore.getState().uploads[0].statusSeen).toBe(true);
+
+    // Reset: the success sets the base cadence again. The next fire still
+    // lands 8s out (armed before the success), but the one AFTER it runs just
+    // 1s later — without the reset it would need another 8s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(8000);
+    });
+    expect(getDocumentStatusesMock).toHaveBeenCalledTimes(6);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(getDocumentStatusesMock).toHaveBeenCalledTimes(7);
+  });
+
+  it("stops monitoring (pollingStopped) after 4 hours without ever issuing a request or flipping to error", async () => {
+    // Seed the REAL store with a non-terminal upload whose clock started
+    // 4h + 1s ago — over the hard cap before the first tick can fire.
+    useUploadStore.setState({
+      uploads: [
+        {
+          id: "stale-1",
+          file: new File([new Uint8Array(8)], "stale.txt", { type: "text/plain" }),
+          status: "processing" as const,
+          uploadProgress: 100,
+          progress: 100,
+          documentId: "501",
+          startedAt: Date.now() - (4 * 60 * 60 * 1000 + 1000),
+        },
+      ],
+      isProcessing: false,
+      activeVaultId: 1,
+      chatAttachmentIds: [],
+    });
+    getDocumentStatusesMock.mockResolvedValue({
+      results: [{ id: 501, status: "processing", chunk_count: 0, phase: "queued" }],
+    });
+
+    await act(async () => {
+      render(
+        <MemoryRouter>
+          <DocumentsPage />
+        </MemoryRouter>
+      );
+    });
+
+    // One monitor tick: the duration cap trips inside fire() BEFORE any
+    // request is issued, so the stale upload never reaches the network.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    const capped = useUploadStore.getState().uploads[0];
+    expect(capped.pollingStopped).toBe(true);
+    // The cap never flips to error — the backend may still be working.
+    expect(capped.status).toBe("processing");
+    expect(capped.error).toBeUndefined();
+    expect(uploadNeedsMonitoring(capped)).toBe(false);
+
+    // No status request was issued for it, before or after the cap tripped.
+    expect(getDocumentStatusesMock).not.toHaveBeenCalled();
+    expect(getDocumentStatusMock).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(getDocumentStatusesMock).not.toHaveBeenCalled();
+  });
+});

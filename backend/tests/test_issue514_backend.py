@@ -174,6 +174,44 @@ class BatchedDocumentStatusTest(DocumentsDeleteAuditTestBase):
         # must not fail the batch.
         self.assertTrue(by_id[other_fid].get("error"))
 
+    def test_batched_status_rejects_empty_id_list(self):
+        resp = self._get_entries("?ids=")
+        self.assertEqual(resp.status_code, 400, resp.text[:300])
+        resp = self._get_entries("?ids=,,,")
+        self.assertEqual(resp.status_code, 400, resp.text[:300])
+
+    def test_batched_status_uniform_error_hides_vault_existence(self):
+        conn = self._connection_pool.get_connection()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (5, 'Other', 'x')"
+            )
+            cur = conn.execute(
+                "INSERT INTO files (vault_id, file_path, file_name, file_size, status) "
+                "VALUES (5, '/uploads/other.txt', 'other.txt', 1, 'indexed')"
+            )
+            other_fid = cur.lastrowid
+            conn.commit()
+        finally:
+            self._connection_pool.release_connection(conn)
+
+        # No vault_id param: the caller (vault-2 member via _admin_headers)
+        # has no read access to vault 5. The per-entry error must use the same
+        # uniform "Document not found" wording as an unknown id — a 100-at-a-
+        # time existence oracle would defeat the per-file route's 404/403 split.
+        resp = self._get_entries(f"?ids={other_fid}")
+        self.assertEqual(resp.status_code, 200, resp.text[:300])
+        entry = resp.json()["results"][0]
+        self.assertEqual(entry["error"], "Document not found")
+        self.assertIsNone(entry["status"])
+
+    def test_batched_status_entries_carry_filename(self):
+        fid = self._seed_file(file_name="carried-name.txt", parsed_text="carried")
+        resp = self._get_entries(f"?ids={fid}")
+        self.assertEqual(resp.status_code, 200, resp.text[:300])
+        results = resp.json()["results"]
+        self.assertEqual(results[0]["filename"], "carried-name.txt")
+
     def test_batched_status_exposes_partial_marker_and_extraction_diagnostics(self):
         fid = self._seed_file(file_name="scanned.txt", parsed_text="text")
         diagnostics = {
@@ -689,6 +727,25 @@ class ChatDocumentScopeRouteTest(unittest.TestCase):
             f"document scope never reached retrieval; kwargs={self.engine_calls!r}",
         )
 
+    def test_chat_document_ids_capped_at_100(self):
+        import pytest
+        from pydantic import ValidationError
+
+        from app.api.routes.chat import ChatRequest, ChatStreamRequest
+
+        with pytest.raises(ValidationError):
+            ChatRequest(message="q", document_ids=list(range(101)))
+        ChatRequest(message="q", document_ids=list(range(100)))
+        with pytest.raises(ValidationError):
+            ChatStreamRequest(
+                messages=[{"role": "user", "content": "q"}],
+                document_ids=list(range(101)),
+            )
+        ChatStreamRequest(
+            messages=[{"role": "user", "content": "q"}],
+            document_ids=list(range(100)),
+        )
+
 
 class DocumentScopeFilterExprTest(unittest.TestCase):
     """The scope expression shape used at the retrieval seam."""
@@ -701,11 +758,6 @@ class DocumentScopeFilterExprTest(unittest.TestCase):
             "file_id IN ('42', '43')",
         )
 
-    def test_empty_scope_yields_zero_match_sentinel(self):
-        from app.services.rag_engine import _document_scope_filter_expr
-
-        self.assertEqual(_document_scope_filter_expr([]), "file_id IN ('')")
-
 
 class ChatDocumentScopeEngineTest(unittest.TestCase):
     """query(document_ids=...) must restrict the REAL retrieval seam.
@@ -715,7 +767,7 @@ class ChatDocumentScopeEngineTest(unittest.TestCase):
     metadata-filter expression when both are supplied).
     """
 
-    def _run_query(self, **query_kwargs):
+    def _run_query(self, engine_hook=None, **query_kwargs):
         from app.services.rag_engine import RAGEngine
 
         class _Store:
@@ -766,6 +818,8 @@ class ChatDocumentScopeEngineTest(unittest.TestCase):
             llm_client=_LLM(),
             reranking_service=None,
         )
+        if engine_hook is not None:
+            engine_hook(engine)
 
         with unittest.mock.patch("app.services.rag_engine.settings") as mock_settings, patch_pool_unavailable():
             mock_settings.agentic_rag_enabled = False
@@ -831,6 +885,145 @@ class ChatDocumentScopeEngineTest(unittest.TestCase):
             self.assertIn("file_id IN ('')", expr)
             self.assertIn("file_id IN ('42')", expr)
             self.assertIn(" AND ", expr)
+
+    def test_empty_scope_means_no_scope_requested(self):
+        # F-004: document_ids=[] is falsy and takes the no-scope path —
+        # whole-vault retrieval, no file_id IN expression anywhere.
+        exprs = self._run_query(document_ids=[])
+        self.assertTrue(exprs)
+        for expr in exprs:
+            self.assertIsNone(expr)
+
+    def test_scoped_partial_document_survives_visibility_filter(self):
+        from app.services.document_retrieval import DocumentRetrievalService, RAGSource
+
+        recorded = []
+
+        class _RecordingRetrieval:
+            # Mirrors the real DocumentRetrievalService contract: raw dict
+            # records in, RAGSource objects out (the pipeline after the seam
+            # reads attributes like .file_id, not dict keys), and
+            # to_source_metadata for the done payload's source list.
+            _serializer = DocumentRetrievalService()
+
+            async def filter_relevant(self, results, reranked=False, indexed_file_ids=None):
+                recorded.append(indexed_file_ids)
+                return [
+                    RAGSource(
+                        text=record.get("text", ""),
+                        file_id=record.get("file_id", ""),
+                        score=float(record.get("_distance", 0.0) or 0.0),
+                        metadata=dict(record.get("metadata") or {}),
+                    )
+                    for record in results
+                ]
+
+            def to_source_metadata(self, chunk, source_index=0):
+                return self._serializer.to_source_metadata(chunk, source_index=source_index)
+
+        def _hook(engine):
+            # SQLite says only file 999 is fully indexed; file 42 is partial.
+            engine._get_indexed_file_ids = lambda vault_id: {"999"}
+            # The scoped-partial seam admits the explicitly named partial id.
+            engine._get_scoped_partial_file_ids = lambda ids, vault_id: {"42"}
+            engine.document_retrieval = _RecordingRetrieval()
+
+        self._run_query(document_ids=[42], engine_hook=_hook)
+        self.assertTrue(recorded)
+        for indexed in recorded:
+            self.assertIsNotNone(indexed)
+            self.assertIn("42", indexed, "scoped partial id must join the visibility set")
+            self.assertIn("999", indexed)
+
+
+class ScopedPartialFileIdsTest(DocumentsDeleteAuditTestBase):
+    """Real-DB contract of the scoped-partial admission seam (PRR-002 fix).
+
+    ``_get_scoped_partial_file_ids`` admits only in-vault ids whose file row
+    has status='partial', and never leaks into unscoped visibility
+    (``_get_indexed_file_ids`` keeps hiding partial files, Issue #13).
+    """
+
+    def _seed_file_status(self, vault_id, file_name, status):
+        # Same INSERT pattern as _seed_file, with the status overridden.
+        conn = self._connection_pool.get_connection()
+        try:
+            cur = conn.execute(
+                "INSERT INTO files (vault_id, file_path, file_name, file_size, status, parsed_text) "
+                "VALUES (?,?,?,?,?,?)",
+                (vault_id, f"/uploads/{file_name}", file_name, 1, status, "seed"),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            self._connection_pool.release_connection(conn)
+
+    def _make_engine(self):
+        # Minimal engine construction the same way ChatDocumentScopeEngineTest
+        # does (stub _Store/_Embed/_Memory/_LLM) — the pool-backed lookups read
+        # this fixture's real SQLite via settings.sqlite_path.
+        from app.services.rag_engine import RAGEngine
+
+        class _Store:
+            async def search(self, embedding, limit, vault_id=None, query_text="",
+                             hybrid=True, hybrid_alpha=0.5, filter_expr=None, **kw):
+                return []
+
+            def get_fts_exceptions(self):
+                return 0
+
+        class _Embed:
+            async def embed_single(self, text):
+                return [0.1, 0.2, 0.3]
+
+            async def embed_passage(self, text):
+                return [0.1, 0.2, 0.3]
+
+        class _Memory:
+            def detect_memory_intent(self, text):
+                return None
+
+        class _LLM:
+            base_url = "stub"
+            model = "stub"
+
+            def __init__(self):
+                self.last_metrics = {}
+
+            async def chat_completion(self, messages, **kw):
+                return "stub"
+
+            async def chat_completion_stream(self, messages, **kw):
+                yield "stub"
+
+        return RAGEngine(
+            embedding_service=_Embed(),
+            vector_store=_Store(),
+            memory_store=_Memory(),
+            llm_client=_LLM(),
+            reranking_service=None,
+        )
+
+    def test_scoped_partial_file_ids_resolve_against_real_db(self):
+        partial_fid = self._seed_file_status(2, "partial.txt", "partial")
+        other_fid = self._seed_file(file_name="done.txt", parsed_text="done")
+        engine = self._make_engine()
+
+        self.assertEqual(
+            engine._get_scoped_partial_file_ids([partial_fid], 2),
+            {str(partial_fid)},
+        )
+        # Vault mismatch: an out-of-vault id is never admitted.
+        self.assertEqual(engine._get_scoped_partial_file_ids([partial_fid], 5), set())
+        # Not partial: a fully indexed id is not a scoped-partial id.
+        self.assertEqual(engine._get_scoped_partial_file_ids([other_fid], 2), set())
+        # Unscoped visibility is unchanged: partial files stay hidden from
+        # _get_indexed_file_ids (Issue #13), while the indexed one shows up.
+        indexed = engine._get_indexed_file_ids(2)
+        self.assertNotIn(str(partial_fid), indexed)
+        self.assertIn(str(other_fid), indexed)
+        # Empty scope: nothing to admit.
+        self.assertEqual(engine._get_scoped_partial_file_ids([], 2), set())
 
 
 class _patch_pool_unavailable:

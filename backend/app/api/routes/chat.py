@@ -85,8 +85,10 @@ class ChatRequest(BaseModel):
     # Document scope ("ask about this document", issue #514 PRODUCT-ENH-05):
     # restrict retrieval to the named file ids. Enforced server-side by
     # threading the scope into the RAG engine's retrieval seam, where it ANDs
-    # with vault scoping and can never widen access beyond the vault.
-    document_ids: Optional[List[int]] = None
+    # with vault scoping and can never widen access beyond the vault. Capped at
+    # the same 100-id bound as the batched status route
+    # (BATCHED_STATUS_MAX_IDS) so the resolved IN (...) filter stays bounded.
+    document_ids: Optional[List[int]] = Field(default=None, max_length=100)
 
 
 class UsedMemory(BaseModel):
@@ -150,8 +152,9 @@ class ChatStreamRequest(BaseModel):
     citation_mode: Optional[CitationMode] = None
     metadata_filter: Optional[MetadataFilter] = None
     # Document scope ("ask about this document", issue #514 PRODUCT-ENH-05):
-    # same server-side retrieval restriction as ChatRequest.document_ids.
-    document_ids: Optional[List[int]] = None
+    # same server-side retrieval restriction as ChatRequest.document_ids,
+    # including the 100-id cap.
+    document_ids: Optional[List[int]] = Field(default=None, max_length=100)
 
 
 class CreateSessionRequest(BaseModel):

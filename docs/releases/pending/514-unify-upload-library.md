@@ -12,7 +12,9 @@
   pollers.
 - **One batched status endpoint.** New `GET /documents/status?ids=1,2,3` (cap 100 ids)
   returns per-file status including searchable/Wiki/KMS state with per-id errors; the old
-  per-file status endpoint is unchanged, so existing clients keep working.
+  per-file status endpoint is otherwise unchanged (it gains additive `partial_embeddings`
+  and `extraction_diagnostics` fields), so existing clients keep working. The client
+  pages id sets larger than one request through multiple batches automatically.
 - **Accurate status, no contradictions.** A late or out-of-order response can no longer
   overwrite newer search results, document details, or attachment states; Wiki status keeps
   refreshing until a compile finishes even when the document list doesn't change; C2's

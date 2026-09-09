@@ -385,6 +385,8 @@ export const useUploadStore = create<UploadState>((set, get) => {
     },
 
     removeUpload: (id) => {
+      // Evict the snapshot-ordering entry so the map tracks live uploads only.
+      lastAppliedSeqByUploadId.delete(id);
       set((state) => ({
         uploads: state.uploads.filter((u) => u.id !== id),
       }));
@@ -441,18 +443,29 @@ export const useUploadStore = create<UploadState>((set, get) => {
     },
 
     clearCompleted: () => {
-      set((state) => ({
-        uploads: state.uploads.filter(
+      set((state) => {
+        const kept = state.uploads.filter(
           (u) =>
             u.status === "pending" ||
             u.status === "uploading" ||
             u.status === "processing" ||
             u.status === "indexing"
-        ),
-      }));
+        );
+        // Evict snapshot-ordering entries for the dropped terminal rows.
+        if (kept.length !== state.uploads.length) {
+          const keptIds = new Set(kept.map((u) => u.id));
+          for (const upload of state.uploads) {
+            if (!keptIds.has(upload.id)) lastAppliedSeqByUploadId.delete(upload.id);
+          }
+        }
+        return { uploads: kept };
+      });
     },
 
     retryUpload: (id) => {
+      // A retry restarts the lifecycle; drop the stale ordering entry so a
+      // fresh monitoring sequence applies immediately.
+      lastAppliedSeqByUploadId.delete(id);
       set((state) => ({
         uploads: state.uploads.map((u) =>
           u.id === id

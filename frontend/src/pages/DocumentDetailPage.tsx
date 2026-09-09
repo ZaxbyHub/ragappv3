@@ -14,6 +14,7 @@ import { ParseQualityPanel } from "@/components/documents/ParseQualityPanel";
 import { documentField } from "@/components/documents/documentProgress";
 import { formatFileSize, formatDate } from "@/lib/formatters";
 import { useChatModeStore } from "@/stores/useChatModeStore";
+import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import {
   getDocument,
   getDocumentRawBlob,
@@ -48,6 +49,12 @@ export default function DocumentDetailPage() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
   const setScopeDocumentIds = useChatModeStore((state) => state.setScopeDocumentIds);
+
+  // Keep the upload monitor alive while the detail page is open: a user who
+  // navigates here mid-upload must still see progress converge (the hook is
+  // refcounted, so unmounting this page disarms it only when no other
+  // consumer — Composer, DocumentsPage — is mounted).
+  useUploadMonitoring();
 
   // Generation token (issue #514 / UI-011): bumped on every load so a late
   // response for a previously-navigated document id can never commit state
@@ -167,6 +174,15 @@ export default function DocumentDetailPage() {
     })();
     return () => {
       if (revoked) URL.revokeObjectURL(revoked);
+      // Abort THIS run's in-flight request: navigating from a previewable
+      // document to a non-previewable one re-runs this effect with an early
+      // return, so the cleanup is the only teardown that fires — without the
+      // abort the old blob request would keep running until unmount.
+      const inFlight = previewInFlightRef.current;
+      if (inFlight && inFlight.gen === gen) {
+        inFlight.controller.abort();
+        previewInFlightRef.current = null;
+      }
       setPreviewText(null);
       setPreviewUrl(null);
     };
@@ -228,8 +244,12 @@ export default function DocumentDetailPage() {
 
   const status = (doc.metadata?.status as string | undefined) ?? "";
   const chunkCount = Number(doc.metadata?.chunk_count ?? 0);
-  // Searchable once chunks are embedded: "indexed", or "partial" (LIVE-03 —
-  // completed with embedding failures; the embedded chunks still retrieve).
+  // Chat-eligible once chunks are embedded: "indexed", or "partial" (LIVE-03
+  // — completed with embedding failures; the embedded chunks still retrieve).
+  // This gate is deliberately broader than the status payload's `searchable`
+  // flag (indexed-only, unscoped semantics): a partial document's embedded
+  // segments become retrievable the moment they are explicitly named in a
+  // document scope (RAGEngine query() admits scoped partial ids).
   const isSearchable = status === "indexed" || status === "partial";
   const chunksFailed = Number(doc.metadata?.chunks_failed ?? 0);
   const failureMessage =

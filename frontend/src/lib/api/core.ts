@@ -431,8 +431,8 @@ export interface Document {
   metadata?: Record<string, unknown> & { chunks_failed?: number };
   tags?: Tag[];
   folder_id?: number | null;
-  /** Parse-quality diagnostics persisted on files.extraction_diagnostics (issue #514). */
-  extraction?: ExtractionDiagnostics | null;
+  /** Parse-quality diagnostics persisted on files.extraction_diagnostics (issue #514). Matches the backend wire field name. */
+  extraction_diagnostics?: ExtractionDiagnostics | null;
 }
 
 export interface Folder {
@@ -506,8 +506,8 @@ export interface DocumentStatusResponse {
   wiki_job_id?: number | null;
   enrichment_status?: "pending" | "processing" | "complete" | "error" | string | null;
   enrichment_error?: string | null;
-  /** Parse-quality diagnostics persisted on files.extraction_diagnostics (issue #514). */
-  extraction?: ExtractionDiagnostics | null;
+  /** Parse-quality diagnostics persisted on files.extraction_diagnostics (issue #514). Matches the backend wire field name. */
+  extraction_diagnostics?: ExtractionDiagnostics | null;
 }
 
 /**
@@ -529,7 +529,8 @@ export type DocumentStatusEntry = Partial<DocumentStatusResponse> & {
  */
 export interface DocumentStatusesResponse {
   results: DocumentStatusEntry[];
-  errors?: Array<{ id?: number; error: string }>;
+  /** Per-id failure entries — same shape as a `results` error entry. */
+  errors?: DocumentStatusEntry[];
 }
 
 export interface DocumentStatsResponse {
@@ -875,30 +876,58 @@ export async function getDocumentStatus(
 }
 
 /**
- * Batched document status (issue #514 / FU-008): one round-trip for N ids
+ * Server-side per-request bound for the batched status route
+ * (BATCHED_STATUS_MAX_IDS in backend/app/api/routes/documents.py): requests
+ * above 100 ids are rejected with 400, so the client pages larger id sets
+ * through multiple requests and merges the envelopes.
+ */
+export const BATCHED_STATUS_MAX_IDS = 100;
+
+/**
+ * Batched document status (issue #514 / FU-008): one logical call for N ids
  * via GET /documents/status?ids=<id>,<id>,... Entries carry their own id so
  * out-of-order responses still converge per document. Ids are joined into a
  * comma list (the endpoint's documented wire form; axios would serialize an
  * array as repeated params otherwise).
+ *
+ * Id sets larger than the server's 100-id request cap are split into
+ * multiple concurrent requests and their results/errors merged — a queue
+ * bigger than one request (a >100-file bulk upload) must keep monitoring
+ * instead of failing the whole poll with 400.
  */
 export async function getDocumentStatuses(
   ids: Array<string | number>,
   vaultId?: number
 ): Promise<DocumentStatusesResponse> {
-  const response = await apiClient.get<DocumentStatusesResponse>(
-    "/documents/status",
-    {
-      params: {
-        ids: ids.map(String).join(","),
-        ...(vaultId != null && { vault_id: vaultId }),
-      },
-    }
+  const slices: Array<Array<string | number>> = [];
+  for (let i = 0; i < ids.length; i += BATCHED_STATUS_MAX_IDS) {
+    slices.push(ids.slice(i, i + BATCHED_STATUS_MAX_IDS));
+  }
+  const responses = await Promise.all(
+    slices.map(async (slice) => {
+      const response = await apiClient.get<DocumentStatusesResponse>(
+        "/documents/status",
+        {
+          params: {
+            ids: slice.map(String).join(","),
+            ...(vaultId != null && { vault_id: vaultId }),
+          },
+        }
+      );
+      const data = response.data;
+      // The batched route serializes the entries under `results`; `documents`
+      // is the alternate envelope key the API may emit.
+      const results =
+        data.results ?? (data as { documents?: DocumentStatusEntry[] }).documents ?? [];
+      return { ...data, results };
+    })
   );
-  const data = response.data;
-  // The batched route serializes the entries under `results`; `documents`
-  // is the alternate envelope key the API may emit.
-  const results = data.results ?? (data as { documents?: DocumentStatusEntry[] }).documents ?? [];
-  return { ...data, results };
+  return {
+    results: responses.flatMap((r) => r.results),
+    errors: responses.some((r) => r.errors?.length)
+      ? responses.flatMap((r) => r.errors ?? [])
+      : undefined,
+  };
 }
 
 export async function getDocumentRawBlob(

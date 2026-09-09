@@ -774,7 +774,7 @@ class DocumentProcessor:
         self._contextual_chunker = None
         self._chunk_enrichment_service = None
 
-    def _persist_extraction_diagnostics(
+    async def _persist_extraction_diagnostics(
         self, file_id: Optional[int], diagnostics: Optional[dict]
     ) -> None:
         """Persist parse-quality diagnostics on ``files.extraction_diagnostics``
@@ -782,14 +782,16 @@ class DocumentProcessor:
 
         Best-effort by contract, mirroring the phase-progress writes: the
         diagnostics are advisory parse metadata and must never abort indexing,
-        so DB/pool failures log and drop. Lazy import because
-        ``document_extraction`` imports this module (the producer lives there
-        per its documented home).
+        so DB/pool failures log and drop. Runs under the shared write permit
+        (``_write_session``) like every other status/commit write — a raw
+        pooled checkout here would bypass the SQLite write serialization the
+        remaining writers rely on. Lazy import because ``document_extraction``
+        imports this module (the producer lives there per its documented home).
         """
         if file_id is None or diagnostics is None:
             return
         try:
-            with self.pool.connection() as conn:
+            async with self._write_session() as conn:
                 conn.execute(
                     "UPDATE files SET extraction_diagnostics = ? WHERE id = ?",
                     (json.dumps(diagnostics), file_id),
@@ -2587,7 +2589,7 @@ class DocumentProcessor:
                 build_extraction_diagnostics,
             )
 
-            self._persist_extraction_diagnostics(
+            await self._persist_extraction_diagnostics(
                 file_id,
                 build_extraction_diagnostics(
                     [
@@ -2760,7 +2762,7 @@ class DocumentProcessor:
                 build_extraction_diagnostics,
             )
 
-            self._persist_extraction_diagnostics(
+            await self._persist_extraction_diagnostics(
                 file_id, build_extraction_diagnostics(elements)
             )
         except Exception as exc:  # noqa: BLE001 — advisory parse metadata only

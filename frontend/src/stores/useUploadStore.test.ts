@@ -488,3 +488,122 @@ describe("useUploadStore — queue maintenance", () => {
     expect(u.progress).toBe(73);
   });
 });
+
+describe("useUploadStore — snapshot-ordering map eviction (issue #514)", () => {
+  it("removeUpload evicts the seq entry: a re-added upload with the same id accepts a lower-seq snapshot", () => {
+    useUploadStore.setState({
+      uploads: [
+        {
+          id: "evict-1",
+          file: makeFile("a.txt"),
+          status: "processing",
+          uploadProgress: 100,
+          progress: 100,
+          documentId: "9",
+        },
+      ],
+      isProcessing: false,
+      activeVaultId: 1,
+    });
+
+    // Attempt 5 lands...
+    useUploadStore.getState().applyStatusSnapshot(
+      "evict-1",
+      { id: 9, status: "processing", chunk_count: 5 },
+      5
+    );
+    expect(useUploadStore.getState().uploads[0].chunkCount).toBe(5);
+
+    // ...and a late seq-3 snapshot stays ignored while the row lives (the
+    // ordering map is doing its job — baseline for the eviction below).
+    useUploadStore.getState().applyStatusSnapshot(
+      "evict-1",
+      { id: 9, status: "processing", chunk_count: 3 },
+      3
+    );
+    expect(useUploadStore.getState().uploads[0].chunkCount).toBe(5);
+
+    // Removing the upload evicts its ordering entry...
+    useUploadStore.getState().removeUpload("evict-1");
+    expect(useUploadStore.getState().uploads).toEqual([]);
+
+    // ...so a re-added upload with the SAME id starts a fresh sequence and a
+    // lower-seq snapshot applies (without eviction seq=3 would be ignored).
+    useUploadStore.setState({
+      uploads: [
+        {
+          id: "evict-1",
+          file: makeFile("a.txt"),
+          status: "processing",
+          uploadProgress: 100,
+          progress: 100,
+          documentId: "9",
+          statusSeen: false,
+        },
+      ],
+      isProcessing: false,
+      activeVaultId: 1,
+    });
+    useUploadStore.getState().applyStatusSnapshot(
+      "evict-1",
+      { id: 9, status: "processing", chunk_count: 3 },
+      3
+    );
+    const reAdded = useUploadStore.getState().uploads[0];
+    expect(reAdded.chunkCount).toBe(3);
+    expect(reAdded.statusSeen).toBe(true);
+  });
+
+  it("retryUpload evicts the seq entry: a lower-seq snapshot applies after a retry", async () => {
+    useUploadStore.setState({
+      uploads: [
+        {
+          id: "retry-evict-1",
+          file: makeFile("a.txt"),
+          status: "processing",
+          uploadProgress: 100,
+          progress: 100,
+          documentId: "9",
+        },
+      ],
+      isProcessing: false,
+      activeVaultId: 1,
+    });
+
+    useUploadStore.getState().applyStatusSnapshot(
+      "retry-evict-1",
+      { id: 9, status: "processing", chunk_count: 5 },
+      5
+    );
+    expect(useUploadStore.getState().uploads[0].chunkCount).toBe(5);
+    // Lower-seq snapshot ignored while the old lifecycle's entry lives.
+    useUploadStore.getState().applyStatusSnapshot(
+      "retry-evict-1",
+      { id: 9, status: "processing", chunk_count: 3 },
+      3
+    );
+    expect(useUploadStore.getState().uploads[0].chunkCount).toBe(5);
+
+    // Hang the retried transfer so the row stays mid-lifecycle for inspection.
+    uploadDocumentMock.mockImplementation(() => new Promise(() => {}));
+    useUploadStore.getState().retryUpload("retry-evict-1");
+    await vi.advanceTimersByTimeAsync(1);
+
+    const retried = useUploadStore.getState().uploads[0];
+    expect(retried.statusSeen).toBe(false);
+
+    // The retry evicted the ordering entry, so the fresh monitoring
+    // sequence's seq=3 snapshot APPLIES (without eviction it would be
+    // ignored as older than the pre-retry seq=5).
+    useUploadStore.getState().applyStatusSnapshot(
+      "retry-evict-1",
+      { id: 9, status: "processing", chunk_count: 3, phase: "parsing" },
+      3
+    );
+    const after = useUploadStore.getState().uploads[0];
+    expect(after.chunkCount).toBe(3);
+    expect(after.phase).toBe("parsing");
+    expect(after.phaseLabel).toBe("Parsing");
+    expect(after.statusSeen).toBe(true);
+  });
+});

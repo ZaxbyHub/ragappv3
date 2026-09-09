@@ -243,12 +243,11 @@ def _document_scope_filter_expr(document_ids: List[int]) -> str:
 
     Companion of the metadata_filter resolution (issue #514 PRODUCT-ENH-05):
     chunk ``file_id`` values are stored as strings, so the ids are quoted the
-    same way ``metadata_filter`` quotes its resolved set. An empty scope yields
-    the zero-match sentinel — a supplied scope is never silently dropped.
+    same way ``metadata_filter`` quotes its resolved set. Callers must pass a
+    non-empty scope — ``query()`` gates on ``if document_ids:``, so an empty
+    list means "no scope requested" (whole-vault retrieval), never a filter.
     """
     quoted = ", ".join(f"'{int(file_id)}'" for file_id in document_ids)
-    if not quoted:
-        return "file_id IN ('')"
     return f"file_id IN ({quoted})"
 
 
@@ -1565,6 +1564,23 @@ class RAGEngine:
             logger.warning(
                 "Failed to fetch indexed_file_ids (visibility filter disabled): %s", _exc
             )
+
+        # Explicit document scope: a partially-indexed scoped document still has
+        # its succeeded chunks in the vector store and the detail page offers
+        # "Ask about this document" for it, so admit those ids into the
+        # visibility set — otherwise filter_relevant would strip every hit and
+        # the scoped question would come back ungrounded. Unscoped retrieval is
+        # unchanged (partial files stay hidden, Issue #13 semantics).
+        if document_ids and indexed_file_ids is not None:
+            try:
+                scoped_partial = await asyncio.to_thread(
+                    self._get_scoped_partial_file_ids, document_ids, vault_id
+                )
+                indexed_file_ids = set(indexed_file_ids) | scoped_partial
+            except Exception as _exc:
+                logger.warning(
+                    "Failed to admit partial scoped files (filter unchanged): %s", _exc
+                )
 
         # Capture retrieval-phase trace stats before filtering.
         trace.fused_hits = len(vector_results)
@@ -3436,6 +3452,44 @@ class RAGEngine:
         except Exception as exc:
             logger.debug("_get_indexed_file_ids failed: %s", exc)
             return None
+
+    def _get_scoped_partial_file_ids(
+        self, document_ids: List[int], vault_id: Optional[int]
+    ) -> Set[str]:
+        """Return the subset of ``document_ids`` whose files have status='partial'.
+
+        Companion of the document-scope seam in ``query()``: a partial file's
+        succeeded segments are searchable when the user explicitly names the
+        file, so those ids join the visibility set. The vault constraint mirrors
+        ``_get_indexed_file_ids`` so an out-of-vault id can never be admitted
+        through this path. Returns an empty set on lookup failure (the caller
+        keeps the unscoped-visibility filter rather than widening it).
+        """
+        if not document_ids:
+            return set()
+        try:
+            pool = _get_pool()
+            conn = pool.get_connection()
+            try:
+                placeholders = ",".join("?" * len(document_ids))
+                if vault_id is not None:
+                    cursor = conn.execute(
+                        "SELECT id FROM files WHERE status='partial' "
+                        f"AND vault_id=? AND id IN ({placeholders})",  # nosec B608 — placeholders is a fixed '?,?,...' literal, ids are bound
+                        (vault_id, *document_ids),
+                    )
+                else:
+                    cursor = conn.execute(
+                        f"SELECT id FROM files WHERE status='partial' AND id IN ({placeholders})",  # nosec B608 — placeholders is a fixed '?,?,...' literal, ids are bound
+                        tuple(document_ids),
+                    )
+                rows = cursor.fetchall()
+                return {str(row["id"]) for row in rows}
+            finally:
+                pool.release_connection(conn)
+        except Exception as exc:
+            logger.debug("_get_scoped_partial_file_ids failed: %s", exc)
+            return set()
 
     def _expand_parent_windows(self, sources: List[RAGSource]) -> List[RAGSource]:
         """Populate parent_window_text on each source when available (Issue #12).

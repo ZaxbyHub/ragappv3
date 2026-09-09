@@ -11,8 +11,9 @@ import type { UploadFile, UploadStatusSnapshot } from "@/stores/useUploadStore";
  *
  * A refcounted singleton: while ANY consumer is mounted and ANY store upload
  * is non-terminal (`uploadNeedsMonitoring`), it issues exactly ONE batched
- * status request per tick (`getDocumentStatuses`) covering every monitored
- * document id, and applies the returned snapshots through
+ * status call per tick (`getDocumentStatuses`) covering every monitored
+ * document id (id sets beyond the server's 100-id request cap are paged by
+ * the api client), and applies the returned snapshots through
  * `applyStatusSnapshot` with a monotonically increasing attempt sequence —
  * so late, out-of-order responses can never regress newer state. Timers are
  * fully cancelled when the last consumer unmounts or nothing is left to

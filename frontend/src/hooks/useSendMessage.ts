@@ -314,7 +314,8 @@ export function useSendMessage(
 
       const abort = chatStream(
         chatMessages,
-        {          onMessage: (chunk) => {
+        {
+          onMessage: (chunk) => {
             setCurrentStage(null);
             // Coalesce SSE appends behind requestAnimationFrame (UI-PERF-2):
             // without this, every token chunk updates the store, re-renders

@@ -19,19 +19,16 @@ function isDiagnostics(value: unknown): value is ParseQualityFacts {
 }
 
 /**
- * Resolve the extraction diagnostics a document payload carries. The detail
- * payload exposes them under `extraction`; the status payload and older
- * shapes carry `extraction_diagnostics` (top level or inside `metadata`).
- * All four carrier shapes are accepted so the panel renders whichever
- * endpoint produced the document.
+ * Resolve the extraction diagnostics a document payload carries. The wire
+ * format is `extraction_diagnostics` — top level on the detail and status
+ * payloads, or inside `metadata` on older shapes. All three carrier shapes
+ * are accepted so the panel renders whichever endpoint produced the document.
  */
 function resolveDiagnostics(doc: Document): ParseQualityFacts | ExtractionDiagnostics | null {
   const direct = doc as Document & { extraction_diagnostics?: unknown };
   const metadata = (doc.metadata ?? {}) as Record<string, unknown>;
   const candidates = [
-    doc.extraction,
     direct.extraction_diagnostics,
-    metadata.extraction,
     metadata.extraction_diagnostics,
   ];
   for (const candidate of candidates) {

@@ -14,19 +14,21 @@ const DIAGNOSTICS = {
   extraction_version: "ext-9f",
 };
 
-function makeDoc(extraction: unknown): Document {
+function makeDoc(extractionDiagnostics: unknown): Document {
   return {
     id: "7",
     filename: "scanned-tables.png",
     size: 2048,
     created_at: "2026-01-01",
     metadata: { status: "indexed", chunk_count: 5 },
-    ...((typeof extraction === "object" && extraction !== null) ? { extraction } : {}),
+    ...((typeof extractionDiagnostics === "object" && extractionDiagnostics !== null)
+      ? { extraction_diagnostics: extractionDiagnostics }
+      : {}),
   } as Document;
 }
 
 describe("ParseQualityPanel (issue #514 / PRODUCT-ENH-06)", () => {
-  it("renders extraction facts from the document's extraction field", () => {
+  it("renders extraction facts from the document's extraction_diagnostics field", () => {
     render(<ParseQualityPanel doc={makeDoc(DIAGNOSTICS)} />);
 
     expect(screen.getByRole("heading", { name: /parse quality/i })).toBeInTheDocument();
@@ -42,18 +44,13 @@ describe("ParseQualityPanel (issue #514 / PRODUCT-ENH-06)", () => {
   });
 
   it("reads the diagnostics from every carrier shape the payloads use", () => {
-    // Top-level extraction_diagnostics (status-payload shape).
+    // Top-level extraction_diagnostics (detail/status payload wire shape).
     const { rerender } = render(
-      <ParseQualityPanel doc={{ ...makeDoc(null), extraction_diagnostics: DIAGNOSTICS } as Document} />
+      <ParseQualityPanel doc={makeDoc(DIAGNOSTICS)} />
     );
     expect(screen.getByText("ext-9f")).toBeInTheDocument();
 
     // metadata.extraction_diagnostics (older detail payloads).
-    rerender(
-      <ParseQualityPanel
-        doc={makeDoc(null) as Document & { metadata: Record<string, unknown> }}
-      />
-    );
     const metaCarrier = {
       ...makeDoc(null),
       metadata: { status: "indexed", chunk_count: 5, extraction_diagnostics: DIAGNOSTICS },

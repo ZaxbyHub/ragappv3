@@ -178,3 +178,43 @@ describe("DocumentDetailPage preview race — committed preview survives a late 
     ).toBe(true);
   });
 });
+
+describe("DocumentDetailPage preview — in-flight blob request aborted on previewable→non-previewable navigation (F-001)", () => {
+  it("aborts doc1's pending blob fetch when the user navigates to a non-previewable document", async () => {
+    const PDF1 = { ...DOC1, filename: "one.pdf" };
+    const DOCX2 = { ...DOC2, filename: "two.docx" };
+    apiMock.getDocument.mockImplementation((id: any) =>
+      Number(id) === 1 ? Promise.resolve(PDF1) : Promise.resolve(DOCX2)
+    );
+    // doc1's blob request never settles; capture its abort signal.
+    let blob1Signal: AbortSignal | null = null;
+    apiMock.getDocumentRawBlob.mockImplementation(
+      (fid: unknown, signal: AbortSignal) => {
+        if (String(fid) === "1") blob1Signal = signal;
+        return new Promise<any>(() => {});
+      }
+    );
+
+    await act(async () => {
+      render(<Harness />);
+      await flushMicrotasks();
+    });
+    expect(apiMock.getDocumentRawBlob).toHaveBeenCalledWith("1", expect.anything());
+    expect(blob1Signal?.aborted).toBe(false);
+
+    // Navigate to a .docx document: the NEW preview effect run early-returns
+    // (non-previewable), so the PREVIOUS run's cleanup is the only teardown —
+    // it must abort the still-pending blob request instead of letting it run
+    // until unmount (F-001).
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("nav-to-2"));
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("two.docx");
+    expect(
+      blob1Signal?.aborted,
+      "the doc1 blob request must be aborted after navigating away from it"
+    ).toBe(true);
+  });
+});
