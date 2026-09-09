@@ -141,7 +141,8 @@ def build_extraction_diagnostics(
     The parse stage calls it right after elements are produced and persists
     the result as JSON on ``files.extraction_diagnostics`` so the per-file
     status payload can reveal parse omissions (e.g. a scanned page the parser
-    recovered nothing from) even when every chunk embedded successfully.
+    recovered nothing from) even when the document is otherwise fully
+    processed and declared searchable.
 
     Derivation rules:
 
