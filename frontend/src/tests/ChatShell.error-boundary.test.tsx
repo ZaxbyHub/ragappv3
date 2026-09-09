@@ -158,6 +158,8 @@ vi.mock("react-router-dom", () => ({
   BrowserRouter: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   useNavigate: () => vi.fn(),
   useParams: vi.fn(() => ({})),
+  // ChatShell reads ?document_ids= for the AC-23 deep link (issue #514).
+  useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));
 
 vi.mock("@/components/shared/KeyboardShortcuts", () => ({
