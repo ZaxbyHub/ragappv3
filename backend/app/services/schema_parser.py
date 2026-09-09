@@ -5,7 +5,7 @@ Parses .sql and .ddl files to extract table schemas as chunks.
 
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 class SchemaParser:
@@ -19,12 +19,27 @@ class SchemaParser:
     # Maximum file size in bytes (100MB)
     MAX_FILE_SIZE = 100 * 1024 * 1024
 
-    # Regex pattern to match CREATE TABLE blocks
-    # Handles optional VIRTUAL keyword, IF NOT EXISTS, schema prefix, backticks/quotes
+    # Regex pattern to match CREATE TABLE blocks.
+    # Handles optional VIRTUAL keyword, IF NOT EXISTS, qualified schema
+    # prefixes, and quoted identifiers ("name with spaces", `backticked`,
+    # 'single-quoted') for both the schema prefix and the table name —
+    # bare names keep the conventional [A-Za-z_]\w* form. The terminator
+    # allows whitespace/newlines between the closing ')' and the ';'
+    # (issue #513 W5 / RC-12). The non-greedy column capture stops at the
+    # FIRST ')\s*;' after each CREATE, so multi-statement files yield one
+    # match per block.
+    #
+    # Capture groups:
+    #   1-4: optional schema prefix (double-quoted / backticked /
+    #        single-quoted / bare), each holding the prefix's inner text
+    #   5-8: table name (double-quoted / backticked / single-quoted / bare),
+    #        each holding the identifier's inner (unquoted) text
+    _QUOTED_IDENTIFIER = r'(?:"([^"]+)"|`([^`]+)`|\'([^\']+)\'|([A-Za-z_][\w$]*))'
     CREATE_TABLE_PATTERN = re.compile(
         r'CREATE\s+(?:VIRTUAL\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
-        r'(?:[`"\']?(?:\w+)[`"\']?\.)?'
-        r'[`"\']?(\w+)[`"\']?\s*\((.*?)\);',
+        r'(?:' + _QUOTED_IDENTIFIER + r'\s*\.\s*)?'
+        + _QUOTED_IDENTIFIER
+        + r'\s*\((.*?)\)\s*;',
         re.IGNORECASE | re.DOTALL
     )
 
@@ -72,27 +87,7 @@ class SchemaParser:
         except UnicodeDecodeError:
             content = path.read_text(encoding='utf-8', errors='replace')
 
-        chunks = []
-
-        # Find all CREATE TABLE blocks
-        for match in self.CREATE_TABLE_PATTERN.finditer(content):
-            table_name = match.group(1)
-            column_block = match.group(2).strip()
-
-            # Reconstruct the full table definition
-            table_definition = f"CREATE TABLE {table_name} (\n{column_block}\n);"
-
-            chunk = {
-                'text': table_definition,
-                'metadata': {
-                    'table_name': table_name,
-                    'object_type': 'table',
-                    'source_file': str(path)
-                }
-            }
-            chunks.append(chunk)
-
-        return chunks
+        return self._extract_chunks(content, source_file=str(path))
 
     def parse_text(self, sql_text: str) -> List[Dict[str, Any]]:
         """
@@ -108,20 +103,76 @@ class SchemaParser:
         if not sql_text or not sql_text.strip():
             return []
 
+        return self._extract_chunks(sql_text, source_file=None)
+
+    @staticmethod
+    def _identifier_parts(match: "re.Match") -> tuple:
+        """Extract (bare_table_name, original_spelling) from a pattern match.
+
+        The table name may be quoted (``"order items"``, ``'order items'``,
+        backticked) or bare. The ORIGINAL quoted spelling — including any
+        qualified schema prefix — is preserved for the emitted chunk text so
+        definitions round-trip (re-parsing the emitted text yields the same
+        identifier); the bare (unquoted) table identifier is returned for
+        metadata.
+
+        Returns:
+            Tuple of (bare_table_name, original_spelling).
+        """
+        # Groups 1-4: optional schema prefix (double-quoted/backtick/single/
+        # bare). Groups 5-8: table name in the same four spellings.
+        prefix_quote, prefix_bare = None, None
+        if match.group(1) is not None:
+            prefix_quote, prefix_bare = '"', match.group(1)
+        elif match.group(2) is not None:
+            prefix_quote, prefix_bare = '`', match.group(2)
+        elif match.group(3) is not None:
+            prefix_quote, prefix_bare = "'", match.group(3)
+        elif match.group(4) is not None:
+            prefix_quote, prefix_bare = '', match.group(4)
+
+        name_quote, bare_name = '', ''
+        if match.group(5) is not None:
+            name_quote, bare_name = '"', match.group(5)
+        elif match.group(6) is not None:
+            name_quote, bare_name = '`', match.group(6)
+        elif match.group(7) is not None:
+            name_quote, bare_name = "'", match.group(7)
+        elif match.group(8) is not None:
+            name_quote, bare_name = '', match.group(8)
+
+        original = ''
+        if prefix_bare is not None:
+            original = f'{prefix_quote}{prefix_bare}{prefix_quote}.'
+        original += f'{name_quote}{bare_name}{name_quote}'
+        return bare_name, original
+
+    def _extract_chunks(
+        self, content: str, source_file: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Extract CREATE TABLE chunks from SQL/DDL content.
+
+        Each emitted chunk's text preserves the ORIGINAL quoted spelling of
+        the table identifier (round-trip safe); metadata carries the bare
+        (unquoted) identifier under ``table_name``.
+        """
         chunks = []
 
-        for match in self.CREATE_TABLE_PATTERN.finditer(sql_text):
-            table_name = match.group(1)
-            column_block = match.group(2).strip()
+        # Find all CREATE TABLE blocks
+        for match in self.CREATE_TABLE_PATTERN.finditer(content):
+            bare_name, original_name = self._identifier_parts(match)
+            column_block = match.group(9).strip()
 
-            table_definition = f"CREATE TABLE {table_name} (\n{column_block}\n);"
+            # Reconstruct the full table definition using the original
+            # identifier spelling so the definition round-trips.
+            table_definition = f"CREATE TABLE {original_name} (\n{column_block}\n);"
 
             chunk = {
                 'text': table_definition,
                 'metadata': {
-                    'table_name': table_name,
+                    'table_name': bare_name,
                     'object_type': 'table',
-                    'source_file': None
+                    'source_file': source_file
                 }
             }
             chunks.append(chunk)

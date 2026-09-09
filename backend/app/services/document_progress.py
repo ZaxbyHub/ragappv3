@@ -124,7 +124,10 @@ def set_phase(
                 params,
             )
             conn.commit()
-    except sqlite3.Error as e:  # pragma: no cover - defensive
+    except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
+        # RuntimeError = expected pool-checkout failure (exhaustion/closed pool,
+        # database.py) — best-effort contract absorbs it (issue #513 W2).
+        # CancelledError (BaseException) and programming errors still propagate.
         logger.warning("set_phase failed for file_id=%s: %s", file_id, e)
 
 
@@ -153,7 +156,8 @@ def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
                 (PHASE_INDEXED, file_id),
             )
             conn.commit()
-    except sqlite3.Error as e:  # pragma: no cover - defensive
+    except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
+        # RuntimeError = expected pool-checkout failure (issue #513 W2).
         logger.warning("clear_progress failed for file_id=%s: %s", file_id, e)
 
 
@@ -175,5 +179,6 @@ def set_wiki_pending(
                 (1 if pending else 0, file_id),
             )
             conn.commit()
-    except sqlite3.Error as e:  # pragma: no cover - defensive
+    except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
+        # RuntimeError = expected pool-checkout failure (issue #513 W2).
         logger.warning("set_wiki_pending failed for file_id=%s: %s", file_id, e)

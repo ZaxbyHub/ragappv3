@@ -193,6 +193,10 @@ class TestEmbeddingsAdversarial:
             mock.embedding_batch_max_retries = 3
             mock.embedding_batch_min_sub_size = 1
             mock.embedding_concurrent_batches = 4
+            # Issue #513 W23: embed_batch now also bounds batches by a
+            # total-char budget read live from settings — production default
+            # supplied here so the count-bound semantics stay unchanged.
+            mock.embedding_batch_max_chars = 131072
             yield mock
 
     def _apply_mock_settings(self, mock_settings):

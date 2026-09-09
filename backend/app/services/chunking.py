@@ -364,6 +364,7 @@ class EmbeddingSemanticChunker:
         min_chunk_size: int = 100,
         max_chunk_size: int = 2000,
         window_size: int = 2,
+        max_merge_chars: int = 8192,
     ):
         """
         Initialize the embedding-based semantic chunker.
@@ -375,6 +376,10 @@ class EmbeddingSemanticChunker:
             min_chunk_size: Minimum number of characters for a chunk
             max_chunk_size: Maximum number of characters for a chunk
             window_size: Window size for comparing sentence embeddings
+            max_merge_chars: Maximum characters when merging a below-minimum
+                boundary fragment into a neighboring chunk (issue #513 W6);
+                a fragment that cannot merge within this bound is emitted as
+                its own (short) chunk instead of being discarded.
         """
         self.embedding_service = embedding_service
         self.threshold_type = threshold_type
@@ -382,6 +387,7 @@ class EmbeddingSemanticChunker:
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
         self.window_size = window_size
+        self.max_merge_chars = max_merge_chars
 
         # Fallback chunker for text that exceeds max_chunk_size
         self._fallback_chunker = SemanticChunker(
@@ -520,10 +526,9 @@ class EmbeddingSemanticChunker:
         breakpoints = self._calculate_breakpoints(similarities)
 
         # Create chunks based on breakpoints
-        chunks = []
-        current_chunk_sentences = []
+        chunk_texts: List[str] = []
+        current_chunk_sentences: List[str] = []
         current_chunk_length = 0
-        chunk_idx = 0
 
         for i, sentence in enumerate(sentences):
             sentence_length = len(sentence)
@@ -538,46 +543,50 @@ class EmbeddingSemanticChunker:
             )
 
             if should_break and current_chunk_sentences:
-                # Start a new chunk
-                chunk_text = " ".join(current_chunk_sentences)
-
-                # Only create chunk if it meets minimum size
-                if len(chunk_text) >= self.min_chunk_size:
-                    metadata = {
-                        "section_title": section_title,
-                        "chunk_index": chunk_idx,
-                        "total_chunks": 0,  # Will be updated later
-                        "element_type": "SemanticChunk",
-                    }
-
-                    chunk = ProcessedChunk(
-                        text=chunk_text, metadata=metadata, chunk_index=chunk_idx
-                    )
-                    chunks.append(chunk)
-                    chunk_idx += 1
-
+                # Start a new chunk. Below-minimum fragments are never
+                # discarded here (issue #513 W6 / RC-13): chunking may
+                # regroup source text but must not delete it. Short boundary
+                # fragments are merged into a neighboring chunk below when
+                # the merge fits the max-merge bound, else kept standalone.
+                chunk_texts.append(" ".join(current_chunk_sentences))
                 current_chunk_sentences = [sentence]
                 current_chunk_length = sentence_length
             else:
                 current_chunk_sentences.append(sentence)
                 current_chunk_length += sentence_length
 
-        # Add remaining sentences as final chunk
+        # Add remaining sentences as final chunk (same never-drop rule)
         if current_chunk_sentences:
-            chunk_text = " ".join(current_chunk_sentences)
+            chunk_texts.append(" ".join(current_chunk_sentences))
 
-            if len(chunk_text) >= self.min_chunk_size:
-                metadata = {
-                    "section_title": section_title,
-                    "chunk_index": chunk_idx,
-                    "total_chunks": 0,
-                    "element_type": "SemanticChunk",
-                }
+        # Merge below-minimum fragments into an adjacent chunk when the merge
+        # fits the max-merge bound; otherwise the fragment is emitted as its
+        # own (short) chunk — coverage wins over size aesthetics.
+        merged_texts: List[str] = []
+        for text in chunk_texts:
+            if merged_texts and (
+                len(merged_texts[-1]) < self.min_chunk_size
+                or len(text) < self.min_chunk_size
+            ):
+                candidate = f"{merged_texts[-1]} {text}"
+                if len(candidate) <= self.max_merge_chars:
+                    merged_texts[-1] = candidate
+                    continue
+            merged_texts.append(text)
 
-                chunk = ProcessedChunk(
-                    text=chunk_text, metadata=metadata, chunk_index=chunk_idx
-                )
-                chunks.append(chunk)
+        chunks = []
+        for chunk_idx, chunk_text in enumerate(merged_texts):
+            metadata = {
+                "section_title": section_title,
+                "chunk_index": chunk_idx,
+                "total_chunks": 0,  # Will be updated later
+                "element_type": "SemanticChunk",
+            }
+
+            chunk = ProcessedChunk(
+                text=chunk_text, metadata=metadata, chunk_index=chunk_idx
+            )
+            chunks.append(chunk)
 
         # Update total_chunks in metadata
         for chunk in chunks:

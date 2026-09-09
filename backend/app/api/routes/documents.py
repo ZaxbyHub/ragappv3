@@ -67,6 +67,10 @@ from app.services.document_processor import (
     DuplicateFileError,
 )
 from app.services.embeddings import EmbeddingService
+from app.services.near_duplicates import (
+    clear_file_centroid,
+    get_near_duplicate_group,
+)
 from app.services.secret_manager import SecretManager
 from app.services.upload_path import UploadPathProvider
 from app.services.upload_validation import (
@@ -399,6 +403,10 @@ class DocumentResponse(BaseModel):
     enrichment_error: Optional[str] = None
     enrichment_enabled: Optional[bool] = None  # Per-file override (null=inherit vault/global)
     effective_enrichment_enabled: bool = False  # Resolved effective state
+    # Advisory near-duplicate group (issue #513 W26): shared group_id when this
+    # file's chunk-embedding centroid is near-identical to another file's in
+    # the vault. Purely informational — null when no group was assigned.
+    near_duplicate_group: Optional[str] = None
     metadata: Optional[dict] = None  # Frontend expects metadata
     tags: List[dict] = Field(default_factory=list)  # Assigned organization tags
     folder_id: Optional[int] = None  # Folder the document is filed in (null = unfiled)
@@ -552,6 +560,60 @@ def _build_order_clause(sort_by: str, sort_order: str) -> str:
     column = _SORT_COLUMNS.get(sort_by, _SORT_COLUMNS["created_at"])
     direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
     return f"ORDER BY {column} {direction}, id {direction}"
+
+
+def _near_duplicate_group_for(
+    conn: sqlite3.Connection, file_id: int
+) -> Optional[str]:
+    """Advisory near-duplicate group for a single document (issue #513 W26).
+
+    Best-effort by construction: the field is pure metadata, so a missing
+    ``document_near_dups`` table (pre-migration database) degrades to null
+    rather than failing the read.
+    """
+    try:
+        return get_near_duplicate_group(conn, file_id)
+    except sqlite3.Error:
+        return None
+
+
+def _near_duplicate_groups_for(
+    conn: sqlite3.Connection, file_ids: List[int]
+) -> dict:
+    """Advisory near-duplicate groups for a page of documents in ONE query.
+
+    Batched companion of ``_near_duplicate_group_for`` so list projections
+    never pay an N+1 lookup per row. Returns ``{file_id: group_id}`` for the
+    files that carry a group; best-effort like the single-file helper.
+    """
+    if not file_ids:
+        return {}
+    try:
+        placeholders = ",".join("?" * len(file_ids))
+        rows = conn.execute(
+            "SELECT file_id, group_id FROM document_near_dups "
+            f"WHERE file_id IN ({placeholders}) AND group_id IS NOT NULL",  # nosec B608 — placeholders is a fixed '?,?,...' literal, ids are bound
+            tuple(file_ids),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {int(row[0]): str(row[1]) for row in rows}
+
+
+def _clear_near_duplicate_centroid(conn: sqlite3.Connection, file_id: int) -> None:
+    """Drop a file's advisory near-duplicate centroid row (issue #513 W26).
+
+    Best-effort: advisory metadata must never block a document delete. Runs on
+    the caller's connection/transaction so the centroid dies with its file.
+    """
+    try:
+        clear_file_centroid(conn, file_id)
+    except sqlite3.Error as exc:
+        logger.warning(
+            "Failed to clear near-duplicate centroid for file_id=%s: %s",
+            file_id,
+            exc,
+        )
 
 
 def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
@@ -805,7 +867,7 @@ async def list_documents(
                    created_at, processed_at, error_message, phase, phase_message,
                    progress_percent, processed_units, total_units, unit_label,
                    phase_started_at, processing_started_at, enrichment_status,
-                   enrichment_error, vault_id, folder_id,
+                   enrichment_error, enrichment_enabled, vault_id, folder_id,
                    (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
                    (SELECT COALESCE(json_group_array(chunk_index), '[]')
                     FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
@@ -838,7 +900,7 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error, vault_id, folder_id,
+                       enrichment_error, enrichment_enabled, vault_id, folder_id,
                        (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
                        (SELECT COALESCE(json_group_array(chunk_index), '[]')
                         FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
@@ -865,7 +927,7 @@ async def list_documents(
                        created_at, processed_at, error_message, phase, phase_message,
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
-                       enrichment_error, vault_id, folder_id,
+                       enrichment_error, enrichment_enabled, vault_id, folder_id,
                        (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
                        (SELECT COALESCE(json_group_array(chunk_index), '[]')
                         FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
@@ -878,6 +940,15 @@ async def list_documents(
     rows = await asyncio.to_thread(cursor.fetchall)
 
     documents = [_row_to_document_response(row) for row in rows]
+
+    # Advisory near-duplicate groups for the page, in one batched query
+    # (issue #513 W26 exposure — no per-row lookup).
+    if documents:
+        near_dup_groups = await asyncio.to_thread(
+            _near_duplicate_groups_for, conn, [doc.id for doc in documents]
+        )
+        for doc in documents:
+            doc.near_duplicate_group = near_dup_groups.get(doc.id)
 
     # Attach organization tags in a single batch query (avoids N+1).
     file_ids = [doc.id for doc in documents]
@@ -1559,7 +1630,7 @@ async def get_document(
                created_at, processed_at, error_message, phase, phase_message,
                progress_percent, processed_units, total_units, unit_label,
                phase_started_at, processing_started_at, enrichment_status,
-               enrichment_error,
+               enrichment_error, enrichment_enabled,
                (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
                (SELECT COALESCE(json_group_array(chunk_index), '[]')
                 FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
@@ -1576,6 +1647,10 @@ async def get_document(
         raise HTTPException(status_code=403, detail="Access denied to vault")
 
     document = _row_to_document_response(row)
+    # Advisory near-duplicate group (issue #513 W26 exposure).
+    document.near_duplicate_group = await asyncio.to_thread(
+        _near_duplicate_group_for, conn, file_id
+    )
     from app.services.tag_store import TagStore
 
     tags = await asyncio.to_thread(TagStore(conn).get_tags_for_document, file_id)
@@ -1647,6 +1722,9 @@ async def toggle_file_enrichment(
     )
     updated_row = await asyncio.to_thread(cursor.fetchone)
     document = _row_to_document_response(updated_row)
+    document.near_duplicate_group = await asyncio.to_thread(
+        _near_duplicate_group_for, conn, file_id
+    )
 
     from app.services.tag_store import TagStore
 
@@ -1730,6 +1808,98 @@ async def upload_document(
         response.file_id, user, getattr(request.app.state, "secret_manager", None), db_pool
     )
     return response
+
+
+def _best_effort_unlink(path: Path) -> None:
+    """Unlink a file, swallowing OSError so cleanup never masks the real error."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to unlink uploaded file %s: %s", path, exc)
+
+
+async def _compensate_failed_registration(
+    db_pool: SQLiteConnectionPool,
+    file_path: Path,
+    file_id: Optional[int],
+    row_created_by_request: bool,
+) -> None:
+    """Keep the files-row ↔ on-disk-file pairing coherent when an upload fails
+    after the row was committed (enqueue or queueing failure; issue #513 W19,
+    frozen check C14 / RC-15).
+
+    - Row CREATED by this request: nothing derived from the row exists yet
+      (the task never reached the queue), so the row is deleted in a single
+      transaction and the uploaded bytes are unlinked. The request leaves no
+      duplicate-blocking 'pending' orphan behind — after maintenance ends the
+      client can simply re-upload instead of waiting for a recovery sweep.
+    - Row that PRE-EXISTED (matched by file_path and refreshed to 'pending'
+      by ``_insert_or_get_file_record``): the prior registration must survive,
+      and that row points at exactly this request's bytes, so both sides of
+      the pair are RETAINED as a coherent retryable unit. (Unlinking the
+      bytes here would recreate the C14 orphan: a pending row pointing at a
+      missing file.)
+    - Failure before any row was touched (file_id is None): remove only this
+      request's bytes, as the route has always done.
+    """
+    if row_created_by_request and file_id is not None:
+        try:
+            conn = db_pool.get_connection()
+        except Exception as exc:  # noqa: BLE001 — pool failure must not mask the cause
+            logger.warning(
+                "Upload compensation could not acquire a connection for "
+                "file_id=%s; retaining row+file as a coherent pair: %s",
+                file_id,
+                exc,
+            )
+            return
+        try:
+
+            def _delete_row(connection: sqlite3.Connection) -> None:
+                # Clear any implicit transaction left by the failed attempt
+                # (e.g. a commit that raised) before opening our own.
+                if connection.in_transaction:
+                    connection.rollback()
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    connection.execute(
+                        "DELETE FROM files WHERE id = ?", (file_id,)
+                    )
+                    connection.commit()
+                except sqlite3.Error:
+                    try:
+                        connection.rollback()
+                    except sqlite3.Error:
+                        pass
+                    raise
+
+            try:
+                await asyncio.to_thread(_delete_row, conn)
+            except sqlite3.Error as exc:
+                # Row delete failed: keep the bytes so the pair stays coherent
+                # (the recovery sweep will settle the pending row).
+                logger.warning(
+                    "Upload compensation failed to delete files row %s; "
+                    "retaining row+file as a coherent pair: %s",
+                    file_id,
+                    exc,
+                )
+                return
+            _best_effort_unlink(file_path)
+        finally:
+            db_pool.release_connection(conn)
+        return
+
+    if file_id is not None:
+        logger.info(
+            "Upload failed after refreshing existing files row %s; row and "
+            "file retained as a coherent retryable pair",
+            file_id,
+        )
+        return
+
+    # No files row was touched by this request — remove only its bytes.
+    _best_effort_unlink(file_path)
 
 
 async def _do_upload(
@@ -1912,6 +2082,10 @@ async def _do_upload(
             pool=db_pool,
         )
 
+        # W19 (C14 / RC-15): track whether THIS request created the files row,
+        # so the failure handlers below can compensate coherently.
+        file_id: Optional[int] = None
+        row_created_by_request = False
         try:
             file_hash = compute_file_hash(str(file_path))
 
@@ -1947,6 +2121,14 @@ async def _do_upload(
                 # _insert_or_get_file_record itself can raise DuplicateFileError
                 # if the partial unique index trips (race window between the
                 # in-flight check and the INSERT/UPDATE). Translate to 409.
+                #
+                # W19 (C14): the method refreshes a pre-existing row when one
+                # matches this file_path; mirror that predicate so the
+                # failure handlers know whether this request created the row
+                # (and may delete it) or only updated an existing one.
+                preexisting_row = conn.execute(
+                    "SELECT id FROM files WHERE file_path = ?", (str(file_path),)
+                ).fetchone()
                 try:
                     file_id = processor._insert_or_get_file_record(
                         str(file_path),
@@ -1963,6 +2145,7 @@ async def _do_upload(
                         status_code=409,
                         detail=f"{e} (uploaded file was cleaned up)",
                     )
+                row_created_by_request = preexisting_row is None
                 conn.commit()
             finally:
                 db_pool.release_connection(conn)
@@ -1977,11 +2160,15 @@ async def _do_upload(
                 message="Queued for processing",
             )
 
+            # W8 (AC30 / RC-21d): the route already computed file_hash above;
+            # pass it to the worker so the content hash is computed exactly
+            # once per upload instead of route-then-worker duplicating it.
             await background_processor.enqueue(
                 file_path=str(file_path),
                 source="upload",
                 vault_id=vault_id,
                 file_id=file_id,
+                file_hash=file_hash,
             )
 
             return UploadResponse(
@@ -2001,11 +2188,25 @@ async def _do_upload(
             # legitimately on disk for accepted uploads.
             raise
         except DocumentProcessingError as e:
-            file_path.unlink(missing_ok=True)
+            # W19 (C14): an enqueue blocked by maintenance mode must leave no
+            # 'pending' row pointing at a missing file — compensate the
+            # row/file pair, then answer with an operational status the
+            # client can retry against.
+            await _compensate_failed_registration(
+                db_pool, file_path, file_id, row_created_by_request
+            )
             logger.exception("Document processing error for file: %s", file_name)
+            if "maintenance mode" in str(e).lower():
+                raise HTTPException(
+                    status_code=503, detail=f"Processing error: {e}"
+                )
             raise HTTPException(status_code=500, detail=f"Processing error: {e}")
         except Exception as e:
-            file_path.unlink(missing_ok=True)
+            # W19 (C14): same compensation for any other post-registration
+            # failure (enqueue failure, queueing error, ...).
+            await _compensate_failed_registration(
+                db_pool, file_path, file_id, row_created_by_request
+            )
             logger.exception("Unexpected error registering file: %s", file_name)
             raise HTTPException(status_code=500, detail=f"Server error: {e}")
     except HTTPException:
@@ -2278,6 +2479,12 @@ async def _delete_file_record(
             conn.execute, "DELETE FROM files WHERE id = ?", (file_id,)
         )
 
+        # W26: the advisory near-duplicate centroid row is keyed to the file;
+        # drop it in the same transaction so no stale group survives the
+        # delete (SQLite can reuse rowids, which would otherwise let a future
+        # file inherit a bogus group). Best-effort — never blocks the delete.
+        await asyncio.to_thread(_clear_near_duplicate_centroid, conn, file_id)
+
         # Draft Room evidence freshness (SPEC section 12.6): a deleted document
         # invalidates every draft_evidence row citing it. Called after the row
         # delete and before the commit so the invalidation lands in the *same*
@@ -2525,6 +2732,13 @@ async def delete_all_vault_documents(
             # deletes so the background sweep can retry them (Issue #219).
             for failed_file_id in vector_delete_failed_ids:
                 _record_pending_vector_delete(conn, failed_file_id, vault_id)
+            # W26: advisory near-duplicate centroid rows die with their files,
+            # inside the same transaction. (This must happen here rather than
+            # in the purge loop above: any uncommitted purge-loop DML is
+            # rolled back by the in_transaction guard at the top of this
+            # function, which would silently undo the centroid deletes.)
+            for collected_id in file_ids:
+                _clear_near_duplicate_centroid(conn, collected_id)
             # Tombstone every asset path within the vault in the same
             # transaction so the artifact sweep collects them after commit
             # (issue #460); rows cascade from the files-row delete.
@@ -2539,8 +2753,16 @@ async def delete_all_vault_documents(
                     rel_paths=vault_assets,
                     generation_hash=None,
                 )
+            # W20 (C23 / RC-16): delete exactly the collected ids — NOT
+            # `WHERE vault_id = ?` — so a file inserted after the collection
+            # phase (concurrent upload) keeps BOTH its row and its on-disk
+            # upload file. Ids already deleted concurrently simply match
+            # nothing here; the BEGIN IMMEDIATE transaction above preserves
+            # the all-or-nothing atomicity over the collected set.
+            id_placeholders = ",".join("?" * len(file_ids))
             cur = conn.execute(
-                "DELETE FROM files WHERE vault_id = ?", (vault_id,)
+                f"DELETE FROM files WHERE id IN ({id_placeholders})",  # nosec B608 — placeholders is a fixed '?,?,...' literal, ids are bound
+                tuple(file_ids),
             )
             conn.commit()
             return cur.rowcount

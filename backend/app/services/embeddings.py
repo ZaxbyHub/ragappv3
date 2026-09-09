@@ -751,8 +751,12 @@ class EmbeddingService:
         Generate embeddings for a batch of texts using true API batching.
 
         Sends multiple texts per API request for efficient GPU utilization.
-        Processes batches concurrently using asyncio.gather, limited by
-        embedding_concurrent_batches setting.
+        Batches are bounded BOTH by item count (``batch_size``) and by a total
+        character budget (``settings.embedding_batch_max_chars``): a batch is
+        closed before adding a text that would push its total character cost
+        past the budget, and an oversized single text ships alone as its own
+        batch (issue #513 W23). Processes batches concurrently using
+        asyncio.gather, limited by embedding_concurrent_batches setting.
 
         Applies the document prefix (if configured) to each input text before embedding.
         The document prefix is used for document embeddings and must remain constant for
@@ -760,7 +764,7 @@ class EmbeddingService:
 
         Args:
             texts: List of texts to embed.
-            batch_size: Number of texts per API request (default: 512).
+            batch_size: Maximum number of texts per API request (default: 512).
             fail_fast: If True (default), raise on any batch failure.
                        If False, return (embeddings, failed_batch_indices) with None
                        placeholders for failed batches.
@@ -826,10 +830,32 @@ class EmbeddingService:
                 async with self._get_global_batch_semaphore():
                     return await self._embed_batch_api(batch_texts, config)
 
-        batch_tasks = []
-        for i in range(0, len(texts_to_embed), batch_size):
-            batch = texts_to_embed[i : i + batch_size]
-            batch_tasks.append(_process_batch(batch))
+        # Token-cost-bounded batching (issue #513 W23 / RC-21e): in addition
+        # to the per-batch count limit, a batch is closed BEFORE adding a
+        # text whose character cost (len of text) would push the batch's
+        # total past ``settings.embedding_batch_max_chars``. An oversized
+        # single text (cost alone over the budget) ships alone as its own
+        # batch. Text order and exactly-one-embedding-per-text are preserved
+        # by construction: the batches partition ``texts_to_embed`` in order.
+        max_batch_chars = settings.embedding_batch_max_chars
+        batches: List[tuple] = []  # (start offset into texts_to_embed, batch texts)
+        current_batch: List[str] = []
+        current_chars = 0
+        for offset, text in enumerate(texts_to_embed):
+            text_cost = len(text)
+            if current_batch and (
+                len(current_batch) >= batch_size
+                or current_chars + text_cost > max_batch_chars
+            ):
+                batches.append((offset - len(current_batch), current_batch))
+                current_batch = []
+                current_chars = 0
+            current_batch.append(text)
+            current_chars += text_cost
+        if current_batch:
+            batches.append((len(texts_to_embed) - len(current_batch), current_batch))
+
+        batch_tasks = [_process_batch(batch) for _start, batch in batches]
 
         batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
 
@@ -846,9 +872,9 @@ class EmbeddingService:
                 if isinstance(result, Exception):
                     failed_indices.append(batch_idx)
                     # Add None placeholders for each text in this failed batch
-                    start = batch_idx * batch_size
-                    end = min(start + batch_size, len(texts_to_embed))
-                    for _ in range(start, end):
+                    # (placeholders track the ACTUAL char-bounded batch size —
+                    # batches are no longer uniform batch_size slices).
+                    for _ in batches[batch_idx][1]:
                         all_embeddings_with_nones.append(None)
                     logger.warning(f"Batch {batch_idx} failed (skipping): {result}")
                 else:

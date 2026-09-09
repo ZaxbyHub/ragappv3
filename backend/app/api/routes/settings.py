@@ -35,6 +35,11 @@ class SettingsUpdate(BaseModel):
     embedding_query_prefix: Optional[str] = None
     retrieval_window: Optional[int] = None
     embedding_batch_size: Optional[int] = None
+    # Embedding batching / cache / near-dup / orphan rescan (issue #513)
+    embedding_batch_max_chars: Optional[int] = None
+    embedding_cache_max_entries: Optional[int] = None
+    near_dup_threshold: Optional[float] = None
+    orphan_rescan_interval_seconds: Optional[float] = None
 
     # Reranker config
     reranker_url: Optional[str] = None
@@ -247,6 +252,37 @@ class SettingsUpdate(BaseModel):
     def validate_embedding_batch_size(cls, v):
         if v is not None and (v < 1 or v > 128):
             raise ValueError("embedding_batch_size must be between 1 and 128 (TEI limit)")
+        return v
+
+    # ── Issue #513 settings: write-path range guards (the PUT path persists
+    # via bare setattr and bypasses pydantic validation of the singleton, so
+    # these validators are the ONLY write guard — ranges mirror config.py).
+    @field_validator("embedding_batch_max_chars")
+    @classmethod
+    def validate_embedding_batch_max_chars(cls, v):
+        if v is not None and not (4096 <= v <= 1048576):
+            raise ValueError("embedding_batch_max_chars must be between 4096 and 1048576")
+        return v
+
+    @field_validator("embedding_cache_max_entries")
+    @classmethod
+    def validate_embedding_cache_max_entries(cls, v):
+        if v is not None and not (1000 <= v <= 1000000):
+            raise ValueError("embedding_cache_max_entries must be between 1000 and 1000000")
+        return v
+
+    @field_validator("near_dup_threshold")
+    @classmethod
+    def validate_near_dup_threshold(cls, v):
+        if v is not None and not (0.5 <= v <= 0.999999):
+            raise ValueError("near_dup_threshold must be between 0.5 and 0.999999")
+        return v
+
+    @field_validator("orphan_rescan_interval_seconds")
+    @classmethod
+    def validate_orphan_rescan_interval_seconds(cls, v):
+        if v is not None and not (60.0 <= v <= 86400.0):
+            raise ValueError("orphan_rescan_interval_seconds must be between 60.0 and 86400.0")
         return v
 
     @field_validator("reranker_top_n")
@@ -492,6 +528,11 @@ ALLOWED_FIELDS = [
     "embedding_query_prefix",
     "retrieval_window",
     "embedding_batch_size",
+    # Embedding batching / cache / near-dup / orphan rescan (issue #513)
+    "embedding_batch_max_chars",
+    "embedding_cache_max_entries",
+    "near_dup_threshold",
+    "orphan_rescan_interval_seconds",
     "reranker_url",
     "reranker_model",
     "reranking_enabled",
@@ -741,6 +782,11 @@ class SettingsResponse(BaseModel):
 
     # Embedding config
     embedding_batch_size: int
+    # Embedding batching / cache / near-dup / orphan rescan (issue #513)
+    embedding_batch_max_chars: int = 131072
+    embedding_cache_max_entries: int = 50000
+    near_dup_threshold: float = 0.96
+    orphan_rescan_interval_seconds: float = 3600.0
 
     # Reranker config
     reranker_url: str = ""
@@ -873,6 +919,11 @@ def _build_settings_dict() -> dict:
         "embedding_query_prefix": settings.embedding_query_prefix,
         "retrieval_window": settings.retrieval_window,
         "embedding_batch_size": settings.embedding_batch_size,
+        # Embedding batching / cache / near-dup / orphan rescan (issue #513)
+        "embedding_batch_max_chars": settings.embedding_batch_max_chars,
+        "embedding_cache_max_entries": settings.embedding_cache_max_entries,
+        "near_dup_threshold": settings.near_dup_threshold,
+        "orphan_rescan_interval_seconds": settings.orphan_rescan_interval_seconds,
         "maintenance_mode": settings.maintenance_mode,
         "auto_scan_enabled": settings.auto_scan_enabled,
         "auto_scan_interval_minutes": settings.auto_scan_interval_minutes,

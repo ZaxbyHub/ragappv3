@@ -50,6 +50,10 @@ def mock_settings():
         mock_settings.embedding_batch_max_retries = 3
         mock_settings.embedding_batch_min_sub_size = 1
         mock_settings.embedding_concurrent_batches = 4
+        # Issue #513 W23: embed_batch now also bounds batches by a total-char
+        # budget read live from settings — production default supplied here so
+        # the count-bound semantics these tests exercise are unchanged.
+        mock_settings.embedding_batch_max_chars = 131072
         mock_settings.chunk_size_chars = 1200
         mock_settings.chunk_overlap_chars = 120
         yield mock_settings

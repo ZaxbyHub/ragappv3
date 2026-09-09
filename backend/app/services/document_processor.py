@@ -10,11 +10,13 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import pandas as pd
 
@@ -22,7 +24,7 @@ from ..config import settings
 from ..models.database import SQLiteConnectionPool, get_pool
 from ..utils.file_utils import compute_file_hash
 from ..utils.retry import with_retry
-from . import artifact_store
+from . import artifact_store, near_duplicates
 from .chunk_enrichment import ChunkEnrichmentService
 from .chunking import (
     EmbeddingSemanticChunker,
@@ -53,6 +55,15 @@ from .document_progress import (
     clear_progress,
     set_phase,
     set_wiki_pending,
+)
+from .embedding_cache import (
+    embedding_cache_key,
+)
+from .embedding_cache import (
+    lookup as embedding_cache_lookup,
+)
+from .embedding_cache import (
+    store as embedding_cache_store,
 )
 from .embeddings import EmbeddingService
 from .image_processor import ImageProcessingResult, process_image
@@ -116,6 +127,47 @@ def _compile_generation(file_hash: str) -> tuple[str, str]:
     )
     parser_fingerprint = f"{DEFAULT_PARSER_NAME}:{_parser_version()}"
     return generation_hash, parser_fingerprint
+
+
+# ── Per-file retry coordination (issue #513 W15) ────────────────────────────
+# Module-level so concurrent retry_failed_chunks calls for the SAME file
+# serialize even when issued through different DocumentProcessor instances
+# (route handler + background worker). Reference-counted: an entry is created
+# on first use and pruned once no coroutine holds it, so the registry cannot
+# grow unboundedly and a fresh asyncio.Lock is created per usage burst (locks
+# bind to one event loop; pruning avoids cross-loop reuse across sequential
+# event loops, e.g. repeated asyncio.run in tests).
+_retry_locks: Dict[int, asyncio.Lock] = {}
+_retry_lock_holders: Dict[int, int] = {}
+# A plain threading.Lock (not asyncio) guards the registry: the critical
+# sections contain no await and must be usable from any event loop.
+_retry_locks_guard = threading.Lock()
+
+
+@asynccontextmanager
+async def _per_file_retry_lock(file_id: int) -> Iterator[None]:
+    """Serialize chunk-retry work per file; prune the lock when unreferenced."""
+    with _retry_locks_guard:
+        lock = _retry_locks.get(file_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _retry_locks[file_id] = lock
+        _retry_lock_holders[file_id] = _retry_lock_holders.get(file_id, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        with _retry_locks_guard:
+            remaining = _retry_lock_holders.get(file_id, 0) - 1
+            if remaining <= 0:
+                _retry_lock_holders.pop(file_id, None)
+                # Prune only when this is still the registered entry and no
+                # holder remains; waiters keep the entry alive via the holder
+                # count they took on entry.
+                if _retry_locks.get(file_id) is lock:
+                    del _retry_locks[file_id]
+            else:
+                _retry_lock_holders[file_id] = remaining
 
 
 def is_enrichment_enabled_for_vault(vault_id: Optional[int]) -> bool:
@@ -533,13 +585,19 @@ class SpreadsheetParser:
 
         try:
             if ext == ".csv":
-                # Single-sheet: wrap in dict to unify the loop below
-                df = pd.read_csv(file_path, dtype=str).fillna("")
+                # Single-sheet: wrap in dict to unify the loop below.
+                # keep_default_na=False (issue #513 W3): pandas' default NA-token
+                # coercion turns literal cell strings like "NA"/"N/A"/"NULL" into
+                # NaN, which ``.fillna("")`` then empties and the non-empty cell
+                # filter drops — destroying literal text. With the flag, empties
+                # stay "" and every literal value round-trips.
+                df = pd.read_csv(file_path, dtype=str, keep_default_na=False).fillna("")
                 sheets: dict = {"Sheet1": df}
             elif ext in {".xls", ".xlsx"}:
                 xf = pd.ExcelFile(file_path)
+                # Same NA-preservation rationale as the CSV branch (issue #513 W3).
                 sheets = {
-                    name: xf.parse(name, dtype=str).fillna("")
+                    name: xf.parse(name, dtype=str, keep_default_na=False).fillna("")
                     for name in xf.sheet_names
                 }
             else:
@@ -716,6 +774,29 @@ class DocumentProcessor:
         self._contextual_chunker = None
         self._chunk_enrichment_service = None
 
+    @asynccontextmanager
+    async def _write_session(self) -> Iterator[sqlite3.Connection]:
+        """Yield a pooled connection under the shared SQLite write permit.
+
+        Single safe pattern for every status/commit write (issue #513 W1 /
+        RC-3): the permit is acquired FIRST, but the fallible pool checkout
+        happens INSIDE the region protected by the permit's finally, so a
+        ``get_connection`` failure (RuntimeError on exhaustion/closed pool)
+        can never leak the permit. The connection is released in a nested
+        finally before the permit is released in the outer finally.
+        """
+        if self._write_semaphore:
+            await self._write_semaphore.acquire()
+        try:
+            conn = self.pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self.pool.release_connection(conn)
+        finally:
+            if self._write_semaphore:
+                self._write_semaphore.release()
+
     def _get_chunker(self) -> "SemanticChunker | EmbeddingSemanticChunker":
         """Return a chunker configured with the live settings values.
 
@@ -729,8 +810,19 @@ class DocumentProcessor:
         service; falls back to title-based chunking with a warning when none is
         available), while the default 'title' keeps the existing behavior.
         """
-        size = settings.chunk_size_chars or self._chunk_size_fallback
-        overlap = settings.chunk_overlap_chars or self._chunk_overlap_fallback
+        # ``is not None`` guards (issue #513 W4): an explicitly configured zero
+        # is a VALUE, not "unset" — ``or``-fallbacks silently swallowed
+        # chunk_overlap_chars=0 (falsy-zero fallthrough).
+        size = (
+            settings.chunk_size_chars
+            if settings.chunk_size_chars is not None
+            else self._chunk_size_fallback
+        )
+        overlap = (
+            settings.chunk_overlap_chars
+            if settings.chunk_overlap_chars is not None
+            else self._chunk_overlap_fallback
+        )
         if settings.semantic_chunking_strategy == "embedding":
             if self.embedding_service is None:
                 logger.warning(
@@ -836,15 +928,89 @@ class DocumentProcessor:
             )
         return self._chunk_enrichment_service
 
-    async def _verify_vector_rows_visible(self, file_id: int) -> None:
-        """Ensure a vector-enabled ingest has visible LanceDB rows before indexing."""
+    async def _verify_vector_rows_visible(
+        self, file_id: int, vector_target: object | None = None
+    ) -> None:
+        """Ensure a vector-enabled ingest has visible LanceDB rows before indexing.
+
+        ``vector_target`` (issue #513 W13) optionally scopes the visibility
+        check to a dimension-rebuild target table instead of the live index.
+        """
         if self.vector_store is None:
             return
 
-        visible_rows = await self.vector_store.count_by_file(str(file_id))
+        if vector_target is not None:
+            visible_rows = await self.vector_store.count_by_file(
+                str(file_id), target=vector_target
+            )
+        else:
+            visible_rows = await self.vector_store.count_by_file(str(file_id))
         if visible_rows <= 0:
             raise DocumentProcessingError(
                 f"Vector store visibility check failed: file_id={file_id} has zero LanceDB rows"
+            )
+
+    async def _maybe_begin_dimension_rebuild(self, embedding_dim: int) -> object | None:
+        """Bare-call dimension auto-migration probe (issue #513 AC9 / INGEST-010).
+
+        When this ingest call carries no explicit ``vector_target`` and the
+        live vector table exists at a DIFFERENT embedding dimension, open a
+        dimension-rebuild handle so the caller can route every vector
+        operation into the rebuild temp table: the incompatible live index is
+        replaced by a validated atomic swap only on success and stays fully
+        intact when anything fails. Returns None (previous behavior, byte for
+        byte) when the dimensions match, when the store does not expose the
+        rebuild API (test doubles, alternative backends), or when no live
+        table exists yet.
+        """
+        if self.vector_store is None:
+            return None
+        get_live_dim = getattr(self.vector_store, "get_live_embedding_dim", None)
+        begin_rebuild = getattr(self.vector_store, "begin_dimension_rebuild", None)
+        if get_live_dim is None or begin_rebuild is None:
+            return None
+        try:
+            live_dim = await get_live_dim()
+        except Exception:  # noqa: BLE001 - probe must never fail the ingest
+            logger.warning(
+                "Live embedding-dimension probe failed for dim=%s; proceeding "
+                "without auto-migration",
+                embedding_dim,
+                exc_info=True,
+            )
+            return None
+        if live_dim is None or int(live_dim) == int(embedding_dim):
+            return None
+        handle = await begin_rebuild(embedding_dim)
+        logger.info(
+            "Embedding dimension %d != live table dimension %s — routing this "
+            "ingest into dimension-rebuild table '%s' (live index untouched "
+            "until commit; issue #513 AC9)",
+            embedding_dim,
+            live_dim,
+            getattr(handle, "table_name", "?"),
+        )
+        return handle
+
+    async def _abort_dimension_rebuild_quietly(self, handle: object) -> None:
+        """Best-effort abort of an auto-opened dimension rebuild after failure.
+
+        The original ingest error is always the one surfaced to the caller;
+        a failing abort only logs (the temp table — never the live index —
+        may survive and is dropped by the next ``begin_dimension_rebuild``).
+        """
+        abort_rebuild = getattr(self.vector_store, "abort_dimension_rebuild", None)
+        if abort_rebuild is None or handle is None:
+            return
+        try:
+            await abort_rebuild(handle)
+        except Exception:  # noqa: BLE001 - cleanup must not mask the real error
+            logger.warning(
+                "Aborting the dimension rebuild after an ingest failure "
+                "failed; the rebuild temp table may remain (the live index "
+                "is untouched and the temp table is dropped by the next "
+                "begin_dimension_rebuild)",
+                exc_info=True,
             )
 
     @staticmethod
@@ -1274,26 +1440,108 @@ class DocumentProcessor:
 
         Returns a summary dict: {retried, succeeded, still_failing,
         failed_chunk_indices}. Raises ``ValueError`` when the file is not in a
-        retryable state (status != 'indexed') so the caller can map to 409.
-        [C1.2, C1.3, C1.4, N1, N3]
+        retryable state (status not 'indexed'/'partial') so the caller can map
+        to 409. [C1.2, C1.3, C1.4, N1, N3] 'partial' must stay eligible: the
+        upload/reindex path (``process_existing_file``) lands below-threshold
+        partial failures in status 'partial' with failed_chunks rows (frozen
+        C27), and stranding those rows behind a 409 would defeat the
+        chunk-scoped recovery this issue exists to provide.
+
+        Concurrency (issue #513 W15): retries for the same file serialize on a
+        module-level per-file lock, so a concurrent double-retry recovers each
+        vector exactly once and increments chunk_count exactly once. Accounting
+        is authoritative: after the reconciliation/vector write, chunk_count is
+        taken from the vector store's live count for the file when a count API
+        exists, otherwise derived from the rows actually cleared/written —
+        repeated retries are no-ops.
+
+        Stale-generation suppression (issue #513 W16): immediately before the
+        vector write the file row is re-read; if the generation identity
+        (file_hash / active_generation_hash), the row itself, or retry
+        eligibility changed while this retry awaited the embedder, nothing is
+        written and no counter is mutated (truthful no-op outcome).
         """
         if self.embedding_service is None or self.vector_store is None:
             raise RuntimeError("Embedding service or vector store unavailable")
 
+        async with _per_file_retry_lock(file_id):
+            return await self._retry_failed_chunks_locked(file_id)
+
+    def _retry_staleness_reason(
+        self, file_id: int, file_hash: str, generation_hash: Optional[str]
+    ) -> Optional[str]:
+        """Re-read the file row; return why a pending retry write is stale, or None.
+
+        The re-read happens after every await that precedes the vector write
+        (embed loop), so a newer generation that completed meanwhile suppresses
+        this retry's publication entirely (issue #513 W16 / C15).
+        """
+        conn = self.pool.get_connection()
+        try:
+            current = conn.execute(
+                "SELECT file_hash, status, active_generation_hash FROM files "
+                "WHERE id = ?",
+                (file_id,),
+            ).fetchone()
+        finally:
+            self.pool.release_connection(conn)
+
+        if current is None:
+            return "file row no longer exists"
+        current_hash = str(current["file_hash"] or "")
+        current_status = str(current["status"] or "")
+        current_generation = current["active_generation_hash"]
+        if current_hash != file_hash:
+            return (
+                f"file_hash changed mid-retry ({file_hash[:8]}… -> "
+                f"{current_hash[:8]}…); a newer generation owns the file"
+            )
+        if current_generation != generation_hash:
+            return "active_generation_hash changed mid-retry"
+        if current_status not in ("indexed", "partial"):
+            return f"status '{current_status}' is no longer retry-eligible"
+        return None
+
+    async def _live_vector_count(self, file_id: int) -> Optional[int]:
+        """Live vector count for a file, or None when unavailable (W15).
+
+        Uses the vector store's count API when it exists; any failure logs a
+        warning and returns None so the caller falls back to the derived count
+        (non-fatal, plan W15 edge case).
+        """
+        count_fn = getattr(self.vector_store, "count_by_file", None)
+        if count_fn is None:
+            return None
+        try:
+            return int(await count_fn(str(file_id)))
+        except Exception:  # noqa: BLE001 - count is an optimization, not a gate
+            logger.warning(
+                "Vector count after chunk retry failed for file_id=%s; "
+                "falling back to the derived chunk_count",
+                file_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _retry_failed_chunks_locked(self, file_id: int) -> Dict[str, Any]:
         conn = self.pool.get_connection()
         try:
             row = conn.execute(
-                "SELECT id, vault_id, file_hash, status, chunks_failed FROM files WHERE id = ?",
+                "SELECT id, vault_id, file_hash, status, chunks_failed, "
+                "chunk_count, active_generation_hash FROM files WHERE id = ?",
                 (file_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"File {file_id} not found")
-            if row["status"] != "indexed":
+            if row["status"] not in ("indexed", "partial"):
                 raise ValueError(
-                    f"File {file_id} status is '{row['status']}', must be 'indexed'"
+                    f"File {file_id} status is '{row['status']}', must be "
+                    "'indexed' or 'partial'"
                 )
             vault_id = int(row["vault_id"])
             file_hash = str(row["file_hash"] or "")
+            generation_hash = row["active_generation_hash"]
+            previous_chunk_count = row["chunk_count"] or 0
 
             stored_rows = conn.execute(
                 "SELECT id, chunk_index, chunk_text, chunk_metadata, attempts "
@@ -1357,11 +1605,38 @@ class DocumentProcessor:
             records.append(record)
             succeeded_row_ids.append(int(srow["id"]))
 
-        # [N3] LanceDB write FIRST (not transactional with SQLite), then SQLite
-        # cleanup in its own try/except. On SQLite failure the next retry's
-        # pre-check reconciles already-indexed chunks.
+        # [W16] Generation guard AFTER the embedding awaits, immediately before
+        # the vector write: a newer generation that completed while this retry
+        # was parked mid-await must see ZERO publication from the old one.
         if records:
+            stale_reason = self._retry_staleness_reason(
+                file_id, file_hash, generation_hash
+            )
+            if stale_reason is not None:
+                logger.info(
+                    "Suppressing stale chunk retry for file_id=%s: %s "
+                    "(nothing written, no counters mutated)",
+                    file_id,
+                    stale_reason,
+                )
+                return {
+                    "retried": len(to_embed),
+                    "succeeded": 0,
+                    "still_failing": 0,
+                    "failed_chunk_indices": [],
+                    "skipped_stale_generation": True,
+                }
+            # [N3] LanceDB write FIRST (not transactional with SQLite), then
+            # SQLite cleanup in its own try/except. On SQLite failure the next
+            # retry's pre-check reconciles already-indexed chunks.
             await self.vector_store.add_chunks(records)
+
+        # [W15] Authoritative chunk_count: prefer the store's live count when a
+        # count API exists (computed BEFORE opening the cleanup connection so
+        # no pooled connection is held across the vector-store await).
+        live_count: Optional[int] = None
+        if records or already_indexed_ids:
+            live_count = await self._live_vector_count(file_id)
 
         conn = self.pool.get_connection()
         try:
@@ -1378,13 +1653,36 @@ class DocumentProcessor:
                     "WHERE id = ?",
                     (reason, row_id),
                 )
-            conn.execute(
-                "UPDATE files SET chunks_failed = "
-                "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
-                "chunk_count = chunk_count + ? "
-                "WHERE id = ?",
-                (file_id, len(records), file_id),
-            )
+            if records or already_indexed_ids:
+                if live_count is None:
+                    # Derived from the ACTUAL rows cleared/written by this
+                    # attempt: cleared rows are (reconciled + written) vectors
+                    # that are now live but were never counted (they had failed
+                    # embedding), so the derived count converges to the same
+                    # value the live count would report.
+                    live_count = (
+                        previous_chunk_count
+                        + len(already_indexed_ids)
+                        + len(records)
+                    )
+                conn.execute(
+                    "UPDATE files SET chunks_failed = "
+                    "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
+                    "partial_embeddings = (SELECT CASE WHEN COUNT(*) > 0 "
+                    "THEN 1 ELSE 0 END FROM failed_chunks WHERE file_id = ?), "
+                    "chunk_count = ? "
+                    "WHERE id = ?",
+                    (file_id, file_id, int(live_count), file_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE files SET chunks_failed = "
+                    "(SELECT COUNT(*) FROM failed_chunks WHERE file_id = ?), "
+                    "partial_embeddings = (SELECT CASE WHEN COUNT(*) > 0 "
+                    "THEN 1 ELSE 0 END FROM failed_chunks WHERE file_id = ?) "
+                    "WHERE id = ?",
+                    (file_id, file_id, file_id),
+                )
             conn.commit()
         except sqlite3.Error:
             conn.rollback()
@@ -1439,6 +1737,90 @@ class DocumentProcessor:
             and self.vector_store is not None
             and self._select_chunks_for_enrichment(chunks)
         )
+
+    def _embedding_cache_identity(self) -> Tuple[str, str, str, int]:
+        """Immutable embedding-contract identity for cache keys (issue #513 W24).
+
+        Returns (model_id, model_revision, doc_prefix, dim). Model identity and
+        the effective document prefix come from the embedding service when it
+        exposes them (its properties read live settings), otherwise directly
+        from settings; the revision component additionally binds the concrete
+        embedder implementation (class identity + provider mode) so swapping
+        the embedder invalidates cached vectors. Deterministic for a given
+        service/settings state — required for cross-run cache hits; any change
+        to any component changes the key (invalidation by construction).
+        """
+        service = self.embedding_service
+        model_id = str(
+            getattr(service, "embedding_model", None) or settings.embedding_model
+        )
+        try:
+            provider_mode = str(getattr(service, "provider_mode", "") or "")
+        except Exception:  # noqa: BLE001 - identity must never fail the embed path
+            provider_mode = ""
+        model_revision = f"{type(service).__name__}:{provider_mode}"
+        prefix_obj = getattr(service, "embedding_doc_prefix", None)
+        doc_prefix = (
+            str(prefix_obj)
+            if prefix_obj is not None
+            else str(settings.embedding_doc_prefix or "")
+        )
+        try:
+            dim = int(
+                getattr(service, "embedding_dim", None) or settings.embedding_dim
+            )
+        except (TypeError, ValueError):
+            dim = int(settings.embedding_dim)
+        return model_id, model_revision, doc_prefix, dim
+
+    async def _embed_with_cache(
+        self, texts: List[str]
+    ) -> List[List[float]]:
+        """Embed texts through the persistent embedding cache (issue #513 W24).
+
+        Cache hits (byte-identical text under the same immutable embedding
+        contract) reuse the stored vector and skip the provider entirely — an
+        enrichment-only retry over unchanged text performs ZERO provider embeds
+        (C32). Only misses are sent to ``embed_batch(fail_fast=False)`` and the
+        successful vectors are stored back. Error semantics match the previous
+        uncached call: a batch failure or an embedding-count mismatch raises
+        ``DocumentProcessingError``.
+        """
+        model_id, model_revision, doc_prefix, dim = self._embedding_cache_identity()
+        keys = [
+            embedding_cache_key(model_id, model_revision, doc_prefix, dim, text)
+            for text in texts
+        ]
+        cached = embedding_cache_lookup(keys)
+        embeddings: List[Optional[List[float]]] = [cached.get(key) for key in keys]
+        miss_positions = [i for i, emb in enumerate(embeddings) if emb is None]
+        if miss_positions:
+            miss_texts = [texts[i] for i in miss_positions]
+            embeddings_result = await self.embedding_service.embed_batch(
+                miss_texts, fail_fast=False
+            )
+            miss_embeddings, failed_batch_indices = embeddings_result
+            if failed_batch_indices:
+                raise DocumentProcessingError(
+                    f"Embedding failed for enriched chunks: batches {failed_batch_indices}"
+                )
+            if len(miss_embeddings) != len(miss_texts):
+                raise DocumentProcessingError(
+                    f"Enriched embedding count mismatch: expected {len(miss_texts)}, got {len(miss_embeddings)}"
+                )
+            stored: List[Tuple[str, List[float]]] = []
+            for i, emb in zip(miss_positions, miss_embeddings):
+                if emb is None:
+                    continue
+                embeddings[i] = emb
+                stored.append((keys[i], emb))
+            embedding_cache_store(stored)
+        missing = sum(1 for emb in embeddings if emb is None)
+        if missing:
+            raise DocumentProcessingError(
+                f"Enriched embedding count mismatch: expected {len(texts)}, got {len(texts) - missing}"
+            )
+        return embeddings  # type: ignore[return-value]  # no None members past the guard
 
     async def run_enrichment_job(
         self,
@@ -1495,14 +1877,10 @@ class DocumentProcessor:
                 for chunk in chunks
             ]
             self._validate_chunk_sizes(enrichment_texts, source_filename)
-            embeddings_result = await self.embedding_service.embed_batch(
-                enrichment_texts, fail_fast=False
-            )
-            embeddings, failed_batch_indices = embeddings_result
-            if failed_batch_indices:
-                raise DocumentProcessingError(
-                    f"Embedding failed for enriched chunks: batches {failed_batch_indices}"
-                )
+            # [W24] Persistent embedding reuse: byte-identical texts under the
+            # same immutable embedding contract are served from the disk-backed
+            # cache; only misses hit the provider (issue #513 C32).
+            embeddings = await self._embed_with_cache(enrichment_texts)
             if len(embeddings) != len(chunks):
                 raise DocumentProcessingError(
                     f"Enriched embedding count mismatch: expected {len(chunks)}, got {len(embeddings)}"
@@ -1737,30 +2115,47 @@ class DocumentProcessor:
         chunk_count: Optional[int] = None,
         error_message: Optional[str] = None,
         chunks_failed: int = 0,
+        partial_embeddings: Optional[int] = None,
     ) -> None:
         """
         Update the processing status of a file.
 
         Args:
             file_id: The database ID of the file
-            status: New status ('pending', 'processing', 'indexed', 'error')
+            status: New status ('pending', 'processing', 'indexed', 'partial',
+                'error') — success-family callers pass 'indexed' (both paths,
+                full success) or 'partial' (upload path, partial success)
             conn: Database connection
             chunk_count: Number of chunks produced (optional)
             error_message: Error message if status is 'error' (optional)
             chunks_failed: Chunks dropped due to embedding failures (Issue #221)
+            partial_embeddings: 1 when this success had chunks_failed > 0
+                (partial content indexed), else 0 (issue #513 AC27). Only
+                meaningful for success-family statuses; None leaves the column
+                untouched.
 
         Note:
             This method does not commit - caller is responsible for transaction management.
         """
         now = datetime.now(UTC).isoformat()
 
-        if status == "indexed":
+        if status in ("indexed", "partial"):
+            # Success-family transitions (issue #513 W9/W14/AC27): full
+            # success lands in 'indexed'; a partial success (some chunks
+            # failed embedding, retrievable content exists) is 'indexed' +
+            # partial_embeddings=1 on the scan/sync path (frozen C6) or
+            # 'partial' on the upload/reindex path (frozen C27). Both write
+            # the truthful chunk accounting and the marker, and CLEAR the
+            # attempt-scoped error_message so a historical failure never
+            # persists on a successful status.
+            marker = partial_embeddings if partial_embeddings is not None else 0
             conn.execute(
                 """UPDATE files
                    SET status = ?, chunk_count = ?, chunks_failed = ?,
+                       partial_embeddings = ?, error_message = NULL,
                        processed_at = ?, modified_at = ?
                    WHERE id = ?""",
-                (status, chunk_count, chunks_failed, now, now, file_id),
+                (status, chunk_count, chunks_failed, int(marker), now, now, file_id),
             )
         elif status == "error":
             conn.execute(
@@ -2364,6 +2759,144 @@ class DocumentProcessor:
                 _add_elapsed_ms(stage_timings, "chunk_ms", chunk_started_at)
             return chunks, document_text, parsed
 
+    async def _finalize_indexed_success(
+        self,
+        *,
+        file_id: int,
+        vault_id: int,
+        chunks: List[ProcessedChunk],
+        document_text: str,
+        chunks_failed_count: int,
+        embeddings: Optional[List[List[float]]] = None,
+        partial_final_status: str = "indexed",
+    ) -> None:
+        """Shared success finalization for BOTH ingest entry points (W9).
+
+        ``process_file`` and ``process_existing_file`` converge here with
+        identical semantics (issue #513 C26): the final status write, the
+        truthful partial marker ``partial_embeddings = 1`` when any chunk
+        failed embedding this attempt else ``0`` (W14/AC27), parsed_text
+        persistence + the gated wiki compile enqueue, the gated KMS compile
+        enqueue, the advisory near-duplicate centroid recording (W26, strictly
+        AFTER the final status commit), and progress cleanup. Success-family
+        writes always CLEAR the attempt-scoped error_message (AC27 clause 2).
+
+        The one intentional per-entry-point difference is the terminal status
+        of a PARTIAL success (frozen-check reconciliation, issue #513 C6 vs
+        C27): ``process_file`` (scan/sync path) pins ``'indexed'`` — its
+        partial state is flagged via ``partial_embeddings`` (frozen C6
+        asserts 'indexed' after a below-threshold embed failure). The default
+        ``partial_final_status='indexed'`` encodes that contract;
+        ``process_existing_file`` (upload/reindex path) passes ``'partial'``
+        because frozen C27 requires the upload-path row to be distinguishable
+        from full success by status alone. Full success is ``'indexed'`` on
+        both paths (frozen C26 convergence).
+        """
+        final_status = (
+            partial_final_status if chunks_failed_count > 0 else "indexed"
+        )
+        async with self._write_session() as conn:
+            self._update_status(
+                file_id,
+                final_status,
+                conn,
+                chunk_count=len(chunks),
+                chunks_failed=chunks_failed_count,
+                partial_embeddings=1 if chunks_failed_count > 0 else 0,
+            )
+            conn.commit()
+
+        # Save full parsed text and enqueue wiki compile job (fire-and-forget;
+        # non-blocking). parsed_text is stored on the files row so manual
+        # recompile can use it without re-parsing the original file.
+        try:
+            from app.services.wiki_store import WikiStore as _WikiStore
+
+            _full_text = document_text or ""
+            async with self._write_session() as conn:
+                if _full_text:
+                    conn.execute(
+                        "UPDATE files SET parsed_text = ? WHERE id = ?",
+                        (_full_text, file_id),
+                    )
+                    conn.commit()
+                # Mark wiki_pending=1 synchronously BEFORE the wiki job is created
+                # so the status route can report wiki_status="pending" during the
+                # brief window before the wiki_compile_jobs row exists.
+                set_wiki_pending(self.pool, file_id, True)
+                if settings.wiki_enabled and settings.wiki_compile_on_ingest:
+                    _WikiStore(conn).create_job(
+                        vault_id=vault_id,
+                        trigger_type="ingest",
+                        trigger_id=f"file:{file_id}",
+                        input_json={"file_id": file_id, "vault_id": vault_id},
+                    )
+                # Always clear the transient marker after the decision is made,
+                # regardless of whether a job row was created.
+                set_wiki_pending(self.pool, file_id, False)
+        except Exception as _wiki_exc:
+            logger.warning(
+                "Failed to enqueue wiki ingest job for file_id=%d: %s",
+                file_id,
+                _wiki_exc,
+            )
+            # If wiki enqueue failed, don't leave wiki_pending=1 hanging.
+            set_wiki_pending(self.pool, file_id, False)
+
+        # Enqueue a KMS compile job so the document becomes a user-curatable,
+        # full-text-searchable KMS entry. Independent of the wiki pipeline and
+        # gated by the kms_enabled / kms_compile_on_ingest flags.
+        try:
+            from app.config import settings as _settings
+
+            if _settings.kms_enabled and _settings.kms_compile_on_ingest:
+                from app.services.kms_store import KMSStore as _KMSStore
+
+                async with self._write_session() as conn:
+                    _KMSStore(conn).create_job(
+                        vault_id=vault_id,
+                        trigger_type="ingest",
+                        trigger_id=f"file:{file_id}",
+                        input_json={"file_id": file_id, "vault_id": vault_id},
+                    )
+        except Exception as _kms_exc:
+            logger.warning(
+                "Failed to enqueue KMS ingest job for file_id=%d: %s",
+                file_id,
+                _kms_exc,
+            )
+
+        # [W26] Advisory near-duplicate centroid: computed from THIS
+        # generation's chunk embeddings (already in memory — no re-embedding)
+        # and recorded only after the final status commit succeeded, so a
+        # failing ingest never leaves an orphan centroid row and re-ingest
+        # replaces the row idempotently. Advisory and never fatal: skipped
+        # silently when no embeddings are in scope (e.g. record-only ingests).
+        # The file's full text is passed so pre-existing vault documents that
+        # pre-date centroid recording can join the advisory group via the
+        # deterministic text-fingerprint fallback (issue #513 C25).
+        if embeddings:
+            try:
+                async with self._write_session() as conn:
+                    near_duplicates.record_file_centroid(
+                        conn,
+                        vault_id,
+                        file_id,
+                        embeddings,
+                        document_text=document_text or None,
+                    )
+            except Exception:  # noqa: BLE001 - advisory only, never fails ingest
+                logger.warning(
+                    "Near-duplicate centroid recording skipped for file_id=%d "
+                    "(advisory only; ingest unaffected)",
+                    file_id,
+                    exc_info=True,
+                )
+
+        # Clear transient progress fields and pin phase=indexed so polls show
+        # a clean "ready" snapshot rather than stale embedding counters.
+        clear_progress(self.pool, file_id)
+
     async def process_file(
         self,
         file_path: str,
@@ -2403,10 +2936,7 @@ class DocumentProcessor:
         stage_timings = _new_stage_timings()
 
         # Phase 1: Quick DB operations - get connection, do quick ops, release
-        if self._write_semaphore:
-            await self._write_semaphore.acquire()
-        conn = self.pool.get_connection()
-        try:
+        async with self._write_session() as conn:
             # Check for duplicates
             duplicate = self._check_duplicate(file_hash, conn, vault_id)
             if duplicate:
@@ -2431,11 +2961,6 @@ class DocumentProcessor:
             # (Issue #396). Idempotent re-ingest must not accumulate stale rows.
             conn.execute("DELETE FROM failed_chunks WHERE file_id = ?", (file_id,))
             conn.commit()
-        finally:
-            # Release connection before long-running operations
-            self.pool.release_connection(conn)
-            if self._write_semaphore:
-                self._write_semaphore.release()
 
         # Mark processing started + initial phase. Best-effort; ignored on failure.
         set_phase(
@@ -2576,6 +3101,9 @@ class DocumentProcessor:
             # Chunks dropped due to partial embedding failures (Issue #221);
             # persisted to files.chunks_failed when the document is indexed.
             chunks_failed_count = 0
+            # This generation's chunk embeddings, kept in scope for the
+            # finalization helper's advisory centroid computation (W26).
+            chunk_embeddings: List[List[float]] = []
 
             # Generate embeddings and store in vector store
             if self.embedding_service is not None and self.vector_store is not None:
@@ -2617,15 +3145,19 @@ class DocumentProcessor:
                     _add_elapsed_ms(stage_timings, "embedding_ms", stage_started_at)
                     batch_embeddings, failed_batch_indices = embeddings_result
 
-                    # Handle partial embedding failures
-                    if failed_batch_indices:
-                        batch_size_val = settings.embedding_batch_size
-                        failed_chunk_indices = set()
-                        for batch_idx in failed_batch_indices:
-                            start = batch_idx * batch_size_val
-                            end = min(start + batch_size_val, len(chunks))
-                            for idx in range(start, end):
-                                failed_chunk_indices.add(idx)
+                    # Handle partial embedding failures. [W10] The failed TEXT
+                    # positions are derived from the per-text None placeholders
+                    # in batch_embeddings — a stable contract that identifies
+                    # exactly the failed texts regardless of how the provider
+                    # batched them (never from failed_batch_indices × a
+                    # re-read batch-size setting, which desyncs when the
+                    # setting changes mid-flight).
+                    if failed_batch_indices or any(
+                        emb is None for emb in batch_embeddings
+                    ):
+                        failed_chunk_indices = {
+                            i for i, emb in enumerate(batch_embeddings) if emb is None
+                        }
 
                         kept_chunks = []
                         kept_embeddings = []
@@ -2703,6 +3235,7 @@ class DocumentProcessor:
                             )
                     else:
                         embeddings = batch_embeddings
+                    chunk_embeddings = embeddings
 
                     sparse_embeddings = [None] * len(chunks)
                     set_phase(
@@ -2804,16 +3337,9 @@ class DocumentProcessor:
         except Exception as e:
             # Phase 3: Update status to error on failure
             # Get connection again to update error status
-            if self._write_semaphore:
-                await self._write_semaphore.acquire()
-            conn = self.pool.get_connection()
-            try:
+            async with self._write_session() as conn:
                 self._update_status(file_id, "error", conn, error_message=str(e))
                 conn.commit()
-            finally:
-                self.pool.release_connection(conn)
-                if self._write_semaphore:
-                    self._write_semaphore.release()
             # Surface error in the phase fields so the frontend can render it
             # without waiting for a status-route round-trip.
             set_phase(
@@ -2825,94 +3351,20 @@ class DocumentProcessor:
             )
             raise
 
-        # Phase 3: Final DB operations - update status to indexed
+        # Phase 3: Final DB operations - shared success finalization (status
+        # write incl. the partial_embeddings marker, parsed_text + gated wiki
+        # enqueue, gated KMS
+        # enqueue, near-dup centroid, progress cleanup). Both ingest entry
+        # points converge here with identical semantics (issue #513 W9/C26).
         stage_started_at = time.monotonic()
-        if self._write_semaphore:
-            await self._write_semaphore.acquire()
-        conn = self.pool.get_connection()
-        try:
-            self._update_status(
-                file_id,
-                "indexed",
-                conn,
-                chunk_count=len(chunks),
-                chunks_failed=chunks_failed_count,
-            )
-            conn.commit()
-        finally:
-            self.pool.release_connection(conn)
-            if self._write_semaphore:
-                self._write_semaphore.release()
-
-        # Save full parsed text and enqueue wiki compile job (fire-and-forget; non-blocking).
-        # parsed_text is stored on the files row so manual recompile can use it without
-        # re-parsing the original file.
-        try:
-            from app.services.wiki_store import WikiStore as _WikiStore
-
-            _full_text = document_text or ""
-            if self._write_semaphore:
-                await self._write_semaphore.acquire()
-            conn = self.pool.get_connection()
-            try:
-                if _full_text:
-                    conn.execute(
-                        "UPDATE files SET parsed_text = ? WHERE id = ?",
-                        (_full_text, file_id),
-                    )
-                    conn.commit()
-                # Mark wiki_pending=1 synchronously BEFORE the wiki job is created
-                # so the status route can report wiki_status="pending" during the
-                # brief window before the wiki_compile_jobs row exists.
-                set_wiki_pending(self.pool, file_id, True)
-                if settings.wiki_enabled and settings.wiki_compile_on_ingest:
-                    _WikiStore(conn).create_job(
-                        vault_id=vault_id,
-                        trigger_type="ingest",
-                        trigger_id=f"file:{file_id}",
-                        input_json={"file_id": file_id, "vault_id": vault_id},
-                    )
-                # Always clear the transient marker after the decision is made,
-                # regardless of whether a job row was created.
-                set_wiki_pending(self.pool, file_id, False)
-            finally:
-                self.pool.release_connection(conn)
-                if self._write_semaphore:
-                    self._write_semaphore.release()
-        except Exception as _wiki_exc:
-            logger.warning("Failed to enqueue wiki ingest job for file_id=%d: %s", file_id, _wiki_exc)
-            # If wiki enqueue failed, don't leave wiki_pending=1 hanging.
-            set_wiki_pending(self.pool, file_id, False)
-
-        # Enqueue a KMS compile job so the document becomes a user-curatable,
-        # full-text-searchable KMS entry. Independent of the wiki pipeline and
-        # gated by the kms_enabled / kms_compile_on_ingest flags.
-        try:
-            from app.config import settings as _settings
-
-            if _settings.kms_enabled and _settings.kms_compile_on_ingest:
-                from app.services.kms_store import KMSStore as _KMSStore
-
-                if self._write_semaphore:
-                    await self._write_semaphore.acquire()
-                conn = self.pool.get_connection()
-                try:
-                    _KMSStore(conn).create_job(
-                        vault_id=vault_id,
-                        trigger_type="ingest",
-                        trigger_id=f"file:{file_id}",
-                        input_json={"file_id": file_id, "vault_id": vault_id},
-                    )
-                finally:
-                    self.pool.release_connection(conn)
-                    if self._write_semaphore:
-                        self._write_semaphore.release()
-        except Exception as _kms_exc:
-            logger.warning("Failed to enqueue KMS ingest job for file_id=%d: %s", file_id, _kms_exc)
-
-        # Clear transient progress fields and pin phase=indexed so polls show
-        # a clean "ready" snapshot rather than stale embedding counters.
-        clear_progress(self.pool, file_id)
+        await self._finalize_indexed_success(
+            file_id=file_id,
+            vault_id=vault_id,
+            chunks=chunks,
+            document_text=document_text,
+            chunks_failed_count=chunks_failed_count,
+            embeddings=chunk_embeddings,
+        )
         _add_elapsed_ms(stage_timings, "sqlite_finalize_ms", stage_started_at)
 
         logger.info(
@@ -2946,6 +3398,9 @@ class DocumentProcessor:
         file_id: int,
         file_path: str,
         vault_id: int,
+        *,
+        file_hash: Optional[str] = None,
+        vector_target: object | None = None,
     ) -> ProcessedDocument:
         """Process a file whose `files` row already exists.
 
@@ -2955,6 +3410,26 @@ class DocumentProcessor:
         ``process_file`` to avoid re-running the duplicate check or
         creating a second row.
 
+        Args:
+            file_id: Existing ``files`` row id.
+            file_path: Path of the file to process.
+            vault_id: Owning vault.
+            file_hash: Content hash computed by the caller (the upload route
+                already hashes the bytes for dedup). When provided it is used
+                as-is — the single content hash per upload feeds dedup,
+                storage, and chunk identity (issue #513 W8/C30). When None
+                (reindex / recovery callers) it is computed here.
+            vector_target: Optional vector-store rebuild target (issue #513
+                W13). When set, every vector-store call below (init_table,
+                add_chunks, delete_*, visibility count) threads it as a
+                trailing ``target=`` argument so a dimension-migrating reindex
+                writes into the rebuild table instead of the live index.
+                When None, a dimension mismatch against the live table is
+                probed after embedding (C9/INGEST-010): on mismatch this call
+                opens its own rebuild handle (auto-migration), commits the
+                atomic swap only if the whole write phase succeeds, and aborts
+                with the prior index untouched on any failure.
+
         Failure semantics match ``process_file``: status -> 'error',
         phase -> 'error', error_message populated. Wiki ingest job is
         enqueued at the end on success (same as ``process_file``).
@@ -2962,10 +3437,7 @@ class DocumentProcessor:
         path = Path(file_path)
         if not path.exists():
             # Surface as error on the existing row so the frontend can render it.
-            if self._write_semaphore:
-                await self._write_semaphore.acquire()
-            conn = self.pool.get_connection()
-            try:
+            async with self._write_session() as conn:
                 self._update_status(
                     file_id,
                     "error",
@@ -2973,10 +3445,6 @@ class DocumentProcessor:
                     error_message=f"File not found: {file_path}",
                 )
                 conn.commit()
-            finally:
-                self.pool.release_connection(conn)
-                if self._write_semaphore:
-                    self._write_semaphore.release()
             set_phase(
                 self.pool,
                 file_id,
@@ -2985,10 +3453,7 @@ class DocumentProcessor:
             )
             raise FileNotFoundError(f"File not found: {file_path}")
         if not path.is_file():
-            if self._write_semaphore:
-                await self._write_semaphore.acquire()
-            conn = self.pool.get_connection()
-            try:
+            async with self._write_session() as conn:
                 self._update_status(
                     file_id,
                     "error",
@@ -2996,10 +3461,6 @@ class DocumentProcessor:
                     error_message=f"Path is not a file: {file_path}",
                 )
                 conn.commit()
-            finally:
-                self.pool.release_connection(conn)
-                if self._write_semaphore:
-                    self._write_semaphore.release()
             set_phase(
                 self.pool,
                 file_id,
@@ -3010,19 +3471,12 @@ class DocumentProcessor:
 
         # Transition status: pending -> processing. Duplicate check intentionally
         # skipped — the route already ran it before inserting the row.
-        if self._write_semaphore:
-            await self._write_semaphore.acquire()
-        conn = self.pool.get_connection()
-        try:
+        async with self._write_session() as conn:
             self._update_status(file_id, "processing", conn)
             # Clear stale failed-chunk records from a prior partial-failure ingest
             # (Issue #396). Idempotent re-ingest must not accumulate stale rows.
             conn.execute("DELETE FROM failed_chunks WHERE file_id = ?", (file_id,))
             conn.commit()
-        finally:
-            self.pool.release_connection(conn)
-            if self._write_semaphore:
-                self._write_semaphore.release()
 
         set_phase(
             self.pool,
@@ -3033,9 +3487,11 @@ class DocumentProcessor:
         )
 
         # The remainder mirrors process_file Phase 2/3 exactly so behavior is
-        # identical to the synchronous path. We re-derive file_hash here for
-        # the safe-reupload chunk-id prefix logic; this is cheap I/O.
-        file_hash = compute_file_hash(file_path)
+        # identical to the synchronous path. [W8] Reuse the caller-provided
+        # content hash when available (single hash per upload); otherwise
+        # re-derive it here for the safe-reupload chunk-id prefix logic.
+        if file_hash is None:
+            file_hash = compute_file_hash(file_path)
         stage_timings = _new_stage_timings()
 
         try:
@@ -3143,6 +3599,9 @@ class DocumentProcessor:
             # Chunks dropped due to partial embedding failures (Issue #221);
             # persisted to files.chunks_failed when the document is indexed.
             chunks_failed_count = 0
+            # This generation's chunk embeddings for the finalization helper's
+            # advisory centroid computation (W26).
+            chunk_embeddings: List[List[float]] = []
 
             if self.embedding_service is not None and self.vector_store is not None:
                 if chunks:
@@ -3173,15 +3632,16 @@ class DocumentProcessor:
                     _add_elapsed_ms(stage_timings, "embedding_ms", stage_started_at)
                     batch_embeddings, failed_batch_indices = embeddings_result
 
-                    # Handle partial embedding failures
-                    if failed_batch_indices:
-                        batch_size_val = settings.embedding_batch_size
-                        failed_chunk_indices = set()
-                        for batch_idx in failed_batch_indices:
-                            start = batch_idx * batch_size_val
-                            end = min(start + batch_size_val, len(chunks))
-                            for idx in range(start, end):
-                                failed_chunk_indices.add(idx)
+                    # Handle partial embedding failures. [W10] Failed TEXT
+                    # positions come from the per-text None placeholders —
+                    # never from failed_batch_indices × a re-read batch-size
+                    # setting (issue #513 C6).
+                    if failed_batch_indices or any(
+                        emb is None for emb in batch_embeddings
+                    ):
+                        failed_chunk_indices = {
+                            i for i, emb in enumerate(batch_embeddings) if emb is None
+                        }
 
                         kept_chunks = []
                         kept_embeddings = []
@@ -3259,6 +3719,7 @@ class DocumentProcessor:
                             )
                     else:
                         embeddings = batch_embeddings
+                    chunk_embeddings = embeddings
 
                     sparse_embeddings = [None] * len(chunks)
                     set_phase(
@@ -3316,48 +3777,112 @@ class DocumentProcessor:
 
                     embedding_dim = len(embeddings[0])
                     stage_started_at = time.monotonic()
-                    await self.vector_store.init_table(embedding_dim)
-                    _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
-
-                    if settings.reupload_safe_order:
-                        vector_timings = await self.vector_store.add_chunks(records)
-                        _merge_vector_timings(stage_timings, vector_timings)
-                        stage_started_at = time.monotonic()
-                        deleted = await self.vector_store.delete_old_generation_by_file(
-                            str(file_id), file_hash[:8]
+                    # [W8/W13 contract] Thread the optional rebuild target into
+                    # every vector-store call below as a trailing ``target=``
+                    # argument (dimension-migrating reindex); omitted entirely
+                    # when None so stores/doubles without the parameter behave
+                    # exactly as before.
+                    # [C9/INGEST-010] Bare-call auto-migration: when this call
+                    # carries NO explicit target, probe the live table's
+                    # dimension now that this file's embeddings are known; on
+                    # mismatch open a rebuild handle so every write below lands
+                    # in the rebuild temp table. The live index is replaced by
+                    # the validated atomic swap only after the whole write
+                    # phase succeeds; any failure aborts the rebuild and
+                    # re-raises with the prior index fully intact.
+                    auto_rebuild_handle = (
+                        await self._maybe_begin_dimension_rebuild(embedding_dim)
+                        if vector_target is None
+                        else None
+                    )
+                    active_target = (
+                        vector_target
+                        if vector_target is not None
+                        else auto_rebuild_handle
+                    )
+                    _target_kwargs = (
+                        {"target": active_target} if active_target is not None else {}
+                    )
+                    try:
+                        if (
+                            auto_rebuild_handle is not None
+                            and not settings.reupload_safe_order
+                        ):
+                            # The delete-first ordering cannot coexist with an
+                            # auto-opened dimension rebuild: deleting this
+                            # file's live old-dimension rows before the
+                            # rebuild commits would destroy the prior index
+                            # the migration must preserve, and the rebuild
+                            # table starts empty so there is nothing to delete
+                            # there. Fail the ingest rather than silently
+                            # performing something other than the configured
+                            # ordering; the abort below leaves the live index
+                            # untouched.
+                            raise DocumentProcessingError(
+                                "Dimension-changing ingest requires the safe "
+                                "re-upload ordering (reupload_safe_order): the "
+                                "delete-first ordering cannot preserve the "
+                                "prior index during a dimension rebuild "
+                                "(issue #513 AC9)"
+                            )
+                        await self.vector_store.init_table(
+                            embedding_dim, **_target_kwargs
                         )
                         _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
-                        if deleted > 0:
-                            logger.info(
-                                "Safe re-upload: deleted %d old-generation chunks for file_id=%s",
-                                deleted,
-                                file_id,
+
+                        if settings.reupload_safe_order:
+                            vector_timings = await self.vector_store.add_chunks(
+                                records, **_target_kwargs
                             )
-                    else:
-                        stage_started_at = time.monotonic()
-                        await self.vector_store.delete_by_file(str(file_id))
-                        _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
-                        vector_timings = await self.vector_store.add_chunks(records)
-                        _merge_vector_timings(stage_timings, vector_timings)
+                            _merge_vector_timings(stage_timings, vector_timings)
+                            stage_started_at = time.monotonic()
+                            deleted = await self.vector_store.delete_old_generation_by_file(
+                                str(file_id), file_hash[:8], **_target_kwargs
+                            )
+                            _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                            if deleted > 0:
+                                logger.info(
+                                    "Safe re-upload: deleted %d old-generation chunks for file_id=%s",
+                                    deleted,
+                                    file_id,
+                                )
+                        else:
+                            stage_started_at = time.monotonic()
+                            await self.vector_store.delete_by_file(
+                                str(file_id), **_target_kwargs
+                            )
+                            _add_elapsed_ms(stage_timings, "vector_write_ms", stage_started_at)
+                            vector_timings = await self.vector_store.add_chunks(
+                                records, **_target_kwargs
+                            )
+                            _merge_vector_timings(stage_timings, vector_timings)
 
-                    await self._verify_vector_rows_visible(file_id)
+                        await self._verify_vector_rows_visible(file_id, active_target)
 
-                    # Publish the generation's atoms/assets/stage rows after the
-                    # new vectors are durable (issue #460).
-                    self._publish_artifacts(
-                        file_id, vault_id, generation_hash, parsed
-                    )
+                        # Publish the generation's atoms/assets/stage rows after the
+                        # new vectors are durable (issue #460).
+                        self._publish_artifacts(
+                            file_id, vault_id, generation_hash, parsed
+                        )
+                    except Exception:
+                        if auto_rebuild_handle is not None:
+                            await self._abort_dimension_rebuild_quietly(
+                                auto_rebuild_handle
+                            )
+                        raise
+                    if auto_rebuild_handle is not None:
+                        # All writes durable and visible in the rebuild table:
+                        # swap it in as the live index. A commit failure
+                        # propagates to the error handling below (the temp
+                        # table remains recoverable; the old index was already
+                        # dropped only after full validation by the store).
+                        await self.vector_store.commit_dimension_rebuild(
+                            auto_rebuild_handle
+                        )
         except Exception as e:
-            if self._write_semaphore:
-                await self._write_semaphore.acquire()
-            conn = self.pool.get_connection()
-            try:
+            async with self._write_session() as conn:
                 self._update_status(file_id, "error", conn, error_message=str(e))
                 conn.commit()
-            finally:
-                self.pool.release_connection(conn)
-                if self._write_semaphore:
-                    self._write_semaphore.release()
             set_phase(
                 self.pool,
                 file_id,
@@ -3367,64 +3892,21 @@ class DocumentProcessor:
             )
             raise
 
-        # Mark indexed
+        # Mark indexed (or 'partial' — the upload path's truthful partial
+        # status, see the helper docstring) via the shared finalization
+        # helper — identical semantics to process_file's tail otherwise
+        # (issue #513 W9/C26): status write, parsed_text + gated wiki
+        # enqueue, gated KMS enqueue, near-dup centroid, progress cleanup.
         stage_started_at = time.monotonic()
-        if self._write_semaphore:
-            await self._write_semaphore.acquire()
-        conn = self.pool.get_connection()
-        try:
-            self._update_status(
-                file_id,
-                "indexed",
-                conn,
-                chunk_count=len(chunks),
-                chunks_failed=chunks_failed_count,
-            )
-            conn.commit()
-        finally:
-            self.pool.release_connection(conn)
-            if self._write_semaphore:
-                self._write_semaphore.release()
-
-        # Save parsed text + enqueue wiki ingest job (best-effort, non-blocking).
-        try:
-            from app.services.wiki_store import WikiStore as _WikiStore
-
-            _full_text = document_text or ""
-            if self._write_semaphore:
-                await self._write_semaphore.acquire()
-            conn = self.pool.get_connection()
-            try:
-                if _full_text:
-                    conn.execute(
-                        "UPDATE files SET parsed_text = ? WHERE id = ?",
-                        (_full_text, file_id),
-                    )
-                    conn.commit()
-                set_wiki_pending(self.pool, file_id, True)
-                if settings.wiki_enabled and settings.wiki_compile_on_ingest:
-                    _WikiStore(conn).create_job(
-                        vault_id=vault_id,
-                        trigger_type="ingest",
-                        trigger_id=f"file:{file_id}",
-                        input_json={"file_id": file_id, "vault_id": vault_id},
-                    )
-                # Always clear the transient marker after the decision is made,
-                # regardless of whether a job row was created.
-                set_wiki_pending(self.pool, file_id, False)
-            finally:
-                self.pool.release_connection(conn)
-                if self._write_semaphore:
-                    self._write_semaphore.release()
-        except Exception as _wiki_exc:
-            logger.warning(
-                "Failed to enqueue wiki ingest job for file_id=%d: %s",
-                file_id,
-                _wiki_exc,
-            )
-            set_wiki_pending(self.pool, file_id, False)
-
-        clear_progress(self.pool, file_id)
+        await self._finalize_indexed_success(
+            file_id=file_id,
+            vault_id=vault_id,
+            chunks=chunks,
+            document_text=document_text,
+            chunks_failed_count=chunks_failed_count,
+            embeddings=chunk_embeddings,
+            partial_final_status="partial",
+        )
         _add_elapsed_ms(stage_timings, "sqlite_finalize_ms", stage_started_at)
 
         logger.info(

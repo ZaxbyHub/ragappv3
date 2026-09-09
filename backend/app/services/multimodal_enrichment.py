@@ -304,22 +304,27 @@ class ArtifactEnrichmentService:
         file_id: int,
         generation_hash: str,
         document_title: str,
-    ) -> list[dict[str, Any]]:
-        """Enrich all actionable atoms for a file/generation; return proxy records.
+    ) -> dict[str, Any]:
+        """Enrich all actionable atoms for a file/generation; return outcomes.
 
         Never holds a DB connection across a provider/filesystem call (short pooled
         claims only, matching the #460/no-connection-over-long-ops contract).
 
-        Returns a list of proxy records to be written through the LanceDB path
-        (add-then-delete) by the caller. On permanent/policy failures the atom stage is
-        marked accordingly and the base/raw proxy remains untouched.
+        Returns ``{"proxy_records": [...], "retryable": N}`` where
+        ``proxy_records`` are to be written through the LanceDB path
+        (add-then-delete) by the caller and ``retryable`` counts atoms whose
+        provider outcome was transient (issue #513 W17: the worker schedules a
+        bounded file-level retry instead of leaving the atom stranded until a
+        restart). On permanent/policy failures the atom stage is marked
+        accordingly and the base/raw proxy remains untouched.
         """
         proxy_records: list[dict[str, Any]] = []
+        retryable_count = 0
 
         # Read the ordered atom list (short claim) for neighbor context.
         atoms = self._load_ordered_atoms(file_id, generation_hash)
         if not atoms:
-            return proxy_records
+            return {"proxy_records": proxy_records, "retryable": retryable_count}
         # Only atoms whose stage is actionable are enriched. This skips
         # already-succeeded atoms (fingerprint/status-based skip), so a
         # retry or re-run does not re-transmit unchanged atoms to the
@@ -339,12 +344,14 @@ class ArtifactEnrichmentService:
             in ("image", "chart", "table", "equation")
         ]
         if not tasks:
-            return proxy_records
+            return {"proxy_records": proxy_records, "retryable": retryable_count}
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, dict) and result.get("proxy_record"):
                 proxy_records.append(result["proxy_record"])
-        return proxy_records
+            elif isinstance(result, dict) and result.get("outcome") == "retryable":
+                retryable_count += 1
+        return {"proxy_records": proxy_records, "retryable": retryable_count}
 
     def _actionable_atom_pks(self, file_id: int, generation_hash: str) -> set[int]:
         """Return atom PKs whose enrich stage is pending / retryable / re-runnable."""
@@ -463,7 +470,11 @@ class ArtifactEnrichmentService:
         except MultimodalProviderError as exc:
             self._fail(atom_pk, file_id, generation_hash, input_fingerprint, exc.code, exc.retryable)
             self._audit(vault_id, file_id, atom_id, atom.get("asset_id"), "attempted_external_transmission", snapshot, "failed")
-            return {"atom_id": atom_id, "outcome": "failed", "code": exc.code}
+            return {
+                "atom_id": atom_id,
+                "outcome": "retryable" if exc.retryable else "failed",
+                "code": exc.code,
+            }
         except DerivedError:
             self._fail(atom_pk, file_id, generation_hash, input_fingerprint, ERR_SCHEMA, False)
             self._audit(vault_id, file_id, atom_id, atom.get("asset_id"), "attempted_external_transmission", snapshot, "failed")
@@ -471,7 +482,7 @@ class ArtifactEnrichmentService:
         except Exception as exc:  # noqa: BLE001 — bounded classification
             logger.warning("Multimodal enrichment unexpected error atom=%s: %s", atom_id, type(exc).__name__)
             self._fail(atom_pk, file_id, generation_hash, input_fingerprint, ERR_NETWORK, True)
-            return {"atom_id": atom_id, "outcome": "failed", "code": ERR_NETWORK}
+            return {"atom_id": atom_id, "outcome": "retryable", "code": ERR_NETWORK}
 
         # Persist derived + succeed (short claim). Reject stale fingerprint.
         with self.pool.connection() as conn:
@@ -490,6 +501,20 @@ class ArtifactEnrichmentService:
                     provider_snapshot=snapshot,
                 )
             conn.commit()
+
+        if not ok:
+            # Stale completion (issue #513 W18 / RC-11b): a newer generation
+            # claimed the atom stage while this response was paused at its
+            # await. Publishing ANYTHING — derived row or proxy vector — would
+            # write an obsolete generation's output, so return no proxy
+            # record. The stage row belongs to the newer fingerprint and is
+            # left untouched for the run that owns it.
+            logger.info(
+                "Stale enrichment completion suppressed for atom=%s (superseded "
+                "generation fingerprint); no derived row or proxy published",
+                atom_id,
+            )
+            return {"atom_id": atom_id, "outcome": "stale"}
 
         self._audit(vault_id, file_id, atom_id, atom.get("asset_id"), "attempted_external_transmission", snapshot, "succeeded")
         raw_proxy = build_proxy_text(raw_evidence=raw_evidence, kind=kind, description=description, retrieval_aids=aids)

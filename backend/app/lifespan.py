@@ -169,6 +169,11 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "embedding_doc_prefix",
             "embedding_query_prefix",
             "embedding_batch_size",
+            # Embedding batching / cache / near-dup / orphan rescan (issue #513)
+            "embedding_batch_max_chars",
+            "embedding_cache_max_entries",
+            "near_dup_threshold",
+            "orphan_rescan_interval_seconds",
             "reranking_enabled",
             "reranker_top_n",
             "initial_retrieval_top_k",
@@ -621,8 +626,19 @@ async def lifespan(app: FastAPI):
         app.state.background_processor = get_background_processor(
             max_retries=3,
             retry_delay=1.0,
-            chunk_size_chars=settings.chunk_size_chars or 2000,
-            chunk_overlap_chars=settings.chunk_overlap_chars or 200,
+            # is-not-None guards: an operator-set 0 is a meaningful value
+            # (zero overlap must stay zero), not "unset" — same contract as
+            # DocumentProcessor._get_chunker (issue #513 defect class).
+            chunk_size_chars=(
+                settings.chunk_size_chars
+                if settings.chunk_size_chars is not None
+                else 2000
+            ),
+            chunk_overlap_chars=(
+                settings.chunk_overlap_chars
+                if settings.chunk_overlap_chars is not None
+                else 200
+            ),
             vector_store=app.state.vector_store,
             embedding_service=app.state.embedding_service,
             maintenance_service=app.state.maintenance_service,

@@ -261,6 +261,96 @@ def list_enrichable_atoms(conn, *, file_id: int, generation_hash: str, stage: st
     return out
 
 
+def is_atom_stage_current(
+    conn,
+    *,
+    file_id: int,
+    generation_hash: str,
+    atom_pk: int,
+    input_fingerprint: str,
+) -> bool:
+    """True when the atom's enrich stage row still matches this fingerprint.
+
+    Used immediately before a proxy vector insert (issue #513 W18): a provider
+    or embedding await can straddle a newer generation claiming the atom stage,
+    and a stale completion must not publish an obsolete vector. The check is
+    fingerprint-guarded exactly like ``complete_atom_stage`` /
+    ``set_proxy_vector_id`` so every publication point shares one rule.
+    """
+    current = _atom_stage_status(
+        conn, file_id=file_id, generation_hash=generation_hash,
+        atom_pk=atom_pk, stage=ENRICH_STAGE,
+    )
+    if current is None:
+        return False
+    existing_fp = current.get("input_fingerprint")
+    return existing_fp is not None and existing_fp == input_fingerprint
+
+
+def resolve_atom_pk(
+    conn, *, file_id: int, generation_hash: str, atom_id: str
+) -> Optional[int]:
+    """Resolve the ``document_atoms`` rowid PK for an opaque atom id."""
+    row = conn.execute(
+        "SELECT id FROM document_atoms "
+        "WHERE file_id = ? AND generation_hash = ? AND atom_id = ?",
+        (file_id, generation_hash, atom_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["id"]) if hasattr(row, "keys") else int(row[0])
+
+
+def mark_proxy_missing_retryable(
+    conn,
+    *,
+    file_id: int,
+    generation_hash: str,
+    atom_pk: int,
+    max_attempts: int,
+) -> str:
+    """Revert a SUCCEEDED enrich stage whose durable proxy never landed (W17).
+
+    Called when a proxy embedding failed (per-text None placeholder) so the
+    atom is NOT silently skipped: the stage goes back to FAILED_RETRYABLE with
+    attempts+1, which both startup resume (``_resume_pending_atom_enrichment``)
+    and ``list_enrichable_atoms`` treat as actionable. Past ``max_attempts``
+    the atom is marked FAILED_PERMANENT instead of looping forever.
+
+    Returns the new stage status, or "" when no actionable transition was made
+    (missing stage row, or the completion guard rejected a stale fingerprint —
+    a stale stage belongs to a newer generation and must not be reverted).
+    """
+    current = _atom_stage_status(
+        conn, file_id=file_id, generation_hash=generation_hash,
+        atom_pk=atom_pk, stage=ENRICH_STAGE,
+    )
+    if current is None:
+        return ""
+    fingerprint = current.get("input_fingerprint")
+    if fingerprint is None:
+        return ""
+    try:
+        prior_attempts = int(current.get("attempts") or 0)
+    except (TypeError, ValueError):
+        prior_attempts = 0
+    attempts = prior_attempts + 1
+    status = FAILED_PERMANENT if attempts > max(1, int(max_attempts)) else FAILED_RETRYABLE
+    ok = complete_atom_stage(
+        conn,
+        file_id=file_id,
+        generation_hash=generation_hash,
+        atom_pk=atom_pk,
+        stage=ENRICH_STAGE,
+        input_fingerprint=fingerprint,
+        status=status,
+        error_code="proxy_embedding_failed",
+        error_message="Derived proxy embedding failed; atom reverted for retry",
+        attempts=attempts,
+    )
+    return status if ok else ""
+
+
 def recover_stranded_atom_stages(conn) -> int:
     """Reclaim stranded atom 'enrich' work (running) back to pending at startup.
 

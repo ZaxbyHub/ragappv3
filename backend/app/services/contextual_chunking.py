@@ -12,6 +12,7 @@ from typing import List
 
 from app.config import settings
 from app.services.chunking import ProcessedChunk
+from app.services.embeddings import EmbeddingService
 from app.services.llm_client import LLMClient, LLMError
 
 logger = logging.getLogger(__name__)
@@ -284,9 +285,27 @@ class ContextualChunker:
                 if context:
                     # Dual-store: keep enriched text for embedding precision,
                     # AND store context separately for prompt builder access.
-                    chunk.raw_text = chunk.text  # preserve original
-                    chunk.metadata["contextual_context"] = context
-                    chunk.text = f"{context}\n\n{chunk.text}"  # enriched for embedding
+                    chunk.raw_text = chunk.text  # preserve original (never truncated)
+                    # Context prefix budget (issue #513 W7 / RC-14): the
+                    # enrichment must never make a canonical-valid chunk
+                    # unembeddable, so the prepended context is capped to fit
+                    # the same per-text bound embed_batch applies
+                    # (MAX_TEXT_LENGTH minus the doc prefix). The CONTEXT is
+                    # truncated (or omitted entirely when the budget is
+                    # exhausted); the canonical raw_text is never touched.
+                    max_total = EmbeddingService.MAX_TEXT_LENGTH - len(
+                        settings.embedding_doc_prefix or ""
+                    )
+                    context_budget = max_total - 2 - len(chunk.raw_text)
+                    if context_budget <= 0:
+                        applied_context = ""  # no room: omit the prefix entirely
+                    elif len(context) > context_budget:
+                        applied_context = context[:context_budget]
+                    else:
+                        applied_context = context
+                    chunk.metadata["contextual_context"] = applied_context
+                    if applied_context:
+                        chunk.text = f"{applied_context}\n\n{chunk.text}"  # enriched for embedding
                     logger.debug(
                         f"Added context metadata to chunk {chunk_index}: {context[:50]}..."
                     )

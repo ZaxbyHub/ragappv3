@@ -29,14 +29,19 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
 
     # The periodic vector-delete reconciliation sweep is spawned in start()
     # after the workers/enrichment task (added with the #219 retry queue); the
-    # artifact-delete sweep task is spawned alongside it (issue #460).
+    # artifact-delete sweep task is spawned alongside it (issue #460). The
+    # deferred-retry scheduler (issue #513 W11) is spawned right after the
+    # reindex worker, and the periodic orphan-rescan sweep (issue #513 W25)
+    # after the artifact-delete sweep.
     assert created_workers == [
         "worker-0",
         "worker-1",
         "enrichment-worker",
         "reindex-worker",
+        "retry-scheduler",
         "vector-delete-sweep",
         "artifact-delete-sweep",
+        "orphan-rescan",
     ]
 
 
