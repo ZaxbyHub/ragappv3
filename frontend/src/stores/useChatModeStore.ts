@@ -36,6 +36,15 @@ export interface ComposerControlsState {
   setMetadataFilterAuthor: (v: string) => void;
   /** Clear every metadata-filter field. */
   resetMetadataFilter: () => void;
+  /**
+   * Document scope for the NEXT question (issue #514 AC-23). Set from a
+   * document's "Ask about this document" control; consumed and cleared by the
+   * send path so the scope applies to exactly one question. One-shot query
+   * context — intentionally not persisted (see `partialize`).
+   */
+  scopeDocumentIds: number[] | null;
+  setScopeDocumentIds: (ids: number[]) => void;
+  clearScopeDocumentIds: () => void;
 }
 
 export const useChatModeStore = create<ComposerControlsState>()(
@@ -68,6 +77,9 @@ export const useChatModeStore = create<ComposerControlsState>()(
           metadataFilterTags: "",
           metadataFilterAuthor: "",
         }),
+      scopeDocumentIds: null,
+      setScopeDocumentIds: (scopeDocumentIds) => set({ scopeDocumentIds }),
+      clearScopeDocumentIds: () => set({ scopeDocumentIds: null }),
     }),
     {
       name: "ragapp_chat_mode",

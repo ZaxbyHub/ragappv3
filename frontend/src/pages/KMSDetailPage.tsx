@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { ArrowLeft, Download, Edit, Save, Trash2, X } from "lucide-react";
@@ -44,16 +44,23 @@ export default function KMSDetailPage() {
   const [status, setStatus] = useState<string>("draft");
   const [saving, setSaving] = useState(false);
 
+  // Generation token (issue #514 / UI-011): a late getKMSEntry response for a
+  // previously-navigated entry id must never commit state for the entry
+  // currently shown. Checked after the await and on the error/finally paths.
+  const loadGenRef = useRef(0);
+
   const load = useCallback(async () => {
     if (!Number.isFinite(id)) {
       setError("Invalid entry id");
       setLoading(false);
       return;
     }
+    const gen = ++loadGenRef.current;
     setLoading(true);
     setError(null);
     try {
       const e = await getKMSEntry(id);
+      if (loadGenRef.current !== gen) return;
       setEntry(e);
       setTitle(e.title);
       setBody(e.body);
@@ -61,9 +68,12 @@ export default function KMSDetailPage() {
       setTags(e.tags.join(", "));
       setStatus(e.status);
     } catch (err) {
+      if (loadGenRef.current !== gen) return;
       setError(err instanceof Error ? err.message : "Failed to load entry");
     } finally {
-      setLoading(false);
+      if (loadGenRef.current === gen) {
+        setLoading(false);
+      }
     }
   }, [id]);
 

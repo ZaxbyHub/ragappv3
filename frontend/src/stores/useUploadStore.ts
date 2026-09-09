@@ -1,13 +1,24 @@
 import { create } from "zustand";
-import { uploadDocument, getDocumentStatus } from "@/lib/api";
-import type { DocumentStatusResponse } from "@/lib/api";
-import { isUploadTooLarge, normalizeUploadErrorMessage, uploadSizeExceededMessage } from "@/lib/uploadLimits";
+import { uploadDocument } from "@/lib/api";
+import { useSettingsStore } from "@/stores/useSettingsStore";
+import {
+  MAX_UPLOAD_FILE_SIZE_MB,
+  isUploadTooLarge,
+  normalizeUploadErrorMessage,
+  uploadSizeExceededMessage,
+} from "@/lib/uploadLimits";
 import { toast } from "sonner";
 
 /**
  * UploadFile state machine
  * ------------------------
  *   pending -> uploading -> processing -> indexed | error | cancelled
+ *
+ * `pending`/`uploading` are byte-transfer states owned by the bounded
+ * transfer pool (see `UPLOAD_CONCURRENCY`). Once the server accepts the
+ * bytes the upload moves to `processing` with a `documentId` and monitoring
+ * becomes the batched status poller's job (`hooks/useUploadMonitoring.ts`)
+ * — the transfer pool never waits for indexing.
  *
  * `progress` is preserved as a deprecated alias of `uploadProgress` for one
  * release so external readers (e.g. legacy tests, untouched components) keep
@@ -28,6 +39,36 @@ export type UploadStatus =
   | "error"
   | "cancelled";
 
+/**
+ * Maximum number of concurrent byte-transfers. A pool slot is held ONLY for
+ * the `uploadDocument` await: as soon as the server accepts a file's bytes
+ * (the upload moves to `processing`) the slot frees and the next pending
+ * transfer starts — transfers never serialize behind indexing, which is
+ * monitored separately by the batched status poller.
+ */
+export const UPLOAD_CONCURRENCY = 3;
+
+/**
+ * Status snapshot shape accepted by `applyStatusSnapshot`. Both the per-file
+ * `DocumentStatusResponse` and batched `DocumentStatusEntry` payloads are
+ * structurally compatible.
+ */
+export interface UploadStatusSnapshot {
+  id: string | number;
+  status: string;
+  filename?: string | null;
+  chunk_count?: number | null;
+  error_message?: string | null;
+  phase?: string | null;
+  phase_message?: string | null;
+  progress_percent?: number | null;
+  processed_units?: number | null;
+  total_units?: number | null;
+  unit_label?: string | null;
+  elapsed_seconds?: number | null;
+  wiki_status?: string | null;
+}
+
 export interface UploadFile {
   id: string;
   file: File;
@@ -46,6 +87,8 @@ export interface UploadFile {
   status: UploadStatus;
   error?: string;
   documentId?: string;
+  /** Backend chunk count once indexing succeeds (informational). */
+  chunkCount?: number | null;
   /** Raw backend phase string, e.g. "embedding". */
   phase?: string | null;
   /** User-friendly label derived from `phase`. */
@@ -63,7 +106,9 @@ export interface UploadFile {
   elapsedSeconds?: number | null;
   /** Backend wiki status: pending | running | completed | failed | cancelled */
   wikiStatus?: string | null;
-  /** True once the polling loop has decided to stop trying (manual stop or hard cap). */
+  /** True once a server status snapshot has been applied to this upload. */
+  statusSeen?: boolean;
+  /** True once monitoring has been stopped for this upload (manual stop or hard cap). */
   pollingStopped?: boolean;
   /** True once the long-running banner should be shown (>= 30 min processing). */
   longRunning?: boolean;
@@ -73,21 +118,34 @@ interface UploadState {
   uploads: UploadFile[];
   isProcessing: boolean;
   activeVaultId: number | null;
+  /** Upload ids currently attached to the chat composer (survives unmounts). */
+  chatAttachmentIds: string[];
 
   // Actions
-  addUploads: (files: File[], vaultId?: number) => void;
+  /** Queue files for upload; returns the ids of the uploads that were queued. */
+  addUploads: (files: File[], vaultId?: number) => string[];
   cancelUpload: (id: string) => void;
   removeUpload: (id: string) => void;
   updateUploadProgress: (id: string, progress: number) => void;
   /** @deprecated alias of updateUploadProgress for legacy callers */
   updateProgress: (id: string, progress: number) => void;
   setStatus: (id: string, status: UploadStatus, error?: string) => void;
-  applyStatusSnapshot: (id: string, snapshot: DocumentStatusResponse) => void;
+  /**
+   * Apply a server status snapshot. `seq` is the monitoring attempt's
+   * monotonically increasing sequence number: a snapshot from an older (or
+   * equal) attempt is ignored, and terminal states are sticky — a
+   * non-terminal snapshot never regresses an upload that already finished.
+   */
+  applyStatusSnapshot: (id: string, snapshot: UploadStatusSnapshot, seq?: number) => void;
   setProcessing: (processing: boolean) => void;
   clearCompleted: () => void;
   retryUpload: (id: string) => void;
-  /** Stop polling for this upload without cancelling backend processing. */
+  /** Stop monitoring this upload without cancelling backend processing. */
   stopPolling: (id: string) => void;
+  /** Register an upload as a chat attachment (chips survive unmount/remount). */
+  attachToChat: (id: string) => void;
+  /** Remove an upload's chat attachment registration. */
+  detachFromChat: (id: string) => void;
   processQueue: () => Promise<void>;
 }
 
@@ -109,20 +167,37 @@ export function phaseLabelFor(phase?: string | null): string | null {
   return PHASE_LABELS[phase] ?? phase;
 }
 
-// Adaptive polling: 1.5s for first 20s, 3s for next 60s, 6s thereafter.
-// Reset back to fast polling when the observed phase changes.
-const MAX_POLL_DURATION_MS = 4 * 60 * 60 * 1000; // 4 hours hard cap
-const LONG_RUNNING_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+/** Terminal upload states — once reached, non-terminal snapshots cannot regress them. */
+const TERMINAL_UPLOAD_STATUSES: ReadonlySet<UploadStatus> = new Set([
+  "indexed",
+  "error",
+  "cancelled",
+]);
 
-function pickPollDelay(elapsedMs: number): number {
-  // Cadence relaxed 2026-08-25: with several files uploading at once the
-  // per-file pollers stacked into a ~5 req/s burst that upstream WAFs
-  // (AF proxy) rate-limit with 403s that look like app errors. 3/6/12s keeps
-  // progress UX responsive at a fraction of the request volume.
-  if (elapsedMs < 20_000) return 3000;
-  if (elapsedMs < 80_000) return 6000;
-  return 12000;
+function isTerminalUploadStatus(status: UploadStatus): boolean {
+  return TERMINAL_UPLOAD_STATUSES.has(status);
 }
+
+/** Wiki states that still require monitoring once the document itself is indexed. */
+function isTransientWikiStatus(wikiStatus?: string | null): boolean {
+  return wikiStatus === "pending" || wikiStatus === "running";
+}
+
+/**
+ * True while the batched status monitor should keep polling for this upload:
+ * bytes are accepted (`documentId` assigned) and the document — or its wiki
+ * compile — has not reached a terminal state.
+ */
+export function uploadNeedsMonitoring(upload: UploadFile): boolean {
+  if (!upload.documentId || upload.pollingStopped) return false;
+  if (upload.status === "indexed") return isTransientWikiStatus(upload.wikiStatus);
+  return upload.status === "processing" || upload.status === "indexing";
+}
+
+// Monotonic snapshot-application ordering (issue #514 / UPLOAD-DEEP-01):
+// the monitoring attempt's seq is recorded per upload so a late response
+// from an older attempt can never overwrite a newer snapshot.
+const lastAppliedSeqByUploadId = new Map<string, number>();
 
 /**
  * Map a backend status snapshot onto our local UploadFile fields. We don't
@@ -130,7 +205,7 @@ function pickPollDelay(elapsedMs: number): number {
  * partial responses.
  */
 function snapshotToPatch(
-  snapshot: DocumentStatusResponse,
+  snapshot: UploadStatusSnapshot,
   prevPhase?: string | null,
 ): Partial<UploadFile> {
   const patch: Partial<UploadFile> = {
@@ -143,6 +218,7 @@ function snapshotToPatch(
     unitLabel: snapshot.unit_label ?? null,
     elapsedSeconds: snapshot.elapsed_seconds ?? null,
     wikiStatus: snapshot.wiki_status ?? null,
+    chunkCount: snapshot.chunk_count ?? null,
     error: snapshot.error_message ?? undefined,
   };
 
@@ -191,308 +267,278 @@ function snapshotToPatch(
   return patch;
 }
 
-export const useUploadStore = create<UploadState>((set, get) => ({
-  uploads: [],
-  isProcessing: false,
-  activeVaultId: null,
+/**
+ * Effective client-side upload limit in MB: the server-configured
+ * `max_file_size_mb` once settings have loaded, else the default fallback.
+ */
+export function effectiveUploadLimitMb(): number {
+  return useSettingsStore.getState().settings?.max_file_size_mb ?? MAX_UPLOAD_FILE_SIZE_MB;
+}
 
-  addUploads: (files, vaultId) => {
-    if (!vaultId) {
-      toast.error("No vault selected. Please select a vault before uploading.");
-      return;
-    }
-    const acceptedFiles = files.filter((file) => {
-      if (!isUploadTooLarge(file)) return true;
-      toast.error(uploadSizeExceededMessage(file.name));
-      return false;
-    });
-    if (acceptedFiles.length === 0) return;
-    const generateId = (f: File) => {
-      if (typeof crypto !== "undefined" && crypto.randomUUID) {
-        return crypto.randomUUID();
-      }
-      return `${f.name}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    };
-
-    const now = Date.now();
-    const newUploads: UploadFile[] = acceptedFiles.map((file) => ({
-      id: generateId(file),
-      file,
-      uploadProgress: 0,
-      progress: 0,
-      processingProgress: null,
-      wikiProgress: null,
-      status: "pending",
-      startedAt: now,
-    }));
-
-    set((state) => ({
-      uploads: [...state.uploads, ...newUploads],
-      activeVaultId: vaultId || state.activeVaultId,
-    }));
-
-    const { isProcessing } = get();
-    if (!isProcessing) {
-      get().processQueue();
-    }
-  },
-
-  cancelUpload: (id) => {
-    set((state) => ({
-      uploads: state.uploads.map((u) =>
-        u.id === id && u.status === "pending" ? { ...u, status: "cancelled" } : u
-      ),
-    }));
-    toast.info("Upload cancelled");
-  },
-
-  removeUpload: (id) => {
-    set((state) => ({
-      uploads: state.uploads.filter((u) => u.id !== id),
-    }));
-  },
-
-  updateUploadProgress: (id, progress) => {
-    set((state) => ({
-      uploads: state.uploads.map((u) =>
-        u.id === id ? { ...u, uploadProgress: progress, progress } : u
-      ),
-    }));
-  },
-
-  // Deprecated alias preserved so untouched callers still compile.
-  updateProgress: (id, progress) => {
-    get().updateUploadProgress(id, progress);
-  },
-
-  setStatus: (id, status, error) => {
-    set((state) => ({
-      uploads: state.uploads.map((u) =>
-        u.id === id ? { ...u, status, error } : u
-      ),
-    }));
-  },
-
-  applyStatusSnapshot: (id, snapshot) => {
-    set((state) => ({
-      uploads: state.uploads.map((u) => {
-        if (u.id !== id) return u;
-        const patch = snapshotToPatch(snapshot, u.phase);
-        return { ...u, ...patch };
-      }),
-    }));
-  },
-
-  setProcessing: (processing) => {
-    set({ isProcessing: processing });
-  },
-
-  clearCompleted: () => {
-    set((state) => ({
-      uploads: state.uploads.filter(
-        (u) =>
-          u.status === "pending" ||
-          u.status === "uploading" ||
-          u.status === "processing" ||
-          u.status === "indexing"
-      ),
-    }));
-  },
-
-  retryUpload: (id) => {
-    set((state) => ({
-      uploads: state.uploads.map((u) =>
-        u.id === id
-          ? {
-              ...u,
-              status: "pending",
-              uploadProgress: 0,
-              progress: 0,
-              processingProgress: null,
-              wikiProgress: null,
-              error: undefined,
-              phase: null,
-              phaseLabel: null,
-              phaseMessage: null,
-              processedUnits: null,
-              totalUnits: null,
-              unitLabel: null,
-              elapsedSeconds: null,
-              pollingStopped: false,
-              longRunning: false,
-            }
-          : u
-      ),
-    }));
-
-    const { isProcessing } = get();
-    if (!isProcessing) {
-      get().processQueue();
-    }
-  },
-
-  stopPolling: (id) => {
-    set((state) => ({
-      uploads: state.uploads.map((u) =>
-        u.id === id ? { ...u, pollingStopped: true } : u
-      ),
-    }));
-  },
-
-  processQueue: async () => {
-    let acquired = false;
-
-    set((state) => {
-      if (state.isProcessing) {
-        return state;
-      }
-      acquired = true;
-      return { ...state, isProcessing: true };
-    });
-
-    if (!acquired) {
-      return;
-    }
-
+export const useUploadStore = create<UploadState>((set, get) => {
+  /**
+   * Run one byte-transfer. A pool slot corresponds to the `uploadDocument`
+   * await only: when the server accepts the bytes the upload moves to
+   * `processing` (monitoring takes over) and the slot frees for the next
+   * pending file. Failures mark the upload error and free the slot.
+   */
+  const runTransfer = async (
+    uploadId: string,
+    file: File,
+    vaultId: number | null
+  ): Promise<void> => {
     try {
+      const uploadResult = await uploadDocument(
+        file,
+        (progress) => {
+          get().updateUploadProgress(uploadId, progress);
+        },
+        vaultId ?? undefined
+      );
+
+      // Network upload finished. Don't claim "indexed" — the backend
+      // is now the source of truth for processing/wiki state.
+      const docId = String(uploadResult.id);
+      set((state) => ({
+        uploads: state.uploads.map((u) =>
+          u.id === uploadId
+            ? {
+                ...u,
+                status: "processing",
+                documentId: docId,
+                uploadProgress: 100,
+                progress: 100,
+                phase: "queued",
+                phaseLabel: phaseLabelFor("queued"),
+                phaseMessage: "Queued for processing",
+                phaseStartedAt: Date.now(),
+              }
+            : u
+        ),
+      }));
+      toast.success(`${file.name} uploaded`);
+    } catch (err) {
+      const errorMsg = normalizeUploadErrorMessage(err);
+      get().setStatus(uploadId, "error", errorMsg);
+      toast.error(`Failed to upload ${file.name}: ${errorMsg}`);
+    } finally {
+      // Free the slot and immediately admit the next pending transfer.
+      void get().processQueue();
+    }
+  };
+
+  return {
+    uploads: [],
+    isProcessing: false,
+    activeVaultId: null,
+    chatAttachmentIds: [],
+
+    addUploads: (files, vaultId) => {
+      if (!vaultId) {
+        toast.error("No vault selected. Please select a vault before uploading.");
+        return [];
+      }
+      const limitMb = effectiveUploadLimitMb();
+      const limitBytes = limitMb * 1024 * 1024;
+      const acceptedFiles = files.filter((file) => {
+        if (!isUploadTooLarge(file, limitBytes)) return true;
+        toast.error(uploadSizeExceededMessage(file.name, limitMb));
+        return false;
+      });
+      if (acceptedFiles.length === 0) return [];
+      const generateId = (f: File) => {
+        if (typeof crypto !== "undefined" && crypto.randomUUID) {
+          return crypto.randomUUID();
+        }
+        return `${f.name}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      };
+
+      const now = Date.now();
+      const newUploads: UploadFile[] = acceptedFiles.map((file) => ({
+        id: generateId(file),
+        file,
+        uploadProgress: 0,
+        progress: 0,
+        processingProgress: null,
+        wikiProgress: null,
+        status: "pending",
+        statusSeen: false,
+        startedAt: now,
+      }));
+
+      set((state) => ({
+        uploads: [...state.uploads, ...newUploads],
+        activeVaultId: vaultId || state.activeVaultId,
+      }));
+
+      void get().processQueue();
+      return newUploads.map((u) => u.id);
+    },
+
+    cancelUpload: (id) => {
+      set((state) => ({
+        uploads: state.uploads.map((u) =>
+          u.id === id && u.status === "pending" ? { ...u, status: "cancelled" } : u
+        ),
+      }));
+      toast.info("Upload cancelled");
+    },
+
+    removeUpload: (id) => {
+      // Evict the snapshot-ordering entry so the map tracks live uploads only.
+      lastAppliedSeqByUploadId.delete(id);
+      set((state) => ({
+        uploads: state.uploads.filter((u) => u.id !== id),
+      }));
+    },
+
+    updateUploadProgress: (id, progress) => {
+      set((state) => ({
+        uploads: state.uploads.map((u) =>
+          u.id === id ? { ...u, uploadProgress: progress, progress } : u
+        ),
+      }));
+    },
+
+    // Deprecated alias preserved so untouched callers still compile.
+    updateProgress: (id, progress) => {
+      get().updateUploadProgress(id, progress);
+    },
+
+    setStatus: (id, status, error) => {
+      set((state) => ({
+        uploads: state.uploads.map((u) =>
+          u.id === id ? { ...u, status, error } : u
+        ),
+      }));
+    },
+
+    applyStatusSnapshot: (id, snapshot, seq) => {
+      set((state) => ({
+        uploads: state.uploads.map((u) => {
+          if (u.id !== id) return u;
+          // Attempt ordering: ignore snapshots from an older (or repeated)
+          // monitoring attempt — its information is stale by construction.
+          if (seq != null) {
+            const lastSeq = lastAppliedSeqByUploadId.get(id);
+            if (lastSeq != null && seq <= lastSeq) return u;
+            lastAppliedSeqByUploadId.set(id, seq);
+          }
+          const patch = snapshotToPatch(snapshot, u.phase);
+          // Terminal states are sticky: a non-terminal snapshot (late or
+          // out-of-order) never regresses a finished upload.
+          if (
+            isTerminalUploadStatus(u.status) &&
+            !isTerminalUploadStatus(patch.status ?? u.status)
+          ) {
+            return u;
+          }
+          return { ...u, ...patch, statusSeen: true };
+        }),
+      }));
+    },
+
+    setProcessing: (processing) => {
+      set({ isProcessing: processing });
+    },
+
+    clearCompleted: () => {
+      set((state) => {
+        const kept = state.uploads.filter(
+          (u) =>
+            u.status === "pending" ||
+            u.status === "uploading" ||
+            u.status === "processing" ||
+            u.status === "indexing"
+        );
+        // Evict snapshot-ordering entries for the dropped terminal rows.
+        if (kept.length !== state.uploads.length) {
+          const keptIds = new Set(kept.map((u) => u.id));
+          for (const upload of state.uploads) {
+            if (!keptIds.has(upload.id)) lastAppliedSeqByUploadId.delete(upload.id);
+          }
+        }
+        return { uploads: kept };
+      });
+    },
+
+    retryUpload: (id) => {
+      // A retry restarts the lifecycle; drop the stale ordering entry so a
+      // fresh monitoring sequence applies immediately.
+      lastAppliedSeqByUploadId.delete(id);
+      set((state) => ({
+        uploads: state.uploads.map((u) =>
+          u.id === id
+            ? {
+                ...u,
+                status: "pending",
+                uploadProgress: 0,
+                progress: 0,
+                processingProgress: null,
+                wikiProgress: null,
+                error: undefined,
+                phase: null,
+                phaseLabel: null,
+                phaseMessage: null,
+                processedUnits: null,
+                totalUnits: null,
+                unitLabel: null,
+                elapsedSeconds: null,
+                statusSeen: false,
+                pollingStopped: false,
+                longRunning: false,
+              }
+            : u
+        ),
+      }));
+
+      void get().processQueue();
+    },
+
+    stopPolling: (id) => {
+      set((state) => ({
+        uploads: state.uploads.map((u) =>
+          u.id === id ? { ...u, pollingStopped: true } : u
+        ),
+      }));
+    },
+
+    attachToChat: (id) => {
+      set((state) =>
+        state.chatAttachmentIds.includes(id)
+          ? state
+          : { chatAttachmentIds: [...state.chatAttachmentIds, id] }
+      );
+    },
+
+    detachFromChat: (id) => {
+      set((state) => ({
+        chatAttachmentIds: state.chatAttachmentIds.filter(
+          (attachmentId) => attachmentId !== id
+        ),
+      }));
+    },
+
+    processQueue: async () => {
+      // Bounded transfer pool: count in-flight transfers from the store rows
+      // (an "uploading" row is exactly one live `uploadDocument` await) and
+      // keep starting pending transfers until the pool is full. No awaits in
+      // this loop — re-entrant calls simply observe the already-marked rows.
       while (true) {
         const { uploads, activeVaultId } = get();
-        const pendingUpload = uploads.find((u) => u.status === "pending");
-
-        if (!pendingUpload) {
-          break;
+        const inFlight = uploads.filter((u) => u.status === "uploading").length;
+        if (inFlight >= UPLOAD_CONCURRENCY) {
+          set({ isProcessing: true });
+          return;
         }
-
-        const currentUpload = uploads.find((u) => u.id === pendingUpload.id);
-        if (!currentUpload || currentUpload.status !== "pending") {
-          continue;
+        const next = uploads.find((u) => u.status === "pending");
+        if (!next) {
+          set({ isProcessing: inFlight > 0 });
+          return;
         }
-
-        try {
-          get().setStatus(pendingUpload.id, "uploading");
-
-          const uploadResult = await uploadDocument(
-            pendingUpload.file,
-            (progress) => {
-              get().updateUploadProgress(pendingUpload.id, progress);
-            },
-            activeVaultId || undefined
-          );
-
-          // Network upload finished. Don't claim "indexed" — the backend
-          // is now the source of truth for processing/wiki state.
-          const docId = String(uploadResult.id);
-          set((state) => ({
-            uploads: state.uploads.map((u) =>
-              u.id === pendingUpload.id
-                ? {
-                    ...u,
-                    status: "processing",
-                    documentId: docId,
-                    uploadProgress: 100,
-                    progress: 100,
-                    phase: "queued",
-                    phaseLabel: phaseLabelFor("queued"),
-                    phaseMessage: "Queued for processing",
-                    phaseStartedAt: Date.now(),
-                  }
-                : u
-            ),
-          }));
-
-          // Poll. Adaptive interval, no hard timeout (4-hour absolute cap).
-          const startedAt = Date.now();
-          let lastPhase: string | null = "queued";
-          let lastWikiStatus: string | null = null;
-          let phaseChangedAt = startedAt;
-          let pollFailures = 0;
-
-          while (true) {
-            const elapsedMs = Date.now() - startedAt;
-            // Adaptive cadence: ramp 1.5s -> 3s -> 6s based on time spent in
-            // the *current* phase (resets to 1.5s on every observed phase
-            // transition). The earlier expression collapsed to a constant.
-            const delayMs = pickPollDelay(Date.now() - phaseChangedAt);
-            await new Promise((r) => setTimeout(r, delayMs));
-
-            const fresh = get().uploads.find((u) => u.id === pendingUpload.id);
-            if (!fresh) break; // removed
-            if (fresh.pollingStopped) break;
-            if (fresh.status === "cancelled") break;
-            if (elapsedMs > MAX_POLL_DURATION_MS) {
-              // Stop polling; do NOT mark error — backend may still be working.
-              get().stopPolling(pendingUpload.id);
-              break;
-            }
-            if (
-              elapsedMs > LONG_RUNNING_THRESHOLD_MS &&
-              !fresh.longRunning
-            ) {
-              set((state) => ({
-                uploads: state.uploads.map((u) =>
-                  u.id === pendingUpload.id ? { ...u, longRunning: true } : u
-                ),
-              }));
-            }
-
-            try {
-              const snapshot = await getDocumentStatus(docId);
-              pollFailures = 0;
-              get().applyStatusSnapshot(pendingUpload.id, snapshot);
-
-              if (snapshot.phase && snapshot.phase !== lastPhase) {
-                lastPhase = snapshot.phase;
-                phaseChangedAt = Date.now();
-              }
-              if (snapshot.wiki_status && snapshot.wiki_status !== lastWikiStatus) {
-                lastWikiStatus = snapshot.wiki_status;
-              }
-
-              if (snapshot.status === "error") {
-                toast.error(`Failed to index ${pendingUpload.file.name}`, {
-                  description: snapshot.error_message ?? undefined,
-                });
-                break;
-              }
-              if (snapshot.status === "indexed") {
-                const wikiTerminal =
-                  snapshot.wiki_status == null ||
-                  snapshot.wiki_status === "completed" ||
-                  snapshot.wiki_status === "failed" ||
-                  snapshot.wiki_status === "cancelled";
-                if (wikiTerminal) {
-                  toast.success(`${pendingUpload.file.name} indexed`);
-                  break;
-                }
-                // Indexed but wiki still working — keep polling for wiki.
-                continue;
-              }
-            } catch {
-              // Transient: keep trying. Bail only after many consecutive failures.
-              pollFailures += 1;
-              if (pollFailures >= 30) {
-                get().setStatus(
-                  pendingUpload.id,
-                  "error",
-                  "Status polling failed repeatedly. Refresh to retry."
-                );
-                break;
-              }
-            }
-          }
-        } catch (err) {
-          const errorMsg = normalizeUploadErrorMessage(err);
-          get().setStatus(pendingUpload.id, "error", errorMsg);
-          toast.error(`Failed to upload ${pendingUpload.file.name}: ${errorMsg}`);
-        }
+        get().setStatus(next.id, "uploading");
+        void runTransfer(next.id, next.file, activeVaultId);
       }
-    } finally {
-      set({ isProcessing: false });
-
-      const { uploads } = get();
-      if (uploads.some((u) => u.status === "pending")) {
-        get().processQueue();
-      }
-    }
-  },
-}));
+    },
+  };
+});

@@ -32,7 +32,9 @@ import {
   type SortOrder,
 } from "@/lib/api";
 import { useDebounce } from "@/hooks/useDebounce";
+import { useUploadMonitoring } from "@/hooks/useUploadMonitoring";
 import { useVaultStore } from "@/stores/useVaultStore";
+import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useUploadStore } from "@/stores/useUploadStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { EmptyState } from "@/components/EmptyState";
@@ -56,7 +58,11 @@ import { FolderTree } from "@/components/documents/FolderTree";
 import { MoveFolderDialog } from "@/components/documents/MoveFolderDialog";
 import { MoveToFolderDialog } from "@/components/documents/MoveToFolderDialog";
 import { ConfirmDialog, type ConfirmDialogState } from "@/components/documents/ConfirmDialog";
-import { isUploadTooLarge, uploadSizeExceededMessage } from "@/lib/uploadLimits";
+import {
+  isUploadTooLarge,
+  uploadSizeExceededMessage,
+  MAX_UPLOAD_FILE_SIZE_MB,
+} from "@/lib/uploadLimits";
 import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 const FILENAME_COL_WIDTH_KEY = "ragapp_doc_table_filename_col";
@@ -217,7 +223,12 @@ export default function DocumentsPage() {
 
   const { uploads, addUploads, cancelUpload, removeUpload, clearCompleted, retryUpload } =
     useUploadStore();
+  // Monitor upload/wiki status for uploads initiated from this page even
+  // when the user is not in chat (batched, attempt-ordered, auto-stops when
+  // nothing is in flight).
+  useUploadMonitoring();
   const { vaults, activeVaultId } = useVaultStore();
+  const settings = useSettingsStore((state) => state.settings);
   const activeVault = vaults.find((vault) => vault.id === activeVaultId);
   const activeVaultPermission = activeVault?.current_user_permission ?? null;
   const canWriteActiveVault =
@@ -250,7 +261,7 @@ export default function DocumentsPage() {
     uploads,
   });
 
-  const { selectedIds, setSelectedIds, clear: clearSelection, selectAll, selectOne } =
+  const { selectedIds, setSelectedIds, clear: clearSelection, selectMany, selectOne } =
     useBulkSelection(canMutateDocuments);
 
   useEffect(() => {
@@ -281,16 +292,21 @@ export default function DocumentsPage() {
     setTagFilterId(null);
   }, [activeVaultId]);
 
-  // Load the vault's folders for the sidebar tree + move dialog.
-  const fetchFolders = useCallback(async () => {
+  // Load the vault's folders for the sidebar tree + move dialog. Returns the
+  // refreshed list so callers can reconcile against it (e.g. the folder filter
+  // after a subtree delete).
+  const fetchFolders = useCallback(async (): Promise<Folder[]> => {
     if (activeVaultId == null) {
       setFolders([]);
-      return;
+      return [];
     }
     try {
-      setFolders(await listFolders(activeVaultId));
+      const refreshed = await listFolders(activeVaultId);
+      setFolders(refreshed);
+      return refreshed;
     } catch (err) {
       console.error("Failed to load folders:", err);
+      return [];
     }
   }, [activeVaultId]);
 
@@ -342,9 +358,19 @@ export default function DocumentsPage() {
         onConfirm: async () => {
           try {
             await deleteFolder(folder.id);
-            // If the active filter pointed at a removed folder, fall back to all.
-            setFolderFilterId((prev) => (prev === folder.id ? null : prev));
-            await Promise.all([fetchFolders(), fetchDocuments()]);
+            // Reconcile the folder filter against the refreshed set — deleting
+            // a subtree removes descendants too, so a filter pointing at any
+            // folder that no longer exists (not just the deleted root) must
+            // fall back to all documents. Clearing the filter retriggers the
+            // query-driven document load without it.
+            const refreshed = await fetchFolders();
+            const filterRemoved =
+              folderFilterId != null && !refreshed.some((f) => f.id === folderFilterId);
+            if (filterRemoved) {
+              setFolderFilterId(null);
+            } else {
+              await fetchDocuments();
+            }
             toast.success("Folder deleted");
           } catch (err) {
             toast.error(err instanceof Error ? err.message : "Failed to delete folder");
@@ -352,7 +378,7 @@ export default function DocumentsPage() {
         },
       });
     },
-    [fetchFolders, fetchDocuments]
+    [folderFilterId, fetchFolders, fetchDocuments]
   );
 
   const handleMoveFolderTrigger = useCallback((folder: Folder) => {
@@ -416,14 +442,6 @@ export default function DocumentsPage() {
     [beginResizeGesture, filenameColWidth]
   );
 
-  const handleSelectAll = useCallback(
-    (checked: boolean | "indeterminate") => {
-      if (checked) selectAll(documents?.map((doc) => String(doc.id)) ?? []);
-      else clearSelection();
-    },
-    [selectAll, clearSelection, documents]
-  );
-
   const executeBulkDelete = useCallback(async () => {
     if (!canMutateDocuments) {
       toast.error("Select a vault you administer before deleting documents");
@@ -432,29 +450,47 @@ export default function DocumentsPage() {
     setIsBulkDeleting(true);
     try {
       const result = await deleteDocuments(Array.from(selectedIds));
+      // Reconcile from the response: only confirmed-deleted rows go away;
+      // failed_ids rows must remain in the list.
+      const failedIds = new Set((result.failed_ids ?? []).map((id) => String(id)));
+      const deletedIds = new Set(
+        Array.from(selectedIds).filter((id) => !failedIds.has(String(id)))
+      );
       if (result.deleted_count > 0) {
         toast.success(`Deleted ${result.deleted_count} document${result.deleted_count > 1 ? "s" : ""}`);
-        setDocuments((prev) => prev.filter((doc) => !selectedIds.has(doc.id)));
-        setStats((prev) =>
-          prev
-            ? {
-                ...prev,
-                total_documents: Math.max(0, (prev.total_documents ?? 0) - result.deleted_count),
-              }
-            : prev
-        );
       }
-      if (result.failed_ids.length > 0) {
-        toast.error(`Failed to delete ${result.failed_ids.length} document${result.failed_ids.length > 1 ? "s" : ""}`);
+      if (failedIds.size > 0) {
+        toast.error(`Failed to delete ${failedIds.size} document${failedIds.size > 1 ? "s" : ""}`);
       }
       clearSelection();
+      // Refetch the authoritative list, then enforce the confirmed deletions
+      // against the response (guards a racing/stale refetch re-adding rows the
+      // server just deleted) while retaining the failed rows either way.
+      await fetchDocuments();
+      setDocuments((prev) => prev.filter((doc) => !deletedIds.has(String(doc.id))));
+      setStats((prev) =>
+        prev
+          ? {
+              ...prev,
+              total_documents: Math.max(0, (prev.total_documents ?? 0) - result.deleted_count),
+            }
+          : prev
+      );
       fetchFolders();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete documents");
     } finally {
       setIsBulkDeleting(false);
     }
-  }, [canMutateDocuments, selectedIds, setDocuments, setStats, clearSelection, fetchFolders]);
+  }, [
+    canMutateDocuments,
+    selectedIds,
+    setDocuments,
+    setStats,
+    clearSelection,
+    fetchDocuments,
+    fetchFolders,
+  ]);
 
   const handleBulkDelete = useCallback(() => {
     if (selectedIds.size === 0) return;
@@ -500,26 +536,52 @@ export default function DocumentsPage() {
     });
   }, [documents, canMutateDocuments, executeDeleteAllInVault]);
 
+  // Effective client-side upload limit: the server-configured
+  // max_file_size_mb from the settings store is the source of truth; the
+  // local constant is only the fallback until settings have loaded.
+  const maxFileSizeMb = settings?.max_file_size_mb;
+  const effectiveMaxFileSizeMb =
+    typeof maxFileSizeMb === "number" && maxFileSizeMb > 0
+      ? maxFileSizeMb
+      : MAX_UPLOAD_FILE_SIZE_MB;
+  const effectiveMaxFileSizeBytes = effectiveMaxFileSizeMb * 1024 * 1024;
+
   const handleFiles = useCallback(
     (acceptedFiles: File[]) => {
       if (!hasSelectedVault || !canWriteActiveVault) {
         toast.error("Select a vault with write access before uploading");
         return;
       }
-      const oversizedFiles = acceptedFiles.filter(isUploadTooLarge);
+      // NOTE: pass the file explicitly — Array.prototype.filter also forwards
+      // the index, which would otherwise become the limit argument (0 bytes)
+      // and reject every file.
+      const oversizedFiles = acceptedFiles.filter((file) =>
+        isUploadTooLarge(file, effectiveMaxFileSizeBytes)
+      );
       if (oversizedFiles.length > 0) {
-        const rejected = oversizedFiles.map((file) => uploadSizeExceededMessage(file.name));
+        const rejected = oversizedFiles.map((file) =>
+          uploadSizeExceededMessage(file.name, effectiveMaxFileSizeMb)
+        );
         setRejectedFiles(rejected);
         rejected.forEach((message) => toast.error(`File rejected: ${message}`));
       } else {
         setRejectedFiles([]);
       }
-      const queueableFiles = acceptedFiles.filter((file) => !isUploadTooLarge(file));
+      const queueableFiles = acceptedFiles.filter(
+        (file) => !isUploadTooLarge(file, effectiveMaxFileSizeBytes)
+      );
       if (queueableFiles.length === 0) return;
       addUploads(queueableFiles, activeVaultId ?? undefined);
       toast.success(`Added ${queueableFiles.length} file(s) to upload queue`);
     },
-    [addUploads, activeVaultId, canWriteActiveVault, hasSelectedVault]
+    [
+      addUploads,
+      activeVaultId,
+      canWriteActiveVault,
+      hasSelectedVault,
+      effectiveMaxFileSizeBytes,
+      effectiveMaxFileSizeMb,
+    ]
   );
 
   const handleRejected = useCallback((names: string[]) => {
@@ -618,8 +680,21 @@ export default function DocumentsPage() {
 
   // Server already filters by search/tag — only apply the local optimistic-delete mask.
   const filteredDocuments = useMemo(
-    () => documents?.filter((doc) => !optimisticallyDeletedIds.has(doc.id)) ?? [],
+    () => documents?.filter((doc) => !optimisticallyDeletedIds.has(String(doc.id))) ?? [],
     [documents, optimisticallyDeletedIds]
+  );
+
+  // Header select-all applies ONLY to the visible rows: checking adds the
+  // visible ids (selections outside the current view are preserved) and
+  // unchecking removes exactly the visible ids.
+  const handleSelectAll = useCallback(
+    (checked: boolean | "indeterminate") => {
+      selectMany(
+        filteredDocuments.map((doc) => String(doc.id)),
+        checked === true
+      );
+    },
+    [selectMany, filteredDocuments]
   );
   const hasActiveSearch = searchQuery.trim().length > 0;
   const hasStats = stats !== null;

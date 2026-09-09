@@ -21,7 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Database, Plus, Pencil, Trash2, FileText, Brain, MessageSquare, Loader2 } from "lucide-react";
+import { Database, Plus, Pencil, Trash2, FileText, Brain, MessageSquare, Loader2, AlertCircle } from "lucide-react";
 import { EmptyState } from "@/components/EmptyState";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { listOrganizations } from "@/lib/api";
@@ -32,7 +32,7 @@ import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 
 export default function VaultsPage() {
   const testMode = useTestMode();
-  const { vaults, loading, fetchVaults, addVault, editVault, removeVault, activeVaultId, setActiveVault } = useVaultStore();
+  const { vaults, loading, error, fetchVaults, addVault, editVault, removeVault, activeVaultId, setActiveVault } = useVaultStore();
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -175,8 +175,21 @@ export default function VaultsPage() {
         </Button>
       </div>
 
+      {/* Failed load — distinct from the success+empty state (UI-053): a
+          retriable error must never read as "you have no vaults". */}
+      {error && !loading && (
+        <div role="alert" className="flex flex-col items-center justify-center py-8 text-center">
+          <AlertCircle className="w-10 h-10 mb-3 text-destructive" aria-hidden="true" />
+          <p className="text-sm text-muted-foreground">Failed to load vaults</p>
+          <p className="text-xs text-muted-foreground mt-1">{error}</p>
+          <Button variant="outline" size="sm" onClick={() => void fetchVaults()} className="mt-3">
+            Retry
+          </Button>
+        </div>
+      )}
+
       {/* Vault Cards Grid */}
-      {vaults.length === 0 && (
+      {vaults.length === 0 && !error && (
         <EmptyState
           icon={Database}
           title="No vaults yet"

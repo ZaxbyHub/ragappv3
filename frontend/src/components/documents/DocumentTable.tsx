@@ -95,6 +95,22 @@ export function DocumentTable({
 }: DocumentTableProps) {
   const tableScrollRef = useRef<HTMLDivElement>(null);
 
+  // Header checkbox state derives from the selection INTERSECTED with the
+  // visible rows — never from size coincidence (selection.size ===
+  // documents.length with disjoint ids must read unchecked). Checked = every
+  // visible row selected; indeterminate = some but not all.
+  const selectedVisibleCount = documents.reduce(
+    (count, doc) => count + (selectedIds.has(String(doc.id)) ? 1 : 0),
+    0
+  );
+  const allVisibleSelected =
+    documents.length > 0 && selectedVisibleCount === documents.length;
+  const headerChecked: boolean | "indeterminate" = allVisibleSelected
+    ? true
+    : selectedVisibleCount > 0
+      ? "indeterminate"
+      : false;
+
   const tableVirtualizer = useVirtualizer({
     count: documents.length,
     getScrollElement: () => tableScrollRef.current,
@@ -117,7 +133,7 @@ export function DocumentTable({
               <tr role="row" className="border-b bg-muted" style={{ display: "flex" }}>
                 <th scope="col" className="text-left p-4 font-medium flex-none w-12">
                   <Checkbox
-                    checked={selectedIds.size > 0 && selectedIds.size === documents.length}
+                    checked={headerChecked}
                     onCheckedChange={onSelectAll}
                     disabled={!canMutateDocuments}
                     aria-label="Select all documents"

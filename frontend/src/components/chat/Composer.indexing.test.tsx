@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { Composer } from "./Composer";
+import { useUploadStore } from "@/stores/useUploadStore";
 
 const apiMock = vi.hoisted(() => ({
   uploadDocument: vi.fn(),
@@ -54,6 +55,14 @@ vi.mock("sonner", () => ({
 beforeEach(() => {
   apiMock.uploadDocument.mockReset();
   apiMock.getDocumentStatus.mockReset();
+  // Attachment state lives in the shared upload store — reset it between
+  // tests so chips never leak across mounts.
+  useUploadStore.setState({
+    uploads: [],
+    isProcessing: false,
+    activeVaultId: null,
+    chatAttachmentIds: [],
+  });
 });
 
 function pasteFile(textarea: Element, file: File) {

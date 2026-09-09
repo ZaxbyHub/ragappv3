@@ -1,10 +1,11 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { useParams } from "react-router-dom";
+import { useParams, useSearchParams } from "react-router-dom";
 import { cn } from "@/lib/utils";
 import { getChatSession } from "@/lib/api";
 import { mapSessionMessage } from "@/lib/chatMessageMapper";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useChatMessages, useChatStore, type Message } from "@/stores/useChatStore";
+import { useChatModeStore } from "@/stores/useChatModeStore";
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { mockChatMessages } from "@/fixtures/chat";
 import { SessionRail } from "@/components/chat/SessionRail";
@@ -62,6 +63,25 @@ export default function ChatShell() {
   } = useChatShellStore();
 
   const isMobile = useIsMobile();
+  // Deep link (issue #514 AC-23): DocumentDetailPage routes here with
+  // ?document_ids=<id> AND sets the scope through the chat-mode store. The
+  // store is the source of truth at send time, so on a HARD refresh (store
+  // empty) this restores the scope from the URL. Runs once on mount; never
+  // overrides a scope that already exists (the store always wins).
+  const [searchParams] = useSearchParams();
+  const setScopeDocumentIds = useChatModeStore((s) => s.setScopeDocumentIds);
+  const scopeDocumentIds = useChatModeStore((s) => s.scopeDocumentIds);
+  const deepLinkDocumentIds = searchParams.get("document_ids");
+  useEffect(() => {
+    if (scopeDocumentIds != null || deepLinkDocumentIds == null) return;
+    const parsed = deepLinkDocumentIds
+      .split(",")
+      .map((t) => Number.parseInt(t.trim(), 10))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .slice(0, 100);
+    if (parsed.length > 0) setScopeDocumentIds(parsed);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Gate right-pane bottom Sheets on sub-lg viewports. Radix's SheetPortal mounts
   // its overlay to document.body, so the `lg:hidden` on SheetContent alone does
   // NOT suppress the fixed inset-0 bg-black/40 overlay — it would dim the whole

@@ -39,6 +39,16 @@ describe("StatusBadge", () => {
       const badge = screen.getByText("Error").closest("span");
       expect(badge?.querySelector("svg")).toBeInTheDocument();
     });
+
+    it("test_partial_shows_partial_badge_not_unknown", () => {
+      // LIVE-03: "partial" is a known terminal status — never "Unknown".
+      render(<StatusBadge status="partial" />);
+      expect(screen.getByText("Partial")).toBeInTheDocument();
+      expect(screen.queryByText("Unknown")).not.toBeInTheDocument();
+      const badge = screen.getByText("Partial").closest("span");
+      expect(badge).toHaveClass("bg-warning");
+      expect(badge?.querySelector("svg")).toBeInTheDocument();
+    });
   });
 
   describe("Partially indexed (chunks_failed > 0)", () => {

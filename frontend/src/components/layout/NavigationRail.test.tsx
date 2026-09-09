@@ -136,6 +136,26 @@ describe("NavigationRail", () => {
       const activeIndicator = documentsButton.querySelector("span");
       expect(activeIndicator).toBeInTheDocument();
     });
+
+    // UI-047: detail routes must keep their parent nav item selected.
+    it.each([
+      { detail: "/documents/7", label: "Documents" },
+      { detail: "/kms/3", label: "KMS" },
+      { detail: "/memory/2", label: "Memory" },
+      { detail: "/wiki/5", label: "Wiki" },
+    ])("keeps $label selected on the detail route $detail", ({ detail, label }) => {
+      render(
+        <MemoryRouter initialEntries={[detail]}>
+          <NavigationRail
+            healthStatus={mockHealthStatus}
+          />
+        </MemoryRouter>
+      );
+
+      const detailLink = screen.getByLabelText(label);
+      expect(detailLink).toHaveAttribute("aria-current", "page");
+      expect(detailLink).toHaveClass("bg-accent");
+    });
   });
 
   describe("Interactions", () => {

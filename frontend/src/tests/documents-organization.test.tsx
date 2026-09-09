@@ -170,7 +170,7 @@ describe("useBulkSelection", () => {
 
   it("selects, toggles, and clears when enabled", () => {
     const { result } = renderHook(() => useBulkSelection(true));
-    act(() => result.current.selectAll(["a", "b"]));
+    act(() => result.current.selectMany(["a", "b"], true));
     expect(result.current.selectedIds).toEqual(new Set(["a", "b"]));
     act(() => result.current.selectOne("a", false));
     expect(result.current.selectedIds).toEqual(new Set(["b"]));
@@ -178,9 +178,18 @@ describe("useBulkSelection", () => {
     expect(result.current.selectedIds.size).toBe(0);
   });
 
+  it("selectMany adds without dropping ids outside the batch and removes only the batch", () => {
+    const { result } = renderHook(() => useBulkSelection(true));
+    act(() => result.current.selectMany(["a"], true));
+    act(() => result.current.selectMany(["b", "c"], true));
+    expect(result.current.selectedIds).toEqual(new Set(["a", "b", "c"]));
+    act(() => result.current.selectMany(["b"], false));
+    expect(result.current.selectedIds).toEqual(new Set(["a", "c"]));
+  });
+
   it("ignores mutations when disabled", () => {
     const { result } = renderHook(() => useBulkSelection(false));
-    act(() => result.current.selectAll(["a", "b"]));
+    act(() => result.current.selectMany(["a", "b"], true));
     expect(result.current.selectedIds.size).toBe(0);
     act(() => result.current.selectOne("a", true));
     expect(result.current.selectedIds.size).toBe(0);

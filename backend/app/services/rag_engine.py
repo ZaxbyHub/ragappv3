@@ -238,6 +238,19 @@ def _raw_rag_required(query_type: str, wiki_evidence: List[Any]) -> bool:
     return True
 
 
+def _document_scope_filter_expr(document_ids: List[int]) -> str:
+    """LanceDB filter expression restricting retrieval to the given file ids.
+
+    Companion of the metadata_filter resolution (issue #514 PRODUCT-ENH-05):
+    chunk ``file_id`` values are stored as strings, so the ids are quoted the
+    same way ``metadata_filter`` quotes its resolved set. Callers must pass a
+    non-empty scope — ``query()`` gates on ``if document_ids:``, so an empty
+    list means "no scope requested" (whole-vault retrieval), never a filter.
+    """
+    quoted = ", ".join(f"'{int(file_id)}'" for file_id in document_ids)
+    return f"file_id IN ({quoted})"
+
+
 class RAGEngine:
     """Coordinates embeddings, vector search, memory search, and LLM responses."""
 
@@ -718,6 +731,7 @@ class RAGEngine:
         include_global: bool = False,
         can_write_memory: bool = False,
         vision_context: Optional[VisionRunContext] = None,
+        document_ids: Optional[List[int]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute a RAG query: embed, search, build prompt, call LLM.
 
@@ -738,6 +752,13 @@ class RAGEngine:
                 user gets a feedback chunk instead. Callers MUST verify the
                 user has write access to ``vault_id`` (or is an admin when
                 ``vault_id is None``) before passing True (issue #404).
+            document_ids: Optional document scope ("ask about this document",
+                issue #514 PRODUCT-ENH-05). Restricts retrieval to the named
+                file ids by ANDing a ``file_id IN (...)`` expression into the
+                same filter the metadata_filter resolves to. Never widens
+                access: vector_store.search applies the vault scope
+                independently, so a scope naming ids outside the vault simply
+                retrieves nothing for them (fail-closed).
         """
         if require_vault and vault_id is None:
             raise ValueError(
@@ -769,6 +790,22 @@ class RAGEngine:
         except Exception as exc:  # noqa: BLE001 — validation errors surface above
             logger.warning("[query] metadata_filter rejected: %s", exc)
             raise
+        # Document scope (issue #514 PRODUCT-ENH-05): resolved into the SAME
+        # local filter expression so every retrieval seam below — the agentic
+        # RetrievalTool, multi-sub-query orchestration, and the standard
+        # single-query path — inherits the restriction without any per-seam
+        # threading. Local by the same PRR-001 rule as the controls above.
+        if document_ids:
+            scope_expr = _document_scope_filter_expr(document_ids)
+            active_filter_expr = (
+                f"{active_filter_expr} AND {scope_expr}"
+                if active_filter_expr is not None
+                else scope_expr
+            )
+            logger.info(
+                "[query] document scope applied (%d ids)",
+                len(document_ids),
+            )
         if retrieval_mode is not None:
             logger.info("[query] retrieval_mode=%s", retrieval_mode)
         if citation_mode is not None:
@@ -1527,6 +1564,23 @@ class RAGEngine:
             logger.warning(
                 "Failed to fetch indexed_file_ids (visibility filter disabled): %s", _exc
             )
+
+        # Explicit document scope: a partially-indexed scoped document still has
+        # its succeeded chunks in the vector store and the detail page offers
+        # "Ask about this document" for it, so admit those ids into the
+        # visibility set — otherwise filter_relevant would strip every hit and
+        # the scoped question would come back ungrounded. Unscoped retrieval is
+        # unchanged (partial files stay hidden, Issue #13 semantics).
+        if document_ids and indexed_file_ids is not None:
+            try:
+                scoped_partial = await asyncio.to_thread(
+                    self._get_scoped_partial_file_ids, document_ids, vault_id
+                )
+                indexed_file_ids = set(indexed_file_ids) | scoped_partial
+            except Exception as _exc:
+                logger.warning(
+                    "Failed to admit partial scoped files (filter unchanged): %s", _exc
+                )
 
         # Capture retrieval-phase trace stats before filtering.
         trace.fused_hits = len(vector_results)
@@ -3398,6 +3452,44 @@ class RAGEngine:
         except Exception as exc:
             logger.debug("_get_indexed_file_ids failed: %s", exc)
             return None
+
+    def _get_scoped_partial_file_ids(
+        self, document_ids: List[int], vault_id: Optional[int]
+    ) -> Set[str]:
+        """Return the subset of ``document_ids`` whose files have status='partial'.
+
+        Companion of the document-scope seam in ``query()``: a partial file's
+        succeeded segments are searchable when the user explicitly names the
+        file, so those ids join the visibility set. The vault constraint mirrors
+        ``_get_indexed_file_ids`` so an out-of-vault id can never be admitted
+        through this path. Returns an empty set on lookup failure (the caller
+        keeps the unscoped-visibility filter rather than widening it).
+        """
+        if not document_ids:
+            return set()
+        try:
+            pool = _get_pool()
+            conn = pool.get_connection()
+            try:
+                placeholders = ",".join("?" * len(document_ids))
+                if vault_id is not None:
+                    cursor = conn.execute(
+                        "SELECT id FROM files WHERE status='partial' "
+                        f"AND vault_id=? AND id IN ({placeholders})",  # nosec B608 — placeholders is a fixed '?,?,...' literal, ids are bound
+                        (vault_id, *document_ids),
+                    )
+                else:
+                    cursor = conn.execute(
+                        f"SELECT id FROM files WHERE status='partial' AND id IN ({placeholders})",  # nosec B608 — placeholders is a fixed '?,?,...' literal, ids are bound
+                        tuple(document_ids),
+                    )
+                rows = cursor.fetchall()
+                return {str(row["id"]) for row in rows}
+            finally:
+                pool.release_connection(conn)
+        except Exception as exc:
+            logger.debug("_get_scoped_partial_file_ids failed: %s", exc)
+            return set()
 
     def _expand_parent_windows(self, sources: List[RAGSource]) -> List[RAGSource]:
         """Populate parent_window_text on each source when available (Issue #12).

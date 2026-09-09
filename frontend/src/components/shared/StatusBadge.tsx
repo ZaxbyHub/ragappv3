@@ -6,6 +6,8 @@ export const FILE_STATUS_LABELS: Record<string, string> = {
   pending: "Pending",
   processing: "Processing",
   indexed: "Indexed",
+  /** Pipeline finished with embedding failures (LIVE-03) — completed-with-failures, never pending. */
+  partial: "Partial",
   error: "Error",
 };
 
@@ -13,6 +15,7 @@ export const FILE_STATUS_COLORS: Record<string, { variant: "default" | "secondar
   pending: { variant: "outline", className: "", icon: Clock },
   processing: { variant: "secondary", className: "", icon: Loader2 },
   indexed: { variant: "default", className: "bg-success", icon: CheckCircle },
+  partial: { variant: "default", className: "bg-warning", icon: AlertTriangle },
   error: { variant: "destructive", className: "", icon: AlertCircle },
 };
 

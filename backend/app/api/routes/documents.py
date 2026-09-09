@@ -407,6 +407,14 @@ class DocumentResponse(BaseModel):
     # file's chunk-embedding centroid is near-identical to another file's in
     # the vault. Purely informational — null when no group was assigned.
     near_duplicate_group: Optional[str] = None
+    # Truthful partial-success marker (issue #514 AC19): 1 when ingest
+    # completed with at least one failed chunk while retrievable content
+    # exists (mirrors files.partial_embeddings).
+    partial_embeddings: Optional[int] = 0
+    # Structured parse-quality diagnostics (issue #514 PRODUCT-ENH-06):
+    # page coverage / low-content pages / OCR use / recovered structures.
+    # None until a diagnostics-aware parse has run for the file.
+    extraction_diagnostics: Optional[dict] = None
     metadata: Optional[dict] = None  # Frontend expects metadata
     tags: List[dict] = Field(default_factory=list)  # Assigned organization tags
     folder_id: Optional[int] = None  # Folder the document is filed in (null = unfiled)
@@ -616,6 +624,21 @@ def _clear_near_duplicate_centroid(conn: sqlite3.Connection, file_id: int) -> No
         )
 
 
+def _parse_extraction_diagnostics(raw: Optional[str]) -> Optional[dict]:
+    """Parse ``files.extraction_diagnostics`` JSON into a dict.
+
+    Degrades to None on a malformed or legacy (non-dict) value — diagnostics
+    are advisory parse metadata and must never fail a status/list read.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     """Convert a database row to a DocumentResponse."""
     keys = row.keys()
@@ -659,6 +682,18 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     enrichment_status = row["enrichment_status"] if "enrichment_status" in keys else None
     enrichment_error = row["enrichment_error"] if "enrichment_error" in keys else None
     folder_id = row["folder_id"] if "folder_id" in keys else None
+    # Partial-success marker + parse-quality diagnostics (issues #514
+    # AC19/PRODUCT-ENH-06). The diagnostics column holds the JSON the parse
+    # stage persisted; a malformed/legacy value degrades to None rather than
+    # failing the read.
+    partial_embeddings = (
+        int(row["partial_embeddings"] or 0)
+        if "partial_embeddings" in keys
+        else 0
+    )
+    extraction_diagnostics = _parse_extraction_diagnostics(
+        row["extraction_diagnostics"] if "extraction_diagnostics" in keys else None
+    )
 
     # Per-file enrichment override
     file_enrichment_raw = row["enrichment_enabled"] if "enrichment_enabled" in keys else None
@@ -707,6 +742,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
         enrichment_error=enrichment_error,
         enrichment_enabled=file_enrichment_override,
         effective_enrichment_enabled=effective_enrichment,
+        partial_embeddings=partial_embeddings,
+        extraction_diagnostics=extraction_diagnostics,
         folder_id=folder_id,
         metadata={
             "status": status,
@@ -729,6 +766,8 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
             "enrichment_error": enrichment_error,
             "enrichment_enabled": file_enrichment_override,
             "effective_enrichment_enabled": effective_enrichment,
+            "partial_embeddings": partial_embeddings,
+            "extraction_diagnostics": extraction_diagnostics,
         },
     )
 
@@ -868,6 +907,7 @@ async def list_documents(
                    progress_percent, processed_units, total_units, unit_label,
                    phase_started_at, processing_started_at, enrichment_status,
                    enrichment_error, enrichment_enabled, vault_id, folder_id,
+                   partial_embeddings, extraction_diagnostics,
                    (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
                    (SELECT COALESCE(json_group_array(chunk_index), '[]')
                     FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
@@ -901,6 +941,7 @@ async def list_documents(
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
                        enrichment_error, enrichment_enabled, vault_id, folder_id,
+                   partial_embeddings, extraction_diagnostics,
                        (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
                        (SELECT COALESCE(json_group_array(chunk_index), '[]')
                         FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
@@ -928,6 +969,7 @@ async def list_documents(
                        progress_percent, processed_units, total_units, unit_label,
                        phase_started_at, processing_started_at, enrichment_status,
                        enrichment_error, enrichment_enabled, vault_id, folder_id,
+                   partial_embeddings, extraction_diagnostics,
                        (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
                        (SELECT COALESCE(json_group_array(chunk_index), '[]')
                         FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids
@@ -994,12 +1036,225 @@ class DocumentStatusResponse(BaseModel):
     phase_started_at: Optional[str] = None
     processing_started_at: Optional[str] = None
     elapsed_seconds: Optional[float] = None
+    # Truthful partial-success marker (issue #514 AC19): 1 when ingest
+    # completed with at least one failed chunk while retrievable content
+    # exists (mirrors files.partial_embeddings).
+    partial_embeddings: Optional[int] = 0
+    # Structured parse-quality diagnostics (issue #514 PRODUCT-ENH-06):
+    # page coverage / low-content pages / OCR use / recovered structures.
+    # None until a diagnostics-aware parse has run for the file.
+    extraction_diagnostics: Optional[dict] = None
     # Wiki state (derived)
     wiki_status: Optional[str] = None
     wiki_phase: Optional[str] = None
     wiki_job_id: Optional[int] = None
     enrichment_status: Optional[str] = None
     enrichment_error: Optional[str] = None
+
+
+class DocumentBatchedStatusEntry(BaseModel):
+    """One per-id entry in the batched status response (issue #514 FU-008).
+
+    Every requested id yields exactly one entry — unknown or unauthorized ids
+    get an entry carrying ``error`` (never a global batch failure) — and each
+    entry carries its ``id`` so clients can key results and tolerate
+    out-of-order responses. Per-file fields stay null on error entries.
+    """
+
+    id: int
+    status: Optional[str] = None
+    filename: Optional[str] = None  # parity with the per-file status payload
+    searchable: Optional[bool] = None  # True iff status == "indexed"
+    chunk_count: int = 0
+    phase: Optional[str] = None
+    progress_percent: Optional[float] = None
+    wiki_status: Optional[str] = None
+    kms_status: Optional[str] = None
+    partial_embeddings: Optional[int] = 0
+    extraction_diagnostics: Optional[dict] = None
+    error_message: Optional[str] = None
+    error: Optional[str] = None
+
+
+class DocumentBatchedStatusResponse(BaseModel):
+    """Batched per-id status response (issue #514 FU-008).
+
+    ``results`` carries one entry per requested id in request order; the
+    per-id error entries are repeated under ``errors`` for clients that
+    prefer a grouped view. The names match the batched entry list the frozen
+    C18 contract accepts (``results``)."""
+
+    results: List[DocumentBatchedStatusEntry] = Field(default_factory=list)
+    errors: List[DocumentBatchedStatusEntry] = Field(default_factory=list)
+
+
+# Documented cap for the batched status route: bounds the IN (...) fan-out and
+# the per-request work so one polling client cannot request unbounded ids.
+BATCHED_STATUS_MAX_IDS = 100
+
+
+def _latest_compile_job_statuses(
+    conn: sqlite3.Connection, table: str, file_ids: List[int]
+) -> dict:
+    """Latest per-file compile-job status keyed by int file id.
+
+    Shared by the batched status route for ``wiki_compile_jobs`` and
+    ``kms_compile_jobs``: both queues tag per-file ingest jobs with
+    trigger_id ``file:<id>`` (see DocumentProcessor's ingest enqueue). Rows
+    are read in ascending id order so the last job per file wins, matching
+    the per-file route's ``ORDER BY id DESC LIMIT 1`` derivation.
+    """
+    if not file_ids:
+        return {}
+    placeholders = ",".join("?" * len(file_ids))
+    triggers = [f"file:{fid}" for fid in file_ids]
+    try:
+        rows = conn.execute(
+            f"SELECT trigger_id, status FROM {table} "  # nosec B608 — table is a fixed literal passed only from this module
+            f"WHERE trigger_id IN ({placeholders}) ORDER BY id ASC",
+            triggers,
+        ).fetchall()
+    except sqlite3.Error:
+        # Compile-job tables may not exist on very old fixtures; treat as no job.
+        return {}
+    latest: dict[int, str] = {}
+    for row in rows:
+        trigger = str(row["trigger_id"])
+        try:
+            fid = int(trigger.split(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        latest[fid] = row["status"]
+    return latest
+
+
+@router.get("/status", response_model=DocumentBatchedStatusResponse)
+async def get_documents_status_batched(
+    ids: str = Query(
+        ..., description="Comma-separated file ids (max 100 per request)"
+    ),
+    vault_id: Optional[int] = Query(
+        None, description="Scope to a vault (same semantics as the list route)"
+    ),
+    conn: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_user_or_service_account),
+    evaluate: Callable = Depends(get_evaluate_policy),
+):
+    """Batched per-id ingest status for the upload-monitoring poller (issue
+    #514 FU-008): one round-trip replaces N per-file status requests while
+    attachments are pending.
+
+    Mirrors the per-file status route's dependency stack and derivations
+    (searchable state, phase progress, wiki status incl. the wiki_pending
+    window, kms status from kms_compile_jobs when a per-file job exists).
+    Unknown or unauthorized ids yield per-id error entries — a bad id never
+    fails the batch. This literal route MUST stay declared ABOVE the
+    ``/{file_id}`` routes: FastAPI matches in declaration order, so a
+    later-declared ``/status`` would fall through to ``/{file_id}`` and 422
+    on the int parse.
+    """
+    tokens = [token.strip() for token in ids.split(",") if token.strip()]
+    if not tokens:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one file id is required",
+        )
+    if len(tokens) > BATCHED_STATUS_MAX_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"At most {BATCHED_STATUS_MAX_IDS} ids per request "
+                f"(got {len(tokens)})"
+            ),
+        )
+    requested: List[int] = []
+    for token in tokens:
+        try:
+            requested.append(int(token))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid file id: {token!r}"
+            ) from None
+    # Dedupe preserving request order so one entry is emitted per id.
+    deduped = list(dict.fromkeys(requested))
+
+    if vault_id is not None and not await evaluate(user, "vault", vault_id, "read"):
+        raise HTTPException(status_code=403, detail="Access denied to vault")
+
+    placeholders = ",".join("?" * len(deduped))
+    cursor = await asyncio.to_thread(
+        conn.execute,
+        f"""
+        SELECT id, file_name AS filename, vault_id, status, chunk_count, phase,
+               progress_percent, wiki_pending, error_message,
+               partial_embeddings, extraction_diagnostics
+        FROM files WHERE id IN ({placeholders})
+        """,
+        tuple(deduped),
+    )
+    rows = {row["id"]: row for row in await asyncio.to_thread(cursor.fetchall)}
+
+    # Vault read checks, one evaluation per distinct vault of the found files
+    # (same per-file route semantics, batched).
+    vault_read: dict = {}
+    for vault in sorted({row["vault_id"] for row in rows.values()}):
+        vault_read[vault] = await evaluate(user, "vault", vault, "read")
+
+    wiki_statuses = await asyncio.to_thread(
+        _latest_compile_job_statuses, conn, "wiki_compile_jobs", deduped
+    )
+    kms_statuses = await asyncio.to_thread(
+        _latest_compile_job_statuses, conn, "kms_compile_jobs", deduped
+    )
+
+    results: List[DocumentBatchedStatusEntry] = []
+    error_entries: List[DocumentBatchedStatusEntry] = []
+    for fid in deduped:
+        row = rows.get(fid)
+        if row is None:
+            entry = DocumentBatchedStatusEntry(id=fid, error="Document not found")
+        elif vault_id is not None and row["vault_id"] != vault_id:
+            # Explicit vault scope: an out-of-vault id reports as not found
+            # rather than disclosing cross-vault existence.
+            entry = DocumentBatchedStatusEntry(id=fid, error="Document not found")
+        elif not vault_read.get(row["vault_id"], False):
+            # Same uniform wording as "not found": the batch never reveals
+            # whether an unreadable id exists (the one-at-a-time per-file route
+            # keeps its pre-existing 404/403 split, so this batched endpoint
+            # must not become a 100-at-a-time existence oracle).
+            entry = DocumentBatchedStatusEntry(id=fid, error="Document not found")
+        else:
+            wiki_status = wiki_statuses.get(fid)
+            if wiki_status is None and row["wiki_pending"]:
+                # Processor signalled intent but no job row has appeared yet —
+                # same pending window as the per-file route.
+                wiki_status = "pending"
+            entry = DocumentBatchedStatusEntry(
+                id=fid,
+                status=row["status"],
+                filename=row["filename"],
+                # ``searchable`` means fully indexed. A ``partial`` document is
+                # not searchable in unscoped retrieval (Issue #13 atomic
+                # visibility), but its embedded segments remain chat-eligible
+                # when explicitly named in a document scope — see RAGEngine
+                # query()'s scoped-partial admission in rag_engine.py.
+                searchable=row["status"] == "indexed",
+                chunk_count=row["chunk_count"] or 0,
+                phase=row["phase"],
+                progress_percent=row["progress_percent"],
+                wiki_status=wiki_status,
+                kms_status=kms_statuses.get(fid),
+                partial_embeddings=int(row["partial_embeddings"] or 0),
+                extraction_diagnostics=_parse_extraction_diagnostics(
+                    row["extraction_diagnostics"]
+                ),
+                error_message=row["error_message"],
+            )
+        results.append(entry)
+        if entry.error:
+            error_entries.append(entry)
+
+    return DocumentBatchedStatusResponse(results=results, errors=error_entries)
 
 
 @router.get("/{file_id}/status", response_model=DocumentStatusResponse)
@@ -1023,7 +1278,7 @@ async def get_document_status(
                processed_at, phase, phase_message, progress_percent,
                processed_units, total_units, unit_label, phase_started_at,
                processing_started_at, wiki_pending, enrichment_status,
-               enrichment_error
+               enrichment_error, partial_embeddings, extraction_diagnostics
         FROM files WHERE id = ?
         """,
         (file_id,),
@@ -1115,6 +1370,10 @@ async def get_document_status(
         phase_started_at=_safe_get(row, "phase_started_at"),
         processing_started_at=_safe_get(row, "processing_started_at"),
         elapsed_seconds=elapsed_seconds,
+        partial_embeddings=int(_safe_get(row, "partial_embeddings", 0) or 0),
+        extraction_diagnostics=_parse_extraction_diagnostics(
+            _safe_get(row, "extraction_diagnostics")
+        ),
         wiki_status=wiki_status,
         wiki_phase=wiki_phase,
         wiki_job_id=wiki_job_id,
@@ -1630,7 +1889,8 @@ async def get_document(
                created_at, processed_at, error_message, phase, phase_message,
                progress_percent, processed_units, total_units, unit_label,
                phase_started_at, processing_started_at, enrichment_status,
-               enrichment_error, enrichment_enabled,
+               enrichment_error, enrichment_enabled, partial_embeddings,
+               extraction_diagnostics,
                (SELECT COUNT(*) FROM failed_chunks WHERE file_id = files.id) AS failed_chunks,
                (SELECT COALESCE(json_group_array(chunk_index), '[]')
                 FROM failed_chunks WHERE file_id = files.id) AS failed_chunk_ids

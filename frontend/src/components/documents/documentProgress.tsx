@@ -16,14 +16,25 @@ export function documentProgress(doc: Document) {
   const phase = documentField<string>(doc, "phase");
   const phaseMessage = documentField<string>(doc, "phase_message");
   const errorMessage = documentField<string>(doc, "error_message");
+  const chunksFailed = documentField<number>(doc, "chunks_failed");
   const progressPercent = documentField<number>(doc, "progress_percent");
   const processedUnits = documentField<number>(doc, "processed_units");
   const totalUnits = documentField<number>(doc, "total_units");
   const unitLabel = documentField<string>(doc, "unit_label");
   const isFailed = status === "error" || status === "failed";
   const isActive = status === "pending" || status === "processing";
-  const label =
-    phaseMessage ?? phase ?? (isFailed ? "Failed" : status === "indexed" ? "Complete" : "Waiting");
+  // LIVE-03: "partial" is a terminal completed-with-failures state — the
+  // pipeline finished but some chunks failed to embed. Never render it as a
+  // pending/"Waiting" state.
+  const isPartial = status === "partial";
+  const failureDescription =
+    errorMessage ??
+    (chunksFailed != null && chunksFailed > 0
+      ? `${chunksFailed.toLocaleString()} chunks failed to embed`
+      : null);
+  const label = isPartial
+    ? failureDescription ?? "Completed with failures"
+    : phaseMessage ?? phase ?? (isFailed ? "Failed" : status === "indexed" ? "Complete" : "Waiting");
   const unitsText =
     processedUnits != null && totalUnits != null
       ? `${processedUnits.toLocaleString()} / ${totalUnits.toLocaleString()} ${
@@ -33,13 +44,21 @@ export function documentProgress(doc: Document) {
 
   return {
     errorMessage,
+    failureDescription,
     isActive,
     isFailed,
+    isPartial,
     label,
     progressPercent,
-    title: isFailed && errorMessage ? errorMessage : label,
+    title:
+      isFailed && errorMessage
+        ? errorMessage
+        : isPartial && failureDescription
+          ? failureDescription
+          : label,
     unitsText,
-    shouldRender: isActive || isFailed || progressPercent != null || Boolean(phaseMessage || phase),
+    shouldRender:
+      isActive || isFailed || isPartial || progressPercent != null || Boolean(phaseMessage || phase),
   };
 }
 
@@ -56,7 +75,11 @@ export function DocumentProgressCell({ doc }: { doc: Document }) {
         <span
           className={cn(
             "truncate",
-            progress.isFailed ? "text-destructive" : "text-muted-foreground"
+            progress.isFailed
+              ? "text-destructive"
+              : progress.isPartial
+                ? "text-warning"
+                : "text-muted-foreground"
           )}
         >
           {progress.label}
@@ -68,7 +91,7 @@ export function DocumentProgressCell({ doc }: { doc: Document }) {
           </span>
         )}
       </div>
-      {!progress.isFailed && (
+      {!progress.isFailed && !progress.isPartial && (
         <Progress
           value={progress.progressPercent ?? undefined}
           className="h-1.5"

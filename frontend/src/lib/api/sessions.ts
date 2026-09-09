@@ -189,6 +189,7 @@ export function chatStream(
   retrievalMode?: string,
   citationMode?: string,
   metadataFilter?: ChatMetadataFilter,
+  documentIds?: number[],
 ): () => void {
   const abortController = new AbortController();
   // Build the request body once and reuse for both the initial POST and
@@ -201,6 +202,10 @@ export function chatStream(
     ...(retrievalMode != null && { retrieval_mode: retrievalMode }),
     ...(citationMode != null && { citation_mode: citationMode }),
     ...(metadataFilter != null && { metadata_filter: metadataFilter }),
+    // Document scope (issue #514 AC-23): restricts retrieval to the scoped
+    // documents' chunks. Omitted entirely when unset so old backends never
+    // see an empty list.
+    ...(documentIds != null && documentIds.length > 0 && { document_ids: documentIds }),
   });
 
   const startStream = async () => {
