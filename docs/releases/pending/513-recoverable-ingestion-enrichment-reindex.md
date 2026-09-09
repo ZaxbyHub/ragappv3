@@ -5,13 +5,13 @@
 ### User-visible behavior
 
 - **Truthful partial-ingest status.** An ingest that completes with failed
-  chunks no longer reports plain success: the file lands in status `indexed`
-  with a new `files.partial_embeddings` marker (`chunks_failed > 0`), so
-  "indexed but incomplete" is distinguishable from full success and remains
-  retryable. The `files.status` CHECK is widened with a RESERVED `partial`
-  value; this design never writes it, and the migration remaps any
-  interim-design row to `indexed` + `partial_embeddings = 1`. Success
-  transitions also clear the attempt-scoped `error_message`.
+  chunks no longer reports plain success. The upload/reindex path
+  (`process_existing_file`) writes status `partial` when `chunks_failed > 0`;
+  the scan/sync path (`process_file`) keeps status `indexed` and sets the new
+  `files.partial_embeddings = 1` marker. Either way, "indexed but incomplete"
+  is distinguishable from full success and remains retryable. The
+  `files.status` CHECK is widened to allow `partial`. Success transitions
+  also clear the attempt-scoped `error_message`.
 - **Reindex interruption is an explicit, recoverable state.** A restart (or
   shutdown) no longer leaves `document_reindex_jobs` rows stranded as
   `running`: they are marked `interrupted` — a terminal, operator-visible
@@ -126,14 +126,19 @@
   `document_near_dups` table, the `partial_embeddings` column, and the
   widened CHECKs are inert for old code (old code simply never reads or
   writes them).
-- Operator note: the reserved status values (`files.status='partial'`,
-  `document_reindex_jobs.status='interrupted'`) are not written by this
-  design — `partial` is CHECK-reserved only, and `interrupted` rows can occur
-  after any restart mid-reindex. Before downgrading with such rows present,
-  map them back to vocabulary the previous deploy understands:
-  - `UPDATE files SET partial_embeddings = 0 WHERE partial_embeddings = 1;`
-    (the marker column is ignored by old code, but clearing it keeps rows
-    byte-identical to a pre-upgrade state; optional);
+- Operator note: this design DOES write both new status values —
+  `files.status='partial'` (upload/reindex-path ingests that complete with
+  `chunks_failed > 0`) and `document_reindex_jobs.status='interrupted'`
+  (rows a restart/shutdown caught mid-reindex). Before downgrading with such
+  rows present, map them back to vocabulary the previous deploy understands
+  (old code filters on `'pending'/'processing'/'indexed'/'error'` and would
+  never match these):
+  - `UPDATE files SET status = 'indexed' WHERE status = 'partial';`
+    (required — a `partial` row is invisible to the previous deploy's
+    filters; the `partial_embeddings` marker column is inert for old code);
+    optionally also
+    `UPDATE files SET partial_embeddings = 0 WHERE partial_embeddings = 1;`
+    to keep rows byte-identical to a pre-upgrade state;
   - `UPDATE document_reindex_jobs SET status = 'failed', error = COALESCE(error, 'interrupted pre-rollback') WHERE status = 'interrupted';`
     — an `interrupted` row would otherwise never match the old deploy's
     status filters.
@@ -166,8 +171,10 @@
 
 ## Operator-visible outcomes
 
-- Files that indexed with failures now show `partial_embeddings` instead of
-  a silent success, and per-file retry repairs them without re-parsing.
+- Files that indexed with failures now show a truthful incomplete state
+  instead of a silent success: upload-path ingests land in status `partial`,
+  scan/sync ingests in status `indexed` with the `partial_embeddings` flag
+  set — and per-file retry repairs them without re-parsing.
 - After a restart, the documents and reindex job lists show interrupted
   reindex jobs as `interrupted` (re-enqueueable) instead of a stuck
   `running` row; upload orphans recover within one rescan interval
