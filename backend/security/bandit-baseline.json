@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 69,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 69547,
+      "loc": 69452,
       "nosec": 0,
       "skipped_tests": 29
     },
@@ -959,7 +959,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1230,
+      "loc": 1135,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3473,9 +3473,29 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "561         # frozen snapshot so the key describes the issuing configuration).\n562         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n563         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n",
+      "code": "560         # frozen snapshot so the key describes the issuing configuration).\n561         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n562         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n",
       "col_offset": 28,
       "end_col_offset": 69,
+      "filename": "backend/app/services/embeddings.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 327,
+        "link": "https://cwe.mitre.org/data/definitions/327.html"
+      },
+      "issue_severity": "HIGH",
+      "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
+      "line_number": 561,
+      "line_range": [
+        561
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
+      "test_id": "B324",
+      "test_name": "hashlib"
+    },
+    {
+      "code": "561         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n562         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n563         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n",
+      "col_offset": 26,
+      "end_col_offset": 65,
       "filename": "backend/app/services/embeddings.py",
       "issue_confidence": "HIGH",
       "issue_cwe": {
@@ -3493,9 +3513,9 @@
       "test_name": "hashlib"
     },
     {
-      "code": "562         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n563         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n564         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n",
-      "col_offset": 26,
-      "end_col_offset": 65,
+      "code": "562         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n563         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n564         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n",
+      "col_offset": 29,
+      "end_col_offset": 72,
       "filename": "backend/app/services/embeddings.py",
       "issue_confidence": "HIGH",
       "issue_cwe": {
@@ -3513,9 +3533,9 @@
       "test_name": "hashlib"
     },
     {
-      "code": "563         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n564         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n565         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n",
-      "col_offset": 29,
-      "end_col_offset": 72,
+      "code": "563         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n564         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n565 \n",
+      "col_offset": 82,
+      "end_col_offset": 124,
       "filename": "backend/app/services/embeddings.py",
       "issue_confidence": "HIGH",
       "issue_cwe": {
@@ -3533,27 +3553,7 @@
       "test_name": "hashlib"
     },
     {
-      "code": "564         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n565         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n566 \n",
-      "col_offset": 82,
-      "end_col_offset": 124,
-      "filename": "backend/app/services/embeddings.py",
-      "issue_confidence": "HIGH",
-      "issue_cwe": {
-        "id": 327,
-        "link": "https://cwe.mitre.org/data/definitions/327.html"
-      },
-      "issue_severity": "HIGH",
-      "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 565,
-      "line_range": [
-        565
-      ],
-      "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
-      "test_id": "B324",
-      "test_name": "hashlib"
-    },
-    {
-      "code": "995                 )\n996         except Exception:\n997             pass  # Silently ignore any errors accessing internal pool state\n998 \n",
+      "code": "994                 )\n995         except Exception:\n996             pass  # Silently ignore any errors accessing internal pool state\n997 \n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/services/embeddings.py",
@@ -3564,10 +3564,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 996,
+      "line_number": 995,
       "line_range": [
-        996,
-        997
+        995,
+        996
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
