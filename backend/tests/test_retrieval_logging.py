@@ -12,14 +12,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # Stub missing optional dependencies before importing
 import types
 
-# Stub lancedb properly with index submodule
-_lancedb = types.ModuleType("lancedb")
-_lancedb_index = types.ModuleType("lancedb.index")
-_lancedb_index.IvfPq = type("IvfPq", (), {})
-_lancedb_index.FTS = type("FTS", (), {})
-_lancedb.index = _lancedb_index
-sys.modules["lancedb"] = _lancedb
-sys.modules["lancedb.index"] = _lancedb_index
+# Stub lancedb properly with index submodule — ONLY when the real package
+# is not importable (see test_hybrid_logging.py: an unconditional install
+# would shadow the REAL lancedb for every later-collected module).
+try:
+    import lancedb  # noqa: F401
+except ImportError:
+    _lancedb = types.ModuleType("lancedb")
+    _lancedb_index = types.ModuleType("lancedb.index")
+    _lancedb_index.IvfPq = type("IvfPq", (), {})
+    _lancedb_index.FTS = type("FTS", (), {})
+    _lancedb.index = _lancedb_index
+    sys.modules["lancedb"] = _lancedb
+    sys.modules["lancedb.index"] = _lancedb_index
 
 # Stub unstructured
 _unstructured = types.ModuleType("unstructured")

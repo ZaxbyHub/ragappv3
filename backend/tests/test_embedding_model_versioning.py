@@ -28,6 +28,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # lancedb is a required dependency for these tests - import it early before any stub is installed
 import lancedb  # noqa: E402
 
+
+async def _validate_schema_with_async_handles(vs, uri: str, **validate_kwargs):
+    """Run validate_schema against REAL lancedb's async connection API.
+
+    VectorStore.validate_schema awaits ``db.table_names()`` /
+    ``table.schema()`` — the ASYNC API shapes. With real lancedb the handles
+    from the sync ``lancedb.connect()`` return plain values and cannot be
+    awaited, so re-bind ``vs`` to ``connect_async`` handles over the same
+    on-disk table and validate within this event loop. (Stub environments
+    never call this helper: their ``lancedb.connect`` objects already expose
+    the async-shaped methods.)
+    """
+    vs.db = await lancedb.connect_async(uri)
+    vs.table = await vs.db.open_table("chunks")
+    return await vs.validate_schema(**validate_kwargs)
+
 try:
     from unstructured.partition.auto import partition
 except ImportError:
@@ -336,10 +352,18 @@ class TestValidateSchemaMismatch(TestEmbeddingModelVersioningBase):
         finally:
             conn.close()
 
-        # Call validate_schema with a different model ID
-        result = asyncio.run(vs.validate_schema(
-            embedding_model_id="configured-model-id", embedding_dim=384
-        ))
+        # Call validate_schema with a different model ID. With real lancedb,
+        # validate via async handles (see helper docstring); in stub
+        # environments the sync connect handles already await correctly.
+        if hasattr(lancedb, "connect_async"):
+            result = asyncio.run(_validate_schema_with_async_handles(
+                vs, str(lancedb_path),
+                embedding_model_id="configured-model-id", embedding_dim=384,
+            ))
+        else:
+            result = asyncio.run(vs.validate_schema(
+                embedding_model_id="configured-model-id", embedding_dim=384
+            ))
 
         # Assert _ready is False due to mismatch
         self.assertFalse(vs._ready)
@@ -402,10 +426,17 @@ class TestValidateSchemaMismatch(TestEmbeddingModelVersioningBase):
         finally:
             conn.close()
 
-        # Call validate_schema with matching model ID
-        result = asyncio.run(vs.validate_schema(
-            embedding_model_id=configured_model_id, embedding_dim=384
-        ))
+        # Call validate_schema with matching model ID (async handles under
+        # real lancedb — see _validate_schema_with_async_handles).
+        if hasattr(lancedb, "connect_async"):
+            result = asyncio.run(_validate_schema_with_async_handles(
+                vs, str(lancedb_path),
+                embedding_model_id=configured_model_id, embedding_dim=384,
+            ))
+        else:
+            result = asyncio.run(vs.validate_schema(
+                embedding_model_id=configured_model_id, embedding_dim=384
+            ))
 
         # Assert _ready is True due to match
         self.assertTrue(vs._ready)

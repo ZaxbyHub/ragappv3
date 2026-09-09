@@ -19,14 +19,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # Stub missing optional dependencies before importing app modules
 import types
 
-# Stub lancedb with index submodule
-_lancedb = types.ModuleType("lancedb")
-_lancedb_index = types.ModuleType("lancedb.index")
-_lancedb_index.IvfPq = type("IvfPq", (), {})
-_lancedb_index.FTS = type("FTS", (), {})
-_lancedb.index = _lancedb_index
-sys.modules["lancedb"] = _lancedb
-sys.modules["lancedb.index"] = _lancedb_index
+# Stub lancedb with index submodule — ONLY when the real package is not
+# importable. An unconditional install would shadow the REAL lancedb for
+# every module collected after this one (e.g. the real-engine skip
+# conditions in test_vector_store_search_guard.py evaluate at module import
+# time), inverting their skips in exactly the environments (CI) where the
+# real package is installed.
+try:
+    import lancedb  # noqa: F401
+except ImportError:
+    _lancedb = types.ModuleType("lancedb")
+    _lancedb_index = types.ModuleType("lancedb.index")
+    _lancedb_index.IvfPq = type("IvfPq", (), {})
+    _lancedb_index.FTS = type("FTS", (), {})
+    _lancedb.index = _lancedb_index
+    sys.modules["lancedb"] = _lancedb
+    sys.modules["lancedb.index"] = _lancedb_index
 
 # Stub unstructured
 _unstructured = types.ModuleType("unstructured")

@@ -31,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
+from app.config import settings
 from app.services.vector_store import VectorStore, _lance_escape
 
 # ---------------------------------------------------------------------------
@@ -637,13 +638,22 @@ class TestCrossVaultLeakagePrevention(unittest.IsolatedAsyncioTestCase):
         await store.add_chunks(vault_x_records + vault_y_records)
 
         vault_x_embedding = vault_x_records[0]["embedding"]
-        results = await store.search(
-            embedding=vault_x_embedding,
-            limit=10,
-            vault_id="vault_x",
-            hybrid=False,
-        )
+        # Disable multi-scale search so search() takes the single-scale path.
+        # These records use chunk_scale="default", but the default multi-scale
+        # config queries scales "768,1536" — matching nothing and making the
+        # leakage assertion below vacuous.
+        with patch.object(settings, "multi_scale_indexing_enabled", False):
+            results = await store.search(
+                embedding=vault_x_embedding,
+                limit=10,
+                vault_id="vault_x",
+                hybrid=False,
+            )
 
+        # The filter must actually RETURN vault_x rows (non-vacuous check)...
+        result_vault_ids = {r.get("vault_id") for r in results}
+        self.assertEqual(result_vault_ids, {"vault_x"})
+        # ...and nothing from any other vault.
         for result in results:
             self.assertEqual(
                 result.get("vault_id"),
@@ -692,12 +702,15 @@ class TestCrossVaultLeakagePrevention(unittest.IsolatedAsyncioTestCase):
         await store.add_chunks(vault_p_records + vault_q_records)
 
         embedding = vault_p_records[0]["embedding"]
-        results = await store.search(
-            embedding=embedding,
-            limit=10,
-            vault_id=None,
-            hybrid=False,
-        )
+        # Single-scale path (records are chunk_scale="default"; see
+        # test_search_cross_vault_isolation for why multi-scale must be off).
+        with patch.object(settings, "multi_scale_indexing_enabled", False):
+            results = await store.search(
+                embedding=embedding,
+                limit=10,
+                vault_id=None,
+                hybrid=False,
+            )
 
         result_vault_ids = {r.get("vault_id") for r in results}
         self.assertIn("vault_p", result_vault_ids)
@@ -766,8 +779,11 @@ class TestDeleteByVaultStringInterpolation(unittest.IsolatedAsyncioTestCase):
         remaining_count = await store.table.count_rows()
         self.assertEqual(remaining_count, 2)
 
-        all_remaining = list(await store.table.to_pandas())
-        for row in all_remaining:
+        # to_pandas() returns a pandas DataFrame — iterate its rows as dicts
+        # (iterating the DataFrame itself yields column names).
+        remaining_df = await store.table.to_pandas()
+        self.assertEqual(len(remaining_df), 2)
+        for row in remaining_df.to_dict("records"):
             self.assertEqual(
                 row["vault_id"],
                 "vault_keep",

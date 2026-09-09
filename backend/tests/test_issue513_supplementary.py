@@ -173,10 +173,21 @@ class _FakeIndex:
 
 
 def _schema_names(schema) -> list:
-    """Field names from the backend-conftest pyarrow stub schema shape."""
+    """Field names from a pyarrow schema (real pyarrow or the backend-conftest stub).
+
+    Real pyarrow (CI / any env with the package installed) exposes ``.names``
+    as a property; the backend-conftest stub exposes ``._fields`` and a
+    ``names()`` method. Support both so the fake tables validate records
+    against the same field set the schema actually carries.
+    """
     fields = getattr(schema, "_fields", None)
     if fields is not None:
         return [f[0] if isinstance(f, tuple) else f.name for f in fields]
+    names = getattr(schema, "names", None)
+    if callable(names):  # backend-conftest stub: names() is a method
+        names = names()
+    if names is not None:
+        return list(names)
     return []
 
 

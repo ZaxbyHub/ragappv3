@@ -52,7 +52,18 @@ def _load_real_module(name, deps=None, purge_prefixes=()):
       submodule.
 
     sys.modules is restored afterwards; the returned module keeps working
-    because it was executed under its own name."""
+    because it was executed under its own name.
+
+    When the real package is ALREADY the active sys.modules entry
+    (backend/conftest.py imports lancedb/pyarrow at session start and only
+    stubs them when the real import fails), it is returned as-is: purging and
+    re-executing the real lancedb would re-initialize its Rust extension,
+    which panics on a second initialization in the same process
+    (pyo3 PanicException: env_logger::init_from_env should not be called
+    after logger initialized: SetLoggerError(()))."""
+    current = sys.modules.get(name)
+    if current is not None and getattr(current, "__file__", None):
+        return current
     real_spec = importlib.machinery.PathFinder.find_spec(name)
     if real_spec is None:
         return None

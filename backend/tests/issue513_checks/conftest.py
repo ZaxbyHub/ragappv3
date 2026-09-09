@@ -15,10 +15,11 @@ the same worker process (``-n auto``):
   suppressing every subsequent log record in the process (that alone fails
   the 9 ``test_admin_token_warning`` assertions on emitted CRITICAL logs);
 * checks c9/c28 exercise the REAL vector store (``lancedb.connect_async`` +
-  ``pyarrow`` schemas), which ``backend/conftest.py`` deliberately stubs out
-  for the suite (an environment without the real package) — under the stubs those checks
-  die with ``AttributeError: module 'lancedb' has no attribute
-  'connect_async'``.
+  ``pyarrow`` schemas). ``backend/conftest.py`` leaves the REAL packages in
+  ``sys.modules`` when they are importable (CI and normal local dev); its
+  synthetic stubs are a last resort for environments without the packages —
+  under those stubs the checks die with ``AttributeError: module 'lancedb'
+  has no attribute 'connect_async'``.
 
 This conftest is NOT frozen and does NOT change what any check asserts. It
 only isolates the checks' side effects around each test:
@@ -27,13 +28,12 @@ only isolates the checks' side effects around each test:
    every check test (autouse fixture), and restore the environment once this
    directory finishes collecting (undoing module-level leaks before later
    test modules are imported);
-2. when the real lancedb/pyarrow are importable (local dev — the standalone
-   execution environment of the checks), temporarily install them over the
-   suite stubs for the duration of each check test, re-importing
-   ``app.services.vector_store`` against them, then restore the stubs —
-   exactly the state ``backend/conftest.py`` enforces for the rest of the
-   suite. When the real packages are unavailable (CI), the stubs are left in
-   place and behavior is unchanged.
+2. ensure the real lancedb/pyarrow graphs are installed for the duration of
+   each check test (reusing the already-imported real packages — re-importing
+   lancedb would re-initialize its Rust extension and PANIC with
+   ``pyo3 PanicException``), re-importing ``app.services.vector_store``
+   against them, then restore the graphs ``backend/conftest.py`` authorizes
+   for the rest of the suite (real when importable, stubs otherwise).
 """
 
 from __future__ import annotations
@@ -72,6 +72,15 @@ def _load_real_graph(name: str) -> dict[str, object] | None:
     the previous (stub) graph afterwards. Returns None when the real package
     is not importable (an environment without the real package keeps the stubs and current behavior).
     """
+    current = sys.modules.get(name)
+    if current is not None and getattr(current, "__file__", None):
+        # The real package is already imported — backend/conftest.py imports
+        # lancedb/pyarrow at session start and leaves the real packages in
+        # sys.modules (stubs are a last resort there). NEVER drop and
+        # re-import: lancedb's Rust extension initializes its global logger
+        # at extension initialization and PANICS on a second initialization
+        # in the same process (pyo3 PanicException: SetLoggerError).
+        return _module_graph(name)
     saved = _module_graph(name)
     _drop_module_graph(name)
     try:
@@ -86,7 +95,9 @@ def _load_real_graph(name: str) -> dict[str, object] | None:
     return real
 
 
-# The suite stubs (installed by backend/conftest.py before collection).
+# The graphs backend/conftest.py authorizes for the suite (real packages when
+# importable — captured by _load_real_graph above as an identity short-circuit
+# — synthetic stubs otherwise).
 _STUB_GRAPHS = {name: _module_graph(name) for name in ("lancedb", "pyarrow")}
 
 # Real pyarrow first: lancedb binds pyarrow at import time and must bind the
@@ -105,10 +116,28 @@ if _REAL_PYARROW is not None:
 
 _REAL_GRAPHS_AVAILABLE = _REAL_LANCEDB is not None and _REAL_PYARROW is not None
 
+# The real/stub swap (and the vector_store re-bind pop) is only needed when
+# the suite-authoritative graphs and the real graphs DIFFER (legacy stub
+# environments). When backend/conftest.py already leaves the real packages in
+# sys.modules, the graphs captured in _STUB_GRAPHS ARE the real graphs and
+# swapping is a no-op — but its ``sys.modules.pop("app.services.vector_store")``
+# is pure harm: the re-imported module object diverges from the one test
+# modules already bound at collection, so a later
+# ``patch("app.services.vector_store.x")`` patches a module object whose code
+# never runs (observed as real-settings behavior inside mocked-settings
+# tests). Skip the whole dance when the graphs already agree.
+_SWAP_NEEDED = not (
+    _REAL_GRAPHS_AVAILABLE
+    and all(
+        (_STUB_GRAPHS.get(name) or {}).get(name) is real.get(name)
+        for name, real in (("lancedb", _REAL_LANCEDB), ("pyarrow", _REAL_PYARROW))
+    )
+)
+
 
 def _install_real_optional_deps() -> None:
     """Swap the suite stubs for the real lancedb/pyarrow (checks only)."""
-    if not _REAL_GRAPHS_AVAILABLE:
+    if not _REAL_GRAPHS_AVAILABLE or not _SWAP_NEEDED:
         return
     for name, real in (("pyarrow", _REAL_PYARROW), ("lancedb", _REAL_LANCEDB)):
         _drop_module_graph(name)
@@ -120,7 +149,7 @@ def _install_real_optional_deps() -> None:
 
 def _restore_stub_optional_deps() -> None:
     """Put the suite stubs back and forget the real-bound re-import."""
-    if not _REAL_GRAPHS_AVAILABLE:
+    if not _REAL_GRAPHS_AVAILABLE or not _SWAP_NEEDED:
         return
     for name in ("lancedb", "pyarrow"):
         _drop_module_graph(name)
