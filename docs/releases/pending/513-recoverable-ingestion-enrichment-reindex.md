@@ -56,11 +56,12 @@
   one-embedding-per-text are preserved.
 - **Persistent embedding reuse cache.** Enrichment/retry embeddings are
   looked up in a disk-backed cache (`<data_dir>/embedding_cache.db`) keyed by
-  the immutable embedding contract — model id, serving-URL discriminator,
-  doc prefix, dimension, and normalized text. Byte-identical text under the
-  same contract is never re-embedded (survives restarts); any contract change
-  produces different keys (invalidation by construction). Capacity-bounded
-  LRU (default 50,000 entries).
+  the immutable embedding contract — model id, embedder revision
+  (implementation class + provider mode), doc prefix, dimension, and
+  normalized text. Byte-identical text under the same contract is never
+  re-embedded (survives restarts); any contract change produces different
+  keys (invalidation by construction). Capacity-bounded LRU (default 50,000
+  entries).
 - **Spreadsheet NA preservation.** CSV/Excel parsing passes
   `keep_default_na=False`, so literal cell text like "NA", "N/A", "NULL" is
   kept verbatim instead of being coerced to missing/empty.
@@ -105,7 +106,7 @@
 | `near_dup_threshold` | 0.5–0.999999 | 0.96 |
 | `orphan_rescan_interval_seconds` | 60–86400 | 3600 |
 
-## Rollout
+## Rollout and rollback
 
 - Additive, non-destructive migrations only, journal-backed with the issue
   #512 recovery semantics (rename-recreate-copy inside one `BEGIN IMMEDIATE`,
@@ -119,8 +120,6 @@
     `vault_id` index (fresh databases get it from the base schema).
 - No public API breaks: responses gain the nullable `near_duplicate_group`
   field only; `PUT /settings` semantics unchanged.
-
-## Rollback
 
 - The previous deploy tolerates the additive schema: the extra
   `document_near_dups` table, the `partial_embeddings` column, and the
@@ -156,18 +155,23 @@
   most the 500 most recent other centroids per vault; it never affects
   retrieval, blocking, or deletion. Group data is computed at ingest time —
   files ingested before this change have no centroid until re-ingested.
-  Vault deletion does not currently purge the vault's advisory
-  `document_near_dups` rows (reported gap): the rows linger harmlessly (the
-  comparison is vault-scoped and re-ingest of a reused file id replaces its
-  row) until that file id is re-ingested or the operator clears them.
+  Vault deletion purges the vault's `document_near_dups` rows in the same
+  transaction as the files cascade, and per-document delete clears its row
+  via `clear_file_centroid` — no stale groups survive deletion.
 - **Startup recovery is unconditional for post-parse rows by design.** At
   startup, any `processing` row past the parse stage is treated as an orphan
   and re-enqueued regardless of age; only parse-stage rows keep the
   30-minute age gate. A crashed ingest resumed this way re-runs from the
   recovered entry point, not from its last completed stage.
+- **Atom-proxy writes racing a dimension-migrating reindex are deferred.**
+  During a dimension-migrating reindex, atom proxy writes that race the
+  rebuild window fail their dim check and are deferred (marked
+  `failed_retryable`); they self-heal via the retry/startup-resume
+  machinery after the new index commits, but proxies are not refreshed
+  into the new index as part of the reindex itself.
 - The embedding cache has no TTL — invalidation is exclusively by contract
-  key (model/URL/prefix/dim/text) and capacity pruning (LRU beyond
-  `embedding_cache_max_entries`).
+  key (model/embedder revision/prefix/dim/text) and capacity pruning (LRU
+  beyond `embedding_cache_max_entries`).
 
 ## Operator-visible outcomes
 

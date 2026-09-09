@@ -17,12 +17,13 @@ beyond the frozen acceptance checks:
   dimension-migrating reindex fills the temp table; new-dim rows retrievable
   after the commit swap.
 - Rev-5b: embedding-cache keys change when ANY contract component (model id,
-  url discriminator, doc prefix, dim, text) changes, and a populated cache
+  revision discriminator, doc prefix, dim, text) changes, and a populated cache
   still hits after a simulated restart (fresh module state on the same disk
-  file).
-- Vault-deletion near-dup cleanup: intentionally SKIPPED — see the skip
-  reason on the test (the landed vault delete does not clear
-  ``document_near_dups``; reported as a gap, not implemented here).
+  file) — exercised through the SHIPPED production cache path
+  (``DocumentProcessor._embed_with_cache``).
+- Vault deletion purges the deleted vault's ``document_near_dups`` rows in
+  the same transaction as the files cascade (``delete_vault``) — asserted by
+  invoking the route handler directly against a migrated temp database.
 
 Vector-store tests run against a faithful fake lancedb (the backend conftest
 stubs the real package for the whole suite — same idiom as
@@ -819,22 +820,36 @@ def isolated_embedding_cache(tmp_path, monkeypatch):
 
 
 class _FakeEmbeddingService:
-    """Deterministic provider whose calls are counted (Rev-5b)."""
+    """Deterministic provider whose calls are counted (Rev-5b).
+
+    Each text maps to its own DISTINCT deterministic vector (dyadic k/16
+    components, so values survive the cache's float32 serialization
+    round-trip byte-exactly). The fake exposes none of the identity
+    attributes the production identity helper probes (embedding_model,
+    provider_mode, embedding_doc_prefix, embedding_dim), so
+    ``DocumentProcessor._embedding_cache_identity`` resolves every component
+    from live settings — exactly the fallback path a real service without
+    those attributes takes.
+    """
 
     def __init__(self, dim: int = 4):
         self.dim = dim
         self.calls: list[list[str]] = []
 
+    def vector_for(self, text: str) -> list[float]:
+        seed = sum(ord(ch) for ch in text)
+        return [((seed + 3 * i) % 16) / 16.0 for i in range(self.dim)]
+
     async def embed_batch(self, texts, fail_fast=False):
         self.calls.append(list(texts))
-        return [[0.01] * self.dim for _ in texts], []
+        return [self.vector_for(t) for t in texts], []
 
 
 class TestEmbeddingCacheKeyInvalidation:
     def test_key_changes_when_any_contract_component_changes(
         self, isolated_embedding_cache
     ):
-        """Rev-5b: model id, revision/url discriminator, doc prefix, dim, and
+        """Rev-5b: model id, revision discriminator, doc prefix, dim, and
         the normalized text are ALL part of the key pre-image — changing any
         one changes the key (invalidation by construction)."""
         ec = isolated_embedding_cache
@@ -850,7 +865,7 @@ class TestEmbeddingCacheKeyInvalidation:
         assert ec.embedding_cache_key(**base) == base_key
         variations = {
             "model_id": "model-b",
-            "model_revision": "http://tei:9000",  # the url discriminator slot
+            "model_revision": "http://tei:9000",  # the revision slot
             "doc_prefix": "doc:",
             "dim": 16,
             "normalized_text": "hello  world",
@@ -860,63 +875,129 @@ class TestEmbeddingCacheKeyInvalidation:
             changed[field] = changed_value
             assert ec.embedding_cache_key(**changed) != base_key, field
 
-    async def test_cache_hits_across_simulated_restart_and_invalidates_on_contract_change(
+    async def test_embed_with_cache_hits_across_restart_and_invalidates_on_contract_change(
         self, isolated_embedding_cache
     ):
-        """End-to-end through ``embed_batch_cached``: byte-identical text
-        under the same contract never re-calls the provider (even after a
-        simulated restart with fresh module connection state on the same disk
-        file); changing a contract component misses and re-embeds."""
-        from app.services.embeddings import embed_batch_cached
-
+        """End-to-end through the SHIPPED production cache path
+        (``DocumentProcessor._embed_with_cache``): byte-identical text under
+        the same contract never re-calls the provider (even after a
+        simulated restart with fresh module connection state on the same
+        disk file); changing a contract component misses and re-embeds."""
         ec = isolated_embedding_cache
         service = _FakeEmbeddingService(dim=4)
-        expected = pytest.approx([0.01] * 4)
+        expected = service.vector_for("alpha")
+
+        # Minimal processor: _embed_with_cache consumes only
+        # embedding_service (for misses) and the identity helper (which
+        # reads the same service + live settings).
+        proc = DocumentProcessor.__new__(DocumentProcessor)
+        proc.embedding_service = service
 
         # First call: provider embeds; second call: served from the cache.
-        first, failed1 = await embed_batch_cached(service, ["alpha"])
-        assert first[0] == expected
-        assert failed1 == []
+        first = await DocumentProcessor._embed_with_cache(proc, ["alpha"])
+        assert first == [expected]
         assert service.calls == [["alpha"]]
-        second, failed2 = await embed_batch_cached(service, ["alpha"])
-        assert second[0] == expected
-        assert failed2 == []
+        second = await DocumentProcessor._embed_with_cache(proc, ["alpha"])
+        assert second == [expected]
         assert service.calls == [["alpha"]]  # no second provider call
 
         # Simulated restart: fresh module connection on the same disk file.
         assert ec._conn is not None
         ec._conn.close()
         ec._conn = None
-        third, _failed3 = await embed_batch_cached(service, ["alpha"])
-        assert third[0] == expected
+        third = await DocumentProcessor._embed_with_cache(proc, ["alpha"])
+        assert third == [expected]
         assert service.calls == [["alpha"]]  # disk-backed hit
 
-        # Contract change (the url discriminator): different key → miss.
+        # Contract change (the shipped identity's doc-prefix component):
+        # different key -> miss -> the provider is called again.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(settings, "ollama_embedding_url", "http://other:1234")
-            fourth, _failed4 = await embed_batch_cached(service, ["alpha"])
-        assert fourth[0] == expected
+            mp.setattr(settings, "embedding_doc_prefix", "shifted:")
+            fourth = await DocumentProcessor._embed_with_cache(proc, ["alpha"])
+        assert fourth == [expected]
         assert service.calls == [["alpha"], ["alpha"]]  # re-embedded once
 
+        # A different text is its own key: miss + its own distinct vector.
+        fifth = await DocumentProcessor._embed_with_cache(proc, ["beta"])
+        assert fifth == [service.vector_for("beta")]
+        assert fifth[0] != expected
+        assert service.calls == [["alpha"], ["alpha"], ["beta"]]
+
 
 # ---------------------------------------------------------------------------
-# Vault deletion × document_near_dups (cleanup-gap check — SUPPRESSED)
+# Vault deletion × document_near_dups (purge check)
 # ---------------------------------------------------------------------------
 
 
-def test_vault_deletion_clears_document_near_dups_rows():
-    """Intentionally skipped: the landed ``vaults.delete_vault`` does NOT
-    clear ``document_near_dups`` rows for the deleted vault (the table has no
-    FK/cascade to ``files``, and only the per-document delete /
-    delete-all-purge paths call ``clear_file_centroid``). Per the plan's
-    ownership boundaries this gap is REPORTED rather than fixed here (no app
-    files are owned by this work item). Advisory rows for a deleted vault
-    linger until the same file id is re-ingested."""
-    pytest.skip(
-        "Gap (reported, not implemented): vault deletion does not clear "
-        "document_near_dups rows — app/api/routes/vaults.py delete_vault has "
-        "no near-dup cleanup and the table carries no FK cascade."
-    )
+async def test_vault_deletion_clears_document_near_dups_rows(
+    tmp_path, monkeypatch
+):
+    """Vault delete purges the vault's advisory rows (vaults.delete_vault).
+
+    The landed ``delete_vault`` runs ``DELETE FROM document_near_dups WHERE
+    vault_id = ?`` inside the same ``BEGIN IMMEDIATE`` transaction as the
+    files/vault cascade, so no stale group rows survive vault deletion. The
+    route handler is invoked directly (its ``Depends(...)`` arguments are
+    plain defaults) against a fully migrated temp database, with a null
+    vector store — the relational purge is the behavior under test.
+    """
+    from app.api.routes.vaults import delete_vault
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path)
+
+    db_path = str(tmp_path / "vault.db")
+    _new_db(db_path).close()  # migrated schema + files row id=1 (vault_id=1)
+    # delete_vault executes SQL on worker threads (asyncio.to_thread), so
+    # the connection must be thread-agnostic — the same choice the route
+    # tests' SimpleConnectionPool makes (tests/_db_pool.py).
+    db = sqlite3.connect(db_path, check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    try:
+        # Vault id=1 ("Default") is seeded by the migrations themselves, and
+        # _new_db already inserted a files row (id=1, vault_id=1) for it.
+        db.execute(
+            "INSERT INTO files (vault_id, file_path, file_name, file_hash, file_size, status) "
+            "VALUES (1, '/tmp/y.txt', 'y.txt', 'hy', 1, 'indexed')"
+        )
+        for file_id in (1, 2):
+            db.execute(
+                "INSERT INTO document_near_dups "
+                "(vault_id, file_id, centroid, dim, group_id, similarity) "
+                "VALUES (1, ?, ?, 4, 'shared-group', 0.99)",
+                (file_id, bytes([file_id]) * 16),
+            )
+        db.commit()
+
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_near_dups WHERE vault_id = 1"
+        ).fetchone()[0] == 2
+
+        class _NullVectorStore:
+            async def delete_by_vault(self, vault_id: str) -> int:
+                return 2
+
+        result = await delete_vault(
+            vault_id=1,
+            conn=db,
+            vector_store=_NullVectorStore(),
+            user={"id": 1, "role": "admin"},
+            _csrf_token=None,
+        )
+        assert "deleted successfully" in result["message"]
+
+        # The purge: 2 rows before, 0 after — in the same transaction as
+        # the files/vault cascade, which completed too.
+        assert db.execute(
+            "SELECT COUNT(*) FROM document_near_dups WHERE vault_id = 1"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM files WHERE vault_id = 1"
+        ).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM vaults WHERE id = 1"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ the same worker process (``-n auto``):
   the 9 ``test_admin_token_warning`` assertions on emitted CRITICAL logs);
 * checks c9/c28 exercise the REAL vector store (``lancedb.connect_async`` +
   ``pyarrow`` schemas), which ``backend/conftest.py`` deliberately stubs out
-  for the suite (CI does not install lancedb) — under the stubs those checks
+  for the suite (an environment without the real package) — under the stubs those checks
   die with ``AttributeError: module 'lancedb' has no attribute
   'connect_async'``.
 
@@ -70,7 +70,7 @@ def _load_real_graph(name: str) -> dict[str, object] | None:
 
     Returns the real module graph for later temporary installation, restoring
     the previous (stub) graph afterwards. Returns None when the real package
-    is not importable (CI keeps the stubs and current behavior).
+    is not importable (an environment without the real package keeps the stubs and current behavior).
     """
     saved = _module_graph(name)
     _drop_module_graph(name)

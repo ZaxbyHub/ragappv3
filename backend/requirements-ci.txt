@@ -1,8 +1,9 @@
 # Runtime deps for CI — excludes packages stubbed by conftest.py
-# (lancedb and unstructured[all-docs] are stubbed at test time and
-#  excluded here to avoid multi-GB installs and system-library requirements).
-# pyarrow is installed for real because the stubs are insufficient for
-# schema-dependent tests.
+# (unstructured[all-docs] is stubbed at test time and excluded here to avoid
+#  multi-GB installs and system-library requirements).
+# pyarrow and lancedb are installed for real because the stubs are
+# insufficient for schema-dependent tests and for the issue-#513 acceptance
+# checks (c9/c28) that exercise the real vector store.
 # Upper bounds mirror requirements.txt so CI resolves the same versions
 # (issue #404 / #391).
 fastapi>=0.141.1,<1.0
@@ -28,4 +29,5 @@ argon2-cffi>=21.3.0,<26.0
 rapidfuzz>=3.0.0,<4.0
 Pillow>=10.0.0,<13.0
 pytesseract>=0.3.10,<1.0
+lancedb>=0.36.0,<1.0
 pyarrow>=25.0.0,<26.0

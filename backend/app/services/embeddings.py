@@ -9,7 +9,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -20,7 +20,6 @@ except ImportError:  # pragma: no cover
     redis = None  # type: ignore[assignment]
 
 from app.config import settings
-from app.services import embedding_cache
 from app.services.circuit_breaker import CircuitBreakerError, embeddings_cb
 from app.services.redis_io import redis_call
 from app.services.ssrf import assert_url_safe
@@ -1490,111 +1489,3 @@ class EmbeddingService:
         client = getattr(self, "_client", None)
         if client is not None and not client.is_closed:
             await client.aclose()
-
-
-async def embed_batch_cached(
-    service: "EmbeddingService",
-    texts: List[str],
-    *,
-    normalize: Optional[Callable[[str], str]] = None,
-) -> tuple[List[Optional[List[float]]], List[int]]:
-    """Embed ``texts`` through ``service.embed_batch`` with persistent-cache reuse.
-
-    Cache-through facade over :meth:`EmbeddingService.embed_batch` with the
-    same return shape as ``embed_batch(..., fail_fast=False)``:
-    ``(embeddings, failed_indices)`` where ``embeddings`` holds exactly one
-    entry per input text (``None`` for texts whose embedding failed) in input
-    order. ``failed_indices`` lists the indices into ``texts`` of the failed
-    texts (stable per-text identity — unlike raw ``embed_batch`` batch
-    indices, these do not depend on how the misses happened to be batched).
-
-    Cache keys bind the IMMUTABLE embedding contract via
-    :func:`app.services.embedding_cache.embedding_cache_key`:
-    model id (``settings.embedding_model``), a revision discriminator (the
-    configured serving endpoint — no dedicated model-revision setting exists,
-    and the endpoint is the remaining identity component, mirroring the L1
-    cache's model+url fingerprint), doc prefix
-    (``settings.embedding_doc_prefix``), dim (``settings.embedding_dim``),
-    and the normalized text (``normalize(text)`` when ``normalize`` is
-    provided, else the text as-is). Changing any component changes the key,
-    invalidating old entries by construction.
-
-    Only cache misses reach the provider (``service.embed_batch`` is called
-    once, with just the missed texts); new vectors are stored after success.
-    The cache is strictly best-effort: any cache failure (key computation,
-    lookup, store) degrades to "no cache for this call" and NEVER fails the
-    embedding path.
-
-    Args:
-        service: The live embedding service used for cache misses.
-        texts: Texts to embed (same per-text validity rules as embed_batch).
-        normalize: Optional key normalizer (e.g. whitespace collapse) so
-            texts that are byte-identical after normalization share one
-            cached vector. The provider call always receives the ORIGINAL
-            text, never the normalized form.
-
-    Returns:
-        Tuple of (per-text embeddings with None placeholders, failed text
-        indices).
-    """
-    if not texts:
-        return [], []
-
-    results: List[Optional[List[float]]] = [None] * len(texts)
-
-    # Immutable contract snapshot. Guarded so a cache-side failure (e.g. an
-    # exotic text that cannot be encoded into a key) can never fail embedding.
-    keys: List[str] = []
-    hits: dict = {}
-    try:
-        model_id = str(getattr(settings, "embedding_model", "") or "")
-        model_revision = str(getattr(settings, "ollama_embedding_url", "") or "")
-        doc_prefix = str(getattr(settings, "embedding_doc_prefix", "") or "")
-        dim = int(getattr(settings, "embedding_dim", 0) or 0)
-        normalized = [normalize(t) if normalize is not None else t for t in texts]
-        keys = [
-            embedding_cache.embedding_cache_key(
-                model_id, model_revision, doc_prefix, dim, text
-            )
-            for text in normalized
-        ]
-        hits = embedding_cache.lookup(keys)
-    except Exception:
-        logger.warning(
-            "embedding cache lookup failed; embedding without cache", exc_info=True
-        )
-        hits = {}
-
-    miss_positions: List[int] = []
-    for pos in range(len(texts)):
-        key = keys[pos] if pos < len(keys) else None
-        vector = hits.get(key) if key is not None else None
-        if vector is not None:
-            results[pos] = vector
-        else:
-            miss_positions.append(pos)
-
-    if miss_positions:
-        miss_texts = [texts[pos] for pos in miss_positions]
-        miss_embeddings, _failed = await service.embed_batch(
-            miss_texts, fail_fast=False
-        )
-        new_items: list = []
-        for offset, pos in enumerate(miss_positions):
-            vector = (
-                miss_embeddings[offset] if offset < len(miss_embeddings) else None
-            )
-            if vector is not None:
-                results[pos] = vector
-                if pos < len(keys):
-                    new_items.append((keys[pos], vector))
-        if new_items:
-            try:
-                embedding_cache.store(new_items)
-            except Exception:
-                logger.warning(
-                    "embedding cache store failed (non-fatal)", exc_info=True
-                )
-
-    failed = [pos for pos, vector in enumerate(results) if vector is None]
-    return results, failed
