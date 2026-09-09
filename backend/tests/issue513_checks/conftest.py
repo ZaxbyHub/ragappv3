@@ -173,3 +173,19 @@ def _isolated_check_process_state():
         logging.disable(saved_disable)
         os.environ.clear()
         os.environ.update(saved_env)
+
+
+def pytest_collection_modifyitems(items):
+    """Bound every check with a hard per-test timeout (pytest-timeout).
+
+    The checks are standalone-fast by design (<25 s locally), but c9/c28
+    exercise REAL LanceDB, which has hung >45 min on a hosted CI runner
+    (issue #529 review round). A hang must surface as a loud FAIL with a
+    traceback, not a silently-stuck CI job, so every check item gets an
+    explicit 600 s timeout marker. pytest-timeout comes from
+    requirements-dev.txt, which CI installs alongside the CI lockfile.
+    """
+    import pytest
+
+    for item in items:
+        item.add_marker(pytest.mark.timeout(600))
