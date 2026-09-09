@@ -136,6 +136,74 @@ def publish_index_generation(
 # (see VectorStore._swap_chunks_table).
 CHUNKS_STAGING_TABLE = "chunks_rebuild"
 
+# Temp table used by the dimension-migrating reindex (issue #513 W13 / RC-8).
+# Distinct from CHUNKS_STAGING_TABLE so a dimension rebuild never collides
+# with the migration machinery's own staging reconciliation.
+DIMENSION_REBUILD_TABLE = "chunks_dim_rebuild"
+
+
+class DimensionRebuildHandle:
+    """Opaque handle to an in-progress dimension-migrating table rebuild.
+
+    Created by :meth:`VectorStore.begin_dimension_rebuild`. While open, all
+    vector writes routed through ``target=handle`` land in the temp table; the
+    live ``chunks`` table is untouched until ``commit_dimension_rebuild``
+    performs the validated swap. ``abort_dimension_rebuild`` drops the temp
+    table and leaves the old index fully intact.
+    """
+
+    __slots__ = ("table_name", "dim", "table")
+
+    def __init__(self, table_name: str, dim: int, table: Any) -> None:
+        self.table_name = table_name
+        self.dim = int(dim)
+        self.table = table
+
+
+def _chunks_table_schema(embedding_dim: int) -> pa.Schema:
+    """Build the canonical ``chunks`` table schema for an embedding dimension.
+
+    Single source of schema truth shared by ``_init_table_unlocked`` (live
+    table creation) and ``begin_dimension_rebuild`` (rebuild temp table), so a
+    dimension-migrated table is schema-identical apart from the vector width.
+    """
+    import hashlib as _hashlib
+
+    _creation_model_id = str(settings.embedding_model or "")
+    _creation_prefix_hash = _hashlib.sha256(
+        _creation_model_id.encode("utf-8")
+    ).hexdigest()[:16]
+    _schema_metadata = {
+        b"embedding_model_id": _creation_model_id.encode("utf-8"),
+        b"embedding_dim": str(embedding_dim).encode("utf-8"),
+        b"embedding_prefix_hash": _creation_prefix_hash.encode("utf-8"),
+    }
+    return pa.schema(
+        [
+            ("id", pa.string()),
+            ("text", pa.string()),
+            ("file_id", pa.string()),
+            ("vault_id", pa.string()),  # Vault isolation
+            ("chunk_index", pa.int32()),
+            (
+                "chunk_scale",
+                pa.string(),
+            ),  # Scale label like "512", "1024", "default"
+            (
+                "sparse_embedding",
+                pa.string(),
+            ),  # JSON string for sparse vectors — retained for schema compat (unused post-Harrier migration)
+            ("metadata", pa.string()),  # JSON string for flexibility
+            # Parent-document retrieval columns (Issue #12) — nullable, backfilled by migration
+            pa.field("parent_doc_id", pa.string(), nullable=True),
+            pa.field("parent_window_start", pa.int32(), nullable=True),
+            pa.field("parent_window_end", pa.int32(), nullable=True),
+            pa.field("chunk_position", pa.int32(), nullable=True),
+            ("embedding", pa.list_(pa.float32(), embedding_dim)),
+        ],
+        metadata=_schema_metadata,
+    )
+
 
 class VectorStore:
     """LanceDB-based vector store for document chunk embeddings."""
@@ -351,7 +419,34 @@ class VectorStore:
             ) from e
         return self
 
-    async def init_table(self, embedding_dim: int) -> "VectorStore":
+    async def init_table(
+        self, embedding_dim: int, target: Optional[DimensionRebuildHandle] = None
+    ) -> "VectorStore":
+        """Initialize or open the live (or rebuild-target) 'chunks' table.
+
+        Args:
+            embedding_dim: Dimension of embedding vectors.
+            target: When a dimension-rebuild handle is supplied, ensure the
+                rebuild temp table is ready instead of touching the live table
+                (the temp table is created by ``begin_dimension_rebuild``).
+                ``None`` keeps the live-table behavior exactly as before.
+
+        Returns:
+            Self for method chaining.
+        """
+        if target is not None:
+            if self.db is None:
+                await self.connect()
+            if target.table is None:
+                raise VectorStoreConnectionError(
+                    "Dimension rebuild target table is not available."
+                )
+            if embedding_dim != target.dim:
+                raise VectorStoreValidationError(
+                    f"Embedding dimension mismatch: rebuild target expects "
+                    f"{target.dim}, got {embedding_dim}."
+                )
+            return self
         async with self._acquire_write_lock():
             return await self._init_table_unlocked(embedding_dim)
 
@@ -382,44 +477,9 @@ class VectorStore:
         # model reindex need (F2-2). LanceDB cannot update metadata on an existing
         # table, so this only applies to freshly-created tables — but it gives the
         # validate_schema model-id comparison a source of truth for new tables.
-        import hashlib as _hashlib
-
-        _creation_model_id = str(settings.embedding_model or "")
-        _creation_prefix_hash = _hashlib.sha256(
-            _creation_model_id.encode("utf-8")
-        ).hexdigest()[:16]
-        _schema_metadata = {
-            b"embedding_model_id": _creation_model_id.encode("utf-8"),
-            b"embedding_dim": str(embedding_dim).encode("utf-8"),
-            b"embedding_prefix_hash": _creation_prefix_hash.encode("utf-8"),
-        }
-
-        # Define schema for chunks table
-        schema = pa.schema(
-            [
-                ("id", pa.string()),
-                ("text", pa.string()),
-                ("file_id", pa.string()),
-                ("vault_id", pa.string()),  # Vault isolation
-                ("chunk_index", pa.int32()),
-                (
-                    "chunk_scale",
-                    pa.string(),
-                ),  # Scale label like "512", "1024", "default"
-                (
-                    "sparse_embedding",
-                    pa.string(),
-                ),  # JSON string for sparse vectors — retained for schema compat (unused post-Harrier migration)
-                ("metadata", pa.string()),  # JSON string for flexibility
-                # Parent-document retrieval columns (Issue #12) — nullable, backfilled by migration
-                pa.field("parent_doc_id", pa.string(), nullable=True),
-                pa.field("parent_window_start", pa.int32(), nullable=True),
-                pa.field("parent_window_end", pa.int32(), nullable=True),
-                pa.field("chunk_position", pa.int32(), nullable=True),
-                ("embedding", pa.list_(pa.float32(), embedding_dim)),
-            ],
-            metadata=_schema_metadata,
-        )
+        # The schema itself is shared with the dimension-rebuild temp table
+        # (issue #513 W13) via _chunks_table_schema.
+        schema = _chunks_table_schema(embedding_dim)
 
         # Create or open table with error handling
         try:
@@ -779,9 +839,21 @@ class VectorStore:
                 current_rows,
             )
 
-    async def add_chunks(self, records: List[Dict[str, Any]]) -> Dict[str, float]:
-        """Serialize chunk writes and related LanceDB maintenance."""
+    async def add_chunks(
+        self,
+        records: List[Dict[str, Any]],
+        target: Optional[DimensionRebuildHandle] = None,
+    ) -> Dict[str, float]:
+        """Serialize chunk writes and related LanceDB maintenance.
+
+        When ``target`` is a dimension-rebuild handle the records are written
+        into the rebuild temp table (expected dim taken from the handle) and
+        the live table's index bookkeeping is left untouched; the validated
+        swap happens only at ``commit_dimension_rebuild``.
+        """
         async with self._acquire_write_lock():
+            if target is not None:
+                return await self._add_chunks_unlocked(records, target=target)
             return await self._add_chunks_unlocked(records)
 
     async def add_chunks_then_delete_ids(
@@ -828,28 +900,43 @@ class VectorStore:
             await self._maybe_rebuild_or_drop_vector_index(count_before)
         return count_before
 
-    async def _add_chunks_unlocked(self, records: List[Dict[str, Any]]) -> Dict[str, float]:
+    async def _add_chunks_unlocked(
+        self,
+        records: List[Dict[str, Any]],
+        target: Optional[DimensionRebuildHandle] = None,
+    ) -> Dict[str, float]:
         """
         Add chunk records to the vector store.
 
         Args:
             records: List of records with keys: id, text, file_id, chunk_index,
                      metadata, embedding, vault_id (required, caller must provide).
+            target: Optional dimension-rebuild handle; writes go to the rebuild
+                temp table instead of the live table.
 
         Raises:
             RuntimeError: If table is not initialized.
             VectorStoreValidationError: If records validation fails.
         """
-        if self.table is None:
-            raise RuntimeError("Table not initialized. Call init_table() first.")
+        if target is not None:
+            table = target.table
+            if table is None:
+                raise RuntimeError(
+                    "Dimension rebuild target table unavailable. Call "
+                    "begin_dimension_rebuild() first."
+                )
+            expected_dim = target.dim
+        else:
+            if self.table is None:
+                raise RuntimeError("Table not initialized. Call init_table() first.")
+            table = self.table
+            # Get expected embedding dimension from table schema
+            expected_dim = await self._get_expected_embedding_dim()
 
         # Handle empty records
         timings = {"vector_write_ms": 0.0, "optimize_ms": 0.0}
         if not records:
             return timings
-
-        # Get expected embedding dimension from table schema
-        expected_dim = await self._get_expected_embedding_dim()
 
         # Required fields for validation
         required_fields = ["id", "text", "file_id", "chunk_index", "embedding"]
@@ -913,9 +1000,16 @@ class VectorStore:
             processed_records.append(processed_record)
 
         t0 = time.monotonic()
-        await self.table.add(processed_records)
-        self._index_mutation_generation += 1
+        await table.add(processed_records)
         timings["vector_write_ms"] += (time.monotonic() - t0) * 1000
+
+        if target is not None:
+            # Rebuild temp-table writes: no live index bookkeeping and no
+            # optimize — the temp table is swapped in (with fresh indices) at
+            # commit_dimension_rebuild and dropped on abort.
+            return timings
+
+        self._index_mutation_generation += 1
 
         # Compact the table per configured optimize_mode
         optimize_mode = settings.optimize_mode
@@ -966,8 +1060,20 @@ class VectorStore:
         except Exception as e:
             logger.warning("flush_optimize failed (non-fatal): %s", e)
 
-    async def count_by_file(self, file_id: str) -> int:
-        """Return the number of visible LanceDB rows for a file_id."""
+    async def count_by_file(
+        self, file_id: str, target: Optional[DimensionRebuildHandle] = None
+    ) -> int:
+        """Return the number of visible LanceDB rows for a file_id.
+
+        With a ``target`` rebuild handle the count is taken against the rebuild
+        temp table instead of the live table (issue #513 W13).
+        """
+        if target is not None:
+            if target.table is None:
+                return 0
+            safe_file_id = _lance_escape(file_id)
+            return await target.table.count_rows(f"file_id = '{safe_file_id}'")
+
         if self.db is None:
             await self.connect()
 
@@ -1473,21 +1579,45 @@ class VectorStore:
         except Exception:
             return False
 
-    async def delete_by_file(self, file_id: str) -> int:
-        """Serialize deletion of all chunks for a file."""
+    async def delete_by_file(
+        self, file_id: str, target: Optional[DimensionRebuildHandle] = None
+    ) -> int:
+        """Serialize deletion of all chunks for a file.
+
+        With a ``target`` rebuild handle the delete runs against the rebuild
+        temp table; the live table is untouched (issue #513 W13).
+        """
         async with self._acquire_write_lock():
+            if target is not None:
+                return await self._delete_by_file_unlocked(file_id, target=target)
             return await self._delete_by_file_unlocked(file_id)
 
-    async def _delete_by_file_unlocked(self, file_id: str) -> int:
+    async def _delete_by_file_unlocked(
+        self, file_id: str, target: Optional[DimensionRebuildHandle] = None
+    ) -> int:
         """
         Delete all chunks for a given file_id.
 
         Args:
             file_id: The file ID to delete chunks for.
+            target: Optional dimension-rebuild handle to delete from the
+                rebuild temp table instead of the live table.
 
         Returns:
             Number of records deleted.
         """
+        if target is not None:
+            if target.table is None:
+                return 0
+            safe_file_id = _lance_escape(file_id)
+            try:
+                count_before = await target.table.count_rows(
+                    f"file_id = '{safe_file_id}'"
+                )
+            except (OSError, RuntimeError, ValueError):
+                count_before = 0
+            await target.table.delete(f"file_id = '{safe_file_id}'")
+            return count_before
         # Ensure DB connection exists
         if self.db is None:
             await self.connect()
@@ -1603,16 +1733,30 @@ class VectorStore:
         return count_before
 
     async def delete_old_generation_by_file(
-        self, file_id: str, new_hash_short: str
+        self,
+        file_id: str,
+        new_hash_short: str,
+        target: Optional[DimensionRebuildHandle] = None,
     ) -> int:
-        """Serialize stale-generation cleanup for a safe re-upload."""
+        """Serialize stale-generation cleanup for a safe re-upload.
+
+        With a ``target`` rebuild handle the cleanup runs against the rebuild
+        temp table; the live table is untouched (issue #513 W13).
+        """
         async with self._acquire_write_lock():
+            if target is not None:
+                return await self._delete_old_generation_by_file_unlocked(
+                    file_id, new_hash_short, target=target
+                )
             return await self._delete_old_generation_by_file_unlocked(
                 file_id, new_hash_short
             )
 
     async def _delete_old_generation_by_file_unlocked(
-        self, file_id: str, new_hash_short: str
+        self,
+        file_id: str,
+        new_hash_short: str,
+        target: Optional[DimensionRebuildHandle] = None,
     ) -> int:
         """Delete stale-generation chunks for a file after a safe re-upload (Issue #13).
 
@@ -1628,10 +1772,38 @@ class VectorStore:
             file_id: The file ID whose old-generation chunks should be removed.
             new_hash_short: First 8 characters of the new file hash used as
                 generation prefix for the newly inserted chunks.
+            target: Optional dimension-rebuild handle to delete from the
+                rebuild temp table instead of the live table.
 
         Returns:
             Number of stale-generation chunks deleted.
         """
+        if target is not None:
+            if target.table is None:
+                return 0
+            table = target.table
+            safe_file_id = _lance_escape(file_id)
+            safe_hash = _lance_escape(new_hash_short)
+            new_prefix = f"{safe_file_id}_{safe_hash}_"
+            try:
+                count_before = await table.count_rows(
+                    f"file_id = '{safe_file_id}'"
+                )
+                count_new = await table.count_rows(
+                    f"file_id = '{safe_file_id}' AND id LIKE '{new_prefix}%'"
+                )
+                old_count = count_before - count_new
+                if old_count <= 0:
+                    return 0
+                await table.delete(
+                    f"file_id = '{safe_file_id}' AND NOT (id LIKE '{new_prefix}%')"
+                )
+                return old_count
+            except (OSError, RuntimeError, ValueError) as e:
+                logger.warning(
+                    "delete_old_generation_by_file (rebuild target) failed: %s", e
+                )
+                return 0
         if self.db is None:
             await self.connect()
 
@@ -1956,6 +2128,199 @@ class VectorStore:
                 migration_name,
                 exc,
             )
+
+    async def get_live_embedding_dim(self) -> Optional[int]:
+        """Public read of the live ``chunks`` table's embedding dimension.
+
+        Returns None when no live table exists. Used by the reindex job (and
+        the ingest path) to decide whether a re-embed requires a
+        dimension-migrating rebuild (issue #513 W13 / RC-8).
+        """
+        if self.db is None:
+            await self.connect()
+        if self.db is None:
+            return None
+        if self.table is None:
+            try:
+                table_names = await self.db.table_names()
+            except (OSError, RuntimeError, ValueError):
+                return None
+            if "chunks" not in table_names:
+                return None
+            try:
+                self.table = await self.db.open_table("chunks")
+            except (OSError, RuntimeError, ValueError):
+                return None
+        return await self._get_expected_embedding_dim()
+
+    async def begin_dimension_rebuild(self, new_dim: int) -> DimensionRebuildHandle:
+        """Open a dimension-migrating rebuild of the ``chunks`` table (W13).
+
+        Creates a temp table (``chunks_dim_rebuild``) with the FULL canonical
+        schema at ``new_dim``. While the handle is open, callers route vector
+        writes through ``target=handle``; the live table is untouched. A stale
+        temp table from a previously aborted/crashed run is dropped first — it
+        was never committed, so the live table remains the only authority.
+
+        Raises VectorStoreConnectionError when the connection or table
+        creation fails (no state is left behind on failure).
+        """
+        async with self._acquire_write_lock():
+            if self.db is None:
+                await self.connect()
+            if self.db is None:
+                raise VectorStoreConnectionError(
+                    "Database connection is not available."
+                )
+            try:
+                table_names = await self.db.table_names()
+                if DIMENSION_REBUILD_TABLE in table_names:
+                    await self.db.drop_table(DIMENSION_REBUILD_TABLE)
+                    logger.warning(
+                        "Dropped stale dimension-rebuild table '%s' from a "
+                        "prior aborted run (live 'chunks' untouched)",
+                        DIMENSION_REBUILD_TABLE,
+                    )
+                table = await self.db.create_table(
+                    DIMENSION_REBUILD_TABLE,
+                    schema=_chunks_table_schema(new_dim),
+                )
+            except (OSError, RuntimeError, ValueError) as e:
+                raise VectorStoreConnectionError(
+                    f"Failed to create dimension-rebuild table: {e}"
+                ) from e
+            # FTS on the temp table so the post-swap index is immediately
+            # hybrid-searchable; a failure here is non-fatal (commit recreates
+            # indices on the swapped-in table anyway).
+            try:
+                await table.create_index(column="text", config=FTS(), replace=False)
+            except (OSError, RuntimeError, ValueError) as e:
+                logger.warning(
+                    "FTS index creation on dimension-rebuild table failed "
+                    "(non-fatal; recreated at commit): %s",
+                    e,
+                )
+            logger.info(
+                "Opened dimension rebuild into '%s' at dim=%d (live 'chunks' untouched)",
+                DIMENSION_REBUILD_TABLE,
+                new_dim,
+            )
+            return DimensionRebuildHandle(DIMENSION_REBUILD_TABLE, new_dim, table)
+
+    async def commit_dimension_rebuild(self, handle: DimensionRebuildHandle) -> None:
+        """Atomically swap the rebuild temp table in as the live ``chunks``.
+
+        Mirrors the validated staging-swap guarantees of
+        ``_swap_chunks_table``: the temp table holds the complete replacement
+        data durably; the old ``chunks`` table is dropped only then, the new
+        table is created from the temp data with the EXPLICIT new-dim schema
+        (fixed-size embedding list), row parity is validated, and FTS/ANN
+        indices are restored — all before the temp table is dropped. Any
+        failure logs CRITICAL naming the still-recoverable temp table and
+        RAISES; it is never reported as success.
+        """
+        async with self._acquire_write_lock():
+            if self.db is None:
+                raise VectorStoreConnectionError(
+                    "Database connection is not available."
+                )
+            if handle is None or handle.table is None:
+                raise VectorStoreError(
+                    "Dimension rebuild handle has no temp table to commit."
+                )
+            df = await self._safe_table_to_pandas(
+                handle.table, "dimension rebuild commit"
+            )
+            expected_rows = len(df)
+            try:
+                await self.db.drop_table("chunks")
+                # Explicit schema keeps the fixed-size embedding list type at
+                # the NEW dimension (create-from-data alone would infer a
+                # variable-width list and lose the schema dim).
+                self.table = await self.db.create_table(
+                    "chunks", data=df, schema=_chunks_table_schema(handle.dim)
+                )
+                final_rows = await self.table.count_rows()
+                if final_rows != expected_rows:
+                    raise VectorStoreError(
+                        f"dimension rebuild: final 'chunks' row count "
+                        f"{final_rows} != expected {expected_rows}."
+                    )
+                self._embedding_dim = handle.dim
+                await self.table.create_index(
+                    column="text", config=FTS(), replace=True
+                )
+                if final_rows >= VECTOR_INDEX_MIN_ROWS:
+                    await self.table.create_index(
+                        column="embedding",
+                        config=IvfPq(
+                            distance_type=cast(
+                                "Literal['l2', 'cosine', 'dot']", settings.vector_metric
+                            ),
+                            num_partitions=256,
+                            num_sub_vectors=handle.dim // 8,
+                        ),
+                        replace=True,
+                    )
+                    self._last_index_build_row_count = final_rows
+                    self._last_index_build_generation = self._index_mutation_generation
+            except Exception as exc:
+                logger.critical(
+                    "dimension rebuild: 'chunks' swap failed after the old table "
+                    "was dropped (%s). The replacement data is durably preserved "
+                    "in the recoverable temp table '%s'.",
+                    exc,
+                    handle.table_name,
+                )
+                raise
+            await self.db.drop_table(handle.table_name)
+            self._index_mutation_generation += 1
+            self._optimize_counter = 0
+            try:
+                publish_index_generation(
+                    detail=(
+                        f"dimension rebuild: 'chunks' swapped via temp table "
+                        f"'{handle.table_name}' at dim={handle.dim} "
+                        f"({expected_rows} rows)"
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "dimension rebuild: index-generation publication failed "
+                    "(swap already complete): %s",
+                    exc,
+                )
+            logger.info(
+                "Committed dimension rebuild: 'chunks' now dim=%d (%d rows)",
+                handle.dim,
+                expected_rows,
+            )
+
+    async def abort_dimension_rebuild(self, handle: DimensionRebuildHandle) -> None:
+        """Drop the rebuild temp table; the old index is left fully intact."""
+        if handle is None:
+            return
+        async with self._acquire_write_lock():
+            if self.db is None:
+                return
+            try:
+                table_names = await self.db.table_names()
+                if handle.table_name in table_names:
+                    await self.db.drop_table(handle.table_name)
+                    logger.info(
+                        "Aborted dimension rebuild: dropped temp table '%s' "
+                        "(live 'chunks' untouched)",
+                        handle.table_name,
+                    )
+            except (OSError, RuntimeError, ValueError) as e:
+                logger.warning(
+                    "Failed to drop dimension-rebuild temp table '%s': %s "
+                    "(left for the next begin_dimension_rebuild to reclaim)",
+                    handle.table_name,
+                    e,
+                )
+            finally:
+                handle.table = None
 
     async def migrate_add_vault_id(self) -> int:
         """

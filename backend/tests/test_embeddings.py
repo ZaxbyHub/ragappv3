@@ -52,6 +52,10 @@ class TestEmbeddingBatching:
         self.mock_settings.embedding_batch_max_retries = 3
         self.mock_settings.embedding_batch_min_sub_size = 1
         self.mock_settings.embedding_concurrent_batches = 4
+        # Issue #513 W23: embed_batch now also bounds batches by a total-char
+        # budget read live from settings — production default supplied here so
+        # the count-bound semantics these tests exercise are unchanged.
+        self.mock_settings.embedding_batch_max_chars = 131072
 
         # Mock the settings for chunk_size_chars
         self.mock_settings.chunk_size_chars = 1200
@@ -305,6 +309,9 @@ class TestIsTokenOverflowError:
         self.mock_settings.embedding_batch_max_retries = 3
         self.mock_settings.embedding_batch_min_sub_size = 1
         self.mock_settings.embedding_concurrent_batches = 4
+        # Issue #513 W23 (see TestEmbeddingBatching.setup): char budget field
+        # read live by embed_batch.
+        self.mock_settings.embedding_batch_max_chars = 131072
         self.mock_settings.chunk_size_chars = 1200
         self.mock_settings.chunk_overlap_chars = 120
 

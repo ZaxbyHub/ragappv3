@@ -647,7 +647,16 @@ CREATE TABLE IF NOT EXISTS files (
     file_type TEXT,
     chunk_count INTEGER DEFAULT 0,
     chunks_failed INTEGER NOT NULL DEFAULT 0,
-    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'indexed', 'error')),
+    -- Partial-success marker (issue #513 AC27): 1 = embedding/indexing
+    -- completed with at least one failed chunk (chunks_failed > 0); retrievable
+    -- content exists and chunk-scoped retry can repair the failures. Written
+    -- by BOTH ingest paths on a partial success; the scan/sync path
+    -- (process_file) also keeps status 'indexed' (frozen C6) and surfaces
+    -- partial state ONLY via this column, while the upload/reindex path
+    -- (process_existing_file) additionally lands in status 'partial'
+    -- (frozen C27 requires a status-level distinction there).
+    partial_embeddings INTEGER NOT NULL DEFAULT 0,
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'indexed', 'partial', 'error')),
     error_message TEXT,
     source TEXT DEFAULT 'upload',
     email_subject TEXT,
@@ -659,8 +668,9 @@ CREATE TABLE IF NOT EXISTS files (
     supersedes_file_id INTEGER,
     ingestion_version INTEGER DEFAULT 1,
     active_generation_hash TEXT,
-    -- Phase-aware progress (status stays in the canonical 4-value enum;
-    -- async/queued/parsing/chunking/embedding live in `phase`).
+    -- Phase-aware progress (status stays in the canonical enum above —
+    -- pending/processing/indexed/partial/error; async/queued/parsing/chunking/
+    -- embedding live in `phase`).
     phase TEXT,
     phase_message TEXT,
     progress_percent REAL,
@@ -694,6 +704,27 @@ CREATE TABLE IF NOT EXISTS failed_chunks (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_failed_chunks_file_id ON failed_chunks(file_id);
+
+-- Advisory near-duplicate grouping (issue #513 W26).
+-- ADVISORY ONLY: grouping never blocks, deletes, or rejects documents; distinct
+-- revisions are always retained. One row per file (file_id UNIQUE); re-ingest
+-- replaces the row (idempotent). `centroid` is the L2-normalized mean of the
+-- file's current-generation chunk embeddings (float32 BLOB, `dim` dims).
+-- `group_id` is shared across near-duplicate files in the same vault (cosine
+-- of centroids >= settings.near_dup_threshold); `similarity` stores the cosine
+-- against the matched row. Also created for existing databases by
+-- migrate_add_document_near_dups.
+CREATE TABLE IF NOT EXISTS document_near_dups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vault_id INTEGER NOT NULL,
+    file_id INTEGER NOT NULL UNIQUE,
+    centroid BLOB NOT NULL,
+    dim INTEGER NOT NULL,
+    group_id TEXT,
+    similarity REAL,
+    computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_near_dups_vault ON document_near_dups(vault_id);
 
 -- Full-text search index for document list metadata search
 CREATE VIRTUAL TABLE IF NOT EXISTS files_search_fts USING fts5(
@@ -1354,7 +1385,10 @@ CREATE TABLE IF NOT EXISTS document_reindex_jobs (
     vault_id INTEGER,
     trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK (trigger_type IN ('manual','api','settings_reindex')),
     trigger_id TEXT,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','cancelled')),
+    -- 'interrupted' (issue #513 W12): terminal status assigned at startup/shutdown
+    -- to jobs found 'running' — a previous process died mid-job; pending jobs are
+    -- re-enqueued separately.
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','cancelled','interrupted')),
     error TEXT,
     result_json TEXT DEFAULT '{}',
     input_json TEXT DEFAULT '{}',
@@ -1682,6 +1716,16 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_atom_enrichment_table(sqlite_path)
     migrate_add_vaults_multimodal_provider(sqlite_path)
     migrate_add_canvas_tables(sqlite_path)
+    # Issue #513 (W12/W14/W26). Registered at the END of the column-adding
+    # migrations: the files rebuild enumerates the full canonical column set
+    # (incl. active_generation_hash from migrate_add_multimodal_artifact_tables
+    # and parsed_text from migrate_add_files_parsed_text) and must run after the
+    # two files FTS migrations so their triggers can be recreated. The partial
+    # unique idx_files_hash_vault_indexed dropped with files_old is recreated
+    # by the block immediately below (IntegrityError-tolerant, as before).
+    migrate_widen_files_status(sqlite_path)
+    migrate_widen_document_reindex_jobs_status(sqlite_path)
+    migrate_add_document_near_dups(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -2633,7 +2677,7 @@ def migrate_add_document_reindex_jobs(sqlite_path: str) -> None:
                 vault_id INTEGER,
                 trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK (trigger_type IN ('manual','api','settings_reindex')),
                 trigger_id TEXT,
-                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','cancelled')),
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','cancelled','interrupted')),
                 error TEXT,
                 result_json TEXT DEFAULT '{}',
                 input_json TEXT DEFAULT '{}',
@@ -3094,8 +3138,10 @@ def migrate_add_curator_claim_support(sqlite_path: str) -> None:
 def migrate_add_files_processing_progress(sqlite_path: str) -> None:
     """Migration: add phase-aware processing-progress columns to files table.
 
-    files.status stays in the canonical 4-value enum
-    ('pending','processing','indexed','error'). All async/queued/parsing/
+    files.status stays in the canonical enum
+    ('pending','processing','indexed','partial','error' — 'partial' is written
+    by the upload/reindex path; the scan path flags partials via the
+    partial_embeddings column). All async/queued/parsing/
     chunking/embedding/writing-index detail lives in `phase` and friends.
 
     Also creates ``idx_files_hash_vault_status`` to back the in-flight
@@ -3820,6 +3866,579 @@ def migrate_widen_wiki_claim_sources_source_kind(sqlite_path: str) -> None:
             conn, migration_name=_journal, phase="succeeded", outcome="ok",
             detail=f"rows={before_count}",
         )
+    finally:
+        conn.close()
+
+
+def migrate_widen_files_status(sqlite_path: str) -> None:
+    """Migration: widen the files.status CHECK with 'partial' and add the
+    ``partial_embeddings`` marker column (issue #513 AC27/W14).
+
+    Status model: an ingest that completes with failed chunks is a truthful
+    partial success — the upload/reindex path (``process_existing_file``)
+    lands in status ``'partial'``, while the scan/sync path (``process_file``)
+    keeps status ``'indexed'`` and flags the partial state via
+    ``partial_embeddings = 1`` (``chunks_failed > 0``); frozen checks C6 and
+    C27 pin those two contracts respectively. The rebuilt table carries the
+    marker column so both representations are queryable; existing rows are
+    copied with their status unchanged and the marker derived from
+    ``chunks_failed``.
+
+    SQLite cannot ALTER a CHECK constraint, so we use the rename-recreate-copy
+    pattern (see ``migrate_widen_wiki_claim_sources_source_kind`` for the simple
+    case). ``files`` is the heaviest table to rebuild: it has two
+    external-content FTS5 projections (``files_search_fts``,
+    ``files_content_fts``) with six triggers, several indexes, and many child
+    tables referencing it via FKs. The swap therefore also drops and recreates
+    the FTS triggers, rebuilds both FTS projections from the new table, and
+    recreates every files index except ``idx_files_hash_vault_indexed`` — that
+    partial unique index is intentionally recreated by the block in
+    ``run_migrations`` that runs right after this migration, matching its
+    IntegrityError-tolerant semantics (existing duplicate rows must not fail
+    the migration).
+
+    Must run AFTER every migration that adds a files column and after the two
+    files FTS migrations (registered at the end of ``run_migrations`` for
+    exactly that reason): the copy enumerates the full canonical column set
+    and the rebuilt table is schema-identical to ``_BASE_SCHEMA``'s files
+    definition (including ``partial_embeddings``).
+
+    Recovery (issue #512 DB-002 semantics): a ``files_old`` left behind by a
+    crashed run is probed BEFORE the early return, and is only discarded when
+    the canonical table is new-shaped and holds every backup id with at least
+    as many rows.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    conn.isolation_level = None
+    _journal = "migrate_widen_files_status"
+    try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='files'"
+        ).fetchone()
+        old_present = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='files_old'"
+        ).fetchone()
+        recovered = False
+        if old_present and not tbl:
+            conn.execute("PRAGMA legacy_alter_table = ON")
+            conn.execute("ALTER TABLE files_old RENAME TO files")
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            recovered = True
+        elif old_present:
+            dest_sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='files'"
+            ).fetchone()
+            dest_sql_text = dest_sql_row[0] if dest_sql_row else ""
+            dest_new_shape = (
+                "'partial'" in dest_sql_text
+                and "partial_embeddings" in dest_sql_text
+            )
+            dest_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            backup_count = conn.execute("SELECT COUNT(*) FROM files_old").fetchone()[0]
+            missing_ids = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM files_old"
+                " EXCEPT SELECT id FROM files)"
+            ).fetchone()[0]
+            dest_complete = (
+                dest_new_shape and dest_count >= backup_count and missing_ids == 0
+            )
+            if not dest_complete:
+                conn.execute("DROP TABLE files")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute("ALTER TABLE files_old RENAME TO files")
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+                recovered = True
+            else:
+                conn.execute("DROP TABLE IF EXISTS files_old")
+
+        if not tbl and not old_present:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="files table absent",
+            )
+            return
+
+        if recovered:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="recovered",
+                outcome="recovered_from_backup",
+                detail="files restored from files_old",
+            )
+            invalidate_derived_data(
+                conn,
+                reason="files restored from files_old (status widen recovery)",
+                migration_name=_journal,
+            )
+
+        create_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='files'"
+        ).fetchone()
+        if create_sql and "'partial'" in create_sql[0] and (
+            "partial_embeddings" in create_sql[0]
+        ):
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="status CHECK widened and partial_embeddings column present",
+            )
+            return
+
+        before_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("PRAGMA legacy_alter_table = ON")
+        # Atomicity (issue #512 semantics): the swap runs inside ONE explicit
+        # BEGIN IMMEDIATE transaction using execute() only (executescript would
+        # implicitly commit), so a crash or copy failure rolls back to the
+        # pre-swap state (files_old included) instead of leaving a committed
+        # empty destination.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Drop the FTS triggers first — they reference files by name and
+            # would fire on the copy below.
+            for trig in (
+                "files_search_fts_insert",
+                "files_search_fts_delete",
+                "files_search_fts_update",
+                "files_content_fts_insert",
+                "files_content_fts_delete",
+                "files_content_fts_update",
+            ):
+                conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+
+            conn.execute("ALTER TABLE files RENAME TO files_old")
+
+            conn.execute(
+                """
+                CREATE TABLE files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id INTEGER NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_hash TEXT,
+                    file_size INTEGER NOT NULL,
+                    file_type TEXT,
+                    chunk_count INTEGER DEFAULT 0,
+                    chunks_failed INTEGER NOT NULL DEFAULT 0,
+                    partial_embeddings INTEGER NOT NULL DEFAULT 0,
+                    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'indexed', 'partial', 'error')),
+                    error_message TEXT,
+                    source TEXT DEFAULT 'upload',
+                    email_subject TEXT,
+                    email_sender TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    processed_at TIMESTAMP,
+                    modified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    document_date TEXT,
+                    supersedes_file_id INTEGER,
+                    ingestion_version INTEGER DEFAULT 1,
+                    active_generation_hash TEXT,
+                    phase TEXT,
+                    phase_message TEXT,
+                    progress_percent REAL,
+                    processed_units INTEGER,
+                    total_units INTEGER,
+                    unit_label TEXT,
+                    phase_started_at TIMESTAMP,
+                    processing_started_at TIMESTAMP,
+                    wiki_pending INTEGER NOT NULL DEFAULT 0,
+                    enrichment_status TEXT,
+                    enrichment_error TEXT,
+                    enrichment_updated_at TIMESTAMP,
+                    enrichment_enabled INTEGER,
+                    folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL,
+                    parsed_text TEXT,
+                    FOREIGN KEY (vault_id) REFERENCES vaults(id)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                INSERT INTO files (
+                    id, vault_id, file_path, file_name, file_hash, file_size,
+                    file_type, chunk_count, chunks_failed, partial_embeddings,
+                    status, error_message,
+                    source, email_subject, email_sender, created_at, processed_at,
+                    modified_at, document_date, supersedes_file_id,
+                    ingestion_version, active_generation_hash, phase,
+                    phase_message, progress_percent, processed_units,
+                    total_units, unit_label, phase_started_at,
+                    processing_started_at, wiki_pending, enrichment_status,
+                    enrichment_error, enrichment_updated_at, enrichment_enabled,
+                    folder_id, parsed_text
+                )
+                SELECT
+                    id, vault_id, file_path, file_name, file_hash, file_size,
+                    file_type, chunk_count, chunks_failed,
+                    CASE WHEN chunks_failed > 0 THEN 1 ELSE 0 END,
+                    status,
+                    error_message,
+                    source, email_subject, email_sender, created_at, processed_at,
+                    modified_at, document_date, supersedes_file_id,
+                    ingestion_version, active_generation_hash, phase,
+                    phase_message, progress_percent, processed_units,
+                    total_units, unit_label, phase_started_at,
+                    processing_started_at, wiki_pending, enrichment_status,
+                    enrichment_error, enrichment_updated_at, enrichment_enabled,
+                    folder_id, parsed_text
+                FROM files_old
+                """
+            )
+
+            after_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            if after_count != before_count:
+                raise RuntimeError(
+                    f"migrate_widen_files_status: row-count parity failed "
+                    f"({before_count} -> {after_count}). files_old has been preserved."
+                )
+
+            # Dropping files_old frees the index names attached to it so the
+            # CREATE INDEX IF NOT EXISTS calls below (and the partial unique
+            # index block in run_migrations) take effect on the new table.
+            conn.execute("DROP TABLE files_old")
+            for index_ddl in (
+                "CREATE INDEX IF NOT EXISTS idx_files_status ON files(status)",
+                "CREATE INDEX IF NOT EXISTS idx_files_hash_vault_status "
+                "ON files(file_hash, vault_id, status)",
+                "CREATE INDEX IF NOT EXISTS idx_files_vault_id ON files(vault_id)",
+                "CREATE INDEX IF NOT EXISTS idx_files_source ON files(source)",
+                "CREATE INDEX IF NOT EXISTS idx_files_folder_id ON files(folder_id)",
+            ):
+                conn.execute(index_ddl)
+
+            # Recreate the FTS triggers exactly as the original schema defines
+            # them (individual execute() calls: executescript would commit).
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_search_fts_insert
+                AFTER INSERT ON files BEGIN
+                    INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_search_fts_delete
+                AFTER DELETE ON files BEGIN
+                    INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_search_fts_update
+                AFTER UPDATE ON files BEGIN
+                    INSERT INTO files_search_fts(files_search_fts, rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES ('delete', old.id, old.file_name, old.file_type, old.status, old.source, old.email_subject, old.email_sender, old.document_date);
+                    INSERT INTO files_search_fts(rowid, file_name, file_type, status, source, email_subject, email_sender, document_date)
+                    VALUES (new.id, new.file_name, new.file_type, new.status, new.source, new.email_subject, new.email_sender, new.document_date);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_content_fts_insert
+                AFTER INSERT ON files BEGIN
+                    INSERT INTO files_content_fts(rowid, parsed_text)
+                    VALUES (new.id, new.parsed_text);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_content_fts_delete
+                AFTER DELETE ON files BEGIN
+                    INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)
+                    VALUES ('delete', old.id, old.parsed_text);
+                END
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_content_fts_update
+                AFTER UPDATE ON files
+                WHEN new.parsed_text IS NOT old.parsed_text BEGIN
+                    INSERT INTO files_content_fts(files_content_fts, rowid, parsed_text)
+                    VALUES ('delete', old.id, old.parsed_text);
+                    INSERT INTO files_content_fts(rowid, parsed_text)
+                    VALUES (new.id, new.parsed_text);
+                END
+                """
+            )
+
+            # Re-index both external-content FTS projections from the new table.
+            conn.execute(
+                "INSERT INTO files_search_fts(files_search_fts) VALUES('rebuild')"
+            )
+            conn.execute(
+                "INSERT INTO files_content_fts(files_content_fts) VALUES('rebuild')"
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            conn.execute("PRAGMA foreign_keys = ON")
+
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"foreign_key_check violations: {len(violations)}",
+            )
+            raise RuntimeError(
+                f"migrate_widen_files_status: foreign_key_check reported "
+                f"{len(violations)} violation(s) post-swap: {violations[:5]}"
+            )
+
+        invalidate_derived_data(
+            conn,
+            reason="files rebuilt with widened status CHECK (partial)",
+            migration_name=_journal,
+        )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"rows={before_count}",
+        )
+    finally:
+        conn.close()
+
+
+def migrate_widen_document_reindex_jobs_status(sqlite_path: str) -> None:
+    """Migration: add 'interrupted' to document_reindex_jobs.status CHECK (issue #513 W12).
+
+    SQLite cannot ALTER a CHECK constraint, so we use the rename-recreate-copy
+    pattern. document_reindex_jobs has NO child tables referencing it, NO FTS
+    virtual table, and NO triggers — the simple case, mirroring
+    ``migrate_widen_wiki_claim_sources_source_kind``.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    conn.isolation_level = None
+    _journal = "migrate_widen_document_reindex_jobs_status"
+    try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
+        tbl = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='document_reindex_jobs'"
+        ).fetchone()
+        old_present = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='document_reindex_jobs_old'"
+        ).fetchone()
+        recovered = False
+        if old_present and not tbl:
+            conn.execute("PRAGMA legacy_alter_table = ON")
+            conn.execute(
+                "ALTER TABLE document_reindex_jobs_old RENAME TO document_reindex_jobs"
+            )
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            recovered = True
+        elif old_present:
+            dest_sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table'"
+                " AND name='document_reindex_jobs'"
+            ).fetchone()
+            dest_new_shape = "'interrupted'" in (
+                dest_sql_row[0] if dest_sql_row else ""
+            )
+            dest_count = conn.execute(
+                "SELECT COUNT(*) FROM document_reindex_jobs"
+            ).fetchone()[0]
+            backup_count = conn.execute(
+                "SELECT COUNT(*) FROM document_reindex_jobs_old"
+            ).fetchone()[0]
+            missing_ids = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM document_reindex_jobs_old"
+                " EXCEPT SELECT id FROM document_reindex_jobs)"
+            ).fetchone()[0]
+            dest_complete = (
+                dest_new_shape and dest_count >= backup_count and missing_ids == 0
+            )
+            if not dest_complete:
+                conn.execute("DROP TABLE document_reindex_jobs")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute(
+                    "ALTER TABLE document_reindex_jobs_old RENAME TO document_reindex_jobs"
+                )
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+                recovered = True
+            else:
+                conn.execute("DROP TABLE IF EXISTS document_reindex_jobs_old")
+
+        if not tbl and not old_present:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="document_reindex_jobs table absent",
+            )
+            return
+
+        if recovered:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="recovered",
+                outcome="recovered_from_backup",
+                detail="document_reindex_jobs restored from backup",
+            )
+            invalidate_derived_data(
+                conn,
+                reason="document_reindex_jobs restored from backup (status widen)",
+                migration_name=_journal,
+            )
+
+        create_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table'"
+            " AND name='document_reindex_jobs'"
+        ).fetchone()
+        if create_sql and "'interrupted'" in create_sql[0]:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="status CHECK already widened",
+            )
+            return
+
+        before_count = conn.execute(
+            "SELECT COUNT(*) FROM document_reindex_jobs"
+        ).fetchone()[0]
+
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("PRAGMA legacy_alter_table = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "ALTER TABLE document_reindex_jobs RENAME TO document_reindex_jobs_old"
+            )
+            conn.execute(
+                """
+                CREATE TABLE document_reindex_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vault_id INTEGER,
+                    trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK (trigger_type IN ('manual','api','settings_reindex')),
+                    trigger_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','completed','failed','cancelled','interrupted')),
+                    error TEXT,
+                    result_json TEXT DEFAULT '{}',
+                    input_json TEXT DEFAULT '{}',
+                    retry_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO document_reindex_jobs (
+                    id, vault_id, trigger_type, trigger_id, status, error,
+                    result_json, input_json, retry_count, created_at,
+                    started_at, completed_at
+                )
+                SELECT
+                    id, vault_id, trigger_type, trigger_id, status, error,
+                    result_json, input_json, retry_count, created_at,
+                    started_at, completed_at
+                FROM document_reindex_jobs_old
+                """
+            )
+            after_count = conn.execute(
+                "SELECT COUNT(*) FROM document_reindex_jobs"
+            ).fetchone()[0]
+            if after_count != before_count:
+                raise RuntimeError(
+                    f"migrate_widen_document_reindex_jobs_status: row-count "
+                    f"parity failed ({before_count} -> {after_count}). "
+                    f"document_reindex_jobs_old has been preserved."
+                )
+            conn.execute("DROP TABLE document_reindex_jobs_old")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_document_reindex_jobs_vault_status "
+                "ON document_reindex_jobs(vault_id, status)"
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            conn.execute("PRAGMA foreign_keys = ON")
+
+        violations = conn.execute(
+            "PRAGMA foreign_key_check(document_reindex_jobs)"
+        ).fetchall()
+        if violations:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"foreign_key_check violations: {len(violations)}",
+            )
+            raise RuntimeError(
+                f"migrate_widen_document_reindex_jobs_status: "
+                f"foreign_key_check reported {len(violations)} violation(s): "
+                f"{violations[:5]}"
+            )
+
+        invalidate_derived_data(
+            conn,
+            reason="document_reindex_jobs rebuilt with widened status CHECK (interrupted)",
+            migration_name=_journal,
+        )
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok",
+            detail=f"rows={before_count}",
+        )
+    finally:
+        conn.close()
+
+
+def migrate_add_document_near_dups(sqlite_path: str) -> None:
+    """Migration: add document_near_dups table for advisory near-duplicate grouping (issue #513 W26).
+
+    One row per file: the L2-normalized mean of the file's current-generation
+    chunk embeddings plus the advisory group_id assigned when the centroid is
+    sufficiently similar (cosine >= settings.near_dup_threshold) to another
+    centroid in the same vault. The table is also part of _BASE_SCHEMA (fresh
+    databases get it from init_db); this migration covers existing installs.
+
+    Rows are advisory metadata only — nothing in ingestion blocks, deletes, or
+    rejects documents based on them.
+
+    Idempotent — safe to run multiple times. Table and index use IF NOT EXISTS
+    guards.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS document_near_dups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL UNIQUE,
+                centroid BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                group_id TEXT,
+                similarity REAL,
+                computed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_near_dups_vault ON document_near_dups(vault_id);
+        """)
+        conn.commit()
     finally:
         conn.close()
 

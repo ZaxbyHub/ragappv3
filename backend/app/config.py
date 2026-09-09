@@ -102,6 +102,27 @@ class Settings(BaseSettings):
     """Maximum number of retries for adaptive batching when token overflow occurs."""
     embedding_batch_min_sub_size: int = 1
     """Minimum sub-batch size for adaptive batching fallback."""
+    embedding_batch_max_chars: int = 131072
+    """Maximum total characters per embedding API batch (issue #513 W23).
+    ``embed_batch`` closes a batch BEFORE adding a text that would exceed this
+    budget; an oversized single text ships alone (per-text validation still
+    applies). Bounds the token cost of each request alongside
+    ``embedding_batch_size``. Range 4096-1048576."""
+    embedding_cache_max_entries: int = 50000
+    """Capacity bound for the persistent embedding cache (issue #513 W24),
+    stored in its own sqlite file under ``data_dir`` by
+    ``app.services.embedding_cache``. Oldest entries are pruned beyond the cap.
+    Range 1000-1000000."""
+    near_dup_threshold: float = 0.96
+    """Cosine threshold for advisory near-duplicate grouping (issue #513 W26).
+    Files whose chunk-embedding centroids are at least this similar (cosine)
+    share an advisory ``group_id``; grouping never blocks, deletes, or rejects
+    documents. Range 0.5-0.999999."""
+    orphan_rescan_interval_seconds: float = 3600.0
+    """Interval in seconds for the periodic stranded-ingestion rescan loop
+    (issue #513 W25). Each tick re-enqueues stranded pending/processing rows
+    (with an active-job lease guard); the startup sweep is separate and runs
+    unconditionally. Range 60.0-86400.0."""
 
     # ── Ingestion performance configuration ──────────────────────────────────
     ingestion_queue_max_size: int = 1000
@@ -1056,6 +1077,30 @@ class Settings(BaseSettings):
     def validate_embedding_batch_size(cls, v: int) -> int:
         """Validate embedding batch size is within safe TEI limits (1-128)."""
         return cls._validate_int_range(v, 1, 128, "embedding_batch_size")
+
+    @field_validator("embedding_batch_max_chars", mode="after")
+    @classmethod
+    def validate_embedding_batch_max_chars(cls, v: int) -> int:
+        """Validate embedding batch character budget is in range 4096-1048576."""
+        return cls._validate_int_range(v, 4096, 1048576, "embedding_batch_max_chars")
+
+    @field_validator("embedding_cache_max_entries", mode="after")
+    @classmethod
+    def validate_embedding_cache_max_entries(cls, v: int) -> int:
+        """Validate embedding cache capacity is in range 1000-1000000."""
+        return cls._validate_int_range(v, 1000, 1000000, "embedding_cache_max_entries")
+
+    @field_validator("near_dup_threshold", mode="after")
+    @classmethod
+    def validate_near_dup_threshold(cls, v: float) -> float:
+        """Validate near-duplicate cosine threshold is in range 0.5-0.999999."""
+        return cls._validate_float_range(v, 0.5, 0.999999, "near_dup_threshold")
+
+    @field_validator("orphan_rescan_interval_seconds", mode="after")
+    @classmethod
+    def validate_orphan_rescan_interval_seconds(cls, v: float) -> float:
+        """Validate orphan rescan interval is in range 60.0-86400.0 seconds."""
+        return cls._validate_float_range(v, 60.0, 86400.0, "orphan_rescan_interval_seconds")
 
     @field_validator("document_parsing_strategy", mode="after")
     @classmethod

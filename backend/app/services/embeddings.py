@@ -9,7 +9,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover
     redis = None  # type: ignore[assignment]
 
 from app.config import settings
+from app.services import embedding_cache
 from app.services.circuit_breaker import CircuitBreakerError, embeddings_cb
 from app.services.redis_io import redis_call
 from app.services.ssrf import assert_url_safe
@@ -751,8 +752,12 @@ class EmbeddingService:
         Generate embeddings for a batch of texts using true API batching.
 
         Sends multiple texts per API request for efficient GPU utilization.
-        Processes batches concurrently using asyncio.gather, limited by
-        embedding_concurrent_batches setting.
+        Batches are bounded BOTH by item count (``batch_size``) and by a total
+        character budget (``settings.embedding_batch_max_chars``): a batch is
+        closed before adding a text that would push its total character cost
+        past the budget, and an oversized single text ships alone as its own
+        batch (issue #513 W23). Processes batches concurrently using
+        asyncio.gather, limited by embedding_concurrent_batches setting.
 
         Applies the document prefix (if configured) to each input text before embedding.
         The document prefix is used for document embeddings and must remain constant for
@@ -760,7 +765,7 @@ class EmbeddingService:
 
         Args:
             texts: List of texts to embed.
-            batch_size: Number of texts per API request (default: 512).
+            batch_size: Maximum number of texts per API request (default: 512).
             fail_fast: If True (default), raise on any batch failure.
                        If False, return (embeddings, failed_batch_indices) with None
                        placeholders for failed batches.
@@ -826,10 +831,32 @@ class EmbeddingService:
                 async with self._get_global_batch_semaphore():
                     return await self._embed_batch_api(batch_texts, config)
 
-        batch_tasks = []
-        for i in range(0, len(texts_to_embed), batch_size):
-            batch = texts_to_embed[i : i + batch_size]
-            batch_tasks.append(_process_batch(batch))
+        # Token-cost-bounded batching (issue #513 W23 / RC-21e): in addition
+        # to the per-batch count limit, a batch is closed BEFORE adding a
+        # text whose character cost (len of text) would push the batch's
+        # total past ``settings.embedding_batch_max_chars``. An oversized
+        # single text (cost alone over the budget) ships alone as its own
+        # batch. Text order and exactly-one-embedding-per-text are preserved
+        # by construction: the batches partition ``texts_to_embed`` in order.
+        max_batch_chars = settings.embedding_batch_max_chars
+        batches: List[tuple] = []  # (start offset into texts_to_embed, batch texts)
+        current_batch: List[str] = []
+        current_chars = 0
+        for offset, text in enumerate(texts_to_embed):
+            text_cost = len(text)
+            if current_batch and (
+                len(current_batch) >= batch_size
+                or current_chars + text_cost > max_batch_chars
+            ):
+                batches.append((offset - len(current_batch), current_batch))
+                current_batch = []
+                current_chars = 0
+            current_batch.append(text)
+            current_chars += text_cost
+        if current_batch:
+            batches.append((len(texts_to_embed) - len(current_batch), current_batch))
+
+        batch_tasks = [_process_batch(batch) for _start, batch in batches]
 
         batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
 
@@ -846,9 +873,9 @@ class EmbeddingService:
                 if isinstance(result, Exception):
                     failed_indices.append(batch_idx)
                     # Add None placeholders for each text in this failed batch
-                    start = batch_idx * batch_size
-                    end = min(start + batch_size, len(texts_to_embed))
-                    for _ in range(start, end):
+                    # (placeholders track the ACTUAL char-bounded batch size —
+                    # batches are no longer uniform batch_size slices).
+                    for _ in batches[batch_idx][1]:
                         all_embeddings_with_nones.append(None)
                     logger.warning(f"Batch {batch_idx} failed (skipping): {result}")
                 else:
@@ -1463,3 +1490,111 @@ class EmbeddingService:
         client = getattr(self, "_client", None)
         if client is not None and not client.is_closed:
             await client.aclose()
+
+
+async def embed_batch_cached(
+    service: "EmbeddingService",
+    texts: List[str],
+    *,
+    normalize: Optional[Callable[[str], str]] = None,
+) -> tuple[List[Optional[List[float]]], List[int]]:
+    """Embed ``texts`` through ``service.embed_batch`` with persistent-cache reuse.
+
+    Cache-through facade over :meth:`EmbeddingService.embed_batch` with the
+    same return shape as ``embed_batch(..., fail_fast=False)``:
+    ``(embeddings, failed_indices)`` where ``embeddings`` holds exactly one
+    entry per input text (``None`` for texts whose embedding failed) in input
+    order. ``failed_indices`` lists the indices into ``texts`` of the failed
+    texts (stable per-text identity — unlike raw ``embed_batch`` batch
+    indices, these do not depend on how the misses happened to be batched).
+
+    Cache keys bind the IMMUTABLE embedding contract via
+    :func:`app.services.embedding_cache.embedding_cache_key`:
+    model id (``settings.embedding_model``), a revision discriminator (the
+    configured serving endpoint — no dedicated model-revision setting exists,
+    and the endpoint is the remaining identity component, mirroring the L1
+    cache's model+url fingerprint), doc prefix
+    (``settings.embedding_doc_prefix``), dim (``settings.embedding_dim``),
+    and the normalized text (``normalize(text)`` when ``normalize`` is
+    provided, else the text as-is). Changing any component changes the key,
+    invalidating old entries by construction.
+
+    Only cache misses reach the provider (``service.embed_batch`` is called
+    once, with just the missed texts); new vectors are stored after success.
+    The cache is strictly best-effort: any cache failure (key computation,
+    lookup, store) degrades to "no cache for this call" and NEVER fails the
+    embedding path.
+
+    Args:
+        service: The live embedding service used for cache misses.
+        texts: Texts to embed (same per-text validity rules as embed_batch).
+        normalize: Optional key normalizer (e.g. whitespace collapse) so
+            texts that are byte-identical after normalization share one
+            cached vector. The provider call always receives the ORIGINAL
+            text, never the normalized form.
+
+    Returns:
+        Tuple of (per-text embeddings with None placeholders, failed text
+        indices).
+    """
+    if not texts:
+        return [], []
+
+    results: List[Optional[List[float]]] = [None] * len(texts)
+
+    # Immutable contract snapshot. Guarded so a cache-side failure (e.g. an
+    # exotic text that cannot be encoded into a key) can never fail embedding.
+    keys: List[str] = []
+    hits: dict = {}
+    try:
+        model_id = str(getattr(settings, "embedding_model", "") or "")
+        model_revision = str(getattr(settings, "ollama_embedding_url", "") or "")
+        doc_prefix = str(getattr(settings, "embedding_doc_prefix", "") or "")
+        dim = int(getattr(settings, "embedding_dim", 0) or 0)
+        normalized = [normalize(t) if normalize is not None else t for t in texts]
+        keys = [
+            embedding_cache.embedding_cache_key(
+                model_id, model_revision, doc_prefix, dim, text
+            )
+            for text in normalized
+        ]
+        hits = embedding_cache.lookup(keys)
+    except Exception:
+        logger.warning(
+            "embedding cache lookup failed; embedding without cache", exc_info=True
+        )
+        hits = {}
+
+    miss_positions: List[int] = []
+    for pos in range(len(texts)):
+        key = keys[pos] if pos < len(keys) else None
+        vector = hits.get(key) if key is not None else None
+        if vector is not None:
+            results[pos] = vector
+        else:
+            miss_positions.append(pos)
+
+    if miss_positions:
+        miss_texts = [texts[pos] for pos in miss_positions]
+        miss_embeddings, _failed = await service.embed_batch(
+            miss_texts, fail_fast=False
+        )
+        new_items: list = []
+        for offset, pos in enumerate(miss_positions):
+            vector = (
+                miss_embeddings[offset] if offset < len(miss_embeddings) else None
+            )
+            if vector is not None:
+                results[pos] = vector
+                if pos < len(keys):
+                    new_items.append((keys[pos], vector))
+        if new_items:
+            try:
+                embedding_cache.store(new_items)
+            except Exception:
+                logger.warning(
+                    "embedding cache store failed (non-fatal)", exc_info=True
+                )
+
+    failed = [pos for pos, vector in enumerate(results) if vector is None]
+    return results, failed

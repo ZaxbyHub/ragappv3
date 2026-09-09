@@ -44,7 +44,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # 62 -> 64: Versioned canvas (issue #509, 2026-09-06) adds canvas_artifacts and
 # canvas_versions.
 # 64 -> 65: issue #512 added migration_journal (recovery journal)
-EXPECTED_BASE_TABLE_COUNT = 65
+# 65 -> 66: issue #513 (W26) added document_near_dups (advisory near-duplicate
+# grouping centroids)
+EXPECTED_BASE_TABLE_COUNT = 66
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

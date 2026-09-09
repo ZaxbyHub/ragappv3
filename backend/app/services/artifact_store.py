@@ -384,6 +384,11 @@ def publish_generation(
     generation is idempotent (content-addressed asset ids + ``INSERT OR REPLACE``
     on the unique keys).
 
+    Same-generation republish (issue #513 W27): when ``generation_hash`` equals
+    the file's currently-committed ``active_generation_hash``, the call is an
+    idempotent republish — rows are upserted, but NOTHING is retired and no
+    tombstones are enqueued, so every referenced byte stays untouched.
+
     Args:
         conn: An open pooled connection (foreign_keys ON).
         file_id: Owning file row.
@@ -415,32 +420,45 @@ def publish_generation(
             f"exceeding {settings.max_asset_bytes_per_generation}"
         )
 
+    # Same-generation republish (issue #513 W27): when the incoming hash
+    # equals the file's currently-committed generation, this publish is an
+    # idempotent republish — only the INSERT OR REPLACE upserts below run.
+    # No old-generation retirement deletes and no tombstone enqueues: bytes
+    # referenced by the committed generation stay untouched (a same-generation
+    # republish must never retire or tombstone anything, even rows carrying a
+    # different hash that may belong to another in-flight publisher).
+    row = conn.execute(
+        "SELECT active_generation_hash FROM files WHERE id = ?", (file_id,)
+    ).fetchone()
+    is_same_generation = bool(row) and row["active_generation_hash"] == generation_hash
+
     # Retire old generations (different hash): tombstone their assets, then
     # delete their atom/asset/stage rows. Never touches the current generation.
-    old_paths = [
-        row["rel_path"]
-        for row in conn.execute(
-            "SELECT rel_path FROM document_assets "
-            "WHERE file_id = ? AND generation_hash <> ?",
+    if not is_same_generation:
+        old_paths = [
+            entry["rel_path"]
+            for entry in conn.execute(
+                "SELECT rel_path FROM document_assets "
+                "WHERE file_id = ? AND generation_hash <> ?",
+                (file_id, generation_hash),
+            ).fetchall()
+        ]
+        if old_paths:
+            enqueue_asset_cleanup(
+                conn, file_id=file_id, vault_id=vault_id, rel_paths=old_paths
+            )
+        conn.execute(
+            "DELETE FROM document_assets WHERE file_id = ? AND generation_hash <> ?",
             (file_id, generation_hash),
-        ).fetchall()
-    ]
-    if old_paths:
-        enqueue_asset_cleanup(
-            conn, file_id=file_id, vault_id=vault_id, rel_paths=old_paths
         )
-    conn.execute(
-        "DELETE FROM document_assets WHERE file_id = ? AND generation_hash <> ?",
-        (file_id, generation_hash),
-    )
-    conn.execute(
-        "DELETE FROM document_atoms WHERE file_id = ? AND generation_hash <> ?",
-        (file_id, generation_hash),
-    )
-    conn.execute(
-        "DELETE FROM ingestion_stage_states WHERE file_id = ? AND generation_hash <> ?",
-        (file_id, generation_hash),
-    )
+        conn.execute(
+            "DELETE FROM document_atoms WHERE file_id = ? AND generation_hash <> ?",
+            (file_id, generation_hash),
+        )
+        conn.execute(
+            "DELETE FROM ingestion_stage_states WHERE file_id = ? AND generation_hash <> ?",
+            (file_id, generation_hash),
+        )
 
     for atom in atoms:
         conn.execute(

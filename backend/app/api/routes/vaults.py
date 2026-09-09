@@ -655,23 +655,33 @@ async def delete_vault(
             type(e).__name__,
         )
 
+    # W21 (C19 / RC-17): the vault's file ids, collected inside the
+    # transaction below so a post-commit vector-store failure can record
+    # per-file `vector_delete_pending` tombstones for the sweep.
+    vault_file_ids: List[int] = []
+
     try:
         # Start transaction. BEGIN IMMEDIATE acquires the write lock up front
         # so a concurrent deletion/mutation of the same vault cannot interleave
         # between our reads and writes (avoids SQLITE_BUSY mid-cascade).
         await asyncio.to_thread(conn.execute, "BEGIN IMMEDIATE")
 
-        # Delete vector chunks for this vault
-        try:
-            deleted_chunks = await vector_store.delete_by_vault(str(vault_id))
-            logger.info(
-                "Deleted %d chunks from vector store for vault_id %s",
-                deleted_chunks,
-                vault_id,
-            )
-        except (OSError, RuntimeError, ValueError) as e:
-            logger.warning("Error deleting chunks from vector store: %s", e)
-            # Continue with database deletion even if vector store fails
+        # Collect the vault's file ids BEFORE deleting their rows: they are
+        # needed for the post-commit vector reconciliation below, and after
+        # `DELETE FROM files` they are unrecoverable.
+        file_id_rows = await asyncio.to_thread(
+            lambda: conn.execute(
+                "SELECT id FROM files WHERE vault_id = ?", (vault_id,)
+            ).fetchall()
+        )
+        vault_file_ids = [int(row[0]) for row in file_id_rows]
+
+        # W21 (C19): vector chunks are NOT deleted here. The relational
+        # deletion is committed first (durable intent) and the vector store
+        # is reconciled AFTER the commit — a pre-commit SQL failure rolls
+        # back with BOTH stores intact, and a vector failure after commit is
+        # tombstoned for the hourly sweep + startup
+        # retry_pending_vector_deletes instead of being swallowed.
 
         # Reassign memories to global (NULL) instead of deleting
         await asyncio.to_thread(
@@ -704,6 +714,15 @@ async def delete_vault(
                 generation_hash=None,
             )
 
+        # Advisory near-duplicate groupings are vault-scoped; clear them with
+        # the files rows so a reused files.id rowid cannot inherit a stale
+        # group from a deleted file.
+        await asyncio.to_thread(
+            conn.execute,
+            "DELETE FROM document_near_dups WHERE vault_id = ?",
+            (vault_id,),
+        )
+
         # Delete files
         await asyncio.to_thread(
             conn.execute, "DELETE FROM files WHERE vault_id = ?", (vault_id,)
@@ -718,26 +737,8 @@ async def delete_vault(
             conn.execute, "DELETE FROM vaults WHERE id = ?", (vault_id,)
         )
 
-        # Commit transaction
+        # Commit transaction (durable deletion intent)
         await asyncio.to_thread(conn.commit)
-
-        if draft_purge_plan is not None:
-            try:
-                await asyncio.to_thread(draft_deletion.commit_purge, draft_purge_plan)
-            except Exception as e:
-                # Bytes are already tombstoned in `.trash`; failing to finish
-                # discarding them must not turn a successful vault delete
-                # into an error response.
-                logger.warning(
-                    "draft_room_vault_purge_commit_failed vault_id=%s reason=%s",
-                    vault_id,
-                    type(e).__name__,
-                )
-
-        return {
-            "message": f"Vault '{vault_name}' (id: {vault_id}) deleted successfully"
-        }
-
     except HTTPException:
         await asyncio.to_thread(lambda: conn.rollback())
         if draft_purge_plan is not None:
@@ -763,6 +764,68 @@ async def delete_vault(
                 )
         logger.exception("Error deleting vault %d", vault_id)
         raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+
+    # -- Post-commit vector reconciliation (W21 / C19). -------------------
+    # The relational delete is durable now; destroy the vault's vectors. On
+    # failure, record one `vector_delete_pending` tombstone per collected
+    # file (the same insert shape the document-delete path uses) so the
+    # hourly sweep and startup retry_pending_vector_deletes reconcile the
+    # orphaned chunks. This can never roll back the committed rows.
+    try:
+        deleted_chunks = await vector_store.delete_by_vault(str(vault_id))
+        logger.info(
+            "Deleted %d chunks from vector store for vault_id %s",
+            deleted_chunks,
+            vault_id,
+        )
+    except Exception as e:  # noqa: BLE001 — reconcile, never fail the response
+        logger.warning(
+            "Error deleting chunks from vector store for vault %s; recording "
+            "%d vector_delete_pending tombstone(s): %s",
+            vault_id,
+            len(vault_file_ids),
+            e,
+        )
+
+        def _record_vector_delete_tombstones() -> None:
+            for pending_file_id in vault_file_ids:
+                conn.execute(
+                    "INSERT INTO vector_delete_pending (file_id, vault_id) "
+                    "VALUES (?, ?)",
+                    (pending_file_id, vault_id),
+                )
+            conn.commit()
+
+        try:
+            await asyncio.to_thread(_record_vector_delete_tombstones)
+        except sqlite3.Error as tombstone_exc:
+            # Last resort: the tombstones themselves failed. The rows are
+            # committed and the chunks remain searchable until an operator
+            # intervenes — log loudly rather than 500 a finished delete.
+            logger.error(
+                "Failed to record vector_delete_pending tombstones for vault "
+                "%s (%d file(s)); orphaned chunks remain searchable: %s",
+                vault_id,
+                len(vault_file_ids),
+                tombstone_exc,
+            )
+
+    if draft_purge_plan is not None:
+        try:
+            await asyncio.to_thread(draft_deletion.commit_purge, draft_purge_plan)
+        except Exception as e:
+            # Bytes are already tombstoned in `.trash`; failing to finish
+            # discarding them must not turn a successful vault delete
+            # into an error response.
+            logger.warning(
+                "draft_room_vault_purge_commit_failed vault_id=%s reason=%s",
+                vault_id,
+                type(e).__name__,
+            )
+
+    return {
+        "message": f"Vault '{vault_name}' (id: {vault_id}) deleted successfully"
+    }
 
 
 @router.put("/vaults/{vault_id}/enrichment-toggle", response_model=VaultResponse)

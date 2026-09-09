@@ -21,13 +21,18 @@ from .embeddings import EmbeddingService
 from .llm_client import LLMClient
 from .maintenance import MaintenanceService
 from .multimodal_enrichment import ArtifactEnrichmentService
-from .vector_store import VectorStore
+from .vector_store import VectorStore, VectorStoreError
 
 logger = logging.getLogger(__name__)
 
-# Timeout for processing rows during startup recovery sweep.
-# If a row has been in status='processing' for longer than this,
-# it will be reset to 'pending' for re-processing.
+# Timeout for processing rows during the PERIODIC stranded-row rescan.
+# If a row has been in status='processing' for longer than this, the periodic
+# sweep (issue #513 W25) resets it to 'pending' for re-processing. The startup
+# sweep deliberately bypasses this timeout for rows that already reached a
+# post-parse stage (at startup, single-process, such rows are orphans by
+# definition — see _recover_stranded_pending_rows); rows still in a parse
+# stage remain age-gated by this constant even at startup so a long legitimate
+# parse is never stolen by restart alone.
 STRANDED_PROCESSING_TIMEOUT_MINUTES = 30
 
 # Per-row cap on the startup stranded-row re-enqueue (PRR-011). Recovery is
@@ -39,6 +44,20 @@ STRANDED_REENQUEUE_TIMEOUT_SECONDS = 30.0
 # this are left in place and logged for operator visibility — we never delete
 # a pending record without confirming the chunks are actually gone.
 MAX_VECTOR_DELETE_ATTEMPTS = 10
+
+# Bound on the deferred-retry backlog (issue #513 W11 / RC-6). Workers hand
+# retryable failures to a dedicated scheduler instead of sleeping inline and
+# re-entering the bounded queue they alone drain; the backlog itself must stay
+# bounded so a failure storm cannot grow unbounded memory. When full, the
+# failure escalates to the existing permanent-error path.
+RETRY_BACKLOG_MAX_SIZE = 1000
+
+# File pipeline phases that are still inside the parse stage. A 'processing'
+# row in one of these phases may belong to a legitimately long parse, so the
+# startup sweep (like the periodic rescan) only recovers them by age; every
+# later phase (embedding/writing_index/...) has durable stage checkpoints and
+# is unconditionally recovered at startup (issue #513 W25 / AC28).
+PARSE_STAGE_PHASES = ("parsing", "extracting_text", "chunking")
 
 # Singleton instance
 _processor_instance: Optional["BackgroundProcessor"] = None
@@ -117,6 +136,9 @@ class TaskItem:
         source: Source of the file ('upload', 'scan', 'email')
         email_subject: Subject line for email-sourced files
         email_sender: Sender address for email-sourced files
+        file_id: When set, the worker calls process_existing_file on this row
+        file_hash: Content hash computed by the enqueueing route (issue #513
+            W8 — single content hash). When None the processor computes it.
     """
     file_path: str
     vault_id: int
@@ -130,6 +152,24 @@ class TaskItem:
     # create a duplicate `files` row. Scan/email paths leave this None so
     # legacy behavior (process_file) is preserved.
     file_id: Optional[int] = None
+    # Pre-computed content hash from the upload route (issue #513 W8 / RC-21d:
+    # the route already hashed the bytes; re-hashing in the worker duplicated
+    # the work and could diverge from what the route persisted).
+    file_hash: Optional[str] = None
+
+
+@dataclass
+class _RetryTicket:
+    """One deferred retry handed to the retry scheduler (issue #513 W11 / RC-6).
+
+    Workers never re-enter their own bounded work queue from inside the
+    consumer coroutine; they park the due time plus the target queue here and
+    the dedicated scheduler task delivers the item once the backoff elapsed.
+    """
+
+    due_at: float
+    queue: "asyncio.Queue"
+    item: object
 
 
 @dataclass
@@ -261,6 +301,24 @@ class BackgroundProcessor:
         self._vector_delete_sweep_task: Optional[asyncio.Task] = None
         self._artifact_delete_sweep_task: Optional[asyncio.Task] = None
         self._reindex_worker_task: Optional[asyncio.Task] = None
+        # Deferred-retry scheduler (issue #513 W11 / RC-6): workers hand
+        # retryable items to this bounded backlog; the dedicated scheduler
+        # task re-inserts them into their work queue once the backoff elapses.
+        # A producer blocking on a full queue is safe there — the consumer
+        # keeps draining — so retry storms can no longer self-deadlock the
+        # sole worker of a bounded queue.
+        self._retry_backlog: asyncio.Queue[_RetryTicket] = asyncio.Queue(
+            maxsize=RETRY_BACKLOG_MAX_SIZE
+        )
+        self._retry_scheduler_task: Optional[asyncio.Task] = None
+        # Periodic stranded-row rescan (issue #513 W25 / FU-007): recovers
+        # orphans that appear AFTER startup, honoring the live-job lease below.
+        self._orphan_rescan_task: Optional[asyncio.Task] = None
+        # Live-job lease: file ids currently held by an ingestion worker. The
+        # periodic rescan never steals these rows, so a legitimately long parse
+        # is not recovered by age alone while it is still running.
+        self._active_file_ids: set = set()
+        self._active_file_ids_lock = asyncio.Lock()
         self._running = False
         self.maintenance_service = maintenance_service
         self._write_semaphore: Optional[asyncio.Semaphore] = None
@@ -321,9 +379,22 @@ class BackgroundProcessor:
                 self._atom_enrichment_worker_loop(), name="atom-enrichment-worker"
             )
         self._reindex_worker_task = asyncio.create_task(self._reindex_worker_loop(), name="reindex-worker")
+        # Deferred-retry scheduler (issue #513 W11): deliver retry tickets into
+        # the bounded work queues once their backoff elapses.
+        self._retry_scheduler_task = asyncio.create_task(
+            self._retry_scheduler_loop(), name="retry-scheduler"
+        )
 
         # Step 3: NOW run recovery. Workers are ready to consume.
-        await self._recover_stranded_pending_rows()
+        # Startup stranded-row sweep (issue #513 W25 / AC28): rows that already
+        # reached a post-parse stage are orphans by definition at startup
+        # (single-process SQLite) and are recovered regardless of age; rows
+        # still inside a parse stage stay age-gated so a long legitimate parse
+        # is never stolen by a restart alone.
+        await self._recover_stranded_pending_rows(
+            require_older_than_minutes=None, ignore_active=set()
+        )
+        await self._recover_interrupted_reindex_jobs()
         await self._recover_stranded_enrichment_rows()
         await self._recover_stranded_atom_enrichment_rows()
         await self._resume_pending_atom_enrichment()
@@ -339,8 +410,110 @@ class BackgroundProcessor:
         self._artifact_delete_sweep_task = asyncio.create_task(
             self._artifact_delete_sweep_loop(), name="artifact-delete-sweep"
         )
+        # Periodic stranded-row rescan (issue #513 W25 / FU-007): orphans that
+        # appear AFTER startup are recovered without waiting for a restart,
+        # honoring the live-job lease and the stranded processing timeout.
+        self._orphan_rescan_task = asyncio.create_task(
+            self._orphan_rescan_loop(), name="orphan-rescan"
+        )
 
         logger.info(f"Background processor started with {worker_count} worker(s)")
+
+    async def _orphan_rescan_loop(self) -> None:
+        """Periodically re-run the stranded-row recovery (issue #513 W25).
+
+        Each tick re-enqueues ``pending``/``queued`` rows and
+        ``processing`` rows older than STRANDED_PROCESSING_TIMEOUT_MINUTES,
+        skipping file ids held by a live worker (the active lease) so a long
+        legitimate parse is never stolen. Rows whose file vanished are marked
+        error, exactly like the startup sweep.
+        """
+        while True:
+            interval = settings.orphan_rescan_interval_seconds
+            # Tolerate a fully-mocked settings object (tests patch the module
+            # attribute wholesale); same defensive coercion pattern as the
+            # vector-store semaphore helpers.
+            if not isinstance(interval, (int, float)):
+                interval = 3600.0
+            await asyncio.sleep(interval)
+            if self.shutdown_event.is_set():
+                break
+            try:
+                await self._recover_stranded_pending_rows()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — rescan must never kill the loop
+                logger.exception("Periodic stranded-row rescan failed")
+
+    def _ensure_retry_scheduler(self) -> None:
+        """Start the retry-scheduler task if it is not already running."""
+        if self.shutdown_event.is_set():
+            return
+        task = self._retry_scheduler_task
+        if task is not None and not task.done():
+            return
+        self._retry_scheduler_task = asyncio.create_task(
+            self._retry_scheduler_loop(), name="retry-scheduler"
+        )
+
+    def _schedule_retry(self, *, queue: "asyncio.Queue", item: object, delay: float) -> bool:
+        """Park a deferred retry with the scheduler instead of blocking the worker.
+
+        Non-blocking: when the bounded retry backlog is full the ticket is
+        refused (returns False) so the caller escalates to its existing
+        permanent-error path — bounded resources are preserved (issue #513
+        W11 / C7 / C31).
+        """
+        if self.shutdown_event.is_set():
+            return False
+        try:
+            self._retry_backlog.put_nowait(
+                _RetryTicket(
+                    due_at=asyncio.get_running_loop().time() + max(0.0, delay),
+                    queue=queue,
+                    item=item,
+                )
+            )
+        except asyncio.QueueFull:
+            return False
+        self._ensure_retry_scheduler()
+        return True
+
+    async def _retry_scheduler_loop(self) -> None:
+        """Deliver deferred retry tickets into their work queues at due time.
+
+        The scheduler is a PRODUCER: ``await queue.put(...)`` may block on a
+        full bounded queue without deadlocking, because the worker consumers
+        keep draining. On shutdown, pending tickets are discarded (never
+        delivered, never hung on).
+        """
+        while True:
+            if self.shutdown_event.is_set() and self._retry_backlog.empty():
+                break
+            try:
+                ticket = await asyncio.wait_for(
+                    self._retry_backlog.get(), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                continue
+            try:
+                delay = ticket.due_at - asyncio.get_running_loop().time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if self.shutdown_event.is_set():
+                    logger.warning(
+                        "Discarding pending retry during shutdown (queue=%s)",
+                        getattr(ticket.queue, "__class__.__name__", "?"),
+                    )
+                    continue
+                # Producer-side blocking put is safe here (see docstring).
+                await ticket.queue.put(ticket.item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — one bad ticket must not kill the loop
+                logger.exception("Retry scheduler failed to deliver a ticket")
+            finally:
+                self._retry_backlog.task_done()
 
     async def _vector_delete_sweep_loop(self, interval_seconds: float = 3600.0) -> None:
         """Hourly retry loop for pending vector deletes (startup pass runs first)."""
@@ -390,20 +563,43 @@ class BackgroundProcessor:
             except Exception:  # noqa: BLE001 — sweep must never kill the loop
                 logger.exception("Periodic artifact-delete sweep failed")
 
-    async def _recover_stranded_pending_rows(self) -> None:
-        """Re-enqueue any `files` rows left at status='pending' from a prior process.
+    async def _recover_stranded_pending_rows(
+        self,
+        *,
+        ignore_active: Optional[set] = None,
+        require_older_than_minutes: Optional[int] = STRANDED_PROCESSING_TIMEOUT_MINUTES,
+    ) -> None:
+        """Re-enqueue stranded `files` rows (startup sweep AND periodic rescan).
 
-        Detection: status='pending' AND phase='queued'. The async upload
-        route is the only writer of this exact combination; legacy scan/
-        email paths leave phase NULL. We deliberately do NOT touch rows
-        in any other phase (parsing/embedding/...) — those imply a worker
-        was actively in the middle of processing them and the operator
-        should investigate manually.
+        Detection for pending rows: status='pending' AND phase='queued'. The
+        async upload route is the only writer of this exact combination; legacy
+        scan/email paths leave phase NULL.
+
+        Processing rows follow one of two age rules:
+
+        * ``require_older_than_minutes`` set (the periodic-rescan default, and
+          the pre-#513 startup behavior): only rows with a phase_started_at
+          older than the given minutes are recovered.
+        * ``require_older_than_minutes=None`` (the startup sweep since issue
+          #513 W25 / AC28): rows that already reached a POST-PARSE phase are
+          recovered regardless of age — at startup, single-process SQLite,
+          every such row is an orphan by definition. Rows still inside a parse
+          phase ('parsing'/'extracting_text'/'chunking') remain age-gated by
+          STRANDED_PROCESSING_TIMEOUT_MINUTES so a long legitimate parse is
+          never stolen by a restart alone (AC24 lease semantics).
+
+        ``ignore_active`` is the live-job lease: file ids in the set are never
+        touched. When None, the processor's current active lease
+        (``_active_file_ids``) is used.
 
         Best-effort: pool absence (e.g. tests) is silently skipped.
         """
         if self.processor is None or self.processor.pool is None:
             return
+
+        if ignore_active is None:
+            async with self._active_file_ids_lock:
+                ignore_active = set(self._active_file_ids)
 
         # SELECT 1: Pending rows
         try:
@@ -420,23 +616,55 @@ class BackgroundProcessor:
             logger.warning("Stranded-row recovery sweep failed at SELECT: %s", e)
             stranded = []
 
-        # SELECT 2: Processing rows
+        # SELECT 2: Processing rows (age rule per the docstring).
         processing_stranded = []
         try:
             with self.processor.pool.connection() as conn:
-                processing_cursor = conn.execute(
-                    """
-                    SELECT id, file_path, vault_id, source
-                    FROM files
-                    WHERE status = 'processing'
-                      AND (phase_started_at IS NOT NULL
-                           AND phase_started_at < datetime('now', ?))
-                    """,
-                    (f"-{STRANDED_PROCESSING_TIMEOUT_MINUTES} minutes",),
-                )
+                if require_older_than_minutes is not None:
+                    processing_cursor = conn.execute(
+                        """
+                        SELECT id, file_path, vault_id, source
+                        FROM files
+                        WHERE status = 'processing'
+                          AND (phase_started_at IS NOT NULL
+                               AND phase_started_at < datetime('now', ?))
+                        """,
+                        (f"-{int(require_older_than_minutes)} minutes",),
+                    )
+                else:
+                    # Startup semantics: post-parse stages are unconditional;
+                    # parse stages stay age-gated (live-parse lease, AC24).
+                    processing_cursor = conn.execute(
+                        """
+                        SELECT id, file_path, vault_id, source
+                        FROM files
+                        WHERE status = 'processing'
+                          AND (
+                            (phase IS NULL OR phase NOT IN
+                              ('parsing', 'extracting_text', 'chunking'))
+                            OR (phase_started_at IS NOT NULL
+                                AND phase_started_at < datetime('now', ?))
+                          )
+                        """,
+                        (f"-{STRANDED_PROCESSING_TIMEOUT_MINUTES} minutes",),
+                    )
                 processing_stranded = processing_cursor.fetchall()
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("Processing-row recovery sweep failed at SELECT: %s", e)
+
+        # Apply the live-job lease to both row sets (never steal a row a
+        # worker currently holds, even between its dequeue and its first
+        # status write).
+        stranded = [
+            row
+            for row in stranded
+            if (row["id"] if hasattr(row, "keys") else row[0]) not in ignore_active
+        ]
+        processing_stranded = [
+            row
+            for row in processing_stranded
+            if (row["id"] if hasattr(row, "keys") else row[0]) not in ignore_active
+        ]
 
         # Skip if no stranded rows to recover
         if not stranded and not processing_stranded:
@@ -553,10 +781,96 @@ class BackgroundProcessor:
 
         if processing_stranded:
             logger.info(
-                "Recovered %d stuck processing row(s) older than %d minutes",
+                "Recovered %d stuck processing row(s)",
                 len(processing_stranded),
-                STRANDED_PROCESSING_TIMEOUT_MINUTES,
             )
+
+    async def _recover_interrupted_reindex_jobs(self) -> None:
+        """Take ownership of `document_reindex_jobs` rows at startup (issue #513 W12).
+
+        A reindex job row must never survive a restart as 'running': the
+        process that owned it is gone (single-process SQLite), so the row is
+        marked 'interrupted' — an explicit terminal status the operator can
+        see — with job identity and progress columns preserved. Pending jobs
+        are re-enqueued (bounded by queue capacity, matching the stranded-row
+        recovery semantics) so queued-but-never-started work resumes.
+
+        Best-effort: pool absence (e.g. tests) is silently skipped.
+        """
+        if self.processor is None or self.processor.pool is None:
+            return
+        try:
+            with self.processor.pool.connection() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE document_reindex_jobs
+                    SET status = 'interrupted',
+                        error = 'Interrupted by process restart',
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE status = 'running'
+                    """,
+                )
+                interrupted = cursor.rowcount
+                conn.commit()
+                pending = conn.execute(
+                    """
+                    SELECT id FROM document_reindex_jobs
+                    WHERE status = 'pending'
+                    ORDER BY id
+                    """
+                ).fetchall()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Reindex-job recovery sweep failed: %s", e)
+            return
+
+        if interrupted:
+            logger.info(
+                "Marked %d reindex job(s) interrupted by restart (no auto-resume)",
+                interrupted,
+            )
+
+        requeued = 0
+        for row in pending:
+            job_id = row["id"] if hasattr(row, "keys") else row[0]
+            try:
+                self.reindex_queue.put_nowait(ReindexTaskItem(job_id=int(job_id)))
+                requeued += 1
+            except asyncio.QueueFull:
+                logger.warning(
+                    "Reindex queue full during startup recovery; %d pending "
+                    "job(s) left for the next restart or manual trigger",
+                    len(pending) - requeued,
+                )
+                break
+        if requeued:
+            logger.info("Re-enqueued %d pending reindex job(s) on startup", requeued)
+
+    def _mark_running_reindex_jobs_interrupted(self, reason: str) -> None:
+        """Shutdown half of the reindex lifecycle (issue #513 W12): after the
+        reindex worker is cancelled, any 'running' row is marked 'interrupted'
+        so a stopped job is never abandoned as 'running'."""
+        if self.processor is None or self.processor.pool is None:
+            return
+        try:
+            with self.processor.pool.connection() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE document_reindex_jobs
+                    SET status = 'interrupted',
+                        error = ?,
+                        completed_at = CURRENT_TIMESTAMP
+                    WHERE status = 'running'
+                    """,
+                    (reason,),
+                )
+                conn.commit()
+            if cursor.rowcount:
+                logger.info(
+                    "Marked %d running reindex job(s) interrupted at shutdown",
+                    cursor.rowcount,
+                )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Failed to mark reindex jobs interrupted: %s", e)
 
     async def retry_pending_vector_deletes(self) -> None:
         """Retry vector-store chunk deletes recorded by failed document deletes.
@@ -716,6 +1030,25 @@ class BackgroundProcessor:
                         est.SKIPPED_NOT_APPLICABLE,
                     ),
                 ).fetchall()
+                # (1b) SUCCEEDED atoms whose durable proxy never landed
+                # (issue #513 W17 / RC-10): the stage was committed before the
+                # LanceDB proxy write failed, leaving the derived row with
+                # proxy_vector_id NULL. Mirrors the actionable logic of
+                # est.list_enrichable_atoms so recovery re-enqueues them.
+                proxy_missing_rows = conn.execute(
+                    "SELECT DISTINCT s.file_id, f.vault_id, f.file_hash "
+                    "FROM ingestion_stage_states s "
+                    "JOIN document_atoms a ON a.id = s.atom_id "
+                    "AND a.file_id = s.file_id AND a.generation_hash = s.generation_hash "
+                    "JOIN document_atom_enrichments d ON d.file_id = a.file_id "
+                    "AND d.generation_hash = a.generation_hash AND d.atom_id = a.atom_id "
+                    "JOIN files f ON f.id = s.file_id "
+                    "WHERE s.stage = ? AND s.status = ? "
+                    "AND a.kind IN ('image','chart','table','equation') "
+                    "AND d.proxy_vector_id IS NULL",
+                    (est.ENRICH_STAGE, est.SUCCEEDED),
+                ).fetchall()
+                rows = rows + proxy_missing_rows
                 # (2) Backfill: files whose active generation has eligible-kind
                 # atoms but NO enrichment stage row at all. Enabling multimodal
                 # after ingestion creates no stage rows (F-6a), so these files
@@ -871,6 +1204,10 @@ class BackgroundProcessor:
         Runs only when a multimodal service is configured. On each completed job,
         derived proxies are embedded and written through the existing LanceDB path
         with add-then-delete so a failed re-embed leaves the base/raw proxy intact.
+
+        Retries (job-level exceptions AND per-atom retryable provider outcomes,
+        issue #513 W17 / AC10) go through the deferred-retry scheduler, bounded
+        by settings.multimodal_max_attempts total attempts per file.
         """
         while True:
             if self.shutdown_event.is_set() and self.atom_enrichment_queue.empty():
@@ -881,13 +1218,16 @@ class BackgroundProcessor:
                 )
             except asyncio.TimeoutError:
                 continue
+            retryable_atoms = 0
             try:
-                proxy_records = await self.multimodal_service.enrich_atoms(
+                outcome = await self.multimodal_service.enrich_atoms(
                     vault_id=item.vault_id,
                     file_id=item.file_id,
                     generation_hash=item.generation_hash,
                     document_title=item.document_title,
                 )
+                proxy_records = outcome.get("proxy_records", [])
+                retryable_atoms = int(outcome.get("retryable", 0) or 0)
                 if proxy_records:
                     await self._write_atom_proxies(
                         proxy_records,
@@ -897,31 +1237,65 @@ class BackgroundProcessor:
                     )
                 # Per-file aggregate status reflects partial/failed atoms.
                 self._sync_file_enrichment_status(item)
+                # In-run retry for transient per-atom outcomes (AC10): without
+                # this only a restart's resume sweep would ever re-reach the
+                # atom. Bounded by multimodal_max_attempts total attempts.
+                if retryable_atoms and not self.shutdown_event.is_set():
+                    self._schedule_atom_enrichment_retry(item)
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "Atom enrichment job failed for file_id=%s", item.file_id
                 )
-                if self.shutdown_event.is_set():
-                    continue
-                # Atom enrichment retries are capped by the multimodal_max_attempts
-                # setting (default 3), not the ingestion max_retries.
-                max_atom_attempts = max(
-                    1, int(settings.multimodal_max_attempts or 1)
-                )
-                if item.attempt < max_atom_attempts:
-                    delay = self.retry_delay * (2 ** item.attempt)
-                    await asyncio.sleep(delay)
-                    if self.shutdown_event.is_set():
-                        continue
-                    item.attempt += 1
-                    await self.atom_enrichment_queue.put(item)
-                else:
-                    logger.error(
-                        "Atom enrichment permanently failed for file_id=%s",
-                        item.file_id,
-                    )
+                if not self.shutdown_event.is_set():
+                    self._schedule_atom_enrichment_retry(item)
             finally:
                 self.atom_enrichment_queue.task_done()
+
+    def _schedule_atom_enrichment_retry(self, item: AtomEnrichmentTaskItem) -> None:
+        """Schedule the next bounded atom-enrichment attempt (W17 / W11).
+
+        Attempts are capped at settings.multimodal_max_attempts TOTAL runs per
+        file (attempt is 0-based). Scheduling is non-blocking; when the retry
+        backlog is full or the cap is exhausted the failure is terminal and
+        the atom stages keep their retryable status for the next startup
+        resume sweep.
+        """
+        max_atom_attempts = max(1, int(settings.multimodal_max_attempts or 1))
+        if item.attempt + 1 >= max_atom_attempts:
+            logger.error(
+                "Atom enrichment permanently failed for file_id=%s after %d "
+                "attempt(s) (multimodal_max_attempts=%d)",
+                item.file_id,
+                item.attempt + 1,
+                max_atom_attempts,
+            )
+            return
+        delay = self.retry_delay * (2 ** item.attempt)
+        new_item = AtomEnrichmentTaskItem(
+            file_id=item.file_id,
+            vault_id=item.vault_id,
+            generation_hash=item.generation_hash,
+            file_hash=item.file_hash,
+            document_title=item.document_title,
+            attempt=item.attempt + 1,
+        )
+        if self._schedule_retry(
+            queue=self.atom_enrichment_queue, item=new_item, delay=delay
+        ):
+            logger.warning(
+                "Atom enrichment retry for file_id=%s scheduled in %.2fs "
+                "(attempt %d/%d, retryable atoms in batch)",
+                item.file_id,
+                delay,
+                item.attempt + 2,
+                max_atom_attempts,
+            )
+        else:
+            logger.error(
+                "Atom enrichment retry for file_id=%s could not be scheduled "
+                "(backlog full or shutdown); leaving atom stages retryable",
+                item.file_id,
+            )
 
     def _sync_file_enrichment_status(self, item: AtomEnrichmentTaskItem) -> None:
         """Map atom-stage aggregates onto files.enrichment_status (distinct from base)."""
@@ -963,6 +1337,18 @@ class BackgroundProcessor:
         New proxy rows are added first; only after they are durable are the prior
         proxy rows (tracked by id in the derived table) deleted. A failed re-embed
         therefore never removes the base/raw proxy.
+
+        Durability and staleness rules (issue #513 W17/W18):
+
+        * A per-text None embedding (failed proxy embed) is NOT a silent skip:
+          the atom's stage is reverted to FAILED_RETRYABLE (bounded by
+          multimodal_max_attempts via est.mark_proxy_missing_retryable), so the
+          startup resume sweep and list_enrichable_atoms both re-reach it and
+          the file is never reported complete without its durable proxy.
+        * Immediately before each vector insert the atom's stage fingerprint is
+          re-verified (est.is_atom_stage_current): a newer generation may have
+          claimed the atom during the embedding await, and an obsolete proxy
+          vector must not be published.
         """
         from . import enrichment_state as est
 
@@ -974,13 +1360,75 @@ class BackgroundProcessor:
         new_records: list[dict] = []
         new_ids: list[str] = []
         texts = [pr["proxy_text"] for pr in proxy_records]
+        # Resolve the atoms' row PKs once (stage/proxy helpers key on the
+        # document_atoms rowid, proxy records carry the opaque atom id).
+        with self.processor.pool.connection() as conn:
+            atom_pks: dict[str, Optional[int]] = {
+                pr.get("atom_id") or "": est.resolve_atom_pk(
+                    conn,
+                    file_id=file_id,
+                    generation_hash=generation_hash,
+                    atom_id=pr.get("atom_id") or "",
+                )
+                for pr in proxy_records
+            }
         embeddings = await emb_service.embed_batch(texts, fail_fast=False)
         emb_list, _failed = embeddings
+        max_attempts = max(1, int(settings.multimodal_max_attempts or 1))
         for i, pr in enumerate(proxy_records):
-            # embed_batch returns a per-text list with None placeholders for any
-            # failed text; skip those so a None vector is never written to LanceDB.
+            atom_pk = atom_pks.get(pr.get("atom_id") or "")
             if emb_list[i] is None:
+                # Failed proxy embedding: revert the atom's stage so recovery
+                # re-reaches it (W17 / AC16) instead of silently skipping.
+                if atom_pk is not None:
+                    try:
+                        with self.processor.pool.connection() as conn:
+                            new_status = est.mark_proxy_missing_retryable(
+                                conn,
+                                file_id=file_id,
+                                generation_hash=generation_hash,
+                                atom_pk=atom_pk,
+                                max_attempts=max_attempts,
+                            )
+                            conn.commit()
+                        if new_status:
+                            logger.warning(
+                                "Proxy embedding failed for atom=%s (file_id=%s): "
+                                "stage reverted to '%s' for bounded retry",
+                                pr.get("atom_id"),
+                                file_id,
+                                new_status,
+                            )
+                    except Exception as exc:  # noqa: BLE001 — never abort the batch
+                        logger.warning(
+                            "Could not revert atom=%s stage after proxy embed "
+                            "failure: %s",
+                            pr.get("atom_id"),
+                            exc,
+                        )
                 continue
+            # Pre-insert staleness re-verify (W18 / AC17): the embedding await
+            # above may have straddled a newer generation claiming the atom.
+            if atom_pk is not None:
+                try:
+                    with self.processor.pool.connection() as conn:
+                        stage_current = est.is_atom_stage_current(
+                            conn,
+                            file_id=file_id,
+                            generation_hash=generation_hash,
+                            atom_pk=atom_pk,
+                            input_fingerprint=pr.get("fingerprint") or "",
+                        )
+                except Exception:  # noqa: BLE001 — on read failure, write as before
+                    stage_current = True
+                if not stage_current:
+                    logger.info(
+                        "Skipping proxy insert for superseded atom=%s "
+                        "(file_id=%s): stage fingerprint moved on",
+                        pr.get("atom_id"),
+                        file_id,
+                    )
+                    continue
             pid = f"{file_id}_{pr['atom_id']}_{gen_short}_{(pr.get('fingerprint') or '')[:8]}"
             new_ids.append(pid)
             metadata = {
@@ -1127,6 +1575,39 @@ class BackgroundProcessor:
         if self._reindex_worker_task:
             self._reindex_worker_task.cancel()
             await asyncio.gather(self._reindex_worker_task, return_exceptions=True)
+            # Reindex lifecycle ownership (issue #513 W12): with the worker
+            # cancelled, a 'running' job row would be abandoned forever —
+            # mark it 'interrupted' (terminal, operator-visible).
+            self._mark_running_reindex_jobs_interrupted(
+                "Interrupted by processor shutdown"
+            )
+        # Deferred-retry scheduler (issue #513 W11): cancel the deliverer, then
+        # discard any still-pending tickets with a warning — shutdown never
+        # hangs on the backlog and never silently delivers post-stop retries.
+        if getattr(self, "_retry_scheduler_task", None):
+            self._retry_scheduler_task.cancel()
+            await asyncio.gather(self._retry_scheduler_task, return_exceptions=True)
+            self._retry_scheduler_task = None
+        if getattr(self, "_orphan_rescan_task", None):
+            self._orphan_rescan_task.cancel()
+            await asyncio.gather(self._orphan_rescan_task, return_exceptions=True)
+            self._orphan_rescan_task = None
+        # Guarded like every other lifecycle attribute above: ``stop`` must be
+        # safe on partially constructed instances (tests and shutdown paths
+        # build minimal processors without running ``__init__``).
+        retry_backlog = getattr(self, "_retry_backlog", None)
+        if retry_backlog is not None:
+            pending_retries = retry_backlog.qsize()
+            if pending_retries:
+                logger.warning(
+                    "Discarding %d pending deferred retry ticket(s) at shutdown",
+                    pending_retries,
+                )
+                while True:
+                    try:
+                        retry_backlog.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
         # Phase 3: Flush optimize on VectorStore if available
         if hasattr(self.processor, 'vector_store') and self.processor.vector_store is not None:
@@ -1148,6 +1629,7 @@ class BackgroundProcessor:
         email_subject: Optional[str] = None,
         email_sender: Optional[str] = None,
         file_id: Optional[int] = None,
+        file_hash: Optional[str] = None,
     ) -> None:
         """
         Add a file to the processing queue.
@@ -1162,6 +1644,11 @@ class BackgroundProcessor:
                 ``DocumentProcessor.process_existing_file`` against this row
                 instead of ``process_file``. Used by the async upload route
                 so duplicate detection and row insertion do not run twice.
+            file_hash: Content hash already computed by the enqueueing route
+                (issue #513 W8 — single content hash). When provided it is
+                passed through to ``process_existing_file`` so the file is
+                hashed once; reindex/recovery callers leave it None and the
+                processor computes it.
 
         Note:
             If the processor is not running, the item will still be queued
@@ -1179,6 +1666,7 @@ class BackgroundProcessor:
             email_sender=email_sender,
             vault_id=vault_id,
             file_id=file_id,
+            file_hash=file_hash,
         )
         await self.queue.put(task)
         logger.debug(f"Enqueued file: {file_path} (file_id={file_id})")
@@ -1256,16 +1744,10 @@ class BackgroundProcessor:
                         item.attempt + 1,
                         self.max_retries,
                     )
-                    await asyncio.sleep(delay)
-                    # Re-check shutdown after backoff; stop() may have been
-                    # called while we were sleeping.
-                    if self.shutdown_event.is_set():
-                        logger.warning(
-                            "Enrichment retry for file_id=%s skipped after backoff "
-                            "because shutdown is in progress",
-                            item.file_id,
-                        )
-                        continue
+                    # Deferred retry (issue #513 W11 / RC-6): the backoff runs in
+                    # the dedicated scheduler, NOT in this worker's consume
+                    # slot, so other queued jobs keep being processed and the
+                    # requeue can never self-deadlock a full bounded queue.
                     new_item = EnrichmentTaskItem(
                         file_id=item.file_id,
                         file_path=item.file_path,
@@ -1275,7 +1757,17 @@ class BackgroundProcessor:
                         document_text=item.document_text,
                         attempt=item.attempt + 1,
                     )
-                    await self.enrichment_queue.put(new_item)
+                    if not self._schedule_retry(
+                        queue=self.enrichment_queue, item=new_item, delay=delay
+                    ):
+                        # Retry backlog full (or shutdown began): escalate to
+                        # the permanent-failure path instead of blocking.
+                        logger.error(
+                            "Enrichment retry for file_id=%s could not be "
+                            "scheduled (retry backlog full); treating as "
+                            "permanent failure",
+                            item.file_id,
+                        )
                 else:
                     logger.error(
                         "Enrichment permanently failed for file_id=%s after %s attempts",
@@ -1365,36 +1857,91 @@ class BackgroundProcessor:
                 vid = row["vault_id"] if hasattr(row, "keys") else row[2]
                 vaults_files.setdefault(vid, []).append((fid, fpath, vid))
 
+            # Step 4b: Dimension probe (issue #513 W13 / RC-8). Embed one probe
+            # text BEFORE iterating files; when the target dimension differs
+            # from the live table's dimension, every per-file vector write is
+            # routed into a rebuild temp table and the live index is replaced
+            # by a validated atomic swap only after ALL files succeed. On any
+            # failure the temp table is dropped and the old index is preserved.
+            vector_store = self.processor.vector_store
+            rebuild_handle = None
+            probe_dim: Optional[int] = None
+            if vector_store is not None and vaults_files:
+                emb_service = self.processor.embedding_service
+                if emb_service is not None:
+                    probe_embeddings, _probe_failed = await emb_service.embed_batch(
+                        ["dimension_probe"], fail_fast=True
+                    )
+                    if probe_embeddings and probe_embeddings[0] is not None:
+                        probe_dim = len(probe_embeddings[0])
+                live_dim = await vector_store.get_live_embedding_dim()
+                if probe_dim is not None and live_dim is not None and probe_dim != live_dim:
+                    rebuild_handle = await vector_store.begin_dimension_rebuild(probe_dim)
+                    logger.info(
+                        "Reindex job %d: embedding dimension %d != live table "
+                        "dimension %d — rebuilding into temp table '%s' "
+                        "(live index untouched until commit)",
+                        job_id,
+                        probe_dim,
+                        live_dim,
+                        getattr(rebuild_handle, "table_name", "?"),
+                    )
+
             # Step 5: Initialize counters
             total_files = 0
             processed_files = 0
             failed_files = 0
             failed_details: list[str] = []
 
-            for vault_id_sorted in sorted(vaults_files.keys()):
-                file_list = vaults_files[vault_id_sorted]
-                for file_id, file_path, vault_id_file in file_list:
-                    total_files += 1
-                    logger.info("Re-embedding file_id=%d in vault_id=%d", file_id, vault_id_file)
-                    try:
-                        await self.processor.process_existing_file(file_id, file_path, vault_id_file)
-                        processed_files += 1
-                    except (
-                        DocumentProcessingError,
-                        FileNotFoundError,
-                        OSError,
-                        RuntimeError,
-                        Exception,
-                    ) as exc:
-                        logger.exception(
-                            "Re-embed failed for file_id=%d in vault_id=%d: %s",
-                            file_id,
-                            vault_id_file,
-                            exc,
+            try:
+                for vault_id_sorted in sorted(vaults_files.keys()):
+                    file_list = vaults_files[vault_id_sorted]
+                    for file_id, file_path, vault_id_file in file_list:
+                        total_files += 1
+                        logger.info("Re-embedding file_id=%d in vault_id=%d", file_id, vault_id_file)
+                        reprocess_kwargs = (
+                            {"vector_target": rebuild_handle}
+                            if rebuild_handle is not None
+                            else {}
                         )
-                        failed_files += 1
-                        failed_details.append(f"file_id={file_id}: {exc}")
-                        continue
+                        try:
+                            await self.processor.process_existing_file(
+                                file_id, file_path, vault_id_file, **reprocess_kwargs
+                            )
+                            processed_files += 1
+                        except (
+                            DocumentProcessingError,
+                            FileNotFoundError,
+                            OSError,
+                            RuntimeError,
+                            Exception,
+                        ) as exc:
+                            logger.exception(
+                                "Re-embed failed for file_id=%d in vault_id=%d: %s",
+                                file_id,
+                                vault_id_file,
+                                exc,
+                            )
+                            failed_files += 1
+                            failed_details.append(f"file_id={file_id}: {exc}")
+                            continue
+
+                # Same-dimension reindex: nothing to swap; unchanged behavior.
+                if rebuild_handle is not None:
+                    if failed_files > 0:
+                        raise VectorStoreError(
+                            f"dimension rebuild aborted: {failed_files}/{total_files} "
+                            f"file(s) failed to re-embed at dimension {probe_dim}"
+                        )
+                    await vector_store.commit_dimension_rebuild(rebuild_handle)
+                    rebuild_handle = None
+            except Exception:
+                # Old index preserved: drop the temp table, then let the outer
+                # handler fail the job.
+                if rebuild_handle is not None:
+                    await vector_store.abort_dimension_rebuild(rebuild_handle)
+                    rebuild_handle = None
+                raise
 
             # Step 6: Determine final job status and result
             if total_files == 0:
@@ -1424,10 +1971,14 @@ class BackgroundProcessor:
                 # Step 7a: Update stored model identity and readiness BEFORE marking completed.
                 # If this fails, mark the job as failed so the app is not left in a mismatched
                 # state on restart (metadata not persisted but job reported as completed).
+                # After a committed dimension rebuild (W13) the recorded dim is
+                # the probe-observed dim the new index was actually built at.
                 try:
                     vector_store = self.processor.vector_store
                     if vector_store is not None:
-                        await vector_store.record_embedding_metadata(settings.embedding_dim, raise_on_error=True)
+                        await vector_store.record_embedding_metadata(
+                            probe_dim or settings.embedding_dim, raise_on_error=True
+                        )
                         await vector_store.mark_ready(True)
                         logger.info(
                             "Vector store model identity updated and marked ready after reindex job %d.",
@@ -1479,12 +2030,22 @@ class BackgroundProcessor:
         Wrapper for _process_task that ensures task_done() is always called.
 
         This wrapper guarantees queue.task_done() is called even if _process_task
-        raises an exception or continues early.
+        raises an exception or continues early. It also maintains the live-job
+        lease (issue #513 W25): the file id is registered from dequeue until
+        settle so the periodic orphan rescan never steals a row a worker is
+        actively processing — even one stuck for hours in a long parse.
         """
+        leased_id = task.file_id
+        if leased_id is not None:
+            async with self._active_file_ids_lock:
+                self._active_file_ids.add(leased_id)
         try:
             await self._process_task(task)
         finally:
             self.queue.task_done()
+            if leased_id is not None:
+                async with self._active_file_ids_lock:
+                    self._active_file_ids.discard(leased_id)
 
     async def _process_task(self, task: TaskItem) -> None:
         """
@@ -1504,10 +2065,16 @@ class BackgroundProcessor:
             if task.file_id is not None:
                 # Async upload path: the row already exists with status='pending'
                 # / phase='queued' and the duplicate check has already passed.
+                # The route-computed content hash (issue #513 W8) is forwarded
+                # when present so the file is hashed exactly once.
+                kwargs = {}
+                if task.file_hash is not None:
+                    kwargs["file_hash"] = task.file_hash
                 result = await self.processor.process_existing_file(
                     file_id=task.file_id,
                     file_path=task.file_path,
                     vault_id=task.vault_id,
+                    **kwargs,
                 )
             else:
                 # Legacy path (scan/email): processor handles dup check + insert.
@@ -1518,26 +2085,27 @@ class BackgroundProcessor:
                     email_sender=task.email_sender,
                     vault_id=task.vault_id,
                 )
-            if self.processor.should_enqueue_enrichment(result.chunks, result.vault_id, result.file_id):
-                self.processor.set_enrichment_status(result.file_id, "pending")
-                await self.enqueue_enrichment(
-                    EnrichmentTaskItem(
+            if result is not None:
+                if self.processor.should_enqueue_enrichment(result.chunks, result.vault_id, result.file_id):
+                    self.processor.set_enrichment_status(result.file_id, "pending")
+                    await self.enqueue_enrichment(
+                        EnrichmentTaskItem(
+                            file_id=result.file_id,
+                            file_path=result.file_path,
+                            vault_id=result.vault_id,
+                            file_hash=result.file_hash,
+                            chunks=result.chunks,
+                            document_text=result.document_text,
+                            attempt=0,
+                        )
+                    )
+                if self.multimodal_service is not None:
+                    self.enqueue_atom_enrichment(
                         file_id=result.file_id,
-                        file_path=result.file_path,
                         vault_id=result.vault_id,
                         file_hash=result.file_hash,
-                        chunks=result.chunks,
-                        document_text=result.document_text,
-                        attempt=0,
+                        document_title=os.path.basename(result.file_path or ""),
                     )
-                )
-            if self.multimodal_service is not None:
-                self.enqueue_atom_enrichment(
-                    file_id=result.file_id,
-                    vault_id=result.vault_id,
-                    file_hash=result.file_hash,
-                    document_title=os.path.basename(result.file_path or ""),
-                )
             logger.info(f"Successfully processed: {task.file_path}")
 
         except DocumentProcessingError as e:
@@ -1556,10 +2124,15 @@ class BackgroundProcessor:
             task: The failed task
             error_message: Error message from the failure
 
-        Requeues the task with incremented attempt count if retries remain.
-        When retries are exhausted (permanent failure) and ``task.file_id`` is set,
-        writes ``status='error'``, ``error_message``, and ``phase='error'`` to the
-        corresponding ``files`` row so the file is not left stuck in 'processing'.
+        Schedules a deferred retry with incremented attempt count if retries
+        remain (issue #513 W11 / RC-6: the backoff sleeps in the dedicated
+        retry scheduler, never in the worker's consume slot, and the requeue
+        is delivered by the scheduler as a queue PRODUCER — a full bounded
+        queue can no longer self-deadlock the sole consumer). When retries are
+        exhausted (permanent failure), the retry backlog is full, or shutdown
+        is in progress, and ``task.file_id`` is set, writes ``status='error'``,
+        ``error_message``, and ``phase='error'`` to the corresponding ``files``
+        row so the file is not left stuck in 'processing'.
         """
         # Don't requeue if shutdown is in progress
         if self.shutdown_event.is_set():
@@ -1576,9 +2149,6 @@ class BackgroundProcessor:
                 f"retrying in {delay}s (attempt {task.attempt + 1}/{self.max_retries})"
             )
 
-            # Wait before requeuing
-            await asyncio.sleep(delay)
-
             # Requeue with incremented attempt count, preserving metadata
             new_task = TaskItem(
                 file_path=task.file_path,
@@ -1588,28 +2158,41 @@ class BackgroundProcessor:
                 email_sender=task.email_sender,
                 vault_id=task.vault_id,
                 file_id=task.file_id,
+                file_hash=task.file_hash,
             )
-            await self.queue.put(new_task)
+            if not self._schedule_retry(queue=self.queue, item=new_task, delay=delay):
+                # Retry backlog full (or shutdown began between the checks):
+                # escalate to the permanent-failure path instead of blocking.
+                logger.error(
+                    "Task retry for %s could not be scheduled (retry backlog "
+                    "full); treating as permanent failure: %s",
+                    task.file_path,
+                    error_message,
+                )
+                self._mark_task_permanently_failed(task, error_message)
         else:
-            # Mark file as error in database so it doesn't stay in 'processing'
-            if task.file_id is not None and self.processor.pool is not None:
-                try:
-                    with self.processor.pool.connection() as conn:
-                        conn.execute(
-                            "UPDATE files SET status='error', "
-                            "error_message=?, phase='error' WHERE id = ?",
-                            (error_message[:500], task.file_id),
-                        )
-                        conn.commit()
-                except Exception:
-                    logger.warning(
-                        "Failed to update file status to 'error' "
-                        "for file_id=%s", task.file_id,
+            self._mark_task_permanently_failed(task, error_message)
+
+    def _mark_task_permanently_failed(self, task: TaskItem, error_message: str) -> None:
+        # Mark file as error in database so it doesn't stay in 'processing'
+        if task.file_id is not None and self.processor.pool is not None:
+            try:
+                with self.processor.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE files SET status='error', "
+                        "error_message=?, phase='error' WHERE id = ?",
+                        (error_message[:500], task.file_id),
                     )
-            logger.error(
-                f"Task permanently failed for {task.file_path} "
-                f"after {self.max_retries} attempts: {error_message}"
-            )
+                    conn.commit()
+            except Exception:
+                logger.warning(
+                    "Failed to update file status to 'error' "
+                    "for file_id=%s", task.file_id,
+                )
+        logger.error(
+            f"Task permanently failed for {task.file_path} "
+            f"after {self.max_retries} attempts: {error_message}"
+        )
 
     @property
     def is_running(self) -> bool:

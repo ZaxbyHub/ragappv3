@@ -391,12 +391,24 @@ class TestDocumentProcessorChunkerLiveReads:
     def test_get_chunker_falls_back_to_init_values_when_settings_unset(
         self, mock_settings
     ):
-        mock_settings.chunk_size_chars = 0  # falsy → use fallback
-        mock_settings.chunk_overlap_chars = 0
+        # Drift review (issue #513 W4 / frozen C3): "unset" is None, which
+        # still falls back to the constructor values. An explicitly configured
+        # 0 is a VALUE and is now honored (previously the falsy-zero bug
+        # treated 0 as unset and silently fell back — that behavior is pinned
+        # as wrong by frozen check C3).
+        mock_settings.chunk_size_chars = None
+        mock_settings.chunk_overlap_chars = None
         processor = DocumentProcessor(chunk_size_chars=1500, chunk_overlap_chars=150)
         chunker = processor._get_chunker()
         assert chunker.chunk_size == 1500
         assert chunker.chunk_overlap == 150
+
+        # Explicit zeros are honored, not treated as unset (issue #513 W4).
+        mock_settings.chunk_size_chars = 0
+        mock_settings.chunk_overlap_chars = 0
+        zero_chunker = processor._get_chunker()
+        assert zero_chunker.chunk_size == 0
+        assert zero_chunker.chunk_overlap == 0
 
     def test_get_chunker_default_strategy_returns_title_chunker(self, mock_settings):
         from app.services.chunking import SemanticChunker
