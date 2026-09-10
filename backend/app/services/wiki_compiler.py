@@ -247,6 +247,16 @@ class WikiCompiler:
                     ),
                 )
                 self._db.commit()
+            # WIKI-006 (#515): reactivate superseded → active when this compile
+            # re-derives the claim text unchanged from a current source (e.g. a
+            # reindex re-promoting a memory whose claim sentence survived an
+            # edit). Only the found-by-text claim is touched, and only from
+            # 'superseded' — a claim whose supporting content changed resolves to
+            # a DIFFERENT sentence, so it never reaches this branch and stays
+            # superseded while its replacement gets its own claim row.
+            if existing.status == "superseded" and new_status == "active":
+                if self._store.reactivate_claim(existing.id):
+                    existing.status = "active"
             # Attach dedup source if not already present
             already = any(
                 s.source_kind == source_kind and self._source_matches(s, source_kind, source_identity)
@@ -639,9 +649,13 @@ class WikiCompiler:
                 # any source that _find_or_create_claim just attached (its return value
                 # is stale after an inline attach+commit).
                 if not _created:
-                    _refreshed = self._store.find_claim_by_text(vault_id, sentence)
+                    # WIKI-008 (#515): reload BY CLAIM ID, not by exact input
+                    # text — the reuse may have matched via normalized text
+                    # (punctuation/whitespace variant), and an exact-text
+                    # lookup then misses the claim and returns an empty
+                    # source snapshot, which re-attaches duplicate rows.
                     _current_sources = list(
-                        (_refreshed.sources if _refreshed else None) or []
+                        self._store.get_claim_sources(claim.id)
                     )
                 else:
                     _current_sources = []
@@ -860,24 +874,67 @@ class WikiCompiler:
         # acronym / ALL-CAPS-org role patterns.
 
         file_name = file_data.get("file_name") or f"file:{file_id}"
-        slug = normalize_slug(f"document/{file_name[:60]}")
         title = file_name
 
-        existing = self._db.execute(
-            "SELECT id FROM wiki_pages WHERE vault_id = ? AND slug = ?", (vault_id, slug)
-        ).fetchone()
-        if existing:
-            page = self._store.get_page(existing[0], load_relations=False)
-        else:
-            page = self._store.create_page(
+        # WIKI-009 (#515): a document's page is resolved through the
+        # wiki_page_files association (stable per file), NOT through a slug
+        # derived only from the file_name — two different files sharing a
+        # file_name in one vault would otherwise collide onto a single page
+        # and clobber each other's compiler-owned content.
+        page = self._store.get_page_by_file(vault_id=vault_id, file_id=file_id)
+        created = False
+        if page is None:
+            slug = normalize_slug(f"document/{file_name[:60]}")
+            existing = self._db.execute(
+                "SELECT id FROM wiki_pages WHERE vault_id = ? AND slug = ?", (vault_id, slug)
+            ).fetchone()
+            if existing is not None and self._db.execute(
+                "SELECT 1 FROM wiki_page_files WHERE vault_id = ? AND page_id = ? "
+                "AND file_id != ? LIMIT 1",
+                (vault_id, existing[0], file_id),
+            ).fetchone():
+                # Another file already owns that slug in this vault — append
+                # the stable file id so each same-named document gets (and,
+                # on recompile, keeps) its own page.
+                slug = normalize_slug(f"document/{file_name[:52]}-{file_id}")
+                existing = self._db.execute(
+                    "SELECT id FROM wiki_pages WHERE vault_id = ? AND slug = ?",
+                    (vault_id, slug),
+                ).fetchone()
+            if existing is not None:
+                # No other file owns the slug: adopt the page (this also
+                # picks up pages created before file associations existed)
+                # and record this file's ownership.
+                page = self._store.get_page(existing[0], load_relations=False)
+                self._store.attach_file(page.id, file_id, vault_id)  # type: ignore[union-attr]
+            else:
+                page = self._store.create_page(
+                    vault_id=vault_id,
+                    title=title,
+                    page_type="entity",
+                    slug=slug,
+                    markdown=text[:2000],
+                    status="needs_review",
+                )
+                self._store.attach_file(page.id, file_id, vault_id)
+                created = True
+        if not created:
+            # WIKI-007 (#515): refresh compiler-owned page content on
+            # recompile so the wiki reflects the CURRENT source text.
+            # POLICY LIMIT: wiki_pages has no manually_edited flag, so the
+            # compiler cannot distinguish manual edits from its own output;
+            # the refresh is unconditional, and update_page snapshots the
+            # prior content into wiki_page_versions first so history always
+            # preserves it.
+            self._store.update_page(
+                page_id=page.id,  # type: ignore[union-attr]
                 vault_id=vault_id,
-                title=title,
-                page_type="entity",
-                slug=slug,
                 markdown=text[:2000],
-                status="needs_review",
+                summary="",
+                last_compiled_at=datetime.utcnow().isoformat(),
             )
 
+        slug = page.slug  # type: ignore[union-attr]
         page_id = page.id  # type: ignore[union-attr]
 
         entities_created: list = []
@@ -1129,39 +1186,47 @@ class WikiCompiler:
             }
 
         # Persist accepted candidates as wiki_claims with provenance.
-        for accepted in cur_result.accepted:
-            try:
-                claim = self._store.create_claim(
-                    vault_id=vault_id,
-                    claim_text=accepted.claim_text,
-                    source_type="document",
-                    page_id=page_id,
-                    claim_type=accepted.claim_type,
-                    subject=accepted.subject,
-                    predicate=accepted.predicate,
-                    object=accepted.object,
-                    status=accepted.status,
-                    confidence=accepted.confidence,
-                    created_by_kind="llm_curator",
-                )
-                self._store.attach_source(
-                    claim_id=claim.id,
-                    source_kind="document",
-                    file_id=accepted.file_id,
-                    chunk_id=accepted.chunk_id,
-                    source_label=accepted.source_label or (
-                        f"file:{accepted.file_id}" if accepted.file_id else "curator"
-                    ),
-                    quote=accepted.source_quote,
-                    confidence=accepted.confidence,
-                )
-            except Exception as e:  # pragma: no cover - defensive
-                cur_result.errors.append(
-                    f"persist_error: {type(e).__name__}: {e}"
-                )
-                logger.warning(
-                    "wiki curator: failed to persist accepted claim: %s", e
-                )
+        # WIKI-010 (#515): the claim row AND its source row commit as one
+        # explicit BEGIN IMMEDIATE ... COMMIT transaction. Previously only
+        # create_claim committed — attach_source's insert stayed pending on
+        # the connection and only reached the DB if a LATER write (e.g. lint
+        # findings) happened to commit, so an accepted claim could be visible
+        # without its provenance, or lose it entirely on return-to-pool.
+        with self._store.transaction():
+            for accepted in cur_result.accepted:
+                try:
+                    claim = self._store.create_claim(
+                        vault_id=vault_id,
+                        claim_text=accepted.claim_text,
+                        source_type="document",
+                        page_id=page_id,
+                        claim_type=accepted.claim_type,
+                        subject=accepted.subject,
+                        predicate=accepted.predicate,
+                        object=accepted.object,
+                        status=accepted.status,
+                        confidence=accepted.confidence,
+                        created_by_kind="llm_curator",
+                        commit=False,
+                    )
+                    self._store.attach_source(
+                        claim_id=claim.id,
+                        source_kind="document",
+                        file_id=accepted.file_id,
+                        chunk_id=accepted.chunk_id,
+                        source_label=accepted.source_label or (
+                            f"file:{accepted.file_id}" if accepted.file_id else "curator"
+                        ),
+                        quote=accepted.source_quote,
+                        confidence=accepted.confidence,
+                    )
+                except Exception as e:  # pragma: no cover - defensive
+                    cur_result.errors.append(
+                        f"persist_error: {type(e).__name__}: {e}"
+                    )
+                    logger.warning(
+                        "wiki curator: failed to persist accepted claim: %s", e
+                    )
 
         # Persist lint findings.
         for finding in cur_result.lint_findings:

@@ -181,11 +181,17 @@ export async function listWikiPages(params: {
   search?: string;
   page?: number;
   per_page?: number;
-}): Promise<{ pages: WikiPage[]; page: number; per_page: number }> {
-  const response = await apiClient.get<{ pages: WikiPage[]; page: number; per_page: number }>(
-    "/wiki/pages",
-    { params }
-  );
+}): Promise<{ pages: WikiPage[]; page: number; per_page: number; total?: number }> {
+  // AC34 (#515): the backend list route also returns `total` (rows matching
+  // the same filters, no LIMIT/OFFSET) so the UI can paginate with Load-more.
+  // Typed optional because older payloads (and test fixtures shaped like them)
+  // omit it; callers treat a missing total as pages.length.
+  const response = await apiClient.get<{
+    pages: WikiPage[];
+    page: number;
+    per_page: number;
+    total?: number;
+  }>("/wiki/pages", { params });
   return response.data;
 }
 
@@ -363,15 +369,57 @@ export async function batchMemoryWikiStatus(
   return response.data.statuses;
 }
 
-// Version history
-export async function getWikiPageVersions(pageId: number, vaultId: number) {
-  const response = await apiClient.get(`/wiki/pages/${pageId}/versions`, { params: { vault_id: vaultId } });
+// Version history — AC40 (#515): mirrors the backend `WikiPageVersion`
+// dataclass (wiki_store.py). There is no `version`/`edited_at`/`diff_summary`;
+// the row `id` identifies the revision and `created_at` carries the timestamp.
+export interface WikiPageVersion {
+  id: number;
+  page_id: number;
+  vault_id: number;
+  title: string;
+  markdown: string;
+  summary: string;
+  status: string;
+  confidence: number;
+  edited_by: number | null;
+  created_at: string;
+}
+
+export type WikiPageVersionsResponse = { versions: WikiPageVersion[] } | WikiPageVersion[];
+
+export async function getWikiPageVersions(
+  pageId: number,
+  vaultId: number,
+): Promise<WikiPageVersionsResponse> {
+  const response = await apiClient.get<WikiPageVersionsResponse>(
+    `/wiki/pages/${pageId}/versions`,
+    { params: { vault_id: vaultId } },
+  );
   return response.data;
 }
 
-// File attachments
-export async function getWikiPageFiles(pageId: number, vaultId: number) {
-  const response = await apiClient.get(`/wiki/pages/${pageId}/files`, { params: { vault_id: vaultId } });
+// File attachments — AC40 (#515): mirrors the backend `WikiPageFile` dataclass
+// after the LEFT JOIN onto `files` (filename resolved server-side; null when
+// the joined row is missing or the payload predates the join).
+export interface WikiPageFile {
+  id: number;
+  page_id: number;
+  file_id: number;
+  vault_id: number;
+  created_at: string;
+  filename?: string | null;
+}
+
+export type WikiPageFilesResponse = { files: WikiPageFile[] } | WikiPageFile[];
+
+export async function getWikiPageFiles(
+  pageId: number,
+  vaultId: number,
+): Promise<WikiPageFilesResponse> {
+  const response = await apiClient.get<WikiPageFilesResponse>(
+    `/wiki/pages/${pageId}/files`,
+    { params: { vault_id: vaultId } },
+  );
   return response.data;
 }
 
@@ -385,9 +433,31 @@ export async function detachWikiPageFile(pageId: number, fileId: number, vaultId
   return response.data;
 }
 
-// Backlinks
-export async function getWikiPageBacklinks(pageId: number, vaultId: number) {
-  const response = await apiClient.get(`/wiki/pages/${pageId}/backlinks`, { params: { vault_id: vaultId } });
+// Backlinks — AC40 (#515): mirrors the backend `WikiPageLink` dataclass after
+// the LEFT JOIN onto `wiki_pages` (source_title/source_slug resolved
+// server-side; null when the source page was deleted or the payload predates
+// the join).
+export interface WikiPageLink {
+  id: number;
+  source_page_id: number;
+  target_page_id: number;
+  vault_id: number;
+  link_text: string | null;
+  created_at: string;
+  source_title?: string | null;
+  source_slug?: string | null;
+}
+
+export type WikiPageBacklinksResponse = { backlinks: WikiPageLink[] } | WikiPageLink[];
+
+export async function getWikiPageBacklinks(
+  pageId: number,
+  vaultId: number,
+): Promise<WikiPageBacklinksResponse> {
+  const response = await apiClient.get<WikiPageBacklinksResponse>(
+    `/wiki/pages/${pageId}/backlinks`,
+    { params: { vault_id: vaultId } },
+  );
   return response.data;
 }
 

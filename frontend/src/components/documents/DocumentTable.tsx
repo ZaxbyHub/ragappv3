@@ -291,7 +291,21 @@ export function DocumentTable({
                         const ws = wikiStatusMap[docId];
                         const isCompiling =
                           compilingDocIds.has(docId) || ws?.wiki_status === "compiling";
-                        if (!ws || ws.wiki_status === "not_compiled" || ws.wiki_status === "skipped") {
+                        // AC29 (#515): a document the compiler SKIPPED (no
+                        // extractable knowledge) gets a distinct label — it is
+                        // NOT uncompiled, so it must not offer the generic
+                        // Compile affordance that invites a pointless retry.
+                        if (ws?.wiki_status === "skipped") {
+                          return (
+                            <span
+                              className="text-xs text-muted-foreground italic"
+                              title="Wiki compile skipped — no extractable knowledge found in this document."
+                            >
+                              Skipped — no extractable knowledge
+                            </span>
+                          );
+                        }
+                        if (!ws || ws.wiki_status === "not_compiled") {
                           return (
                             <button
                               type="button"

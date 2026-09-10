@@ -12,7 +12,6 @@ import json
 import logging
 import mimetypes
 import os
-import re
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
@@ -67,6 +66,7 @@ from app.services.document_processor import (
     DuplicateFileError,
 )
 from app.services.embeddings import EmbeddingService
+from app.services.fts_query import build_fts_match_query
 from app.services.near_duplicates import (
     clear_file_centroid,
     get_near_duplicate_group,
@@ -773,13 +773,18 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
 
 
 def _build_files_fts_query(raw_search: str) -> str:
-    # Strip hyphens: FTS5 treats hyphens as column-filter prefix (col:term).
-    # Including hyphens in tokens causes OperationalError on hyphenated searches.
-    # FTS5's default tokenizer already splits on hyphens during indexing,
-    # so individual tokens (my, doc, pdf) still match hyphenated filenames.
-    normalized = raw_search.lower().replace("-", " ")
-    tokens = re.findall(r"[A-Za-z0-9_]+", normalized)
-    return " ".join(f"{token}*" for token in tokens[:8])
+    # Thin shim over the shared FTS5 tokenizer (issue #515 / C21): identical
+    # ASCII behavior — hyphens become spaces (FTS5 reads ``-`` as column-filter
+    # syntax and the unicode61 tokenizer already splits indexed text on
+    # hyphens), underscore/alnum tokens gain a ``*`` prefix-match suffix, the
+    # token count is capped at 8, and punctuation-only input yields ``""`` —
+    # while the shared helper's Unicode ``\w+`` regex ADDITIONALLY keeps CJK
+    # and accented tokens that the old ASCII-only regex silently discarded.
+    # ``.lower()`` runs here rather than inside the helper's None-tolerant
+    # normalization so a None argument still raises AttributeError, as pinned
+    # by test_build_files_fts_query_adversarial.py::test_none_input.
+    normalized = raw_search.lower()
+    return build_fts_match_query(normalized)
 
 
 @router.get("", response_model=DocumentListResponse, include_in_schema=False)
@@ -1663,11 +1668,42 @@ async def search_documents(
     # A single statement computes both the page and the total over the
     # de-duplicated set: a full-count CTE (no LIMIT) is joined to the paginated
     # page, so the non-sargable filename LIKE runs once, not twice (NF3).
+    #
+    # C22 (SEARCH-001, issue #515): excerpts are match-centered. ``snippet()``
+    # windows the column text around the best match (unlike ``highlight()``,
+    # which returns the whole column), so a term late in a long body or in a
+    # low-priority metadata column still appears — with its ``<mark>``
+    # highlight — inside the excerpt.
+    _SNIPPET_TOKENS = 24
+
+    def _meta_snippet(col: int) -> str:
+        return (
+            f"snippet(files_search_fts, {col}, '<mark>', '</mark>', '…', "
+            f"{_SNIPPET_TOKENS})"
+        )
+
+    # files_search_fts columns in excerpt-priority order:
+    # 4=email_subject, 5=email_sender, 1=file_type, 3=source,
+    # 6=document_date, 0=file_name. A per-column snippet contains '<mark>'
+    # only when THAT column matched, so
+    # NULLIF(snippet, replace(snippet, '<mark>', '')) passes through exactly
+    # the snippets with a hit — the first matching column wins regardless of
+    # its priority position (a sender-only hit no longer loses to a
+    # non-matching, higher-priority subject). The trailing COALESCE layer
+    # keeps the old first-non-empty-column fallback for rows where no
+    # snippet-able column carries a mark.
+    _meta_snippets = [_meta_snippet(col) for col in (4, 5, 1, 3, 6, 0)]
+    _meta_excerpt_expr = "COALESCE(\n" + ",\n".join(
+        [f"NULLIF({s}, replace({s}, '<mark>', ''))" for s in _meta_snippets]
+        + [f"NULLIF({s}, '')" for s in _meta_snippets]
+    ) + ")"
+
     ranked_sql = f"""
     WITH raw_matches AS (
         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
                bm25(files_content_fts) AS rank,
-               highlight(files_content_fts, 0, '<mark>', '</mark>') AS excerpt_raw,
+               snippet(files_content_fts, 0, '<mark>', '</mark>', '…',
+                       {_SNIPPET_TOKENS}) AS excerpt_raw,
                1 AS type_priority
         FROM files_content_fts
         JOIN files f ON f.id = files_content_fts.rowid
@@ -1676,14 +1712,7 @@ async def search_documents(
         UNION ALL
         SELECT f.id, f.file_name, f.vault_id, f.status, f.parsed_text,
                bm25(files_search_fts) AS rank,
-               COALESCE(
-                   NULLIF(highlight(files_search_fts, 4, '<mark>', '</mark>'), ''),
-                   NULLIF(highlight(files_search_fts, 5, '<mark>', '</mark>'), ''),
-                   NULLIF(highlight(files_search_fts, 1, '<mark>', '</mark>'), ''),
-                   NULLIF(highlight(files_search_fts, 3, '<mark>', '</mark>'), ''),
-                   NULLIF(highlight(files_search_fts, 6, '<mark>', '</mark>'), ''),
-                   highlight(files_search_fts, 0, '<mark>', '</mark>')
-               ) AS excerpt_raw,
+               {_meta_excerpt_expr} AS excerpt_raw,
                2 AS type_priority
         FROM files_search_fts
         JOIN files f ON f.id = files_search_fts.rowid
@@ -1758,7 +1787,10 @@ async def search_documents(
             int(row["type_priority"]), "body"
         )
         excerpt_raw = row["excerpt_raw"]
-        # Excerpt finalization: FTS highlight → parsed_text window → filename.
+        # Excerpt finalization: FTS snippet (match-centered, <mark>-highlighted)
+        # → parsed_text window → filename. The parsed_text/filename fallbacks
+        # only fire when no snippet survived the COALESCE (C22: fallback must
+        # not mask a matched snippet).
         if isinstance(excerpt_raw, str) and excerpt_raw.strip():
             excerpt = excerpt_raw[:300]
         elif row["parsed_text"]:
@@ -2999,6 +3031,22 @@ async def delete_all_vault_documents(
             # function, which would silently undo the centroid deletes.)
             for collected_id in file_ids:
                 _clear_near_duplicate_centroid(conn, collected_id)
+            # WIKI-002 (#515): wiki claim invalidation must commit ATOMICALLY
+            # with the files delete. The purge loop above already ran
+            # mark_claims_stale_by_file, but that write deliberately does not
+            # commit and is discarded by the in_transaction guard at the top
+            # of this function — so redo it INSIDE this transaction: one
+            # commit persists both the superseded-status writes and the row
+            # deletes (a fresh connection sees the file gone AND its
+            # sole-source claims superseded). The call issues no commit of
+            # its own, so it joins this transaction; an exception propagates
+            # to the rollback below, keeping the delete and the invalidation
+            # all-or-nothing.
+            from app.services.wiki_store import WikiStore as _WikiStoreTx
+
+            _tx_store = _WikiStoreTx(conn)
+            for collected_id in file_ids:
+                _tx_store.mark_claims_stale_by_file(collected_id, vault_id)
             # Tombstone every asset path within the vault in the same
             # transaction so the artifact sweep collects them after commit
             # (issue #460); rows cascade from the files-row delete.

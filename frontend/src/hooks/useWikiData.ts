@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import {
   listWikiPages,
   getWikiPage,
@@ -18,6 +18,9 @@ import {
 import { useTestMode } from "@/fixtures/TestModeContext";
 import { mockWikiPages, mockWikiLintFindings } from "@/fixtures/wiki";
 
+/** AC34 (#515): page size used for Load-more requests (matches the backend default). */
+const LIST_PER_PAGE = 50;
+
 export function useWikiData(vaultId: number | null) {
   const testMode = useTestMode();
   const [pages, setPages] = useState<WikiPage[]>(testMode ? mockWikiPages : []);
@@ -26,7 +29,20 @@ export function useWikiData(vaultId: number | null) {
   const [claims, setClaims] = useState<WikiClaim[]>([]);
   const [lintFindings, setLintFindings] = useState<WikiLintFinding[]>(testMode ? mockWikiLintFindings : []);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // AC34 (#515): total rows matching the current filters (backend list route).
+  const [total, setTotal] = useState<number>(0);
+
+  // AC31 (#515) request-identity guards. Each list/detail request captures the
+  // current generation; a response may only commit state while it is still the
+  // NEWEST request of its kind. A slow earlier response resolving last can
+  // therefore never clobber a newer one (list half and detail half).
+  const listGenRef = useRef(0);
+  const detailGenRef = useRef(0);
+  // Current list page for Load-more (AC34) — a ref so loadMore reads the
+  // latest committed page without re-creating the callback.
+  const listPageRef = useRef(1);
 
   const fetchPages = useCallback(
     async (params?: { page_type?: string; status?: string; search?: string }) => {
@@ -44,17 +60,53 @@ export function useWikiData(vaultId: number | null) {
           filtered = filtered.filter((p) => p.title.toLowerCase().includes(q) || p.summary?.toLowerCase().includes(q));
         }
         setPages(filtered);
+        listPageRef.current = 1;
         return;
       }
+      const gen = ++listGenRef.current;
       setLoading(true);
       setError(null);
       try {
         const res = await listWikiPages({ vault_id: vaultId, ...params });
+        if (listGenRef.current !== gen) return;
         setPages(res.pages);
+        listPageRef.current = res.page ?? 1;
+        setTotal(typeof res.total === "number" ? res.total : res.pages.length);
       } catch (e) {
+        if (listGenRef.current !== gen) return;
         setError(e instanceof Error ? e.message : "Failed to load pages");
       } finally {
-        setLoading(false);
+        if (listGenRef.current === gen) setLoading(false);
+      }
+    },
+    [vaultId, testMode]
+  );
+
+  // AC34 (#515): fetch the NEXT page with the same filters and append. Shares
+  // the list generation guard so a Load-more response never clobbers a newer
+  // full refetch (and vice versa).
+  const loadMore = useCallback(
+    async (params?: { page_type?: string; status?: string; search?: string }) => {
+      if (!vaultId || testMode) return;
+      const nextPage = listPageRef.current + 1;
+      const gen = ++listGenRef.current;
+      setLoadingMore(true);
+      try {
+        const res = await listWikiPages({
+          vault_id: vaultId,
+          ...params,
+          page: nextPage,
+          per_page: LIST_PER_PAGE,
+        });
+        if (listGenRef.current !== gen) return;
+        setPages((prev) => [...prev, ...res.pages]);
+        listPageRef.current = nextPage;
+        setTotal((prevTotal) => (typeof res.total === "number" ? res.total : prevTotal));
+      } catch (e) {
+        if (listGenRef.current !== gen) return;
+        setError(e instanceof Error ? e.message : "Failed to load more pages");
+      } finally {
+        if (listGenRef.current === gen) setLoadingMore(false);
       }
     },
     [vaultId, testMode]
@@ -66,19 +118,27 @@ export function useWikiData(vaultId: number | null) {
       setSelectedPage(page);
       return;
     }
+    const gen = ++detailGenRef.current;
     setLoading(true);
     setError(null);
     try {
       const page = await getWikiPage(pageId);
+      if (detailGenRef.current !== gen) return;
       setSelectedPage(page);
     } catch (e) {
+      if (detailGenRef.current !== gen) return;
       setError(e instanceof Error ? e.message : "Failed to load page");
     } finally {
-      setLoading(false);
+      if (detailGenRef.current === gen) setLoading(false);
     }
   }, [testMode]);
 
-  const closePage = useCallback(() => setSelectedPage(null), []);
+  // Back invalidates any in-flight detail request so a late response cannot
+  // reopen the page the user just left (AC31 detail half).
+  const closePage = useCallback(() => {
+    detailGenRef.current += 1;
+    setSelectedPage(null);
+  }, []);
 
   const createPage = useCallback(
     async (data: Parameters<typeof createWikiPage>[0]) => {
@@ -163,8 +223,11 @@ export function useWikiData(vaultId: number | null) {
     claims,
     lintFindings,
     loading,
+    loadingMore,
     error,
+    total,
     fetchPages,
+    loadMore,
     openPage,
     closePage,
     createPage,

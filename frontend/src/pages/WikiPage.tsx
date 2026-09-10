@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useVaultStore } from "@/stores/useVaultStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { WikiPageList, PAGE_TYPES } from "./WikiPageList";
@@ -8,7 +9,9 @@ import { WikiLintPanel } from "./WikiLintPanel";
 import { WikiJobsPanel } from "./WikiJobsPanel";
 import { useWikiData } from "@/hooks/useWikiData";
 import { toast } from "sonner";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { AlertCircle, Layers, Search, Plus, Activity } from "lucide-react";
@@ -16,6 +19,24 @@ import { PageTitleHeader } from "@/components/layout/PageTitleHeader";
 import { EmptyState } from "@/components/EmptyState";
 import { getWikiActivityFeed } from "@/lib/api";
 import { useWikiEventStream } from "@/hooks/useWikiEventStream";
+
+/**
+ * AC39 (#515): read the router's search params when mounted inside a <Router>,
+ * returning null when rendered outside one (bare unit-test mounts). The hook
+ * call itself always runs — react-router throws only AFTER its internal
+ * useContext, so catching leaves the hook order stable across renders.
+ */
+function useOptionalSearchParams(): [
+  URLSearchParams | null,
+  ((next: URLSearchParams, opts?: { replace?: boolean }) => void) | null,
+] {
+  try {
+    const [params, setParams] = useSearchParams();
+    return [params, (next, opts) => setParams(next, opts)];
+  } catch {
+    return [null, null];
+  }
+}
 
 export default function WikiPage() {
   const { activeVaultId } = useVaultStore();
@@ -31,19 +52,25 @@ export default function WikiPage() {
   const [search, setSearch] = useState("");
   const [activeType, setActiveType] = useState("");
   const [jobsRefreshSignal, setJobsRefreshSignal] = useState(0);
+  const [searchParams, setSearchParams] = useOptionalSearchParams();
 
   const {
     pages,
     selectedPage,
+    claims,
     lintFindings,
     loading,
+    loadingMore,
     error,
+    total,
     fetchPages,
+    loadMore,
     openPage,
     closePage,
     createPage,
     editPage,
     removePage,
+    fetchClaims,
     fetchLintFindings,
     runLint,
   } = useWikiData(activeVaultId);
@@ -52,6 +79,8 @@ export default function WikiPage() {
     if (activeVaultId) {
       fetchPages();
       fetchLintFindings();
+      // AC43 (#515): vault-wide claims surface on the wiki landing view.
+      fetchClaims?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeVaultId]);
@@ -63,13 +92,57 @@ export default function WikiPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeType]);
 
+  // AC33 (#515): the terminal-job refetch must keep the user's ACTIVE
+  // search/page_type filters. The stream callback is stable, so it reads the
+  // current filters through a ref mirror instead of a stale closure.
+  const filtersRef = useRef({ search: "", page_type: "" });
+  useEffect(() => {
+    filtersRef.current = { search, page_type: activeType };
+  }, [search, activeType]);
+
+  // AC39 (#515): /wiki?page=<id|slug> deep link — WikiCards navigates here
+  // with `page_id` (or slug). Opens the detail without a list click, once per
+  // mount; Back clears the param so popstate returns to the list.
+  const deepLinkHandledRef = useRef(false);
+  useEffect(() => {
+    if (!activeVaultId || deepLinkHandledRef.current) return;
+    const raw = searchParams?.get("page");
+    if (!raw) return;
+    const numericId = Number.parseInt(raw, 10);
+    if (Number.isInteger(numericId) && numericId > 0) {
+      deepLinkHandledRef.current = true;
+      openPage(numericId);
+      return;
+    }
+    // Slug form — resolve against the loaded list (best effort).
+    const bySlug = pages.find((p) => p.slug === raw);
+    if (bySlug) {
+      deepLinkHandledRef.current = true;
+      openPage(bySlug.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeVaultId, searchParams, pages]);
+
+  const handleBack = useCallback(() => {
+    if (searchParams?.has("page") && setSearchParams) {
+      const next = new URLSearchParams(searchParams);
+      next.delete("page");
+      setSearchParams(next, { replace: true });
+    }
+    closePage();
+  }, [searchParams, setSearchParams, closePage]);
+
   // Subscribe to wiki compile job completion events for the active vault.
   // On any terminal job event, refetch pages, lint findings, and bump the
   // refresh signal so an open WikiJobsPanel reloads too. Uses an authenticated
   // fetch stream (Bearer header) rather than EventSource — see
   // useWikiEventStream for why EventSource always 401s here.
   const handleJobTerminal = useCallback(() => {
-    fetchPages();
+    const current = filtersRef.current;
+    fetchPages({
+      page_type: current.page_type || undefined,
+      search: current.search || undefined,
+    });
     fetchLintFindings();
     setJobsRefreshSignal((n) => n + 1);
   }, [fetchPages, fetchLintFindings]);
@@ -97,7 +170,9 @@ export default function WikiPage() {
     }
   }
 
-  async function handleSave(data: Parameters<typeof createPage>[0] | Parameters<typeof editPage>[1]) {
+  async function handleSave(
+    data: Parameters<typeof createPage>[0] | Parameters<typeof editPage>[1],
+  ): Promise<void | { conflict: boolean }> {
     if (!activeVaultId) return;
     if (editingPage) {
       // DD-C020 optimistic locking (issue #276 1X-1): send the version we
@@ -114,18 +189,19 @@ export default function WikiPage() {
           ?? (err as { status?: number } | undefined)?.status;
         if (status === 409) {
           toast.error("This page was edited by someone else. Refresh and try again.");
-          await fetchPages();
-        } else {
-          throw err;
+          await fetchPages({ page_type: activeType || undefined, search: search || undefined });
+          // AC32 (#515): signal the conflict instead of throwing so the edit
+          // dialog keeps the user's draft open (it decides from the signal).
+          return { conflict: true };
         }
-        return;
+        throw err;
       }
     } else {
       const createData = data as Parameters<typeof createPage>[0];
       await createPage({ ...createData, vault_id: activeVaultId });
       toast.success("Page created");
     }
-    await fetchPages();
+    await fetchPages({ page_type: activeType || undefined, search: search || undefined });
   }
 
   async function handleDelete() {
@@ -141,6 +217,13 @@ export default function WikiPage() {
     setLintPanelOpen(true);
     toast.info(`Lint complete: ${findings.length} finding(s)`);
   }
+
+  // AC35 (#515): after resolve/dismiss, refresh the panel from the findings
+  // LIST (which reflects suppressions) instead of re-RUNNING lint — a plain
+  // re-run must not be able to resurrect a finding the user just dismissed.
+  const handleLintRefresh = useCallback(() => {
+    if (activeVaultId) fetchLintFindings();
+  }, [activeVaultId, fetchLintFindings]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
@@ -236,6 +319,9 @@ export default function WikiPage() {
               onSelect={openPage}
               vaultId={activeVaultId}
               onRefresh={() => fetchPages({ page_type: activeType || undefined, search: search || undefined })}
+              hasMore={pages.length < total}
+              loadingMore={loadingMore}
+              onLoadMore={loadMore ? () => loadMore({ page_type: activeType || undefined, search: search || undefined }) : undefined}
             />
           )}
           {error && (
@@ -248,7 +334,7 @@ export default function WikiPage() {
           <div className="flex-1 px-4 overflow-hidden">
             <WikiPageDetail
               page={selectedPage}
-              onBack={closePage}
+              onBack={handleBack}
               onEdit={handleEditClick}
               onDelete={handleDelete}
             />
@@ -262,6 +348,7 @@ export default function WikiPage() {
               findings={lintFindings}
               loading={loading}
               onRunLint={handleRunLint}
+              onRefresh={handleLintRefresh}
               vaultId={activeVaultId}
             />
           </div>
@@ -303,6 +390,66 @@ export default function WikiPage() {
           </div>
         )}
       </div>
+
+      {/* Vault-wide claims (AC43, issue #515): every claim in the vault with
+          its lifecycle status. Empty state is explicit so a claimless vault is
+          clearly distinguishable from a loading one. */}
+      <Card>
+        <CardHeader className="pb-2 pt-3 px-4">
+          <CardTitle className="text-sm">Claims</CardTitle>
+        </CardHeader>
+        <CardContent className="px-4 pb-3">
+          {claims && claims.length > 0 ? (
+            <div className="flex flex-col gap-2">
+              {claims.map((claim) => (
+                <div
+                  key={claim.id}
+                  className="flex items-start justify-between gap-2 border-b border-border pb-2 last:border-0 last:pb-0"
+                >
+                  <p className="text-sm min-w-0">{claim.claim_text}</p>
+                  <Badge variant="outline" className="text-[10px] uppercase shrink-0">
+                    {claim.status.replace(/_/g, " ")}
+                  </Badge>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">No claims yet.</p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Lifecycle help (AC44, issue #515): how the knowledge surfaces relate
+          and where promoted knowledge ends up. */}
+      <Card>
+        <CardHeader className="pb-2 pt-3 px-4">
+          <CardTitle className="text-sm">How knowledge works</CardTitle>
+        </CardHeader>
+        <CardContent className="px-4 pb-3 text-xs text-muted-foreground space-y-1">
+          <p>
+            <strong className="text-foreground">Documents</strong> are ingested files —
+            the raw source of truth for everything extracted downstream.
+          </p>
+          <p>
+            <strong className="text-foreground">Memories</strong> capture durable facts from
+            chats and notes; interesting ones can be promoted into wiki pages.
+          </p>
+          <p>
+            <strong className="text-foreground">Wiki pages</strong> compile claims and
+            entities extracted from documents and memories into readable knowledge.
+          </p>
+          <p>
+            <strong className="text-foreground">KMS entries</strong> are curated how-to
+            knowledge maintained for reuse across the vault.
+          </p>
+          <p>
+            Promotion outcomes: extracted claims land with a lifecycle status
+            (active, awaiting review, superseded, …); documents with no
+            extractable knowledge are marked skipped; stale claims are flagged
+            by lint for review.
+          </p>
+        </CardContent>
+      </Card>
 
       {/* Edit / Create dialog */}
       {activeVaultId && (

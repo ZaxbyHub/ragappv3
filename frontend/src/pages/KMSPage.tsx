@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { FileText, Library, Plus, RefreshCw, Search } from "lucide-react";
@@ -46,6 +46,7 @@ export default function KMSPage() {
 
   const [entries, setEntries] = useState<KMSEntry[]>([]);
   const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -58,31 +59,54 @@ export default function KMSPage() {
   const [newTags, setNewTags] = useState("");
   const [saving, setSaving] = useState(false);
 
-  const fetchEntries = useCallback(async () => {
-    if (!activeVaultId) return;
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await listKMSEntries({
-        vault_id: activeVaultId,
-        search: search.trim() || undefined,
-        status: statusFilter === "all" ? undefined : statusFilter,
-        per_page: 200,
-      });
-      setEntries(res.entries);
-      setTotal(res.total);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load KMS entries");
-    } finally {
-      setLoading(false);
-    }
-  }, [activeVaultId, search, statusFilter]);
+  // Generation token (issue #515 / C36): a slow earlier list/search response
+  // resolving after a newer request must never commit stale entries or total.
+  // Mirrors KMSDetailPage's loadGenRef pattern — checked after the await and
+  // on the error/finally paths so late responses are dropped entirely.
+  const fetchGenRef = useRef(0);
+
+  const fetchEntries = useCallback(
+    async (pageToLoad: number, append: boolean) => {
+      if (!activeVaultId) return;
+      const gen = ++fetchGenRef.current;
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await listKMSEntries({
+          vault_id: activeVaultId,
+          search: search.trim() || undefined,
+          status: statusFilter === "all" ? undefined : statusFilter,
+          page: pageToLoad,
+          per_page: 200,
+        });
+        if (fetchGenRef.current !== gen) return;
+        setEntries((prev) => (append ? [...prev, ...res.entries] : res.entries));
+        setTotal(res.total);
+        setPage(res.page ?? pageToLoad);
+      } catch (e) {
+        if (fetchGenRef.current !== gen) return;
+        setError(e instanceof Error ? e.message : "Failed to load KMS entries");
+      } finally {
+        if (fetchGenRef.current === gen) {
+          setLoading(false);
+        }
+      }
+    },
+    [activeVaultId, search, statusFilter]
+  );
 
   useEffect(() => {
     if (!activeVaultId) return;
-    const t = setTimeout(fetchEntries, search ? 300 : 0);
+    const t = setTimeout(() => fetchEntries(1, false), search ? 300 : 0);
     return () => clearTimeout(t);
   }, [activeVaultId, search, statusFilter, fetchEntries]);
+
+  // C37: past the fixed per_page=200 window the remaining entries are fetched
+  // on demand; the page-2 request retains the current search/vault filters.
+  function handleLoadMore() {
+    if (!activeVaultId) return;
+    fetchEntries(page + 1, true);
+  }
 
   async function handleCreate() {
     if (!activeVaultId || !newTitle.trim()) return;
@@ -185,10 +209,10 @@ export default function KMSPage() {
             <p className="text-sm text-muted-foreground text-center py-12">
               Select a vault to view its knowledge entries.
             </p>
-          ) : loading ? (
-            <p className="text-sm text-muted-foreground py-8">Loading…</p>
           ) : error ? (
             <p className="text-sm text-destructive py-8">{error}</p>
+          ) : loading && entries.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-8">Loading…</p>
           ) : entries.length === 0 ? (
             <p className="text-sm text-muted-foreground text-center py-12">
               No entries yet. Create one, or upload documents to auto-generate
@@ -235,6 +259,18 @@ export default function KMSPage() {
                   </button>
                 ))}
               </div>
+              {entries.length < total && (
+                <div className="flex justify-center mt-4">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleLoadMore}
+                    disabled={loading || !activeVaultId}
+                  >
+                    Load more
+                  </Button>
+                </div>
+              )}
             </>
           )}
         </div>

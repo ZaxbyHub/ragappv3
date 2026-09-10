@@ -45,6 +45,11 @@ def _normalize_tags(tags: Optional[str]) -> Optional[str]:
             parsed = json.loads(tags)
             if not isinstance(parsed, list):
                 raise ValueError("Tags must be a JSON array")
+            # Every element must be a non-empty string (issue #515, AC18):
+            # a string-form array like "[1]" would otherwise persist and later
+            # break typed List[str] response serialization with a 500.
+            if not all(isinstance(tag, str) and tag.strip() for tag in parsed):
+                raise ValueError("Tags must be a JSON array of non-empty strings")
             return json.dumps(parsed)
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON array for tags: {e}")
@@ -402,6 +407,10 @@ async def create_memory(
     if body.vault_id is not None:
         if not await evaluate(user, "vault", body.vault_id, "write"):
             raise HTTPException(status_code=403, detail="No write access to this vault")
+    # Whitespace-only content is not a usable memory (issue #515, DEEP-D-02):
+    # reject before any persistence instead of storing a blank row.
+    if not body.content.strip():
+        raise HTTPException(status_code=422, detail="Content cannot be empty")
     try:
         record = await asyncio.to_thread(
             memory_store.add_memory,
@@ -453,9 +462,12 @@ async def update_memory(
     Returns 404 if the memory is not found.
     """
     try:
-        # Check if memory exists and get vault_id
+        # Check if memory exists and get vault_id + current content (the
+        # content is the no-op-save baseline for the claim invalidation below)
         cursor = await asyncio.to_thread(
-            conn.execute, "SELECT id, vault_id FROM memories WHERE id = ?", (memory_id,)
+            conn.execute,
+            "SELECT id, vault_id, content FROM memories WHERE id = ?",
+            (memory_id,),
         )
         row = await asyncio.to_thread(cursor.fetchone)
         if row is None:
@@ -465,6 +477,7 @@ async def update_memory(
 
         # Check vault write permission
         memory_vault_id = row[1]
+        stored_content = row[2]
         # Global memories (vault_id IS NULL) are admin-only (issue #404).
         _require_admin_for_global(user, memory_vault_id)
         if memory_vault_id is not None:
@@ -472,6 +485,17 @@ async def update_memory(
                 raise HTTPException(
                     status_code=403, detail="No write access to this vault"
                 )
+
+        # Whitespace-only content is not a usable memory (issue #515,
+        # DEEP-D-02): reject before any write so the row is not blanked.
+        if body.content is not None and not body.content.strip():
+            raise HTTPException(status_code=422, detail="Content cannot be empty")
+
+        # No-op save detection (issue #515, AC27): the wiki-claim
+        # invalidation below must only fire when the submitted content
+        # actually differs from the stored content — an identical-content
+        # save cannot have changed any derived claim.
+        content_changed = body.content is not None and body.content != stored_content
 
         # Build update query dynamically based on provided fields
         update_fields = []
@@ -489,7 +513,14 @@ async def update_memory(
         if body.category is not None:
             update_fields.append("category = ?")
             params.append(body.category)
-        if body.tags is not None:
+        # Explicit-null vs omitted (issue #515, AC19): a JSON null for
+        # tags/expires_at CLEARS the column (SET ... = NULL), while an
+        # omitted field preserves the stored value. The before-validators
+        # normalize null/"" to None, so the distinction is made here via
+        # pydantic v2 model_fields_set: the field counts as "provided" when
+        # it was explicitly sent, even when its validated value is None.
+        fields_set = body.model_fields_set
+        if "tags" in fields_set:
             update_fields.append("tags = ?")
             params.append(body.tags)
         if body.source is not None:
@@ -498,7 +529,7 @@ async def update_memory(
         if body.importance is not None:
             update_fields.append("importance = ?")
             params.append(body.importance)
-        if body.expires_at is not None:
+        if "expires_at" in fields_set:
             update_fields.append("expires_at = ?")
             params.append(body.expires_at)
 
@@ -560,8 +591,11 @@ async def update_memory(
                     "Could not recompute embedding for memory %d after content update",
                     memory_id,
                 )
-            # Mark wiki claims stale since the source memory content changed
-            if memory_vault_id is not None:
+            # Mark wiki claims stale since the source memory content changed.
+            # No-op guard (issue #515, AC27): identical-content saves keep
+            # sole-source claims active — only real content changes
+            # supersede derived claims.
+            if content_changed and memory_vault_id is not None:
                 try:
                     from app.services.wiki_store import WikiStore as _WikiStore
 

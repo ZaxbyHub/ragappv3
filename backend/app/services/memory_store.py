@@ -209,55 +209,114 @@ class MemoryStore:
                     exc,
                 )
 
+    async def _embed_text_with_outcome(
+        self, text: str
+    ) -> "tuple[Optional[List[float]], str]":
+        """Best-effort embed; never raises.
+
+        Returns ``(embedding, outcome)`` where outcome is (issue #515, OBS-004):
+
+          * ``"ok"``      — the provider returned a vector;
+          * ``"skipped"`` — no embedding service is wired in or text is empty;
+          * ``"failed"``  — the provider raised or returned None.
+        """
+        if not self.embedding_service or not text:
+            return None, "skipped"
+        try:
+            embedding = await self.embedding_service.embed_passage(text)
+        except Exception as exc:  # noqa: BLE001 — defensive, optional path
+            logger.debug("Memory embedding failed (continuing FTS-only): %s", exc)
+            return None, "failed"
+        if embedding is None:
+            return None, "failed"
+        return embedding, "ok"
+
     async def _embed_text(self, text: str) -> Optional[List[float]]:
         """Best-effort embed; never raises. Returns None on failure or when
         no embedding service is wired in.
         """
-        if not self.embedding_service or not text:
-            return None
-        try:
-            return await self.embedding_service.embed_passage(text)
-        except Exception as exc:  # noqa: BLE001 — defensive, optional path
-            logger.debug("Memory embedding failed (continuing FTS-only): %s", exc)
-            return None
+        embedding, _outcome = await self._embed_text_with_outcome(text)
+        return embedding
 
     def _store_embedding(
-        self, memory_id: int, embedding: Optional[List[float]]
-    ) -> None:
-        """Persist or clear the embedding JSON for a single memory row."""
+        self,
+        memory_id: int,
+        embedding: Optional[List[float]],
+        expected_content: Optional[str] = None,
+    ) -> bool:
+        """Persist the embedding JSON for a single memory row.
+
+        Returns True when a row was written, False otherwise (nothing to
+        store, embedding columns absent, no matching row, or a storage
+        error — all logged at debug level).
+
+        Revision guard (issue #515, MEM-001): when ``expected_content`` is
+        provided, the UPDATE only matches while the row's content still
+        equals the content the embedding was computed from. A
+        late-arriving embedding for since-replaced content updates 0 rows
+        and cannot clobber the current row state. When ``expected_content``
+        is None the write is unguarded (legacy/administrative callers).
+        """
         if embedding is None:
-            return
+            return False
         try:
             payload = json.dumps(embedding)
             model = getattr(settings, "embedding_model", None) or ""
             conn = self.pool.get_connection()
             try:
                 if not self._has_embedding_columns(conn):
-                    return
-                conn.execute(
-                    "UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?",
-                    (payload, model, memory_id),
-                )
+                    return False
+                if expected_content is not None:
+                    cursor = conn.execute(
+                        "UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ? AND content = ?",
+                        (payload, model, memory_id, expected_content),
+                    )
+                else:
+                    cursor = conn.execute(
+                        "UPDATE memories SET embedding = ?, embedding_model = ? WHERE id = ?",
+                        (payload, model, memory_id),
+                    )
+                written = cursor.rowcount > 0
                 conn.commit()
+                return written
             finally:
                 self.pool.release_connection(conn)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to store memory embedding (id=%s): %s", memory_id, exc)
+            return False
 
     def close_all(self) -> None:
         """Close all connections in this MemoryStore's dedicated pool."""
         self.pool.close_all()
 
-    async def embed_and_store(self, memory_id: int, content: str) -> None:
+    async def embed_and_store(self, memory_id: int, content: str) -> str:
         """Public helper: compute and persist the embedding for an existing memory.
 
         Useful for backfilling memories that pre-date the embedding column,
-        or for re-running after the embedding model changes. No-op if no
-        embedding service is configured.
+        or for re-running after the embedding model changes. No-op (returns
+        ``"skipped"``) if no embedding service is configured.
+
+        ``content`` doubles as the revision guard: the computed embedding is
+        only written while the row's content still equals ``content``
+        (issue #515, MEM-001), so a late completion for old content cannot
+        overwrite the embedding of an already-updated row.
+
+        Returns the outcome string (issue #515, OBS-004):
+
+          * ``"stored"`` — embedding computed and the row was written;
+          * ``"failed"`` — the provider raised/returned None, or the row
+            write did not commit (including the revision guard rejecting a
+            late old-content write);
+          * ``"skipped"`` — no embedding service is wired in or content is
+            empty.
         """
-        embedding = await self._embed_text(content)
-        if embedding is not None:
-            await asyncio.to_thread(self._store_embedding, memory_id, embedding)
+        embedding, outcome = await self._embed_text_with_outcome(content)
+        if embedding is None:
+            return outcome
+        written = await asyncio.to_thread(
+            self._store_embedding, memory_id, embedding, content
+        )
+        return "stored" if written else "failed"
 
     async def backfill_missing_embeddings(self, batch_size: int = 50) -> dict:
         """Idempotent backfill: embed memories that have no embedding or whose
@@ -267,6 +326,10 @@ class MemoryStore:
         is unavailable the run is logged as skipped and FTS fallback remains intact.
 
         Returns a summary dict with counts of processed/skipped/failed rows.
+        ``processed`` counts ONLY rows whose embedding was actually written
+        (issue #515, OBS-004); provider exceptions, provider None results, and
+        revision-guard-rejected writes count as ``failed``, and rows never
+        attempted (no service / empty content) count as ``skipped``.
         """
         from app.config import settings as _settings
 
@@ -313,10 +376,14 @@ class MemoryStore:
                 max(1, getattr(settings, "embedding_concurrent_batches", 4))
             )
 
-            async def _embed_one(mid: int, text: str) -> bool:
+            # Each row's content was read at selection time; embed_and_store
+            # uses it as the revision guard's expected content (issue #515,
+            # MEM-001). A row whose content changed after selection has its
+            # write honestly rejected below — it keeps a NULL embedding and
+            # is picked up again by the next backfill run with fresh content.
+            async def _embed_one(mid: int, text: str) -> str:
                 async with sem:
-                    await self.embed_and_store(mid, text)
-                    return True
+                    return await self.embed_and_store(mid, text)
 
             results = await asyncio.gather(
                 *(_embed_one(memory_id, content) for memory_id, content in batch),
@@ -326,8 +393,14 @@ class MemoryStore:
                 if isinstance(res, Exception):
                     logger.warning("Backfill failed for memory %d: %s", memory_id, res)
                     summary["failed"] += 1
-                else:
+                elif res == "stored":
                     summary["processed"] += 1
+                elif res == "failed":
+                    summary["failed"] += 1
+                else:
+                    # "skipped" (and any unexpected outcome from wrapped or
+                    # mocked embed helpers) — nothing was written.
+                    summary["skipped"] += 1
 
             logger.info(
                 "Memory embedding backfill progress: %d/%d done",
@@ -338,9 +411,10 @@ class MemoryStore:
             await asyncio.sleep(0)
 
         logger.info(
-            "Memory embedding backfill complete: processed=%d failed=%d",
+            "Memory embedding backfill complete: processed=%d failed=%d skipped=%d",
             summary["processed"],
             summary["failed"],
+            summary["skipped"],
         )
         return summary
 
@@ -401,7 +475,7 @@ class MemoryStore:
             try:
                 embedding = asyncio.run(self._embed_text(content))
                 if embedding is not None:
-                    self._store_embedding(memory_id, embedding)
+                    self._store_embedding(memory_id, embedding, content)
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "Memory embedding skipped on add (id=%s): %s", memory_id, exc
@@ -414,7 +488,9 @@ class MemoryStore:
             tags=tags,
             source=source,
             vault_id=retrieved_vault_id,
-            importance=float(retrieved_importance or 0.5),
+            # None-guard (not truthiness) so importance 0.0 round-trips
+            # instead of being coerced to the 0.5 default (issue #515, MEM-002).
+            importance=float(0.5 if retrieved_importance is None else retrieved_importance),
             expires_at=retrieved_expires_at,
             created_at=created_at,
             updated_at=updated_at,
@@ -448,7 +524,7 @@ class MemoryStore:
             try:
                 embedding = asyncio.run(self._embed_text(new_content))
                 if embedding is not None:
-                    self._store_embedding(memory_id, embedding)
+                    self._store_embedding(memory_id, embedding, new_content)
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "Memory embedding refresh skipped (id=%s): %s", memory_id, exc
@@ -567,7 +643,10 @@ class MemoryStore:
                 tags=row[3],
                 source=row[4],
                 vault_id=row[5],
-                importance=float(row[6] or 0.5),
+                # None-guard (not truthiness) so importance 0.0 round-trips
+                # instead of being coerced to the 0.5 default (issue #515,
+                # MEM-002). float() still accepts str/bytes values from rows.
+                importance=float(0.5 if row[6] is None else row[6]),
                 expires_at=row[7],
                 created_at=row[8],
                 updated_at=row[9],
@@ -703,7 +782,11 @@ class MemoryStore:
                         tags=row[3],
                         source=row[4],
                         vault_id=row[5],
-                        importance=float(row[6] or 0.5),
+                        # None-guard (not truthiness) so importance 0.0
+                        # round-trips instead of being coerced to the 0.5
+                        # default (issue #515, MEM-002). float() still
+                        # accepts str/bytes values from rows.
+                        importance=float(0.5 if row[6] is None else row[6]),
                         expires_at=row[7],
                         created_at=row[8],
                         updated_at=row[9],

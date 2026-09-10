@@ -266,7 +266,16 @@ async def _enqueue_wiki_compile_job(
     doc_sources: List[Dict[str, Any]],
     memories: List[Any],
 ) -> None:
-    """Enqueue a post-answer wiki compile job. Runs as a background task."""
+    """Enqueue a post-answer wiki compile job. Runs as a background task.
+
+    WIKI-001 (#515): gated on the wiki feature flags — when ``wiki_enabled``
+    or ``wiki_compile_on_query`` is off, chat answers must persist NO wiki
+    data, so nothing is enqueued. (The worker re-checks the same flags at
+    claim time so a job enqueued before a settings flip still cannot write
+    wiki rows — see WikiCompileProcessor._dispatch.)
+    """
+    if not settings.wiki_enabled or not settings.wiki_compile_on_query:
+        return
     import datetime as _dt
     pool = get_pool(str(settings.sqlite_path))
     try:

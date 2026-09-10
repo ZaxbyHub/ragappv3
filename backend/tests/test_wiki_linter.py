@@ -110,27 +110,51 @@ class TestLintRunLifecycle(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def test_run_lint_clears_prior_open_findings(self):
-        # First run creates findings
+    def test_run_lint_suppresses_previously_dismissed_findings(self):
+        # Issue #515 AC35 (sanctioned rename/update of the old
+        # test_run_lint_clears_prior_open_findings pin): run_lint now upserts
+        # by fingerprint instead of clear-open-then-recreate, because the
+        # issue mandates that a DISMISSED finding stop resurrecting as a
+        # fresh open row on every subsequent run.
         self.store.create_claim(
             vault_id=1, claim_text="Unsupported 1", source_type="manual"
         )
         findings1 = self.linter.run_lint(1)
         self.assertGreater(len(findings1), 0)
+        target = next(f for f in findings1 if f.finding_type == "unsupported_claim")
 
-        # Second run — no new issues — should clear and return empty
-        # Remove the problem claim
-        for finding in findings1:
-            pass  # findings created
-        # Delete all claims so second run finds nothing
+        dismissed = self.store.update_lint_finding(target.id, vault_id=1, status="dismissed")
+        self.assertEqual(dismissed.status, "dismissed")
+
+        # Second run still detects the same issue (claim unchanged) — the
+        # dismissed row must NOT be re-created as open, and must remain the
+        # only row for that fingerprint.
+        findings2 = self.linter.run_lint(1)
+        self.assertNotIn(target.id, [f.id for f in findings2])
+        row = self.conn.execute(
+            "SELECT status FROM wiki_lint_findings WHERE id = ?", (target.id,)
+        ).fetchone()
+        self.assertEqual(row["status"], "dismissed")
+        dup_count = self.conn.execute(
+            "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id = 1 AND status = 'open'"
+        ).fetchone()[0]
+        self.assertEqual(
+            dup_count,
+            len(findings2),
+            "open rows after the run must equal the returned findings "
+            "(no suppressed duplicates)",
+        )
+
+        # Remove the underlying issue: open rows for issues that went away
+        # must transition to 'resolved' (not linger, not be deleted).
         self.conn.execute("DELETE FROM wiki_claims WHERE vault_id = 1")
         self.conn.commit()
-
-        findings2 = self.linter.run_lint(1)
+        findings3 = self.linter.run_lint(1)
         total_open = self.conn.execute(
             "SELECT COUNT(*) FROM wiki_lint_findings WHERE vault_id = 1 AND status = 'open'"
         ).fetchone()[0]
-        self.assertEqual(total_open, len(findings2))
+        self.assertEqual(total_open, len(findings3))
+        self.assertEqual(total_open, 0, "no open findings should remain after the issue is gone")
 
     def test_duplicate_alias_detection(self):
         self.store.upsert_entity(vault_id=1, canonical_name="AFOMIS", aliases=["AirForce Med"])
