@@ -117,6 +117,11 @@ class DraftJobProcessor:
         self._engine = engine
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # Throttle for the unwired-engine compile warning (issue #532 review,
+        # PRR-024): the poll loop calls ``_claim_next_job`` every interval, so
+        # without this flag the same "engine not wired" condition would log
+        # once per poll for the whole deferral window.
+        self._warned_unwired_compile_claim = False
         # Strong references to detached background tasks so CPython does not
         # garbage-collect them mid-flight, mirroring WikiCompileProcessor.
         self._bg_tasks: set[asyncio.Task] = set()
@@ -315,8 +320,18 @@ class DraftJobProcessor:
             # would terminally fail queued work that only needed to wait.
             # ``set_rag_engine`` makes compile jobs claimable again;
             # ``_unwired_retrieval`` in ``draft_pipeline.default_deps``
-            # remains fail-closed defense in depth.
+            # remains fail-closed defense in depth. Surface the deferral once
+            # per processor lifetime (never per poll) so an operator can see
+            # why queued compile work is not being picked up.
             if self._engine is None:
+                if not self._warned_unwired_compile_claim and (
+                    store.has_pending_compile_job()
+                ):
+                    self._warned_unwired_compile_claim = True
+                    logger.warning(
+                        "DraftJobProcessor: compile jobs pending but RAG "
+                        "engine not wired yet; compile claiming deferred"
+                    )
                 return None
             return store.claim_next_compile_job()
 
@@ -781,10 +796,10 @@ class DraftJobProcessor:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT cancel_requested_at FROM draft_jobs WHERE id = ?",
+                    "SELECT status, cancel_requested_at FROM draft_jobs WHERE id = ?",
                     (job.id,),
                 ).fetchone()
-                if row is not None and row[0] is not None:
+                if row is not None and row[1] is not None:
                     # Same row effects as _cancel_job_and_input_sync's store
                     # calls, kept inside this transaction so the input's and
                     # the job's terminal outcomes settle together.
@@ -800,6 +815,21 @@ class DraftJobProcessor:
                         "heartbeat_at = CURRENT_TIMESTAMP, "
                         "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
                         (job.id,),
+                    )
+                    # The same durable ``job_cancelled`` audit row the API
+                    # cancel path writes (``request_job_cancel``), so the
+                    # draft's event ledger carries the cancellation even when
+                    # it is this transaction that settles it (issue #532
+                    # review, PRR-022). Same event type and payload shape;
+                    # the worker has no requesting-actor context, so the job's
+                    # own creator stands in as the actor, exactly as the
+                    # pipeline does for its revision events.
+                    DraftStore(conn)._insert_event(
+                        draft_id=job.draft_id,
+                        event_type="job_cancelled",
+                        actor_user_id=job.created_by,
+                        job_id=job.id,
+                        payload={"prior_status": row[0]},
                     )
                     conn.commit()
                     return False

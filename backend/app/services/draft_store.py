@@ -1448,6 +1448,8 @@ class DraftStore:
         self._begin_immediate()
         try:
             draft = self._locked_draft(draft_id, owner_id, None)
+            if draft.status == "archived":
+                raise InvalidTransitionError("archived draft cannot be edited")
             self._assert_no_active_compile(draft_id)
             existing = self._db.execute(
                 "SELECT role, authority, as_of_date, locked_spans_json "
@@ -3480,6 +3482,19 @@ class DraftStore:
 
     # ── compile jobs ─────────────────────────────────────────────────────
 
+    def has_pending_compile_job(self) -> bool:
+        """True when at least one ``compile`` job is waiting to be claimed.
+
+        Read-only probe for callers (e.g. the processor's unwired-engine
+        warning) that need to know a compile job *would* be claimable without
+        claiming it.
+        """
+        row = self._db.execute(
+            "SELECT 1 FROM draft_jobs WHERE status = 'pending' "
+            "AND job_type = 'compile' LIMIT 1"
+        ).fetchone()
+        return row is not None
+
     def claim_next_compile_job(self) -> Optional[DraftJobRecord]:
         """Atomically claim one pending ``compile`` job.
 
@@ -3500,7 +3515,14 @@ class DraftStore:
             job_id = int(row[0])
             cur = self._db.execute(
                 "UPDATE draft_jobs SET status = 'running', "
-                "started_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP "
+                # A fresh job gets its claim time; a recovered job keeps its
+                # original claim time so ``_build_context`` can derive the
+                # resumed wall-clock deadline from it (issue #516 DRAFT-013,
+                # wired up in the #532 review): overwriting it here would
+                # re-grant the full timeout to a job that already spent most
+                # of it.
+                "started_at = COALESCE(started_at, CURRENT_TIMESTAMP), "
+                "heartbeat_at = CURRENT_TIMESTAMP "
                 "WHERE id = ? AND status = 'pending'",
                 (job_id,),
             )
@@ -3611,7 +3633,10 @@ class DraftStore:
         Also settles that job's own abandoned ``running`` stage attempts onto
         ``failed`` (``worker_restart``) in the same transaction: a completed
         stage row is immutable, so a resumed run must redo any stage that
-        never finished rather than trust a half-written one.
+        never finished rather than trust a half-written one. ``started_at`` is
+        deliberately preserved (not nulled): the resumed run derives its
+        wall-clock deadline from the original claim time when the job already
+        consumed model calls (issue #516 DRAFT-011/DRAFT-013).
 
         Returns:
             The number of jobs reset to pending (cancelled jobs are not counted).
@@ -3644,7 +3669,10 @@ class DraftStore:
                     )
                     continue
                 self._db.execute(
-                    "UPDATE draft_jobs SET status = 'pending', started_at = NULL, "
+                    "UPDATE draft_jobs SET status = 'pending', "
+                    # started_at stays: the wall-clock budget of a resumed
+                    # compile must keep counting from its original claim, not
+                    # restart (see claim_next_compile_job's COALESCE).
                     "error_code = 'worker_restart', error_message = "
                     "'previous attempt abandoned by a worker restart' WHERE id = ?",
                     (job_id,),

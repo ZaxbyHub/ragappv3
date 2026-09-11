@@ -2134,9 +2134,15 @@ class _CompileRun:
                     retryable=False,
                     message="compile job exceeded its wall-clock budget",
                 ) from None
-            # Provider-internal timeout with budget left: the handler below
-            # keeps today's retrieval_unavailable classification.
-            raise
+            # Provider-internal timeout with budget left: classify it here as
+            # an unavailable retrieval instead of re-raising the raw
+            # TimeoutError. A raw exception would skip ``_run_stage``'s failed
+            # stage-row recording and fall through to run_compile's generic
+            # ``internal_error`` settlement, losing the stable
+            # ``retrieval_unavailable`` code (issue #532 review, PRR-001).
+            raise CompileFailure(
+                CODE_RETRIEVAL_UNAVAILABLE, retryable=False
+            ) from None
         except ProviderPolicyError as exc:
             raise CompileFailure(exc.code, retryable=False) from None
         except Exception as exc:
