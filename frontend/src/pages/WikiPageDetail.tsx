@@ -1,11 +1,19 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ArrowLeft, ChevronDown, ChevronRight, Edit, FileText, Link2, Trash2, History } from "lucide-react";
-import type { WikiPage, WikiClaim, WikiLintFinding } from "@/lib/api";
-import { getWikiPageVersions, getWikiPageFiles, getWikiPageBacklinks } from "@/lib/api";
+import type {
+  WikiPage,
+  WikiClaim,
+  WikiLintFinding,
+  WikiPageVersion,
+  WikiPageFile,
+  WikiPageLink,
+} from "@/lib/api";
+import { getWikiPage, getWikiPageVersions, getWikiPageFiles, getWikiPageBacklinks } from "@/lib/api";
 
 interface WikiPageDetailProps {
   page: WikiPage;
@@ -73,13 +81,44 @@ function ClaimRow({ claim }: { claim: WikiClaim }) {
       </div>
       {claim.sources && claim.sources.length > 0 && (
         <div className="flex gap-1 flex-wrap mt-1">
-          {claim.sources.map((src) => (
-            <Badge key={src.id} variant="outline" className="text-xs">
-              {src.source_kind}
-              {src.memory_id != null && ` #${src.memory_id}`}
-              {src.file_id != null && ` file:${src.file_id}`}
-            </Badge>
-          ))}
+          {claim.sources.map((src) => {
+            // AC44 (#515): origin chips LINK to the surface the claim came
+            // from so provenance is one click away. document → the document
+            // detail route; memory → the memories page. PRR-006 (#531):
+            // client-side <Link> navigation (not origin <a href>) so the
+            // chips stay inside the SPA router.
+            if (src.source_kind === "document" && src.file_id != null) {
+              return (
+                <Link
+                  key={src.id}
+                  to={`/documents/${src.file_id}`}
+                  title={`Open source document ${src.file_id}`}
+                  className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground hover:underline"
+                >
+                  document{src.source_label ? ` · ${src.source_label}` : ` · file ${src.file_id}`}
+                </Link>
+              );
+            }
+            if (src.source_kind === "memory" && src.memory_id != null) {
+              return (
+                <Link
+                  key={src.id}
+                  to="/memory"
+                  title={`Open memories (source memory ${src.memory_id})`}
+                  className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground hover:underline"
+                >
+                  memory{src.source_label ? ` · ${src.source_label}` : ` #${src.memory_id}`}
+                </Link>
+              );
+            }
+            return (
+              <Badge key={src.id} variant="outline" className="text-xs">
+                {src.source_kind}
+                {src.memory_id != null && ` #${src.memory_id}`}
+                {src.file_id != null && ` file:${src.file_id}`}
+              </Badge>
+            );
+          })}
         </div>
       )}
     </div>
@@ -95,28 +134,9 @@ function LintFindingRow({ finding }: { finding: WikiLintFinding }) {
   );
 }
 
-interface VersionEntry {
-  version: number;
-  edited_by: string | null;
-  edited_at: string;
-  diff_summary: string | null;
-}
-
-interface FileAttachment {
-  file_id: number;
-  filename: string;
-  attached_at: string;
-}
-
-interface BacklinkEntry {
-  page_id: number;
-  title: string;
-  slug: string;
-}
-
 function VersionHistorySection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
   const [open, setOpen] = useState(false);
-  const [versions, setVersions] = useState<VersionEntry[]>([]);
+  const [versions, setVersions] = useState<WikiPageVersion[]>([]);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -148,13 +168,16 @@ function VersionHistorySection({ pageId, vaultId }: { pageId: number; vaultId: n
           )}
           {!loading &&
             versions.map((v) => (
-              <div key={v.version} className="border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
+              <div key={v.id} className="border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
                 <div className="flex items-center gap-2 text-xs">
-                  <Badge variant="outline" className="text-[10px]">v{v.version}</Badge>
-                  <span className="text-muted-foreground">{new Date(v.edited_at).toLocaleString()}</span>
-                  {v.edited_by && <span className="text-muted-foreground">by {v.edited_by}</span>}
+                  {/* AC40 (#515): the backend version row identifies itself by
+                      its id (no separate version number column). */}
+                  <Badge variant="outline" className="text-[10px]">v{v.id}</Badge>
+                  <span className="text-muted-foreground">{new Date(v.created_at).toLocaleString()}</span>
+                  {v.edited_by != null && (
+                    <span className="text-muted-foreground">by user {v.edited_by}</span>
+                  )}
                 </div>
-                {v.diff_summary && <p className="text-xs text-muted-foreground mt-0.5">{v.diff_summary}</p>}
               </div>
             ))}
         </CardContent>
@@ -165,7 +188,7 @@ function VersionHistorySection({ pageId, vaultId }: { pageId: number; vaultId: n
 
 function AttachmentsSection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
   const [open, setOpen] = useState(false);
-  const [files, setFiles] = useState<FileAttachment[]>([]);
+  const [files, setFiles] = useState<WikiPageFile[]>([]);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -197,10 +220,13 @@ function AttachmentsSection({ pageId, vaultId }: { pageId: number; vaultId: numb
           )}
           {!loading &&
             files.map((f) => (
-              <div key={f.file_id} className="flex items-center gap-2 text-xs border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
+              <div key={f.id} className="flex items-center gap-2 text-xs border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
                 <FileText className="w-3 h-3 text-muted-foreground" />
-                <span className="truncate">{f.filename}</span>
-                <span className="text-muted-foreground ml-auto">{new Date(f.attached_at).toLocaleDateString()}</span>
+                {/* AC40 (#515): filename comes joined from the backend; fall
+                    back to an identifiable file-id label when the join missed
+                    (deleted file / legacy payload). */}
+                <span className="truncate">{f.filename ?? `File #${f.file_id}`}</span>
+                <span className="text-muted-foreground ml-auto">{new Date(f.created_at).toLocaleDateString()}</span>
               </div>
             ))}
         </CardContent>
@@ -211,16 +237,53 @@ function AttachmentsSection({ pageId, vaultId }: { pageId: number; vaultId: numb
 
 function BacklinksSection({ pageId, vaultId }: { pageId: number; vaultId: number }) {
   const [open, setOpen] = useState(false);
-  const [backlinks, setBacklinks] = useState<BacklinkEntry[]>([]);
+  const [backlinks, setBacklinks] = useState<WikiPageLink[]>([]);
+  const [resolvedSources, setResolvedSources] = useState<Record<number, { title: string; slug: string } | null>>({});
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setLoading(true);
+    // PRR-013 (#531): pageId/vaultId changed — drop the legacy-source
+    // resolution cache so stale titles/slugs from the previous page can't
+    // bleed into this page's backlinks while the new fetch is in flight.
+    setResolvedSources({});
+    let cancelled = false;
     getWikiPageBacklinks(pageId, vaultId)
-      .then((data) => setBacklinks(Array.isArray(data) ? data : data.backlinks ?? []))
-      .catch(() => setBacklinks([]))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        const rows = Array.isArray(data) ? data : data.backlinks ?? [];
+        if (cancelled) return;
+        setBacklinks(rows);
+        // AC40 (#515): rows normally carry source_title/source_slug from the
+        // backend's JOIN onto wiki_pages; resolve legacy rows (null fields)
+        // via a page fetch so every backlink still shows its source page.
+        const unresolved = rows
+          .filter((bl) => bl.source_title == null && bl.source_page_id != null)
+          .map((bl) => bl.source_page_id);
+        if (unresolved.length === 0) return;
+        Promise.all(
+          unresolved.map(async (sourcePageId) => {
+            try {
+              const page = await getWikiPage(sourcePageId);
+              return [sourcePageId, { title: page.title, slug: page.slug }] as const;
+            } catch {
+              return [sourcePageId, null] as const;
+            }
+          }),
+        ).then((entries) => {
+          if (cancelled) return;
+          setResolvedSources((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setBacklinks([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, pageId, vaultId]);
 
   return (
@@ -242,13 +305,19 @@ function BacklinksSection({ pageId, vaultId }: { pageId: number; vaultId: number
             <p className="text-xs text-muted-foreground">No pages link to this page.</p>
           )}
           {!loading &&
-            backlinks.map((bl) => (
-              <div key={bl.page_id} className="flex items-center gap-2 text-xs border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
-                <Link2 className="w-3 h-3 text-muted-foreground" />
-                <span className="truncate font-medium">{bl.title}</span>
-                <span className="text-muted-foreground ml-auto">{bl.slug}</span>
-              </div>
-            ))}
+            backlinks.map((bl) => {
+              const title =
+                bl.source_title ?? resolvedSources[bl.source_page_id]?.title ?? `Page ${bl.source_page_id}`;
+              const slug =
+                bl.source_slug ?? resolvedSources[bl.source_page_id]?.slug ?? "";
+              return (
+                <div key={bl.id} className="flex items-center gap-2 text-xs border-b border-border pb-2 mb-2 last:border-0 last:mb-0 last:pb-0">
+                  <Link2 className="w-3 h-3 text-muted-foreground" />
+                  <span className="truncate font-medium">{title}</span>
+                  {slug && <span className="text-muted-foreground ml-auto">{slug}</span>}
+                </div>
+              );
+            })}
         </CardContent>
       )}
     </Card>
@@ -307,19 +376,25 @@ export function WikiPageDetail({ page, onBack, onEdit, onDelete }: WikiPageDetai
           </Card>
         )}
 
-        {/* Claims */}
-        {page.claims && page.claims.length > 0 && (
-          <Card>
-            <CardHeader className="pb-2 pt-3 px-4">
-              <CardTitle className="text-sm">Claims ({page.claims.length})</CardTitle>
-            </CardHeader>
-            <CardContent className="px-4 pb-3">
-              {page.claims.map((claim) => (
+        {/* Claims — always rendered (AC29, issue #515): a page with zero
+            claims gets an explicit empty state instead of silently hiding the
+            section, so "compiled but claimless" is distinguishable. */}
+        <Card>
+          <CardHeader className="pb-2 pt-3 px-4">
+            <CardTitle className="text-sm">
+              Claims{page.claims?.length ? ` (${page.claims.length})` : ""}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="px-4 pb-3">
+            {page.claims && page.claims.length > 0 ? (
+              page.claims.map((claim) => (
                 <ClaimRow key={claim.id} claim={claim} />
-              ))}
-            </CardContent>
-          </Card>
-        )}
+              ))
+            ) : (
+              <p className="text-xs text-muted-foreground">No claims extracted yet.</p>
+            )}
+          </CardContent>
+        </Card>
 
         {/* Related Entities */}
         {page.entities && page.entities.length > 0 && (

@@ -138,7 +138,7 @@ interface WikiEditDialogProps {
     summary: string;
     status: string;
     confidence: number;
-  }) => Promise<void>;
+  }) => Promise<void | { conflict: boolean }>;
 }
 
 export function WikiEditDialog({ open, page, vaultId: _vaultId, onClose, onSave }: WikiEditDialogProps) {
@@ -192,7 +192,15 @@ export function WikiEditDialog({ open, page, vaultId: _vaultId, onClose, onSave 
     setSaving(true);
     setError(null);
     try {
-      await onSave({ title, page_type: pageType, slug: slug || undefined, markdown, summary, status, confidence });
+      const result = await onSave({ title, page_type: pageType, slug: slug || undefined, markdown, summary, status, confidence });
+      // AC32 (#515): a 409 optimistic-locking conflict resolves with a
+      // conflict signal instead of throwing — the dialog stays OPEN with the
+      // draft intact so the user can refresh and retry instead of losing
+      // their edits. Everything else closes on success.
+      if (result && typeof result === "object" && result.conflict) {
+        setError("This page was edited by someone else. Refresh and try again — your draft is preserved.");
+        return;
+      }
       onClose();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Save failed");

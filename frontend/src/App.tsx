@@ -37,6 +37,9 @@ const NotFoundPage = lazy(() => import("@/pages/NotFoundPage"));
 const WikiPage = lazy(() => import("@/pages/WikiPage"));
 const KMSPage = lazy(() => import("@/pages/KMSPage"));
 const KMSDetailPage = lazy(() => import("@/pages/KMSDetailPage"));
+// Unified discovery surface (issue #515 / PRODUCT-ENH-11) — reached via the
+// shell's global searchbox or a direct /search?q=… link.
+const SearchPage = lazy(() => import("@/pages/SearchPage"));
 const DraftRoomPage = lazy(() => import("@/pages/DraftRoomPage"));
 const DraftRoomDetailPage = lazy(() => import("@/pages/DraftRoomDetailPage"));
 const CanvasPage = lazy(() => import("@/components/canvas/CanvasPage"));
@@ -326,6 +329,20 @@ function App() {
                   <ProtectedRoute>
                     <MainAppShell>
                       <KMSDetailPage />
+                    </MainAppShell>
+                  </ProtectedRoute>
+                }
+              />
+
+              {/* Unified discovery search results (issue #515 / PRODUCT-ENH-11).
+                  The shell's global searchbox navigates here with ?q=…&types=…;
+                  no nav item owns it, so the rail keeps no active highlight. */}
+              <Route
+                path="/search"
+                element={
+                  <ProtectedRoute testMode={TEST_MODE}>
+                    <MainAppShell testMode={TEST_MODE}>
+                      <SearchPage />
                     </MainAppShell>
                   </ProtectedRoute>
                 }

@@ -15,4 +15,5 @@ export * from "./vaults";
 export * from "./organizations";
 export * from "./memories";
 export * from "./auth-sessions";
+export * from "./search";
 export { default } from "./core";

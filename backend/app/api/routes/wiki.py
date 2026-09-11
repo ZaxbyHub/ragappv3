@@ -174,8 +174,15 @@ async def list_wiki_pages(
 ):
     await _require_vault_read(evaluate, user, vault_id)
     store = WikiStore(db)
-    pages = store.list_pages(vault_id, page_type=page_type, status=status, search=search, page=page, per_page=per_page)
-    return {"pages": [_as_dict(p) for p in pages], "page": page, "per_page": per_page}
+    result = store.list_pages(vault_id, page_type=page_type, status=status, search=search, page=page, per_page=per_page)
+    # AC34 (#515): expose ``total`` (rows matching the same filters, no
+    # LIMIT/OFFSET) so the UI can offer Load-more pagination.
+    return {
+        "pages": [_as_dict(p) for p in result],
+        "page": page,
+        "per_page": per_page,
+        "total": result.total,
+    }
 
 
 @router.post("/wiki/pages", status_code=201)
@@ -249,8 +256,24 @@ async def update_wiki_page(
         if exc.status_code == 403:
             raise HTTPException(status_code=404, detail="Wiki page not found")
         raise
-    updates = request.model_dump(exclude_none=True)
-    expected_version = updates.pop("expected_version", None)
+    # API-002 (#515): build the update payload from ``model_fields_set`` so an
+    # EXPLICIT ``{"parent_id": null}` clears the parent while an ABSENT field
+    # (empty body / title-only) preserves it. The previous
+    # ``model_dump(exclude_none=True)`` dropped explicit nulls, making the
+    # parent unclearable. Explicit nulls pass through only for nullable
+    # columns; a null on a NOT NULL column keeps the old drop-it behavior
+    # instead of turning into a 500 from the UPDATE.
+    nullable_update_fields = frozenset({"parent_id", "summary"})
+    fields_set = request.model_fields_set
+    expected_version = request.expected_version if "expected_version" in fields_set else None
+    updates: Dict[str, object] = {}
+    for field_name in fields_set:
+        if field_name == "expected_version":
+            continue
+        value = getattr(request, field_name)
+        if value is None and field_name not in nullable_update_fields:
+            continue
+        updates[field_name] = value
     try:
         updated = store.update_page(
             page_id,
@@ -978,8 +1001,27 @@ async def get_document_wiki_status(
     claims_total = len(claims_rows)
     active_claims = sum(1 for r in claims_rows if dict(r)["status"] == "active")
 
-    # Collect linked page IDs
+    # Collect linked page IDs. WIKI-011 (#515): the union is NOT claim-derived
+    # only — a compiled plain document materializes a page with zero claims,
+    # so also include (a) the page-file associations for this file and (b) the
+    # page named by the latest completed job's result_json.
     page_ids = {dict(r)["page_id"] for r in claims_rows if dict(r)["page_id"]}
+    assoc_rows = db.execute(
+        "SELECT page_id FROM wiki_page_files WHERE file_id = ? AND vault_id = ?",
+        (file_id, vault_id),
+    ).fetchall()
+    page_ids.update(
+        dict(r)["page_id"] for r in assoc_rows if dict(r)["page_id"]
+    )
+    if latest_job is not None and latest_job.status == "completed":
+        try:
+            latest_result = json.loads(latest_job.result_json or "{}")
+        except (json.JSONDecodeError, TypeError):
+            latest_result = {}
+        job_page = latest_result.get("page")
+        if isinstance(job_page, dict) and job_page.get("id"):
+            page_ids.add(job_page["id"])
+
     pages_info = []
     for pid in page_ids:
         row = db.execute(
@@ -989,7 +1031,10 @@ async def get_document_wiki_status(
         if row:
             pages_info.append(dict(row))
 
-    # A completed job with zero extracted claims is "skipped" (no extractable knowledge)
+    # A completed job that produced NOTHING (no claims, no materialized page,
+    # no association) is "skipped" — no extractable knowledge. WIKI-011
+    # (#515): a compiled plain document (page created, zero claims) now has a
+    # non-empty pages union above and stays "compiled".
     if wiki_status == "compiled" and claims_total == 0 and not pages_info:
         wiki_status = "skipped"
 

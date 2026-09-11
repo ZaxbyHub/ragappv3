@@ -1,7 +1,8 @@
 """
-Semantic search API routes for document chunks.
+Search API routes.
 
-Provides endpoints for searching document chunks using vector similarity.
+Semantic (vector) search for document chunks, chunk context expansion, and
+the unified cross-entity discovery endpoint (Issue #515 / PRODUCT-ENH-11).
 """
 
 import asyncio
@@ -15,13 +16,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
+    get_current_active_user,
     get_current_user_or_service_account,
     get_db,
     get_embedding_service,
     get_evaluate_policy,
+    get_user_accessible_vault_ids,
     get_vector_store,
     require_model_ready,
 )
+from app.api.routes.documents import _build_files_fts_query, search_documents
 from app.config import settings
 from app.limiter import limiter
 from app.services.document_retrieval import (
@@ -30,11 +34,13 @@ from app.services.document_retrieval import (
     whitelist_metadata_for_wire,
 )
 from app.services.embeddings import EmbeddingError, EmbeddingService
+from app.services.kms_store import KMSStore
 from app.services.vector_store import (
     SearchSemaphoreTimeoutError,
     VectorStore,
     VectorStoreError,
 )
+from app.services.wiki_store import WikiStore
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -363,3 +369,246 @@ async def get_chunk_context(
         before=before_texts,
         after=after_texts,
     )
+
+
+# ---------------------------------------------------------------------------
+# Unified cross-entity discovery search (Issue #515 / PRODUCT-ENH-11)
+# ---------------------------------------------------------------------------
+
+class UnifiedSearchResult(BaseModel):
+    """One cross-entity discovery hit (Issue #515).
+
+    ``type`` discriminates the entity kind so clients can pick a renderer;
+    ``url_hint`` is the frontend path that opens the entity; ``score`` is
+    bm25-derived for documents and a deterministic title > summary > body
+    tier proxy for the FTS-backed stores whose public search APIs do not
+    expose a rank.
+    """
+
+    type: str
+    id: int
+    title: str
+    snippet: str
+    vault_id: int
+    url_hint: str
+    score: float
+
+
+class UnifiedSearchResponse(BaseModel):
+    """Aggregated response for GET /search/unified (Issue #515)."""
+
+    results: List[UnifiedSearchResult]
+
+
+_UNIFIED_TYPES = ("document", "wiki", "kms", "chat")
+_UNIFIED_TYPE_ORDER = {name: idx for idx, name in enumerate(_UNIFIED_TYPES)}
+
+
+def _parse_unified_types(raw: Optional[str]) -> List[str]:
+    """Parse the ``types`` query parameter into a validated entity-type list.
+
+    Unknown values are rejected with 422: the parameter is a machine contract
+    (frontend type-filter checkboxes), not free-text search input. An absent
+    or blank parameter means "search every entity type".
+    """
+    if raw is None or not raw.strip():
+        return list(_UNIFIED_TYPES)
+    requested = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    invalid = sorted({part for part in requested if part not in _UNIFIED_TYPE_ORDER})
+    if not requested or invalid:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "types must be a comma-separated subset of "
+                f"{list(_UNIFIED_TYPES)}; invalid: {invalid or ['<empty>']}"
+            ),
+        )
+    deduped: List[str] = []
+    for entity_type in requested:
+        if entity_type not in deduped:
+            deduped.append(entity_type)
+    return deduped
+
+
+def _unified_snippet(primary: Optional[str], fallback: Optional[str]) -> str:
+    """Prefer the entity's summary field, fall back to its body, clipped."""
+    text = (primary or "").strip() or (fallback or "").strip()
+    return text[:200]
+
+
+def _tiered_score(
+    query_lower: str, title: Optional[str], summary: Optional[str]
+) -> float:
+    """Deterministic relevance proxy for stores without a bm25 rank:
+    title containment scores 3.0, summary containment 2.0, body-only FTS
+    match 1.0. ``query_lower`` is non-empty at every call site."""
+    if query_lower in (title or "").lower():
+        return 3.0
+    if query_lower in (summary or "").lower():
+        return 2.0
+    return 1.0
+
+
+@router.get("/search/unified", response_model=UnifiedSearchResponse)
+async def unified_search(
+    q: str = Query(..., min_length=1, max_length=200, description="Search query"),
+    vault_id: Optional[int] = Query(None, description="Restrict to a vault"),
+    types: Optional[str] = Query(
+        None,
+        description="Comma-separated subset of document,wiki,kms,chat (default: all)",
+    ),
+    limit: int = Query(20, ge=1, le=50, description="Maximum results per entity type"),
+    db: sqlite3.Connection = Depends(get_db),
+    user: dict = Depends(get_current_active_user),
+    evaluate: Callable = Depends(get_evaluate_policy),
+):
+    """Unified discovery search across documents, wiki pages, KMS entries and
+    chat session titles (Issue #515, PRODUCT-ENH-11).
+
+    SQL/FTS-only — no vector store involvement. Each arm reuses the existing
+    per-entity search logic rather than a new retrieval stack: documents call
+    the ranked ``GET /documents/search`` handler (bm25 + highlighted
+    excerpts + per-document dedup), wiki pages go through ``WikiStore.search``,
+    KMS entries through ``KMSStore.list_entries`` and chat sessions are
+    matched on title the way ``GET /chat/sessions`` scopes them. Every arm
+    applies its own ``LIMIT``. Authz mirrors the sibling per-entity routes:
+    vault read check when ``vault_id`` is given, accessible-vault scoping for
+    non-admins without one.
+    """
+    query_text = q.strip()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Query must not be empty")
+    requested_types = _parse_unified_types(types)
+    query_lower = query_text.lower()
+
+    # Vault scoping (mirrors GET /documents/search). WikiStore.search and
+    # KMSStore.list_entries take a single vault_id, so a multi-vault scope
+    # iterates the vault list per vault with `limit` each, then merges and
+    # truncates the per-type pool to `limit` total (PRR-003, #531).
+    if vault_id is not None:
+        if not await evaluate(user, "vault", vault_id, "read"):
+            raise HTTPException(status_code=403, detail="Access denied to vault")
+        scope_vaults: List[int] = [vault_id]
+    elif user.get("role") in ("admin", "superadmin"):
+        cursor = await asyncio.to_thread(db.execute, "SELECT id FROM vaults ORDER BY id")
+        scope_vaults = [int(row[0]) for row in await asyncio.to_thread(cursor.fetchall)]
+    else:
+        scope_vaults = await get_user_accessible_vault_ids(user, db)
+        if not scope_vaults:
+            return UnifiedSearchResponse(results=[])
+
+    # Sanitize once into a safe FTS5 prefix query: raw user input containing
+    # hyphens/punctuation would otherwise be interpreted as FTS5 MATCH syntax
+    # by the wiki store's pass-through MATCH.
+    fts_query = _build_files_fts_query(query_text)
+
+    results: List[UnifiedSearchResult] = []
+
+    if "document" in requested_types and fts_query:
+        # Direct reuse of the ranked documents search — it re-applies the same
+        # vault scoping rules (evaluate check above already ran for the
+        # vault_id case) and returns deduplicated, excerpt-bearing hits.
+        # PRR-015 (#531): the conn/user/evaluate wiring below manually mirrors
+        # the DI signature of documents.search_documents; if that handler
+        # gains new dependencies, this call site must be updated in step.
+        doc_response = await search_documents(
+            q=q,
+            vault_id=vault_id,
+            limit=limit,
+            offset=0,
+            conn=db,
+            user=user,
+            evaluate=evaluate,
+        )
+        for hit in doc_response.results:
+            results.append(
+                UnifiedSearchResult(
+                    type="document",
+                    id=hit.id,
+                    title=hit.file_name,
+                    snippet=hit.excerpt,
+                    vault_id=hit.vault_id,
+                    url_hint=f"/documents/{hit.id}",
+                    score=float(hit.score),
+                )
+            )
+
+    if "wiki" in requested_types and fts_query and scope_vaults:
+        wiki_store = WikiStore(db)
+        # PRR-003 (#531): accumulate across the scoped vaults, then cap at
+        # `limit` TOTAL wiki hits (not limit per vault) — sort by score
+        # descending with id ascending as the deterministic tie-break.
+        wiki_typed: List[UnifiedSearchResult] = []
+        for scope_vault in scope_vaults:
+            wiki_hits = wiki_store.search(scope_vault, fts_query, limit=limit)
+            for page in wiki_hits["pages"]:
+                wiki_typed.append(
+                    UnifiedSearchResult(
+                        type="wiki",
+                        id=page.id,
+                        title=page.title or page.slug,
+                        snippet=_unified_snippet(page.summary, page.markdown),
+                        vault_id=page.vault_id,
+                        url_hint=f"/wiki?page={page.id}",
+                        score=_tiered_score(query_lower, page.title, page.summary),
+                    )
+                )
+        wiki_typed.sort(key=lambda r: (-r.score, r.id))
+        results.extend(wiki_typed[:limit])
+
+    if "kms" in requested_types and fts_query and scope_vaults:
+        kms_store = KMSStore(db)
+        # PRR-003 (#531): same TOTAL-per-type cap as the wiki arm above.
+        kms_typed: List[UnifiedSearchResult] = []
+        for scope_vault in scope_vaults:
+            for entry in kms_store.list_entries(
+                scope_vault, search=fts_query, page=1, per_page=limit
+            ):
+                kms_typed.append(
+                    UnifiedSearchResult(
+                        type="kms",
+                        id=entry.id,
+                        title=entry.title,
+                        snippet=_unified_snippet(entry.summary, entry.body),
+                        vault_id=entry.vault_id,
+                        url_hint=f"/kms/{entry.id}",
+                        score=_tiered_score(query_lower, entry.title, entry.summary),
+                    )
+                )
+        kms_typed.sort(key=lambda r: (-r.score, r.id))
+        results.extend(kms_typed[:limit])
+
+    if "chat" in requested_types:
+        # Title substring match with the same visibility rules as
+        # GET /chat/sessions: admins see the vault's sessions, non-admins
+        # only their own (plus unowned) ones.
+        chat_sql = "SELECT id, vault_id, title FROM chat_sessions WHERE LOWER(title) LIKE ?"
+        chat_params: List[Any] = [f"%{query_lower}%"]
+        if scope_vaults:
+            placeholders = ",".join("?" * len(scope_vaults))
+            chat_sql += f" AND vault_id IN ({placeholders})"
+            chat_params.extend(scope_vaults)
+        if user.get("role") not in ("admin", "superadmin"):
+            chat_sql += " AND (user_id = ? OR user_id IS NULL)"
+            chat_params.append(user.get("id"))
+        chat_sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        chat_params.append(limit)
+        cursor = await asyncio.to_thread(db.execute, chat_sql, chat_params)
+        for row in await asyncio.to_thread(cursor.fetchall):
+            # A NULL title can never satisfy the LIKE, so matched rows
+            # always carry a non-empty title.
+            results.append(
+                UnifiedSearchResult(
+                    type="chat",
+                    id=int(row["id"]),
+                    title=str(row["title"]),
+                    snippet=str(row["title"]),
+                    vault_id=int(row["vault_id"]),
+                    url_hint=f"/chat/{row['id']}",
+                    score=_tiered_score(query_lower, row["title"], None),
+                )
+            )
+
+    # Deterministic ordering: entity type, then score descending, then id.
+    results.sort(key=lambda r: (_UNIFIED_TYPE_ORDER[r.type], -r.score, r.id))
+    return UnifiedSearchResponse(results=results)

@@ -86,6 +86,12 @@ class CuratorResult:
     rejected: list[CuratorRejection] = field(default_factory=list)
     lint_findings: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # WIKI-015 (#515): open_questions the prompt schema requests ("if you
+    # are unsure about a relationship, prefer an open_question"). Retained
+    # on the result surface and in to_summary() (which flows into the
+    # compile job's result_json) — deliberately NOT persisted as claim
+    # rows; they are questions, not verified facts.
+    open_questions: list[dict[str, Any]] = field(default_factory=list)
     calls: int = 0
     input_chars: int = 0
 
@@ -95,6 +101,7 @@ class CuratorResult:
             "rejected": len(self.rejected),
             "lint": len(self.lint_findings),
             "errors": list(self.errors),
+            "open_questions": list(self.open_questions),
             "calls": self.calls,
             "input_chars": self.input_chars,
         }
@@ -112,6 +119,10 @@ class CuratorResult:
 
 _NORM_RE = re.compile(r"\s+")
 
+# WIKI-012 (#515): digit-sequence tokens (integers and decimals) used for
+# the fuzzy-path numeric-identity gate.
+_NUM_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?")
+
 
 def _normalize(text: str) -> str:
     """Collapse whitespace + lowercase. Punctuation is kept because it
@@ -119,6 +130,16 @@ def _normalize(text: str) -> str:
     if not text:
         return ""
     return _NORM_RE.sub(" ", text).strip().lower()
+
+
+def _numeric_multiset(text: str) -> list[str]:
+    """Sorted digit-sequence tokens of ``text`` for multiset equality.
+
+    Sorting makes the comparison order-insensitive while keeping
+    multiplicity ('30 30' != '30'), so a quote that repeats or drops a
+    number is still caught.
+    """
+    return sorted(_NUM_TOKEN_RE.findall(text or ""))
 
 
 def _quote_matches(quote: str, source_text: str, *, fuzzy_threshold: int = 92) -> bool:
@@ -130,6 +151,14 @@ def _quote_matches(quote: str, source_text: str, *, fuzzy_threshold: int = 92) -
     some reason the import fails at runtime we fall back to strict
     substring only — safer to reject a borderline match than to
     silently accept it.
+
+    WIKI-012 (#515): the fuzzy path additionally requires numeric
+    identity — quote and source must carry the SAME multiset of
+    digit-sequence tokens. partial_ratio alone scores '30 minutes' vs
+    '300 minutes' ~94.7, which used to auto-activate a quote that
+    mutates a number, i.e. a materially different fact. The strict
+    substring paths are unaffected: a verbatim quote's numbers are, by
+    definition, present in the source.
 
     The curator now shows the source to the LLM XML-escaped (e.g. ``&``
     as ``&amp;``), so a model that echoes the rendered tokens rather than
@@ -153,14 +182,34 @@ def _quote_matches(quote: str, source_text: str, *, fuzzy_threshold: int = 92) -
         from rapidfuzz import fuzz
     except ImportError:  # pragma: no cover - defensive
         return False
+    if _numeric_multiset(quote) != _numeric_multiset(source_text):
+        # Numerically different text is a different fact, no matter how
+        # highly the fuzzy score ranks it.
+        return False
     score = fuzz.partial_ratio(_normalize(quote), ns)
     return score >= fuzzy_threshold
 
 
-def _dedupe_key(subject: str, predicate: str, obj: str, normalized_quote: str) -> str:
+def _dedupe_key(
+    subject: str,
+    predicate: str,
+    obj: str,
+    normalized_quote: str,
+    normalized_claim_text: str,
+) -> str:
     """Stable hash used to drop curator candidates that duplicate a
-    deterministic claim of the same job."""
-    raw = f"{subject or ''}|{predicate or ''}|{obj or ''}|{normalized_quote}"
+    deterministic claim of the same job.
+
+    WIKI-013 (#515): the key is FULL equality — the normalized claim_text
+    participates alongside the triple and the quote. Previously two
+    candidates with null triples and the same quote but DIFFERENT
+    claim_text collided on one key, so the second distinct claim was
+    silently dropped as a duplicate of the first.
+    """
+    raw = (
+        f"{subject or ''}|{predicate or ''}|{obj or ''}"
+        f"|{normalized_quote}|{normalized_claim_text or ''}"
+    )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -400,6 +449,15 @@ class WikiCurator:
                 merged_contradictions.extend(
                     c for c in raw_contradictions if isinstance(c, dict)
                 )
+            # WIKI-015 (#515): retain the prompt schema's open_questions so
+            # they surface in the result + job summary instead of being
+            # parsed and dropped. Absent key or non-list → no questions,
+            # never an error.
+            raw_open_questions = parsed.get("open_questions") or []
+            if isinstance(raw_open_questions, list):
+                result.open_questions.extend(
+                    q for q in raw_open_questions if isinstance(q, dict)
+                )
 
         # Sort merged claims deterministically so that when concurrency > 1
         # and two chunks propose the same claim, the dedup winner is always
@@ -487,7 +545,10 @@ class WikiCurator:
             subject = (raw.get("subject") or "") if isinstance(raw.get("subject"), str) else ""
             predicate = (raw.get("predicate") or "") if isinstance(raw.get("predicate"), str) else ""
             obj = (raw.get("object") or "") if isinstance(raw.get("object"), str) else ""
-            key = _dedupe_key(subject, predicate, obj, _normalize(source_quote))
+            key = _dedupe_key(
+                subject, predicate, obj,
+                _normalize(source_quote), _normalize(claim_text),
+            )
             if key in dedupe_keys:
                 # Silent duplicate — already covered by deterministic
                 # output. Don't store as rejection or lint; not a bug.
@@ -556,7 +617,14 @@ class WikiCurator:
 def deterministic_dedupe_key(
     subject: str, predicate: str, obj: str, source_quote: str
 ) -> str:
-    return _dedupe_key(subject or "", predicate or "", obj or "", _normalize(source_quote or ""))
+    # A deterministic role claim's sentence is BOTH its claim_text and its
+    # quote, so the same normalized value feeds both key components and a
+    # curator re-emission of the identical fact still collides (full-equality
+    # dedupe, WIKI-013 / #515).
+    normalized = _normalize(source_quote or "")
+    return _dedupe_key(
+        subject or "", predicate or "", obj or "", normalized, normalized
+    )
 
 
 def verify_quote(quote: str, source_text: str, *, fuzzy_threshold: int = 92) -> bool:

@@ -126,12 +126,20 @@ describe("WikiPageDetail header callbacks", () => {
 
 describe("WikiPageDetail VersionHistorySection", () => {
   it("does not fetch until expanded, then fetches once (array shape)", async () => {
+    // Real backend shape (wiki_store.WikiPageVersion dataclass): the row id
+    // identifies the revision; created_at carries the timestamp.
     mockGetVersions.mockResolvedValue([
       {
-        version: 1,
-        edited_by: "alice",
-        edited_at: "2024-01-01T00:00:00",
-        diff_summary: "initial revision",
+        id: 301,
+        page_id: 10,
+        vault_id: 2,
+        title: "Alice doc",
+        markdown: "# older",
+        summary: "",
+        status: "draft",
+        confidence: 0.5,
+        edited_by: 7,
+        created_at: "2024-01-01T00:00:00Z",
       },
     ]);
     renderDetail();
@@ -143,31 +151,44 @@ describe("WikiPageDetail VersionHistorySection", () => {
 
     await waitFor(() => expect(mockGetVersions).toHaveBeenCalledTimes(1));
     expect(mockGetVersions).toHaveBeenCalledWith(10, 2);
-    expect(await screen.findByText("v1")).toBeInTheDocument();
-    expect(screen.getByText("initial revision")).toBeInTheDocument();
+    expect(await screen.findByText("v301")).toBeInTheDocument();
   });
 
   it("tolerates the {versions:[...]} object shape", async () => {
     mockGetVersions.mockResolvedValue({
       versions: [
         {
-          version: 7,
+          id: 307,
+          page_id: 10,
+          vault_id: 2,
+          title: "Alice doc",
+          markdown: "# v2",
+          summary: "",
+          status: "draft",
+          confidence: 0.5,
           edited_by: null,
-          edited_at: "2024-02-02T00:00:00",
-          diff_summary: null,
+          created_at: "2024-02-02T00:00:00Z",
         },
       ],
     });
     renderDetail();
     fireEvent.click(screen.getByText("Version History"));
-    expect(await screen.findByText("v7")).toBeInTheDocument();
+    expect(await screen.findByText("v307")).toBeInTheDocument();
   });
 });
 
 describe("WikiPageDetail AttachmentsSection", () => {
   it("fetches files on expand and renders them", async () => {
+    // Real backend shape (wiki_store.WikiPageFile after the files JOIN).
     mockGetFiles.mockResolvedValue([
-      { file_id: 5, filename: "spec.pdf", attached_at: "2024-01-01T00:00:00" },
+      {
+        id: 401,
+        page_id: 10,
+        file_id: 5,
+        vault_id: 2,
+        created_at: "2024-01-01T00:00:00Z",
+        filename: "spec.pdf",
+      },
     ]);
     renderDetail();
     expect(mockGetFiles).not.toHaveBeenCalled();
@@ -188,9 +209,19 @@ describe("WikiPageDetail AttachmentsSection", () => {
 });
 
 describe("WikiPageDetail BacklinksSection", () => {
-  it("fetches backlinks on expand and renders them (array shape)", async () => {
+  it("fetches backlinks on expand and renders entries (array shape)", async () => {
+    // Real backend shape (wiki_store.WikiPageLink after the wiki_pages JOIN).
     mockGetBacklinks.mockResolvedValue([
-      { page_id: 42, title: "Linking Page", slug: "doc/linking" },
+      {
+        id: 501,
+        source_page_id: 42,
+        target_page_id: 10,
+        vault_id: 2,
+        link_text: "see also",
+        created_at: "2024-01-01T00:00:00Z",
+        source_title: "Linking Page",
+        source_slug: "doc/linking",
+      },
     ]);
     renderDetail();
     expect(mockGetBacklinks).not.toHaveBeenCalled();
@@ -205,7 +236,18 @@ describe("WikiPageDetail BacklinksSection", () => {
 
   it("tolerates the {backlinks:[...]} object shape", async () => {
     mockGetBacklinks.mockResolvedValue({
-      backlinks: [{ page_id: 99, title: "Wrapped Link", slug: "doc/wrapped" }],
+      backlinks: [
+        {
+          id: 502,
+          source_page_id: 99,
+          target_page_id: 10,
+          vault_id: 2,
+          link_text: "wrapped",
+          created_at: "2024-01-01T00:00:00Z",
+          source_title: "Wrapped Link",
+          source_slug: "doc/wrapped",
+        },
+      ],
     });
     renderDetail();
     fireEvent.click(screen.getByText("Backlinks"));

@@ -387,6 +387,7 @@ class WikiRetrievalService(DualPoolMixin):
         """Look up relations from an entity, optionally filtered by predicate."""
         rows = conn.execute(
             """SELECT r.*, c.claim_text, c.status AS claim_status, c.confidence AS claim_confidence,
+                      c.page_id AS page_id,
                       p.title, p.slug, p.page_type, p.status AS page_status, p.last_compiled_at,
                       p.summary
                FROM wiki_relations r

@@ -103,9 +103,22 @@ class WikiCompileProcessor:
 
                 try:
                     result = await asyncio.to_thread(self._dispatch, job)
-                    await asyncio.to_thread(self._complete_job, job.id, result)
-                    logger.info("WikiCompileProcessor: completed job id=%d", job.id)
-                    self._publish_event(job, "job_completed", result=result)
+                    if result.get("cancelled") == "wiki_compile_disabled":
+                        # WIKI-001 (#515): the flags went off between enqueue
+                        # and claim — _dispatch already marked the job
+                        # cancelled; do not try to complete it (complete_job
+                        # would no-op on the cancelled row anyway) and surface
+                        # the terminal state as a cancellation, not a
+                        # completion.
+                        logger.info(
+                            "WikiCompileProcessor: cancelled job id=%d (wiki compile disabled at dispatch)",
+                            job.id,
+                        )
+                        self._publish_event(job, "job_cancelled", result=result)
+                    else:
+                        await asyncio.to_thread(self._complete_job, job.id, result)
+                        logger.info("WikiCompileProcessor: completed job id=%d", job.id)
+                        self._publish_event(job, "job_completed", result=result)
                 except Exception as exc:
                     logger.exception(
                         "WikiCompileProcessor: job id=%d failed: %s", job.id, exc
@@ -273,8 +286,36 @@ class WikiCompileProcessor:
 
     def _dispatch(self, job) -> dict:
         """Dispatch a job to the appropriate handler. Runs in a thread."""
+        from app.config import settings
         from app.services.wiki_compiler import WikiCompiler
         from app.services.wiki_store import WikiStore
+
+        # WIKI-001 (#515): the enqueue-side gate can race a settings flip —
+        # a job created while the flags were on may be claimed after they
+        # were turned off. Re-check at claim time and cancel the job WITHOUT
+        # running the compiler, so no wiki rows are written from a disabled
+        # subsystem. ``wiki_enabled`` gates every trigger; the
+        # ``wiki_compile_on_query`` toggle only gates chat-answer ("query")
+        # compilation — manual/ingest compiles stay allowed when just that
+        # toggle is off.
+        if (not settings.wiki_enabled) or (
+            job.trigger_type == "query" and not settings.wiki_compile_on_query
+        ):
+            result = {
+                "cancelled": "wiki_compile_disabled",
+                "skipped": True,
+                "reason": (
+                    "wiki compilation disabled at dispatch "
+                    "(wiki_enabled or wiki_compile_on_query is off)"
+                ),
+            }
+            logger.info(
+                "WikiCompileProcessor: cancelling job id=%d type=%s — wiki compile disabled",
+                job.id, job.trigger_type,
+            )
+            with self._pool.connection() as conn:
+                WikiStore(conn).cancel_job(job.id, job.vault_id, result_json=result)
+            return result
 
         input_json: dict = {}
         if job.input_json:

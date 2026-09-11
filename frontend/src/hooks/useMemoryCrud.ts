@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { toast } from "sonner";
 import { addMemory, deleteMemory, type MemoryResult } from "@/lib/api";
 
@@ -41,6 +41,12 @@ export function useMemoryCrud(
   const [isDeleting, setIsDeleting] = useState<string | null>(null);
   const [contentError, setContentError] = useState<string | null>(null);
 
+  // In-flight guard (issue #515 / C41): Ctrl+Enter and the Add Memory button
+  // both funnel into handleAddMemory; a synchronous ref (not state) blocks the
+  // second invocation while the first request is pending, so the API is called
+  // exactly once per submit intent.
+  const submittingRef = useRef(false);
+
   const validateContent = useCallback((content: string): boolean => {
     if (content.length > MAX_MEMORY_CONTENT_LENGTH) {
       setContentError(`Content exceeds maximum length of ${MAX_MEMORY_CONTENT_LENGTH} characters`);
@@ -61,8 +67,17 @@ export function useMemoryCrud(
   }, []);
 
   const handleAddMemory = useCallback(async () => {
-    if (!newMemory.content.trim()) return;
+    // C28 (issue #515): an empty add must surface user-visible feedback —
+    // a silent return leaves keyboard submitters with no explanation.
+    if (!newMemory.content.trim()) {
+      toast.error("Content cannot be empty");
+      return;
+    }
     if (!validateContent(newMemory.content)) return;
+    // C41: drop repeated submits (Ctrl+Enter spam / double click) while the
+    // create request is in flight instead of queueing duplicate memories.
+    if (submittingRef.current) return;
+    submittingRef.current = true;
 
     setIsSubmitting(true);
     try {
@@ -85,6 +100,7 @@ export function useMemoryCrud(
       console.error("Failed to add memory:", err);
       toast.error(err instanceof Error ? err.message : "Failed to add memory");
     } finally {
+      submittingRef.current = false;
       setIsSubmitting(false);
     }
   }, [newMemory, activeVaultId, refreshMemories, validateContent]);

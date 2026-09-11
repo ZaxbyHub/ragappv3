@@ -1,8 +1,11 @@
 """
 WikiLinter: Detects quality issues in wiki content and writes wiki_lint_findings rows.
 
-run_lint() clears all open findings for the vault before inserting new ones,
-preventing ghost findings from accumulating across runs.
+run_lint() detects issues into plain specs, then reconciles them against the
+existing findings BY FINGERPRINT (WikiStore.upsert_lint_findings) so a
+dismissed or resolved finding is never resurrected as a fresh open row on the
+next run, while open rows for issues that went away transition to 'resolved'
+(AC35 / issue #515).
 """
 
 import json
@@ -26,18 +29,20 @@ class WikiLinter:
         """
         Run all lint checks for vault_id.
 
-        Clears existing open findings first, then inserts fresh results.
-        Returns list of created WikiLintFinding objects.
+        Detection produces specs; ``WikiStore.upsert_lint_findings`` reconciles
+        them by fingerprint: previously dismissed/resolved findings stay
+        suppressed (no open resurrection), still-present open findings keep
+        their rows, newly detected issues insert open rows, and open rows whose
+        issue disappeared become 'resolved'. Returns the list of open findings
+        representing this run (kept + newly created).
         """
-        self._store.clear_open_findings(vault_id)
-
-        findings = []
-        findings += self._detect_unsupported_claims(vault_id)
-        findings += self._detect_orphan_claims(vault_id)
-        findings += self._detect_pages_without_claims(vault_id)
-        findings += self._detect_duplicate_entity_aliases(vault_id)
-        findings += self._detect_conflicting_claims(vault_id)
-        return findings
+        specs: list[dict] = []
+        specs += self._detect_unsupported_claims(vault_id)
+        specs += self._detect_orphan_claims(vault_id)
+        specs += self._detect_pages_without_claims(vault_id)
+        specs += self._detect_duplicate_entity_aliases(vault_id)
+        specs += self._detect_conflicting_claims(vault_id)
+        return self._store.upsert_lint_findings(vault_id, specs)
 
     def _detect_unsupported_claims(self, vault_id: int) -> list:
         """Claims with no entries in wiki_claim_sources."""
@@ -50,20 +55,20 @@ class WikiLinter:
             """,
             (vault_id,),
         ).fetchall()
-        findings = []
+        specs = []
         for row in rows:
             claim_id, claim_text, page_id = row[0], row[1], row[2]
-            f = self._store.create_lint_finding(
-                vault_id=vault_id,
-                finding_type="unsupported_claim",
-                severity="high",
-                title=f"Unsupported claim: {claim_text[:80]}",
-                details=f"Claim id={claim_id} has no provenance sources.",
-                related_page_ids=[page_id] if page_id else [],
-                related_claim_ids=[claim_id],
+            specs.append(
+                {
+                    "finding_type": "unsupported_claim",
+                    "severity": "high",
+                    "title": f"Unsupported claim: {claim_text[:80]}",
+                    "details": f"Claim id={claim_id} has no provenance sources.",
+                    "related_page_ids": [page_id] if page_id else [],
+                    "related_claim_ids": [claim_id],
+                }
             )
-            findings.append(f)
-        return findings
+        return specs
 
     def _detect_orphan_claims(self, vault_id: int) -> list:
         """Claims where page_id is NULL (orphaned when page was deleted)."""
@@ -74,19 +79,19 @@ class WikiLinter:
             """,
             (vault_id,),
         ).fetchall()
-        findings = []
+        specs = []
         for row in rows:
             claim_id, claim_text = row[0], row[1]
-            f = self._store.create_lint_finding(
-                vault_id=vault_id,
-                finding_type="orphan",
-                severity="medium",
-                title=f"Orphan claim: {claim_text[:80]}",
-                details=f"Claim id={claim_id} has no parent page (page was deleted).",
-                related_claim_ids=[claim_id],
+            specs.append(
+                {
+                    "finding_type": "orphan",
+                    "severity": "medium",
+                    "title": f"Orphan claim: {claim_text[:80]}",
+                    "details": f"Claim id={claim_id} has no parent page (page was deleted).",
+                    "related_claim_ids": [claim_id],
+                }
             )
-            findings.append(f)
-        return findings
+        return specs
 
     def _detect_pages_without_claims(self, vault_id: int) -> list:
         """Pages with zero claims."""
@@ -98,19 +103,19 @@ class WikiLinter:
             """,
             (vault_id,),
         ).fetchall()
-        findings = []
+        specs = []
         for row in rows:
             page_id, title = row[0], row[1]
-            f = self._store.create_lint_finding(
-                vault_id=vault_id,
-                finding_type="missing_page",
-                severity="low",
-                title=f"Page without claims: {title}",
-                details=f"Page id={page_id} '{title}' has no associated claims.",
-                related_page_ids=[page_id],
+            specs.append(
+                {
+                    "finding_type": "missing_page",
+                    "severity": "low",
+                    "title": f"Page without claims: {title}",
+                    "details": f"Page id={page_id} '{title}' has no associated claims.",
+                    "related_page_ids": [page_id],
+                }
             )
-            findings.append(f)
-        return findings
+        return specs
 
     def _detect_duplicate_entity_aliases(self, vault_id: int) -> list:
         """Two different entities in the same vault share an alias value."""
@@ -131,18 +136,18 @@ class WikiLinter:
                 if key:
                     alias_to_entities.setdefault(key, []).append(entity_id)
 
-        findings = []
+        specs = []
         for alias, entity_ids in alias_to_entities.items():
             if len(entity_ids) > 1:
-                f = self._store.create_lint_finding(
-                    vault_id=vault_id,
-                    finding_type="duplicate_entity",
-                    severity="medium",
-                    title=f"Duplicate alias: '{alias}'",
-                    details=f"Alias '{alias}' appears in entities: {entity_ids}",
+                specs.append(
+                    {
+                        "finding_type": "duplicate_entity",
+                        "severity": "medium",
+                        "title": f"Duplicate alias: '{alias}'",
+                        "details": f"Alias '{alias}' appears in entities: {entity_ids}",
+                    }
                 )
-                findings.append(f)
-        return findings
+        return specs
 
     def _detect_conflicting_claims(self, vault_id: int) -> list:
         """Same subject+predicate pair has different object values."""
@@ -157,17 +162,20 @@ class WikiLinter:
             """,
             (vault_id,),
         ).fetchall()
-        findings = []
+        specs = []
         for row in rows:
             subject, predicate, _, ids_str = row[0], row[1], row[2], row[3]
             claim_ids = [int(i) for i in ids_str.split(",") if i]
-            f = self._store.create_lint_finding(
-                vault_id=vault_id,
-                finding_type="contradiction",
-                severity="high",
-                title=f"Conflicting claims: {subject} — {predicate}",
-                details=f"Multiple objects for subject='{subject}' predicate='{predicate}'. Claim ids: {claim_ids}",
-                related_claim_ids=claim_ids,
+            specs.append(
+                {
+                    "finding_type": "contradiction",
+                    "severity": "high",
+                    "title": f"Conflicting claims: {subject} — {predicate}",
+                    "details": (
+                        f"Multiple objects for subject='{subject}' predicate='{predicate}'. "
+                        f"Claim ids: {claim_ids}"
+                    ),
+                    "related_claim_ids": claim_ids,
+                }
             )
-            findings.append(f)
-        return findings
+        return specs

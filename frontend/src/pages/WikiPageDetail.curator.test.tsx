@@ -15,6 +15,9 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
+// PRR-006 (#531): WikiPageDetail renders react-router <Link> origin chips,
+// so its bare mounts must sit inside a router context.
+import { MemoryRouter } from "react-router-dom";
 import { WikiPageDetail } from "./WikiPageDetail";
 import type { WikiClaim, WikiPage, WikiCompileJob } from "@/lib/api";
 
@@ -77,12 +80,14 @@ describe("WikiPageDetail provenance chips", () => {
   it("renders 'deterministic' chip for legacy / deterministic claims", () => {
     const page = makePage([makeClaim({ created_by_kind: "deterministic" })]);
     render(
-      <WikiPageDetail
-        page={page}
-        onBack={() => {}}
-        onEdit={() => {}}
-        onDelete={() => {}}
-      />,
+      <MemoryRouter>
+        <WikiPageDetail
+          page={page}
+          onBack={() => {}}
+          onEdit={() => {}}
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
     );
     expect(screen.getByText(/deterministic/i)).toBeInTheDocument();
     expect(screen.queryByText(/LLM curator/i)).not.toBeInTheDocument();
@@ -91,12 +96,14 @@ describe("WikiPageDetail provenance chips", () => {
   it("renders 'LLM curator' chip for curator-authored claims", () => {
     const page = makePage([makeClaim({ created_by_kind: "llm_curator" })]);
     render(
-      <WikiPageDetail
-        page={page}
-        onBack={() => {}}
-        onEdit={() => {}}
-        onDelete={() => {}}
-      />,
+      <MemoryRouter>
+        <WikiPageDetail
+          page={page}
+          onBack={() => {}}
+          onEdit={() => {}}
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
     );
     expect(screen.getByText(/LLM curator/i)).toBeInTheDocument();
   });
@@ -109,12 +116,14 @@ describe("WikiPageDetail provenance chips", () => {
       }),
     ]);
     render(
-      <WikiPageDetail
-        page={page}
-        onBack={() => {}}
-        onEdit={() => {}}
-        onDelete={() => {}}
-      />,
+      <MemoryRouter>
+        <WikiPageDetail
+          page={page}
+          onBack={() => {}}
+          onEdit={() => {}}
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
     );
     expect(screen.getByText(/Needs review/i)).toBeInTheDocument();
   });
@@ -122,12 +131,14 @@ describe("WikiPageDetail provenance chips", () => {
   it("treats null created_by_kind as deterministic for display", () => {
     const page = makePage([makeClaim({ created_by_kind: null })]);
     render(
-      <WikiPageDetail
-        page={page}
-        onBack={() => {}}
-        onEdit={() => {}}
-        onDelete={() => {}}
-      />,
+      <MemoryRouter>
+        <WikiPageDetail
+          page={page}
+          onBack={() => {}}
+          onEdit={() => {}}
+          onDelete={() => {}}
+        />
+      </MemoryRouter>,
     );
     expect(screen.getByText(/deterministic/i)).toBeInTheDocument();
   });

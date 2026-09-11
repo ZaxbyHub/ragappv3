@@ -8,9 +8,12 @@ FTS search is backed by wiki_pages_fts, wiki_claims_fts, wiki_entities_fts.
 import json
 import re
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
+
+from app.services.fts_query import FTS_CANDIDATE_CAP, build_fts_match_query
 
 # ---------------------------------------------------------------------------
 # DTO dataclasses
@@ -164,6 +167,10 @@ class WikiPageFile:
     file_id: int
     vault_id: int
     created_at: str
+    # AC40 (#515): display name resolved via a LEFT JOIN onto ``files`` so the
+    # UI can label attachments without a second round-trip. None when the
+    # joined files row is missing (or the row was built without the join).
+    filename: Optional[str] = None
 
 
 @dataclass
@@ -174,6 +181,12 @@ class WikiPageLink:
     vault_id: int
     link_text: Optional[str]
     created_at: str
+    # AC40 (#515): source-page display fields resolved via a LEFT JOIN onto
+    # ``wiki_pages`` so backlink rows carry the linking page's title/slug.
+    # None when the source page was deleted or the row was built without the
+    # join.
+    source_title: Optional[str] = None
+    source_slug: Optional[str] = None
 
 
 @dataclass
@@ -191,6 +204,31 @@ class WikiActivityEntry:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class PageList(list):
+    """``list[WikiPage]`` carrying pagination metadata (AC34 / issue #515).
+
+    Subclasses ``list`` so every existing consumer (iteration, ``len``,
+    indexing, equality) is unchanged; the API route reads ``.total`` /
+    ``.page`` / ``.per_page`` to expose pagination in the response envelope
+    so the UI can offer a Load-more control while a vault grows past one
+    page. ``total`` counts rows matching the SAME filtered WHERE clause (no
+    LIMIT/OFFSET).
+    """
+
+    def __init__(
+        self,
+        pages: Optional[list] = None,
+        *,
+        total: int = 0,
+        page: int = 1,
+        per_page: int = 50,
+    ) -> None:
+        super().__init__(pages or [])
+        self.total = total
+        self.page = page
+        self.per_page = per_page
+
 
 def normalize_slug(text: str) -> str:
     """Lowercase, strip special chars, replace whitespace/underscores with hyphens."""
@@ -366,6 +404,7 @@ def _to_page_file(row: sqlite3.Row) -> WikiPageFile:
         file_id=d["file_id"],
         vault_id=d["vault_id"],
         created_at=d["created_at"],
+        filename=d.get("filename"),
     )
 
 
@@ -378,6 +417,8 @@ def _to_page_link(row: sqlite3.Row) -> WikiPageLink:
         vault_id=d["vault_id"],
         link_text=d.get("link_text"),
         created_at=d["created_at"],
+        source_title=d.get("source_title"),
+        source_slug=d.get("source_slug"),
     )
 
 
@@ -402,9 +443,37 @@ def _to_activity_entry(row: sqlite3.Row) -> WikiActivityEntry:
 class WikiStore:
     """Vault-scoped CRUD and FTS search for all wiki tables."""
 
+    # SEARCH-003 (#515): chunk any SQL ``IN (...)`` list fed to a store search
+    # so it stays under SQLite's default 999 host-variable limit.
+    _SQL_IN_CHUNK = 900
+
     def __init__(self, db: sqlite3.Connection) -> None:
         self._db = db
         self._db.row_factory = sqlite3.Row
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Explicit ``BEGIN IMMEDIATE ... COMMIT/ROLLBACK`` transaction.
+
+        WIKI-010 (#515): multi-statement persistence sequences (claim +
+        sources) must commit atomically instead of relying on whatever
+        write happens to come next (lint findings, a later job) to flush
+        the pending inserts. BEGIN IMMEDIATE takes the write lock up
+        front so the block serialises against concurrent writers.
+
+        Precondition: the connection must not already be inside a
+        transaction (every store write path commits before returning);
+        SQLite would otherwise reject the nested BEGIN. On any exception
+        the block rolls back and re-raises, so partial writes never
+        become visible to other connections.
+        """
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._db.rollback()
+            raise
+        self._db.commit()
 
     # -----------------------------------------------------------------------
     # Pages
@@ -467,37 +536,41 @@ class WikiStore:
         search: Optional[str] = None,
         page: int = 1,
         per_page: int = 50,
-    ) -> list[WikiPage]:
+    ) -> PageList:
+        """List pages for a vault, most recently updated first.
+
+        AC34 (#515): returns a ``PageList`` — a plain list of pages plus
+        ``.total`` counting every row matching the SAME WHERE clause, so the
+        route can expose ``total`` for Load-more pagination.
+        """
         offset = (page - 1) * per_page
+        where = "vault_id = ?"
+        params: list[Any] = [vault_id]
         if search:
             ids = self._fts_page_ids(vault_id, search)
             if not ids:
-                return []
+                return PageList([], total=0, page=page, per_page=per_page)
             placeholders = ",".join("?" * len(ids))
-            sql = f"SELECT * FROM wiki_pages WHERE id IN ({placeholders}) AND vault_id = ?"
-            params: list[Any] = [*ids, vault_id]
-            if page_type:
-                sql += " AND page_type = ?"
-                params.append(page_type)
-            if status:
-                sql += " AND status = ?"
-                params.append(status)
-            sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-            params += [per_page, offset]
-            rows = self._db.execute(sql, params).fetchall()
-        else:
-            params = [vault_id]
-            sql = "SELECT * FROM wiki_pages WHERE vault_id = ?"
-            if page_type:
-                sql += " AND page_type = ?"
-                params.append(page_type)
-            if status:
-                sql += " AND status = ?"
-                params.append(status)
-            sql += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-            params += [per_page, offset]
-            rows = self._db.execute(sql, params).fetchall()
-        return [_to_wiki_page(r) for r in rows]
+            where = f"id IN ({placeholders}) AND vault_id = ?"
+            params = [*ids, vault_id]
+        if page_type:
+            where += " AND page_type = ?"
+            params.append(page_type)
+        if status:
+            where += " AND status = ?"
+            params.append(status)
+        total = self._db.execute(
+            f"SELECT COUNT(*) FROM wiki_pages WHERE {where}",  # nosec B608 — where is built from fixed fragments with bound params
+            params,
+        ).fetchone()[0]
+        rows = self._db.execute(
+            f"SELECT * FROM wiki_pages WHERE {where} "  # nosec B608 — see above
+            f"ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+            [*params, per_page, offset],
+        ).fetchall()
+        return PageList(
+            [_to_wiki_page(r) for r in rows], total=total, page=page, per_page=per_page
+        )
 
     def update_page(
         self,
@@ -508,6 +581,16 @@ class WikiStore:
         commit: bool = True,
         **kwargs: Any,
     ) -> Optional[WikiPage]:
+        """Update page columns; only kwargs present in ``allowed`` are written.
+
+        AC17 (#515) null semantics: an explicitly-passed ``parent_id=None``
+        CLEARS the parent (``SET parent_id = NULL``); an ABSENT ``parent_id``
+        kwarg leaves it untouched. The route layer decides which is which via
+        ``request.model_fields_set`` — the store cannot distinguish them
+        itself because a plain ``None`` value in ``**kwargs`` is a deliberate
+        "clear" instruction, not a "skip". Same for other nullable columns
+        (``summary``); non-nullable columns must never be passed as None.
+        """
         allowed = {"title", "page_type", "markdown", "summary", "status", "confidence", "slug", "last_compiled_at", "parent_id"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
@@ -584,8 +667,25 @@ class WikiStore:
         return deleted
 
     def _fts_page_ids(self, vault_id: int, query: str) -> list[int]:
+        """FTS candidate page ids for ``query`` (bm25-ranked, bounded).
+
+        SEARCH-004 (#515): the raw query is tokenized via the shared
+        ``fts_query.build_fts_match_query`` helper, so an ordinary hyphenated
+        term like ``Model-X`` reaches FTS5 as ``model* x*`` instead of raw
+        column-filter syntax that raises ``OperationalError``. The emitted
+        tokens always match ``\\w+``, so the MATCH input is structurally safe.
+
+        SEARCH-003 (#515): ids are rank-ordered and capped ONLY to bound the
+        SQL ``IN`` list in callers; visible filtering, ordering, and the
+        result cap are decided by the caller's SQL over the returned set.
+        """
+        fts_query = build_fts_match_query(query)
+        if not fts_query:
+            return []
         rows = self._db.execute(
-            "SELECT rowid FROM wiki_pages_fts WHERE wiki_pages_fts MATCH ?", (query,)
+            "SELECT rowid FROM wiki_pages_fts WHERE wiki_pages_fts MATCH ? "
+            "ORDER BY rank LIMIT ?",
+            (fts_query, FTS_CANDIDATE_CAP),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -685,8 +785,14 @@ class WikiStore:
         return [_to_wiki_entity(r) for r in rows]
 
     def _fts_entity_ids(self, vault_id: int, query: str) -> list[int]:
+        """FTS candidate entity ids for ``query`` — see ``_fts_page_ids``."""
+        fts_query = build_fts_match_query(query)
+        if not fts_query:
+            return []
         rows = self._db.execute(
-            "SELECT rowid FROM wiki_entities_fts WHERE wiki_entities_fts MATCH ?", (query,)
+            "SELECT rowid FROM wiki_entities_fts WHERE wiki_entities_fts MATCH ? "
+            "ORDER BY rank LIMIT ?",
+            (fts_query, FTS_CANDIDATE_CAP),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -709,7 +815,16 @@ class WikiStore:
         created_by: Optional[int] = None,
         created_by_kind: Optional[str] = None,
         sources: Optional[list] = None,
+        commit: bool = True,
     ) -> WikiClaim:
+        """Create a claim row (plus optional inline sources).
+
+        ``commit=False`` leaves the write inside the caller's open
+        ``store.transaction()`` block so the claim and its subsequent
+        ``attach_source`` inserts commit atomically (WIKI-010 / issue #515 —
+        the curator's accepted-claim persistence must not expose a committed
+        claim whose source row is still pending).
+        """
         now = datetime.utcnow().isoformat()
         cur = self._db.execute(
             """INSERT INTO wiki_claims
@@ -725,7 +840,8 @@ class WikiStore:
         if sources:
             for src in sources:
                 self._attach_source(claim_id, src)  # type: ignore[arg-type]
-        self._db.commit()
+        if commit:
+            self._db.commit()
         return self.get_claim(claim_id)  # type: ignore[return-value]
 
     def get_claim(self, claim_id: int) -> Optional[WikiClaim]:
@@ -790,6 +906,41 @@ class WikiStore:
         claim = _to_wiki_claim(row)
         claim.sources = self._load_sources(claim.id)
         return claim
+
+    def reactivate_claim(self, claim_id: int) -> bool:
+        """Transition a ``superseded`` claim back to ``active``.
+
+        WIKI-006 (#515): when a recompile re-derives a claim whose text is
+        unchanged from a still-supported source, the claim is proof again
+        and must not stay buried as superseded. The UPDATE's
+        ``status = 'superseded'`` predicate makes the check-and-flip atomic,
+        so a claim that concurrently reached any other state can never be
+        blanket-reactivated. Returns True when the transition committed.
+        """
+        cur = self._db.execute(
+            "UPDATE wiki_claims SET status = 'active', updated_at = ? "
+            "WHERE id = ? AND status = 'superseded'",
+            (datetime.utcnow().isoformat(), claim_id),
+        )
+        if cur.rowcount == 0:
+            # Nothing transitioned (already active / resolved elsewhere, or
+            # the row is gone). Roll back the implicit transaction Python's
+            # sqlite3 opened for the 0-row UPDATE so the connection stays clean.
+            self._db.rollback()
+            return False
+        self._db.commit()
+        return True
+
+    def get_claim_sources(self, claim_id: int) -> list[WikiClaimSource]:
+        """List a claim's source rows by claim id.
+
+        WIKI-008 (#515): claim-reuse paths must reload provenance by the
+        CLAIM ID they already hold. Looking the claim up again by exact
+        input text misses normalized-equivalent matches (punctuation /
+        whitespace variants) and yields an empty source snapshot, which
+        then re-attaches duplicate source rows.
+        """
+        return self._load_sources(claim_id)
 
     def update_claim(self, claim_id: int, vault_id: int, **kwargs: Any) -> Optional[WikiClaim]:
         allowed = {"claim_text", "claim_type", "subject", "predicate", "object", "source_type", "status", "confidence", "page_id"}
@@ -895,8 +1046,14 @@ class WikiStore:
         return grouped
 
     def _fts_claim_ids(self, vault_id: int, query: str) -> list[int]:
+        """FTS candidate claim ids for ``query`` — see ``_fts_page_ids``."""
+        fts_query = build_fts_match_query(query)
+        if not fts_query:
+            return []
         rows = self._db.execute(
-            "SELECT rowid FROM wiki_claims_fts WHERE wiki_claims_fts MATCH ?", (query,)
+            "SELECT rowid FROM wiki_claims_fts WHERE wiki_claims_fts MATCH ? "
+            "ORDER BY rank LIMIT ?",
+            (fts_query, FTS_CANDIDATE_CAP),
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -1051,21 +1208,31 @@ class WikiStore:
             self._db.rollback()
             raise
 
-    def complete_job(self, job_id: int, result_json: Any) -> None:
-        """Mark job completed. No-op if the job was already cancelled."""
-        row = self._db.execute(
-            "SELECT status FROM wiki_compile_jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        if row and dict(row)["status"] == "cancelled":
-            return
+    def complete_job(self, job_id: int, result_json: Any) -> bool:
+        """Mark job completed. Returns True if the transition committed.
+
+        No-op (returns False) if the job was already cancelled: the UPDATE's
+        ``status != 'cancelled'`` predicate is evaluated atomically with the
+        write, so a cancellation landing between this method's call and its
+        write can never be overwritten (WIKI-004 / issue #515 — the previous
+        read-then-write guard raced in exactly that window).
+        """
         now = datetime.utcnow().isoformat()
         if isinstance(result_json, dict):
             result_json = json.dumps(result_json)
-        self._db.execute(
-            "UPDATE wiki_compile_jobs SET status = 'completed', completed_at = ?, result_json = ? WHERE id = ?",
+        cur = self._db.execute(
+            "UPDATE wiki_compile_jobs SET status = 'completed', completed_at = ?, result_json = ? "
+            "WHERE id = ? AND status != 'cancelled'",
             (now, result_json or "{}", job_id),
         )
+        if cur.rowcount == 0:
+            # No transition committed (cancelled, or the row is gone). Roll
+            # back the implicit transaction Python's sqlite3 opened for the
+            # 0-row UPDATE so the connection is left clean.
+            self._db.rollback()
+            return False
         self._db.commit()
+        return True
 
     def fail_job(self, job_id: int, error: str) -> int:
         """Mark job failed, increment retry_count. Returns new retry_count.
@@ -1093,8 +1260,9 @@ class WikiStore:
         processor's backoff window (issue #276 A6-1). The processor only calls
         this immediately after ``fail_job`` set status='failed', so the guard is
         a no-op on the intended path; every sibling state-transition method
-        (complete_job, fail_job, cancel_job, retry_job) guards status the same
-        way.
+        (complete_job, fail_job, cancel_job, retry_job) guards the transition
+        the same atomic way — a conditional UPDATE predicate, not a
+        read-then-write check that can race (issue #515).
         """
         self._db.execute(
             "UPDATE wiki_compile_jobs SET status = 'pending', started_at = NULL, completed_at = NULL "
@@ -1103,33 +1271,50 @@ class WikiStore:
         )
         self._db.commit()
 
-    def cancel_job(self, job_id: int, vault_id: int) -> bool:
-        """Cancel a pending or running job. Returns True if cancelled."""
-        row = self._db.execute(
-            "SELECT status FROM wiki_compile_jobs WHERE id = ? AND vault_id = ?",
-            (job_id, vault_id),
-        ).fetchone()
-        if not row or dict(row)["status"] not in ("pending", "running"):
-            return False
-        self._db.execute(
-            "UPDATE wiki_compile_jobs SET status = 'cancelled', completed_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), job_id),
+    def cancel_job(self, job_id: int, vault_id: int, result_json: Optional[Any] = None) -> bool:
+        """Cancel a pending or running job. Returns True if cancelled.
+
+        The ``status IN ('pending','running')`` predicate makes the
+        check-and-flip atomic, so a job that already reached a terminal state
+        (completed / failed / cancelled) can never be resurrected or
+        double-terminalised by a late cancel (issue #515).
+
+        ``result_json`` (WIKI-001 / issue #515) lets the worker record WHY a
+        job was cancelled — e.g. ``{"cancelled": "wiki_compile_disabled"}``
+        when the feature flags went off between enqueue and dispatch — so the
+        cancellation is auditable from the job row itself.
+        """
+        if isinstance(result_json, dict):
+            result_json = json.dumps(result_json)
+        set_result = ", result_json = ?" if result_json else ""
+        params: list[Any] = [datetime.utcnow().isoformat()]
+        if result_json:
+            params.append(result_json)
+        cur = self._db.execute(
+            f"UPDATE wiki_compile_jobs SET status = 'cancelled', completed_at = ?{set_result} "
+            f"WHERE id = ? AND vault_id = ? AND status IN ('pending', 'running')",  # nosec B608 — fragments are fixed literals
+            [*params, job_id, vault_id],
         )
+        if cur.rowcount == 0:
+            self._db.rollback()
+            return False
         self._db.commit()
         return True
 
     def retry_job(self, job_id: int, vault_id: int) -> Optional[WikiCompileJob]:
-        """Reset a failed job to pending. Returns the updated job or None."""
-        row = self._db.execute(
-            "SELECT status FROM wiki_compile_jobs WHERE id = ? AND vault_id = ?",
+        """Reset a failed job to pending. Returns the updated job or None.
+
+        The ``status = 'failed'`` predicate makes the check-and-flip atomic:
+        a job that was concurrently cancelled or completed cannot be reset.
+        """
+        cur = self._db.execute(
+            "UPDATE wiki_compile_jobs SET status = 'pending', error = NULL, started_at = NULL, completed_at = NULL "
+            "WHERE id = ? AND vault_id = ? AND status = 'failed'",
             (job_id, vault_id),
-        ).fetchone()
-        if not row or dict(row)["status"] != "failed":
-            return None
-        self._db.execute(
-            "UPDATE wiki_compile_jobs SET status = 'pending', error = NULL, started_at = NULL, completed_at = NULL WHERE id = ?",
-            (job_id,),
         )
+        if cur.rowcount == 0:
+            self._db.rollback()
+            return None
         self._db.commit()
         row = self._db.execute(
             "SELECT * FROM wiki_compile_jobs WHERE id = ?", (job_id,)
@@ -1317,18 +1502,23 @@ class WikiStore:
         related_page_ids: Optional[list] = None,
         related_claim_ids: Optional[list] = None,
     ) -> WikiLintFinding:
-        now = datetime.utcnow().isoformat()
-        cur = self._db.execute(
-            """INSERT INTO wiki_lint_findings
-               (vault_id, finding_type, severity, title, details,
-                related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
-            (vault_id, finding_type, severity, title, details,
-             json.dumps(related_page_ids or []), json.dumps(related_claim_ids or []), now, now),
+        """Insert one OPEN lint finding and commit.
+
+        AC35 (#515): callers that re-detect the same issue across runs should
+        prefer ``upsert_lint_findings`` (fingerprint-aware, respects
+        dismissals); this direct insert is for one-off findings (e.g. claim
+        invalidation writing 'stale'/'weak_provenance' rows).
+        """
+        return self._insert_lint_finding_row(
+            vault_id=vault_id,
+            finding_type=finding_type,
+            title=title,
+            severity=severity,
+            details=details,
+            related_page_ids=related_page_ids,
+            related_claim_ids=related_claim_ids,
+            commit=True,
         )
-        self._db.commit()
-        row = self._db.execute("SELECT * FROM wiki_lint_findings WHERE id = ?", (cur.lastrowid,)).fetchone()
-        return _to_lint_finding(row)
 
     def list_lint_findings(
         self,
@@ -1361,8 +1551,163 @@ class WikiStore:
         self._db.commit()
 
     # -----------------------------------------------------------------------
+    # Lint finding identity + upsert (AC35 / issue #515)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def lint_fingerprint(
+        finding_type: str, title: str, related_page_ids: Optional[list] = None
+    ) -> tuple:
+        """Stable identity for a lint finding, derived from existing columns.
+
+        AC35 (#515): ``finding_type`` (the rule) + the sorted related-page-id
+        tuple + the normalized title (the message) identify the SAME logical
+        finding across lint runs, with no schema change. Severity/details may
+        drift without changing identity; whitespace/case differences in the
+        title do not either.
+        """
+        pages = tuple(sorted({int(p) for p in (related_page_ids or []) if p}))
+        normalized_title = re.sub(r"\s+", " ", (title or "").strip().lower())
+        return (finding_type, pages, normalized_title)
+
+    @staticmethod
+    def _row_lint_fingerprint(row: sqlite3.Row) -> tuple:
+        d = _row_to_dict(row)
+        try:
+            page_ids = json.loads(d.get("related_page_ids_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            page_ids = []
+        return WikiStore.lint_fingerprint(
+            d["finding_type"], d.get("title") or "", page_ids
+        )
+
+    def _insert_lint_finding_row(
+        self,
+        vault_id: int,
+        finding_type: str,
+        title: str,
+        severity: str = "medium",
+        details: str = "",
+        related_page_ids: Optional[list] = None,
+        related_claim_ids: Optional[list] = None,
+        commit: bool = True,
+    ) -> WikiLintFinding:
+        """INSERT one open lint finding (shared by create/upsert paths)."""
+        now = datetime.utcnow().isoformat()
+        cur = self._db.execute(
+            """INSERT INTO wiki_lint_findings
+               (vault_id, finding_type, severity, title, details,
+                related_page_ids_json, related_claim_ids_json, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+            (vault_id, finding_type, severity, title, details,
+             json.dumps(related_page_ids or []), json.dumps(related_claim_ids or []), now, now),
+        )
+        if commit:
+            self._db.commit()
+        row = self._db.execute(
+            "SELECT * FROM wiki_lint_findings WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return _to_lint_finding(row)
+
+    def upsert_lint_findings(self, vault_id: int, specs: list) -> list:
+        """Reconcile this run's DETECTED findings against existing rows.
+
+        AC35 (#515): a dismissed/resolved finding must not resurrect as a new
+        open row on the next lint run. Instead of clear-open-then-recreate:
+
+        - a detected fingerprint that matches an existing NON-open row
+          (dismissed / resolved / acknowledged) is SUPPRESSED — no new row;
+        - a detected fingerprint with an existing open row keeps that row
+          (no duplicate insert);
+        - a detected fingerprint with no existing row inserts a fresh open
+          finding;
+        - an open row whose fingerprint was NOT detected this run transitions
+          to 'resolved' (the underlying issue went away).
+
+        Returns the open findings representing this run (kept + newly
+        created); suppressed fingerprints contribute nothing.
+        """
+        detected: dict[tuple, dict] = {}
+        for spec in specs:
+            fp = self.lint_fingerprint(
+                spec.get("finding_type", ""),
+                spec.get("title", ""),
+                spec.get("related_page_ids"),
+            )
+            detected.setdefault(fp, spec)
+
+        rows = self._db.execute(
+            "SELECT * FROM wiki_lint_findings WHERE vault_id = ?", (vault_id,)
+        ).fetchall()
+        existing_by_fp: dict[tuple, list] = {}
+        for row in rows:
+            existing_by_fp.setdefault(self._row_lint_fingerprint(row), []).append(row)
+
+        now = datetime.utcnow().isoformat()
+        result: list = []
+        with self.transaction():
+            for fp, spec in detected.items():
+                matches = existing_by_fp.get(fp)
+                if matches:
+                    open_rows = [r for r in matches if r["status"] == "open"]
+                    if open_rows:
+                        # Still open — keep the existing row as-is.
+                        result.append(_to_lint_finding(open_rows[0]))
+                    # else: only terminal (dismissed/resolved/acknowledged)
+                    # rows share this fingerprint — suppressed on purpose.
+                    continue
+                result.append(
+                    self._insert_lint_finding_row(
+                        vault_id=vault_id,
+                        finding_type=spec.get("finding_type", ""),
+                        title=spec.get("title", ""),
+                        severity=spec.get("severity", "medium"),
+                        details=spec.get("details", ""),
+                        related_page_ids=spec.get("related_page_ids"),
+                        related_claim_ids=spec.get("related_claim_ids"),
+                        commit=False,
+                    )
+                )
+            for row in rows:
+                if row["status"] == "open" and self._row_lint_fingerprint(row) not in detected:
+                    self._db.execute(
+                        "UPDATE wiki_lint_findings SET status = 'resolved', updated_at = ? "
+                        "WHERE id = ? AND vault_id = ?",
+                        (now, row["id"], vault_id),
+                    )
+        return result
+
+    # -----------------------------------------------------------------------
     # Global Search
     # -----------------------------------------------------------------------
+
+    def _filter_ids_in_chunks(
+        self,
+        table: str,
+        ids: list[int],
+        vault_id: int,
+        extra_clauses: str = "",
+        extra_params: Optional[list] = None,
+    ) -> list[int]:
+        """Filter candidate row ids in SQL, chunking the ``IN`` list.
+
+        SEARCH-003 (#515): runs over the FULL FTS candidate set BEFORE any
+        LIMIT so the visible cap applies after filtering. The chunking only
+        keeps the host-parameter count under SQLite's default 999-variable
+        limit; ``table`` / ``extra_clauses`` are internal constants, never
+        user input.
+        """
+        matched: list[int] = []
+        params = extra_params or []
+        for start in range(0, len(ids), self._SQL_IN_CHUNK):
+            chunk = ids[start : start + self._SQL_IN_CHUNK]
+            ph = ",".join("?" * len(chunk))
+            rows = self._db.execute(
+                f"SELECT id FROM {table} WHERE id IN ({ph}) AND vault_id = ?{extra_clauses}",
+                [*chunk, vault_id, *params],
+            ).fetchall()
+            matched.extend(r[0] for r in rows)
+        return matched
 
     def search(
         self,
@@ -1373,46 +1718,67 @@ class WikiStore:
         status: Optional[str] = None,
         sort_by: Optional[str] = None,
     ) -> dict:
+        """Vault-wide search across pages, claims, and entities.
+
+        SEARCH-003 (#515): the FTS id preselection only bounds the candidate
+        pool (bm25-ranked, capped at ``FTS_CANDIDATE_CAP``). Filtering and the
+        requested ordering run in SQL over the full candidate set, and LIMIT
+        is applied last — a matching row inserted late can never be dropped
+        by a pre-cap slice, and the FTS rank order never decides visible
+        order.
+        """
         page_ids = self._fts_page_ids(vault_id, query)
         claim_ids = self._fts_claim_ids(vault_id, query)
         entity_ids = self._fts_entity_ids(vault_id, query)
 
         pages = []
         if page_ids:
-            ph = ",".join("?" * min(len(page_ids), limit))
-            sql = f"SELECT * FROM wiki_pages WHERE id IN ({ph}) AND vault_id = ?"
-            params: list[Any] = [*page_ids[:limit], vault_id]
+            filter_clauses = ""
+            filter_params: list[Any] = []
             if page_type:
-                sql += " AND page_type = ?"
-                params.append(page_type)
+                filter_clauses += " AND page_type = ?"
+                filter_params.append(page_type)
             if status:
-                sql += " AND status = ?"
-                params.append(status)
-            allowed_sorts = {"updated_at", "created_at", "title", "confidence"}
-            order_col = sort_by if sort_by in allowed_sorts else "updated_at"
-            order_dir = "ASC" if order_col == "title" else "DESC"
-            sql += f" ORDER BY {order_col} {order_dir} LIMIT ?"
-            params.append(limit)
-            rows = self._db.execute(sql, params).fetchall()
-            pages = [_to_wiki_page(r) for r in rows]
+                filter_clauses += " AND status = ?"
+                filter_params.append(status)
+            matched = self._filter_ids_in_chunks(
+                "wiki_pages", page_ids, vault_id, filter_clauses, filter_params
+            )
+            if matched:
+                allowed_sorts = {"updated_at", "created_at", "title", "confidence"}
+                order_col = sort_by if sort_by in allowed_sorts else "updated_at"
+                order_dir = "ASC" if order_col == "title" else "DESC"
+                ph = ",".join("?" * len(matched))
+                rows = self._db.execute(
+                    f"SELECT * FROM wiki_pages WHERE id IN ({ph}) "
+                    f"ORDER BY {order_col} {order_dir} LIMIT ?",
+                    [*matched, limit],
+                ).fetchall()
+                pages = [_to_wiki_page(r) for r in rows]
 
         claims = []
         if claim_ids:
-            ph = ",".join("?" * min(len(claim_ids), limit))
-            rows = self._db.execute(
-                f"SELECT * FROM wiki_claims WHERE id IN ({ph}) AND vault_id = ? LIMIT ?",
-                [*claim_ids[:limit], vault_id, limit],
-            ).fetchall()
-            claims = [_to_wiki_claim(r) for r in rows]
+            matched = self._filter_ids_in_chunks("wiki_claims", claim_ids, vault_id)
+            if matched:
+                ph = ",".join("?" * len(matched))
+                rows = self._db.execute(
+                    f"SELECT * FROM wiki_claims WHERE id IN ({ph}) "
+                    "ORDER BY created_at DESC, id DESC LIMIT ?",
+                    [*matched, limit],
+                ).fetchall()
+                claims = [_to_wiki_claim(r) for r in rows]
 
         entities = []
         if entity_ids:
-            ph = ",".join("?" * min(len(entity_ids), limit))
-            rows = self._db.execute(
-                f"SELECT * FROM wiki_entities WHERE id IN ({ph}) AND vault_id = ? LIMIT ?",
-                [*entity_ids[:limit], vault_id, limit],
-            ).fetchall()
-            entities = [_to_wiki_entity(r) for r in rows]
+            matched = self._filter_ids_in_chunks("wiki_entities", entity_ids, vault_id)
+            if matched:
+                ph = ",".join("?" * len(matched))
+                rows = self._db.execute(
+                    f"SELECT * FROM wiki_entities WHERE id IN ({ph}) "
+                    "ORDER BY canonical_name LIMIT ?",
+                    [*matched, limit],
+                ).fetchall()
+                entities = [_to_wiki_entity(r) for r in rows]
 
         return {"pages": pages, "claims": claims, "entities": entities, "query": query}
 
@@ -1451,9 +1817,16 @@ class WikiStore:
         return _to_page_version(vrow)
 
     def list_versions(self, page_id: int, limit: int = 20) -> list[WikiPageVersion]:
-        """List version history for a page, most recent first."""
+        """List version history for a page, most recent first.
+
+        WIKI-003 (#515): versions saved within the same ``created_at`` second
+        tie-break on descending insertion id (autoincrement, so id DESC is the
+        insertion-order tie breaker). Without it, ``limit=1`` returned an
+        arbitrary same-timestamp sibling — usually the OLDEST version.
+        """
         rows = self._db.execute(
-            "SELECT * FROM wiki_page_versions WHERE page_id = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM wiki_page_versions WHERE page_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
             (page_id, limit),
         ).fetchall()
         return [_to_page_version(r) for r in rows]
@@ -1497,12 +1870,40 @@ class WikiStore:
         return cur.rowcount > 0
 
     def list_page_files(self, page_id: int) -> list[WikiPageFile]:
-        """List files attached to a wiki page."""
+        """List files attached to a wiki page.
+
+        AC40 (#515): LEFT JOINs ``files`` so each row carries the attachment's
+        ``filename`` for display; legacy keys (id/page_id/file_id/vault_id/
+        created_at) are unchanged.
+        """
         rows = self._db.execute(
-            "SELECT * FROM wiki_page_files WHERE page_id = ? ORDER BY created_at",
+            """SELECT pf.*, f.file_name AS filename
+               FROM wiki_page_files pf
+               LEFT JOIN files f ON f.id = pf.file_id
+               WHERE pf.page_id = ?
+               ORDER BY pf.created_at""",
             (page_id,),
         ).fetchall()
         return [_to_page_file(r) for r in rows]
+
+    def get_page_by_file(self, vault_id: int, file_id: int) -> Optional[WikiPage]:
+        """Return the page a file is associated with in ``wiki_page_files``.
+
+        WIKI-009 (#515): document-page identity on recompile must be
+        resolved through the page-file association (stable per file), not
+        through a slug derived only from the file_name — two different
+        files sharing a name would otherwise collide onto one page. If a
+        file is (exceptionally) associated with several pages, the oldest
+        association wins for determinism.
+        """
+        row = self._db.execute(
+            "SELECT page_id FROM wiki_page_files WHERE vault_id = ? AND file_id = ? "
+            "ORDER BY id LIMIT 1",
+            (vault_id, file_id),
+        ).fetchone()
+        if not row:
+            return None
+        return self.get_page(row[0], load_relations=False)
 
     # -----------------------------------------------------------------------
     # Wiki Links (DD-C030)
@@ -1574,10 +1975,18 @@ class WikiStore:
         return [_to_page_link(r) for r in rows]
 
     def list_backlinks(self, page_id: int, vault_id: int) -> list[WikiPageLink]:
-        """List pages that link TO this page (scoped to the page's vault)."""
+        """List pages that link TO this page (scoped to the page's vault).
+
+        AC40 (#515): LEFT JOINs ``wiki_pages`` on the SOURCE page so each row
+        carries the linking page's ``source_title`` / ``source_slug`` for
+        display; legacy keys are unchanged.
+        """
         rows = self._db.execute(
-            "SELECT * FROM wiki_page_links WHERE target_page_id = ? AND vault_id = ? "
-            "ORDER BY created_at DESC",
+            """SELECT pl.*, wp.title AS source_title, wp.slug AS source_slug
+               FROM wiki_page_links pl
+               LEFT JOIN wiki_pages wp ON wp.id = pl.source_page_id
+               WHERE pl.target_page_id = ? AND pl.vault_id = ?
+               ORDER BY pl.created_at DESC""",
             (page_id, vault_id),
         ).fetchall()
         return [_to_page_link(r) for r in rows]

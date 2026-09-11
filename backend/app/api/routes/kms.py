@@ -18,7 +18,6 @@ from app.api.deps import (
     get_current_active_user,
     get_db,
     get_evaluate_policy,
-    require_model_ready,
 )
 from app.config import settings
 from app.security import csrf_protect
@@ -231,8 +230,14 @@ async def search_kms(
     user: dict = Depends(get_current_active_user),
     evaluate: Callable = Depends(get_evaluate_policy),
     _: None = Depends(require_kms_enabled),
-    _model_ready: None = Depends(require_model_ready),
 ):
+    """Search KMS entries (pure SQLite FTS — no vector-store dependency).
+
+    Issue #515 (C20 / API-004): this route must keep working while the vector
+    store is unready or awaiting an embedding-model reindex, so it does NOT
+    gate on ``require_model_ready``. The ``kms_enabled`` master switch (503)
+    above still applies.
+    """
     await _require_vault_read(evaluate, user, vault_id)
     store = KMSStore(db)
     entries = store.list_entries(vault_id, search=q, page=page, per_page=per_page)

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+from app.services.fts_query import FTS_CANDIDATE_CAP, build_fts_match_query
 from app.services.wiki_store import normalize_slug
 
 # ---------------------------------------------------------------------------
@@ -332,10 +333,22 @@ class KMSStore:
         return self.get_entry(cur.lastrowid)  # type: ignore[return-value]
 
     def _fts_entry_ids(self, query: str) -> list[int]:
+        """FTS candidate entry ids for ``query`` (bm25-ranked, bounded).
+
+        SEARCH-004 (#515): the raw query is tokenized via the shared
+        ``fts_query.build_fts_match_query`` helper first, so an ordinary
+        hyphenated term like ``Model-X`` reaches FTS5 as ``model* x*`` instead
+        of raw column-filter syntax. The OperationalError guard below stays
+        as a last resort for anything the tokenizer cannot make safe.
+        """
+        fts_query = build_fts_match_query(query)
+        if not fts_query:
+            return []
         try:
             rows = self._db.execute(
-                "SELECT rowid FROM kms_entries_fts WHERE kms_entries_fts MATCH ? ORDER BY rank",
-                (query,),
+                "SELECT rowid FROM kms_entries_fts WHERE kms_entries_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (fts_query, FTS_CANDIDATE_CAP),
             ).fetchall()
         except sqlite3.OperationalError:
             # Malformed FTS5 query (unbalanced quotes etc.) — treat as no match.
@@ -415,21 +428,31 @@ class KMSStore:
         ).fetchone()
         return _to_job(row) if row else None
 
-    def complete_job(self, job_id: int, result_json: Any) -> None:
-        """Mark job completed. No-op if the job was already cancelled."""
-        row = self._db.execute(
-            "SELECT status FROM kms_compile_jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        if row and dict(row)["status"] == "cancelled":
-            return
+    def complete_job(self, job_id: int, result_json: Any) -> bool:
+        """Mark job completed. Returns True if the transition committed.
+
+        No-op (returns False) if the job was already cancelled: the UPDATE's
+        ``status != 'cancelled'`` predicate is evaluated atomically with the
+        write, so a cancellation landing between this method's call and its
+        write can never be overwritten (WIKI-004 / issue #515 — mirrors
+        WikiStore.complete_job; the old read-then-write check raced).
+        """
         now = datetime.utcnow().isoformat()
         if isinstance(result_json, dict):
             result_json = json.dumps(result_json)
-        self._db.execute(
-            "UPDATE kms_compile_jobs SET status = 'completed', completed_at = ?, result_json = ? WHERE id = ?",
+        cur = self._db.execute(
+            "UPDATE kms_compile_jobs SET status = 'completed', completed_at = ?, result_json = ? "
+            "WHERE id = ? AND status != 'cancelled'",
             (now, result_json or "{}", job_id),
         )
+        if cur.rowcount == 0:
+            # No transition committed (cancelled, or the row is gone). Roll
+            # back the implicit transaction Python's sqlite3 opened for the
+            # 0-row UPDATE so the connection is left clean.
+            self._db.rollback()
+            return False
         self._db.commit()
+        return True
 
     def fail_job(self, job_id: int, error: str) -> int:
         """Mark job failed, increment retry_count. Returns new retry_count.
@@ -466,32 +489,38 @@ class KMSStore:
         self._db.commit()
 
     def cancel_job(self, job_id: int, vault_id: int) -> bool:
-        """Cancel a pending or running job. Returns True if cancelled."""
-        row = self._db.execute(
-            "SELECT status FROM kms_compile_jobs WHERE id = ? AND vault_id = ?",
-            (job_id, vault_id),
-        ).fetchone()
-        if not row or dict(row)["status"] not in ("pending", "running"):
-            return False
-        self._db.execute(
-            "UPDATE kms_compile_jobs SET status = 'cancelled', completed_at = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), job_id),
+        """Cancel a pending or running job. Returns True if cancelled.
+
+        The ``status IN ('pending','running')`` predicate makes the
+        check-and-flip atomic, so a job that already reached a terminal state
+        (completed / failed / cancelled) can never be resurrected or
+        double-terminalised by a late cancel (issue #515).
+        """
+        cur = self._db.execute(
+            "UPDATE kms_compile_jobs SET status = 'cancelled', completed_at = ? "
+            "WHERE id = ? AND vault_id = ? AND status IN ('pending', 'running')",
+            (datetime.utcnow().isoformat(), job_id, vault_id),
         )
+        if cur.rowcount == 0:
+            self._db.rollback()
+            return False
         self._db.commit()
         return True
 
     def retry_job(self, job_id: int, vault_id: int) -> Optional[KMSCompileJob]:
-        """Reset a failed job to pending. Returns the updated job or None."""
-        row = self._db.execute(
-            "SELECT status FROM kms_compile_jobs WHERE id = ? AND vault_id = ?",
+        """Reset a failed job to pending. Returns the updated job or None.
+
+        The ``status = 'failed'`` predicate makes the check-and-flip atomic:
+        a job that was concurrently cancelled or completed cannot be reset.
+        """
+        cur = self._db.execute(
+            "UPDATE kms_compile_jobs SET status = 'pending', error = NULL, started_at = NULL, completed_at = NULL "
+            "WHERE id = ? AND vault_id = ? AND status = 'failed'",
             (job_id, vault_id),
-        ).fetchone()
-        if not row or dict(row)["status"] != "failed":
-            return None
-        self._db.execute(
-            "UPDATE kms_compile_jobs SET status = 'pending', error = NULL, started_at = NULL, completed_at = NULL WHERE id = ?",
-            (job_id,),
         )
+        if cur.rowcount == 0:
+            self._db.rollback()
+            return None
         self._db.commit()
         row = self._db.execute(
             "SELECT * FROM kms_compile_jobs WHERE id = ?", (job_id,)

@@ -2,11 +2,12 @@ import {
   ChevronLeft,
   ChevronRight,
   Library,
+  Search,
 } from "lucide-react";
 import { useThemeStore, type Theme } from "@/stores/useThemeStore";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { cn } from "@/lib/utils";
-import { NavLink, useLocation } from "react-router-dom";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { NavItemId, NavigationProps } from "./navigationTypes";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -71,6 +72,31 @@ const themeOptions: { value: Theme; label: string }[] = [
   { value: "high-contrast", label: "High contrast" },
 ];
 
+// Unified discovery search (issue #515 / PRODUCT-ENH-11). The entity-type ids
+// mirror the backend GET /search/unified `types` contract (document, wiki,
+// kms, chat); kept local so the shell renders without importing the API layer.
+// Accessible names are prefixed with "Search " so they never collide with the
+// identically-named navigation items in getByLabelText-style queries.
+type GlobalSearchTypeId = "document" | "wiki" | "kms" | "chat";
+
+const GLOBAL_SEARCH_TYPE_OPTIONS: Array<{
+  id: GlobalSearchTypeId;
+  short: string;
+  a11y: string;
+}> = [
+  { id: "document", short: "Docs", a11y: "Search documents" },
+  { id: "wiki", short: "Wiki", a11y: "Search wiki" },
+  { id: "kms", short: "KMS", a11y: "Search KMS" },
+  { id: "chat", short: "Chat", a11y: "Search chat" },
+];
+
+const DEFAULT_GLOBAL_SEARCH_TYPES: Record<GlobalSearchTypeId, boolean> = {
+  document: true,
+  wiki: true,
+  kms: true,
+  chat: true,
+};
+
 // Hugeicons icons are IconSvgElement arrays; everything else (lucide icons,
 // etc.) is a React component. lucide icons are forwardRef OBJECTS, not
 // functions, so a `typeof === "function"` check would misroute them into
@@ -116,11 +142,34 @@ const SIDEBAR_EXPANDED_KEY = "sidebar-expanded";
 export function NavigationRail({ healthStatus }: NavigationRailProps) {
   const location = useLocation();
   const pathname = location.pathname;
+  const navigate = useNavigate();
   const { theme, setTheme } = useThemeStore();
   const userRole = useAuthStore((state) => state.user?.role);
   const logout = useAuthStore((state) => state.logout);
   const isAdmin = userRole === "admin" || userRole === "superadmin";
   const draftRoomVisible = useDraftRoomVisible();
+
+  // Global search state (issue #515 / PRODUCT-ENH-11) — submitting routes to
+  // the /search results page, which owns the unified API call.
+  const [globalQuery, setGlobalQuery] = useState("");
+  const [globalSearchTypes, setGlobalSearchTypes] = useState<Record<GlobalSearchTypeId, boolean>>(
+    () => ({ ...DEFAULT_GLOBAL_SEARCH_TYPES })
+  );
+
+  const submitGlobalSearch = () => {
+    const query = globalQuery.trim();
+    if (!query) return;
+    const activeTypes = GLOBAL_SEARCH_TYPE_OPTIONS.filter(
+      (option) => globalSearchTypes[option.id]
+    ).map((option) => option.id);
+    const search = new URLSearchParams({ q: query });
+    // Omit `types` when every entity kind is selected — the backend default
+    // for an absent parameter is "search everything".
+    if (activeTypes.length > 0 && activeTypes.length < GLOBAL_SEARCH_TYPE_OPTIONS.length) {
+      search.set("types", activeTypes.join(","));
+    }
+    navigate({ pathname: "/search", search: search.toString() });
+  };
 
   const [isExpanded, setIsExpanded] = useState(() => {
     const saved = localStorage.getItem(SIDEBAR_EXPANDED_KEY);
@@ -204,6 +253,64 @@ export function NavigationRail({ healthStatus }: NavigationRailProps) {
       {/* Scrollable nav content */}
       <ScrollArea className="flex-1 min-h-0 justify-between">
         <div className={cn("pb-2 px-2 overflow-hidden transition-all duration-300 ease-in-out", isExpanded ? "w-full" : "w-14")}>
+          {/* Unified discovery search (issue #515 / PRODUCT-ENH-11) */}
+          {isExpanded ? (
+            <div className="flex flex-col gap-1.5 pt-2 pb-1">
+              <input
+                type="search"
+                value={globalQuery}
+                onChange={(e) => setGlobalQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    submitGlobalSearch();
+                  }
+                }}
+                placeholder="Search across everything…"
+                aria-label="Search across everything"
+                className="flex h-8 w-full min-w-0 rounded-sm border border-border bg-background px-2.5 text-xs text-foreground transition-colors placeholder:text-muted-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+                {GLOBAL_SEARCH_TYPE_OPTIONS.map((option) => (
+                  <div
+                    key={option.id}
+                    className="flex items-center gap-1.5 rounded-sm px-1 py-0.5 min-w-0"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={globalSearchTypes[option.id]}
+                      onChange={(e) =>
+                        setGlobalSearchTypes((prev) => ({
+                          ...prev,
+                          [option.id]: e.target.checked,
+                        }))
+                      }
+                      aria-label={option.a11y}
+                      className="size-3.5 shrink-0 accent-primary"
+                    />
+                    <span
+                      className="text-[11px] text-muted-foreground truncate select-none"
+                      aria-hidden="true"
+                    >
+                      {option.short}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="pt-2 pb-1 flex justify-center">
+              <NavLink
+                to="/search"
+                aria-label="Search across everything"
+                title="Search across everything"
+                className="flex items-center justify-center rounded-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors w-8 min-h-[32px] focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <Search className="w-4 h-4 shrink-0" aria-hidden="true" />
+              </NavLink>
+            </div>
+          )}
+
           {/* Workspace Section */}
           <SectionHeader label={sectionLabels.workspace} isExpanded={isExpanded} />
           <div className="flex flex-col gap-2 pt-2">

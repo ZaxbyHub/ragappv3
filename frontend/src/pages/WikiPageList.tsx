@@ -37,9 +37,15 @@ interface WikiPageListProps {
   vaultId?: number | null;
   /** Called after a bulk action so the parent can refetch the current view. */
   onRefresh?: () => void;
+  /** AC34 (#515): true while more pages remain (pages.length < total). */
+  hasMore?: boolean;
+  /** True while a Load-more request is in flight. */
+  loadingMore?: boolean;
+  /** Fetches the next page with the current filters and appends results. */
+  onLoadMore?: () => void;
 }
 
-export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh }: WikiPageListProps) {
+export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh, hasMore, loadingMore, onLoadMore }: WikiPageListProps) {
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [bulkLoading, setBulkLoading] = useState(false);
 
@@ -196,6 +202,21 @@ export function WikiPageList({ pages, loading, onSelect, vaultId, onRefresh }: W
           </CardContent>
         </Card>
       ))}
+
+      {/* AC34 (#515): Load-more pagination — shown while the loaded page count
+          is below the filtered total; the follow-up request keeps the active
+          search/type filters (the parent passes them through). */}
+      {hasMore && onLoadMore && !loading && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="self-center mt-2"
+          onClick={onLoadMore}
+          disabled={loadingMore}
+        >
+          {loadingMore ? "Loading…" : "Load more"}
+        </Button>
+      )}
     </div>
   );
 }

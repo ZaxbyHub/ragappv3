@@ -24,9 +24,17 @@ interface WikiLintPanelProps {
   loading: boolean;
   onRunLint: () => void;
   vaultId: number | null;
+  /**
+   * AC35 (#515): refresh invoked after a resolve/dismiss. Defaults to
+   * onRunLint when omitted. The parent passes a findings-LIST refresh so a
+   * dismissal is never undone by an immediate re-lint recreating the finding
+   * as open; the backend's fingerprint suppression makes the listed state the
+   * authoritative one.
+   */
+  onRefresh?: () => void;
 }
 
-export function WikiLintPanel({ findings, loading, onRunLint, vaultId }: WikiLintPanelProps) {
+export function WikiLintPanel({ findings, loading, onRunLint, onRefresh, vaultId }: WikiLintPanelProps) {
   const [resolving, setResolving] = useState<number | null>(null);
 
   const handleResolve = async (findingId: number, status: "resolved" | "dismissed") => {
@@ -34,7 +42,7 @@ export function WikiLintPanel({ findings, loading, onRunLint, vaultId }: WikiLin
     setResolving(findingId);
     try {
       await resolveWikiLintFinding(findingId, vaultId, status);
-      onRunLint();
+      (onRefresh ?? onRunLint)();
     } finally {
       setResolving(null);
     }

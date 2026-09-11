@@ -24,6 +24,7 @@ import {
   updateKMSEntry,
   type KMSEntry,
 } from "@/lib/api";
+import { MarkdownMessage } from "@/components/chat/MarkdownMessage";
 
 const STATUS_VALUES = ["draft", "published", "archived"] as const;
 
@@ -155,7 +156,17 @@ export default function KMSDetailPage() {
             </Button>
             <div>
               {editing ? (
-                <Input value={title} onChange={(e) => setTitle(e.target.value)} className="text-lg font-semibold" />
+                <>
+                  <label htmlFor="kms-edit-title" className="sr-only">
+                    Title
+                  </label>
+                  <Input
+                    id="kms-edit-title"
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                    className="text-lg font-semibold"
+                  />
+                </>
               ) : (
                 <h1 className="text-lg font-semibold">{entry.title}</h1>
               )}
@@ -178,6 +189,7 @@ export default function KMSDetailPage() {
                 <Button
                   variant="ghost"
                   size="sm"
+                  aria-label="Cancel edit"
                   onClick={() => {
                     setEditing(false);
                     setTitle(entry.title);
@@ -200,6 +212,7 @@ export default function KMSDetailPage() {
                   variant="outline"
                   size="sm"
                   onClick={handleDelete}
+                  aria-label="Delete entry"
                   className="text-destructive hover:text-destructive"
                 >
                   <Trash2 className="w-4 h-4" />
@@ -278,14 +291,25 @@ export default function KMSDetailPage() {
           </CardHeader>
           <CardContent className="px-4 pb-3">
             {editing ? (
-              <Textarea
-                value={body}
-                onChange={(e) => setBody(e.target.value)}
-                rows={16}
-                className="font-mono text-xs"
-              />
+              <div>
+                <Label htmlFor="kms-edit-body" className="sr-only">
+                  Content (markdown)
+                </Label>
+                <Textarea
+                  id="kms-edit-body"
+                  value={body}
+                  onChange={(e) => setBody(e.target.value)}
+                  rows={16}
+                  className="font-mono text-xs"
+                />
+              </div>
             ) : entry.body ? (
-              <pre className="text-xs whitespace-pre-wrap font-sans">{entry.body}</pre>
+              // C42: the entry body is authored markdown — render it through
+              // the app's shared safe markdown pipeline (react-markdown +
+              // rehype-sanitize) instead of dumping the raw source in a <pre>.
+              <div className="text-sm">
+                <MarkdownMessage content={entry.body} />
+              </div>
             ) : (
               <p className="text-xs text-muted-foreground italic">No content.</p>
             )}

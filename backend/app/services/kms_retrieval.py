@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
 from app.config import settings
+from app.services.fts_query import build_fts_match_query
 from app.services.store_utils import DualPoolMixin
 
 logger = logging.getLogger(__name__)
@@ -33,18 +33,31 @@ logger = logging.getLogger(__name__)
 _EXCERPT_CHARS = 600
 # Maximum FTS candidates pulled per query.
 _FTS_LIMIT = 8
+# Token window for FTS5 snippet() excerpts (match-centered evidence, C22).
+_SNIPPET_TOKENS = 24
 
 
 def build_kms_fts_query(raw_search: str) -> str:
     """Sanitize a natural-language query into a safe FTS5 prefix-match string.
 
-    Strips hyphens (FTS5 column-filter syntax) and punctuation, keeps alnum/_
-    tokens, and prefix-matches each token. Returns "" when no usable token
-    remains (caller then skips the search).
+    Delegates to the shared tokenizer (:func:`app.services.fts_query.
+    build_fts_match_query`, issue #515): hyphens and punctuation are stripped,
+    alnum/_ tokens are prefix-matched, and the token count is capped. The
+    shared ``\\w+`` regex is Unicode-aware, so CJK and accented query terms
+    survive (an earlier ASCII-only regex silently discarded them). Returns
+    ``""`` when no usable token remains (caller then skips the search).
     """
-    normalized = (raw_search or "").lower().replace("-", " ")
-    tokens = re.findall(r"[a-z0-9_]+", normalized)
-    return " ".join(f"{token}*" for token in tokens[:8])
+    return build_fts_match_query(raw_search or "")
+
+
+def _strip_marks(snippet: str) -> str:
+    """Remove the ``<mark>``/``</mark>`` highlight tags from an FTS5 snippet.
+
+    KMS evidence excerpts feed the RAG prompt and citation hashing as plain
+    text (unlike the documents search API, whose marked excerpts the frontend
+    renders), so the tags are dropped while the match-centered window stays.
+    """
+    return snippet.replace("<mark>", "").replace("</mark>", "")
 
 
 @dataclass
@@ -122,7 +135,11 @@ class KMSRetrievalService(DualPoolMixin):
             rows = conn.execute(
                 """
                 SELECT e.id, e.slug, e.title, e.summary, e.body, e.tags_json,
-                       e.status, e.source_type, e.file_id
+                       e.status, e.source_type, e.file_id,
+                       snippet(kms_entries_fts, 2, '<mark>', '</mark>', '…',
+                               ?) AS body_snippet,
+                       snippet(kms_entries_fts, 1, '<mark>', '</mark>', '…',
+                               ?) AS summary_snippet
                 FROM kms_entries_fts
                 JOIN kms_entries e ON kms_entries_fts.rowid = e.id
                 WHERE kms_entries_fts MATCH ?
@@ -131,7 +148,13 @@ class KMSRetrievalService(DualPoolMixin):
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (fts_query, vault_id, _FTS_LIMIT),
+                (
+                    _SNIPPET_TOKENS,
+                    _SNIPPET_TOKENS,
+                    fts_query,
+                    vault_id,
+                    _FTS_LIMIT,
+                ),
             ).fetchall()
         except sqlite3.OperationalError as exc:
             logger.debug("KMS FTS search error (query=%r): %s", fts_query, exc)
@@ -148,7 +171,26 @@ class KMSRetrievalService(DualPoolMixin):
                 tags = []
             body = d.get("body") or ""
             summary = d.get("summary") or ""
-            excerpt = summary or body[:_EXCERPT_CHARS]
+            # C22 (SEARCH-001, issue #515): match-centered evidence excerpts.
+            # snippet() windows the column around the FTS match, so a term
+            # beyond the first _EXCERPT_CHARS of the body (or inside a summary
+            # that was shadowed by the old summary-first rule) still shows up.
+            # A snippet only contains '<mark>' when its column matched; the
+            # summary is used only when IT matched, and the legacy
+            # summary-or-body-head fallback survives solely for rows where no
+            # snippet carries a mark. The highlight tags are stripped: unlike
+            # the documents search API (whose <mark> excerpts are rendered by
+            # the frontend), this excerpt becomes the RAG
+            # RetrievedSource.passage — plain text for the prompt and citation
+            # hashing.
+            summary_snippet = d.get("summary_snippet") or ""
+            body_snippet = d.get("body_snippet") or ""
+            if "<mark>" in summary_snippet:
+                excerpt = _strip_marks(summary_snippet)
+            elif "<mark>" in body_snippet:
+                excerpt = _strip_marks(body_snippet)
+            else:
+                excerpt = summary or body[:_EXCERPT_CHARS]
             results.append(
                 KMSEvidence(
                     label_placeholder=f"K{i + 1}",
