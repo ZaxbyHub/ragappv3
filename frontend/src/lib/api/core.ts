@@ -8,6 +8,8 @@ console.info("[KnowledgeVault] API_BASE_URL:", API_BASE_URL);
 const IDEMPOTENT_METHODS = new Set(["get", "head", "options"]);
 const TRANSIENT_STATUS_CODES = new Set([502, 503, 504]);
 const TRANSIENT_RETRY_DELAYS_MS = [300, 900];
+// Error Blobs larger than this are never buffered into a string for JSON decoding (PRR-021).
+export const MAX_ERROR_BLOB_DECODE_BYTES = 64 * 1024;
 
 export function isTransientRetryableRequest(method?: string, status?: number, hasResponse = true): boolean {
   if (!method || !IDEMPOTENT_METHODS.has(method.toLowerCase())) {
@@ -160,20 +162,31 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
     (resp) => resp,
     async (error) => {
       const config = error.config;
-      let detail = error.response?.data?.detail || "";
-      // Blob error bodies (responseType: "blob", e.g. the draft export download)
-      // have no .detail — read the text so CSRF 403 detection still matches.
+      // Blob error bodies (responseType: "blob", e.g. the draft export
+      // download) carry no .detail/.code — axios delivers the raw Blob. Decode
+      // JSON blob bodies regardless of status and replace
+      // error.response.data IN PLACE (mutating the shared axios error object)
+      // so every downstream reader — the CSRF-403 detection here, this
+      // module's message extraction, and Draft Room error parsing via
+      // originalError.response.data — sees the real envelope
+      // {detail, code, context} while the status is preserved. Non-JSON blobs
+      // keep today's fallbacks (issue #516 API-003; the previous 403-only
+      // decode is a subset of this). Blobs above MAX_ERROR_BLOB_DECODE_BYTES
+      // are also left as-is: a huge error body must not be buffered into a
+      // string wholesale, so its readers fall back to statusText / header-
+      // based CSRF detection exactly as they did before the decode existed.
       if (
-        error.response?.status === 403 &&
         typeof Blob !== "undefined" &&
-        error.response.data instanceof Blob
+        error.response?.data instanceof Blob &&
+        error.response.data.size <= MAX_ERROR_BLOB_DECODE_BYTES
       ) {
         try {
-          detail = JSON.parse(await error.response.data.text())?.detail ?? detail;
+          error.response.data = JSON.parse(await error.response.data.text());
         } catch {
-          // non-JSON body — keep detail as-is
+          // non-JSON body — leave the Blob as-is
         }
       }
+      const detail = error.response?.data?.detail || "";
       const isCsrfError = error.response?.status === 403 && (
         error.response?.headers?.["x-csrf-error"] === "true" ||
         (typeof detail === "string" && detail.toLowerCase().includes("csrf"))

@@ -509,6 +509,11 @@ class CompileContext:
     started_at: datetime
     deadline: datetime
     max_model_calls: int
+    #: Model calls the job row had already consumed before this run started
+    #: (issue #516 DRAFT-011). Zero for fresh jobs and child retry rows; the
+    #: run's budget is seeded from it so a recovered job resumes its budget
+    #: instead of being silently granted a fresh one.
+    resumed_model_calls: int
     max_sections: int
     max_correction_loops: int
     transient_retry_limit: int
@@ -912,8 +917,12 @@ class _CompileRun:
         self._pool = pool
         self._deps = deps
         self._ctx = ctx
+        # DRAFT-011: a recovered job row resumes its persisted model-call
+        # consumption rather than starting from zero.
         self._budget = _Budget(
-            deadline=ctx.deadline, max_model_calls=ctx.max_model_calls
+            deadline=ctx.deadline,
+            max_model_calls=ctx.max_model_calls,
+            model_calls=ctx.resumed_model_calls,
         )
         self._attempts: dict[str, int] = {}
         self._checkpoints: dict[str, "DraftStageRecord"] = {}
@@ -983,6 +992,18 @@ class _CompileRun:
                 retryable=False,
                 message="compile job exceeded its wall-clock budget",
             )
+
+    def _remaining_wall_clock(self) -> float:
+        """Seconds of wall-clock budget left, clamped at zero.
+
+        Issue #516 DRAFT-013: this is the bound handed to ``asyncio.wait_for``
+        around in-flight provider/retrieval awaits. The cooperative deadline
+        gate above only runs between awaits, so without it a never-returning
+        call suspends the coroutine past every later check; with it, the
+        spent-budget timeout settles the job instead. The clamp makes an
+        already-past deadline fire the bound immediately.
+        """
+        return max((self._budget.deadline - self._deps.now()).total_seconds(), 0.0)
 
     def _check_model_call_budget(self) -> None:
         if self._budget.model_calls >= self._budget.max_model_calls:
@@ -1117,18 +1138,16 @@ class _CompileRun:
 
             self._budget.model_calls += 1
             try:
-                raw = await self._deps.complete(
-                    rendered,
-                    logical_mode=prompt.logical_mode,
-                    temperature=prompt.temperature,
-                    sensitive=self._ctx.sensitive,
-                )
+                raw = await self._complete_bounded(prompt, rendered)
             except ProviderPolicyError as exc:
                 # Never auto-retried: policy is a decision, not a fault.
                 raise CompileFailure(
                     exc.code, retryable=False, message="provider policy rejected the call"
                 ) from None
-            except _CompileCancelled:
+            except (_CompileCancelled, CompileFailure):
+                # Escape the generic transient handler: cancellation and the
+                # wall-clock settlement carry their own terminal verdict and
+                # must never be masked as provider_unavailable.
                 raise
             except Exception as exc:
                 if not _is_transient(exc) or attempt >= self._ctx.transient_retry_limit:
@@ -1149,6 +1168,42 @@ class _CompileRun:
             await self._check_cancel()
             await asyncio.to_thread(self._db_bump_model_calls, self._budget.model_calls)
             return raw
+
+    async def _complete_bounded(
+        self, prompt: PromptDefinition, rendered: str
+    ) -> str:
+        """One provider call bounded by the remaining wall-clock budget.
+
+        Issue #516 DRAFT-013: ``asyncio.wait_for`` bounds the in-flight await
+        so a never-returning provider call cannot suspend the coroutine past
+        every cooperative deadline check; provider client timeouts remain
+        additional outer limits.
+
+        A timeout fired while budget still remained is a provider-internal
+        timeout and re-raises, keeping its ordinary transient classification
+        in ``_provider_call``'s retry handler. A timeout at the deadline
+        settles the stable, non-retryable ``job_timeout``. Either way the call
+        was issued, so the budget increment taken before it stands — a
+        timed-out call is charged, never refunded.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._deps.complete(
+                    rendered,
+                    logical_mode=prompt.logical_mode,
+                    temperature=prompt.temperature,
+                    sensitive=self._ctx.sensitive,
+                ),
+                timeout=self._remaining_wall_clock(),
+            )
+        except asyncio.TimeoutError:
+            if self._deps.now() >= self._budget.deadline:
+                raise CompileFailure(
+                    CODE_JOB_TIMEOUT,
+                    retryable=False,
+                    message="compile job exceeded its wall-clock budget",
+                ) from None
+            raise
 
     # -- stage 0: intake ---------------------------------------------------
 
@@ -2064,9 +2119,30 @@ class _CompileRun:
             }
         )
         try:
-            result = await self._deps.retrieve_sources(
-                normalized, ctx.vault_id, limit=ctx.retrieval_limit
+            # DRAFT-013: bound the retrieval await by the remaining wall-clock
+            # budget, mirroring _complete_bounded for the model call.
+            result = await asyncio.wait_for(
+                self._deps.retrieve_sources(
+                    normalized, ctx.vault_id, limit=ctx.retrieval_limit
+                ),
+                timeout=self._remaining_wall_clock(),
             )
+        except asyncio.TimeoutError:
+            if self._deps.now() >= self._budget.deadline:
+                raise CompileFailure(
+                    CODE_JOB_TIMEOUT,
+                    retryable=False,
+                    message="compile job exceeded its wall-clock budget",
+                ) from None
+            # Provider-internal timeout with budget left: classify it here as
+            # an unavailable retrieval instead of re-raising the raw
+            # TimeoutError. A raw exception would skip ``_run_stage``'s failed
+            # stage-row recording and fall through to run_compile's generic
+            # ``internal_error`` settlement, losing the stable
+            # ``retrieval_unavailable`` code (issue #532 review, PRR-001).
+            raise CompileFailure(
+                CODE_RETRIEVAL_UNAVAILABLE, retryable=False
+            ) from None
         except ProviderPolicyError as exc:
             raise CompileFailure(exc.code, retryable=False) from None
         except Exception as exc:
@@ -2592,14 +2668,19 @@ class _CompileRun:
         fact_status: str,
         qa_summary_json: str,
     ) -> int:
-        """Create the immutable revision and land the draft in ``needs_review``.
+        """Create the immutable replacement revision, invisible until
+        publication.
 
-        One ``BEGIN IMMEDIATE`` transaction, mirroring
-        ``DraftStore.create_manual_revision``: clear the old current flag,
-        allocate ``MAX(revision_no)+1``, insert, mark current, point the job at
-        it, and move the draft. The only status string written here is
-        ``needs_review`` — ``ready`` appears nowhere in this module, so no
-        automatic path can set it (SPEC §12.5 rule 8).
+        One ``BEGIN IMMEDIATE`` transaction: gate on the draft's status,
+        capture the current revision as the new row's ``parent_revision_id``,
+        allocate ``MAX(revision_no)+1``, and insert the candidate with
+        ``is_current = 0``. Issue #516 DRAFT-014: the previous current
+        revision is deliberately NOT demoted here — demotion and promotion
+        happen together in ``_db_publish_revision``'s single
+        ``BEGIN IMMEDIATE``, so a failure between this commit and publication
+        (a ledger write, a crash) leaves the previous current revision
+        current instead of the draft with none. ``ready`` appears nowhere in
+        this module, so no automatic path can set it (SPEC §12.5 rule 8).
         """
         ctx = self._ctx
         with self._pool.connection() as conn:
@@ -2623,11 +2704,6 @@ class _CompileRun:
                     (ctx.draft_id,),
                 ).fetchone()
                 current_id = None if current is None else int(current[0])
-                if current_id is not None:
-                    conn.execute(
-                        "UPDATE draft_revisions SET is_current = 0 WHERE id = ?",
-                        (current_id,),
-                    )
                 next_no = int(
                     conn.execute(
                         "SELECT COALESCE(MAX(revision_no), 0) + 1 FROM "
@@ -2946,6 +3022,22 @@ def _parent_inheritance_allowed(
     return bool(parent_fp) and parent_fp == compile_fingerprint(payload, parent_start)
 
 
+def _parse_db_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse a SQLite ``CURRENT_TIMESTAMP`` value (UTC, second precision).
+
+    Returns None for absent or unrecognized values so callers can fall back
+    to a fresh-budget derivation instead of failing a resumable job.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
 def _build_context(
     conn: sqlite3.Connection, job: "DraftJobRecord", now: datetime
 ) -> CompileContext:
@@ -3012,6 +3104,20 @@ def _build_context(
     )
     fingerprint = compile_fingerprint(payload, job.start_stage)
     timeout = job.timeout_seconds or settings.draft_job_timeout_seconds
+    # Issue #516 DRAFT-011: a same-job recovery must resume its budgets, not
+    # re-grant them. Every consumed model call is persisted on the job row
+    # (``_db_bump_model_calls``), so surface it for the run's counter, and
+    # when the row also carries a prior ``started_at`` alongside nonzero
+    # consumption, derive the wall-clock deadline from that original start —
+    # an already-spent budget then settles timeout on the first check. Fresh
+    # jobs and child retry rows (new rows, ``model_call_count == 0``) keep
+    # today's full ``now + timeout`` budget.
+    resumed_model_calls = max(int(job.model_call_count or 0), 0)
+    started_at = _parse_db_timestamp(job.started_at)
+    if started_at is not None and resumed_model_calls > 0:
+        deadline = started_at + timedelta(seconds=timeout)
+    else:
+        deadline = now + timedelta(seconds=timeout)
     resume_allowed = bool(
         job.compile_input_sha256 == fingerprint
         and job.prompt_bundle_version == PROMPT_BUNDLE_VERSION
@@ -3034,12 +3140,13 @@ def _build_context(
         parent_job_id=job.parent_job_id,
         inherit_allowed=inherit_allowed,
         started_at=now,
-        deadline=now + timedelta(seconds=timeout),
+        deadline=deadline,
         max_model_calls=(
             job.max_model_calls
             if job.max_model_calls > 0
             else settings.draft_job_max_model_calls
         ),
+        resumed_model_calls=resumed_model_calls,
         max_sections=settings.draft_max_sections,
         max_correction_loops=settings.draft_qa_retry_limit,
         transient_retry_limit=settings.draft_transient_retry_limit,

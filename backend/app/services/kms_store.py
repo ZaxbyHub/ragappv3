@@ -319,6 +319,13 @@ class KMSStore:
                    WHERE id = ?""",
                 (title, body, summary, now, now, existing.id),
             )
+            # SPEC section 12.6 (issue #516 DRAFT-025): a recompiled entry body
+            # invalidates Draft Room evidence rows carrying this kms_entry_id.
+            # Best effort, cannot raise; an unchanged body is a no-op via the
+            # hook's own hash guard (mirrors update_entry).
+            from app.services.draft_evidence_freshness import on_kms_entry_changed
+
+            on_kms_entry_changed(self._db, entry_id=existing.id, new_body=body)
             self._db.commit()
             return self.get_entry(existing.id)  # type: ignore[return-value]
         slug = self._unique_slug(vault_id, title)

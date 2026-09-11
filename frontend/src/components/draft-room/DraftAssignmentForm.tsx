@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listAccessibleVaults } from "@/lib/api";
@@ -62,6 +62,19 @@ function linesToList(text: string): string[] {
 
 function countNonBlankLines(text: string): number {
   return text.split("\n").filter((line) => line.trim().length > 0).length;
+}
+
+/**
+ * Canonical equality basis for the multiline list buffers (issue #516 UI-022):
+ * string-joined trimmed non-blank lines — the exact shape `linesToList`
+ * emits, so a server list and a freshly emitted list compare equal iff their
+ * visible content matches, regardless of blank-line padding in the textarea.
+ */
+function listSignature(items: string[]): string {
+  return items
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+    .join("\n");
 }
 
 export interface DraftAssignmentFormValue {
@@ -261,7 +274,37 @@ export function DraftAssignmentForm(props: DraftAssignmentFormProps): JSX.Elemen
   const [mustIncludeText, setMustIncludeText] = useState(() => value.brief.must_include.join("\n"));
   const [mustAvoidText, setMustAvoidText] = useState(() => value.brief.must_avoid.join("\n"));
 
+  // The exact arrays this form last emitted for the two list fields, recorded
+  // SYNCHRONOUSLY inside updateBrief at emit time (issue #516 UI-022). The
+  // resync effect below compares incoming server arrays against it: equal
+  // means the parent round-tripped this form's own emit (keep the textarea
+  // text, preserving intentional blank-line edits); different means a
+  // server-driven brief change (resync both textareas from the incoming
+  // lists and adopt them as the new baseline).
+  const lastEmittedListsRef = useRef<{ mustInclude: string[] | null; mustAvoid: string[] | null }>({
+    mustInclude: null,
+    mustAvoid: null,
+  });
+
+  useEffect(() => {
+    const lastEmitted = lastEmittedListsRef.current;
+    const isOwnEmitRoundTrip =
+      lastEmitted.mustInclude != null &&
+      listSignature(lastEmitted.mustInclude) === listSignature(value.brief.must_include) &&
+      lastEmitted.mustAvoid != null &&
+      listSignature(lastEmitted.mustAvoid) === listSignature(value.brief.must_avoid);
+    if (isOwnEmitRoundTrip) return;
+    setMustIncludeText(value.brief.must_include.join("\n"));
+    setMustAvoidText(value.brief.must_avoid.join("\n"));
+    lastEmitted.mustInclude = value.brief.must_include;
+    lastEmitted.mustAvoid = value.brief.must_avoid;
+  }, [value.brief.must_include, value.brief.must_avoid]);
+
   function updateBrief(partial: Partial<DraftBrief>): void {
+    // Record the exact emitted arrays before they leave the form so the resync
+    // effect above can recognize their round-trip.
+    if (partial.must_include) lastEmittedListsRef.current.mustInclude = partial.must_include;
+    if (partial.must_avoid) lastEmittedListsRef.current.mustAvoid = partial.must_avoid;
     onChange({ ...value, brief: { ...value.brief, ...partial } });
   }
 

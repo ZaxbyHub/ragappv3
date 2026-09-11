@@ -550,13 +550,16 @@ def _discard_safe(path: Optional[Path]) -> bool:
 async def _compensate(
     db_pool: SQLiteConnectionPool,
     *,
+    background_processor: BackgroundProcessor,
     promotion_id: Optional[int],
     file_id: Optional[int],
     dest_path: Optional[Path],
+    enqueued_file_id: Optional[int],
 ) -> bool:
-    """Undo everything a failed promotion attempt created: the provenance
-    row (if inserted), the ``files`` row (only ever one this attempt itself
-    inserted), and the copied bytes.
+    """Undo everything a failed promotion attempt created: any ingestion job
+    handed to the background processor, the provenance row (if inserted), the
+    ``files`` row (only ever one this attempt itself inserted), and the copied
+    bytes.
 
     Never raises. Each step is independently guarded so a failure in one
     does not stop the others from running, and nothing here can replace or
@@ -567,6 +570,25 @@ async def _compensate(
     succeeded; ``False`` means an orphan may genuinely still exist somewhere.
     """
     cleanup_ok = True
+    if enqueued_file_id is not None:
+        # DRAFT-023 (issue #516): the enqueue try-step may have durably
+        # queued an ingestion job before the failure landed (e.g. a
+        # cancellation delivered inside ``enqueue`` itself). Cancel any
+        # queued-not-yet-started job for that file FIRST, before the rows and
+        # bytes it references are deleted, so a worker cannot pick it up
+        # mid-compensation. Best-effort: ``cancel_pending_jobs`` never raises
+        # (and a processor lacking the API — older test doubles — only costs
+        # this step's success flag, never the compensation itself).
+        try:
+            background_processor.cancel_pending_jobs(file_id=enqueued_file_id)
+        except Exception:
+            cleanup_ok = False
+            logger.warning(
+                "draft_room_promote: compensation step cancel_pending_jobs "
+                "raised unexpectedly for file_id=%s — an orphaned ingestion "
+                "job may now exist",
+                enqueued_file_id,
+            )
     if promotion_id is not None:
         try:
             if not await asyncio.to_thread(_delete_promotion_row, db_pool, promotion_id):
@@ -605,9 +627,11 @@ async def _compensate(
 async def _compensate_shielded(
     db_pool: SQLiteConnectionPool,
     *,
+    background_processor: BackgroundProcessor,
     promotion_id: Optional[int],
     file_id: Optional[int],
     dest_path: Optional[Path],
+    enqueued_file_id: Optional[int],
 ) -> bool:
     """Run :func:`_compensate` shielded from the enclosing cancel scope, with
     a bounded timeout, so a cancelled request cannot skip compensation
@@ -625,7 +649,12 @@ async def _compensate_shielded(
     """
     with anyio.move_on_after(_COMPENSATION_TIMEOUT_SECONDS, shield=True):
         return await _compensate(
-            db_pool, promotion_id=promotion_id, file_id=file_id, dest_path=dest_path
+            db_pool,
+            background_processor=background_processor,
+            promotion_id=promotion_id,
+            file_id=file_id,
+            dest_path=dest_path,
+            enqueued_file_id=enqueued_file_id,
         )
     logger.warning(
         "draft_room_promote: compensation timed out after %ss "
@@ -711,6 +740,11 @@ async def _promote(
     dest_path: Optional[Path] = None
     file_id: Optional[int] = None
     promotion_id: Optional[int] = None
+    # DRAFT-023 (issue #516): set immediately BEFORE the enqueue await below,
+    # so a cancellation delivered inside ``enqueue`` itself still unwinds with
+    # the marker set — compensation then knows an ingestion job may have been
+    # durably queued even though the call never returned.
+    enqueued_file_id: Optional[int] = None
     try:
         dest_path = await _reserve_destination_path_shielded(upload_dir, file_name)
         await asyncio.to_thread(write_bytes, dest_path)
@@ -736,6 +770,7 @@ async def _promote(
             phase=PHASE_QUEUED,
             message="Queued for processing",
         )
+        enqueued_file_id = file_id
         await background_processor.enqueue(
             file_path=str(dest_path),
             source=PROMOTE_SOURCE,
@@ -749,7 +784,12 @@ async def _promote(
         is_control_flow = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit))
 
         cleanup_ok = await _compensate_shielded(
-            db_pool, promotion_id=promotion_id, file_id=file_id, dest_path=dest_path
+            db_pool,
+            background_processor=background_processor,
+            promotion_id=promotion_id,
+            file_id=file_id,
+            dest_path=dest_path,
+            enqueued_file_id=enqueued_file_id,
         )
 
         if is_control_flow:

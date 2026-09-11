@@ -1149,12 +1149,22 @@ def _sync_active_compile_job(
 # that does not require materializing the rows.
 
 
-def _sync_open_blocker_count(conn: sqlite3.Connection, draft_id: int) -> int:
+def _sync_open_blocker_count(
+    conn: sqlite3.Connection, draft_id: int, *, current_revision_id: Optional[int]
+) -> int:
+    """Open blockers applicable to the draft's CURRENT revision (issue #516 /
+    DRAFT-020). Blockers are revision-scoped: a historical (superseded-
+    revision) open blocker must neither gate Ready nor inflate this count —
+    only findings raised against the current revision block it. A draft with
+    no current revision has no applicable blockers by definition."""
+    if current_revision_id is None:
+        return 0
     return int(
         conn.execute(
             "SELECT COUNT(*) FROM draft_findings "
-            "WHERE draft_id = ? AND severity = 'blocker' AND status = 'open'",
-            (draft_id,),
+            "WHERE draft_id = ? AND revision_id = ? "
+            "AND severity = 'blocker' AND status = 'open'",
+            (draft_id, current_revision_id),
         ).fetchone()[0]
     )
 
@@ -1178,14 +1188,22 @@ def _sync_count_evidence(conn: sqlite3.Connection, *, job_id: int) -> int:
 def _sync_ledger_counts(
     conn: sqlite3.Connection, *, draft_id: int, current_revision_id: Optional[int]
 ) -> dict[str, Any]:
-    """Evidence/claim/finding roll-ups for ``GET /drafts/{id}`` detail."""
+    """Evidence/claim/finding roll-ups for ``GET /drafts/{id}`` detail.
+
+    Open findings are counted revision-scoped (issue #516 / DRAFT-020):
+    ``finding_counts_by_severity`` reflects only findings applicable to the
+    draft's CURRENT revision — historical open findings stay visible through
+    the findings list endpoints but no longer inflate the detail roll-up. A
+    draft with no current revision has no applicable findings."""
     finding_counts: dict[str, int] = {}
-    for row in conn.execute(
-        "SELECT severity, COUNT(*) FROM draft_findings "
-        "WHERE draft_id = ? AND status = 'open' GROUP BY severity",
-        (draft_id,),
-    ).fetchall():
-        finding_counts[str(row[0])] = int(row[1])
+    if current_revision_id is not None:
+        for row in conn.execute(
+            "SELECT severity, COUNT(*) FROM draft_findings "
+            "WHERE draft_id = ? AND revision_id = ? AND status = 'open' "
+            "GROUP BY severity",
+            (draft_id, current_revision_id),
+        ).fetchall():
+            finding_counts[str(row[0])] = int(row[1])
 
     claim_counts: dict[str, int] = {}
     evidence_count = 0
@@ -1236,7 +1254,9 @@ def _sync_summary_extras(
         "current_revision_id": current.id if current else None,
         "active_job_id": active_job.id if active_job else None,
         "input_count": len(inputs),
-        "open_blocker_count": _sync_open_blocker_count(conn, draft.id),
+        "open_blocker_count": _sync_open_blocker_count(
+            conn, draft.id, current_revision_id=current.id if current else None
+        ),
     }
 
 
@@ -1263,7 +1283,9 @@ def _sync_detail_extras(
         "active_job": active_job,
         "active_compile_job": active_compile,
         "revision_count": store.count_revisions(draft.id),
-        "open_blocker_count": _sync_open_blocker_count(conn, draft.id),
+        "open_blocker_count": _sync_open_blocker_count(
+            conn, draft.id, current_revision_id=current.id if current else None
+        ),
         "ledger": _sync_ledger_counts(
             conn,
             draft_id=draft.id,
@@ -2202,11 +2224,16 @@ def _sync_mark_ready(
                 "fact_candidate_mismatch",
             )
 
-        # Rules 3-5: open blockers block. Advisory info/warning findings never do.
+        # Rules 3-5: open blockers block. Advisory info/warning findings never
+        # do. Blockers are revision-scoped (issue #516 / DRAFT-020): only
+        # open blockers raised against THIS revision gate its Ready — a
+        # historical blocker on a superseded revision stays open in history
+        # but must not wedge the corrected current revision.
         open_blockers = conn.execute(
             "SELECT id, waivable FROM draft_findings WHERE draft_id = ? "
+            "AND revision_id = ? "
             "AND severity = 'blocker' AND status = 'open'",
-            (draft_id,),
+            (draft_id, revision_id),
         ).fetchall()
         if open_blockers:
             non_waivable = [int(r[0]) for r in open_blockers if not int(r[1])]
@@ -2750,6 +2777,41 @@ async def upload_draft_input(
         )
         raise DraftRoomHTTPError(500, "failed to store uploaded file", "internal_error") from exc
 
+    async def _compensate_enqueue_phase() -> None:
+        """DRAFT-024 (issue #516): never-raises rollback for an infrastructure
+        failure in the enqueue phase. ``_run_store`` translates only
+        ``DraftStoreError``; a raw ``sqlite3``/``OSError`` propagates
+        untranslated, and an untranslated error must strand neither the
+        finalized bytes nor the reserved input row (a stranded row 409s every
+        retry on ``UNIQUE(draft_id, content_sha256)`` until restart recovery).
+        Each step is guarded and logged individually so a failure in one
+        cannot skip the other — and cannot mask the original error the caller
+        re-raises."""
+        try:
+            await asyncio.to_thread(
+                lambda: storage.resolve(
+                    input_record.storage_relpath
+                ).unlink(missing_ok=True)
+            )
+        except Exception:
+            logger.error(
+                "draft_room: enqueue-phase rollback unlink failed draft_id=%s "
+                "input_id=%s",
+                draft_id,
+                input_record.id,
+            )
+        try:
+            await _delete_input_row_best_effort(
+                store, draft_id=draft_id, owner_id=owner_id, input_id=input_record.id
+            )
+        except Exception:
+            logger.error(
+                "draft_room: enqueue-phase rollback input-row delete failed "
+                "draft_id=%s input_id=%s",
+                draft_id,
+                input_record.id,
+            )
+
     try:
         job = await _run_store(
             lambda: store.enqueue_parse_job(
@@ -2766,6 +2828,15 @@ async def upload_draft_input(
         await _delete_input_row_best_effort(
             store, draft_id=draft_id, owner_id=owner_id, input_id=input_record.id
         )
+        raise
+    except Exception:
+        # Same compensation as the translated-domain-error branch above, but
+        # guarded: an infrastructure error (raw sqlite3.OperationalError,
+        # OSError, ...) must roll the upload back just like a domain conflict,
+        # and a fault inside the compensation itself must never replace the
+        # original error. The original exception is re-raised untranslated —
+        # the generic 500 handler renders it.
+        await _compensate_enqueue_phase()
         raise
 
     return DraftInputUploadResponse(

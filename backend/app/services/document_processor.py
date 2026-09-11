@@ -2090,6 +2090,17 @@ class DocumentProcessor:
                         file_id,
                     ),
                 )
+                # Draft Room evidence freshness (SPEC section 12.6, issue #516
+                # DRAFT-001): an overwrite changes the file's content hash, so
+                # evidence snapshotted against the old content must be
+                # invalidated before this transaction commits. Best effort: the
+                # hook cannot raise into the ingest path, and its hash guard
+                # makes a same-content overwrite a no-op.
+                from app.services.draft_evidence_freshness import on_document_changed
+
+                on_document_changed(
+                    conn, file_id=file_id, new_content_sha256=file_hash
+                )
             else:
                 # Insert new record
                 cursor = conn.execute(

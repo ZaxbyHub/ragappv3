@@ -281,7 +281,12 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     return jobs.reduce((latest, job) => (job.created_at > latest.created_at ? job : latest));
   }, [jobsQuery.data]);
 
-  const relevantJobId = activeJob?.id ?? detail.current_revision_summary?.job_id ?? latestCompileJob?.id ?? null;
+  // Execution inspection binds to the active or latest compile job — the run
+  // whose stages the user needs to inspect (a newer failed run must win over
+  // the older job that produced the current revision). The current revision
+  // remains the editor/claim context; its job_id is only the last-resort
+  // fallback (issue #516 UI-021).
+  const relevantJobId = activeJob?.id ?? latestCompileJob?.id ?? detail.current_revision_summary?.job_id ?? null;
   const relevantJobStatus = activeJob?.status ?? latestCompileJob?.status ?? null;
   const relevantJobActiveStage = activeJob?.active_stage ?? null;
 
@@ -525,17 +530,29 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const [saveConflict, setSaveConflict] = useState(false);
   const saveHeadingRef = useRef<HTMLHeadingElement>(null);
   const saveRevisionMutation = useMutation({
-    mutationFn: () =>
+    // The submitted content is captured as the mutation variables at mutate()
+    // time — never re-read from the live editor inside the callbacks — so the
+    // request carries exactly what the user saved (issue #516 UI-019).
+    mutationFn: (contentMd: string) =>
       createDraftRevision(draftId, {
         base_revision_id: currentRevisionId,
         lock_version: draft.lock_version,
-        content_md: editorValue,
+        content_md: contentMd,
       }),
-    onSuccess: (revisionDetail) => {
+    onSuccess: (revisionDetail, submittedContentMd) => {
       toast.success("New revision saved.");
       setSaveConfirmOpen(false);
       setSaveConflict(false);
-      clearDraftTextStore(draftId);
+      // The user may have kept typing while the request was in flight. Clear
+      // the stored buffer ONLY when the LIVE buffer (read from the store at
+      // success time, never a stale closure) still equals the submitted
+      // snapshot; otherwise keep it — the invalidations below refresh the
+      // baseline, so the newer edits stay in the editor and stay dirty
+      // (issue #516 UI-019).
+      const liveBuffer = useDraftRoomUiStore.getState().draftText[draftId];
+      if (liveBuffer === submittedContentMd) {
+        clearDraftTextStore(draftId);
+      }
       queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(draftId) });
       queryClient.invalidateQueries({ queryKey: draftRoomKeys.revisions(draftId) });
       queryClient.invalidateQueries({ queryKey: draftRoomKeys.revision(draftId, revisionDetail.summary.id) });
@@ -1108,7 +1125,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
               </Button>
               <Button
                 type="button"
-                onClick={() => saveRevisionMutation.mutate()}
+                onClick={() => saveRevisionMutation.mutate(editorValue)}
                 disabled={saveRevisionMutation.isPending}
               >
                 {saveRevisionMutation.isPending && (

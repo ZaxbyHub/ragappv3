@@ -18,8 +18,10 @@ Hard invariants (SPEC section 10.1):
   ``DraftStore.claim_next_compile_job`` (both use ``BEGIN IMMEDIATE``) so two
   processors can never double-run a job.
 * Cooperative cancellation is checked before starting extraction and again
-  immediately before committing parsed text; observed cancellation discards
-  the extracted text rather than persisting it. For compile jobs,
+  immediately before committing parsed text — and re-checked inside the very
+  transaction that persists that text (issue #516 DRAFT-005), so a cancel
+  racing the final pre-commit awaits still settles cancelled and discards
+  the extracted output rather than persisting it. For compile jobs,
   ``draft_pipeline.run_compile`` performs the equivalent cancellation checks
   and discards any in-flight provider result itself (SPEC section 10.2); this
   module never resurrects a job it settles as ``cancelled``.
@@ -115,6 +117,11 @@ class DraftJobProcessor:
         self._engine = engine
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # Throttle for the unwired-engine compile warning (issue #532 review,
+        # PRR-024): the poll loop calls ``_claim_next_job`` every interval, so
+        # without this flag the same "engine not wired" condition would log
+        # once per poll for the whole deferral window.
+        self._warned_unwired_compile_claim = False
         # Strong references to detached background tasks so CPython does not
         # garbage-collect them mid-flight, mirroring WikiCompileProcessor.
         self._bg_tasks: set[asyncio.Task] = set()
@@ -307,6 +314,25 @@ class DraftJobProcessor:
             job = store.claim_next_parse_job()
             if job is not None:
                 return job
+            # Compile jobs stay pending until the RAG engine is wired (issue
+            # #516 DRAFT-007): lifespan starts this processor before the
+            # engine exists, and dispatching a compile job in that window
+            # would terminally fail queued work that only needed to wait.
+            # ``set_rag_engine`` makes compile jobs claimable again;
+            # ``_unwired_retrieval`` in ``draft_pipeline.default_deps``
+            # remains fail-closed defense in depth. Surface the deferral once
+            # per processor lifetime (never per poll) so an operator can see
+            # why queued compile work is not being picked up.
+            if self._engine is None:
+                if not self._warned_unwired_compile_claim and (
+                    store.has_pending_compile_job()
+                ):
+                    self._warned_unwired_compile_claim = True
+                    logger.warning(
+                        "DraftJobProcessor: compile jobs pending but RAG "
+                        "engine not wired yet; compile claiming deferred"
+                    )
+                return None
             return store.claim_next_compile_job()
 
     # ------------------------------------------------------------------
@@ -460,7 +486,7 @@ class DraftJobProcessor:
             return
 
         try:
-            await asyncio.to_thread(self._commit_success, job, extracted)
+            committed = await asyncio.to_thread(self._commit_success, job, extracted)
         except Exception as exc:
             logger.error(
                 "DraftJobProcessor: job id=%d could not commit parsed text (%s)",
@@ -468,6 +494,14 @@ class DraftJobProcessor:
                 type(exc).__name__,
             )
             await self._fail_input_and_job(job, code=CODE_INTERNAL_ERROR)
+            return
+
+        if not committed:
+            # A cancel landed inside the commit transaction: the extracted
+            # text was discarded and the job/input settled cancelled there.
+            self._publish_event(
+                job, "job_cancelled", job_id=job.id, status="cancelled"
+            )
             return
 
         logger.info("DraftJobProcessor: completed job id=%d", job.id)
@@ -737,17 +771,97 @@ class DraftJobProcessor:
             total = store.total_parsed_chars(draft_id, excluding_input_id=input_id)
         return (total + extracted.character_count) > settings.draft_max_total_parsed_chars
 
-    def _commit_success(self, job: "DraftJobRecord", extracted) -> None:
+    def _commit_success(self, job: "DraftJobRecord", extracted) -> bool:
+        """Commit the parsed output, honoring a cancel raced at the wire.
+
+        The ``cancel_requested_at`` re-check runs INSIDE the single
+        ``BEGIN IMMEDIATE`` transaction that persists the input's outcome and
+        the job's terminal state (issue #516 DRAFT-005). Cooperative check #2
+        happens before the char-limit and permission awaits, so a cancel
+        landing after it used to be overwritten by this success commit,
+        persisting post-cancel output as ``status='completed'``. Under the
+        write lock the read and the writes are serialized with any concurrent
+        ``request_job_cancel``: a cancel committed first is observed and
+        settled here (mirroring ``_cancel_job_and_input_sync``'s input+job
+        cancellation settlement, extracted text discarded); a cancel arriving
+        later finds the job already terminal.
+
+        Returns:
+            True when the success path ran; False when the run settled as
+            cancelled instead.
+        """
         with self._pool.connection() as conn:
-            store = DraftStore(conn)
-            store.set_input_parse_status(
-                input_id=job.input_id,
-                target="ready",
-                parsed_text=extracted.text,
-                parsed_text_sha256=sha256_text(extracted.text),
-                parsed_char_count=extracted.character_count,
-            )
-            store.set_job_status(job_id=job.id, target="completed", progress_percent=100.0)
+            if conn.in_transaction:
+                conn.rollback()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status, cancel_requested_at FROM draft_jobs WHERE id = ?",
+                    (job.id,),
+                ).fetchone()
+                if row is not None and row[1] is not None:
+                    # Same row effects as _cancel_job_and_input_sync's store
+                    # calls, kept inside this transaction so the input's and
+                    # the job's terminal outcomes settle together.
+                    conn.execute(
+                        "UPDATE draft_inputs SET parse_status = 'cancelled', "
+                        "parse_error = NULL, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ?",
+                        (job.input_id,),
+                    )
+                    conn.execute(
+                        "UPDATE draft_jobs SET status = 'cancelled', "
+                        "error_code = NULL, error_message = NULL, "
+                        "heartbeat_at = CURRENT_TIMESTAMP, "
+                        "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (job.id,),
+                    )
+                    # The same durable ``job_cancelled`` audit row the API
+                    # cancel path writes (``request_job_cancel``), so the
+                    # draft's event ledger carries the cancellation even when
+                    # it is this transaction that settles it (issue #532
+                    # review, PRR-022). Same event type and payload shape;
+                    # the worker has no requesting-actor context, so the job's
+                    # own creator stands in as the actor, exactly as the
+                    # pipeline does for its revision events.
+                    DraftStore(conn)._insert_event(
+                        draft_id=job.draft_id,
+                        event_type="job_cancelled",
+                        actor_user_id=job.created_by,
+                        job_id=job.id,
+                        payload={"prior_status": row[0]},
+                    )
+                    conn.commit()
+                    return False
+                # Byte-identical row effects to the previous
+                # set_input_parse_status('ready') + set_job_status('completed')
+                # pair, now inside this transaction so the cancel check above
+                # is serialized with them.
+                conn.execute(
+                    "UPDATE draft_inputs SET parse_status = 'ready', "
+                    "parsed_text = ?, parsed_text_sha256 = ?, "
+                    "parsed_char_count = ?, parse_error = NULL, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (
+                        extracted.text,
+                        sha256_text(extracted.text),
+                        extracted.character_count,
+                        job.input_id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE draft_jobs SET status = 'completed', "
+                    "error_code = NULL, error_message = NULL, "
+                    "progress_percent = 100.0, "
+                    "heartbeat_at = CURRENT_TIMESTAMP, "
+                    "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (job.id,),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return True
 
     def _fail_input_and_job_sync(
         self, job: "DraftJobRecord", *, code: str, message: Optional[str]

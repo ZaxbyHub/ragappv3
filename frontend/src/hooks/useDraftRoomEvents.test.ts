@@ -182,8 +182,14 @@ describe("useDraftRoomEvents", () => {
     emit('data: {"type":"subscribed","draft_id":42}\n\n');
 
     await waitFor(() => expect(result.current.lastEvent).toEqual({ type: "subscribed", draft_id: 42 }));
-    // "subscribed" is not state-changing — it must not trigger an invalidation.
-    expect(invalidateSpy).not.toHaveBeenCalled();
+    // "subscribed" carries no state itself, but the stream has no replay
+    // (no Last-Event-ID): a (re)subscription is the only chance to heal the
+    // canonical caches for events missed during a connection gap, so it
+    // invalidates detail + jobs (issue #516 UI-018).
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.detail(DRAFT_ID) })
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: draftRoomKeys.jobs(DRAFT_ID) });
   });
 
   it("ignores SSE comment (keepalive) lines and does not surface them as events", async () => {

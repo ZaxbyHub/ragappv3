@@ -3072,6 +3072,19 @@ async def delete_all_vault_documents(
                 f"DELETE FROM files WHERE id IN ({id_placeholders})",  # nosec B608 — placeholders is a fixed '?,?,...' literal, ids are bound
                 tuple(file_ids),
             )
+            # Draft Room evidence freshness (SPEC section 12.6, issue #516
+            # DRAFT-001): every bulk-deleted document invalidates the evidence
+            # rows citing it — the same hook, with the same same-transaction
+            # semantics, the single-delete path in _delete_file_record uses.
+            # Runs after the DELETE and before the commit so an all-or-nothing
+            # rollback also rolls the invalidation back. Best effort: the hook
+            # is wrapped so it cannot raise into this path.
+            from app.services.draft_evidence_freshness import on_document_changed
+
+            for deleted_file_id in file_ids:
+                on_document_changed(
+                    conn, file_id=deleted_file_id, new_content_sha256=None
+                )
             conn.commit()
             return cur.rowcount
         except Exception:
