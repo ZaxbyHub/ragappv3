@@ -411,6 +411,36 @@ CREATE INDEX IF NOT EXISTS idx_draft_promotions_draft
 _DRAFT_ROOM_PROMOTIONS_DDL = _DRAFT_ROOM_PROMOTIONS_TABLE_DDL + _DRAFT_ROOM_PROMOTIONS_INDEX_DDL
 
 
+# Draft Room evidence-reconciler state (issue #516, DRAFT-002/DRAFT-004).
+#
+# `draft_reconcile_cursor` is the single-row (id=1) keyset continuation cursor
+# for the bounded startup Ready-evidence sweep: a sweep truncated by its
+# max-drafts budget resumes after the last draft it scanned on the next run,
+# instead of re-reading the same lowest-id Ready prefix forever. The cursor is
+# reset to 0 whenever a sweep exhausts the Ready table.
+# `draft_reconcile_backlog` records source invalidations whose historical
+# evidence pass was truncated by the per-source cap, so the startup reconciler
+# can durably continue them instead of silently dropping the remainder.
+#
+# Defined as its own constant, appended to SCHEMA below and executed verbatim by
+# migrate_add_516_draft_reconcile_state(), so a fresh database and a migrated
+# database cannot drift apart.
+_DRAFT_RECONCILE_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS draft_reconcile_cursor (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    after_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS draft_reconcile_backlog (
+    source_kind TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    next_offset INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (source_kind, source_id)
+);
+"""
+
+
 # Multimodal artifact foundation (issue #460, multimodal RAG part 1).
 #
 # Canonical typed parse units ("atoms"), extracted binary assets, and per-stage
@@ -1536,6 +1566,7 @@ SCHEMA = (
     + _DRAFT_ROOM_PIPELINE_DDL
     + _DRAFT_ROOM_FACTUALITY_DDL
     + _DRAFT_ROOM_PROMOTIONS_DDL
+    + _DRAFT_RECONCILE_STATE_DDL
     + _MULTIMODAL_ARTIFACT_DDL
     + _ENRICHMENT_DERIVED_DDL
     + _CANVAS_DDL
@@ -1718,6 +1749,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_draft_room_pipeline(sqlite_path)
     migrate_add_draft_room_factuality(sqlite_path)
     migrate_add_draft_room_promotions(sqlite_path)
+    migrate_add_516_draft_reconcile_state(sqlite_path)
     migrate_add_multimodal_artifact_tables(sqlite_path)
     migrate_add_atom_enrichment_table(sqlite_path)
     migrate_add_vaults_multimodal_provider(sqlite_path)
@@ -5653,6 +5685,34 @@ def migrate_add_draft_room_promotions(sqlite_path: str) -> None:
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+def migrate_add_516_draft_reconcile_state(sqlite_path: str) -> None:
+    """Migration: add the Draft Room evidence-reconciler state tables (issue
+    #516, DRAFT-002/DRAFT-004).
+
+    Creates ``draft_reconcile_cursor`` (the persisted keyset continuation
+    cursor for the bounded startup Ready-evidence sweep) and
+    ``draft_reconcile_backlog`` (durable continuations for source
+    invalidations whose historical evidence pass was truncated by the
+    per-source cap). See ``_DRAFT_RECONCILE_STATE_DDL``.
+
+    Executes the exact same constant that is appended to ``SCHEMA`` — so a
+    database created by ``init_db`` and a legacy database upgraded by this
+    migration converge on an identical schema (repo double-definition
+    convention). Every statement is ``CREATE TABLE IF NOT EXISTS``, so repeat
+    execution is a no-op and existing data is preserved.
+
+    Args:
+        sqlite_path: Path to the SQLite database file.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.executescript(_DRAFT_RECONCILE_STATE_DDL)
+        conn.commit()
     finally:
         conn.close()
 

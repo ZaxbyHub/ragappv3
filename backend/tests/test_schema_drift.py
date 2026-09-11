@@ -46,7 +46,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # 64 -> 65: issue #512 added migration_journal (recovery journal)
 # 65 -> 66: issue #513 (W26) added document_near_dups (advisory near-duplicate
 # grouping centroids)
-EXPECTED_BASE_TABLE_COUNT = 66
+# 66 -> 68: issue #516 (2026-09-10) added draft_reconcile_cursor and
+# draft_reconcile_backlog (evidence-reconciler continuation state)
+EXPECTED_BASE_TABLE_COUNT = 68
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

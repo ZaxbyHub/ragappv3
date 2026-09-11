@@ -97,6 +97,20 @@ function isDraftRoomEvent(value: unknown): value is DraftRoomEvent {
 }
 
 /**
+ * The polling stop predicate covers the full activity surface: an active
+ * compile job OR any active parse work (the draft summary's active_job_id or
+ * any input's active_parse_job_id) keeps the fallback poll alive. Reads are
+ * defensive because a cache entry typed DraftDetail can still hold a partial
+ * object at runtime. (issue #516 UI-020)
+ */
+function detailHasActiveWork(detail: DraftDetail): boolean {
+  const partial = detail as Partial<DraftDetail>;
+  if (partial.active_compile_job != null) return true;
+  if (partial.summary?.active_job_id != null) return true;
+  return (partial.inputs ?? []).some((input) => input.active_parse_job_id != null);
+}
+
+/**
  * Race a single `reader.read()` against an inactivity timeout. A stream that
  * never yields a byte leaves the underlying `read()` promise pending
  * forever, so the timeout — not `reader.read()` itself — is what lets the
@@ -179,7 +193,10 @@ export function useDraftRoomEvents(
       const intervalMs = Math.max(500, pollSeconds * 1000);
       pollTimer = setInterval(() => {
         const detail = queryClient.getQueryData<DraftDetail>(draftRoomKeys.detail(id));
-        if (detail && detail.active_compile_job == null) {
+        // Stop only when there is no active work anywhere — no compile job
+        // AND no parse job; a parse-only draft keeps refreshing until parse
+        // finishes too (issue #516 UI-020).
+        if (detail && !detailHasActiveWork(detail)) {
           stopPolling();
           return;
         }
@@ -246,6 +263,14 @@ export function useDraftRoomEvents(
           queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
           return;
         case "subscribed":
+          // The stream guarantees no replay (no Last-Event-ID support): any
+          // state-changing event published while this client was disconnected
+          // is gone forever, so every (re)subscription must re-sync the
+          // canonical detail/jobs caches — the `subscribed` frame alone is
+          // the only signal that a gap just healed (issue #516 UI-018).
+          queryClient.invalidateQueries({ queryKey: draftRoomKeys.detail(id) });
+          queryClient.invalidateQueries({ queryKey: draftRoomKeys.jobs(id) });
+          return;
         case "heartbeat":
         default:
           return;

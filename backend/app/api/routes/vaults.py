@@ -728,6 +728,21 @@ async def delete_vault(
             conn.execute, "DELETE FROM files WHERE vault_id = ?", (vault_id,)
         )
 
+        # Draft Room evidence freshness (SPEC section 12.6, issue #516
+        # DRAFT-001): every purged document invalidates the evidence rows
+        # citing it — the same hook, in this same transaction, that the
+        # single-document delete path uses. Best effort: the hook is wrapped
+        # so it cannot raise into the purge.
+        from app.services.draft_evidence_freshness import on_document_changed
+
+        for purged_file_id in vault_file_ids:
+            await asyncio.to_thread(
+                on_document_changed,
+                conn,
+                file_id=purged_file_id,
+                new_content_sha256=None,
+            )
+
         # Delete the vault itself. drafts.vault_id carries ON DELETE CASCADE
         # to vaults(id) (see app/models/database.py _DRAFT_ROOM_CORE_DDL), and
         # draft_inputs/draft_jobs/draft_revisions/draft_events all cascade

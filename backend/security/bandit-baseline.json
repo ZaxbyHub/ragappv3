@@ -10,7 +10,7 @@
       "SEVERITY.LOW": 69,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 70764,
+      "loc": 71398,
       "nosec": 0,
       "skipped_tests": 35
     },
@@ -101,7 +101,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 13,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2497,
+      "loc": 2502,
       "nosec": 0,
       "skipped_tests": 3
     },
@@ -114,7 +114,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3624,
+      "loc": 3683,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -244,7 +244,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 472,
+      "loc": 478,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -322,7 +322,7 @@
       "SEVERITY.LOW": 4,
       "SEVERITY.MEDIUM": 2,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 875,
+      "loc": 883,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -465,7 +465,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 4855,
+      "loc": 4893,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -595,7 +595,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1837,
+      "loc": 1908,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -738,7 +738,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3334,
+      "loc": 3338,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -803,7 +803,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 620,
+      "loc": 794,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -829,7 +829,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 656,
+      "loc": 721,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -842,7 +842,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2682,
+      "loc": 2754,
       "nosec": 0,
       "skipped_tests": 3
     },
@@ -855,7 +855,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 673,
+      "loc": 701,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -920,7 +920,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3169,
+      "loc": 3267,
       "nosec": 0,
       "skipped_tests": 18
     },
@@ -1115,7 +1115,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 3,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 455,
+      "loc": 457,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1557,7 +1557,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1001,
+      "loc": 1005,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3041,7 +3041,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1072         lambda: conn.execute(\n1073             f\"\"\"\n1074             SELECT id, org_id FROM groups\n1075             WHERE id IN ({placeholders})\n1076             \"\"\",\n1077             tuple(group_ids),\n",
+      "code": "1087         lambda: conn.execute(\n1088             f\"\"\"\n1089             SELECT id, org_id FROM groups\n1090             WHERE id IN ({placeholders})\n1091             \"\"\",\n1092             tuple(group_ids),\n",
       "col_offset": 12,
       "end_col_offset": 15,
       "filename": "backend/app/api/routes/vaults.py",
@@ -3052,12 +3052,12 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 1073,
+      "line_number": 1088,
       "line_range": [
-        1073,
-        1074,
-        1075,
-        1076
+        1088,
+        1089,
+        1090,
+        1091
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",
@@ -3426,7 +3426,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "698                             conn.commit()\n699                     except Exception:  # pragma: no cover - defensive\n700                         pass\n701                     continue\n",
+      "code": "707                             conn.commit()\n708                     except Exception:  # pragma: no cover - defensive\n709                         pass\n710                     continue\n",
       "col_offset": 20,
       "end_col_offset": 28,
       "filename": "backend/app/services/background_tasks.py",
@@ -3437,17 +3437,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 699,
+      "line_number": 708,
       "line_range": [
-        699,
-        700
+        708,
+        709
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "935                         conn.commit()\n936                 except Exception:  # pragma: no cover - defensive\n937                     pass\n938                 continue\n",
+      "code": "944                         conn.commit()\n945                 except Exception:  # pragma: no cover - defensive\n946                     pass\n947                 continue\n",
       "col_offset": 16,
       "end_col_offset": 24,
       "filename": "backend/app/services/background_tasks.py",
@@ -3458,10 +3458,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 936,
+      "line_number": 945,
       "line_range": [
-        936,
-        937
+        945,
+        946
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",

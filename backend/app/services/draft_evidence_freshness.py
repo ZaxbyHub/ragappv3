@@ -106,6 +106,9 @@ MAX_EVIDENCE_PER_JOB = 5000
 # Reconciler bounds (SPEC 12.6: "process in pages").
 RECONCILE_PAGE_SIZE = 50
 RECONCILE_MAX_DRAFTS = 500
+# DRAFT-004 (issue #516): how many truncated source invalidations the startup
+# reconciler durably continues per run.
+RECONCILE_BACKLOG_BATCH = 8
 
 
 @dataclass(frozen=True)
@@ -474,6 +477,49 @@ def enforce_evidence_freshness(
 # ---------------------------------------------------------------------------
 
 
+def _collect_affected_pass(
+    store: DraftStore,
+    affected: dict[tuple[int, int], list[int]],
+    *,
+    identity: str,
+    source_id: int,
+    new_content_sha256: Optional[str],
+    current_revision: bool,
+    offset: int = 0,
+) -> Optional[int]:
+    """Collect one currency-scoped pass of a source's affected evidence rows.
+
+    ``current_revision=True`` selects rows whose ``(draft_id, job_id)`` targets
+    an ``is_current = 1`` revision; ``False`` selects the historical remainder.
+    Rows whose snapshot hash equals ``new_content_sha256`` are skipped (a no-op
+    save is a no-op here), so a repeated pass is idempotent.
+
+    Returns the offset the pass stopped at when it was truncated by
+    :data:`MAX_EVIDENCE_PER_JOB`, or ``None`` when it walked the source's rows
+    in this scope to the end.
+    """
+    while True:
+        rows = store.list_evidence_identities_for_source(
+            source_kind=identity,
+            source_id=source_id,
+            limit=EVIDENCE_PAGE_SIZE,
+            offset=offset,
+            current_revision=current_revision,
+        )
+        if not rows:
+            return None
+        for ev in rows:
+            if (
+                new_content_sha256 is not None
+                and ev.source_content_sha256 == new_content_sha256
+            ):
+                continue
+            affected.setdefault((ev.draft_id, ev.job_id), []).append(ev.id)
+        offset += len(rows)
+        if offset >= MAX_EVIDENCE_PER_JOB:
+            return offset
+
+
 def _invalidate_for_source(
     conn: sqlite3.Connection,
     *,
@@ -481,6 +527,7 @@ def _invalidate_for_source(
     source_id: int,
     new_content_sha256: Optional[str],
     actor_user_id: Optional[int] = None,
+    resume_offset: int = 0,
 ) -> int:
     """Indexed invalidation for one changed/deleted source.
 
@@ -490,31 +537,46 @@ def _invalidate_for_source(
     evidence whose snapshot hash differs is invalidated (so a no-op save is a
     no-op here, and a repeated hook is idempotent).
 
+    Evidence for the source is collected in two ordered passes, each bounded by
+    :data:`MAX_EVIDENCE_PER_JOB` (issue #516, DRAFT-004): rows behind the
+    drafts' *current* revisions first — those are the live claims the hook
+    exists to invalidate, and storage order is oldest-first, so a plain id-ASC
+    walk could spend the whole budget on superseded history and never reach
+    them — then historical rows (a deletion still stamps those, SPEC 5.6). When
+    the historical pass truncates, the remaining offset is persisted to
+    ``draft_reconcile_backlog`` in the same transaction, and the startup
+    reconciler continues it. ``resume_offset`` > 0 continues exactly such a
+    backlog entry (the current-revision pass already completed).
+
     Returns the number of drafts whose current revision was invalidated.
     """
     store = DraftStore(conn)
     deleted = new_content_sha256 is None
 
-    # Collect affected evidence in pages, grouped by (draft, job).
+    # Collect affected evidence, grouped by (draft, job).
     affected: dict[tuple[int, int], list[int]] = {}
-    offset = 0
-    while True:
-        rows = store.list_evidence_identities_for_source(
-            source_kind=identity,
+    if resume_offset == 0:
+        # Current-revision rows first. This pass has no durable continuation:
+        # it can only truncate on >= MAX_EVIDENCE_PER_JOB current rows for one
+        # source, the same pathological ceiling the single-pass walk had.
+        _collect_affected_pass(
+            store,
+            affected,
+            identity=identity,
             source_id=source_id,
-            limit=EVIDENCE_PAGE_SIZE,
-            offset=offset,
+            new_content_sha256=new_content_sha256,
+            current_revision=True,
         )
-        if not rows:
-            break
-        for ev in rows:
-            if not deleted and ev.source_content_sha256 == new_content_sha256:
-                continue
-            affected.setdefault((ev.draft_id, ev.job_id), []).append(ev.id)
-        offset += len(rows)
-        if offset >= MAX_EVIDENCE_PER_JOB:
-            break
-    if not affected:
+    next_offset = _collect_affected_pass(
+        store,
+        affected,
+        identity=identity,
+        source_id=source_id,
+        new_content_sha256=new_content_sha256,
+        current_revision=False,
+        offset=resume_offset,
+    )
+    if not affected and next_offset is None and resume_offset == 0:
         return 0
 
     reason = SOURCE_DELETED if deleted else EVIDENCE_CHANGED
@@ -552,6 +614,21 @@ def _invalidate_for_source(
                 actor_user_id=actor_user_id,
             ):
                 invalidated += 1
+        if next_offset is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO draft_reconcile_backlog "
+                "(source_kind, source_id, next_offset, created_at) "
+                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (identity, int(source_id), int(next_offset)),
+            )
+        else:
+            # The historical pass completed: any backlog row for this source is
+            # finished work and must not survive.
+            conn.execute(
+                "DELETE FROM draft_reconcile_backlog "
+                "WHERE source_kind = ? AND source_id = ?",
+                (identity, int(source_id)),
+            )
         if own_tx:
             conn.commit()
     except Exception:
@@ -697,6 +774,105 @@ def _reconcile_one(
         pool.release_connection(conn)
 
 
+def _read_reconcile_cursor(pool: Any) -> int:
+    """The persisted keyset continuation cursor (``after_id``), default 0."""
+    conn = pool.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT after_id FROM draft_reconcile_cursor WHERE id = 1"
+        ).fetchone()
+        return 0 if row is None else int(row[0])
+    finally:
+        pool.release_connection(conn)
+
+
+def _write_reconcile_cursor(pool: Any, after_id: int) -> None:
+    """Persist the sweep's continuation cursor (DRAFT-002, issue #516).
+
+    ``UPDATE ... WHERE id = 1`` with an ``INSERT OR REPLACE`` fallback, so an
+    aborted first write can never wedge the next run: whichever path runs, the
+    row ends up holding exactly ``after_id``.
+    """
+    conn = pool.get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE draft_reconcile_cursor SET after_id = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = 1",
+            (int(after_id),),
+        )
+        if cur.rowcount == 0:
+            conn.execute(
+                "INSERT OR REPLACE INTO draft_reconcile_cursor "
+                "(id, after_id, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP)",
+                (int(after_id),),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.release_connection(conn)
+
+
+# Live-hash lookups for backlog drain continuations. A backlog row records only
+# the continuation offset, so the source's current canonical hash is re-derived
+# at drain time: a source deleted after truncation keeps deletion semantics,
+# a changed one gets change semantics. ``raw`` marks columns already storing a
+# canonical hash; the others store text that must be hashed here.
+_BACKLOG_SOURCE_HASH_SQL: dict[str, tuple[str, bool]] = {
+    "draft_input": ("SELECT parsed_text_sha256 FROM draft_inputs WHERE id = ?", True),
+    "document": ("SELECT file_hash FROM files WHERE id = ?", True),
+    "wiki_page": ("SELECT markdown FROM wiki_pages WHERE id = ?", False),
+    "wiki_claim": ("SELECT claim_text FROM wiki_claims WHERE id = ?", False),
+    "kms": ("SELECT body FROM kms_entries WHERE id = ?", False),
+}
+
+
+def _backlog_source_sha256(
+    conn: sqlite3.Connection, source_kind: str, source_id: int
+) -> Optional[str]:
+    """Current canonical hash for a backlog source, or ``None`` when gone."""
+    lookup = _BACKLOG_SOURCE_HASH_SQL.get(source_kind)
+    if lookup is None:
+        return None
+    sql, raw = lookup
+    row = conn.execute(sql, (int(source_id),)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return str(row[0]) if raw else sha256_text(str(row[0]))
+
+
+def _drain_backlog_batch(pool: Any, batch_size: int) -> int:
+    """Continue up to ``batch_size`` truncated source invalidations (DRAFT-004).
+
+    Each entry is resumed by the same :func:`_invalidate_for_source`
+    continuation the hooks use. A completed continuation removes its own
+    backlog row; a re-truncated one persists its new offset for the next run,
+    so eventual coverage is guaranteed without an unbounded startup pass.
+    """
+    conn = pool.get_connection()
+    try:
+        entries = conn.execute(
+            "SELECT source_kind, source_id, next_offset FROM draft_reconcile_backlog "
+            "ORDER BY created_at, source_kind, source_id LIMIT ?",
+            (int(batch_size),),
+        ).fetchall()
+        for source_kind, source_id, next_offset in entries:
+            _invalidate_for_source(
+                conn,
+                identity=str(source_kind),
+                source_id=int(source_id),
+                new_content_sha256=_backlog_source_sha256(
+                    conn, str(source_kind), int(source_id)
+                ),
+                resume_offset=int(next_offset),
+            )
+        return len(entries)
+    finally:
+        pool.release_connection(conn)
+
+
 async def reconcile_ready_evidence(
     pool: Any,
     *,
@@ -712,9 +888,13 @@ async def reconcile_ready_evidence(
     Bounds: at most ``max_drafts`` drafts, walked by keyset in pages of
     ``page_size``; each draft's own evidence pass is itself bounded by
     :data:`MAX_EVIDENCE_PER_JOB`. Reaching ``max_drafts`` sets ``truncated`` and
-    is logged — the next startup resumes the sweep. Each page and each draft
-    take a pooled connection and release it before the next ``await``, so no
-    connection is ever held across one.
+    is logged — the sweep's continuation cursor (``draft_reconcile_cursor``,
+    DRAFT-002 in issue #516) is persisted so the next run resumes after the
+    last scanned draft instead of restarting at the lowest ids forever; a sweep
+    that exhausts the Ready table resets the cursor to 0. After the sweep, up to
+    :data:`RECONCILE_BACKLOG_BATCH` truncated source invalidations are durably
+    continued. Each pooled connection is released before the next ``await``, so
+    no connection is ever held across one.
 
     Idempotent: a draft already moved to ``needs_review`` no longer matches the
     Ready page query, and repeated invalidation of the same revision reuses the
@@ -728,10 +908,14 @@ async def reconcile_ready_evidence(
     truncated = False
     after_id = 0
     try:
+        after_id = _read_reconcile_cursor(pool)
         while scanned < max_drafts:
             limit = min(page_size, max_drafts - scanned)
             page = await asyncio.to_thread(_reconcile_page, pool, after_id, limit)
             if not page:
+                # Nothing Ready at or after the cursor: the sweep exhausted the
+                # table, so the next run starts from the top again.
+                after_id = 0
                 break
             for draft_id, _owner_id, _vault_id, revision_id, job_id in page:
                 after_id = draft_id
@@ -746,6 +930,9 @@ async def reconcile_ready_evidence(
                 if not result.is_current:
                     invalidated += 1
             if len(page) < limit:
+                # The sweep exhausted the Ready table: start the next run from
+                # the top again (drafts may have become Ready since).
+                after_id = 0
                 break
         else:
             truncated = True
@@ -756,13 +943,33 @@ async def reconcile_ready_evidence(
             scanned,
             exc,
         )
+    backlog_drained = 0
+    try:
+        backlog_drained = await asyncio.to_thread(
+            _drain_backlog_batch, pool, RECONCILE_BACKLOG_BATCH
+        )
+    except Exception as exc:  # noqa: BLE001 - startup must not fail on this
+        logger.warning(
+            "Ready-evidence reconciler could not drain its invalidation backlog "
+            "(continuing startup): %s",
+            exc,
+        )
+    try:
+        await asyncio.to_thread(_write_reconcile_cursor, pool, after_id)
+    except Exception as exc:  # noqa: BLE001 - startup must not fail on this
+        logger.warning(
+            "Ready-evidence reconciler could not persist its continuation cursor "
+            "(continuing startup): %s",
+            exc,
+        )
     logger.info(
         "Ready-evidence reconcile: drafts_scanned=%d drafts_invalidated=%d "
-        "evidence_checked=%d truncated=%s",
+        "evidence_checked=%d truncated=%s backlog_drained=%d",
         scanned,
         invalidated,
         evidence_checked,
         truncated,
+        backlog_drained,
     )
     return ReconcileSummary(
         drafts_scanned=scanned,

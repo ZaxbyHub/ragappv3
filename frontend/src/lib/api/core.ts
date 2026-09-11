@@ -160,20 +160,27 @@ export function attachCsrfInterceptor(instance: ReturnType<typeof axios.create>)
     (resp) => resp,
     async (error) => {
       const config = error.config;
-      let detail = error.response?.data?.detail || "";
-      // Blob error bodies (responseType: "blob", e.g. the draft export download)
-      // have no .detail — read the text so CSRF 403 detection still matches.
+      // Blob error bodies (responseType: "blob", e.g. the draft export
+      // download) carry no .detail/.code — axios delivers the raw Blob. Decode
+      // JSON blob bodies regardless of status and replace
+      // error.response.data IN PLACE (mutating the shared axios error object)
+      // so every downstream reader — the CSRF-403 detection here, this
+      // module's message extraction, and Draft Room error parsing via
+      // originalError.response.data — sees the real envelope
+      // {detail, code, context} while the status is preserved. Non-JSON blobs
+      // keep today's fallbacks (issue #516 API-003; the previous 403-only
+      // decode is a subset of this).
       if (
-        error.response?.status === 403 &&
         typeof Blob !== "undefined" &&
-        error.response.data instanceof Blob
+        error.response?.data instanceof Blob
       ) {
         try {
-          detail = JSON.parse(await error.response.data.text())?.detail ?? detail;
+          error.response.data = JSON.parse(await error.response.data.text());
         } catch {
-          // non-JSON body — keep detail as-is
+          // non-JSON body — leave the Blob as-is
         }
       }
+      const detail = error.response?.data?.detail || "";
       const isCsrfError = error.response?.status === 403 && (
         error.response?.headers?.["x-csrf-error"] === "true" ||
         (typeof detail === "string" && detail.toLowerCase().includes("csrf"))

@@ -1001,6 +1001,11 @@ class DraftStore:
     ) -> DraftRecord:
         """Update title/brief/tier under an optimistic lock.
 
+        A *material* change (brief or tier actually differs from the locked
+        draft's current values) invalidates an active Ready approval the same
+        way ``create_manual_revision`` does (issue #516, DRAFT-022); a
+        title-only or unchanged-value update leaves Ready untouched.
+
         Raises:
             DraftConflictError: If ``lock_version`` is stale or a compile job is
                 active (an in-flight job snapshotted the brief it is running on).
@@ -1030,6 +1035,16 @@ class DraftStore:
                 "WHERE id = ? AND created_by = ?",
                 (title, brief_json, tier, draft_id, owner_id),
             )
+            if (
+                draft.ready_revision_id is not None
+                and (
+                    (brief_json is not None and brief_json != draft.brief_json)
+                    or (tier is not None and tier != draft.tier)
+                )
+            ):
+                self._invalidate_ready_on_material_change(
+                    draft, owner_id=owner_id, reason="draft_metadata_changed"
+                )
             self._db.commit()
         except Exception:
             self._db.rollback()
@@ -1155,6 +1170,36 @@ class DraftStore:
                 "AND status IN ('pending','running')",
                 (draft_id,),
             ).fetchone()[0]
+        )
+
+    def _invalidate_ready_on_material_change(
+        self, draft: DraftRecord, *, owner_id: int, reason: str
+    ) -> None:
+        """Clear an active Ready approval after a material metadata change.
+
+        Brief/tier/input metadata are compile inputs, so changing one after
+        approval invalidates the approval exactly as ``create_manual_revision``
+        does (issue #516, DRAFT-022): same transition check, same Ready-pointer
+        clears, same ``ready_invalidated`` audit event, inside the caller's
+        already-open transaction (the caller's UPDATE owns the lock bump).
+        Callers must only invoke this while the draft holds a Ready pointer.
+        """
+        target_status = "needs_review"
+        if draft.status not in ("needs_review",):
+            _check_transition(
+                "draft", draft.status, target_status,
+                _DRAFT_TRANSITIONS, _DRAFT_RECOVERY_TRANSITIONS,
+            )
+        self._db.execute(
+            "UPDATE drafts SET status = ?, ready_revision_id = NULL, "
+            "ready_by = NULL, ready_at = NULL WHERE id = ? AND created_by = ?",
+            (target_status, draft.id, owner_id),
+        )
+        self._insert_event(
+            draft_id=draft.id,
+            event_type="ready_invalidated",
+            actor_user_id=owner_id,
+            payload={"reason": reason},
         )
 
     # ── events ───────────────────────────────────────────────────────────
@@ -1391,7 +1436,9 @@ class DraftStore:
         """Update an input's role/authority/as-of date/locked spans.
 
         Not permitted while a compile job is active: a running job snapshotted
-        these values and must not observe them change underneath it.
+        these values and must not observe them change underneath it. A material
+        change to any of them invalidates an active Ready approval (issue #516,
+        DRAFT-022), exactly as ``update_draft`` does for brief/tier.
         """
         if role is not None and role not in INPUT_ROLES:
             raise DraftValidationError(f"unknown input role: {role!r}")
@@ -1400,10 +1447,11 @@ class DraftStore:
 
         self._begin_immediate()
         try:
-            self._locked_draft(draft_id, owner_id, None)
+            draft = self._locked_draft(draft_id, owner_id, None)
             self._assert_no_active_compile(draft_id)
             existing = self._db.execute(
-                "SELECT id FROM draft_inputs WHERE id = ? AND draft_id = ?",
+                "SELECT role, authority, as_of_date, locked_spans_json "
+                "FROM draft_inputs WHERE id = ? AND draft_id = ?",
                 (input_id, draft_id),
             ).fetchone()
             if existing is None:
@@ -1422,6 +1470,25 @@ class DraftStore:
                 "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND draft_id = ?",
                 (role, authority, as_of_date, locked_spans_json, input_id, draft_id),
             )
+            if draft.ready_revision_id is not None and (
+                (role is not None and role != existing["role"])
+                or (authority is not None and authority != existing["authority"])
+                or (
+                    as_of_date is not None
+                    and as_of_date != existing["as_of_date"]
+                )
+                or (
+                    clear_as_of_date
+                    and existing["as_of_date"] is not None
+                )
+                or (
+                    locked_spans_json is not None
+                    and locked_spans_json != existing["locked_spans_json"]
+                )
+            ):
+                self._invalidate_ready_on_material_change(
+                    draft, owner_id=owner_id, reason="input_metadata_changed"
+                )
             self._db.commit()
         except Exception:
             self._db.rollback()
@@ -2200,6 +2267,12 @@ class DraftStore:
         that would otherwise never be parsed. Startup reconciliation re-enqueues
         those whose bytes are present and fails those whose bytes are missing.
 
+        Inputs holding a *cancelled* parse job are excluded (issue #516,
+        DRAFT-006): cancelling a pending job terminalizes the job but
+        deliberately leaves the input ``pending``, so without this exclusion
+        startup recovery would resurrect work the user explicitly cancelled.
+        The explicit ``retry_parse_job`` path remains the way back.
+
         Returns:
             Tuples of ``(input_id, draft_id, owner_id, storage_relpath)``.
         """
@@ -2209,6 +2282,9 @@ class DraftStore:
             "WHERE i.parse_status = 'pending' AND NOT EXISTS ("
             "  SELECT 1 FROM draft_jobs j WHERE j.input_id = i.id "
             "  AND j.job_type = 'parse_input' AND j.status IN ('pending','running'))"
+            " AND NOT EXISTS (SELECT 1 FROM draft_jobs jc "
+            "  WHERE jc.input_id = i.id AND jc.job_type = 'parse_input' "
+            "  AND jc.status = 'cancelled')"
         ).fetchall()
         return [(int(r[0]), int(r[1]), int(r[2]), r[3]) for r in rows]
 
@@ -2730,7 +2806,13 @@ class DraftStore:
         return [_row_to_evidence_identity(r) for r in rows]
 
     def list_evidence_identities_for_source(
-        self, *, source_kind: str, source_id: int, limit: int = 200, offset: int = 0
+        self,
+        *,
+        source_kind: str,
+        source_id: int,
+        limit: int = 200,
+        offset: int = 0,
+        current_revision: Optional[bool] = None,
     ) -> list[DraftEvidenceIdentity]:
         """Find every evidence row pointing at one external source.
 
@@ -2741,6 +2823,12 @@ class DraftStore:
         (SPEC 12.6). Each filter is written to hit one of the partial identity
         indexes created in ``_DRAFT_ROOM_PIPELINE_DDL``.
 
+        ``current_revision`` optionally splits the rows by revision currency
+        (issue #516, DRAFT-004): ``True`` returns only rows whose
+        ``(draft_id, job_id)`` targets an ``is_current = 1`` revision, ``False``
+        only historical rows, and ``None`` (the default) keeps the unfiltered
+        behavior.
+
         Raises:
             DraftValidationError: ``source_kind`` is not a known identity.
         """
@@ -2749,10 +2837,27 @@ class DraftStore:
             raise DraftValidationError(
                 f"unknown evidence source identity: {source_kind!r}"
             )
+        # Full literal branches (no interpolation) keep bandit B608 quiet:
+        # only source_kind routes between them, and source_id stays bound.
+        currency_current = (
+            " AND EXISTS (SELECT 1 FROM draft_revisions r "
+            "WHERE r.draft_id = j.draft_id AND r.job_id = j.id "
+            "AND r.is_current = 1)"
+        )
+        currency_non_current = (
+            " AND NOT EXISTS (SELECT 1 FROM draft_revisions r "
+            "WHERE r.draft_id = j.draft_id AND r.job_id = j.id "
+            "AND r.is_current = 1)"
+        )
+        currency = ""
+        if current_revision is True:
+            currency = currency_current
+        elif current_revision is False:
+            currency = currency_non_current
         rows = self._db.execute(
             f"SELECT {_EVIDENCE_IDENTITY_COLUMNS} "  # nosec B608
             "FROM draft_evidence e JOIN draft_jobs j ON j.id = e.job_id "
-            f"WHERE {predicate} ORDER BY e.id ASC LIMIT ? OFFSET ?",
+            f"WHERE {predicate}{currency} ORDER BY e.id ASC LIMIT ? OFFSET ?",  # nosec B608
             (source_id, limit, offset),
         ).fetchall()
         return [_row_to_evidence_identity(r) for r in rows]

@@ -156,6 +156,15 @@ class TaskItem:
     # the route already hashed the bytes; re-hashing in the worker duplicated
     # the work and could diverge from what the route persisted).
     file_hash: Optional[str] = None
+    # Set by BackgroundProcessor.cancel_pending_jobs on queued, not-yet-started
+    # items whose attributes match the caller's cancellation match (e.g.
+    # file_id). The ingestion worker checks this flag at the top of item
+    # handling and skips cancelled items entirely (issue #516 / DRAFT-023) —
+    # the enqueueing side has already compensated by deleting the files row
+    # and the bytes, so processing would only fail against missing state. A
+    # fresh enqueue of the same file creates a new TaskItem with the flag
+    # unset, so cancellation never leaks into later legitimate work.
+    cancelled: bool = False
 
 
 @dataclass
@@ -1671,6 +1680,77 @@ class BackgroundProcessor:
         await self.queue.put(task)
         logger.debug(f"Enqueued file: {file_path} (file_id={file_id})")
 
+    def cancel_pending_jobs(self, **match: object) -> int:
+        """Best-effort cancellation of queued, not-yet-started ingestion tasks
+        (issue #516 / DRAFT-023).
+
+        Marks every :class:`TaskItem` still sitting on the ingestion queue
+        whose attributes match ``match`` (e.g. ``file_id=42`` — each keyword
+        must compare equal on the item) as ``cancelled``. The worker-skip
+        contract: the ingestion worker checks the flag at the top of item
+        handling and drops cancelled items without processing them; the
+        enqueueing side (draft promotion compensation) has already deleted the
+        ``files`` row and the bytes, and the worker's existing missing-file
+        failure path remains as a second guard for an item a worker already
+        claimed past the flag check. Only the ingestion queue is scanned —
+        enrichment/reindex queues hold post-index work, never a
+        not-yet-started ingestion. Matching applies only to items still
+        QUEUED: one already claimed by a worker is past cancellation.
+
+        ``asyncio.Queue`` supports no removal, so the queue is drained and
+        refilled in FIFO order. This method is deliberately synchronous — it
+        never awaits, so the drain-and-refill is atomic with respect to the
+        event-loop workers (no coroutine can run mid-drain and observe a
+        partially drained queue, and a concurrently-blocked producer cannot
+        interleave). ``task_done()``/``put_nowait()`` pairs keep the
+        ``queue.join()`` unfinished-task bookkeeping balanced.
+
+        An empty ``match`` is a caller bug (it would match everything) and is
+        refused. Never raises — a cancellation failure is logged and the
+        count so far is returned — because callers invoke it from
+        failure-path compensation where a second exception would mask the
+        original one.
+
+        Returns the number of items marked cancelled.
+        """
+        if not match:
+            logger.error("cancel_pending_jobs called with an empty match; refusing")
+            return 0
+        cancelled = 0
+        try:
+            drained: List[TaskItem] = []
+            while True:
+                try:
+                    drained.append(self.queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            for item in drained:
+                if all(
+                    getattr(item, key, None) == value
+                    for key, value in match.items()
+                ):
+                    item.cancelled = True
+                    cancelled += 1
+                # Balance the unfinished-task bookkeeping for the get_nowait
+                # above, then requeue in FIFO order (capacity was freed by the
+                # get, so put_nowait cannot hit QueueFull here).
+                self.queue.task_done()
+                self.queue.put_nowait(item)
+        except Exception as exc:  # noqa: BLE001 — must never raise
+            logger.warning(
+                "cancel_pending_jobs(%s) failed after %d item(s): %s",
+                match,
+                cancelled,
+                exc,
+            )
+        if cancelled:
+            logger.info(
+                "Cancelled %d queued ingestion task(s) matching %s",
+                cancelled,
+                match,
+            )
+        return cancelled
+
     async def enqueue_enrichment(self, item: EnrichmentTaskItem) -> None:
         """Add a post-index enrichment job to the enrichment queue."""
         await self.enrichment_queue.put(item)
@@ -2057,6 +2137,19 @@ class BackgroundProcessor:
         On failure, requeues the task with incremented attempt count
         and exponential backoff delay if retries remain.
         """
+        if task.cancelled:
+            # Worker-skip contract (BackgroundProcessor.cancel_pending_jobs,
+            # issue #516 / DRAFT-023): this item was cancelled while queued.
+            # The enqueueing side has compensated — deleted the files row and
+            # the bytes this task points at — so drop it instead of running
+            # it into missing state. The queue's task_done() is still called
+            # by _process_task_wrapper's finally block.
+            logger.info(
+                "Skipping cancelled ingestion task for %s (file_id=%s)",
+                task.file_path,
+                task.file_id,
+            )
+            return
         logger.info(
             f"Processing file: {task.file_path} (attempt {task.attempt}, file_id={task.file_id})"
         )
