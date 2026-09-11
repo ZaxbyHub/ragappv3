@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -17,23 +17,49 @@ export interface DraftEditorProps {
 }
 
 /**
+ * Imperative surface for the workspace shell (issue #517 AC12): lets a
+ * finding row ask the editor to select and reveal the exact span it flagged.
+ */
+export interface DraftEditorHandle {
+  /**
+   * Focuses the textarea, selects the given character range of the CURRENT
+   * text (clamped, so a stale span cannot throw), and scrolls the selection
+   * into view.
+   */
+  selectSpan(start: number, end: number): void;
+}
+
+/**
  * Controlled Markdown editor for a Draft Room revision. Deliberately a plain
  * `<Textarea>` — no rich-text or code editor framework, no autosave
  * (SPEC 16.5). The save mutation itself lives in the workspace shell; this
  * component only reports text changes and surfaces the dirty state.
  */
-export function DraftEditor({
-  draftId,
-  revision,
-  value,
-  onChange,
-  disabled,
-  disabledReason,
-}: DraftEditorProps) {
+export const DraftEditor = forwardRef<DraftEditorHandle, DraftEditorProps>(function DraftEditor(
+  { draftId, revision, value, onChange, disabled, disabledReason },
+  ref
+) {
   const textareaId = `draft-editor-${draftId}`;
   const disabledReasonId = `${textareaId}-disabled-reason`;
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const isDirty = revision != null && value !== revision.content_md;
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      selectSpan(start: number, end: number) {
+        const textarea = textareaRef.current;
+        if (!textarea) return;
+        const clampedStart = Math.max(0, Math.min(start, textarea.value.length));
+        const clampedEnd = Math.max(clampedStart, Math.min(end, textarea.value.length));
+        textarea.focus();
+        textarea.setSelectionRange(clampedStart, clampedEnd);
+        textarea.scrollIntoView({ block: "center" });
+      },
+    }),
+    []
+  );
 
   // Announce the dirty state politely, but only on the transition into or
   // out of "dirty" — never on every keystroke.
@@ -58,6 +84,7 @@ export function DraftEditor({
         {dirtyAnnouncement}
       </div>
       <Textarea
+        ref={textareaRef}
         id={textareaId}
         value={value}
         onChange={(event) => onChange(event.target.value)}
@@ -80,4 +107,4 @@ export function DraftEditor({
       )}
     </div>
   );
-}
+});

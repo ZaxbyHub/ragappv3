@@ -1382,7 +1382,8 @@ class TestRetryStartStageInheritance(PipelineTestBase):
             model.count("outline"), 1, "a model swap must invalidate checkpoints"
         )
         self.assertGreaterEqual(model.count("draft"), 1)
-        self.assertEqual(self._evidence_count(retry_id), 1)
+        # Issue #517 DRAFT-016: S1 plus the minted [D#] input snapshot.
+        self.assertEqual(self._evidence_count(retry_id), 2)
 
     def test_the_model_identity_is_part_of_the_fingerprint(self):
         self._seal(self.job_id, "research")
@@ -1588,7 +1589,9 @@ class TestEvidenceSnapshot(PipelineTestBase):
             "WHERE job_id = ? ORDER BY id",
             (self.job_id,),
         ).fetchall()
-        self.assertEqual(len(rows), 1)
+        # Issue #517 DRAFT-016: the research snapshot also persists the
+        # minted [D#] project-input evidence row next to the vault evidence.
+        self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["label"], "S1")
         self.assertEqual(rows[0]["source_kind"], "document")
         self.assertEqual(rows[0]["file_id"], DOC_SOURCE.file_id)
@@ -1597,6 +1600,9 @@ class TestEvidenceSnapshot(PipelineTestBase):
         self.assertEqual(
             rows[0]["source_content_sha256"], DOC_SOURCE.content_sha256
         )
+        self.assertEqual(rows[1]["label"], "D1")
+        self.assertEqual(rows[1]["source_kind"], "draft_input")
+        self.assertIsNone(rows[1]["file_id"])
 
 
 # ── Structural guarantee: the module never writes `ready` ────────────────────

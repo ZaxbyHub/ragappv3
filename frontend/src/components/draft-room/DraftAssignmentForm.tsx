@@ -15,6 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 import { labelVariants } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import {
@@ -27,6 +28,12 @@ import {
   type DraftTier,
 } from "@/lib/api/draftRoom";
 import {
+  listDraftBriefTemplates,
+  saveDraftBriefTemplate,
+  type DraftBriefTemplate,
+} from "@/lib/draftBriefTemplates";
+import {
+  BRIEF_TEMPLATE_HELP,
   DRAFTING_PRIORITY_LABELS,
   INPUT_ROLE_LABELS,
   MODE_DESCRIPTIONS,
@@ -270,6 +277,27 @@ export function DraftAssignmentForm(props: DraftAssignmentFormProps): JSX.Elemen
     enabled: !isEdit,
   });
   const vaults = vaultsQuery.data?.vaults ?? [];
+
+  // ---- Brief templates (issue #517 AC14) ----------------------------------
+  // Read once per mount: templates are a local browser convenience stored
+  // under a namespaced localStorage key. Saves refresh this state from the
+  // helper's return value so the apply affordance appears without a remount.
+  const [briefTemplates, setBriefTemplates] = useState<DraftBriefTemplate[]>(() =>
+    listDraftBriefTemplates()
+  );
+  const latestBriefTemplate = briefTemplates.length > 0 ? briefTemplates[briefTemplates.length - 1] : null;
+
+  function handleSaveBriefTemplate(): void {
+    setBriefTemplates(saveDraftBriefTemplate(value.title, value.brief));
+  }
+
+  function handleApplyBriefTemplate(): void {
+    if (!latestBriefTemplate) return;
+    // Templates fill the brief fields ONLY: the form's own title/vault/mode/
+    // tier stay as they are, and nothing about evidence, fact-check,
+    // approval, or readiness is ever carried or fabricated.
+    onChange({ ...value, brief: latestBriefTemplate.brief });
+  }
 
   const [mustIncludeText, setMustIncludeText] = useState(() => value.brief.must_include.join("\n"));
   const [mustAvoidText, setMustAvoidText] = useState(() => value.brief.must_avoid.join("\n"));
@@ -708,6 +736,35 @@ export function DraftAssignmentForm(props: DraftAssignmentFormProps): JSX.Elemen
         </Select>
         <FieldHelp id={`${tierId}-help`}>{TIER_DESCRIPTIONS[value.tier] ?? ""}</FieldHelp>
       </div>
+
+      <section className="space-y-2 rounded-md border border-border p-3" aria-label="Brief templates">
+        <div className="flex flex-wrap gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleSaveBriefTemplate}
+            disabled={disabled}
+          >
+            Save as template
+          </Button>
+          {latestBriefTemplate && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={handleApplyBriefTemplate}
+              disabled={disabled}
+              aria-describedby={`${idPrefix}-brief-templates-help`}
+            >
+              Apply template ({latestBriefTemplate.name})
+            </Button>
+          )}
+        </div>
+        <p id={`${idPrefix}-brief-templates-help`} className="text-sm text-muted-foreground">
+          {BRIEF_TEMPLATE_HELP}
+        </p>
+      </section>
     </div>
   );
 }

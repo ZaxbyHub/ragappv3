@@ -292,7 +292,9 @@ class TestStableLabels(DraftResearchAsyncTestCase):
 
         labels_1 = [ev.label for ev in outcome_1.evidence]
         labels_2 = [ev.label for ev in outcome_2.evidence]
-        self.assertEqual(labels_1, ["S1", "W1"])
+        # Issue #517 DRAFT-016: minted [D#] project-input snapshots are part
+        # of the evidence set, in input order after the vault labels.
+        self.assertEqual(labels_1, ["S1", "W1", "D1"])
         self.assertEqual(labels_1, labels_2)
         self.assertEqual(
             [ev.label for ev in outcome_1.packet.evidence],
@@ -318,7 +320,9 @@ class TestRetrievalStatusClassification(DraftResearchAsyncTestCase):
         self.assertTrue(outcome.source_only)
         self.assertTrue(outcome.packet.source_only)
         self.assertEqual(outcome.blockers, ())
-        self.assertEqual(outcome.evidence, ())
+        # Issue #517 DRAFT-016: a source-only run still carries the minted
+        # [D#] input snapshot; source_only tracks the VAULT only.
+        self.assertEqual([ev.label for ev in outcome.evidence], ["D1"])
         # No model call was made -- nothing to reason about.
         self.assertEqual(model.calls, 0)
 
@@ -335,7 +339,9 @@ class TestRetrievalStatusClassification(DraftResearchAsyncTestCase):
         self.assertEqual(outcome.retrieval_status, "unavailable")
         self.assertIn("retrieval_unavailable", outcome.blockers)
         self.assertFalse(outcome.source_only)
-        self.assertEqual(outcome.evidence, ())
+        # No vault evidence; the minted [D#] input snapshot still ships
+        # (issue #517 DRAFT-016) and source_only stays False.
+        self.assertEqual([ev.label for ev in outcome.evidence], ["D1"])
         self.assertEqual(model.calls, 0)
 
     async def test_partial_outage_with_evidence_is_partial_and_non_waivable(self):
@@ -360,7 +366,10 @@ class TestRetrievalStatusClassification(DraftResearchAsyncTestCase):
         self.assertEqual(outcome.retrieval_status, "partial")
         self.assertEqual(outcome.blockers, ("retrieval_partial",))
         self.assertFalse(outcome.source_only)
-        self.assertEqual(len(outcome.evidence), 1)
+        # S1 retrieved + two minted [D#] input snapshots (two eligible inputs).
+        self.assertEqual(
+            sorted(ev.label for ev in outcome.evidence), ["D1", "D2", "S1"]
+        )
 
     async def test_partial_outage_with_zero_evidence_is_unavailable(self):
         # One facet fully fails, the other succeeds but genuinely finds nothing.
@@ -382,7 +391,9 @@ class TestRetrievalStatusClassification(DraftResearchAsyncTestCase):
 
         self.assertEqual(outcome.retrieval_status, "unavailable")
         self.assertIn("retrieval_unavailable", outcome.blockers)
-        self.assertEqual(outcome.evidence, ())
+        self.assertEqual(
+            sorted(ev.label for ev in outcome.evidence), ["D1", "D2"]
+        )
 
 
 # ── 4. Transient retry bounded by retry_limit, never silently empty ──────────
@@ -404,7 +415,8 @@ class TestTransientRetry(DraftResearchAsyncTestCase):
 
         self.assertEqual(len(retriever.queries), 3)  # 1 original + 2 retries
         self.assertEqual(outcome.retrieval_status, "ok")
-        self.assertEqual(len(outcome.evidence), 1)
+        # S1 retrieved + the minted [D#] input snapshot (issue #517 DRAFT-016).
+        self.assertEqual(len(outcome.evidence), 2)
 
     async def test_transient_error_exhausting_retry_limit_surfaces_as_failed_never_empty_success(
         self,
@@ -422,7 +434,9 @@ class TestTransientRetry(DraftResearchAsyncTestCase):
         self.assertEqual(len(retriever.queries), RETRY_LIMIT + 1)
         self.assertEqual(outcome.retrieval_status, "unavailable")
         self.assertIn("retrieval_unavailable", outcome.blockers)
-        self.assertEqual(outcome.evidence, ())
+        # No vault evidence survives a full outage; the minted [D#] input
+        # snapshot still ships (issue #517 DRAFT-016), never as empty success.
+        self.assertEqual([ev.label for ev in outcome.evidence], ["D1"])
 
 
 # ── 5. Exactly one structured-output repair, then failure ────────────────────
@@ -441,7 +455,8 @@ class TestStructuredOutputRepair(DraftResearchAsyncTestCase):
         )
 
         self.assertEqual(model.calls, 2)
-        self.assertEqual(len(outcome.evidence), 1)
+        # S1 retrieved + the minted [D#] input snapshot (issue #517 DRAFT-016).
+        self.assertEqual(len(outcome.evidence), 2)
 
     async def test_exactly_one_repair_then_failure_raises_research_error(self):
         inputs = [manuscript_input(1, "A claim sentence long enough to be a facet.")]
@@ -499,12 +514,13 @@ class TestAdversarialFabricatedEvidence(DraftResearchAsyncTestCase):
         self.assertNotIn(fabricated_label, labels)
         self.assertNotIn(fabricated_passage, passages)
         self.assertNotIn(fabricated_hash, hashes)
-        # Only the genuinely retrieved evidence survives.
-        self.assertEqual(labels, {"S1"})
-        self.assertEqual(passages, {doc.passage})
+        # Only the genuinely retrieved evidence survives alongside the minted
+        # [D#] input snapshot; the fabricated row is still fully discarded.
+        self.assertEqual(labels, {"S1", "D1"})
+        self.assertEqual(passages, {doc.passage, "A claim sentence long enough to be a facet."})
         # Same discipline holds for the internal snapshot used to persist rows.
         snapshot_labels = {ev.label for ev in outcome.evidence}
-        self.assertEqual(snapshot_labels, {"S1"})
+        self.assertEqual(snapshot_labels, {"S1", "D1"})
 
 
 # ── 7. Adversarial: model's own "ok" claim cannot clear a real partial blocker ─
@@ -593,8 +609,19 @@ class TestPromptInjection(DraftResearchAsyncTestCase):
         self.assertGreaterEqual(len(outcome.packet.facets), 4)
         self.assertEqual(outcome.retrieval_status, "ok")
         self.assertTrue(
-            all(ev.passage == doc.passage for ev in outcome.packet.evidence),
-            "only the genuinely retrieved passage may appear as evidence",
+            all(
+                ev.passage == doc.passage
+                for ev in outcome.packet.evidence
+                if ev.kind != "draft_input"
+            ),
+            "only the genuinely retrieved passage may appear as vault evidence",
+        )
+        # [D#] input snapshots legitimately carry the input text (issue #517
+        # DRAFT-016); they are provenance rows, not fabricated retrieval.
+        self.assertTrue(
+            all(ev.kind == "draft_input" for ev in outcome.packet.evidence
+                if ev.passage != doc.passage),
+            "non-vault evidence passages must be minted [D#] input snapshots",
         )
 
 

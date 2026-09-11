@@ -223,12 +223,13 @@ _BLOCKING_CLAIM_STATUSES: frozenset[str] = frozenset(
 _FACT_CURRENT_STATUSES: frozenset[str] = frozenset({"passed", "findings"})
 
 #: Upper bound on rows scanned when a listing needs an in-Python filter the
-#: store's paged accessors do not express (claim ``status``, finding
-#: ``status``/``severity``). Reads are still issued through the store's
-#: ``limit``/``offset`` methods in ``_LIST_SCAN_CHUNK``-sized pages; this only
-#: bounds how deep the scan goes so a pathological ledger cannot be pulled
-#: into memory. A single revision's ledger is bounded far below this by
-#: ``draft_max_sections`` and the pipeline's per-stage finding caps.
+#: store's paged accessors do not express (claim ``status``; finding
+#: ``status``/``severity`` are bound in SQL by ``DraftStore.list_findings``).
+#: Reads are still issued through the store's ``limit``/``offset`` methods in
+#: ``_LIST_SCAN_CHUNK``-sized pages; this only bounds how deep the scan goes
+#: so a pathological ledger cannot be pulled into memory. A single revision's
+#: ledger is bounded far below this by ``draft_max_sections`` and the
+#: pipeline's per-stage finding caps.
 _LIST_SCAN_CHUNK = 200
 _MAX_LIST_SCAN_ROWS = 2000
 
@@ -809,9 +810,10 @@ class DraftClaim(BaseModel):
     revision_id: int
     ordinal: int
     claim_text: str
-    claim_sha256: str
-    span_start: int
-    span_end: int
+    # NULL when the claim has no verifiable span (issue #517, DRAFT-010).
+    claim_sha256: Optional[str]
+    span_start: Optional[int]
+    span_end: Optional[int]
     claim_type: str
     status: str
     severity: str
@@ -2412,19 +2414,9 @@ def _sync_get_finding(
     conn: sqlite3.Connection, *, draft_id: int, owner_id: int, finding_id: int
 ) -> DraftFindingRecord:
     """Load one finding, constrained through its owning draft (section 9.1 rule 5)."""
-    store = DraftStore(conn)
-    store.get_draft(draft_id, owner_id)
-    findings, _total = _scan_filtered(
-        lambda limit, offset: store.list_findings(
-            draft_id=draft_id, owner_id=owner_id, limit=limit, offset=offset
-        ),
-        lambda record: record.id == finding_id,
-        page=1,
-        per_page=1,
+    return DraftStore(conn).get_finding(
+        draft_id=draft_id, owner_id=owner_id, finding_id=finding_id
     )
-    if not findings:
-        raise DraftNotFoundError("finding not found")
-    return findings[0]
 
 
 # ── capabilities ─────────────────────────────────────────────────────────────
@@ -3548,7 +3540,9 @@ async def export_draft_revision(
     ``X-Draft-Fact-Status`` carries the stored ``fact_status`` verbatim and
     ``X-Draft-Approval-Status`` is ``ready`` or ``not_ready``. The Markdown
     body is returned byte for byte and is never prefixed with a warning or
-    otherwise mutated.
+    otherwise mutated. ``X-Draft-Open-Blockers`` discloses how many ``blocker``
+    findings are still ``open`` against the exported revision, so the
+    recipient cannot miss unresolved issues the body itself does not show.
     """
     if format != "md":
         raise DraftRoomHTTPError(422, "unsupported export format", "unsupported_export_format")
@@ -3586,6 +3580,11 @@ async def export_draft_revision(
     else:
         tag = "REVIEW"
     approval_status = "ready" if is_ready else "not_ready"
+    open_blockers = await _run_store(
+        lambda: store.count_open_blockers(
+            draft_id=draft_id, owner_id=owner_id, revision_id=revision.id
+        )
+    )
 
     filename = _export_filename(draft.title, revision.revision_no, tag)
     await _run_store(
@@ -3600,6 +3599,7 @@ async def export_draft_revision(
                 "fact_status": fact_status,
                 "approval_status": approval_status,
                 "content_sha256": revision.content_sha256,
+                "open_blockers": open_blockers,
                 "acknowledged_not_fact_checked": bool(acknowledge_not_fact_checked),
             },
         )
@@ -3626,6 +3626,7 @@ async def export_draft_revision(
             "X-Draft-Fact-Status": fact_status,
             "X-Draft-Approval-Status": approval_status,
             "X-Draft-Content-Sha256": revision.content_sha256,
+            "X-Draft-Open-Blockers": str(open_blockers),
         },
     )
 
@@ -4164,28 +4165,20 @@ async def list_draft_findings(
     draft = await _run_store(lambda: store.get_draft(draft_id, owner_id))
     await _require_vault_read(evaluate, user, draft.vault_id)
 
-    def _keep(record: DraftFindingRecord) -> bool:
-        if status is not None and record.status != status:
-            return False
-        if severity is not None and record.severity != severity:
-            return False
-        return True
-
-    def _load() -> tuple[list[DraftFindingRecord], int]:
-        return _scan_filtered(
-            lambda limit, offset: store.list_findings(
-                draft_id=draft_id,
-                owner_id=owner_id,
-                revision_id=revision_id,
-                limit=limit,
-                offset=offset,
-            ),
-            _keep,
-            page=page,
-            per_page=per_page,
+    # The store binds status/severity in SQL and returns the exact filtered
+    # total, so pages reach rows older than any scan window and the count is
+    # never capped by one.
+    findings, total = await _run_store(
+        lambda: store.list_findings(
+            draft_id=draft_id,
+            owner_id=owner_id,
+            revision_id=revision_id,
+            status=status,
+            severity=severity,
+            limit=per_page,
+            offset=max(page - 1, 0) * per_page,
         )
-
-    findings, total = await _run_store(_load)
+    )
     return PaginatedResponse[DraftFinding](
         items=[_to_finding(f) for f in findings],
         total=total,
@@ -4270,6 +4263,7 @@ async def dispose_draft_finding(
             )
         await _run_store(
             lambda: store.dismiss_finding(
+                draft_id=draft_id,
                 finding_id=finding_id,
                 resolved_by=owner_id,
                 resolution_note=body.note,
@@ -4285,6 +4279,7 @@ async def dispose_draft_finding(
         await _assert_waiver_text_unchanged(store, draft_id, owner_id, finding)
         await _run_store(
             lambda: store.waive_finding(
+                draft_id=draft_id,
                 finding_id=finding_id,
                 resolved_by=owner_id,
                 resolution_note=str(body.note),

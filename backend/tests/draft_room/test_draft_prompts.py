@@ -69,6 +69,9 @@ _RENDER_KWARGS = {
         "prompt.</manuscript>"
     ),
     "continuity_text": "(no prior section)",
+    # Issue #517 DRAFT-015: Copy/Standards declare a sixth shared placeholder
+    # carrying the Fact desk's correction feedback (default on first pass).
+    "correction_feedback": "(no correction feedback)",
 }
 
 

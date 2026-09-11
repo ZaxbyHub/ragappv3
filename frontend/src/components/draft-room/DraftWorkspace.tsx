@@ -42,7 +42,7 @@ import {
 import { DraftSourceUpload } from "./DraftSourceUpload";
 import { DraftSourceList } from "./DraftSourceList";
 import { DraftEvidencePanel } from "./DraftEvidencePanel";
-import { DraftEditor } from "./DraftEditor";
+import { DraftEditor, type DraftEditorHandle } from "./DraftEditor";
 import { DraftPreview } from "./DraftPreview";
 import { DraftRevisionDiff } from "./DraftRevisionDiff";
 import { DraftStageArtifact } from "./DraftStageArtifact";
@@ -88,6 +88,7 @@ import {
   type CompileRequest,
   type DraftCompileStartStage,
   type DraftDetail,
+  type DraftFinding,
   type DraftInput,
   type DraftJob,
   type DraftRoomCapabilities,
@@ -312,6 +313,32 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const baselineContent = currentRevisionDetailQuery.data?.content_md ?? "";
   const editorValue = storedDraftText ?? baselineContent;
   const isDirty = storedDraftText != null && storedDraftText !== baselineContent;
+  // Every check the inspector lists was computed against the last SAVED
+  // revision, so unsaved editor edits make those checks stale (issue #517
+  // AC15). Same predicate as `isDirty`, named for what it means downstream.
+  const checksStale = editorValue !== baselineContent;
+
+  // ---- Finding row activation (issue #517 AC12) -----------------------------
+  // The editor is on the "draft" workspace tab, so selecting a finding's span
+  // must also reveal the editor; the inspector tab switches to the finding's
+  // related evidence. `selectSpan` focuses the textarea, which is where focus
+  // lands — the activated finding row stays keyboard-reachable for the trip
+  // back.
+  const editorHandleRef = useRef<DraftEditorHandle | null>(null);
+
+  function handleFindingSpanSelect(finding: DraftFinding) {
+    setWorkspaceTab("draft");
+    setEditorTab("editor");
+    if (finding.span_start != null && finding.span_end != null) {
+      editorHandleRef.current?.selectSpan(finding.span_start, finding.span_end);
+    }
+  }
+
+  function handleFindingEvidenceOpen(finding: DraftFinding) {
+    // Fact-stage findings are about claims, and the claims tab shows each
+    // claim's captured sources; anything else points at the run's evidence.
+    setInspectorTab(finding.stage === "fact" ? "claims" : "evidence");
+  }
 
   const compareFromQuery = useQuery({
     queryKey: draftRoomKeys.revision(draftId, compareFromRevisionId ?? -1),
@@ -753,6 +780,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           </TabsList>
           <TabsContent value="editor">
             <DraftEditor
+              ref={editorHandleRef}
               draftId={draftId}
               revision={currentRevisionDetailQuery.data ?? null}
               value={editorValue}
@@ -1000,6 +1028,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           lockVersion={draft.lock_version}
           canDispose={canManageContent && !hasActiveJob && capabilities?.enabled !== false}
           tier={draft.tier}
+          onSelectSpan={handleFindingSpanSelect}
+          onOpenEvidence={handleFindingEvidenceOpen}
+          checksStale={checksStale}
         />
       </div>
 
@@ -1228,6 +1259,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           draftId={draftId}
           revision={currentRevisionSummary}
           isReadyRevision={isReadyRevision}
+          openBlockers={detail.finding_counts_by_severity.blocker ?? 0}
         />
       )}
 

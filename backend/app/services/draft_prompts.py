@@ -41,7 +41,7 @@ from pydantic import BaseModel, Field, ValidationInfo, field_validator
 # Bundle version
 # ---------------------------------------------------------------------------
 
-PROMPT_BUNDLE_VERSION = "2026.08.22-draft-prompts-2"
+PROMPT_BUNDLE_VERSION = "2026.09.11-draft-prompts-3"
 
 # ---------------------------------------------------------------------------
 # Shared enums / literals (SPEC §4.4, §11, §12.3, §13)
@@ -49,6 +49,11 @@ PROMPT_BUNDLE_VERSION = "2026.08.22-draft-prompts-2"
 
 LogicalMode = Literal["instant", "thinking", "editorial"]
 SourceKind = Literal["document", "wiki", "kms"]
+
+#: Evidence item kinds: vault retrieval families plus the ``[D#]``
+#: project-input snapshots minted at research time (SPEC §12.2). Retrieval
+#: *status* lists only ever carry :data:`SourceKind` values.
+EvidenceKind = Literal["document", "wiki", "kms", "draft_input"]
 RetrievalStatus = Literal["ok", "partial", "unavailable"]
 OutlineMode = Literal["rewrite", "compose"]
 CriticVerdict = Literal["approved", "needs_revision", "rejected"]
@@ -162,7 +167,7 @@ class ResearchFacet(BaseModel):
 
 class ResearchEvidenceItem(BaseModel):
     label: str
-    kind: SourceKind
+    kind: EvidenceKind
     title: str
     passage: str
     chunk_ref: str | None = None
@@ -176,6 +181,9 @@ class ResearchEvidenceItem(BaseModel):
     wiki_page_id: int | None = None
     wiki_claim_id: int | None = None
     kms_entry_id: int | None = None
+    # Populated only for ``[D#]`` project-input snapshots minted at research
+    # time (SPEC §12.2); vault-retrieved evidence never carries it.
+    draft_input_id: int | None = None
 
     @field_validator("content_sha256")
     @classmethod
@@ -399,8 +407,9 @@ def _frame(
     brief_section: str,
     schema_section: str,
     example_section: str = "",
+    correction_block: bool = False,
 ) -> str:
-    return (
+    template = (
         f"PROMPT_ID: {prompt_id}\n"
         f"PROMPT_VERSION: {version}\n\n"
         f"ROLE: {role}\n\n"
@@ -420,10 +429,21 @@ def _frame(
         f"{{locked_spans}}\n</untrusted_data>\n\n"
         f"<untrusted_data name=\"upstream_artifact\">\n"
         f"{{upstream_artifact}}\n</untrusted_data>\n\n"
-        f"{schema_section}\n\n"
-        + (f"{example_section}\n\n" if example_section else "")
-        + f"{_OUTPUT_CONTRACT_NOTICE}"
     )
+    if correction_block:
+        # SPEC §11.8: a correction retry must tell the desks WHAT to repair.
+        # The block is DATA (the Fact desk's findings about the current
+        # candidate) and defaults to "(no correction feedback)" on the first
+        # pass, so the render contract stays symmetric across loops.
+        template += (
+            "<untrusted_data name=\"correction_feedback\">\n"
+            "{correction_feedback}\n</untrusted_data>\n\n"
+        )
+    template += f"{schema_section}\n\n"
+    if example_section:
+        template += f"{example_section}\n\n"
+    template += f"{_OUTPUT_CONTRACT_NOTICE}"
+    return template
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +567,7 @@ _COPY_VERSION = "1.0.0"
 _COPY_TEMPLATE = _frame(
     prompt_id=_COPY_PROMPT_ID,
     version=_COPY_VERSION,
+    correction_block=True,
     role=(
         "You are the Copy desk of an editorial drafting pipeline. You review "
         "one section for grammar, clarity, flow, redundancy, tone, "
@@ -574,6 +595,7 @@ _STANDARDS_VERSION = "1.0.0"
 _STANDARDS_TEMPLATE = _frame(
     prompt_id=_STANDARDS_PROMPT_ID,
     version=_STANDARDS_VERSION,
+    correction_block=True,
     role=(
         "You are the Standards desk of an editorial drafting pipeline. You "
         "check for stock framing, mechanical rhythm, repeated structures, "

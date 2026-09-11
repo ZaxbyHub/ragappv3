@@ -26,10 +26,13 @@ import {
 } from "@/lib/api/draftRoom";
 import {
   ARCHIVED_READ_ONLY_WARNING,
+  FINDING_CATEGORY_LABELS,
+  FINDINGS_STALE_NOTICE,
   READY_BLOCKER_LABELS,
   STAGE_LABELS,
   TIER_DESCRIPTIONS,
   VAULT_ACCESS_REVOKED_WARNING,
+  findingExplanation,
 } from "@/components/draft-room/labels";
 import { useDraftRoomUiStore } from "@/stores/useDraftRoomUiStore";
 import { cn } from "@/lib/utils";
@@ -44,6 +47,24 @@ export interface DraftFindingsPanelProps {
   /** Drives the tier-specific consequence shown before confirming a waiver. */
   tier: DraftTier;
   onRevisionCreated?(revision: DraftRevisionSummary): void;
+  /**
+   * Sent when a finding row is activated (click or keyboard): asks the owner
+   * of the editor to select the finding's span in the manuscript (issue #517
+   * AC12).
+   */
+  onSelectSpan?(finding: DraftFinding): void;
+  /**
+   * Sent when a finding row is activated: asks the owner of the inspector to
+   * open the finding's related evidence (claims for fact-stage findings,
+   * captured evidence otherwise).
+   */
+  onOpenEvidence?(finding: DraftFinding): void;
+  /**
+   * True while the editor holds unsaved edits — every check this panel lists
+   * was computed against the last SAVED revision, so a stale notice is shown
+   * (issue #517 AC15).
+   */
+  checksStale?: boolean;
 }
 
 const DEFAULT_PER_PAGE = 20;
@@ -133,12 +154,28 @@ interface FindingRowProps {
   isMutating: boolean;
   waiveOpen: boolean;
   waiveReason: string;
+  /** True only when the panel was given span/evidence activation handlers. */
+  canActivate: boolean;
+  onActivate(): void;
   onWaiveReasonChange(value: string): void;
   onStartWaive(): void;
   onCancelWaive(): void;
   onApply(): void;
   onDismiss(): void;
   onConfirmWaive(): void;
+}
+
+/**
+ * Interactive descendants of a finding row (disposition buttons, the waiver
+ * form, the diagnostics disclosure) own their activation — a click that
+ * originates inside one of them must never also trigger the row's
+ * span/evidence activation.
+ */
+function isRowControlTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    target.closest("button,a,input,textarea,select,summary,details,label") != null
+  );
 }
 
 function FindingRow({
@@ -149,6 +186,8 @@ function FindingRow({
   isMutating,
   waiveOpen,
   waiveReason,
+  canActivate,
+  onActivate,
   onWaiveReasonChange,
   onStartWaive,
   onCancelWaive,
@@ -161,9 +200,22 @@ function FindingRow({
   const actionsDisabled = !canDispose || conflict || isMutating;
   const reasonId = `waive-reason-${finding.id}`;
   const reasonHintId = `waive-reason-hint-${finding.id}`;
+  const explanationId = `finding-explanation-${finding.id}`;
+  const stageLabel = STAGE_LABELS[finding.stage] ?? finding.stage;
+  const categoryLabel = FINDING_CATEGORY_LABELS[finding.category] ?? finding.category;
+
+  function handleRowClick(event: React.MouseEvent<HTMLLIElement>) {
+    if (isRowControlTarget(event.target)) return;
+    onActivate();
+  }
 
   return (
-    <li className="rounded-sm border border-border p-4">
+    // eslint-disable-next-line jsx-a11y-x/click-events-have-key-events, jsx-a11y-x/no-noninteractive-element-interactions -- The row-level click is a pointer convenience for the whole card; keyboard activation goes through the fully operable "Show in editor" button inside the row, and the li must keep its listitem role (flattening it to a button would break the findings-list semantics).
+    <li
+      className="rounded-sm border border-border p-4"
+      aria-describedby={explanationId}
+      onClick={canActivate ? handleRowClick : undefined}
+    >
       <div className="flex flex-wrap items-center gap-2">
         <Badge variant="outline" className={severityMeta.className}>
           <SeverityIcon className="mr-1 h-3 w-3" aria-hidden="true" />
@@ -171,17 +223,41 @@ function FindingRow({
         </Badge>
         <Badge variant="secondary">{STATUS_LABEL[finding.status]}</Badge>
         <span className="text-xs text-muted-foreground">
-          {(STAGE_LABELS[finding.stage] ?? finding.stage) +
-            " · " +
-            finding.category +
-            " · " +
-            finding.rule_id +
-            " v" +
-            finding.rule_version}
+          {stageLabel} · {categoryLabel}
         </span>
+        {canActivate && (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="ml-auto"
+            aria-label={`Show finding in editor: ${stageLabel} (${finding.rule_id})`}
+            onClick={onActivate}
+          >
+            Show in editor
+          </Button>
+        )}
       </div>
 
       <p className="mt-2 text-sm text-foreground">{finding.message}</p>
+
+      <p id={explanationId} className="mt-1 text-xs text-muted-foreground">
+        {findingExplanation(finding.rule_id, finding.category)}
+      </p>
+
+      <details className="mt-2 text-xs text-muted-foreground" data-diagnostic>
+        <summary className="cursor-pointer select-none">Diagnostics</summary>
+        <dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5">
+          <dt className="font-medium">Rule</dt>
+          <dd className="truncate font-mono">{finding.rule_id}</dd>
+          <dt className="font-medium">Category</dt>
+          <dd>{finding.category}</dd>
+          <dt className="font-medium">Rule version</dt>
+          <dd>{finding.rule_version}</dd>
+          <dt className="font-medium">Stage</dt>
+          <dd>{finding.stage}</dd>
+        </dl>
+      </details>
 
       {(finding.original_text != null || finding.suggestion != null) && (
         <div className="mt-2 space-y-1 overflow-x-auto rounded-sm bg-muted/50 p-2 text-xs">
@@ -284,6 +360,9 @@ export function DraftFindingsPanel({
   canDispose,
   tier,
   onRevisionCreated,
+  onSelectSpan,
+  onOpenEvidence,
+  checksStale = false,
 }: DraftFindingsPanelProps) {
   const queryClient = useQueryClient();
   const severityFilter = useDraftRoomUiStore((s) => s.findingSeverityFilter) as DraftFindingSeverity | null;
@@ -358,9 +437,22 @@ export function DraftFindingsPanel({
 
   const items = findingsQuery.data?.items ?? [];
   const total = findingsQuery.data?.total ?? 0;
+  const canRowActivate = onSelectSpan != null || onOpenEvidence != null;
+
+  function activateFinding(finding: DraftFinding) {
+    onSelectSpan?.(finding);
+    onOpenEvidence?.(finding);
+  }
 
   return (
     <div className="space-y-4">
+      {checksStale && (
+        <Alert variant="warning">
+          <AlertTitle>Checks may not cover your latest edits</AlertTitle>
+          <AlertDescription>{FINDINGS_STALE_NOTICE}</AlertDescription>
+        </Alert>
+      )}
+
       {conflict && (
         <Alert variant="destructive">
           <AlertTitle>Conflict</AlertTitle>
@@ -442,6 +534,8 @@ export function DraftFindingsPanel({
               }
               waiveOpen={waivingFindingId === finding.id}
               waiveReason={waiveReason}
+              canActivate={canRowActivate}
+              onActivate={() => activateFinding(finding)}
               onWaiveReasonChange={setWaiveReason}
               onStartWaive={() => {
                 setWaivingFindingId(finding.id);

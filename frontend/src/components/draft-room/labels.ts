@@ -120,7 +120,105 @@ export const CLAIM_STATUS_LABELS: Record<string, string> = {
   opinion: "Opinion",
 };
 
-/** Fact-check status display names. */
+/**
+ * Finding category display names. Human labels only — the raw category code
+ * stays available on demand through each finding row's diagnostics disclosure.
+ */
+export const FINDING_CATEGORY_LABELS: Record<string, string> = {
+  boilerplate: "Boilerplate",
+  style: "Style",
+  preservation: "Preservation",
+  factuality: "Factuality",
+  quote: "Quotes",
+  citation: "Citations",
+  conflict: "Source conflict",
+  security: "Security",
+  operational: "Operational",
+};
+
+/**
+ * Sentence-case explanations for finding categories, used when no
+ * rule-specific explanation exists. Never embeds the raw rule id or category
+ * code — those live in the diagnostics disclosure (issue #517 AC13a).
+ */
+export const FINDING_CATEGORY_EXPLANATIONS: Record<string, string> = {
+  boilerplate: "This finding rewrites stock filler phrasing so the piece makes a specific claim.",
+  style: "This finding concerns wording and style, not the factual accuracy of the draft.",
+  preservation: "This finding protects text that must stay unchanged, such as quotes, numbers, and uncertainty.",
+  factuality: "This finding concerns how a claim in the draft lines up with the evidence captured for this run.",
+  quote: "This finding concerns quoted material and how it is attributed.",
+  citation: "This finding concerns the citation labels attached to the draft.",
+  conflict: "This finding marks a conflict between the draft and the captured sources.",
+  security: "This finding marks content that must not leave the vault.",
+  operational: "This finding reports how the newsroom run itself behaved.",
+};
+
+/**
+ * Rule-specific explanations, keyed by exact rule id where the id is fixed
+ * (e.g. `structure_signal.triad_overuse`) or by the rule family prefix where
+ * the tail is data-dependent (`blocked_boilerplate.<slug>`,
+ * `review_vocabulary.<word>`, `fact.claim_<status>`).
+ */
+export const FINDING_RULE_EXPLANATIONS: Record<string, string> = {
+  blocked_boilerplate: "A stock phrase was flagged for rewriting without changing the claim.",
+  review_vocabulary: "A context-sensitive word was flagged for editorial review.",
+  "structure_signal.repeated_openers": "Several sentences open the same way, which reads as mechanical.",
+  "structure_signal.triad_overuse": "Rule-of-three constructions appear too often in a row.",
+  "structure_signal.uniform_sentence_length": "Sentence lengths are too uniform, which flattens the rhythm.",
+  "structure_signal.transition_density": "Transition words are packed too closely together.",
+  "readability_signal.passive_voice": "Passive voice leaves the actor unclear.",
+  "readability_signal.long_sentence": "The sentence is long enough to slow the reader down.",
+  "readability_signal.flesch_score": "Overall readability sits below the target band for this piece.",
+  "citation.unknown_label_removed": "A citation label the system does not recognise was removed.",
+  "fact.claim_span_unresolved": "A claim could not be matched to the text it was checked against.",
+  "fact.evidence_label_not_snapshotted": "A claim cites evidence that was not captured for this run.",
+  "fact.quote_mismatch": "A quote in the draft does not match the captured source passage.",
+  "fact.single_source_high_stakes": "A high-stakes claim rests on a single source.",
+  "fact.claim_supported": "The captured evidence establishes support for this claim.",
+  "fact.claim_contradicted": "The captured evidence contradicts this claim.",
+  "fact.claim_ambiguous": "The captured evidence does not settle this claim either way.",
+  "fact.claim_stale": "The evidence behind this claim changed after it was checked.",
+  "fact.claim_unsupported": "No captured evidence establishes support for this claim.",
+  "fact.claim_opinion": "This passage states an opinion, so it is not held to factual support.",
+  fact: "This finding concerns how a claim in the draft lines up with the captured evidence.",
+};
+
+/**
+ * Resolves the human-readable explanation for a finding. Prefers the exact
+ * rule id, then the rule family (the segment before the first dot), then the
+ * category explanation — so an unseen rule id still renders a plain sentence
+ * instead of a raw code.
+ */
+export function findingExplanation(ruleId: string, category: string): string {
+  const exact = FINDING_RULE_EXPLANATIONS[ruleId];
+  if (exact) return exact;
+  const family = FINDING_RULE_EXPLANATIONS[ruleId.split(".")[0] ?? ""];
+  if (family) return family;
+  return (
+    FINDING_CATEGORY_EXPLANATIONS[category] ??
+    "This finding reports an issue the newsroom checks flagged in the draft."
+  );
+}
+
+/**
+ * Shown on the findings panel while the editor holds unsaved edits (issue
+ * #517 AC15). The findings, claims, and evidence were computed against the
+ * last saved revision — never against text still being typed.
+ */
+export const FINDINGS_STALE_NOTICE =
+  "Checks reflect the last saved revision. They do not cover unsaved edits, and saving your edits " +
+  "invalidates the affected checks and any Ready approval.";
+
+/**
+ * Fact-check status display names.
+ *
+ * `passed` deliberately stays "Fact-checked": it reports that the fact-check
+ * stage RAN against this revision — never that every claim is supported
+ * (per-claim support is established separately) and never that a human
+ * approved anything. `DraftRevisionDiff` and the promote dialog render this
+ * exact string, and the export dialog adds `EXPORT_STATUS_EXPLANATION`
+ * beneath it so the distinction is stated where approval decisions happen.
+ */
 export const FACT_STATUS_LABELS: Record<string, string> = {
   not_run: "Not fact-checked",
   running: "Fact-checking",
@@ -232,6 +330,39 @@ export const EXPORT_READY_EXPLANATION =
   "This is the approved Ready revision, so the file uses the ordinary project filename.";
 export const EXPORT_ACK_LABEL =
   "I understand this revision has not passed a current fact-check.";
+
+/**
+ * States the three distinct things the export dialog reports, so a completed
+ * fact check cannot be read as per-claim support or as approval (issue #517
+ * AC13): fact status says the fact-check stage completed against this
+ * revision; "Supported" is established per claim by the captured evidence;
+ * Ready is a human approval recorded separately.
+ */
+export const EXPORT_STATUS_EXPLANATION =
+  "Fact status reports that the fact-check stage completed against this revision. Support for each " +
+  "claim is established separately by the captured evidence, and Ready is a human approval recorded " +
+  "on top of both.";
+
+/**
+ * Unresolved-blocker disclosure shown in the export dialog BEFORE the export
+ * action is used (issue #517 AC13b). Count is the revision's open blocker
+ * findings.
+ */
+export function exportOpenBlockersText(count: number): string {
+  const noun = count === 1 ? "blocker" : "blockers";
+  const pronoun = count === 1 ? "it" : "them";
+  return `This revision has ${count} unresolved ${noun} finding${count === 1 ? "" : "s"}. ` +
+    `Resolve or waive ${pronoun} before this draft can be marked Ready.`;
+}
+
+/**
+ * Helper copy beside the brief-template controls (issue #517 AC14). Templates
+ * carry the brief only — never evidence, fact-check, approval, or readiness
+ * state — and compiling re-retrieves sources from scratch.
+ */
+export const BRIEF_TEMPLATE_HELP =
+  "Templates fill the brief fields only. They never carry evidence, fact-check, approval, or " +
+  "readiness state, and sources are re-retrieved whenever the newsroom runs.";
 
 /** Save-revision consequence, shown in the confirmation dialog. */
 export const SAVE_REVISION_CONSEQUENCE =

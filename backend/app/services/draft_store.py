@@ -676,9 +676,11 @@ class DraftClaimRecord:
     revision_id: int
     ordinal: int
     claim_text: str
-    claim_sha256: str
-    span_start: int
-    span_end: int
+    # NULL when the claim has no verifiable span (issue #517, DRAFT-010):
+    # no anchor, no span hash.
+    claim_sha256: Optional[str]
+    span_start: Optional[int]
+    span_end: Optional[int]
     claim_type: str
     status: str
     severity: str
@@ -3027,8 +3029,8 @@ class DraftStore:
         revision_id: int,
         ordinal: int,
         claim_text: str,
-        span_start: int,
-        span_end: int,
+        span_start: Optional[int],
+        span_end: Optional[int],
         claim_type: str,
         status: str,
         severity: str,
@@ -3036,6 +3038,10 @@ class DraftStore:
         retrieval_audit_json: str = "{}",
     ) -> int:
         """Insert one immutable claim, hashing its exact revision span.
+
+        A claim whose span is ``None`` (its proposition could not be located
+        verbatim in the revision) is stored with NULL span columns and no
+        span hash — never a fabricated anchor (issue #517, DRAFT-010).
 
         Raises:
             DraftValidationError: An enum value is unknown, or the span is out
@@ -3056,7 +3062,13 @@ class DraftStore:
             ).fetchone()
             if row is None:
                 raise DraftNotFoundError("revision not found")
-            claim_sha256 = validate_claim_span(row[0], span_start, span_end)
+            anchored = span_start is not None and span_end is not None
+            if anchored:
+                claim_sha256: Optional[str] = validate_claim_span(
+                    row[0], span_start, span_end
+                )
+            else:
+                claim_sha256 = None
             try:
                 cur = self._db.execute(
                     "INSERT INTO draft_claims (revision_id, ordinal, claim_text, "
@@ -3068,8 +3080,8 @@ class DraftStore:
                         ordinal,
                         claim_text,
                         claim_sha256,
-                        span_start,
-                        span_end,
+                        span_start if anchored else None,
+                        span_end if anchored else None,
                         claim_type,
                         status,
                         severity,
@@ -3335,11 +3347,25 @@ class DraftStore:
         owner_id: int,
         revision_id: Optional[int] = None,
         job_id: Optional[int] = None,
+        status: Optional[str] = None,
+        severity: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
-    ) -> list[DraftFindingRecord]:
-        """Page through a draft's findings, newest first."""
+    ) -> tuple[list[DraftFindingRecord], int]:
+        """Page through a draft's findings, newest first.
+
+        ``status``/``severity`` are bound in SQL, so a filtered page reaches
+        rows older than any Python-side scan window and ``total`` is the exact
+        filtered row count, not a scan-window cap.
+
+        Raises:
+            DraftValidationError: ``status``/``severity`` is not a known value.
+        """
         self.get_draft(draft_id, owner_id)
+        if status is not None and status not in FINDING_STATUSES:
+            raise DraftValidationError(f"unknown finding status: {status!r}")
+        if severity is not None and severity not in FINDING_SEVERITIES:
+            raise DraftValidationError(f"unknown finding severity: {severity!r}")
         where = ["draft_id = ?"]
         params: list[Any] = [draft_id]
         if revision_id is not None:
@@ -3348,24 +3374,72 @@ class DraftStore:
         if job_id is not None:
             where.append("job_id = ?")
             params.append(job_id)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        if severity is not None:
+            where.append("severity = ?")
+            params.append(severity)
         clause = " AND ".join(where)
+        # clause is built only from literal fragments; all values are bound parameters
+        total = int(
+            self._db.execute(
+                f"SELECT COUNT(*) FROM draft_findings WHERE {clause}", params  # nosec B608
+            ).fetchone()[0]
+        )
         # clause is built only from literal fragments; all values are bound parameters
         rows = self._db.execute(
             f"SELECT {_FINDING_COLUMNS} FROM draft_findings WHERE {clause} "  # nosec B608
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (*params, limit, offset),
         ).fetchall()
-        return [_row_to_finding(r) for r in rows]
+        return [_row_to_finding(r) for r in rows], total
+
+    def get_finding(
+        self, *, draft_id: int, owner_id: int, finding_id: int
+    ) -> DraftFindingRecord:
+        """Load one finding, constrained through its owning draft.
+
+        Raises:
+            DraftNotFoundError: The draft or the finding does not exist.
+        """
+        self.get_draft(draft_id, owner_id)
+        row = self._db.execute(
+            f"SELECT {_FINDING_COLUMNS} FROM draft_findings "  # nosec B608
+            "WHERE id = ? AND draft_id = ?",
+            (finding_id, draft_id),
+        ).fetchone()
+        if row is None:
+            raise DraftNotFoundError("finding not found")
+        return _row_to_finding(row)
+
+    def count_open_blockers(
+        self, *, draft_id: int, owner_id: int, revision_id: int
+    ) -> int:
+        """Count one revision's unresolved ``blocker`` findings.
+
+        The export route discloses this count (header + audit event) so a
+        downloaded revision cannot carry hidden blockers.
+        """
+        self.get_draft(draft_id, owner_id)
+        row = self._db.execute(
+            "SELECT COUNT(*) FROM draft_findings WHERE draft_id = ? AND "
+            "revision_id = ? AND severity = 'blocker' AND status = 'open'",
+            (draft_id, revision_id),
+        ).fetchone()
+        return int(row[0])
 
     def apply_finding(
         self,
         *,
+        draft_id: int,
         finding_id: int,
         resolved_by: int,
         resolution_note: Optional[str] = None,
     ) -> None:
         """Mark a finding ``applied`` (its suggested fix was incorporated)."""
         self._set_finding_status(
+            draft_id=draft_id,
             finding_id=finding_id,
             target="applied",
             resolved_by=resolved_by,
@@ -3375,6 +3449,7 @@ class DraftStore:
     def dismiss_finding(
         self,
         *,
+        draft_id: int,
         finding_id: int,
         resolved_by: int,
         resolution_note: Optional[str] = None,
@@ -3382,18 +3457,20 @@ class DraftStore:
         """Mark a finding ``dismissed``.
 
         Raises:
-            DraftNotFoundError: The finding does not exist.
+            DraftNotFoundError: The finding does not exist in this draft.
             DraftValidationError: The finding is a ``blocker`` — blockers
                 cannot be dismissed, only applied or waived.
         """
         row = self._db.execute(
-            "SELECT severity FROM draft_findings WHERE id = ?", (finding_id,)
+            "SELECT severity FROM draft_findings WHERE id = ? AND draft_id = ?",
+            (finding_id, draft_id),
         ).fetchone()
         if row is None:
             raise DraftNotFoundError("finding not found")
         if row[0] == "blocker":
             raise DraftValidationError("blocker findings cannot be dismissed")
         self._set_finding_status(
+            draft_id=draft_id,
             finding_id=finding_id,
             target="dismissed",
             resolved_by=resolved_by,
@@ -3403,6 +3480,7 @@ class DraftStore:
     def waive_finding(
         self,
         *,
+        draft_id: int,
         finding_id: int,
         resolved_by: int,
         resolution_note: str,
@@ -3412,7 +3490,7 @@ class DraftStore:
         """Mark a finding ``waived``.
 
         Raises:
-            DraftNotFoundError: The finding does not exist.
+            DraftNotFoundError: The finding does not exist in this draft.
             DraftValidationError: The finding is not ``waivable``, or
                 ``resolution_note`` is empty.
         """
@@ -3423,8 +3501,9 @@ class DraftStore:
         self._begin_immediate()
         try:
             row = self._db.execute(
-                "SELECT status, waivable FROM draft_findings WHERE id = ?",
-                (finding_id,),
+                "SELECT status, waivable FROM draft_findings "
+                "WHERE id = ? AND draft_id = ?",
+                (finding_id, draft_id),
             ).fetchone()
             if row is None:
                 raise DraftNotFoundError("finding not found")
@@ -3437,13 +3516,15 @@ class DraftStore:
             self._db.execute(
                 "UPDATE draft_findings SET status = 'waived', resolved_by = ?, "
                 "resolved_at = CURRENT_TIMESTAMP, resolution_note = ?, "
-                "waiver_rule_version = ?, waiver_text_sha256 = ? WHERE id = ?",
+                "waiver_rule_version = ?, waiver_text_sha256 = ? "
+                "WHERE id = ? AND draft_id = ?",
                 (
                     resolved_by,
                     resolution_note,
                     waiver_rule_version,
                     waiver_text_sha256,
                     finding_id,
+                    draft_id,
                 ),
             )
             self._db.commit()
@@ -3454,6 +3535,7 @@ class DraftStore:
     def _set_finding_status(
         self,
         *,
+        draft_id: int,
         finding_id: int,
         target: str,
         resolved_by: Optional[int],
@@ -3462,7 +3544,8 @@ class DraftStore:
         self._begin_immediate()
         try:
             row = self._db.execute(
-                "SELECT status FROM draft_findings WHERE id = ?", (finding_id,)
+                "SELECT status FROM draft_findings WHERE id = ? AND draft_id = ?",
+                (finding_id, draft_id),
             ).fetchone()
             if row is None:
                 raise DraftNotFoundError("finding not found")
@@ -3472,8 +3555,9 @@ class DraftStore:
             )
             self._db.execute(
                 "UPDATE draft_findings SET status = ?, resolved_by = ?, "
-                "resolved_at = CURRENT_TIMESTAMP, resolution_note = ? WHERE id = ?",
-                (target, resolved_by, resolution_note, finding_id),
+                "resolved_at = CURRENT_TIMESTAMP, resolution_note = ? "
+                "WHERE id = ? AND draft_id = ?",
+                (target, resolved_by, resolution_note, finding_id, draft_id),
             )
             self._db.commit()
         except Exception:
