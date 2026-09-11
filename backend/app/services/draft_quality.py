@@ -198,13 +198,18 @@ def _find_fenced_code_blocks(text: str) -> list[tuple[int, int]]:
         offset += len(raw_line)
         if opener is not None:
             stripped = line.lstrip(" \t")
+            # CommonMark §4.4: a closing fence may be followed only by spaces
+            # or tabs, so the marker must be compared with trailing whitespace
+            # stripped (the opener side already tolerates it via the info
+            # string).
+            closer = stripped.rstrip(" \t")
             indent = len(line) - len(stripped)
             if (
                 indent <= 3
-                and stripped
-                and set(stripped) == {opener[0]}
-                and len(stripped) >= opener[1]
-                and not stripped.startswith("\\")
+                and closer
+                and set(closer) == {opener[0]}
+                and len(closer) >= opener[1]
+                and not closer.startswith("\\")
             ):
                 spans.append((opener[2], line_start + len(line)))
                 opener = None

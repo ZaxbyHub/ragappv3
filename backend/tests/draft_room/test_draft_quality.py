@@ -107,6 +107,28 @@ class TestMaskingExclusions(unittest.TestCase):
     def test_phrase_inside_fenced_code_is_excluded(self) -> None:
         self._assert_no_blocker(f"Before.\n```\n{BOILERPLATE_PHRASE}\n```\nAfter.")
 
+    def test_fenced_code_closer_with_trailing_whitespace_is_excluded(self) -> None:
+        # CommonMark 4.4: a closing fence may be followed only by spaces or
+        # tabs. A closer like "```   " must still close the block so the
+        # code inside stays excluded from lint and rewrites (PRR-002).
+        self._assert_no_blocker(
+            f"Before.\n```\n{BOILERPLATE_PHRASE}\n```   \nAfter."
+        )
+        self._assert_no_blocker(
+            f"Before.\n~~~\n{BOILERPLATE_PHRASE}\n~~~\t\nAfter."
+        )
+
+    def test_fenced_code_with_trailing_space_closer_is_byte_identical_after_rewrites(
+        self,
+    ) -> None:
+        text = f"```\n{BOILERPLATE_PHRASE}\n```   "
+        report = run_deterministic_lint(text)
+        blockers = [f for f in report.findings if f.severity == "blocker"]
+        self.assertEqual(blockers, [])
+        rewritten, applied = apply_bounded_rewrites(text, report)
+        self.assertEqual(applied, 0)
+        self.assertEqual(rewritten, text)
+
     def test_phrase_inside_inline_code_is_excluded(self) -> None:
         self._assert_no_blocker(f"Before `{BOILERPLATE_PHRASE}` after.")
 

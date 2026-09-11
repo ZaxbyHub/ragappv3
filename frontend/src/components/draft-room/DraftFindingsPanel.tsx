@@ -210,11 +210,16 @@ function FindingRow({
   }
 
   return (
+    // Programmatic focus target (issue #517 AC12): `tabIndex={-1}` keeps the
+    // row out of the tab order while letting "Back to findings" in the
+    // workspace return focus to it after the span/evidence inspection.
     // eslint-disable-next-line jsx-a11y-x/click-events-have-key-events, jsx-a11y-x/no-noninteractive-element-interactions -- The row-level click is a pointer convenience for the whole card; keyboard activation goes through the fully operable "Show in editor" button inside the row, and the li must keep its listitem role (flattening it to a button would break the findings-list semantics).
     <li
-      className="rounded-sm border border-border p-4"
+      className="rounded-sm border border-border p-4 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
       aria-describedby={explanationId}
       onClick={canActivate ? handleRowClick : undefined}
+      tabIndex={-1}
+      data-finding-row={finding.id}
     >
       <div className="flex flex-wrap items-center gap-2">
         <Badge variant="outline" className={severityMeta.className}>

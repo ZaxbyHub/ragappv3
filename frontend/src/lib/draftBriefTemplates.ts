@@ -116,3 +116,12 @@ export function latestDraftBriefTemplate(): DraftBriefTemplate | null {
   const templates = listDraftBriefTemplates();
   return templates.length > 0 ? templates[templates.length - 1] : null;
 }
+
+/**
+ * Clears the session cache so the next `listDraftBriefTemplates()` re-reads
+ * storage. Exists purely for test isolation — within a session the in-memory
+ * copy is authoritative by design, so production code never needs this.
+ */
+export function resetDraftBriefTemplatesCacheForTests(): void {
+  sessionTemplates = null;
+}

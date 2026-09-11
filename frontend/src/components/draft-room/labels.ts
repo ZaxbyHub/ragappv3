@@ -210,6 +210,19 @@ export const FINDINGS_STALE_NOTICE =
   "invalidates the affected checks and any Ready approval.";
 
 /**
+ * Controls on the bar shown above the editor while a finding row is activated
+ * (issue #517 AC12): send focus back to the originating finding row, and —
+ * when the finding was recorded against a different revision — compare that
+ * revision with the current one.
+ */
+export const FINDINGS_BACK_LABEL = "Back to findings";
+
+/** CTA for comparing the activated finding's revision with the current revision. */
+export function compareFindingRevisionLabel(): string {
+  return "Compare with current revision";
+}
+
+/**
  * Fact-check status display names.
  *
  * `passed` deliberately stays "Fact-checked": it reports that the fact-check

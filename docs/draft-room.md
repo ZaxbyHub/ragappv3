@@ -292,6 +292,7 @@ or other text injected into the body. The response always carries:
 - `X-Draft-Fact-Status` — the stored `fact_status` verbatim
 - `X-Draft-Approval-Status` — `ready` or `not_ready`
 - `X-Draft-Content-Sha256` — the content hash of the exported bytes
+- `X-Draft-Open-Blockers` — the count of open blocker findings on the exported revision
 
 The filename takes one of three forms, based on the revision's state at export
 time:
