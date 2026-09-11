@@ -295,15 +295,24 @@ CREATE INDEX IF NOT EXISTS idx_draft_evidence_kms_identity
 # Defined as its own constant, appended to SCHEMA below and executed verbatim by
 # migrate_add_draft_room_factuality(), so a fresh database and a migrated database
 # cannot drift apart.
+#
+# Issue #517 (DRAFT-010): the claim span columns and their span hash are
+# nullable. Every claim used to anchor to exact revision bytes, but a claim
+# with no verifiable span (e.g. a paraphrase the checker cannot locate) must
+# still be preserved in the ledger, and a non-NULL sentinel span would
+# fabricate an anchor the claim does not have — NULL is the honest shape.
+# Pre-existing databases are brought to this exact shape by
+# migrate_relax_draft_claims_span_not_null(), which re-executes the same
+# table definition over a rename-copy swap.
 _DRAFT_ROOM_FACTUALITY_DDL = """
 CREATE TABLE IF NOT EXISTS draft_claims (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     revision_id INTEGER NOT NULL REFERENCES draft_revisions(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL,
     claim_text TEXT NOT NULL,
-    claim_sha256 TEXT NOT NULL,
-    span_start INTEGER NOT NULL,
-    span_end INTEGER NOT NULL,
+    claim_sha256 TEXT,
+    span_start INTEGER,
+    span_end INTEGER,
     claim_type TEXT NOT NULL CHECK (claim_type IN ('factual','quote','opinion')),
     status TEXT NOT NULL CHECK (status IN (
         'supported','contradicted','ambiguous','stale','unsupported','opinion'
@@ -1748,6 +1757,10 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_draft_room_core(sqlite_path)
     migrate_add_draft_room_pipeline(sqlite_path)
     migrate_add_draft_room_factuality(sqlite_path)
+    # Issue #517 (DRAFT-010). Registered immediately after the factuality
+    # migration that creates draft_claims: it rebuilds the table with nullable
+    # span columns on pre-existing databases and is a no-op on fresh ones.
+    migrate_relax_draft_claims_span_not_null(sqlite_path)
     migrate_add_draft_room_promotions(sqlite_path)
     migrate_add_516_draft_reconcile_state(sqlite_path)
     migrate_add_multimodal_artifact_tables(sqlite_path)
@@ -5586,6 +5599,262 @@ def migrate_add_draft_room_factuality(sqlite_path: str) -> None:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_DRAFT_ROOM_FACTUALITY_DDL)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_relax_draft_claims_span_not_null(sqlite_path: str) -> None:
+    """Migration (issue #517, DRAFT-010): make ``draft_claims``'s span columns
+    and span hash nullable so a claim with no verifiable span persists as
+    NULL rows instead of being dropped or handed a fabricated anchor.
+
+    ``claim_sha256``/``span_start``/``span_end`` shipped NOT NULL because
+    every claim was expected to anchor to exact revision bytes (SPEC 5.7).
+    SQLite cannot ALTER a NOT NULL constraint away, so pre-existing databases
+    follow the rename-recreate-copy pattern of
+    ``migrate_add_curator_claim_support``. Three subtleties carry over:
+
+    1. CRITICAL — with ``legacy_alter_table=OFF`` (the default), SQLite
+       rewrites the textual FK references in *child* tables to follow
+       ``ALTER TABLE … RENAME TO``. After the swap ``draft_claim_sources.
+       claim_id`` would still point at ``draft_claims_old`` and CASCADE would
+       never fire, so ``legacy_alter_table=ON`` is set for the duration of
+       the swap. Verified post-swap with ``PRAGMA foreign_key_check``.
+    2. Recovery — a run that died mid-swap leaves ``draft_claims_old``
+       behind. The canonical-name restore plus the row-identity parity check
+       (issue #512 DB-001: never delete the only preserved source on a
+       retry) make a retry converge instead of destroying data.
+    3. Atomicity — the whole swap runs inside ONE explicit BEGIN IMMEDIATE
+       transaction using ``execute()`` only (``executescript`` would commit
+       implicitly and make the RENAME permanent before the copy could run),
+       so a crash mid-copy rolls back to the pre-swap state.
+
+    Fresh databases already get the relaxed shape from
+    ``_DRAFT_ROOM_FACTUALITY_DDL`` (this function's CREATE mirrors that
+    constant's ``draft_claims`` definition; the table below is the shared
+    shape both paths must converge on) and the migration is a no-op.
+
+    Idempotent — safe to run multiple times.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    # Autocommit so PRAGMAs take effect outside an implicit transaction,
+    # matching migrate_add_curator_claim_support.
+    conn.isolation_level = None
+    _journal = "migrate_relax_draft_claims_span_not_null"
+    try:
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="start", outcome="ok"
+        )
+        # Recovery: if a previous run crashed after the rename but before the
+        # CREATE, only the backup exists. Restore the canonical name first.
+        old_present = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='draft_claims_old'"
+        ).fetchone()
+        new_present = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='draft_claims'"
+        ).fetchone()
+        if old_present and not new_present:
+            logger.warning(
+                "migrate_relax_draft_claims_span_not_null: detected "
+                "draft_claims_old without draft_claims; restoring."
+            )
+            conn.execute("PRAGMA legacy_alter_table = ON")
+            conn.execute("ALTER TABLE draft_claims_old RENAME TO draft_claims")
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            new_present = True
+            # The backup no longer exists under its own name — clear the
+            # probe so the branches below cannot reference it.
+            old_present = None
+
+        if not new_present:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="succeeded", outcome="noop",
+                detail="draft_claims table absent",
+            )
+            return
+
+        def _relaxed() -> bool:
+            notnull = {
+                row[1]: int(row[3])
+                for row in conn.execute("PRAGMA table_info(draft_claims)").fetchall()
+            }
+            return all(
+                notnull.get(col) == 0
+                for col in ("claim_sha256", "span_start", "span_end")
+            )
+
+        if _relaxed():
+            if old_present:
+                # Migration already applied; a lingering backup is only safe
+                # to drop when the canonical table holds every backup id and
+                # at least as many rows. Otherwise the backup is
+                # authoritative — restore it and re-run the swap on it.
+                dest_count = conn.execute(
+                    "SELECT COUNT(*) FROM draft_claims"
+                ).fetchone()[0]
+                backup_count = conn.execute(
+                    "SELECT COUNT(*) FROM draft_claims_old"
+                ).fetchone()[0]
+                missing_ids = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT id FROM draft_claims_old"
+                    " EXCEPT SELECT id FROM draft_claims)"
+                ).fetchone()[0]
+                if dest_count >= backup_count and missing_ids == 0:
+                    conn.execute("DROP TABLE IF EXISTS draft_claims_old")
+                    record_migration_outcome(
+                        conn, migration_name=_journal, phase="succeeded",
+                        outcome="noop",
+                        detail="span columns already nullable; stale backup dropped",
+                    )
+                    return
+                logger.warning(
+                    "migrate_relax_draft_claims_span_not_null: backup holds "
+                    "rows the destination lacks; restoring from "
+                    "draft_claims_old."
+                )
+                conn.execute("DROP TABLE draft_claims")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute("ALTER TABLE draft_claims_old RENAME TO draft_claims")
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+            else:
+                record_migration_outcome(
+                    conn, migration_name=_journal, phase="succeeded",
+                    outcome="noop", detail="span columns already nullable",
+                )
+                return
+        elif old_present:
+            # Both tables exist and the canonical one still has the old
+            # shape: either a stale duplicate from an interrupted run or a
+            # failed partial copy. Same parity rule decides which survives.
+            dest_count = conn.execute(
+                "SELECT COUNT(*) FROM draft_claims"
+            ).fetchone()[0]
+            backup_count = conn.execute(
+                "SELECT COUNT(*) FROM draft_claims_old"
+            ).fetchone()[0]
+            missing_ids = conn.execute(
+                "SELECT COUNT(*) FROM (SELECT id FROM draft_claims_old"
+                " EXCEPT SELECT id FROM draft_claims)"
+            ).fetchone()[0]
+            if dest_count >= backup_count and missing_ids == 0:
+                logger.warning(
+                    "migrate_relax_draft_claims_span_not_null: detected stale "
+                    "draft_claims_old alongside pre-migration draft_claims; "
+                    "dropping the stale table before re-running migration."
+                )
+                conn.execute("DROP TABLE IF EXISTS draft_claims_old")
+            else:
+                logger.warning(
+                    "migrate_relax_draft_claims_span_not_null: detected failed "
+                    "partial copy in draft_claims; restoring authoritative "
+                    "draft_claims_old."
+                )
+                conn.execute("DROP TABLE draft_claims")
+                conn.execute("PRAGMA legacy_alter_table = ON")
+                conn.execute("ALTER TABLE draft_claims_old RENAME TO draft_claims")
+                conn.execute("PRAGMA legacy_alter_table = OFF")
+
+        before_count = conn.execute(
+            "SELECT COUNT(*) FROM draft_claims"
+        ).fetchone()[0]
+
+        # Detach FK validation for the duration of the swap and force legacy
+        # ALTER behaviour so draft_claim_sources' FK reference stays
+        # textually pointing at the canonical table name.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("PRAGMA legacy_alter_table = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("ALTER TABLE draft_claims RENAME TO draft_claims_old")
+
+            # Same shape as _DRAFT_ROOM_FACTUALITY_DDL's draft_claims — the
+            # only change is the three nullable span columns.
+            conn.execute(
+                """
+                CREATE TABLE draft_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    revision_id INTEGER NOT NULL REFERENCES draft_revisions(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL,
+                    claim_text TEXT NOT NULL,
+                    claim_sha256 TEXT,
+                    span_start INTEGER,
+                    span_end INTEGER,
+                    claim_type TEXT NOT NULL CHECK (claim_type IN ('factual','quote','opinion')),
+                    status TEXT NOT NULL CHECK (status IN (
+                        'supported','contradicted','ambiguous','stale','unsupported','opinion'
+                    )),
+                    severity TEXT NOT NULL CHECK (severity IN ('info','warning','blocker')),
+                    rationale TEXT NOT NULL DEFAULT '',
+                    retrieval_audit_json TEXT NOT NULL DEFAULT '{}',
+                    resolution TEXT NOT NULL DEFAULT 'open' CHECK (resolution IN (
+                        'open','resolved_by_revision','accepted','waived'
+                    )),
+                    resolved_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    resolved_at TIMESTAMP,
+                    resolution_note TEXT,
+                    UNIQUE(revision_id, ordinal)
+                )
+                """
+            )
+
+            conn.execute(
+                """
+                INSERT INTO draft_claims (
+                    id, revision_id, ordinal, claim_text, claim_sha256,
+                    span_start, span_end, claim_type, status, severity,
+                    rationale, retrieval_audit_json, resolution, resolved_by,
+                    resolved_at, resolution_note
+                )
+                SELECT id, revision_id, ordinal, claim_text, claim_sha256,
+                       span_start, span_end, claim_type, status, severity,
+                       rationale, retrieval_audit_json, resolution, resolved_by,
+                       resolved_at, resolution_note
+                FROM draft_claims_old
+                """
+            )
+
+            # Row-identity parity before dropping the only preserved copy.
+            after_count = conn.execute(
+                "SELECT COUNT(*) FROM draft_claims"
+            ).fetchone()[0]
+            if after_count != before_count:
+                raise RuntimeError(
+                    "migrate_relax_draft_claims_span_not_null: row-count "
+                    f"parity failed ({before_count} -> {after_count}). "
+                    "draft_claims_old has been preserved."
+                )
+
+            conn.execute("DROP TABLE draft_claims_old")
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        finally:
+            # Restore both PRAGMAs unconditionally; new connections otherwise
+            # inherit legacy_alter_table=ON behaviour.
+            conn.execute("PRAGMA legacy_alter_table = OFF")
+            conn.execute("PRAGMA foreign_keys = ON")
+
+        # Any violation here means the swap produced a broken DB; fail loudly.
+        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            record_migration_outcome(
+                conn, migration_name=_journal, phase="failed", outcome="error",
+                detail=f"foreign_key_check violations: {len(violations)}",
+            )
+            raise RuntimeError(
+                "migrate_relax_draft_claims_span_not_null: "
+                f"foreign_key_check reported {len(violations)} violation(s) "
+                f"post-swap: {violations[:5]}"
+            )
+
+        record_migration_outcome(
+            conn, migration_name=_journal, phase="succeeded", outcome="ok"
+        )
     finally:
         conn.close()
 

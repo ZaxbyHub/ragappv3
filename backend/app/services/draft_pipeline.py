@@ -578,12 +578,18 @@ class _PendingFinding:
 
 @dataclass
 class _ClaimRow:
-    """A resolved atomic claim ready to be written to ``draft_claims``."""
+    """A resolved atomic claim ready to be written to ``draft_claims``.
+
+    ``span_start``/``span_end`` are ``None`` for a claim whose proposition
+    could not be located verbatim in the candidate (e.g. the Fact desk
+    paraphrased it): the claim stays in the ledger with its desk verdict,
+    but no span — and therefore no span hash — is invented for it.
+    """
 
     ordinal: int
     claim_text: str
-    span_start: int
-    span_end: int
+    span_start: Optional[int]
+    span_end: Optional[int]
     claim_type: str
     status: str
     severity: str
@@ -945,6 +951,11 @@ class _CompileRun:
         self._claims: list[_ClaimRow] = []
         self._findings: list[_PendingFinding] = []
         self._correction_loops: int = 0
+        #: Rendered Fact feedback for the correction-loop desk prompts
+        #: (SPEC §11.8); empty on the first pass.
+        self._correction_feedback: str = ""
+        #: Job-scoped claim-retrieval cache (SPEC §11.8 validated cache hits).
+        self._claim_retrieval_cache: dict[str, RetrievalAudit] = {}
         self._source_snapshot_sha256: str = ""
 
     # -- entry ------------------------------------------------------------
@@ -1550,6 +1561,39 @@ class _CompileRun:
 
     # -- stage 4: lint -----------------------------------------------------
 
+    def _candidate_locked_spans(self) -> list[tuple[int, int]]:
+        """Resolve input-relative locked spans into candidate-relative ranges.
+
+        Locked spans are stored as offsets into an input's parsed text, while
+        lint and rewrite operate on the generated candidate. Each locked span
+        is therefore located in the CURRENT candidate by its exact text, with
+        a whitespace-normalized fallback for incidental reflowing, so the
+        author's preserved wording can be excluded from initial lint and from
+        every subsequent relint/rewrite pass (issue #517 DRAFT-018). A locked
+        span the candidate no longer contains simply contributes no exclusion
+        here; the §11.6 exact-preservation contract is enforced on the desks
+        by prompt, and a vanished locked span surfaces through review rather
+        than through an invented offset.
+        """
+        spans: list[tuple[int, int]] = []
+        for inp in self._ctx.inputs:
+            for start, end in inp.locked_spans:
+                if not (0 <= start < end <= len(inp.parsed_text)):
+                    continue
+                text = inp.parsed_text[start:end]
+                at = self._candidate.find(text)
+                if at >= 0:
+                    spans.append((at, at + len(text)))
+                    continue
+                words = text.split()
+                if not words:
+                    continue
+                pattern = re.compile(r"\s+".join(re.escape(word) for word in words))
+                match = pattern.search(self._candidate)
+                if match:
+                    spans.append((match.start(), match.end()))
+        return spans
+
     async def _stage_lint(self) -> None:
         """Deterministic lint plus at most N bounded rewrites (SPEC §11.5/§13)."""
         ctx = self._ctx
@@ -1564,20 +1608,39 @@ class _CompileRun:
             )
             return
 
-        report = run_deterministic_lint(self._candidate, rule_version=BOILERPLATE_RULE_VERSION)
+        locked = self._candidate_locked_spans()
+        report = run_deterministic_lint(
+            self._candidate, locked_spans=locked, rule_version=BOILERPLATE_RULE_VERSION
+        )
         rewritten, applied = apply_bounded_rewrites(
-            self._candidate, report, limit=settings.draft_lint_rewrite_limit
+            self._candidate,
+            report,
+            limit=settings.draft_lint_rewrite_limit,
+            locked_spans=locked,
         )
         if applied:
             rewritten = _normalize_line_endings(rewritten)
+            # Offsets moved with the rewrite: re-resolve the locked spans
+            # against the rewritten bytes before the confirming relint.
             report = run_deterministic_lint(
-                rewritten, rule_version=BOILERPLATE_RULE_VERSION
+                rewritten,
+                locked_spans=self._candidate_locked_spans_after(rewritten),
+                rule_version=BOILERPLATE_RULE_VERSION,
             )
             self._candidate = rewritten
         # SPEC §13.3: a residual blocker does NOT stop the pipeline — the draft
         # still lands in needs_review carrying a human-waivable finding.
         self._collect_lint_findings(report)
         await self._persist_stage("lint", input_sha, report, candidate=self._candidate)
+
+    def _candidate_locked_spans_after(self, rewritten: str) -> list[tuple[int, int]]:
+        """``_candidate_locked_spans`` against a not-yet-committed candidate."""
+        original = self._candidate
+        self._candidate = rewritten
+        try:
+            return self._candidate_locked_spans()
+        finally:
+            self._candidate = original
 
     def _collect_lint_findings(self, report: LintReport) -> None:
         self._findings = [f for f in self._findings if f.stage != "lint"]
@@ -1599,13 +1662,54 @@ class _CompileRun:
                 )
             )
 
+    def _collect_desk_findings(self, stage: str, findings: list[str]) -> None:
+        """Normalize a desk report's free-form findings into ledger rows.
+
+        Copy and Standards report editorial concerns as plain strings; the
+        review workflow can only disposition findings that exist as
+        ``draft_findings`` rows, so every message becomes one row with a
+        stable stage/rule identity (``<stage>.desk_finding``) and
+        conservative semantics: advisory severity (a desk observation never
+        blocks Ready by itself), waivable, and no span — the desks are not
+        required to locate their concerns, so none is invented. The stage's
+        prior findings are cleared first so correction/convergence reruns
+        replace rather than duplicate.
+        """
+        self._findings = [f for f in self._findings if f.stage != stage]
+        for message in findings:
+            text = (message or "").strip()
+            if not text:
+                continue
+            self._findings.append(
+                _PendingFinding(
+                    stage=stage,
+                    rule_id=f"{stage}.desk_finding",
+                    rule_version=PROMPT_BUNDLE_VERSION,
+                    category="style",
+                    severity="warning",
+                    message=text,
+                    waivable=True,
+                )
+            )
+
     # -- stages 5/6: copy and standards ------------------------------------
 
     async def _stage_copy_first_pass(self) -> None:
         await self._run_copy(reason="pre_fact")
 
     async def _stage_standards_first_pass(self) -> None:
-        await self._run_standards(reason="pre_fact")
+        result = await self._run_standards(reason="pre_fact")
+        # SPEC §11.7 steps 2-4: a semantic/structural Standards edit must be
+        # Copy-reviewed before Fact, and a Copy pass that then changes text
+        # must go back to Standards — bounded by ``draft_qa_retry_limit``
+        # with residual desk findings visible when the cap is hit.
+        for loop in range(1, max(settings.draft_qa_retry_limit, 0) + 1):
+            if not result.semantic_changed:
+                break
+            copy_result = await self._run_copy(reason=f"convergence_{loop}")
+            if not copy_result.semantic_changed:
+                break
+            result = await self._run_standards(reason=f"convergence_{loop}")
 
     async def _run_copy(self, *, reason: str) -> _TextResult:
         """Copy desk (SPEC §11.6). Always runs BEFORE Standards."""
@@ -1617,6 +1721,7 @@ class _CompileRun:
         if reused is not None and reason == "pre_fact":
             report = CopyReport.model_validate_json(reused.artifact_json)
             self._candidate = reused.content_md or self._candidate
+            self._collect_desk_findings("copy", report.findings)
             return _TextResult(
                 text=self._candidate,
                 semantic_changed=bool(reused.semantic_changed),
@@ -1627,12 +1732,16 @@ class _CompileRun:
         model, _audit = await self._call_model(
             stage="copy",
             prompt=definition,
-            render=self._render_context(self._candidate),
+            render=self._render_context(
+                self._candidate,
+                correction_feedback=self._correction_feedback_text(),
+            ),
             output_model=CopyReport,
         )
         report: CopyReport = model  # type: ignore[assignment]
         result = _apply_edits(self._candidate, report.edits)
         self._candidate = result.text
+        self._collect_desk_findings("copy", report.findings)
         applied_report = CopyReport(
             edits=list(result.applied_edits), findings=report.findings
         )
@@ -1658,6 +1767,7 @@ class _CompileRun:
         if reused is not None and reason == "pre_fact":
             report = StandardsReport.model_validate_json(reused.artifact_json)
             self._candidate = reused.content_md or self._candidate
+            self._collect_desk_findings("standards", report.findings)
             return _TextResult(
                 text=self._candidate,
                 semantic_changed=bool(reused.semantic_changed),
@@ -1668,12 +1778,16 @@ class _CompileRun:
         model, _audit = await self._call_model(
             stage="standards",
             prompt=definition,
-            render=self._render_context(self._candidate),
+            render=self._render_context(
+                self._candidate,
+                correction_feedback=self._correction_feedback_text(),
+            ),
             output_model=StandardsReport,
         )
         report: StandardsReport = model  # type: ignore[assignment]
         result = _apply_edits(self._candidate, report.edits)
         self._candidate = result.text
+        self._collect_desk_findings("standards", report.findings)
         applied_report = StandardsReport(
             edits=list(result.applied_edits), findings=report.findings
         )
@@ -1686,6 +1800,39 @@ class _CompileRun:
             prompt=definition,
         )
         return result
+
+    def _correction_feedback_text(self) -> str:
+        """What Fact wants repaired, for the correction-loop desk prompts.
+
+        SPEC §11.8 returns a required correction to Copy, then Standards —
+        which only helps if the desks know what the correction IS. The
+        Fact-stage findings and the approved outline are therefore rendered
+        into every desk prompt while a correction loop is active; the first
+        pass renders the neutral default, keeping the prompt contract
+        symmetric across loops.
+        """
+        return self._correction_feedback or "(no correction feedback)"
+
+    def _build_correction_feedback(self) -> str:
+        """Render the Fact-stage findings plus outline as desk feedback."""
+        lines: list[str] = []
+        outline = self._outline
+        if outline is not None:
+            headings = [section.heading for section in outline.sections]
+            lines.append(
+                "Approved outline sections: " + "; ".join(filter(None, headings))
+            )
+        fact_findings = [f for f in self._findings if f.stage == "fact"]
+        report_messages = [
+            message
+            for message in (self._fact_report.findings if self._fact_report else [])
+            if (message or "").strip()
+        ]
+        if fact_findings or report_messages:
+            lines.append("Required corrections from the Fact desk:")
+            lines.extend(f"- [{f.rule_id}] {f.message}" for f in fact_findings)
+            lines.extend(f"- {message}" for message in report_messages)
+        return "\n".join(lines)
 
     # -- stage 7: fact, and the bounded correction loop --------------------
 
@@ -1735,9 +1882,14 @@ class _CompileRun:
                 return
             self._correction_loops += 1
             reason = f"correction_{self._correction_loops}"
+            # SPEC §11.8: the retry must target the requested repair, so the
+            # desks see WHAT Fact flagged (findings + outline context) and
+            # not just the candidate bytes.
+            self._correction_feedback = self._build_correction_feedback()
             # Copy first, Standards second. Always.
             await self._run_copy(reason=reason)
             await self._run_standards(reason=reason)
+            self._correction_feedback = ""
             # Any semantic change either desk just made invalidates the Fact
             # result above; the loop therefore returns to Fact, never onward.
             self._fact_report = None
@@ -1825,7 +1977,9 @@ class _CompileRun:
         """
         self._collect_lint_findings(
             run_deterministic_lint(
-                self._candidate, rule_version=BOILERPLATE_RULE_VERSION
+                self._candidate,
+                locked_spans=self._candidate_locked_spans(),
+                rule_version=BOILERPLATE_RULE_VERSION,
             )
         )
 
@@ -1912,19 +2066,57 @@ class _CompileRun:
         for claim in report.claims:
             span_start = candidate.find(claim.proposition)
             if span_start < 0 or not claim.proposition:
-                # No verifiable span: record the gap, never invent one.
+                # No verifiable span: keep the claim in the ledger with its
+                # desk verdict but no invented span, and let the severity
+                # follow the verdict. An adverse (blocking) claim that fails
+                # exact anchoring must stay review-blocking — dropping it
+                # would let a paraphrased unsupported claim ship as a passed
+                # revision with an empty-looking ledger (issue #517
+                # DRAFT-010).
+                status = claim.status
+                adverse = status in _BLOCKING_CLAIM_STATUSES
+                audit: Optional[RetrievalAudit] = None
+                if claim.claim_type == "factual":
+                    audit = await self._claim_retrieval_audit_cached(claim)
+                ordinal += 1
+                rows.append(
+                    _ClaimRow(
+                        ordinal=ordinal,
+                        claim_text=claim.proposition,
+                        span_start=None,
+                        span_end=None,
+                        claim_type=claim.claim_type,
+                        status=status,
+                        severity=(
+                            "blocker"
+                            if adverse
+                            else "warning"
+                            if _is_high_stakes(claim)
+                            else "info"
+                        ),
+                        rationale="",
+                        retrieval_audit_json=(
+                            canonical_json(audit.model_dump(mode="json"))
+                            if audit is not None
+                            else "{}"
+                        ),
+                        sources=(),
+                    )
+                )
                 self._findings.append(
                     _PendingFinding(
                         stage="fact",
                         rule_id="fact.claim_span_unresolved",
                         rule_version=PROMPT_BUNDLE_VERSION,
                         category="operational",
-                        severity="warning",
+                        severity="blocker" if adverse else "warning",
                         message=(
-                            "a reported claim could not be located in the candidate "
-                            "text and was not recorded"
+                            "a reported claim could not be located in the "
+                            "candidate text and is retained in the claim "
+                            "ledger without a span"
+                            + (" as an unresolved adverse verdict" if adverse else "")
                         ),
-                        waivable=True,
+                        waivable=not adverse,
                     )
                 )
                 continue
@@ -1998,10 +2190,15 @@ class _CompileRun:
                     )
                 )
 
+            if claim.claim_type == "factual":
+                # SPEC §11.8: every factual claim gets a claim-specific
+                # contradictory/newer-evidence retrieval — or a validated
+                # cache hit for an identical proposition in this job — and
+                # the audit is persisted on the claim row whether or not
+                # anything was found (SPEC §12.3). A supported verdict is
+                # therefore recorded WITH the promised search, never without.
+                audit = await self._claim_retrieval_audit_cached(claim)
             if status == "unsupported":
-                # Claim-specific retrieval, audited whether or not it finds
-                # anything (SPEC §12.3).
-                audit = await self._claim_retrieval_audit(claim)
                 sources = []
 
             high_stakes = _is_high_stakes(claim)
@@ -2106,6 +2303,36 @@ class _CompileRun:
                 return quoted
             return None
         return passage
+
+    async def _claim_retrieval_audit_cached(self, claim: FactClaim) -> RetrievalAudit:
+        """Job-cached claim retrieval keyed per SPEC §11.8.
+
+        The cache key binds the normalized proposition to the vault scope,
+        the immutable source snapshot and the retrieval configuration, so a
+        hit is only valid when every input the retrieval depended on is
+        unchanged within this job.
+        """
+        normalized = " ".join(claim.proposition.split())
+        config = canonical_json(
+            {
+                "limit": self._ctx.retrieval_limit,
+                "source_kinds": ["document", "kms", "wiki"],
+            }
+        )
+        key = canonical_json(
+            [
+                normalized,
+                self._ctx.vault_id,
+                self._source_snapshot_sha256,
+                config,
+            ]
+        )
+        cached = self._claim_retrieval_cache.get(key)
+        if cached is not None:
+            return cached
+        audit = await self._claim_retrieval_audit(claim)
+        self._claim_retrieval_cache[key] = audit
+        return audit
 
     async def _claim_retrieval_audit(self, claim: FactClaim) -> RetrievalAudit:
         """Claim-specific retrieval whose audit is recorded even on zero results."""
@@ -2214,8 +2441,13 @@ class _CompileRun:
                 message="candidate needs a prose mutation assemble may not make",
             )
 
-        # Step 2: every claim span must still map to the byte-identical text.
+        # Step 2: every anchored claim span must still map to the
+        # byte-identical text. Unanchored claims (no verbatim span) carry
+        # their adverse verdict without a span, so there is nothing to
+        # re-verify for them here.
         for row in self._claims:
+            if row.span_start is None or row.span_end is None:
+                continue
             if candidate[row.span_start : row.span_end] != row.claim_text:
                 raise CompileFailure(
                     CODE_ASSEMBLE_HASH_MISMATCH,

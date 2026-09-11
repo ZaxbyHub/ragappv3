@@ -227,6 +227,12 @@ A compile run is **source-only** when it completed with no vault evidence
 available to check its claims against. This is recorded on the revision's QA
 summary, not inferred from anything else.
 
+Uploaded project inputs are still captured as immutable evidence snapshots
+(`[D#]` labels, in input order) even on a source-only run, so citations that
+point at your own uploaded material resolve in the claim ledger. `source_only`
+continues to track *vault* evidence only — uploaded inputs never turn a
+source-only run into a "checked" one.
+
 A source-only revision cannot be marked Ready without the caller explicitly
 passing `acknowledge_source_only=true` on the Ready request. This is not a
 workaround or a defect being tolerated — it is a deliberate checkpoint: because
@@ -286,6 +292,7 @@ or other text injected into the body. The response always carries:
 - `X-Draft-Fact-Status` — the stored `fact_status` verbatim
 - `X-Draft-Approval-Status` — `ready` or `not_ready`
 - `X-Draft-Content-Sha256` — the content hash of the exported bytes
+- `X-Draft-Open-Blockers` — the count of open blocker findings on the exported revision
 
 The filename takes one of three forms, based on the revision's state at export
 time:

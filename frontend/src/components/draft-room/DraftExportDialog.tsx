@@ -33,8 +33,10 @@ import {
   EXPORT_CTA,
   EXPORT_READY_EXPLANATION,
   EXPORT_REVIEW_EXPLANATION,
+  EXPORT_STATUS_EXPLANATION,
   EXPORT_UNVERIFIED_EXPLANATION,
   FACT_STATUS_LABELS,
+  exportOpenBlockersText,
 } from "@/components/draft-room/labels";
 
 export interface DraftExportDialogProps {
@@ -43,6 +45,12 @@ export interface DraftExportDialogProps {
   draftId: number;
   revision: DraftRevisionSummary;
   isReadyRevision: boolean;
+  /**
+   * Open blocker findings for this revision. When positive, an unresolved-
+   * blockers disclosure renders BEFORE the export action so the state is
+   * visible before anything downloads (issue #517 AC13b).
+   */
+  openBlockers?: number;
 }
 
 const FACT_CURRENT = new Set<string>(FACT_CURRENT_STATUSES);
@@ -73,6 +81,7 @@ export function DraftExportDialog({
   draftId,
   revision,
   isReadyRevision,
+  openBlockers = 0,
 }: DraftExportDialogProps) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const { data: capabilities } = useDraftRoomCapabilities();
@@ -148,7 +157,12 @@ export function DraftExportDialog({
               {isReadyRevision ? DRAFT_STATUS_LABELS.ready : "Not ready"}
             </span>
           </p>
+          <p className="text-xs text-muted-foreground">{EXPORT_STATUS_EXPLANATION}</p>
         </div>
+
+        {openBlockers > 0 && (
+          <p className="text-sm text-warning">{exportOpenBlockersText(openBlockers)}</p>
+        )}
 
         <div className="space-y-1">
           <Label htmlFor="draft-export-format">Format</Label>

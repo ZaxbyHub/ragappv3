@@ -838,6 +838,12 @@ export interface DraftExportResult {
   factStatus: string;
   approvalStatus: string;
   contentSha256: string;
+  /**
+   * Open blocker findings for the exported revision, from the
+   * `X-Draft-Open-Blockers` response header. Absent when the server does not
+   * report the header (older deployments) or reports a non-numeric value.
+   */
+  openBlockers?: number;
 }
 
 const DEFAULT_EXPORT_FILENAME = "draft.md";
@@ -882,12 +888,15 @@ export async function exportDraftRevision(
     { params, responseType: "blob" }
   );
   const headers = response.headers as Record<string, unknown> | undefined;
+  const openBlockersRaw = getHeaderCaseInsensitive(headers, "x-draft-open-blockers");
+  const openBlockers = /^\d+$/.test(openBlockersRaw) ? Number(openBlockersRaw) : undefined;
   return {
     blob: response.data as Blob,
     filename: parseContentDispositionFilename(getHeaderCaseInsensitive(headers, "content-disposition")),
     factStatus: getHeaderCaseInsensitive(headers, "x-draft-fact-status"),
     approvalStatus: getHeaderCaseInsensitive(headers, "x-draft-approval-status"),
     contentSha256: getHeaderCaseInsensitive(headers, "x-draft-content-sha256"),
+    ...(openBlockers !== undefined ? { openBlockers } : {}),
   };
 }
 

@@ -4,7 +4,7 @@ import { DraftClaimsPanel } from "./DraftClaimsPanel";
 import { DraftEvidencePanel } from "./DraftEvidencePanel";
 import { DraftStageArtifact } from "./DraftStageArtifact";
 import { useDraftRoomUiStore, type InspectorTab } from "@/stores/useDraftRoomUiStore";
-import type { DraftRevisionSummary, DraftStage, DraftTier } from "@/lib/api/draftRoom";
+import type { DraftFinding, DraftRevisionSummary, DraftStage, DraftTier } from "@/lib/api/draftRoom";
 
 export interface DraftInspectorProps {
   draftId: number;
@@ -24,6 +24,12 @@ export interface DraftInspectorProps {
   tier: DraftTier;
   onRevisionCreated?(revision: DraftRevisionSummary): void;
   onEditDraft?(): void;
+  /** Forwarded to the findings panel: activate a finding row's span in the editor (issue #517 AC12). */
+  onSelectSpan?(finding: DraftFinding): void;
+  /** Forwarded to the findings panel: open a finding row's related evidence (issue #517 AC12). */
+  onOpenEvidence?(finding: DraftFinding): void;
+  /** Forwarded to the findings panel: the editor holds unsaved edits, so checks may be stale (issue #517 AC15). */
+  checksStale?: boolean;
 }
 
 /**
@@ -49,6 +55,9 @@ export function DraftInspector({
   canDispose,
   tier,
   onRevisionCreated,
+  onSelectSpan,
+  onOpenEvidence,
+  checksStale = false,
 }: DraftInspectorProps) {
   const inspectorTab = useDraftRoomUiStore((s) => s.inspectorTab);
   const setInspectorTab = useDraftRoomUiStore((s) => s.setInspectorTab);
@@ -71,6 +80,9 @@ export function DraftInspector({
             canDispose={canDispose}
             tier={tier}
             onRevisionCreated={onRevisionCreated}
+            onSelectSpan={onSelectSpan}
+            onOpenEvidence={onOpenEvidence}
+            checksStale={checksStale}
           />
         </TabsContent>
         <TabsContent value="claims">

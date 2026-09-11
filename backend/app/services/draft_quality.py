@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Optional, Sequence
 
 from app.config import settings
 from app.services.draft_prompts import LintFinding, LintReport
@@ -165,8 +165,7 @@ class MaskedText:
     spans: tuple[tuple[int, int, str], ...] = field(default_factory=tuple)
 
 
-_FENCE_RE = re.compile(r"(?<!\\)```")
-_INLINE_CODE_RE = re.compile(r"(?<!\\)`[^`\n]*(?<!\\)`")
+_FENCE_MARKER_RE = re.compile(r"[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 _BLOCKQUOTE_RE = re.compile(r"^[ \t]{0,3}>.*$", re.MULTILINE)
 _STRAIGHT_DOUBLE_QUOTE_RE = re.compile(r'"[^"\n]*"')
 _CURLY_DOUBLE_QUOTE_RE = re.compile(r"“[^”\n]*”")
@@ -178,20 +177,87 @@ _FRONT_MATTER_RE = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
 
 
 def _find_fenced_code_blocks(text: str) -> list[tuple[int, int]]:
-    """Pair up non-escaped ``` markers into (start, end) fenced-block spans.
+    """Pair CommonMark fenced-code markers into (start, end) block spans.
 
-    A marker preceded by a backslash (an escaped fence, e.g. ``\\```) is
-    excluded by the regex's negative lookbehind and never starts or closes a
-    block, per SPEC §13.2's explicit "escaped fences" test requirement. An
-    unmatched trailing fence (odd count) is left unclosed and not masked --
-    conservative behavior, since we cannot tell where it was meant to end.
+    An opener is a line with at most three leading spaces followed by a run
+    of 3+ backticks or 3+ tildes (plus an info string, which for backtick
+    fences must not itself contain a backtick — CommonMark §4.4). The closer
+    is a line containing only a run of the same marker character at least as
+    long as the opener. A marker preceded by a backslash (an escaped fence,
+    e.g. ``\\```) never opens or closes a block, per SPEC §13.2's explicit
+    "escaped fences" test requirement. An unmatched opener is left unclosed
+    and not masked — conservative behavior, since we cannot tell where it
+    was meant to end.
     """
-    positions = [m.start() for m in _FENCE_RE.finditer(text)]
     spans: list[tuple[int, int]] = []
-    i = 0
-    while i + 1 < len(positions):
-        spans.append((positions[i], positions[i + 1] + 3))
-        i += 2
+    opener: Optional[tuple[str, int, int]] = None  # (marker char, length, offset)
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        line_start = offset
+        offset += len(raw_line)
+        if opener is not None:
+            stripped = line.lstrip(" \t")
+            # CommonMark §4.4: a closing fence may be followed only by spaces
+            # or tabs, so the marker must be compared with trailing whitespace
+            # stripped (the opener side already tolerates it via the info
+            # string).
+            closer = stripped.rstrip(" \t")
+            indent = len(line) - len(stripped)
+            if (
+                indent <= 3
+                and closer
+                and set(closer) == {opener[0]}
+                and len(closer) >= opener[1]
+                and not closer.startswith("\\")
+            ):
+                spans.append((opener[2], line_start + len(line)))
+                opener = None
+            continue
+        match = _FENCE_MARKER_RE.match(line)
+        if not match:
+            continue
+        marker = match.group(1)
+        if marker.startswith("\\"):
+            continue
+        char, length = marker[0], len(marker)
+        info = match.group(2)
+        if char == "`" and "`" in info:
+            # CommonMark §4.4: a backtick fence's info string may not contain
+            # a backtick, so a prose line like "use ```x``` here" is not an
+            # opener (the inline scanner still masks its code spans).
+            continue
+        opener = (char, length, line_start)
+    return spans
+
+
+def _find_inline_code_spans(text: str) -> list[tuple[int, int]]:
+    """Find single-line inline code spans delimited by equal-length runs.
+
+    A span opens at a backtick run of length ``n >= 1`` not preceded by a
+    backslash and closes at the next run of exactly ``n`` backticks on the
+    same line (CommonMark §6.1, conservative: never crossing a newline, so
+    an unmatched run stays literal prose exactly as before).
+    """
+    spans: list[tuple[int, int]] = []
+    line_start = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        i = 0
+        while i < len(line):
+            if line[i] != "`" or (i > 0 and line[i - 1] == "\\"):
+                i += 1
+                continue
+            run_start = i
+            while i < len(line) and line[i] == "`":
+                i += 1
+            run_len = i - run_start
+            closer = line.find("`" * run_len, i)
+            if closer == -1:
+                continue
+            spans.append((line_start + run_start, line_start + closer + run_len))
+            i = closer + run_len
+        line_start += len(raw_line)
     return spans
 
 
@@ -251,8 +317,8 @@ def mask_excluded_spans(
     for start, end in _find_fenced_code_blocks(current()):
         add(start, end, "fenced_code")
 
-    for m in _INLINE_CODE_RE.finditer(current()):
-        add(m.start(), m.end(), "inline_code")
+    for start, end in _find_inline_code_spans(current()):
+        add(start, end, "inline_code")
 
     for m in _BLOCKQUOTE_RE.finditer(current()):
         add(m.start(), m.end(), "blockquote")
@@ -696,6 +762,7 @@ def apply_bounded_rewrites(
     report: LintReport,
     *,
     limit: int | None = None,
+    locked_spans: Sequence[tuple[int, int]] = (),
 ) -> tuple[str, int]:
     """Apply at most ``limit`` deterministic rewrites of exact boilerplate.
 
@@ -708,11 +775,22 @@ def apply_bounded_rewrites(
     live text at its span (the text changed since the finding was computed)
     is skipped rather than applied, to avoid corrupting unrelated content.
 
+    The replacement template is resolved from a whitespace-normalized key so
+    a match the detector found across incidental whitespace variation (a hard
+    line-wrap, a tab) rewrites exactly like its single-space form; the rewrite
+    itself still replaces the exact detected span, so surrounding text and
+    span-exactness are untouched. A span overlapping any ``locked_spans``
+    range is never rewritten, and after each applied rewrite every locked
+    span's text is re-verified to still be present — a rewrite that would
+    consume preserved wording is reverted before it can stick.
+
     Args:
         text: the exact text the report's offsets refer to.
         report: a :class:`LintReport` (e.g. from :func:`run_deterministic_lint`).
         limit: maximum rewrites to apply; defaults to
             ``settings.draft_lint_rewrite_limit``.
+        locked_spans: caller-supplied ``(start, end)`` ranges whose text must
+            survive verbatim (already-approved manuscript spans).
 
     Returns:
         tuple[str, int]: the rewritten text, and the number of rewrites
@@ -720,6 +798,13 @@ def apply_bounded_rewrites(
     """
     if limit is None:
         limit = settings.draft_lint_rewrite_limit
+
+    locked_pairs = [
+        (start, end)
+        for start, end in locked_spans
+        if 0 <= start < end <= len(text)
+    ]
+    locked_texts = [text[start:end] for start, end in locked_pairs]
 
     eligible = [
         f
@@ -736,11 +821,24 @@ def apply_bounded_rewrites(
     for finding in sorted(eligible, key=lambda f: f.start, reverse=True):
         if new_text[finding.start : finding.end] != finding.excerpt:
             continue
-        phrase_key = finding.excerpt.strip().lower()
+        if any(
+            not (finding.end <= ls or finding.start >= le)
+            for ls, le in locked_pairs
+        ):
+            continue
+        # Resolve the template on a whitespace-normalized key so a match the
+        # detector found across a line-wrap rewrites like the single-space
+        # form (detection and resolution must agree on the same equivalence).
+        phrase_key = re.sub(r"\s+", " ", finding.excerpt.strip().lower())
         replacement_template = BLOCKED_BOILERPLATE.get(phrase_key)
         if replacement_template is None:
             continue
         replacement = _rewrite_replacement(finding.excerpt, replacement_template)
-        new_text = new_text[: finding.start] + replacement + new_text[finding.end :]
+        candidate = (
+            new_text[: finding.start] + replacement + new_text[finding.end :]
+        )
+        if any(locked not in candidate for locked in locked_texts):
+            continue
+        new_text = candidate
         applied += 1
     return new_text, applied

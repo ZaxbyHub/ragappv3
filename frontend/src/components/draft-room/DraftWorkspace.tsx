@@ -42,7 +42,7 @@ import {
 import { DraftSourceUpload } from "./DraftSourceUpload";
 import { DraftSourceList } from "./DraftSourceList";
 import { DraftEvidencePanel } from "./DraftEvidencePanel";
-import { DraftEditor } from "./DraftEditor";
+import { DraftEditor, type DraftEditorHandle } from "./DraftEditor";
 import { DraftPreview } from "./DraftPreview";
 import { DraftRevisionDiff } from "./DraftRevisionDiff";
 import { DraftStageArtifact } from "./DraftStageArtifact";
@@ -55,6 +55,7 @@ import {
   CANCEL_CONSEQUENCE,
   DRAFT_ROOM_DISABLED_MESSAGE,
   EXPORT_CTA,
+  FINDINGS_BACK_LABEL,
   INPUT_ROLE_LABELS,
   MARK_READY_CTA,
   MODE_LABELS,
@@ -65,6 +66,7 @@ import {
   SAVE_REVISION_CTA,
   STAGE_LABELS,
   TIER_LABELS,
+  compareFindingRevisionLabel,
   compileCtaLabel,
 } from "./labels";
 import {
@@ -88,6 +90,7 @@ import {
   type CompileRequest,
   type DraftCompileStartStage,
   type DraftDetail,
+  type DraftFinding,
   type DraftInput,
   type DraftJob,
   type DraftRoomCapabilities,
@@ -312,6 +315,99 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
   const baselineContent = currentRevisionDetailQuery.data?.content_md ?? "";
   const editorValue = storedDraftText ?? baselineContent;
   const isDirty = storedDraftText != null && storedDraftText !== baselineContent;
+  // Every check the inspector lists was computed against the last SAVED
+  // revision, so unsaved editor edits make those checks stale (issue #517
+  // AC15). Same predicate as `isDirty`, named for what it means downstream.
+  const checksStale = editorValue !== baselineContent;
+
+  // ---- Finding row activation (issue #517 AC12) -----------------------------
+  // The editor is on the "draft" workspace tab, so selecting a finding's span
+  // must also reveal the editor; the inspector tab switches to the finding's
+  // related evidence. `selectSpan` focuses the textarea, so the activated
+  // finding is remembered and a bar above the editor offers the trip back:
+  // returning focus to the originating finding row, and comparing the
+  // finding's revision with the current one when they differ.
+  const editorHandleRef = useRef<DraftEditorHandle | null>(null);
+
+  const [activeFinding, setActiveFinding] = useState<DraftFinding | null>(null);
+  const [showBackToFindings, setShowBackToFindings] = useState(false);
+  // Row that must receive focus once the inspector's findings tab has
+  // remounted it — activation switches the inspector away from findings, so
+  // the row is unmounted at "Back to findings" click time.
+  const [returnFocusFindingId, setReturnFocusFindingId] = useState<number | null>(null);
+
+  function handleFindingSpanSelect(finding: DraftFinding) {
+    // A new activation supersedes any pending focus return (PRR feedback:
+    // otherwise the return-focus observer keeps watching for a row that is
+    // no longer the one the user cares about).
+    setReturnFocusFindingId(null);
+    setActiveFinding(finding);
+    setShowBackToFindings(true);
+    setWorkspaceTab("draft");
+    setEditorTab("editor");
+    if (finding.span_start != null && finding.span_end != null) {
+      editorHandleRef.current?.selectSpan(finding.span_start, finding.span_end);
+    }
+  }
+
+  function handleFindingEvidenceOpen(finding: DraftFinding) {
+    setReturnFocusFindingId(null);
+    setActiveFinding(finding);
+    setShowBackToFindings(true);
+    // Fact-stage findings are about claims, and the claims tab shows each
+    // claim's captured sources; anything else points at the run's evidence.
+    setInspectorTab(finding.stage === "fact" ? "claims" : "evidence");
+  }
+
+  // Only when the finding was recorded against a different revision than the
+  // current one does compare navigation mean anything.
+  const canCompareFindingRevision =
+    activeFinding?.revision_id != null &&
+    currentRevisionId != null &&
+    activeFinding.revision_id !== currentRevisionId;
+
+  function handleBackToFindings() {
+    const finding = activeFinding;
+    setActiveFinding(null);
+    setShowBackToFindings(false);
+    // Activation switched the inspector away from findings, unmounting the
+    // row — switch back first; focus is delivered once the row remounts
+    // (see the effect below).
+    setInspectorTab("findings");
+    if (finding != null) setReturnFocusFindingId(finding.id);
+  }
+
+  // Focus lands on the originating finding row once it is back in the DOM.
+  // "Back to findings" switches the inspector's findings tab in first, but
+  // the panel re-subscribes/re-fetches before it re-renders its rows, so the
+  // row can mount a commit later than the click — a MutationObserver delivers
+  // focus at the moment the row actually appears. If the row never returns
+  // (filters changed, the finding was disposed), the request simply waits on
+  // the observer until the next activation or unmount clears it.
+  useEffect(() => {
+    if (returnFocusFindingId == null) return;
+    const selector = `[data-finding-row="${returnFocusFindingId}"]`;
+    const deliverFocus = (): boolean => {
+      const row = document.querySelector<HTMLElement>(selector);
+      if (row == null) return false;
+      setReturnFocusFindingId(null);
+      row.focus();
+      return true;
+    };
+    if (deliverFocus()) return;
+    const observer = new MutationObserver(() => {
+      deliverFocus();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [returnFocusFindingId]);
+
+  function handleCompareFindingRevision() {
+    const findingRevisionId = activeFinding?.revision_id;
+    if (findingRevisionId == null || currentRevisionId == null) return;
+    setCompareRevisions(findingRevisionId, currentRevisionId);
+    setEditorTab("compare");
+  }
 
   const compareFromQuery = useQuery({
     queryKey: draftRoomKeys.revision(draftId, compareFromRevisionId ?? -1),
@@ -745,6 +841,18 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
     // tab === "draft": the manuscript editor / preview / compare area.
     return (
       <div className="space-y-4">
+        {showBackToFindings && activeFinding != null && (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" variant="outline" size="sm" onClick={handleBackToFindings}>
+              {FINDINGS_BACK_LABEL}
+            </Button>
+            {canCompareFindingRevision && (
+              <Button type="button" variant="outline" size="sm" onClick={handleCompareFindingRevision}>
+                {compareFindingRevisionLabel()}
+              </Button>
+            )}
+          </div>
+        )}
         <Tabs value={editorTab} onValueChange={(value) => setEditorTab(value as EditorTab)}>
           <TabsList>
             <TabsTrigger value="editor">Editor</TabsTrigger>
@@ -753,6 +861,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           </TabsList>
           <TabsContent value="editor">
             <DraftEditor
+              ref={editorHandleRef}
               draftId={draftId}
               revision={currentRevisionDetailQuery.data ?? null}
               value={editorValue}
@@ -1000,6 +1109,9 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           lockVersion={draft.lock_version}
           canDispose={canManageContent && !hasActiveJob && capabilities?.enabled !== false}
           tier={draft.tier}
+          onSelectSpan={handleFindingSpanSelect}
+          onOpenEvidence={handleFindingEvidenceOpen}
+          checksStale={checksStale}
         />
       </div>
 
@@ -1228,6 +1340,7 @@ export const DraftWorkspace = forwardRef<DraftWorkspaceHandle, DraftWorkspacePro
           draftId={draftId}
           revision={currentRevisionSummary}
           isReadyRevision={isReadyRevision}
+          openBlockers={detail.finding_counts_by_severity.blocker ?? 0}
         />
       )}
 

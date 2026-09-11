@@ -25,6 +25,7 @@ structured-output repair attempt (SPEC §14.3).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -58,6 +59,9 @@ class EvidenceSnapshot:
     source_content_sha256: str
     retrieval_score: float
     source_updated_at: str | None
+    #: Populated only for ``[D#]`` project-input snapshots minted at research
+    #: time (SPEC §12.2); vault-retrieved evidence never carries it.
+    draft_input_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -239,28 +243,22 @@ def _label_evidence(
 ) -> list[EvidenceSnapshot]:
     """Assign stable S#/W#/K# labels in facet order (SPEC §12.2).
 
-    KNOWN LIMITATION -- ``[D#]`` project-input labels are NOT minted here.
+    ``[D#]`` project-input labels are minted separately by
+    :func:`mint_input_evidence` and appended by :func:`run_research` AFTER the
+    retrieval-status computation, so vault-retrieval availability
+    (``source_only``) is tracked independently from input evidence and a
+    source-only run still carries resolvable ``[D#]`` snapshots.
 
     Issue #436 §5 requires citation validation to *support* ``[D#]`` only when
     an explicit Draft registry is supplied, with an empty default so chat is
     unaffected; that is implemented and tested in
     ``citation_validator.calculate_citation_lexical_overlap`` /
-    ``parse_draft_citations``. SPEC §12.2 additionally describes ``[D#]`` as
-    part of the job's immutable evidence snapshot, and the supporting
-    plumbing exists (the ``draft_input`` source kind, the
+    ``parse_draft_citations``. The Draft Room pipeline supplies that registry
+    from the minted snapshots (the ``draft_input`` source kind, the
     ``draft_evidence.draft_input_id`` column, the freshness resolver for that
-    family, and the ``D`` branch of the citation regex).
-
-    Minting the labels here was implemented and then reverted: project inputs
-    are always present, so counting them as evidence made ``source_only``
-    permanently False and masked the genuine empty-vault state that SPEC §12.5
-    rule 7 requires a human to acknowledge. Separating "vault evidence" from
-    "input evidence" through the status logic, the prompts, the ledger and the
-    Ready gate is a coherent change, but it is a broad semantic one and is not
-    required by this issue's acceptance criteria. Until it is made, a model
-    emitting ``[D1]`` has that label removed by the pre-Fact sanitation pass
-    and surfaced as a finding, rather than silently presenting provenance the
-    ledger cannot back.
+    family, and the ``D`` branch of the citation regex), so a model emitting
+    ``[D1]`` in Draft Room now cites a snapshot the ledger can back instead of
+    having the label stripped as fabricated.
     """
     doc_n = wiki_n = kms_n = 0
     evidence: list[EvidenceSnapshot] = []
@@ -297,6 +295,50 @@ def _label_evidence(
                 )
             )
     return evidence
+
+
+def mint_input_evidence(inputs: Sequence[dict]) -> tuple[EvidenceSnapshot, ...]:
+    """Mint immutable ``[D#]`` project-input evidence snapshots (SPEC §12.2).
+
+    Every input whose role is evidence-eligible per the §12.1 role table
+    (``style`` supplies prose characteristics only and is never evidence)
+    becomes one snapshot labeled ``D1..Dn`` in input-id order — the same
+    deterministic order ``_derive_facets`` uses — with the full parsed text
+    as its passage (bounded upstream by the intake char limits) and its
+    sha256 as the content hash, so ``draft_evidence_freshness`` re-resolution
+    compares against the same bytes the snapshot captured. An input whose
+    parsed text is empty/whitespace is skipped: no empty-passage evidence
+    rows. Labels are never renumbered within a job (SPEC §12.2).
+    """
+    snapshots: list[EvidenceSnapshot] = []
+    ordinal = 0
+    for record in sorted(inputs, key=_input_id):
+        if record.get("role") not in _FACET_ROLES:
+            continue
+        text = _input_text(record) or ""
+        if not text.strip():
+            continue
+        ordinal += 1
+        snapshots.append(
+            EvidenceSnapshot(
+                label=f"D{ordinal}",
+                source_kind="draft_input",
+                file_id=None,
+                wiki_page_id=None,
+                wiki_claim_id=None,
+                kms_entry_id=None,
+                chunk_uid=None,
+                title=f"project input #{_input_id(record)} ({record.get('role')})",
+                passage=text,
+                source_content_sha256=hashlib.sha256(
+                    text.encode("utf-8")
+                ).hexdigest(),
+                retrieval_score=0.0,
+                source_updated_at=None,
+                draft_input_id=_input_id(record),
+            )
+        )
+    return tuple(snapshots)
 
 
 # ---------------------------------------------------------------------------
@@ -442,47 +484,60 @@ async def run_research(
     successful_list = _sorted_kinds(successful_kinds)
     failed_list = _sorted_kinds(failed_kinds)
 
+    # Input evidence is tracked independently from vault retrieval: the
+    # ``source_only``/``retrieval_status`` computation above reflects the
+    # vault only, while every eligible project input still becomes a
+    # resolvable ``[D#]`` snapshot (SPEC §12.2) so citations and rewrite
+    # context survive a source-only run.
+    input_evidence = mint_input_evidence(inputs)
+
+    def _evidence_items(snapshots: Sequence[EvidenceSnapshot]) -> list[ResearchEvidenceItem]:
+        return [
+            ResearchEvidenceItem(
+                label=ev.label,
+                kind=ev.source_kind,
+                title=ev.title,
+                passage=ev.passage,
+                chunk_ref=ev.chunk_uid,
+                observed_at=ev.source_updated_at,
+                retrieval_score=ev.retrieval_score,
+                content_sha256=ev.source_content_sha256,
+                file_id=ev.file_id,
+                chunk_uid=ev.chunk_uid,
+                wiki_page_id=ev.wiki_page_id,
+                wiki_claim_id=ev.wiki_claim_id,
+                kms_entry_id=ev.kms_entry_id,
+                draft_input_id=ev.draft_input_id,
+            )
+            for ev in snapshots
+        ]
+
     if not evidence:
         # Nothing retrieved (genuinely empty vault or full outage) — nothing
         # for the model to reason about, so skip the model call entirely
         # rather than risk it fabricating contradictions/gaps from nothing.
+        # The minted ``[D#]`` input snapshots still ship so uploaded sources
+        # remain citable evidence even here.
         packet = ResearchPacket(
             facets=facets,
             retrieval_status=retrieval_status,
             requested_source_kinds=requested_list,
             successful_source_kinds=successful_list,
             failed_source_kinds=failed_list,
-            evidence=[],
+            evidence=_evidence_items(input_evidence),
             contradictions=[],
             gaps=[],
             source_only=source_only,
         )
         return ResearchOutcome(
             packet=packet,
-            evidence=(),
+            evidence=input_evidence,
             retrieval_status=retrieval_status,
             source_only=source_only,
             blockers=blockers,
         )
 
-    evidence_items = [
-        ResearchEvidenceItem(
-            label=ev.label,
-            kind=ev.source_kind,
-            title=ev.title,
-            passage=ev.passage,
-            chunk_ref=ev.chunk_uid,
-            observed_at=ev.source_updated_at,
-            retrieval_score=ev.retrieval_score,
-            content_sha256=ev.source_content_sha256,
-            file_id=ev.file_id,
-            chunk_uid=ev.chunk_uid,
-            wiki_page_id=ev.wiki_page_id,
-            wiki_claim_id=ev.wiki_claim_id,
-            kms_entry_id=ev.kms_entry_id,
-        )
-        for ev in evidence
-    ]
+    evidence_items = _evidence_items(evidence) + _evidence_items(input_evidence)
 
     prompt = _build_research_prompt(brief=brief, inputs=inputs, evidence=evidence)
     model_packet = await _complete_packet(complete=complete, prompt=prompt)
@@ -500,7 +555,7 @@ async def run_research(
     )
     return ResearchOutcome(
         packet=packet,
-        evidence=tuple(evidence),
+        evidence=tuple(evidence) + input_evidence,
         retrieval_status=retrieval_status,
         source_only=source_only,
         blockers=blockers,
