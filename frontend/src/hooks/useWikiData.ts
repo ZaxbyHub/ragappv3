@@ -43,6 +43,17 @@ export function useWikiData(vaultId: number | null) {
   // Current list page for Load-more (AC34) — a ref so loadMore reads the
   // latest committed page without re-creating the callback.
   const listPageRef = useRef(1);
+  // PRR-005 (#531): true while a list RESET (fetchPages) is still in flight.
+  // loadMore must not start inside that window: it would take the newer
+  // generation, its append would win, and the still-pending reset would be
+  // dropped — silently discarding the fresh list. Reachable because openPage
+  // shares the `loading` flag: its finally can re-render the Load-more button
+  // while a fetchPages is pending.
+  const listResetInFlightRef = useRef(false);
+  // PRR-005 (#531): separate generation for the loadingMore flag. With only
+  // listGenRef, a loadMore superseded by a newer list request skipped its own
+  // setLoadingMore(false) and the control stayed stuck on "Loading…" forever.
+  const loadMoreGenRef = useRef(0);
 
   const fetchPages = useCallback(
     async (params?: { page_type?: string; status?: string; search?: string }) => {
@@ -64,6 +75,7 @@ export function useWikiData(vaultId: number | null) {
         return;
       }
       const gen = ++listGenRef.current;
+      listResetInFlightRef.current = true;
       setLoading(true);
       setError(null);
       try {
@@ -76,7 +88,10 @@ export function useWikiData(vaultId: number | null) {
         if (listGenRef.current !== gen) return;
         setError(e instanceof Error ? e.message : "Failed to load pages");
       } finally {
-        if (listGenRef.current === gen) setLoading(false);
+        if (listGenRef.current === gen) {
+          listResetInFlightRef.current = false;
+          setLoading(false);
+        }
       }
     },
     [vaultId, testMode]
@@ -85,11 +100,16 @@ export function useWikiData(vaultId: number | null) {
   // AC34 (#515): fetch the NEXT page with the same filters and append. Shares
   // the list generation guard so a Load-more response never clobbers a newer
   // full refetch (and vice versa).
+  // PRR-005 (#531): no-op while a list reset is in flight — an append started
+  // in that window would outrank the reset and silently drop the fresh list
+  // (see listResetInFlightRef).
   const loadMore = useCallback(
     async (params?: { page_type?: string; status?: string; search?: string }) => {
       if (!vaultId || testMode) return;
+      if (listResetInFlightRef.current) return;
       const nextPage = listPageRef.current + 1;
       const gen = ++listGenRef.current;
+      const moreGen = ++loadMoreGenRef.current;
       setLoadingMore(true);
       try {
         const res = await listWikiPages({
@@ -106,7 +126,7 @@ export function useWikiData(vaultId: number | null) {
         if (listGenRef.current !== gen) return;
         setError(e instanceof Error ? e.message : "Failed to load more pages");
       } finally {
-        if (listGenRef.current === gen) setLoadingMore(false);
+        if (loadMoreGenRef.current === moreGen) setLoadingMore(false);
       }
     },
     [vaultId, testMode]

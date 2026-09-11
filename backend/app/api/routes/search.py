@@ -483,7 +483,8 @@ async def unified_search(
 
     # Vault scoping (mirrors GET /documents/search). WikiStore.search and
     # KMSStore.list_entries take a single vault_id, so a multi-vault scope
-    # iterates the vault list with the same per-entity limit.
+    # iterates the vault list per vault with `limit` each, then merges and
+    # truncates the per-type pool to `limit` total (PRR-003, #531).
     if vault_id is not None:
         if not await evaluate(user, "vault", vault_id, "read"):
             raise HTTPException(status_code=403, detail="Access denied to vault")
@@ -507,6 +508,9 @@ async def unified_search(
         # Direct reuse of the ranked documents search — it re-applies the same
         # vault scoping rules (evaluate check above already ran for the
         # vault_id case) and returns deduplicated, excerpt-bearing hits.
+        # PRR-015 (#531): the conn/user/evaluate wiring below manually mirrors
+        # the DI signature of documents.search_documents; if that handler
+        # gains new dependencies, this call site must be updated in step.
         doc_response = await search_documents(
             q=q,
             vault_id=vault_id,
@@ -531,10 +535,14 @@ async def unified_search(
 
     if "wiki" in requested_types and fts_query and scope_vaults:
         wiki_store = WikiStore(db)
+        # PRR-003 (#531): accumulate across the scoped vaults, then cap at
+        # `limit` TOTAL wiki hits (not limit per vault) — sort by score
+        # descending with id ascending as the deterministic tie-break.
+        wiki_typed: List[UnifiedSearchResult] = []
         for scope_vault in scope_vaults:
             wiki_hits = wiki_store.search(scope_vault, fts_query, limit=limit)
             for page in wiki_hits["pages"]:
-                results.append(
+                wiki_typed.append(
                     UnifiedSearchResult(
                         type="wiki",
                         id=page.id,
@@ -545,14 +553,18 @@ async def unified_search(
                         score=_tiered_score(query_lower, page.title, page.summary),
                     )
                 )
+        wiki_typed.sort(key=lambda r: (-r.score, r.id))
+        results.extend(wiki_typed[:limit])
 
     if "kms" in requested_types and fts_query and scope_vaults:
         kms_store = KMSStore(db)
+        # PRR-003 (#531): same TOTAL-per-type cap as the wiki arm above.
+        kms_typed: List[UnifiedSearchResult] = []
         for scope_vault in scope_vaults:
             for entry in kms_store.list_entries(
                 scope_vault, search=fts_query, page=1, per_page=limit
             ):
-                results.append(
+                kms_typed.append(
                     UnifiedSearchResult(
                         type="kms",
                         id=entry.id,
@@ -563,6 +575,8 @@ async def unified_search(
                         score=_tiered_score(query_lower, entry.title, entry.summary),
                     )
                 )
+        kms_typed.sort(key=lambda r: (-r.score, r.id))
+        results.extend(kms_typed[:limit])
 
     if "chat" in requested_types:
         # Title substring match with the same visibility rules as

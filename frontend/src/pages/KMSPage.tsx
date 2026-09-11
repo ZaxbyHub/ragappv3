@@ -86,6 +86,9 @@ export default function KMSPage() {
       } catch (e) {
         if (fetchGenRef.current !== gen) return;
         setError(e instanceof Error ? e.message : "Failed to load KMS entries");
+        // PRR-002 (#531): re-sync page state on error too — without this a
+        // failed load-more left `page` pointing at the page that never loaded.
+        setPage(pageToLoad);
       } finally {
         if (fetchGenRef.current === gen) {
           setLoading(false);
@@ -103,8 +106,10 @@ export default function KMSPage() {
 
   // C37: past the fixed per_page=200 window the remaining entries are fetched
   // on demand; the page-2 request retains the current search/vault filters.
+  // PRR-007 (#531): no-op while a fetch is already in flight so a load-more
+  // click can't race (and interleave with) a just-started filter change.
   function handleLoadMore() {
-    if (!activeVaultId) return;
+    if (!activeVaultId || loading) return;
     fetchEntries(page + 1, true);
   }
 

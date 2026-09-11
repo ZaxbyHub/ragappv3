@@ -104,6 +104,14 @@ export default function WikiPage() {
   // with `page_id` (or slug). Opens the detail without a list click, once per
   // mount; Back clears the param so popstate returns to the list.
   const deepLinkHandledRef = useRef(false);
+  // PRR-004 (#531): switching vaults re-arms the one-shot deep link so the
+  // still-present ?page= param opens in the NEW vault's context. Declared
+  // BEFORE the deep-link effect so the reset lands before it runs; within a
+  // single vault the ref still guarantees once-per-mount handling (no
+  // re-trigger for the same URL param).
+  useEffect(() => {
+    deepLinkHandledRef.current = false;
+  }, [activeVaultId]);
   useEffect(() => {
     if (!activeVaultId || deepLinkHandledRef.current) return;
     const raw = searchParams?.get("page");

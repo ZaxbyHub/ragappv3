@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -83,29 +84,31 @@ function ClaimRow({ claim }: { claim: WikiClaim }) {
           {claim.sources.map((src) => {
             // AC44 (#515): origin chips LINK to the surface the claim came
             // from so provenance is one click away. document → the document
-            // detail route; memory → the memories page.
+            // detail route; memory → the memories page. PRR-006 (#531):
+            // client-side <Link> navigation (not origin <a href>) so the
+            // chips stay inside the SPA router.
             if (src.source_kind === "document" && src.file_id != null) {
               return (
-                <a
+                <Link
                   key={src.id}
-                  href={`/documents/${src.file_id}`}
+                  to={`/documents/${src.file_id}`}
                   title={`Open source document ${src.file_id}`}
                   className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground hover:underline"
                 >
                   document{src.source_label ? ` · ${src.source_label}` : ` · file ${src.file_id}`}
-                </a>
+                </Link>
               );
             }
             if (src.source_kind === "memory" && src.memory_id != null) {
               return (
-                <a
+                <Link
                   key={src.id}
-                  href="/memory"
+                  to="/memory"
                   title={`Open memories (source memory ${src.memory_id})`}
                   className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground hover:underline"
                 >
                   memory{src.source_label ? ` · ${src.source_label}` : ` #${src.memory_id}`}
-                </a>
+                </Link>
               );
             }
             return (
@@ -241,6 +244,10 @@ function BacklinksSection({ pageId, vaultId }: { pageId: number; vaultId: number
   useEffect(() => {
     if (!open) return;
     setLoading(true);
+    // PRR-013 (#531): pageId/vaultId changed — drop the legacy-source
+    // resolution cache so stale titles/slugs from the previous page can't
+    // bleed into this page's backlinks while the new fetch is in flight.
+    setResolvedSources({});
     let cancelled = false;
     getWikiPageBacklinks(pageId, vaultId)
       .then((data) => {

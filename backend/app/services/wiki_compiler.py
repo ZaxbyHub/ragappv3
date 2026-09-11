@@ -1192,8 +1192,16 @@ class WikiCompiler:
         # the connection and only reached the DB if a LATER write (e.g. lint
         # findings) happened to commit, so an accepted claim could be visible
         # without its provenance, or lose it entirely on return-to-pool.
+        # PRR-001 (#531): each claim+source pair is additionally wrapped in a
+        # SAVEPOINT, so the pair is atomic even when it fails — the per-claim
+        # except below rolls the pair back (a failed attach_source can no
+        # longer leave an orphaned committed claim without its source) while
+        # the batch continues with the next candidate. The SAVEPOINT/RELEASE
+        # statements run on self._db, the SAME connection WikiStore wraps (its
+        # transaction() opened the surrounding BEGIN IMMEDIATE on it).
         with self._store.transaction():
             for accepted in cur_result.accepted:
+                self._db.execute("SAVEPOINT claim_pair")
                 try:
                     claim = self._store.create_claim(
                         vault_id=vault_id,
@@ -1220,7 +1228,13 @@ class WikiCompiler:
                         quote=accepted.source_quote,
                         confidence=accepted.confidence,
                     )
+                    self._db.execute("RELEASE claim_pair")
                 except Exception as e:  # pragma: no cover - defensive
+                    # Undo this pair only; RELEASE the (still-open) savepoint
+                    # so the next iteration starts from a clean savepoint
+                    # stack inside the still-open outer transaction.
+                    self._db.execute("ROLLBACK TO claim_pair")
+                    self._db.execute("RELEASE claim_pair")
                     cur_result.errors.append(
                         f"persist_error: {type(e).__name__}: {e}"
                     )
