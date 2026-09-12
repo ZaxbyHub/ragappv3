@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from app.services.feedback_reranker import (
     _DEFAULT_BONUS_PER_VOTE,
@@ -442,17 +443,46 @@ class TestCache(unittest.TestCase):
         self.assertIn(99, reranker._cache)
 
     def test_explicit_refresh_bypasses_ttl(self):
-        """Calling refresh() re-queries even when cache is still valid."""
+        """refresh() re-reads the DATABASE even while the cache is TTL-valid.
+
+        Issue #258 (TEST-002): the legacy body compared ``_cache_timestamp``
+        movement across a real 0.01 s wall-clock pause — a proxy metric that
+        never pinned the actual contract (a refresh returns the NEW vote
+        state). This rewrite asserts DB-derived outcomes with zero sleeps:
+        TTL expiry is exercised only through a patched ``time.monotonic``.
+        """
         _insert_message(self._db.conn(), 1, "assistant", [{"file_id": "f_cached"}], "up")
         reranker = FeedbackReranker(
             db_path=self._db.path,
             cache_ttl_seconds=300,
         )
-        _ = reranker.get_feedback_score("f_cached", vault_id=10)
-        old_ts = reranker._cache_timestamp[10]
-        time.sleep(0.01)
+        # Warm the cache: one up vote is visible.
+        warm = reranker.get_feedback_score("f_cached", vault_id=10)
+        self.assertIsNotNone(warm)
+        self.assertEqual(warm.net_positive, 1)
+
+        # A second vote lands AFTER the cache was warmed. The cache is still
+        # TTL-valid here, so only refresh() can surface it.
+        _insert_message(self._db.conn(), 1, "assistant", [{"file_id": "f_cached"}], "up")
         reranker.refresh(10)
-        self.assertGreater(reranker._cache_timestamp[10], old_ts)
+        refreshed = reranker.get_feedback_score("f_cached", vault_id=10)
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed.net_positive, 2)
+        self.assertEqual(refreshed.up_votes, 2)
+        self.assertEqual(refreshed.down_votes, 0)
+
+        # TTL expiry via explicit clock control only (no sleep): advance the
+        # patched monotonic clock past the TTL and assert the next read
+        # re-queries the DB and observes a third vote.
+        _insert_message(self._db.conn(), 1, "assistant", [{"file_id": "f_cached"}], "up")
+        clock_base = time.monotonic()
+        with patch(
+            "app.services.feedback_reranker.time.monotonic",
+            return_value=clock_base + 301.0,
+        ):
+            expired = reranker.get_feedback_score("f_cached", vault_id=10)
+        self.assertIsNotNone(expired)
+        self.assertEqual(expired.net_positive, 3)
 
     def test_refresh_vault_not_in_cache_noops(self):
         """refresh() on an uncached vault is safe (no KeyError)."""
