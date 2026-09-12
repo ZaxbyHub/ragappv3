@@ -32,10 +32,14 @@ RAGAPPv3 is a Retrieval-Augmented Generation (RAG) knowledge base application wi
 | Component | Minimum Version | Purpose |
 |-----------|----------------|---------|
 | Python | 3.11+ | Backend runtime |
-| Node.js | 18+ | Frontend build |
-| npm | 9+ | Package management |
+| Node.js | 22.11+ (LTS) | Frontend build |
+| npm | Bundled with Node.js 22 | Package management |
 | Git | 2.40+ | Source control |
 | Ollama | 0.1.0+ | Local LLM inference |
+
+> The runtime contract (Node.js 22.11 / Python 3.11) is enforced mechanically
+> across CI, the Docker images and `frontend/package.json` engines by
+> `scripts/check_runtime_contract.py` — this table agrees with that contract.
 
 ### Optional (but Recommended)
 
@@ -69,7 +73,7 @@ pip --version
 
 ```powershell
 # Download from https://nodejs.org/en/download
-# Choose LTS version (18.x or 20.x)
+# Choose the Node.js 22 LTS line (>= 22.11.0)
 
 # Verify installation
 node --version
@@ -131,7 +135,7 @@ python3.11 --version
 #### Step 3: Install Node.js
 
 ```bash
-brew install node@18
+brew install node@22
 
 # Verify
 node --version
@@ -181,7 +185,7 @@ python3.11 --version
 
 ```bash
 # Using NodeSource
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt install -y nodejs
 
 # Verify
@@ -273,13 +277,14 @@ npm list | grep -E "react|vite|typescript"
 
 ```bash
 # From project root
-cp backend/.env.example backend/.env
-
-# Edit backend/.env with your settings
-# See Configuration section below
+# The repo's .env.example is the docker-compose template (root .env).
+# For native development, create backend/.env — the backend loads .env from
+# its working directory (backend/) — using the Configuration section below.
+cp .env.example .env          # docker-compose deployments
+# and/or create backend/.env  # native development (see Configuration)
 ```
 
-#### Step 5: Database Initialization
+#### Step 5: Database Initialization (Optional)
 
 ```bash
 # Navigate to backend
@@ -289,12 +294,19 @@ cd backend
 # Windows: venv\Scripts\activate
 # macOS/Linux: source venv/bin/activate
 
-# Initialize database
-python -c "from app.models.database import init_db; init_db()"
+# Initialize the database schema at the path your SQLITE_PATH points to
+# (./ragapp.db in the example configuration below)
+python -c "from app.models.database import init_db; init_db('./ragapp.db')"
 
 # Verify database created
 ls -la *.db
 ```
+
+> **Note:** this step is optional — starting the backend with
+> `uvicorn app.main:app` (next step) runs the same migrations automatically
+> on startup via the application lifespan (`app.models.database.run_migrations`,
+> which applies the schema plus the startup migrations). The manual command
+> exists for headless/first-run provisioning.
 
 #### Step 6: Start Services
 
@@ -325,191 +337,149 @@ npm run dev
 ollama serve
 ```
 
-### Method 2: Docker Desktop (Windows 11)
+### Method 2: Docker Compose (All Platforms)
 
-#### Step 1: Install Docker Desktop
+The repository ships a maintained `docker-compose.yml` at the project root.
+It defines the full service set — `harrier-embed` (TEI embedding server),
+`reranker` (bge-reranker-v2-m3 via TEI), `redis`, and `knowledgevault`
+(the combined backend + frontend image built from the root `Dockerfile`) —
+so there is no per-install compose recipe or Dockerfile to author.
 
-1. Download from https://www.docker.com/products/docker-desktop
-2. Run installer
-3. Enable WSL2 backend when prompted
-4. Restart computer
+#### Step 1: Install Docker
 
-#### Step 2: Verify Docker Installation
+1. Windows 11 / macOS: download Docker Desktop from
+   https://www.docker.com/products/docker-desktop (enable the WSL2 backend
+   on Windows when prompted)
+2. Linux: follow https://docs.docker.com/engine/install/
 
-```powershell
-# In PowerShell
+#### Step 2: Verify the Docker Installation
+
+```bash
 docker --version
-docker-compose --version
+docker compose version
 
 # Test Docker
 docker run hello-world
 ```
 
-#### Step 3: Create Docker Configuration
+#### Step 3: Configure the Environment
 
-Create `docker-compose.yml` in project root:
+```bash
+# From the project root
+cp .env.example .env
+
+# .env requires two secrets with no defaults (the backend rejects empty values):
+#   ADMIN_SECRET_TOKEN=<random string>
+#   JWT_SECRET_KEY=<random string>
+# generate each with: python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+#### Step 4: Start the Stack
+
+```bash
+# From the project root (builds the knowledgevault image on first run)
+docker compose up -d --build
+
+# All services healthy? (harrier-embed/reranker have a long first-start
+# model download; their healthchecks report starting until it finishes)
+docker compose ps
+docker compose logs -f knowledgevault
+
+# Stop the stack
+docker compose down
+```
+
+The `knowledgevault` service wires the model endpoints to the bundled
+containers. Excerpt from the repo's `docker-compose.yml` — see the file for
+the full set (draft-room, multimodal and retrieval-tuning variables):
 
 ```yaml
-version: '3.8'
-
 services:
-  backend:
+
+  # Harrier Embedding Server (replaces flag-embed-server)
+  harrier-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
+    command: --model-id microsoft/harrier-oss-v1-0.6b --port 8080 --max-batch-tokens 16384 --max-client-batch-size 128
+    ports:
+      - "8080:8080"
+    volumes:
+      - harrier-model-cache:/data
+    # ... healthcheck + GPU reservation (see docker-compose.yml)
+
+  # Reranker Server (bge-reranker-v2-m3 via TEI)
+  reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:cuda-latest@sha256:1bf10562b37c8b835693084e1bab4d80232188cb258da886eaf1e6eaf6770353
+    command: --model-id BAAI/bge-reranker-v2-m3 --port 8081 --max-batch-tokens 8192
+    ports:
+      - "8081:8081"
+    volumes:
+      - reranker-model-cache:/data
+    # ... healthcheck + GPU reservation (see docker-compose.yml)
+
+  # Redis
+  redis:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    # ... healthcheck (see docker-compose.yml)
+
+  # KnowledgeVault (backend + frontend, combined image)
+  knowledgevault:
     build:
-      context: ./backend
+      context: .
       dockerfile: Dockerfile
     ports:
-      - "9090:9090"
+      - "${PORT:-9090}:9090"
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/app/data
     environment:
-      - SQLITE_PATH=/app/data/ragapp.db
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - OLLAMA_EMBEDDING_URL=${OLLAMA_EMBEDDING_URL:-http://harrier-embed:8080/v1/embeddings}
+      - RERANKER_URL=${RERANKER_URL:-http://reranker:8081}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/harrier-oss-v1-0.6b}
+      - CHAT_MODEL=${CHAT_MODEL:-gemma-4-26b-a4b-it-apex}
+      - INSTANT_CHAT_MODEL=${INSTANT_CHAT_MODEL:-nvidia/nemotron-3-nano-4b}
+      # Chat endpoints reach the Docker host's Ollama / LM Studio via
+      # host.docker.internal (extra_hosts: host-gateway in the full file):
+      # - OLLAMA_CHAT_URL=${OLLAMA_CHAT_URL:-http://host.docker.internal:11434}
+      # - INSTANT_CHAT_URL=${INSTANT_CHAT_URL:-http://host.docker.internal:1234}
+      # REQUIRED — no default, backend rejects empty values
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
-      - APP_ROOT_PATH=${APP_ROOT_PATH:-}
-      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
-      - OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
-      - OLLAMA_CHAT_URL=http://ollama:11434
-      - EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
-      - CHAT_MODEL=gemma-4-26b-a4b-it-apex
-    volumes:
-      - ./data:/app/data
-      - ./uploads:/app/uploads
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
     depends_on:
-      - ollama
-    networks:
-      - ragapp-network
-
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        VITE_APP_BASENAME: ${VITE_APP_BASENAME:-/}
-        VITE_API_URL: ${VITE_API_URL:-}
-    ports:
-      - "3000:3000"
-    depends_on:
-      - backend
-    networks:
-      - ragapp-network
-
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama-data:/root/.ollama
-    networks:
-      - ragapp-network
+      redis:
+        condition: service_healthy
+    # ... healthcheck + further environment defaults (see docker-compose.yml)
 
 volumes:
-  ollama-data:
-
-networks:
-  ragapp-network:
-    driver: bridge
+  harrier-model-cache:
+  reranker-model-cache:
+  redis_data:
 ```
 
-#### Step 4: Create Backend Dockerfile
+#### Step 5: Pull the Chat Models (on the Docker Host)
 
-Create `backend/Dockerfile`:
+The bundled `harrier-embed`/`reranker` containers download their models on
+first start — no manual pull is needed for embeddings or reranking. Chat
+traffic, however, is served by the Ollama instance on your Docker host
+(`OLLAMA_CHAT_URL` defaults to `http://host.docker.internal:11434`), so pull
+every model you configure as `CHAT_MODEL` / `INSTANT_CHAT_MODEL` on the host:
 
-```dockerfile
-FROM python:3.11-slim
+```bash
+# The default CHAT_MODEL used in this guide
+ollama pull llama3.2
 
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libsqlite3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
-COPY . .
-
-# Create data directory
-RUN mkdir -p /app/data /app/uploads
-
-# Expose port
-EXPOSE 9090
-
-# Start command
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 9090 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]
+# If you override CHAT_MODEL / INSTANT_CHAT_MODEL in .env, pull those too,
+# for example:
+# ollama pull gemma-4-26b-a4b-it-apex
 ```
 
-#### Step 5: Create Frontend Dockerfile
-
-Create `frontend/Dockerfile`:
-
-```dockerfile
-FROM node:18-alpine
-
-WORKDIR /app
-
-# Copy package files
-COPY package*.json ./
-
-# Install dependencies
-RUN npm ci
-
-# Copy application code
-COPY . .
-
-ARG VITE_APP_BASENAME=/
-ARG VITE_API_URL=
-ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
-ENV VITE_API_URL=${VITE_API_URL}
-
-# Build application
-RUN npm run build
-
-# Expose port
-EXPOSE 3000
-
-# Start command
-CMD ["npm", "run", "preview", "--", "--host", "0.0.0.0", "--port", "3000"]
-```
-
-#### Step 6: Build and Run
-
-```powershell
-# Navigate to project root
-cd ragappv3
-
-# Create environment file
-@"
-JWT_SECRET_KEY=your-super-secret-jwt-key-change-this-in-production
-ADMIN_SECRET_TOKEN=your-admin-token-change-this
-"@ | Out-File -FilePath .env -Encoding utf8
-
-# Build and start services
-docker-compose up --build
-
-# Or run in background
-docker-compose up --build -d
-
-# View logs
-docker-compose logs -f
-
-# Stop services
-docker-compose down
-```
-
-#### Step 7: Pull Ollama Models (in Docker)
-
-```powershell
-# Wait for Ollama container to be ready
-docker-compose ps
-
-# Pull models
-docker-compose exec ollama ollama pull llama3.2
-# Harrier TEI embeddings are started by docker-compose; no Ollama embedding pull is required.
-```
+The frontend is served by the combined `knowledgevault` image on the port
+mapped by `${PORT:-9090}` (open http://localhost:9090). A standalone
+frontend image is also maintained at `frontend/Dockerfile` for deployments
+that serve the SPA separately.
 
 ---
 
@@ -525,13 +495,19 @@ ADMIN_SECRET_TOKEN=
 # Database
 SQLITE_PATH=./ragapp.db
 
-# Model services
-OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
+# Model services (native dev)
+# Start the bundled embedding/reranker containers first — their ports are
+# published to localhost:
+#   docker compose up -d harrier-embed reranker
+OLLAMA_EMBEDDING_URL=http://localhost:8080/v1/embeddings
+RERANKER_URL=http://localhost:8081
 OLLAMA_CHAT_URL=http://localhost:11434
-INSTANT_CHAT_URL=http://localhost:1234
-CHAT_MODEL=gemma-4-26b-a4b-it-apex
+CHAT_MODEL=llama3.2
 EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
-INSTANT_CHAT_MODEL=nvidia/nemotron-3-nano-4b
+# Optional instant-chat model server (e.g. LM Studio) — uncomment and pull
+# whichever model you point INSTANT_CHAT_MODEL at:
+# INSTANT_CHAT_URL=http://localhost:1234
+# INSTANT_CHAT_MODEL=nvidia/nemotron-3-nano-4b
 
 # Embedding Configuration
 # Batch size for embedding requests (default: 32)
@@ -726,7 +702,7 @@ curl http://localhost:9090/api/health
 1. Check logs:
    - Backend: Terminal running uvicorn
    - Frontend: Browser console (F12)
-   - Docker: `docker-compose logs`
+   - Docker: `docker compose logs`
 
 2. Enable debug mode:
    ```bash
@@ -765,9 +741,9 @@ cd frontend && npm install && cd ..
 cp backend/.env.example backend/.env
 # (Edit backend/.env with secure keys)
 
-# 5. Database
+# 5. Database (optional — uvicorn auto-initializes via the app lifespan)
 cd backend
-python -c "from app.models.database import init_db; init_db()"
+python -c "from app.models.database import init_db; init_db('./ragapp.db')"
 cd ..
 
 # 6. Start Services
