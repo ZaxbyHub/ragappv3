@@ -33,7 +33,12 @@ const UNSAVED_CHANGES_WARNING =
 
 function DraftRoomDetailSkeleton() {
   return (
-    <div className="space-y-4" data-testid="draft-detail-skeleton">
+    <div
+      className="space-y-4"
+      data-testid="draft-detail-skeleton"
+      role="status"
+      aria-label="Loading draft"
+    >
       <Skeleton className="h-8 w-64" />
       <Skeleton className="h-10 w-full" />
       <Skeleton className="h-64 w-full" />

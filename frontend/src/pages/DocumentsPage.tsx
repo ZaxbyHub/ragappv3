@@ -38,6 +38,7 @@ import { useSettingsStore } from "@/stores/useSettingsStore";
 import { useUploadStore } from "@/stores/useUploadStore";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { EmptyState } from "@/components/EmptyState";
+import { ErrorState } from "@/components/shared/ErrorState";
 import {
   FILENAME_COL_WIDTH_MIN,
   FILENAME_COL_WIDTH_MAX,
@@ -243,6 +244,7 @@ export default function DocumentsPage() {
     stats,
     setStats,
     loading,
+    listError,
     fetchDocuments,
     fetchStats,
     wikiStatusMap,
@@ -732,6 +734,14 @@ export default function DocumentsPage() {
     [selectedIds]
   );
 
+  // Retry affordance for a failed list fetch (issue #258 / legacy-14): a
+  // network blip or backend restart must be distinguishable from an empty
+  // vault, and recoverable without a full page reload.
+  const retryLoadDocuments = useCallback(() => {
+    void fetchDocuments();
+    void fetchStats();
+  }, [fetchDocuments, fetchStats]);
+
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-12">
       <div className="flex items-center justify-between">
@@ -845,6 +855,12 @@ export default function DocumentsPage() {
         <div className="flex-1 min-w-0">
       {loading ? (
         <DocumentsTableSkeleton />
+      ) : listError && filteredDocuments.length === 0 ? (
+        <ErrorState
+          title="Failed to load documents"
+          description="The document list could not be fetched. Check your connection and try again."
+          action={{ label: "Try Again", onClick: retryLoadDocuments }}
+        />
       ) : isResolvingSearchEmptyState ? (
         <div className="space-y-3" role="status" aria-live="polite">
           <Skeleton className="h-8 w-64" />

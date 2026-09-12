@@ -124,7 +124,12 @@ function selectionToLineRange(
 
 function CanvasPageSkeleton() {
   return (
-    <div className="space-y-4" data-testid="canvas-skeleton">
+    <div
+      className="space-y-4"
+      data-testid="canvas-skeleton"
+      role="status"
+      aria-label="Loading canvas"
+    >
       <Skeleton className="h-6 w-40" />
       <Skeleton className="h-8 w-72" />
       <div className="flex flex-col gap-4 lg:flex-row">
