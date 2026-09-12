@@ -769,6 +769,16 @@ class TestNegativeCosineRegression(unittest.TestCase):
             sorted(alias.json()["metrics"].keys()),
         )
 
+    def test_alias_route_returns_identical_values_and_details(self):
+        # PRR-013: the deprecated alias must return the SAME computed body,
+        # not merely the same key set. evaluation_time_ms is excluded as a
+        # timing value; metrics (including the deterministic lexical
+        # heuristics and the cosine) and details must be identical.
+        canonical = self.client.post("/api/eval/heuristic", json=self._payload())
+        alias = self.client.post("/api/eval/ragas", json=self._payload())
+        self.assertEqual(canonical.json()["metrics"], alias.json()["metrics"])
+        self.assertEqual(canonical.json()["details"], alias.json()["details"])
+
     def test_alias_marked_deprecated_in_openapi(self):
         response = self.client.get("/openapi.json")
         spec = response.json()

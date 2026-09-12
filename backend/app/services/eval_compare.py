@@ -67,8 +67,10 @@ class RunComparison:
 def load_run_report(path: str | Path) -> RunReport:
     """Load a run report JSON file into a ``RunReport``.
 
-    Raises ``ValueError`` on missing keys, non-string environment entries, or
-    an environment missing any of ``ENVIRONMENT_KEYS`` with a non-empty value.
+    Raises ``ValueError`` on missing keys, non-string environment entries,
+    an environment missing any of ``ENVIRONMENT_KEYS`` with a non-empty
+    value, or an ``intervals`` entry whose ``low``/``high`` bounds are
+    missing or non-numeric.
     """
     p = Path(path)
     try:
@@ -104,10 +106,15 @@ def load_run_report(path: str | Path) -> RunReport:
             raise ValueError(
                 f"run report {p}: intervals[{metric_name!r}] must be an object"
             )
-        intervals[str(metric_name)] = {
-            "low": float(entry.get("low")),
-            "high": float(entry.get("high")),
-        }
+        try:
+            low = float(entry["low"])
+            high = float(entry["high"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"run report {p}: intervals[{metric_name!r}] must carry numeric "
+                f"'low' and 'high' bounds"
+            ) from exc
+        intervals[str(metric_name)] = {"low": low, "high": high}
     return RunReport(
         run_id=str(obj["run_id"]),
         environment={str(k): str(v) for k, v in environment.items()},

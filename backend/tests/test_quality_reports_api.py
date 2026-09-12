@@ -117,17 +117,21 @@ class QualityReportsApiTest(unittest.TestCase):
 
         self._allow = allow
         self._deny = deny
+        # addCleanup-based teardown: overrides and the module cache are
+        # removed even when setUp itself fails partway (PRR-024d), and the
+        # module-level _release_id_cache is cleared so no stubbed release id
+        # can leak across tests (PRR-005).
+        from app.api.routes import quality_reports as _qr
+
+        _qr._release_id_cache.clear()
+        self.addCleanup(_qr._release_id_cache.clear)
+        self.addCleanup(self.conn.close)
         app.dependency_overrides[get_db] = lambda: self.conn
         app.dependency_overrides[get_current_active_user] = lambda: ADMIN
         app.dependency_overrides[get_evaluate_policy] = lambda: allow
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf"
-
-    def tearDown(self):
-        app.dependency_overrides.pop(get_db, None)
-        app.dependency_overrides.pop(get_current_active_user, None)
-        app.dependency_overrides.pop(get_evaluate_policy, None)
-        app.dependency_overrides.pop(csrf_protect, None)
-        self.conn.close()
+        for dep in (get_db, get_current_active_user, get_evaluate_policy, csrf_protect):
+            self.addCleanup(app.dependency_overrides.pop, dep, None)
 
     def _report(self, message_id=None, category="incorrect_answer", note="wrong date"):
         return {
@@ -286,6 +290,54 @@ class QualityReportsApiTest(unittest.TestCase):
             json={"before": {"answer": ""}, "after": {"answer": ""}},
         )
         self.assertEqual(response.status_code, 404)
+
+    # -- authz negatives (PRR-004): require_admin_role enforcement --------
+
+    def test_convert_member_403(self):
+        report = self.client.post(
+            "/api/quality/reports", json=self._report()
+        ).json()
+        app.dependency_overrides[get_current_active_user] = lambda: MEMBER
+        try:
+            response = self.client.post(
+                f"/api/quality/reports/{report['id']}/convert",
+                json={"expected_outcome": "x"},
+            )
+        finally:
+            app.dependency_overrides[get_current_active_user] = lambda: ADMIN
+        self.assertEqual(response.status_code, 403)
+
+    def test_compare_member_403(self):
+        case_id = self._case_id()
+        app.dependency_overrides[get_current_active_user] = lambda: MEMBER
+        try:
+            response = self.client.post(
+                f"/api/quality/eval-cases/{case_id}/compare",
+                json={"before": {"answer": ""}, "after": {"answer": ""}},
+            )
+        finally:
+            app.dependency_overrides[get_current_active_user] = lambda: ADMIN
+        self.assertEqual(response.status_code, 403)
+
+    # -- list negatives (PRR-024b) ----------------------------------------
+
+    def test_list_reports_missing_session_id_422(self):
+        response = self.client.get("/api/quality/reports")
+        self.assertEqual(response.status_code, 422)
+
+    # -- duplicate submission (PRR-024a): insert-only contract -------------
+
+    def test_duplicate_submit_creates_independent_reports(self):
+        first = self.client.post("/api/quality/reports", json=self._report())
+        second = self.client.post("/api/quality/reports", json=self._report())
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        # Insert-only: no dedup constraint — each submission is its own row.
+        self.assertNotEqual(first.json()["id"], second.json()["id"])
+        listing = self.client.get(
+            "/api/quality/reports", params={"session_id": self.session_id}
+        ).json()["reports"]
+        self.assertEqual(len(listing), 2)
 
 
 if __name__ == "__main__":

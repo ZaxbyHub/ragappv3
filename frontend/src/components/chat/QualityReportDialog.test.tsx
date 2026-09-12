@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { useState } from "react";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QualityReportDialog } from "./QualityReportDialog";
@@ -81,6 +82,48 @@ describe("QualityReportDialog (issue #237 PRODUCT-ENH-12)", () => {
       "missing_source",
       "source missing"
     );
+  });
+
+  it("resets category, note and submitting state when closed", async () => {
+    const user = userEvent.setup();
+    // Parent-state wrapper (PRR-024c): close via the dialog's onOpenChange
+    // and reopen, so handleOpenChange's reset path actually runs.
+    function Wrapper() {
+      const [open, setOpen] = useState(true);
+      return (
+        <>
+          <button onClick={() => setOpen(true)}>reopen</button>
+          <QualityReportDialog
+            open={open}
+            onOpenChange={setOpen}
+            sessionId={7}
+            messageId={42}
+          />
+        </>
+      );
+    }
+    render(<Wrapper />);
+
+    await user.click(screen.getByTestId("quality-category-stale_source"));
+    await user.type(screen.getByLabelText("Note (optional)"), "draft note");
+    expect(
+      (screen.getByTestId("quality-report-submit") as HTMLButtonElement).disabled
+    ).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "reopen" }));
+
+    // Reopened dialog: form is back to its initial state.
+    expect(
+      (screen.getByTestId("quality-category-stale_source") as HTMLInputElement)
+        .checked
+    ).toBe(false);
+    expect(
+      (screen.getByLabelText("Note (optional)") as HTMLInputElement).value
+    ).toBe("");
+    expect(
+      (screen.getByTestId("quality-report-submit") as HTMLButtonElement).disabled
+    ).toBe(true);
   });
 
   it("surfaces an error toast when submission fails", async () => {

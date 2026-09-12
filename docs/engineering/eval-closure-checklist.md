@@ -15,8 +15,8 @@ must reach), never a placeholder.
 | Negative cosine tolerance | answer_similarity on [-1, 1] returns 200 for -1.0, 0.0 and +1.0 | 3-value route regression fixture | met at HEAD |
 | Empty-passage citation invalidity | valid_count 0 / accuracy 0.0 for empty and whitespace-only passages; 1.0 for a real passage; 1.0 for an empty citation list | 4-fixture scorer regression | met at HEAD |
 | Tuning/held-out disjointness | overlapping, unknown, or empty splits raise ValueError; fixture manifest is disjoint and non-empty | 15-case fixture manifest | met at HEAD |
-| Baseline comparison exactness | identical runs give a 0.0 delta on every metric; a controlled regression moves exactly the affected metric | 3-metric comparison fixture | met at HEAD |
-| Semantic preservation decision table | paraphrase passes without literal substring; negation, numeric and code contradictions fail | 7-row decision-table fixture | met at HEAD |
+| Baseline comparison exactness | identical runs give a 0.0 delta on every metric; a controlled regression moves exactly the affected metric | 2-metric comparison fixture (identical-runs zero delta + controlled regression; tests/test_eval_compare.py) | met at HEAD |
+| Semantic preservation decision table | paraphrase passes without literal substring; negation, numeric and code contradictions fail | 11-assertion decision-table suite (tests/test_semantic_checks.py) | met at HEAD |
 | Report honesty | every mean carries metric_n, metric_skipped, an uncertainty interval and a definition; no lexical heuristic is labeled as an external-library metric | 15-key report contract fixture | met at HEAD |
 
 ## Real-quality gates (operator evidence — the issue's own operator-data gate)

@@ -124,6 +124,31 @@ class TestCompareRuns(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_run_report(path)
 
+    def test_load_run_report_rejects_malformed_interval_with_value_error(self):
+        import json
+
+        from app.services.eval_compare import load_run_report
+
+        for bad_intervals in (
+            {"recall_at_k_mean": {"high": 0.6}},  # missing low
+            {"recall_at_k_mean": {"low": 0.4}},  # missing high
+            {"recall_at_k_mean": {}},  # missing both
+            {"recall_at_k_mean": {"low": None, "high": 0.6}},  # non-numeric
+        ):
+            with self.subTest(intervals=bad_intervals):
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / "run.json"
+                    payload = {
+                        "run_id": "run-1",
+                        "environment": ENV,
+                        "metrics": {"recall_at_k_mean": 0.5},
+                        "intervals": bad_intervals,
+                    }
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaises(ValueError) as ctx:
+                        load_run_report(path)
+                    self.assertIn("intervals", str(ctx.exception))
+
     def test_environment_fingerprint_is_deterministic(self):
         from app.services.eval_compare import environment_fingerprint
 
