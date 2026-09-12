@@ -94,7 +94,7 @@ services:
     environment:
       - DATA_DIR=/app/data
       - UVICORN_RELOAD=false
-      - APP_ROOT_PATH
+      - APP_ROOT_PATH=${APP_ROOT_PATH:-}
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-127.0.0.1}
       - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS:-false}
       # PRODUCTION: set to your domain, e.g. https://knowledgevault.example.com
@@ -109,15 +109,15 @@ services:
       - DRAFT_UPLOAD_RATE_LIMIT=${DRAFT_UPLOAD_RATE_LIMIT:-20/minute}
       - DRAFT_POLL_INTERVAL_SECONDS=${DRAFT_POLL_INTERVAL_SECONDS:-2.0}
       # Draft Room pipeline (issue #436, SPEC.md section 15)
-      - DRAFT_ALLOWED_MODEL_ORIGINS
-      - DRAFT_EDITORIAL_CHAT_URL
-      - DRAFT_EDITORIAL_CHAT_MODEL
-      - DRAFT_SENSITIVE_ALLOWED_MODEL_ORIGINS
+      - DRAFT_ALLOWED_MODEL_ORIGINS=${DRAFT_ALLOWED_MODEL_ORIGINS:-}
+      - DRAFT_EDITORIAL_CHAT_URL=${DRAFT_EDITORIAL_CHAT_URL:-}
+      - DRAFT_EDITORIAL_CHAT_MODEL=${DRAFT_EDITORIAL_CHAT_MODEL:-}
+      - DRAFT_SENSITIVE_ALLOWED_MODEL_ORIGINS=${DRAFT_SENSITIVE_ALLOWED_MODEL_ORIGINS:-}
       # Multimodal artifact enrichment (issue #461) — default OFF, fail-closed
       - MULTIMODAL_ENRICHMENT_ENABLED=${MULTIMODAL_ENRICHMENT_ENABLED:-false}
-      - MULTIMODAL_ALLOWED_MODEL_ORIGINS
-      - MULTIMODAL_CHAT_URL
-      - MULTIMODAL_MODEL
+      - MULTIMODAL_ALLOWED_MODEL_ORIGINS=${MULTIMODAL_ALLOWED_MODEL_ORIGINS:-}
+      - MULTIMODAL_CHAT_URL=${MULTIMODAL_CHAT_URL:-}
+      - MULTIMODAL_MODEL=${MULTIMODAL_MODEL:-}
       - MULTIMODAL_MODE=${MULTIMODAL_MODE:-thinking}
       - MULTIMODAL_TIMEOUT_SECONDS=${MULTIMODAL_TIMEOUT_SECONDS:-60.0}
       - MULTIMODAL_CONCURRENCY=${MULTIMODAL_CONCURRENCY:-2}
@@ -156,7 +156,7 @@ services:
       # when every model endpoint is public. ALLOW_LOCAL_CURATOR is a separate,
       # opt-in (empty) guard for the wiki curator.
       - ALLOW_LOCAL_SERVICES=${ALLOW_LOCAL_SERVICES:-1}
-      - ALLOW_LOCAL_CURATOR
+      - ALLOW_LOCAL_CURATOR=${ALLOW_LOCAL_CURATOR:-}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/harrier-oss-v1-0.6b}
       - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
       - CHAT_MODEL=${CHAT_MODEL:-gemma-4-26b-a4b-it-apex}
@@ -207,14 +207,17 @@ services:
       # ------------------------------------------------------------------
       # Issue #494 (CONFIG-007 / AC17): every ACTIVE (uncommented) KEY=
       # variable documented in .env.example is forwarded into the backend
-      # container via the SHORT passthrough form `- KEY` so tuning it in
-      # .env reaches the containerized backend AND an unset key is omitted
-      # entirely — compose never injects an empty string, so typed int/
-      # float/bool fields cannot fail startup coercion (review F2, PR
-      # #576; empty-string values remain MEANINGFUL — e.g. REDIS_URL=""
-      # selects the in-memory limiter). Secrets (ADMIN_SECRET_TOKEN,
-      # JWT_SECRET_KEY) stay explicit above. Keep this block in sync with
-      # .env.example (guarded by
+      # container so tuning it in .env reaches the containerized backend.
+      # Two forms, deliberately:
+      #   - `- KEY` (short passthrough) for typed int/float/bool keys: an
+      #     unset key is OMITTED entirely, so compose never injects "" into
+      #     a field that would fail startup coercion (review F2, PR #576).
+      #   - `- KEY=${KEY:-}` for str keys pinned by check_config_contract
+      #     (APP_ROOT_PATH, MULTIMODAL_*): "" is their documented default.
+      # Empty-string values remain MEANINGFUL in Settings (REDIS_URL="" →
+      # in-memory limiter) — do NOT add env_ignore_empty=True.
+      # Secrets (ADMIN_SECRET_TOKEN, JWT_SECRET_KEY) stay explicit above.
+      # Keep in sync with .env.example (guarded by
       # backend/tests/test_issue494_compose_env_forwarding.py and
       # ..._compose_literal_values.py).
       # ------------------------------------------------------------------
@@ -225,28 +228,28 @@ services:
       - WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
       # Auth & security
       - USERS_ENABLED
-      - JWT_ALGORITHM
-      - ADMIN_RATE_LIMIT
-      - HEALTH_CHECK_API_KEY
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-}
+      - ADMIN_RATE_LIMIT=${ADMIN_RATE_LIMIT:-}
+      - HEALTH_CHECK_API_KEY=${HEALTH_CHECK_API_KEY:-}
       - CSRF_TOKEN_TTL
-      - ALLOWED_HOSTS
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}
       # Model tuning & validation
       - ENABLE_MODEL_VALIDATION
       - INSTANT_ENABLE_THINKING
       # Document processing & retrieval
       - CHUNK_SIZE_CHARS
       - CHUNK_OVERLAP_CHARS
-      - DOCUMENT_PARSING_STRATEGY
+      - DOCUMENT_PARSING_STRATEGY=${DOCUMENT_PARSING_STRATEGY:-}
       - RETRIEVAL_TOP_K
       - MAX_DISTANCE_THRESHOLD
-      - VECTOR_METRIC
+      - VECTOR_METRIC=${VECTOR_METRIC:-}
       - RETRIEVAL_WINDOW
-      - ALLOWED_EXTENSIONS
+      - ALLOWED_EXTENSIONS=${ALLOWED_EXTENSIONS:-}
       # Embedding tuning
       - EMBEDDING_BATCH_MAX_RETRIES
       - EMBEDDING_BATCH_MIN_SUB_SIZE
-      - EMBEDDING_DOC_PREFIX
-      - EMBEDDING_QUERY_PREFIX
+      - EMBEDDING_DOC_PREFIX=${EMBEDDING_DOC_PREFIX:-}
+      - EMBEDDING_QUERY_PREFIX=${EMBEDDING_QUERY_PREFIX:-}
       # Opt-in RAG features
       - CONTEXTUAL_CHUNKING_CONCURRENCY
       - MULTI_SCALE_OVERLAP_RATIO
@@ -271,12 +274,12 @@ services:
       - MAINTENANCE_MODE
       # IMAP email ingestion
       - IMAP_ENABLED
-      - IMAP_HOST
+      - IMAP_HOST=${IMAP_HOST:-}
       - IMAP_PORT
       - IMAP_USE_SSL
-      - IMAP_USERNAME
-      - IMAP_PASSWORD
-      - IMAP_MAILBOX
+      - IMAP_USERNAME=${IMAP_USERNAME:-}
+      - IMAP_PASSWORD=${IMAP_PASSWORD:-}
+      - IMAP_MAILBOX=${IMAP_MAILBOX:-}
       - IMAP_POLL_INTERVAL
       - IMAP_MAX_ATTACHMENT_SIZE
     extra_hosts:
