@@ -92,7 +92,7 @@ the committed real-docs fixture parser tests, the FULL backend suite, and a
 cross-file isolation run. New binary fixtures include `scanned_page.pdf`
 (image-only, zero text) — the tier asserts zero text chunks surface for it
 (parser-behavior evidence, not silent pass). `scripts/parser_bakeoff.py`
-committed (Docling vs unstructured hi_res vs marker on the same fixtures,
+committed (unstructured fast vs hi_res on the same fixtures by default; Docling and marker are optional backends the harness probes and skips with an explicit note until their dependencies are added to the nightly install,
 emitting a committed benchmark markdown) (C12/C13).
 
 ### G7 — docs (DOC-001..003, ENH-001, ENH-003)
