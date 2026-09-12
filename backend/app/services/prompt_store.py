@@ -143,6 +143,12 @@ class PromptVersionStore:
 
         If activate=True, this version becomes the active one immediately.
         """
+        # PROMPT-001 (issue #494): deactivating prior active rows and
+        # inserting the new active row must be ONE transaction (the same
+        # execute/execute/commit idiom as activate()), so an activated
+        # create can never leave two active rows.
+        if activate:
+            self._db.execute("UPDATE prompt_versions SET is_active = 0")
         if created_at is not None:
             cursor = self._db.execute(
                 "INSERT INTO prompt_versions (version, content, is_active, created_by, created_at) "
