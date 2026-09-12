@@ -523,7 +523,7 @@ class TestAllWikiEndpointsDI(WikiDITestBase):
 
     def test_wiki_events_stream_no_db_in_signature(self):
         """
-        SSE streaming is tested end-to-end in test_wiki_events.py::TestSSEEventGenerator.
+        SSE streaming is tested end-to-end in test_issue258_wiki_sse_production.py.
         This test verifies the endpoint does NOT inject db (uses evaluate via Depends).
         """
         import inspect

@@ -339,6 +339,37 @@ async def _validate_tei_embedding_model(embedding_service) -> None:
         logger.warning("TEI model validation failed (continuing): %s", e)
 
 
+async def validate_fts_index(table) -> bool:
+    """Validate that the vector table carries the full-text-search index.
+
+    ``table`` is the vector store's table object (anything exposing an async
+    ``list_indices()`` whose results have a ``.name`` attribute). Returns
+    True iff an index named ``"fts_text"`` exists. Returns False — after
+    logging — when the index is missing or when ``list_indices()`` itself
+    raises; a validation failure is observable via the return value and
+    never propagated, so startup always continues.
+
+    Note: no production caller currently branches on the return value (the
+    lifespan call site ignores it); the bool surface exists so the check is
+    observable to tests and future callers.
+    """
+    try:
+        indices = await table.list_indices()
+        fts_index_exists = any(idx.name == "fts_text" for idx in indices)
+        if not fts_index_exists:
+            logger.error(
+                "Hybrid search is enabled but the FTS index is missing on the 'text' column. "
+                "FTS search will not function. Create the index with "
+                "VectorStore._ensure_fts_index() or rebuild the table."
+            )
+        return fts_index_exists
+    except Exception as e:
+        logger.error(
+            f"Failed to check FTS index status (hybrid search may not work): {e}"
+        )
+        return False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
@@ -500,21 +531,12 @@ async def lifespan(app: FastAPI):
         timeout=10,
     )
 
-    # Validate FTS index exists if hybrid search is enabled
+    # Validate FTS index exists if hybrid search is enabled.
+    # The return value is intentionally ignored: validation logs on failure
+    # and startup continues either way (behavior identical to the former
+    # inline block).
     if settings.hybrid_search_enabled:
-        try:
-            indices = await app.state.vector_store.table.list_indices()
-            fts_index_exists = any(idx.name == "fts_text" for idx in indices)
-            if not fts_index_exists:
-                logger.error(
-                    "Hybrid search is enabled but the FTS index is missing on the 'text' column. "
-                    "FTS search will not function. Create the index with "
-                    "VectorStore._ensure_fts_index() or rebuild the table."
-                )
-        except Exception as e:
-            logger.error(
-                f"Failed to check FTS index status (hybrid search may not work): {e}"
-            )
+        await validate_fts_index(app.state.vector_store.table)
 
     # Initialize RerankingService — no explicit args so URL/model/top_n are
     # read live from settings on each call (admin can change via Settings UI).

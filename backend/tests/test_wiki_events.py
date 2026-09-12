@@ -1,17 +1,21 @@
-"""Tests for WikiEventBus and the SSE wiki_events_stream endpoint.
+"""Tests for WikiEventBus (issue #114).
 
 Covers the subscribe/publish/unsubscribe lifecycle, bounded-queue overflow,
-helper publish methods, and the SSE streaming route including disconnect
-cleanup.
+helper publish methods, and consumer-side observability regressions.
 
-Regression for issue #114: zero test coverage on WikiEventBus and the
-wiki_events_stream endpoint.
+The SSE streaming route itself (hello frame, published-event delivery,
+keepalive, disconnect cleanup) is covered PRODUCTION-DRIVEN in
+``test_issue258_wiki_sse_production.py`` (issue #258 / TEST-003): that file
+drives the real ``wiki_events_stream`` route and its real generator closure
+against the real WikiEventBus singleton. The former inline-generator
+replica tests here were removed as test theater (they re-implemented the
+generator inside the test, so mutating production code could not fail
+them).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sqlite3
 import sys
@@ -231,188 +235,6 @@ class TestGetWikiEventBus(unittest.TestCase):
     def test_returns_wiki_event_bus_instance(self) -> None:
         bus = get_wiki_event_bus()
         self.assertIsInstance(bus, WikiEventBus)
-
-
-# ---------------------------------------------------------------------------
-# SSE event_generator unit tests
-#
-# We test the event_generator async function directly rather than through
-# TestClient because the sync TestClient deadlocks on infinite async
-# generators (while True + await).  This gives us full coverage of the
-# generator logic: hello event, published-event delivery, keepalive,
-# disconnect/unsubscribe cleanup, and vault isolation.
-# ---------------------------------------------------------------------------
-
-
-class TestSSEEventGenerator(unittest.IsolatedAsyncioTestCase):
-    """Unit tests for the SSE event_generator logic used by wiki_events_stream."""
-
-    async def _collect_generator(self, gen, max_items: int = 20, timeout: float = 2.0):
-        """Collect up to max_items from an async generator with a timeout."""
-        collected = []
-        try:
-            async for item in asyncio.wait_for(gen.__anext__(), timeout=timeout):
-                collected.append(item)
-                if len(collected) >= max_items:
-                    break
-        except (asyncio.TimeoutError, StopAsyncIteration):
-            pass
-        return collected
-
-    async def test_hello_event_is_first(self) -> None:
-        """The first yielded value must be the subscribed hello event."""
-        bus = WikiEventBus()
-        vault_id = 1
-        queue = bus.subscribe(vault_id)
-
-        async def event_generator():
-            try:
-                yield f"data: {json.dumps({'type': 'subscribed', 'vault_id': vault_id})}\n\n"
-                while True:
-                    try:
-                        event = await asyncio.wait_for(queue.get(), timeout=0.1)
-                        yield f"data: {json.dumps(event)}\n\n"
-                    except asyncio.TimeoutError:
-                        yield ": keepalive\n\n"
-            finally:
-                bus.unsubscribe(vault_id, queue)
-
-        items = []
-        async for item in event_generator():
-            items.append(item)
-            break  # Just the first item
-
-        self.assertEqual(len(items), 1)
-        payload = json.loads(items[0][len("data: "):].strip())
-        self.assertEqual(payload["type"], "subscribed")
-        self.assertEqual(payload["vault_id"], vault_id)
-
-    async def test_published_events_appear_after_hello(self) -> None:
-        """Events published to the queue must be yielded after the hello."""
-        bus = WikiEventBus()
-        vault_id = 1
-        queue = bus.subscribe(vault_id)
-        published = {"type": "page_change", "page_id": 99}
-
-        async def event_generator():
-            try:
-                yield f"data: {json.dumps({'type': 'subscribed', 'vault_id': vault_id})}\n\n"
-                while True:
-                    try:
-                        event = await asyncio.wait_for(queue.get(), timeout=0.1)
-                        yield f"data: {json.dumps(event)}\n\n"
-                    except asyncio.TimeoutError:
-                        yield ": keepalive\n\n"
-            finally:
-                bus.unsubscribe(vault_id, queue)
-
-        items = []
-        async for item in event_generator():
-            items.append(item)
-            if len(items) == 1:
-                # Publish an event after receiving hello.
-                await asyncio.sleep(0)
-                bus.publish(vault_id, published)
-            if len(items) >= 2:
-                break
-
-        self.assertTrue(len(items) >= 2, f"Expected hello + event, got {len(items)}")
-        payload = json.loads(items[1][len("data: "):].strip())
-        self.assertEqual(payload, published)
-
-    async def test_keepalive_on_timeout(self) -> None:
-        """When the queue is empty for longer than the timeout, a keepalive
-        comment must be yielded."""
-        bus = WikiEventBus()
-        vault_id = 1
-        queue = bus.subscribe(vault_id)
-
-        async def event_generator():
-            try:
-                yield f"data: {json.dumps({'type': 'subscribed', 'vault_id': vault_id})}\n\n"
-                while True:
-                    try:
-                        event = await asyncio.wait_for(queue.get(), timeout=0.05)
-                        yield f"data: {json.dumps(event)}\n\n"
-                    except asyncio.TimeoutError:
-                        yield ": keepalive\n\n"
-            finally:
-                bus.unsubscribe(vault_id, queue)
-
-        items = []
-        async for item in event_generator():
-            items.append(item)
-            if any(": keepalive" in it for it in items):
-                break
-            if len(items) > 20:
-                break
-
-        self.assertTrue(
-            any(": keepalive" in it for it in items),
-            f"Expected keepalive comment, got: {items}",
-        )
-
-    async def test_disconnect_unsubscribes_from_bus(self) -> None:
-        """When the generator is closed (client disconnect), the queue must
-        be removed from the bus."""
-        bus = WikiEventBus()
-        vault_id = 1
-        queue = bus.subscribe(vault_id)
-
-        async def event_generator():
-            try:
-                yield f"data: {json.dumps({'type': 'subscribed', 'vault_id': vault_id})}\n\n"
-                while True:
-                    try:
-                        event = await asyncio.wait_for(queue.get(), timeout=0.05)
-                        yield f"data: {json.dumps(event)}\n\n"
-                    except asyncio.TimeoutError:
-                        yield ": keepalive\n\n"
-            finally:
-                bus.unsubscribe(vault_id, queue)
-
-        gen = event_generator()
-        # Consume one item (hello).
-        item = await gen.__anext__()
-        self.assertIn("subscribed", item)
-        # Close the generator (simulates client disconnect).
-        await gen.aclose()
-
-        # The queue must be removed from the bus.
-        self.assertNotIn(vault_id, bus._subs)
-
-    async def test_multiple_subscribers_receive_events(self) -> None:
-        """Multiple queues subscribed to the same vault all receive published
-        events."""
-        bus = WikiEventBus()
-        vault_id = 1
-        q1 = bus.subscribe(vault_id)
-        q2 = bus.subscribe(vault_id)
-        published = {"type": "page_change", "page_id": 77}
-        bus.publish(vault_id, published)
-
-        self.assertEqual(q1.get_nowait(), published)
-        self.assertEqual(q2.get_nowait(), published)
-
-        bus.unsubscribe(vault_id, q1)
-        bus.unsubscribe(vault_id, q2)
-
-    async def test_vault_isolation_in_generator(self) -> None:
-        """Events published to a different vault must not appear in this
-        generator's queue."""
-        bus = WikiEventBus()
-        vault_id = 1
-        queue = bus.subscribe(vault_id)
-        # Publish to a different vault.
-        bus.publish(vault_id=2, event={"type": "wrong_vault"})
-        # Publish to our vault.
-        bus.publish(vault_id=1, event={"type": "correct_vault"})
-
-        event = queue.get_nowait()
-        self.assertEqual(event["type"], "correct_vault")
-        self.assertTrue(queue.empty())
-
-        bus.unsubscribe(vault_id, queue)
 
 
 # ---------------------------------------------------------------------------
