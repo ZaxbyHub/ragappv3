@@ -68,4 +68,8 @@ jobs:
         with:
           name: parser-bakeoff
           path: docs/benchmarks/parser-bakeoff.md
-          if-no-files-found: error
+          # warn, not error: if the bake-off script itself failed, the job
+        # already failed at that step with the real error — a missing file
+        # here should not mask it with a misleading upload failure
+        # (PR #577 review, MEDIUM).
+        if-no-files-found: warn
