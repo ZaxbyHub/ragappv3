@@ -536,17 +536,26 @@ class TestRegisterUsersEnabledGuardAdversarial(unittest.TestCase):
         self.assertNotEqual(response.status_code, 200)
 
     def test_register_wrong_content_type_when_disabled(self):
-        """Non-JSON content type → FastAPI raises exception (not 200)."""
+        """Non-JSON content type → structured 422 validation envelope (not 200)."""
         settings.users_enabled = False
 
-        # FastAPI raises an exception for malformed content
-        # instead of processing the request - this is secure behavior
-        with self.assertRaises(Exception):
-            self.client.post(
-                "/api/auth/register",
-                content=b"username=admin&password=Password123",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
+        # Malformed bodies must not be processed. Before the API-001 fix
+        # (issue #494) the custom validation handler crashed on the
+        # un-serializable body and surfaced as a server exception; it now
+        # returns the documented FastAPI 422 envelope — the same secure
+        # "not processed" property, without the 500.
+        response = self.client.post(
+            "/api/auth/register",
+            content=b"username=admin&password=Password123",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        self.assertNotEqual(response.status_code, 200)
+        self.assertIn(response.status_code, (400, 422))
+        detail = response.json().get("detail")
+        self.assertTrue(
+            isinstance(detail, list) and detail,
+            f"expected a structured validation envelope, got {detail!r}",
+        )
 
     def test_register_double_content_length_when_disabled(self):
         """Duplicate Content-Length headers with users_enabled=False should still 403."""

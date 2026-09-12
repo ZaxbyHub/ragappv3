@@ -6,6 +6,7 @@ for new files and enqueues them for processing via BackgroundProcessor.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -24,13 +25,17 @@ class FileWatcher:
 
     Periodically scans settings.uploads_dir and settings.library_dir for files
     not present in the database, enqueuing new files via BackgroundProcessor.
-    Respects settings.auto_scan_enabled and settings.auto_scan_interval_minutes.
+    Respects settings.auto_scan_enabled and settings.auto_scan_interval_minutes
+    — re-evaluated live via ``reconcile()`` after every settings save (issue
+    #494 CONFIG-001), not only at startup.
 
     Attributes:
         processor: BackgroundProcessor instance for enqueueing new files
         _watching_task: Reference to the watching coroutine
         _running: Boolean indicating if watcher is active
         _shutdown_event: asyncio.Event for graceful shutdown
+        _wake_event: asyncio.Event used to interrupt the interval wait so a
+            saved cadence change applies on the next cycle
     """
 
     def __init__(self, processor: BackgroundProcessor, pool: Optional[SQLiteConnectionPool] = None):
@@ -46,6 +51,18 @@ class FileWatcher:
         self._watching_task: Optional[asyncio.Task] = None
         self._running = False
         self._shutdown_event = asyncio.Event()
+        # Wake signal for prompt reconciliation (issue #494 CONFIG-001): a
+        # saved auto_scan_interval_minutes change sets this so the watch loop
+        # re-reads the interval on its next cycle instead of sleeping out the
+        # old cadence.
+        self._wake_event = asyncio.Event()
+        # The event loop the watch task lives on. ``reconcile`` may be invoked
+        # from a threadpool worker (sync FastAPI settings handlers), so
+        # lifecycle transitions are marshalled back onto this loop.
+        try:
+            self._loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
     async def start(self) -> None:
         """
@@ -63,6 +80,7 @@ class FileWatcher:
             return
 
         self._running = True
+        self._loop = asyncio.get_running_loop()
         self._shutdown_event.clear()
         self._watching_task = asyncio.create_task(self._watch_loop())
         logger.info("File watcher started")
@@ -79,6 +97,9 @@ class FileWatcher:
 
         logger.info("Stopping file watcher...")
         self._shutdown_event.set()
+        # Interrupt an in-flight interval wait so shutdown is prompt (the
+        # watch loop waits on wake OR shutdown, whichever fires first).
+        self._wake_event.set()
 
         if self._watching_task:
             try:
@@ -93,6 +114,58 @@ class FileWatcher:
 
         self._running = False
         logger.info("File watcher stopped")
+
+    def reconcile(self, settings_source=None) -> None:
+        """Reconcile the watcher lifecycle with the current auto-scan settings.
+
+        Called from the settings save path (POST/PUT /api/settings) so a saved
+        ``auto_scan_enabled`` / ``auto_scan_interval_minutes`` change takes
+        effect WITHOUT an app restart (issue #494 CONFIG-001):
+
+          - ``auto_scan_enabled`` False -> stop a running watcher;
+          - ``auto_scan_enabled`` True  -> start a stopped watcher;
+          - enabled and already running -> wake the watch loop so a changed
+            interval applies on its next cycle (the loop re-reads
+            ``settings.auto_scan_interval_minutes`` on every iteration).
+
+        Args:
+            settings_source: Settings-like object to read the auto-scan flags
+                from; defaults to the live settings singleton.
+
+        Safe to call from any thread: lifecycle transitions are scheduled onto
+        the event loop that owns the watch task.
+        """
+        cfg = settings_source if settings_source is not None else settings
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            # Never started on an event loop (e.g. constructed off-loop with
+            # auto-scan disabled) — nothing to reconcile.
+            return
+        enabled = bool(getattr(cfg, "auto_scan_enabled", False))
+
+        def _log_lifecycle_failure(fut: "concurrent.futures.Future") -> None:
+            # The scheduling caller is a sync settings route on a worker
+            # thread; it never inspects these futures. A silently-dropped
+            # exception here leaves _running inconsistent with reality
+            # (review F7, PR #576), so surface it in the logs.
+            try:
+                fut.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error("FileWatcher lifecycle transition failed: %s", exc)
+
+        if enabled:
+            if self._running:
+                # Cadence may have changed: wake the loop so the next cycle
+                # picks up the new interval.
+                loop.call_soon_threadsafe(self._wake_event.set)
+            else:
+                fut = asyncio.run_coroutine_threadsafe(self.start(), loop)
+                fut.add_done_callback(_log_lifecycle_failure)
+        elif self._running:
+            fut = asyncio.run_coroutine_threadsafe(self.stop(), loop)
+            fut.add_done_callback(_log_lifecycle_failure)
 
     async def scan_once(self) -> int:
         """
@@ -209,24 +282,46 @@ class FileWatcher:
         Main watch loop that periodically scans directories.
 
         Continuously scans at configured intervals until shutdown_event is set.
+        The interval is re-read from ``settings.auto_scan_interval_minutes`` on
+        EVERY iteration (issue #494 CONFIG-001) instead of being captured once,
+        and each wait also listens on the wake event so a reconciled cadence
+        change applies promptly rather than after the old interval elapses.
         """
-        interval_seconds = settings.auto_scan_interval_minutes * 60
-
         while not self._shutdown_event.is_set():
             try:
                 await self.scan_once()
             except Exception as e:
                 logger.error(f"Error during scan: {e}")
 
-            # Wait for next scan interval or shutdown
+            # Re-read the cadence every cycle so a saved interval change
+            # applies without a watcher restart.
+            interval_seconds = settings.auto_scan_interval_minutes * 60
+
+            # Wait for the next scan interval, a reconcile wake, or shutdown —
+            # whichever comes first.
+            wake_wait = asyncio.ensure_future(self._wake_event.wait())
+            shutdown_wait = asyncio.ensure_future(self._shutdown_event.wait())
+            pending: Set[asyncio.Task] = {wake_wait, shutdown_wait}
             try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(),
-                    timeout=interval_seconds
+                await asyncio.wait(
+                    pending,
+                    timeout=interval_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            except asyncio.TimeoutError:
-                # Timeout means interval elapsed, continue to next scan
-                pass
+            finally:
+                for task in pending:
+                    task.cancel()
+                # Consume the wake INSIDE the loop body, immediately after the
+                # wait returns (review RP-001, PR #576): the event stays set
+                # until explicitly cleared, so clearing it anywhere else (in
+                # start(), or after the loop — which stop()'s task-cancel path
+                # skips entirely) lets every subsequent wait resolve instantly
+                # and turns the periodic scan into an unbounded busy loop.
+                self._wake_event.clear()
+
+        # Belt-and-suspenders for a clean loop exit (the cancel path above
+        # already covers stop()-during-wait).
+        self._wake_event.clear()
 
     @property
     def is_running(self) -> bool:

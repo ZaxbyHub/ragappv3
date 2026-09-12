@@ -98,19 +98,27 @@ def _non_stream_payload(finish_reason=None, content="Partial answer cut off"):
 
 
 def _stream_lines(finish_reason=None):
-    lines = [
+    events = [
         'data: {"choices": [{"delta": {"role": "assistant"}}]}',
         'data: {"choices": [{"delta": {"content": "Streamed partial answ"}}]}',
         'data: {"choices": [{"delta": {"content": "er cut at the limit."}}]}',
     ]
     if finish_reason is not None:
-        lines.append(
+        events.append(
             'data: '
             + json.dumps(
                 {"choices": [{"delta": {}, "finish_reason": finish_reason}]}
             )
         )
-    lines.append("data: [DONE]")
+    events.append("data: [DONE]")
+    # Proper SSE framing (issue #494 LLM-001): every event is terminated by
+    # a blank line; consecutive data: lines without one are ONE multi-line
+    # event per the SSE spec. The old fixtures omitted the blank lines,
+    # which only worked against the pre-spec parser.
+    lines = []
+    for event in events:
+        lines.append(event)
+        lines.append("")
     return lines
 
 
@@ -187,11 +195,10 @@ class TestStreamFinishReason:
         """When multiple finish_reason values appear, the LAST non-null one
         is the one surfaced."""
         lines = _stream_lines("stop")
-        # Insert an earlier, superseded finish_reason chunk.
-        lines.insert(
-            2,
-            'data: {"choices": [{"delta": {}, "finish_reason": "length"}]}',
-        )
+        # Insert an earlier, superseded finish_reason chunk as its own
+        # properly framed event (data line + blank line) after the first one.
+        lines.insert(2, 'data: {"choices": [{"delta": {}, "finish_reason": "length"}]}')
+        lines.insert(3, "")
         fake = FakeAsyncHTTP(stream_lines=lines)
         client = _client(fake)
         async for _ in client.chat_completion_stream(

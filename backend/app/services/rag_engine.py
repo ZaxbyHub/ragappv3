@@ -1381,7 +1381,13 @@ class RAGEngine:
         _multi_sub_rerank_success: Optional[bool] = None
         _multi_sub_hybrid_status: str = "disabled"
         _multi_sub_rerank_status: str = "disabled"
-        if raw_rag_needed and len(plan) > 1:
+        # OPS-005 (issue #494): maintenance mode must gate the multi-sub-query
+        # branch too. When set, skip orchestration entirely so the flow falls
+        # through to the single-query maintenance gate below (inside
+        # ``elif not _skip_standard_retrieval:``), producing the identical
+        # maintenance indication (fallback_reason="RAG index is under
+        # maintenance", vector_results=[]) with zero retrieval calls.
+        if raw_rag_needed and len(plan) > 1 and not self.maintenance_mode:
             try:
                 (
                     vector_results,
@@ -2218,6 +2224,20 @@ class RAGEngine:
 
         # If ALL sub-query embeddings failed, fall back to single-query retrieval.
         if not sub_query_embeddings:
+            if self.maintenance_mode:
+                # OPS-005 (issue #494) defense-in-depth: never fall back to
+                # document retrieval while the RAG index is under maintenance —
+                # mirror the single-query maintenance gate's empty indication.
+                return (
+                    [],
+                    False,
+                    failed_sub_queries,
+                    "distance",
+                    None,
+                    None,
+                    "disabled",
+                    "disabled",
+                )
             logger.warning(
                 "[_orchestrate_sub_query_retrieval] all sub-query embeddings failed, "
                 "falling back to single-query retrieval",
@@ -2297,6 +2317,20 @@ class RAGEngine:
 
         successful_results = [r for r in per_sub_results if r]
         if not successful_results:
+            if self.maintenance_mode:
+                # OPS-005 (issue #494) defense-in-depth: never fall back to
+                # document retrieval while the RAG index is under maintenance —
+                # mirror the single-query maintenance gate's empty indication.
+                return (
+                    [],
+                    False,
+                    failed_sub_queries,
+                    "distance",
+                    None,
+                    None,
+                    "disabled",
+                    "disabled",
+                )
             logger.warning(
                 "[_orchestrate_sub_query_retrieval] all sub-query retrievals failed, "
                 "falling back to single-query retrieval",
@@ -2555,6 +2589,15 @@ class RAGEngine:
             all_results = []
             for i, result in enumerate(gather_results):
                 variant_type = query_embeddings[i][0] if i < len(query_embeddings) else f"variant_{i}"
+                if isinstance(result, SearchSemaphoreTimeoutError):
+                    # OPS-006 (issue #494): a search-capacity timeout is a
+                    # server-busy signal for EVERY variant type (including
+                    # paraphrase/step_back/hyde) — propagate it so the outer
+                    # handlers surface HTTP 503 instead of degrading to
+                    # generation with no documents. The ``except
+                    # SearchSemaphoreTimeoutError: raise`` at the end of this
+                    # search phase passes it through unchanged.
+                    raise result
                 if isinstance(result, BaseException):
                     # ORIGINAL QUERY FAILURE: propagate error immediately
                     if variant_type == 'original':
@@ -3055,17 +3098,28 @@ class RAGEngine:
             raise RAGEngineError(f"LLM chat failed: {last_error}") from last_error
 
     def _fallback_clients(self, primary: LLMClient) -> List[LLMClient]:
-        """Return primary plus distinct fallback clients in configured mode order."""
+        """Return primary plus distinct fallback clients in configured mode order.
+
+        LLM-002 (issue #494): the dedup key is (base_url, model), so a
+        same-endpoint fallback running a DIFFERENT model is still tried.
+        Exact duplicates (same url AND model) still collapse to one entry.
+        Clients without a usable base_url attribute (test fakes) fall back to
+        an identity-based key so distinct fakes are never collapsed.
+        """
         candidates = [primary, self.instant_client, self.thinking_client, self.llm_client]
         out: List[LLMClient] = []
-        seen_urls: set[str] = set()
+        seen: set[tuple] = set()
         for candidate in candidates:
             if candidate is None:
                 continue
-            url = getattr(candidate, "base_url", None) or str(id(candidate))
-            if url in seen_urls:
+            url = getattr(candidate, "base_url", None)
+            if url:
+                key = (url, getattr(candidate, "model", None))
+            else:
+                key = (str(id(candidate)),)
+            if key in seen:
                 continue
-            seen_urls.add(url)
+            seen.add(key)
             out.append(candidate)
         return out
 

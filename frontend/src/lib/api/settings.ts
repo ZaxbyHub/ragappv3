@@ -23,6 +23,7 @@ export interface SettingsResponse {
   instant_memory_context_top_k?: number;
   instant_max_tokens?: number;
   thinking_max_tokens?: number;
+  instant_enable_thinking?: boolean;
 
   // Document processing (character-based)
   chunk_size_chars: number;
@@ -155,6 +156,7 @@ export interface UpdateSettingsRequest {
   instant_memory_context_top_k?: number;
   instant_max_tokens?: number;
   thinking_max_tokens?: number;
+  instant_enable_thinking?: boolean;
   // Wiki / Knowledge Compiler config
   wiki_enabled?: boolean;
   wiki_compile_on_ingest?: boolean;

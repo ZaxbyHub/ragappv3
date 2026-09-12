@@ -372,11 +372,37 @@ apiClient.interceptors.response.use(
 
     // Extract the most useful error message
     let message = "An unexpected error occurred";
-    
+
     if (error.response) {
       // Server responded with an error status
       const data = error.response.data;
-      message = data?.detail || data?.message || data?.error || error.response.statusText || message;
+      const detail = data?.detail;
+      if (Array.isArray(detail)) {
+        // FastAPI request-validation failures (422) send `detail` as an
+        // array of per-field error objects ({loc, msg, type}). Format each
+        // entry as "<field>: <msg>" (field = last loc segment) joined by
+        // "; " so consumers see which fields failed and why — the raw
+        // array would coerce to "[object Object],..." in Error.message.
+        const formatted = detail
+          .map((entry: unknown) => {
+            if (entry !== null && typeof entry === "object") {
+              const { loc, msg } = entry as { loc?: unknown; msg?: unknown };
+              const segments = Array.isArray(loc) ? loc : [];
+              const field = segments.length
+                ? String(segments[segments.length - 1])
+                : "";
+              const text =
+                typeof msg === "string" ? msg : JSON.stringify(msg) ?? "";
+              return field ? `${field}: ${text}` : text;
+            }
+            return String(entry);
+          })
+          .filter((part: string) => part.length > 0)
+          .join("; ");
+        message = formatted || data?.message || data?.error || error.response.statusText || message;
+      } else {
+        message = detail || data?.message || data?.error || error.response.statusText || message;
+      }
     } else if (error.request) {
       // Request was made but no response received
       message = "Unable to reach the server. Please check your connection.";
