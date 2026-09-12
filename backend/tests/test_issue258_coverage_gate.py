@@ -73,7 +73,11 @@ def test_ac11_coverage_thresholds_configured():
     print("AC11 CHECK: PASS")
 
 
-@pytest.mark.skipif(_NPM is None, reason="no npm on PATH (frontend toolchain unavailable)")
+@pytest.mark.skipif(
+    _NPM is None or not (FRONTEND / "node_modules").is_dir(),
+    reason="npm or frontend/node_modules unavailable (backend CI runner); "
+    "the Frontend CI job runs the coverage gate",
+)
 def test_ac11_coverage_command_passes():
     try:
         package = json.loads((FRONTEND / "package.json").read_text(encoding="utf-8"))

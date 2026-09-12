@@ -55,13 +55,17 @@ def _run(argv: list[str], cwd: Path, timeout: int = _SUBPROCESS_TIMEOUT_SECONDS)
 
 
 def _node_config_typecheck_argv() -> list[str] | None:
-    """Prefer the repo-local tsc (junction-safe); fall back to npx."""
+    """Repo-local tsc only (junction-safe).
+
+    The bare-npx fallback ran a GLOBAL tsc without frontend/node_modules on
+    the CI backend runner (which has node on PATH but never installs the
+    frontend deps) and failed on missing vite/vitest types. The dedicated
+    Frontend CI job runs typecheck:contracts; this node needs the repo-local
+    install and skips otherwise.
+    """
     local_tsc = FRONTEND / "node_modules" / "typescript" / "bin" / "tsc"
     if _NODE and local_tsc.is_file():
         return [_NODE, str(local_tsc), "-p", "tsconfig.node.json", "--noEmit"]
-    npx = shutil.which("npx")
-    if npx:
-        return [npx, "tsc", "-p", "tsconfig.node.json", "--noEmit"]
     return None
 
 
