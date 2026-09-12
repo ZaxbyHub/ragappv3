@@ -36,6 +36,56 @@ _THINK_PARTIAL_OPEN_RE = re.compile(r"^<[tT]?[hH]?[iI]?[nN]?[kK]?$")
 # mid-content occurrence (e.g. quoted from a RAG document).
 _THINKING_PROCESS_MARKER = "Thinking Process:"
 
+# Legacy hardcoded generation budget; still the signature default of
+# chat_completion/chat_completion_stream (a pinned contract test asserts
+# the default equals 32768).
+_DEFAULT_MAX_TOKENS = 32768
+
+
+class _UnsetMaxTokens(int):
+    """Sentinel for "the caller did not pass ``max_tokens``.
+
+    Compares equal to the legacy default (32768) so the pinned signature
+    contract (``inspect.signature(...).parameters["max_tokens"].default
+    == 32768``) keeps holding, while ``isinstance`` still distinguishes an
+    explicitly-passed 32768 from the default at runtime — an explicit value
+    is never overridden by the client's configured per-mode budget
+    (ENH-015, issue #494).
+    """
+
+    pass
+
+
+_UNSET_MAX_TOKENS = _UnsetMaxTokens(_DEFAULT_MAX_TOKENS)
+
+
+def _httpcore_live_pool_counts(
+    client: httpx.AsyncClient,
+) -> "tuple[Optional[int], Optional[int]]":
+    """Best-effort live connection counts from the httpcore pool.
+
+    Returns ``(total_connections, keepalive_connections)`` where the
+    keepalive count is the number of connections in httpcore's IDLE state.
+    Returns ``(None, None)`` when the pool state cannot be introspected —
+    never fabricated zeros (OBS-001, issue #494). A defensive copy of this
+    helper lives in ``embeddings.py``; keep the two in sync.
+    """
+    transport = getattr(client, "_transport", None)
+    # SSRFSafeTransport wraps the real httpx.AsyncHTTPTransport as
+    # `_transport`, not `_pool` — unwrap it before looking for `_pool`.
+    if transport is not None and not hasattr(transport, "_pool"):
+        transport = getattr(transport, "_transport", None)
+    pool_obj = getattr(transport, "_pool", None)
+    live = getattr(pool_obj, "_connections", None)
+    if live is None:
+        return (None, None)
+    keepalive = 0
+    for conn in live:
+        state = getattr(conn, "state", None)
+        if str(getattr(state, "name", state)).upper() == "IDLE":
+            keepalive += 1
+    return (len(live), keepalive)
+
 
 class LLMError(Exception):
     """Exception raised for LLM client errors."""
@@ -53,6 +103,7 @@ class LLMClient:
         model: Optional[str] = None,
         cb_name: str = "llm",
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        max_tokens: Optional[int] = None,
     ):
         """
         Initialize the LLM client.
@@ -62,16 +113,31 @@ class LLMClient:
             base_url: Override for the chat endpoint. Defaults to settings.ollama_chat_url.
             model: Override for the model name. Defaults to settings.chat_model.
             cb_name: Circuit breaker name (for logging / metrics distinction).
+            chat_template_kwargs: Per-client chat-template controls (e.g.
+                ``{"enable_thinking": False}`` for Gemma 4 Instant).
+            max_tokens: Default generation budget for chat_completion /
+                chat_completion_stream when the caller does not pass an
+                explicit ``max_tokens`` (ENH-015, issue #494). ``None`` keeps
+                the legacy default of 32768.
         """
         self.base_url = (base_url or settings.ollama_chat_url).rstrip("/")
         self.model = model or settings.chat_model
         self.timeout = timeout
+        self.max_tokens = max_tokens
         # Per-client template controls (e.g. Gemma 4 Instant no-thinking).
         # Copy so callers cannot mutate the live request policy after creation.
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         assert_url_safe(base_url or settings.ollama_chat_url)
         self._circuit_breaker = create_llm_circuit_breaker(name=cb_name)
         self._client: Optional[httpx.AsyncClient] = None
+        # Configured pool limits; start() replaces these with the live
+        # settings values. Kept in sync at construction so _log_pool_stats
+        # can report configured caps even for directly injected clients
+        # (OBS-001, issue #494).
+        self._pool_limits: httpx.Limits = httpx.Limits(
+            max_connections=settings.llm_max_connections,
+            max_keepalive_connections=settings.llm_max_keepalive_connections,
+        )
         self.last_metrics: Dict[str, Any] = {}
 
     def _approx_tokens(self, text: str) -> int:
@@ -123,6 +189,10 @@ class LLMClient:
             max_connections=settings.llm_max_connections,
             keepalive_expiry=300.0,  # Keep connections alive for 5 minutes
         )
+        # Stored so _log_pool_stats reports the CONFIGURED caps instead of
+        # fabricating counts from urllib3-era internals httpx never had
+        # (OBS-001, issue #494).
+        self._pool_limits = limits
         # Add keep-alive headers to prevent LM Studio from unloading
         headers = {"Connection": "keep-alive", "Keep-Alive": "timeout=300, max=1000"}
         # SSRFSafeTransport re-validates the resolved IP at request time to
@@ -160,28 +230,30 @@ class LLMClient:
         return self._client
 
     def _log_pool_stats(self) -> None:
-        """Log connection pool statistics for monitoring."""
+        """Log connection pool statistics for monitoring.
+
+        Reports the CONFIGURED limits from the ``httpx.Limits`` stored at
+        client creation plus live counts read from httpcore's pool state
+        when introspectable. The urllib3-era ``_num_connections`` /
+        ``_num_keepalive`` attributes do not exist under httpx's asyncio
+        transport, so the previous implementation fabricated zeros from
+        getattr defaults; when the live state cannot be read, the log says
+        so instead of inventing counts (OBS-001, issue #494).
+        """
         try:
             client = self._client
             if client is None:
                 return
-            pool = getattr(client, "_transport", None)
-            # SSRFSafeTransport wraps the real httpx.AsyncHTTPTransport as
-            # `_transport`, not `_pool` — unwrap it before looking for `_pool`.
-            if pool is not None and not hasattr(pool, "_pool"):
-                pool = getattr(pool, "_transport", None)
-            if pool and hasattr(pool, "_pool"):
-                pool_obj = pool._pool
-                connections = getattr(pool_obj, "_num_connections", 0)
-                keepalive = getattr(pool_obj, "_num_keepalive", 0)
-                limits = getattr(pool_obj, "_limits", None)
-                max_connections = (
-                    getattr(limits, "max_connections", settings.llm_max_connections) if limits else settings.llm_max_connections
+            max_connections = self._pool_limits.max_connections
+            max_keepalive = self._pool_limits.max_keepalive_connections
+            connections, keepalive = _httpcore_live_pool_counts(client)
+            if connections is None:
+                logger.info(
+                    f"LLM client pool: live counts unavailable "
+                    f"(configured {max_connections} max connections, "
+                    f"{max_keepalive} max keepalive)"
                 )
-                max_keepalive = (
-                    getattr(limits, "max_keepalive_connections", settings.llm_max_keepalive_connections)
-                    if limits else settings.llm_max_keepalive_connections
-                )
+            else:
                 logger.info(
                     f"LLM client pool: {connections}/{max_connections} connections, "
                     f"{keepalive}/{max_keepalive} keepalive"
@@ -204,7 +276,7 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 32768,
+        max_tokens: int = _UNSET_MAX_TOKENS,
         response_format: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
@@ -213,7 +285,9 @@ class LLMClient:
         Args:
             messages: List of message dicts with 'role' and 'content' keys
             temperature: Sampling temperature (default: 0.7)
-            max_tokens: Maximum tokens to generate (default: 32768)
+            max_tokens: Maximum tokens to generate (default: 32768, or the
+                client's configured per-mode budget when one was supplied
+                at construction — ENH-015, issue #494)
 
         Returns:
             The generated content string
@@ -222,6 +296,13 @@ class LLMClient:
             LLMError: If the request fails or response is invalid
             RuntimeError: If the client has not been started
         """
+        if isinstance(max_tokens, _UnsetMaxTokens):
+            # An explicitly passed value always wins over the configured
+            # per-mode default; see _UnsetMaxTokens for why the sentinel is
+            # needed (the signature default must stay comparable to 32768).
+            max_tokens = (
+                self.max_tokens if self.max_tokens is not None else _DEFAULT_MAX_TOKENS
+            )
         client = self._ensure_started()
         url = f"{self.base_url}/v1/chat/completions"
 
@@ -240,8 +321,18 @@ class LLMClient:
         started_at = time.perf_counter()
         prompt_tokens = self._prompt_token_estimate(messages)
         try:
-            response = await self._circuit_breaker(client.post)(url, json=payload)
-            response.raise_for_status()
+            # OPS-002 (issue #494): run the POST and the HTTP status check
+            # as ONE breaker-wrapped operation so HTTPStatusError trips the
+            # breaker (previously raise_for_status() ran outside the wrap,
+            # so every error status recorded a SUCCESS). JSON decoding and
+            # response validation stay outside — a malformed body is not an
+            # outage signal.
+            async def _checked_post() -> httpx.Response:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                return response
+
+            response = await self._circuit_breaker(_checked_post)()
             data = response.json()
 
             if "choices" not in data or not data["choices"]:
@@ -297,7 +388,7 @@ class LLMClient:
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
-        max_tokens: int = 32768,
+        max_tokens: int = _UNSET_MAX_TOKENS,
     ) -> AsyncGenerator[str, None]:
         """
         Send a streaming chat completion request and yield content chunks.
@@ -305,7 +396,9 @@ class LLMClient:
         Args:
             messages: List of message dicts with 'role' and 'content' keys
             temperature: Sampling temperature (default: 0.7)
-            max_tokens: Maximum tokens to generate (default: 32768)
+            max_tokens: Maximum tokens to generate (default: 32768, or the
+                client's configured per-mode budget when one was supplied
+                at construction — ENH-015, issue #494)
 
         Yields:
             Content chunks as they arrive from the SSE stream
@@ -314,6 +407,10 @@ class LLMClient:
             LLMError: If the request fails
             RuntimeError: If the client has not been started
         """
+        if isinstance(max_tokens, _UnsetMaxTokens):
+            max_tokens = (
+                self.max_tokens if self.max_tokens is not None else _DEFAULT_MAX_TOKENS
+            )
         client = self._ensure_started()
         url = f"{self.base_url}/v1/chat/completions"
 
@@ -397,197 +494,223 @@ class LLMClient:
                     stream_succeeded = True
                     return
 
-                try:
-                    async for line in response.aiter_lines():
-                        line = line.strip()
+                async def _sse_events() -> AsyncGenerator[str, None]:
+                    """Yield one joined ``data`` payload per SSE event.
 
-                        # Skip empty lines and SSE keep-alive comments
-                        if not line or line.startswith(":"):
+                    Implements SSE framing (LLM-001, issue #494): the field
+                    name is everything before the first colon; at most ONE
+                    optional leading space is stripped from the value
+                    (``data: {...}`` and ``data:{...}`` are equivalent);
+                    consecutive ``data:`` lines of one event accumulate and
+                    dispatch — joined with ``\\n`` — on the blank line that
+                    ends the event or at stream end; ``\\r`` is stripped so
+                    CRLF transports parse identically; comment lines
+                    (leading ``:``) and other field names (``event:``,
+                    ``id:``, ``retry:``) are ignored.
+                    """
+                    data_lines: List[str] = []
+                    async for raw_line in response.aiter_lines():
+                        line = raw_line.rstrip("\r")
+                        if not line:
+                            # Blank line: end of the current SSE event.
+                            if data_lines:
+                                yield "\n".join(data_lines)
+                                data_lines.clear()
+                            continue
+                        if line.startswith(":"):
+                            # SSE comment / keep-alive — ignore.
+                            continue
+                        field, _sep, value = line.partition(":")
+                        if value.startswith(" "):
+                            value = value[1:]
+                        if field == "data":
+                            data_lines.append(value)
+                    # Stream ended mid-event: dispatch any remaining data.
+                    if data_lines:
+                        yield "\n".join(data_lines)
+                        data_lines.clear()
+
+                try:
+                    async for data_str in _sse_events():
+                        # Check for stream end marker
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
                             continue
 
-                        # SSE format: data: {...}
-                        if line.startswith("data: "):
-                            data_str = line[6:]  # Remove "data: " prefix
+                        # Extract content delta from choices
+                        choices = data.get("choices", [])
+                        if not choices:
+                            continue
 
-                            # Check for stream end marker
-                            if data_str == "[DONE]":
-                                break
+                        delta = choices[0].get("delta", {})
+                        # ``reasoning_content`` is the OpenAI-compatible
+                        # field used by some models (gpt-oss-120b,
+                        # nvidia_nemotron) to emit chain-of-thought.
+                        # We never expose it to users — drop it entirely
+                        # and only stream ``content`` deltas.
+                        content = delta.get("content") or ""
 
-                            try:
-                                data = json.loads(data_str)
-                            except json.JSONDecodeError:
-                                continue
+                        # finish_reason lives on the choice object, not
+                        # the delta — read it BEFORE the empty-content
+                        # skip below, otherwise the delta-only final
+                        # chunk that carries it is never inspected.
+                        chunk_finish_reason = choices[0].get("finish_reason")
+                        if chunk_finish_reason:
+                            _finish_reason = chunk_finish_reason
 
-                            # Extract content delta from choices
-                            choices = data.get("choices", [])
-                            if not choices:
-                                continue
+                        if not content:
+                            # Pure reasoning chunk (or empty) — skip.
+                            continue
 
-                            delta = choices[0].get("delta", {})
-                            # ``reasoning_content`` is the OpenAI-compatible
-                            # field used by some models (gpt-oss-120b,
-                            # nvidia_nemotron) to emit chain-of-thought.
-                            # We never expose it to users — drop it entirely
-                            # and only stream ``content`` deltas.
-                            content = delta.get("content") or ""
+                        _buffer += content
 
-                            # finish_reason lives on the choice object, not
-                            # the delta — read it BEFORE the empty-content
-                            # skip below, otherwise the delta-only final
-                            # chunk that carries it is never inspected.
-                            chunk_finish_reason = choices[0].get("finish_reason")
-                            if chunk_finish_reason:
-                                _finish_reason = chunk_finish_reason
+                        if len(_buffer) > _MAX_THINKING_BUFFER:
+                            logger.error(
+                                "Thinking content buffer exceeded %d bytes, possible malformed response",
+                                _MAX_THINKING_BUFFER,
+                            )
+                            raise LLMError(
+                                "Thinking content buffer overflow - model response may be malformed"
+                            )
 
-                            if not content:
-                                # Pure reasoning chunk (or empty) — skip.
-                                continue
-
-                            _buffer += content
-
-                            if len(_buffer) > _MAX_THINKING_BUFFER:
-                                logger.error(
-                                    "Thinking content buffer exceeded %d bytes, possible malformed response",
-                                    _MAX_THINKING_BUFFER,
+                        if not _thinking_active:
+                            # Not currently in a thinking block.  Look for
+                            # complete open markers first; if none found,
+                            # check whether the buffer is a partial prefix
+                            # of a known marker (hold it) or safe to yield.
+                            think_open_match = _THINK_OPEN_RE.search(_buffer)
+                            _stripped = _buffer.lstrip()
+                            if think_open_match:
+                                logger.debug(
+                                    "Filtering thinking content from model response (<think> pattern)"
                                 )
-                                raise LLMError(
-                                    "Thinking content buffer overflow - model response may be malformed"
-                                )
-
-                            if not _thinking_active:
-                                # Not currently in a thinking block.  Look for
-                                # complete open markers first; if none found,
-                                # check whether the buffer is a partial prefix
-                                # of a known marker (hold it) or safe to yield.
-                                think_open_match = _THINK_OPEN_RE.search(_buffer)
-                                _stripped = _buffer.lstrip()
-                                if think_open_match:
-                                    logger.debug(
-                                        "Filtering thinking content from model response (<think> pattern)"
-                                    )
-                                    pre_think = _buffer[: think_open_match.start()]
-                                    if pre_think:
-                                        completion_chars += len(pre_think)
-                                        yield pre_think
-                                        _content_emitted = True
-                                    _thinking_active = True
-                                    _in_prefix_region = False
-                                    _buffer = _buffer[think_open_match.end() :]
-                                    # Handle inline close in the same buffer
-                                    close_match = _THINK_CLOSE_RE.search(_buffer)
-                                    if close_match:
-                                        _thinking_active = False
-                                        _buffer = _buffer[close_match.end() :]
-                                elif _in_prefix_region and _buffer.lstrip().startswith("_lhs"):
-                                    # Legacy Qwen-style marker. Only valid as a
-                                    # prefix of the model response: once we
-                                    # have streamed any non-thinking answer
-                                    # text, a bare ``_lhs`` substring (e.g.
-                                    # ``expr_lhs``, ``node_lhs``) is just
-                                    # legitimate content and must not be
-                                    # treated as a thinking-block open.
-                                    logger.debug(
-                                        "Filtering thinking content from model response (_lhs/_rhs pattern)"
-                                    )
-                                    pre_think, _, remainder = _buffer.partition("_lhs")
-                                    if pre_think:
-                                        yield pre_think
-                                        _content_emitted = True
-                                    _thinking_active = True
-                                    _in_prefix_region = False
-                                    _buffer = remainder
-                                    if "_rhs" in _buffer:
-                                        _, _, after_think = _buffer.partition("_rhs")
-                                        _thinking_active = False
-                                        _buffer = after_think
-                                elif _in_prefix_region and (
-                                    _THINKING_PROCESS_MARKER.startswith(_buffer)
-                                    or _buffer.startswith(_THINKING_PROCESS_MARKER)
-                                    or _THINK_PARTIAL_OPEN_RE.match(_buffer)
-                                ):
-                                    # Two related hold-buffer cases, both
-                                    # anchored to the start of the buffer:
-                                    #
-                                    # 1. qwen3.5-122b "Thinking Process:"
-                                    #    prefix — the marker must appear at
-                                    #    the start of the buffer (either as
-                                    #    a full marker or as a partial
-                                    #    prefix still streaming in). A bare
-                                    #    substring match later in the
-                                    #    buffer is treated as legitimate
-                                    #    content. See issue #227.
-                                    #
-                                    # 2. ``<think`` partial prefix — we
-                                    #    hold the buffer while the angle-
-                                    #    bracketed open tag streams in.
-                                    if _THINKING_PROCESS_MARKER in _buffer:
-                                        logger.debug(
-                                            "Filtering thinking content from model response (Thinking Process pattern)"
-                                        )
-                                        pre_marker, _, _ = _buffer.partition(
-                                            _THINKING_PROCESS_MARKER
-                                        )
-                                        if pre_marker:
-                                            completion_chars += len(pre_marker)
-                                            yield pre_marker
-                                            _content_emitted = True
-                                        _thinking_active = True
-                                        _in_prefix_region = False
-                                        _buffer = ""
-                                    # else: still accumulating a partial
-                                    # open marker — hold buffer until full
-                                    # marker arrives or it diverges from
-                                    # any prefix.
-                                elif _buffer:
-                                    # No opening pattern and no partial-open
-                                    # prefix — safe to yield.
-                                    completion_chars += len(_buffer)
-                                    yield _buffer
-                                    _in_prefix_region = False
-                                    _buffer = ""
-                            else:
-                                # Currently inside a thinking block — look for any
-                                # of the known closing markers (case-insensitive).
+                                pre_think = _buffer[: think_open_match.start()]
+                                if pre_think:
+                                    completion_chars += len(pre_think)
+                                    yield pre_think
+                                    _content_emitted = True
+                                _thinking_active = True
+                                _in_prefix_region = False
+                                _buffer = _buffer[think_open_match.end() :]
+                                # Handle inline close in the same buffer
                                 close_match = _THINK_CLOSE_RE.search(_buffer)
                                 if close_match:
                                     _thinking_active = False
                                     _buffer = _buffer[close_match.end() :]
-                                elif "_rhs" in _buffer:
+                            elif _in_prefix_region and _buffer.lstrip().startswith("_lhs"):
+                                # Legacy Qwen-style marker. Only valid as a
+                                # prefix of the model response: once we
+                                # have streamed any non-thinking answer
+                                # text, a bare ``_lhs`` substring (e.g.
+                                # ``expr_lhs``, ``node_lhs``) is just
+                                # legitimate content and must not be
+                                # treated as a thinking-block open.
+                                logger.debug(
+                                    "Filtering thinking content from model response (_lhs/_rhs pattern)"
+                                )
+                                pre_think, _, remainder = _buffer.partition("_lhs")
+                                if pre_think:
+                                    yield pre_think
+                                    _content_emitted = True
+                                _thinking_active = True
+                                _in_prefix_region = False
+                                _buffer = remainder
+                                if "_rhs" in _buffer:
                                     _, _, after_think = _buffer.partition("_rhs")
                                     _thinking_active = False
                                     _buffer = after_think
-                                # Else: still inside thinking; drop accumulated
-                                # thinking content periodically so the buffer
-                                # cap protects against runaway thinking blocks.
-                                if (
-                                    _thinking_active
-                                    and len(_buffer) > _MAX_THINKING_BUFFER // 2
-                                ):
-                                    _buffer = _buffer[-256:]
-                            # Yield any buffered content when not in thinking
-                            # mode and not holding a partial open marker.
-                            # The partial-prefix-holding checks (e.g. for
-                            # ``<think`` or ``Thinking Process:``) only
-                            # apply while we are still in the prefix region
-                            # of the model response; once any non-thinking
-                            # answer text has been streamed, partial
-                            # substrings of those markers are just ordinary
-                            # content and must be yielded. See issue #227.
-                            if (
-                                not _thinking_active
-                                and _buffer
-                                and not (
-                                    _in_prefix_region
-                                    and (
-                                        "Thinking Process:".startswith(_buffer)
-                                        or _THINK_PARTIAL_OPEN_RE.match(_buffer)
-                                    )
-                                )
+                            elif _in_prefix_region and (
+                                _THINKING_PROCESS_MARKER.startswith(_buffer)
+                                or _buffer.startswith(_THINKING_PROCESS_MARKER)
+                                or _THINK_PARTIAL_OPEN_RE.match(_buffer)
                             ):
+                                # Two related hold-buffer cases, both
+                                # anchored to the start of the buffer:
+                                #
+                                # 1. qwen3.5-122b "Thinking Process:"
+                                #    prefix — the marker must appear at
+                                #    the start of the buffer (either as
+                                #    a full marker or as a partial
+                                #    prefix still streaming in). A bare
+                                #    substring match later in the
+                                #    buffer is treated as legitimate
+                                #    content. See issue #227.
+                                #
+                                # 2. ``<think`` partial prefix — we
+                                #    hold the buffer while the angle-
+                                #    bracketed open tag streams in.
+                                if _THINKING_PROCESS_MARKER in _buffer:
+                                    logger.debug(
+                                        "Filtering thinking content from model response (Thinking Process pattern)"
+                                    )
+                                    pre_marker, _, _ = _buffer.partition(
+                                        _THINKING_PROCESS_MARKER
+                                    )
+                                    if pre_marker:
+                                        completion_chars += len(pre_marker)
+                                        yield pre_marker
+                                        _content_emitted = True
+                                    _thinking_active = True
+                                    _in_prefix_region = False
+                                    _buffer = ""
+                                # else: still accumulating a partial
+                                # open marker — hold buffer until full
+                                # marker arrives or it diverges from
+                                # any prefix.
+                            elif _buffer:
+                                # No opening pattern and no partial-open
+                                # prefix — safe to yield.
                                 completion_chars += len(_buffer)
                                 yield _buffer
                                 _in_prefix_region = False
                                 _buffer = ""
+                        else:
+                            # Currently inside a thinking block — look for any
+                            # of the known closing markers (case-insensitive).
+                            close_match = _THINK_CLOSE_RE.search(_buffer)
+                            if close_match:
+                                _thinking_active = False
+                                _buffer = _buffer[close_match.end() :]
+                            elif "_rhs" in _buffer:
+                                _, _, after_think = _buffer.partition("_rhs")
+                                _thinking_active = False
+                                _buffer = after_think
+                            # Else: still inside thinking; drop accumulated
+                            # thinking content periodically so the buffer
+                            # cap protects against runaway thinking blocks.
+                            if (
+                                _thinking_active
+                                and len(_buffer) > _MAX_THINKING_BUFFER // 2
+                            ):
+                                _buffer = _buffer[-256:]
+                        # Yield any buffered content when not in thinking
+                        # mode and not holding a partial open marker.
+                        # The partial-prefix-holding checks (e.g. for
+                        # ``<think`` or ``Thinking Process:``) only
+                        # apply while we are still in the prefix region
+                        # of the model response; once any non-thinking
+                        # answer text has been streamed, partial
+                        # substrings of those markers are just ordinary
+                        # content and must be yielded. See issue #227.
+                        if (
+                            not _thinking_active
+                            and _buffer
+                            and not (
+                                _in_prefix_region
+                                and (
+                                    "Thinking Process:".startswith(_buffer)
+                                    or _THINK_PARTIAL_OPEN_RE.match(_buffer)
+                                )
+                            )
+                        ):
+                            completion_chars += len(_buffer)
+                            yield _buffer
+                            _in_prefix_region = False
+                            _buffer = ""
                     stream_succeeded = True
                 except GeneratorExit:
                     # Generator was closed by consumer - clean exit
@@ -664,12 +787,20 @@ class LLMClient:
 
 
 def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
-    """Create an LLMClient configured for the Thinking backend (gpt-oss-120b / DGX Spark)."""
+    """Create an LLMClient configured for the Thinking backend (gpt-oss-120b / DGX Spark).
+
+    The client carries ``settings.thinking_max_tokens`` as its default
+    generation budget (ENH-015, issue #494): callers that do not pass an
+    explicit ``max_tokens`` get the configured thinking budget instead of
+    the legacy hardcoded 32768. An explicit per-call ``max_tokens`` still
+    wins.
+    """
     return LLMClient(
         timeout=timeout,
         base_url=settings.ollama_chat_url,
         model=settings.chat_model,
         cb_name="llm_thinking",
+        max_tokens=settings.thinking_max_tokens,
     )
 
 
@@ -690,11 +821,30 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
 
 
 def create_instant_client(timeout: float = 120.0) -> "LLMClient":
-    """Create the Instant client; Gemma 4 must use no-thinking template mode."""
+    """Create the Instant client; Gemma 4 must use no-thinking template mode.
+
+    ``settings.instant_enable_thinking`` (FU-005, issue #494; default False)
+    selects the template mode: False keeps the historical
+    ``chat_template_kwargs={'enable_thinking': False}`` payload — the
+    correct behavior for Gemma-4-style deployments whose chat templates
+    default to thinking — while True omits the kwarg entirely so the
+    provider/model chat-template default governs. The client also carries
+    ``settings.instant_max_tokens`` as its default generation budget
+    (ENH-015, issue #494), mirroring ``create_thinking_client``.
+    """
+    # Pydantic guarantees a real bool here; the identity check keeps
+    # partially mocked settings objects (tests) on the default-False branch.
+    chat_template_kwargs = (
+        None
+        if settings.instant_enable_thinking is True
+        else {"enable_thinking": False}
+    )
+    instant_max_tokens = getattr(settings, "instant_max_tokens", None)
     return LLMClient(
         timeout=timeout,
         base_url=settings.instant_chat_url,
         model=settings.instant_chat_model,
         cb_name="llm_instant",
-        chat_template_kwargs={"enable_thinking": False},
+        max_tokens=instant_max_tokens if isinstance(instant_max_tokens, int) else None,
+        chat_template_kwargs=chat_template_kwargs,
     )

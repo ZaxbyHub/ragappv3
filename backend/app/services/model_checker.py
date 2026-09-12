@@ -20,7 +20,7 @@ from typing import Any, Dict
 import httpx
 
 from app.config import settings
-from app.services.circuit_breaker import CircuitBreakerError
+from app.services.circuit_breaker import CircuitBreakerError, model_checker_cb
 from app.services.ssrf import assert_url_safe
 
 
@@ -38,24 +38,51 @@ class _DialectMismatch(Exception):
     """
 
 
+class _ProbeFailureResult(dict):
+    """An unavailable probe result caused by a transport/host failure.
+
+    Produced only by :func:`_model_check_error` (timeouts, connection
+    errors, non-404/405 HTTP errors). The probe circuit breaker (FU-004,
+    issue #494) charges exactly these; listing-based "model not found"
+    results are authoritative answers from a healthy endpoint and must not
+    open the breaker. Serializes/compares exactly like a plain dict.
+    """
+
+
+class _ProbeFailure(Exception):
+    """Internal: re-surfaces a swallowed probe failure for the breaker.
+
+    ``AsyncCircuitBreaker`` records a failure only when the wrapped
+    operation raises; the ``_check_*`` helpers swallow transport errors
+    into ``_ProbeFailureResult`` dicts, so the breaker-wrapped outer call
+    re-raises them as this exception type.
+    """
+
+    def __init__(self, result: Dict[str, Any]):
+        super().__init__(result.get("error") or "model probe failed")
+        self.result = result
+
+
 def _model_check_error(timeout: float, exc: BaseException) -> Dict[str, Any]:
     """Map a model-probe exception to the standard unavailable-result dict.
 
     Shared by all three model-check methods so the error-handling tail stays
     identical (TimeoutException / HTTPStatusError / RequestError /
-    ValueError|TypeError|RuntimeError).
+    ValueError|TypeError|RuntimeError). Results are ``_ProbeFailureResult``
+    dicts so the probe circuit breaker can distinguish transport failures
+    from listing-based "model not found" answers.
     """
     if isinstance(exc, httpx.TimeoutException):
-        return {'available': False, 'error': f"Request timed out after {timeout}s"}
+        return _ProbeFailureResult({'available': False, 'error': f"Request timed out after {timeout}s"})
     if isinstance(exc, httpx.HTTPStatusError):
-        return {
+        return _ProbeFailureResult({
             'available': False,
             'error': f"HTTP error {exc.response.status_code}: {exc.response.text}",
-        }
+        })
     if isinstance(exc, httpx.RequestError):
-        return {'available': False, 'error': f"Request failed: {str(exc)}"}
+        return _ProbeFailureResult({'available': False, 'error': f"Request failed: {str(exc)}"})
     if isinstance(exc, (ValueError, TypeError, RuntimeError)):
-        return {'available': False, 'error': f"Unexpected error: {str(exc)}"}
+        return _ProbeFailureResult({'available': False, 'error': f"Unexpected error: {str(exc)}"})
     # Should not reach here for the documented exception set; re-raise to avoid
     # silently swallowing an unexpected error type.
     raise exc
@@ -64,7 +91,18 @@ def _model_check_error(timeout: float, exc: BaseException) -> Dict[str, Any]:
 # URL suffixes that identify a specific API route rather than a server root.
 # Stripping them (repeatedly, so e.g. "/v1/embeddings" behind a proxy prefix
 # also resolves) yields the base every dialect appends its own path to.
-_KNOWN_ROUTE_SUFFIXES = ('/v1/embeddings', '/v1/models', '/api/tags', '/embed')
+# Longest-match-first matters within the loop's first-match semantics: the
+# loop breaks the strip cycle per iteration at the FIRST suffix that matches,
+# so '/api/embed' must precede '/embed' (else "…/api/embed" over-strips to
+# "…/api"), and '/api/embeddings'/'/api/embed' both precede '/embed'.
+_KNOWN_ROUTE_SUFFIXES = (
+    '/v1/embeddings',
+    '/v1/models',
+    '/api/tags',
+    '/api/embeddings',
+    '/api/embed',
+    '/embed',
+)
 
 
 def _derive_base(url: str) -> str:
@@ -236,19 +274,46 @@ class ModelChecker:
                 checker = self._check_ollama_model
             timeout = self.timeout if i == 0 else self.fallback_timeout
 
+            async def _breaker_probe() -> Any:
+                """Run one dialect probe through the model-checker breaker.
+
+                FU-004 (issue #494): consecutive provider failures open the
+                circuit so probe storms during outages fail fast
+                (restore-not-delete decision; matches the reranking_cb
+                precedent). The breaker wraps this OUTER per-dialect call
+                because the inner ``_check_*`` helpers swallow
+                HTTPStatusError/ConnectError into ``_model_check_error``
+                RESULT dicts — an inner wrap would never record a failure.
+                Swallowed failures are re-surfaced here as exceptions (the
+                breaker records failures only on exceptions), while
+                wrong-dialect answers pass through as values so the chain's
+                normal fallback never charges the breaker.
+                """
+                try:
+                    result = await checker(client, base_url, model_name, timeout)
+                except _DialectMismatch as mismatch:
+                    return mismatch
+                if isinstance(result, _ProbeFailureResult):
+                    raise _ProbeFailure(result)
+                return result
+
             try:
-                result = await checker(client, base_url, model_name, timeout)
-            except _DialectMismatch as e:
-                mismatch_notes.append(f"{dialect}: {e}")
-                continue
+                outcome = await model_checker_cb(_breaker_probe)()
+            except _ProbeFailure as e:
+                result = e.result
             except CircuitBreakerError as e:
-                # Defensive: no breaker wraps the dialect probes today, but a
-                # tripped breaker must never wedge the whole chain — treat it
-                # as "this dialect unusable, try the next".
+                # A tripped breaker means the host has failed consecutively;
+                # treat it as "this dialect unusable, try the next" so an
+                # open breaker never wedges the whole chain.
                 mismatch_notes.append(f"{dialect}: circuit breaker open ({e})")
                 continue
             except Exception as e:
                 return _model_check_error(timeout, e)
+            else:
+                if isinstance(outcome, _DialectMismatch):
+                    mismatch_notes.append(f"{dialect}: {outcome}")
+                    continue
+                result = outcome
 
             if result.get('available'):
                 self._dialect_cache[base_key] = dialect

@@ -291,9 +291,18 @@ class RerankingService:
                 follow_redirects=False,
                 transport=SSRFSafeTransport(),
             )
-        try:
-            response = await reranking_cb(self._http_client.post)(url, json=payload)
+        # OPS-002 (issue #494): run the POST and the HTTP status check as
+        # ONE breaker-wrapped operation so HTTPStatusError trips the
+        # reranking breaker. Previously raise_for_status() ran outside the
+        # wrap, so error statuses recorded a SUCCESS on the breaker.
+        # JSON decoding stays outside — a malformed body is not an outage.
+        async def _checked_post() -> httpx.Response:
+            response = await self._http_client.post(url, json=payload)
             response.raise_for_status()
+            return response
+
+        try:
+            response = await reranking_cb(_checked_post)()
             data = response.json()
         except CircuitBreakerError:
             raise

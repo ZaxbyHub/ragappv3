@@ -104,6 +104,46 @@ class EmbeddingDimensionMismatchError(EmbeddingError):
         )
 
 
+def _is_outage_status(status_code: int) -> bool:
+    """Classify an HTTP status as a provider outage (breaker-worthy).
+
+    5xx server errors and 429 rate-limiting mean the provider is unavailable
+    or overloaded — retryable outages that should count toward opening the
+    circuit breaker. Other 4xx statuses are input/configuration errors that
+    would fail identically on every retry and must NOT trip the breaker
+    (OPS-002, issue #494).
+    """
+    return status_code >= 500 or status_code == 429
+
+
+def _httpcore_live_pool_counts(
+    client: httpx.AsyncClient,
+) -> tuple[Optional[int], Optional[int]]:
+    """Best-effort live connection counts from the httpcore pool.
+
+    Returns ``(total_connections, keepalive_connections)`` where the
+    keepalive count is the number of connections in httpcore's IDLE state.
+    Returns ``(None, None)`` when the pool state cannot be introspected —
+    never fabricated zeros (OBS-001, issue #494). A defensive copy of this
+    helper lives in ``llm_client.py``; keep the two in sync.
+    """
+    transport = getattr(client, "_transport", None)
+    # SSRFSafeTransport wraps the real httpx.AsyncHTTPTransport as
+    # `_transport`, not `_pool` — unwrap it before looking for `_pool`.
+    if transport is not None and not hasattr(transport, "_pool"):
+        transport = getattr(transport, "_transport", None)
+    pool_obj = getattr(transport, "_pool", None)
+    live = getattr(pool_obj, "_connections", None)
+    if live is None:
+        return (None, None)
+    keepalive = 0
+    for conn in live:
+        state = getattr(conn, "state", None)
+        if str(getattr(state, "name", state)).upper() == "IDLE":
+            keepalive += 1
+    return (len(live), keepalive)
+
+
 @dataclass(frozen=True)
 class _EmbeddingRequestConfig:
     """Frozen per-request embedding configuration (EMBED-002, issue #511).
@@ -181,13 +221,17 @@ class EmbeddingService:
         # reverts to httpx's defaults.
         from app.services.ssrf_transport import SSRFSafeTransport
 
+        # Pool limits stored at client creation so _log_pool_stats reports
+        # the CONFIGURED caps instead of guessing (OBS-001, issue #494).
+        self._pool_limits = httpx.Limits(
+            max_connections=20, max_keepalive_connections=10
+        )
+
         self._client = httpx.AsyncClient(
             timeout=self.timeout,
             follow_redirects=False,
             transport=SSRFSafeTransport(
-                transport=httpx.AsyncHTTPTransport(
-                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
-                )
+                transport=httpx.AsyncHTTPTransport(limits=self._pool_limits)
             ),
         )
 
@@ -589,11 +633,33 @@ class EmbeddingService:
 
         _embed_started = time.perf_counter()
         try:
-            response = await embeddings_cb(self._client.post)(
-                config.url, json=self._build_payload(text_to_embed, config)
-            )
+            # OPS-002 (issue #494): classify the response status INSIDE the
+            # breaker-wrapped operation. The breaker only records failures
+            # on exceptions; previously the POST returned a 503 response
+            # normally (recording a SUCCESS) and the status raise happened
+            # outside the wrap, so outage responses never tripped it.
+            async def _checked_post() -> httpx.Response:
+                response = await self._client.post(
+                    config.url,
+                    json=self._build_payload(text_to_embed, config),
+                )
+                if response.status_code != 200 and _is_outage_status(
+                    response.status_code
+                ):
+                    logger.warning(
+                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    )
+                    raise EmbeddingError(
+                        f"Embedding API returned status {response.status_code}"
+                    )
+                return response
+
+            response = await embeddings_cb(_checked_post)()
 
             if response.status_code != 200:
+                # Other non-200 statuses (input/config 4xx errors) are
+                # raised OUTSIDE the breaker: they are caller errors that
+                # would recur on every retry, not provider outages.
                 logger.warning(
                     f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
                 )
@@ -714,6 +780,77 @@ class EmbeddingService:
             EmbeddingError: If the API request fails or returns non-200 status.
         """
         return await self._embed_with_prefix(text, self.embedding_doc_prefix)
+
+    async def embed_probe(self, timeout: float) -> None:
+        """Issue a cache-bypassing ping embedding for deep-health checks.
+
+        Runs the ping through the breaker-wrapped checked POST with a
+        per-request ``timeout`` — httpx per-request timeouts override the
+        persistent client's default without mutating the shared client or
+        any service state (OPS-004, issue #494) — and skips both cache
+        layers entirely: the L1 LRU and Redis caches are neither consulted
+        nor populated, so the probe observes the live provider instead of a
+        stale healthy past (OPS-003, issue #494). ``last_metrics`` is left
+        untouched so health probes do not pollute operational metrics.
+
+        Args:
+            timeout: Per-request timeout in seconds for the probe POST.
+
+        Raises:
+            EmbeddingError: If the provider returns a non-200 status, the
+                breaker is open, or the response body is invalid. Transport
+                exceptions (e.g. ``httpx.TimeoutException``) propagate
+                unchanged for the caller to classify.
+        """
+        config = self._request_config()
+
+        async def _checked_probe_post() -> httpx.Response:
+            response = await self._client.post(
+                config.url,
+                json=self._build_payload("ping", config),
+                timeout=timeout,
+            )
+            if response.status_code != 200 and _is_outage_status(
+                response.status_code
+            ):
+                logger.warning(
+                    f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                )
+                raise EmbeddingError(
+                    f"Embedding API returned status {response.status_code}"
+                )
+            return response
+
+        try:
+            response = await embeddings_cb(_checked_probe_post)()
+        except CircuitBreakerError as e:
+            logger.warning(
+                "Embedding probe failed (mode=%s): circuit breaker open: %s",
+                config.mode,
+                e,
+            )
+            raise EmbeddingError(
+                f"Embedding service circuit breaker is open: {e}"
+            ) from e
+
+        if response.status_code != 200:
+            logger.warning(
+                f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+            )
+            raise EmbeddingError(
+                f"Embedding API returned status {response.status_code}"
+            )
+
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.warning(
+                f"Invalid JSON response from embedding API for {config.mode} mode: {e}, response: {response.text}"
+            )
+            raise EmbeddingError("Invalid response from embedding service")
+
+        # Validate the response shape (raises EmbeddingError when malformed).
+        self._extract_embedding(data, config)
 
     async def validate_embedding_dimension(self, expected_dim: int) -> bool:
         """
@@ -967,30 +1104,38 @@ class EmbeddingService:
         return list(gathered)
 
     def _log_pool_stats(self, client: httpx.AsyncClient) -> None:
-        """Log connection pool and cache statistics for monitoring."""
+        """Log connection pool and cache statistics for monitoring.
+
+        Reports the CONFIGURED limits from the ``httpx.Limits`` stored at
+        client creation plus live counts read from httpcore's pool state
+        when introspectable. The urllib3-era ``_num_connections`` /
+        ``_num_keepalive`` attributes do not exist under httpx's asyncio
+        transport, so the previous implementation fabricated ``0/20
+        connections, 0/10 keepalive`` even while connections were alive
+        (OBS-001, issue #494); when the live state cannot be read, the log
+        says so instead of inventing zeros.
+        """
         try:
-            pool = getattr(client, "_transport", None)
-            # SSRFSafeTransport wraps the real httpx.AsyncHTTPTransport as
-            # `_transport`, not `_pool` — unwrap it before looking for `_pool`.
-            if pool is not None and not hasattr(pool, "_pool"):
-                pool = getattr(pool, "_transport", None)
-            if pool and hasattr(pool, "_pool"):
-                pool_obj = pool._pool
-                connections = getattr(pool_obj, "_num_connections", 0)
-                keepalive = getattr(pool_obj, "_num_keepalive", 0)
-                limits = getattr(pool_obj, "_limits", None)
-                max_connections = (
-                    getattr(limits, "max_connections", 20) if limits else 20
+            max_connections = self._pool_limits.max_connections
+            max_keepalive = self._pool_limits.max_keepalive_connections
+            connections, keepalive = _httpcore_live_pool_counts(client)
+
+            cache_stats = self._embed_cache.get_stats()
+            cache_part = (
+                f"cache: {cache_stats['hits']} hits, {cache_stats['misses']} misses, "
+                f"{cache_stats['hit_rate']}% hit rate, "
+                f"{cache_stats['size']}/{cache_stats['maxsize']} entries"
+            )
+            if connections is None:
+                logger.info(
+                    f"Embedding service pool: live counts unavailable "
+                    f"(configured {max_connections} max connections, "
+                    f"{max_keepalive} max keepalive), {cache_part}"
                 )
-                max_keepalive = (
-                    getattr(limits, "max_keepalive_connections", 10) if limits else 10
-                )
-                cache_stats = self._embed_cache.get_stats()
+            else:
                 logger.info(
                     f"Embedding service pool: {connections}/{max_connections} connections, "
-                    f"{keepalive}/{max_keepalive} keepalive, "
-                    f"cache: {cache_stats['hits']} hits, {cache_stats['misses']} misses, "
-                    f"{cache_stats['hit_rate']}% hit rate, {cache_stats['size']}/{cache_stats['maxsize']} entries"
+                    f"{keepalive}/{max_keepalive} keepalive, {cache_part}"
                 )
         except Exception:
             pass  # Silently ignore any errors accessing internal pool state
@@ -1071,10 +1216,32 @@ class EmbeddingService:
                     )
                 payload = {"model": config.model, "prompt": texts[0]}
 
+            # OPS-002 (issue #494): classify the response status INSIDE the
+            # breaker-wrapped operation so outage responses (5xx + 429) trip
+            # the breaker. A 500 whose body is a token-overflow error is NOT
+            # an outage — it is a recoverable batch-size failure the caller
+            # splits and retries below — so it returns normally and leaves
+            # the breaker uncharged (preserves the pre-existing HTTP 500
+            # special case).
+            async def _checked_post() -> httpx.Response:
+                response = await client.post(config.url, json=payload)
+                if response.status_code != 200 and _is_outage_status(
+                    response.status_code
+                ):
+                    if response.status_code == 500 and self._is_token_overflow_error(
+                        response.text.lower()
+                    ):
+                        return response
+                    logger.warning(
+                        f"Embedding API returned status {response.status_code} for {config.mode} mode: {response.text}"
+                    )
+                    raise EmbeddingError(
+                        f"Embedding API returned status {response.status_code}"
+                    )
+                return response
+
             try:
-                response = await embeddings_cb(client.post)(
-                    config.url, json=payload
-                )
+                response = await embeddings_cb(_checked_post)()
             except CircuitBreakerError as e:
                 raise EmbeddingError(f"Embedding service circuit breaker is open: {e}")
 
