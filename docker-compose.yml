@@ -204,6 +204,74 @@ services:
       - CHUNK_ENRICHMENT_ENABLED=${CHUNK_ENRICHMENT_ENABLED:-false}
       - MULTI_SCALE_INDEXING_ENABLED=${MULTI_SCALE_INDEXING_ENABLED:-true}
       - MULTI_SCALE_CHUNK_SIZES=${MULTI_SCALE_CHUNK_SIZES:-768,1536}
+      # ------------------------------------------------------------------
+      # Issue #494 (CONFIG-007 / AC17): every ACTIVE (uncommented) KEY=
+      # variable documented in .env.example is forwarded into the backend
+      # container as `- KEY=${KEY:-}` so tuning it in .env actually reaches
+      # the containerized backend. Keep this block in sync with .env.example
+      # (guarded by backend/tests/test_issue494_compose_env_forwarding.py).
+      # Host-/build-time exceptions that are deliberately NOT forwarded:
+      # PORT (host port mapping), VITE_APP_BASENAME / VITE_API_URL (frontend
+      # build args), HOST_DATA_DIR (bind-mount host path), HF_TOKEN
+      # (harrier-embed sidecar). Secrets (ADMIN_SECRET_TOKEN, JWT_SECRET_KEY)
+      # stay explicit above — never forwarded with implicit defaults.
+      # ------------------------------------------------------------------
+      # Auth & security
+      - USERS_ENABLED=${USERS_ENABLED:-}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-}
+      - ADMIN_RATE_LIMIT=${ADMIN_RATE_LIMIT:-}
+      - HEALTH_CHECK_API_KEY=${HEALTH_CHECK_API_KEY:-}
+      - CSRF_TOKEN_TTL=${CSRF_TOKEN_TTL:-}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}
+      # Model tuning & validation
+      - ENABLE_MODEL_VALIDATION=${ENABLE_MODEL_VALIDATION:-}
+      - INSTANT_ENABLE_THINKING=${INSTANT_ENABLE_THINKING:-}
+      # Document processing & retrieval
+      - CHUNK_SIZE_CHARS=${CHUNK_SIZE_CHARS:-}
+      - CHUNK_OVERLAP_CHARS=${CHUNK_OVERLAP_CHARS:-}
+      - DOCUMENT_PARSING_STRATEGY=${DOCUMENT_PARSING_STRATEGY:-}
+      - RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-}
+      - MAX_DISTANCE_THRESHOLD=${MAX_DISTANCE_THRESHOLD:-}
+      - VECTOR_METRIC=${VECTOR_METRIC:-}
+      - RETRIEVAL_WINDOW=${RETRIEVAL_WINDOW:-}
+      - ALLOWED_EXTENSIONS=${ALLOWED_EXTENSIONS:-}
+      # Embedding tuning
+      - EMBEDDING_BATCH_MAX_RETRIES=${EMBEDDING_BATCH_MAX_RETRIES:-}
+      - EMBEDDING_BATCH_MIN_SUB_SIZE=${EMBEDDING_BATCH_MIN_SUB_SIZE:-}
+      - EMBEDDING_DOC_PREFIX=${EMBEDDING_DOC_PREFIX:-}
+      - EMBEDDING_QUERY_PREFIX=${EMBEDDING_QUERY_PREFIX:-}
+      # Opt-in RAG features
+      - CONTEXTUAL_CHUNKING_CONCURRENCY=${CONTEXTUAL_CHUNKING_CONCURRENCY:-}
+      - MULTI_SCALE_OVERLAP_RATIO=${MULTI_SCALE_OVERLAP_RATIO:-}
+      - QUERY_TRANSFORMATION_ENABLED=${QUERY_TRANSFORMATION_ENABLED:-}
+      - RETRIEVAL_EVALUATION_ENABLED=${RETRIEVAL_EVALUATION_ENABLED:-}
+      # Concurrency & pool sizing
+      - VECTOR_SEARCH_CONCURRENCY=${VECTOR_SEARCH_CONCURRENCY:-}
+      - SEARCH_SEMAPHORE_TIMEOUT_SECONDS=${SEARCH_SEMAPHORE_TIMEOUT_SECONDS:-}
+      - WRITE_LOCK_TIMEOUT_SECONDS=${WRITE_LOCK_TIMEOUT_SECONDS:-}
+      - ACTIVE_USER_CACHE_TTL_SECONDS=${ACTIVE_USER_CACHE_TTL_SECONDS:-}
+      - MEMORY_STORE_POOL_SIZE=${MEMORY_STORE_POOL_SIZE:-}
+      - DB_POOL_MAX_SIZE=${DB_POOL_MAX_SIZE:-}
+      # Legacy/deprecated aliases (still honored for backward compatibility)
+      - CHUNK_SIZE=${CHUNK_SIZE:-}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-}
+      - MAX_CONTEXT_CHUNKS=${MAX_CONTEXT_CHUNKS:-}
+      - VECTOR_TOP_K=${VECTOR_TOP_K:-}
+      - RAG_RELEVANCE_THRESHOLD=${RAG_RELEVANCE_THRESHOLD:-}
+      # Auto-scan & maintenance mode
+      - AUTO_SCAN_ENABLED=${AUTO_SCAN_ENABLED:-}
+      - AUTO_SCAN_INTERVAL_MINUTES=${AUTO_SCAN_INTERVAL_MINUTES:-}
+      - MAINTENANCE_MODE=${MAINTENANCE_MODE:-}
+      # IMAP email ingestion
+      - IMAP_ENABLED=${IMAP_ENABLED:-}
+      - IMAP_HOST=${IMAP_HOST:-}
+      - IMAP_PORT=${IMAP_PORT:-}
+      - IMAP_USE_SSL=${IMAP_USE_SSL:-}
+      - IMAP_USERNAME=${IMAP_USERNAME:-}
+      - IMAP_PASSWORD=${IMAP_PASSWORD:-}
+      - IMAP_MAILBOX=${IMAP_MAILBOX:-}
+      - IMAP_POLL_INTERVAL=${IMAP_POLL_INTERVAL:-}
+      - IMAP_MAX_ATTACHMENT_SIZE=${IMAP_MAX_ATTACHMENT_SIZE:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
