@@ -460,3 +460,64 @@ class TestReleaseId:
             release_id = _get_release_id()
             # Since settings has no app_version, fallback is "unknown"
             assert release_id == "unknown"
+
+
+class TestDuplicateIdRejection(unittest.TestCase):
+    """EVAL-002 (issue #237): id-keyed association requires unique ids."""
+
+    def test_duplicate_benchmark_ids_raise(self):
+        from app.services.eval_adapter import BenchmarkItem, LiveEvalAdapter
+
+        adapter = LiveEvalAdapter(top_k=5)
+        with self.assertRaises(ValueError) as ctx:
+            adapter.score_run(
+                [
+                    BenchmarkItem(id="q1", query="a", relevant_ids=["d1"]),
+                    BenchmarkItem(id="q1", query="b", relevant_ids=["d2"]),
+                ],
+                [],
+                release_id="test",
+            )
+        self.assertIn("duplicate", str(ctx.exception))
+
+    def test_duplicate_ranking_query_ids_raise(self):
+        from app.services.eval_adapter import (
+            BenchmarkItem,
+            LiveEvalAdapter,
+            RetrievedRanking,
+        )
+
+        adapter = LiveEvalAdapter(top_k=5)
+        with self.assertRaises(ValueError) as ctx:
+            adapter.score_run(
+                [BenchmarkItem(id="q1", query="a", relevant_ids=["d1"])],
+                [
+                    RetrievedRanking(query_id="q1", retrieved_ids=["d1"]),
+                    RetrievedRanking(query_id="q1", retrieved_ids=["d1"]),
+                ],
+                release_id="test",
+            )
+        self.assertIn("duplicate", str(ctx.exception))
+
+    def test_unique_perfect_rankings_score_one(self):
+        from app.services.eval_adapter import (
+            BenchmarkItem,
+            LiveEvalAdapter,
+            RetrievedRanking,
+        )
+
+        adapter = LiveEvalAdapter(top_k=5)
+        result = adapter.score_run(
+            [
+                BenchmarkItem(id="q1", query="a", relevant_ids=["d1"]),
+                BenchmarkItem(id="q2", query="b", relevant_ids=["d2"]),
+            ],
+            [
+                RetrievedRanking(query_id="q1", retrieved_ids=["d1"]),
+                RetrievedRanking(query_id="q2", retrieved_ids=["d2"]),
+            ],
+            release_id="test",
+        )
+        self.assertEqual(result.recall_mean, 1.0)
+        self.assertEqual(result.mrr_mean, 1.0)
+        self.assertEqual(result.ndcg_mean, 1.0)

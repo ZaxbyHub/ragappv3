@@ -676,7 +676,7 @@ class Settings(BaseSettings):
     # Feature flags
     enable_model_validation: bool = False
     eval_enabled: bool = False
-    """Enable RAGAS evaluation endpoint. Disabled by default for production safety."""
+    """Enable the evaluation endpoints (/eval/heuristic and /eval/live). Disabled by default for production safety."""
 
     # Admin security
     admin_secret_token: str = (

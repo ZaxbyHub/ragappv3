@@ -335,6 +335,25 @@ class LiveEvalAdapter:
         """
         effective_top_k = top_k_override if top_k_override is not None else self.top_k
 
+        # EVAL-002 (issue #237): association below is keyed by id, so duplicate
+        # ids must fail loudly here — silently keeping the last entry mis-scores
+        # every other item sharing the id.
+        seen_benchmark_ids: set = set()
+        for item in benchmark:
+            if item.id in seen_benchmark_ids:
+                raise ValueError(
+                    f"duplicate benchmark item id: {item.id!r} — benchmark ids must be unique"
+                )
+            seen_benchmark_ids.add(item.id)
+        seen_query_ids: set = set()
+        for ranking in retrieved_per_query:
+            if ranking.query_id in seen_query_ids:
+                raise ValueError(
+                    f"duplicate query_id in retrieved rankings: {ranking.query_id!r} — "
+                    "ranking ids must be unique"
+                )
+            seen_query_ids.add(ranking.query_id)
+
         retrieved_map: Dict[str, RetrievedRanking] = {
             r.query_id: r for r in retrieved_per_query
         }

@@ -1,4 +1,10 @@
-"""Tests for eval_enabled feature flag gate on /eval/ragas endpoint."""
+"""Tests for the eval_enabled feature flag gate on the evaluation endpoints.
+
+The gate applies solely to ``settings.eval_enabled`` (the historical
+``import ragas`` install-presence gate was removed in issue #283). The
+canonical heuristic route is ``/eval/heuristic``; ``/eval/ragas`` is a
+deprecated alias gated identically (issue #343 / #237).
+"""
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -42,48 +48,44 @@ class TestEvalFeatureGate:
         }
         return TestClient(app)
 
-    def test_eval_disabled_returns_501(self, setup_app):
-        """When eval_enabled=False (default), endpoint returns 501."""
-        client = self._get_client(self._test_app)
-        payload = {
+    @staticmethod
+    def _payload():
+        return {
             "query": "What is RAG?",
             "answer": "RAG stands for Retrieval Augmented Generation.",
             "contexts": ["RAG is a technique that combines retrieval and generation."],
         }
 
-        response = client.post("/eval/ragas", json=payload)
+    def test_eval_disabled_returns_501_on_canonical_route(self, setup_app):
+        """When eval_enabled=False (default), the canonical route returns 501."""
+        client = self._get_client(self._test_app)
+
+        response = client.post("/eval/heuristic", json=self._payload())
+        assert response.status_code == 501
+        assert "EVAL_ENABLED" in response.json()["detail"]
+
+    def test_eval_disabled_returns_501_on_deprecated_alias(self, setup_app):
+        """The deprecated /eval/ragas alias is gated identically."""
+        client = self._get_client(self._test_app)
+
+        response = client.post("/eval/ragas", json=self._payload())
         assert response.status_code == 501
         assert "EVAL_ENABLED" in response.json()["detail"]
 
     def test_eval_disabled_message_is_descriptive(self, setup_app):
         """Error message explains how to enable the endpoint."""
         client = self._get_client(self._test_app)
-        payload = {
-            "query": "What is RAG?",
-            "answer": "RAG stands for Retrieval Augmented Generation.",
-            "contexts": ["RAG is a technique that combines retrieval and generation."],
-        }
 
-        response = client.post("/eval/ragas", json=payload)
+        response = client.post("/eval/heuristic", json=self._payload())
         detail = response.json()["detail"]
         assert "EVAL_ENABLED" in detail
 
-    def test_eval_enabled_missing_ragas_returns_501(self, setup_app):
-        """When eval_enabled=True but ragas not installed, returns 501 about ragas."""
+    def test_eval_enabled_returns_200_on_canonical_route(self, setup_app):
+        """When eval_enabled=True, the canonical route serves the request."""
         client = self._get_client(self._test_app)
-        payload = {
-            "query": "What is RAG?",
-            "answer": "RAG stands for Retrieval Augmented Generation.",
-            "contexts": ["RAG is a technique that combines retrieval and generation."],
-        }
 
-        # Patch settings at the config module level (where it's imported from)
-        with patch("app.config.settings") as mock_settings:
-            mock_settings.eval_enabled = True
-            response = client.post("/eval/ragas", json=payload)
+        with patch("app.config.settings.eval_enabled", True, create=True):
+            response = client.post("/eval/heuristic", json=self._payload())
 
-            # If ragas is not installed, should get 501 about ragas
-            if response.status_code == 501:
-                detail = response.json()["detail"]
-                # Should mention ragas installation
-                assert "ragas" in detail.lower()
+        assert response.status_code == 200
+        assert "metrics" in response.json()

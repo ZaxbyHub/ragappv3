@@ -48,7 +48,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # grouping centroids)
 # 66 -> 68: issue #516 (2026-09-10) added draft_reconcile_cursor and
 # draft_reconcile_backlog (evidence-reconciler continuation state)
-EXPECTED_BASE_TABLE_COUNT = 68
+# 68 -> 70: issue #237 (AC12) adds quality_reports and quality_eval_cases (PRODUCT-ENH-12 report->case->compare)
+EXPECTED_BASE_TABLE_COUNT = 70
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

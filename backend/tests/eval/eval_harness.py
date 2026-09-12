@@ -48,6 +48,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from tests.eval.report_contract import (
+    MEAN_METRIC_KEYS,
+    METRIC_DEFINITIONS,
+    UNCERTAINTY_METHOD,
+)
+
 
 @dataclass
 class GoldenCase:
@@ -112,13 +118,19 @@ class CaseMetrics:
     # Fraction of expected modalities observed among retrieved modality kinds.
     modality_match_rate: Optional[float] = None
     retrieval_status: Optional[str] = None
+    # EVAL-003 (issue #237): execution presence, independent of any metric
+    # family — a memory-only or no-match case runs successfully while every
+    # metric above can legitimately be None.
+    ran: bool = False
 
 
 def load_jsonl(path: str | Path) -> List[GoldenCase]:
     """Load a JSONL golden set into typed cases. Tolerant of missing
-    optional fields."""
+    optional fields. Duplicate case ids are rejected (issue #237, EVAL-002
+    class): id-keyed association must never silently collapse entries."""
     p = Path(path)
     cases: List[GoldenCase] = []
+    seen_ids: set[str] = set()
     with p.open("r", encoding="utf-8") as f:
         for line_no, raw in enumerate(f, start=1):
             line = raw.strip()
@@ -130,6 +142,12 @@ def load_jsonl(path: str | Path) -> List[GoldenCase]:
                 raise ValueError(
                     f"Failed to parse line {line_no} of {p}: {exc}"
                 ) from exc
+            case_id = str(obj["id"])
+            if case_id in seen_ids:
+                raise ValueError(
+                    f"duplicate golden case id {case_id!r} at line {line_no} of {p}"
+                )
+            seen_ids.add(case_id)
             cases.append(_case_from_dict(obj))
     return cases
 
@@ -151,36 +169,17 @@ def _case_from_dict(obj: Dict[str, Any]) -> GoldenCase:
     )
 
 
-# Re-export the 3 metric primitives from the production module so that
+# Re-export the metric primitives from the production module so that
 # test-side callers importing from tests.eval.eval_harness continue to work.
 # These take priority over any local definitions (which have been removed).
+# citation_validity / fact_coverage moved to app.services.eval_metrics
+# (issue #237: the quality-report compare endpoint is a production consumer);
+# re-exported here for harness callers, same pattern as the primitives below.
+from app.services.eval_metrics import citation_validity as citation_validity
+from app.services.eval_metrics import fact_coverage as fact_coverage
 from app.services.eval_metrics import mean_reciprocal_rank as mean_reciprocal_rank
 from app.services.eval_metrics import ndcg_at_k as ndcg_at_k
 from app.services.eval_metrics import recall_at_k as recall_at_k
-
-
-def citation_validity(
-    cited: Sequence[str], available: Sequence[str]
-) -> float:
-    """Fraction of cited labels that reference an available source/memory.
-
-    Returns 1.0 when no citations were emitted (vacuously valid).
-    """
-    if not cited:
-        return 1.0
-    available_set = set(available)
-    valid = sum(1 for c in cited if c in available_set)
-    return valid / float(len(cited))
-
-
-def fact_coverage(answer: str, expected_facts: Sequence[str]) -> float:
-    """Fraction of expected fact substrings that appear (case-insensitive) in the answer."""
-    if not expected_facts:
-        return 0.0
-    a = answer.lower()
-    hit = sum(1 for f in expected_facts if f.lower() in a)
-    return hit / float(len(expected_facts))
-
 
 # ---------- Runner ------------------------------------------------------------
 
@@ -190,7 +189,13 @@ class EvalRunner:
 
     def __init__(self, cases: Iterable[GoldenCase], top_k: int = 5):
         self.top_k = top_k
-        self._cases: Dict[str, GoldenCase] = {c.id: c for c in cases}
+        self._cases: Dict[str, GoldenCase] = {}
+        for case in cases:
+            if case.id in self._cases:
+                raise ValueError(
+                    f"duplicate golden case id {case.id!r} — golden ids must be unique"
+                )
+            self._cases[case.id] = case
         self._results: Dict[str, CaseResult] = {}
 
     @property
@@ -346,6 +351,7 @@ class EvalRunner:
                     vision_degradation_rate=vision_degraded,
                     modality_match_rate=modality_match,
                     retrieval_status=result.retrieval_status,
+                    ran=True,
                 )
             )
         return out
@@ -353,13 +359,37 @@ class EvalRunner:
     def summarize(self, metrics: Optional[Sequence[CaseMetrics]] = None) -> Dict[str, Any]:
         m = list(metrics or self.evaluate())
 
-        def _mean(field_name: str) -> Optional[float]:
-            vals = [
-                getattr(c, field_name) for c in m if getattr(c, field_name) is not None
+        def _values(field_name: str) -> List[float]:
+            return [
+                getattr(c, field_name)
+                for c in m
+                if getattr(c, field_name) is not None
             ]
+
+        def _mean(field_name: str) -> Optional[float]:
+            vals = _values(field_name)
             if not vals:
                 return None
             return statistics.fmean(vals)
+
+        def _attr_for(key: str) -> str:
+            if key == "no_match_correct_rate":
+                return "no_match_correct"
+            if key.endswith("_mean"):
+                return key[: -len("_mean")]
+            return key
+
+        def _interval(mean: float, vals: List[float]) -> Dict[str, Any]:
+            # normal_approx_95_clamped (see report_contract): deterministic,
+            # clamped to [0, 1] because every metric in the contract is a rate.
+            n = len(vals)
+            sd = statistics.stdev(vals) if n >= 2 else 0.0
+            margin = 1.96 * sd / math.sqrt(n)
+            return {
+                "method": UNCERTAINTY_METHOD,
+                "low": float(max(0.0, mean - margin)),
+                "high": float(min(1.0, mean + margin)),
+            }
 
         no_match = [c.no_match_correct for c in m if c.no_match_correct is not None]
         no_match_rate = (
@@ -370,9 +400,14 @@ class EvalRunner:
             st = c.retrieval_status
             if st:
                 retrieval_counts[st] = retrieval_counts.get(st, 0) + 1
-        return {
+
+        # EVAL-003 (issue #237): execution count derives from result presence,
+        # never from any metric family being non-None — specialized cases
+        # (memory-only, no-match, artifact-only) ran even when recall/fact/
+        # citation metrics are all None.
+        summary: Dict[str, Any] = {
             "case_count": len(m),
-            "ran_count": sum(1 for c in m if c.recall_at_k is not None or c.fact_coverage is not None or c.citation_validity is not None),
+            "ran_count": sum(1 for c in m if c.ran),
             "top_k": self.top_k,
             "recall_at_k_mean": _mean("recall_at_k"),
             "mrr_mean": _mean("mrr"),
@@ -393,6 +428,27 @@ class EvalRunner:
             "modality_match_rate_mean": _mean("modality_match_rate"),
             "retrieval_status_counts": retrieval_counts,
         }
+
+        # Issue #237 (AC7) — honest denominators, uncertainty and definitions.
+        metric_n: Dict[str, int] = {}
+        metric_skipped: Dict[str, int] = {}
+        uncertainty: Dict[str, Dict[str, Any]] = {}
+        for key in MEAN_METRIC_KEYS:
+            attr = _attr_for(key)
+            vals = _values(attr)
+            metric_n[key] = len(vals)
+            metric_skipped[key] = sum(1 for c in m if c.ran and getattr(c, attr) is None)
+            value = summary.get(key)
+            if value is None:
+                continue
+            uncertainty[key] = _interval(float(value), vals)
+        summary["metric_n"] = metric_n
+        summary["metric_skipped"] = metric_skipped
+        summary["uncertainty"] = uncertainty
+        summary["metric_definitions"] = {
+            key: METRIC_DEFINITIONS[key] for key in MEAN_METRIC_KEYS
+        }
+        return summary
 
     def to_json(self, path: str | Path) -> None:
         m = self.evaluate()

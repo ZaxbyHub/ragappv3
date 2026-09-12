@@ -56,7 +56,30 @@ def ndcg_at_k(
     return dcg / ideal
 
 
+def citation_validity(cited: Sequence[str], available: Sequence[str]) -> float:
+    """Fraction of cited labels that reference an available source/memory.
+
+    Returns 1.0 when no citations were emitted (vacuously valid).
+    """
+    if not cited:
+        return 1.0
+    available_set = set(available)
+    valid = sum(1 for c in cited if c in available_set)
+    return valid / float(len(cited))
+
+
+def fact_coverage(answer: str, expected_facts: Sequence[str]) -> float:
+    """Fraction of expected fact substrings that appear (case-insensitive) in the answer."""
+    if not expected_facts:
+        return 0.0
+    a = answer.lower()
+    hit = sum(1 for f in expected_facts if f.lower() in a)
+    return hit / float(len(expected_facts))
+
+
 __all__ = [
+    "citation_validity",
+    "fact_coverage",
     "mean_reciprocal_rank",
     "ndcg_at_k",
     "recall_at_k",

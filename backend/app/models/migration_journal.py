@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS migration_journal (
     detail TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
+;
 """
 
 _PHASES = ("start", "succeeded", "failed", "recovered")

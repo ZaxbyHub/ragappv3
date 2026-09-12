@@ -1,4 +1,4 @@
-"""Tests for RAGAS evaluation endpoint in eval.py.
+"""Tests for the heuristic evaluation endpoint in eval.py (renamed from the legacy RAGAS-prefixed route, issue #343/#237).
 
 Tests cover:
 - All 6 metric calculation functions
@@ -41,8 +41,8 @@ from fastapi.testclient import TestClient
 
 # Import metric functions directly
 from app.api.routes.eval import (
-    RAGASEvaluationRequest,
-    RAGASMetrics,
+    HeuristicEvaluationRequest,
+    HeuristicMetrics,
     _calculate_answer_relevancy,
     _calculate_answer_similarity,
     _calculate_context_precision,
@@ -468,7 +468,7 @@ class TestRAGASModels(unittest.TestCase):
 
     def test_request_valid_minimal(self):
         """Valid minimal request should parse correctly."""
-        request = RAGASEvaluationRequest(
+        request = HeuristicEvaluationRequest(
             query="What is ML?",
             answer="Machine learning is AI.",
             contexts=["ML is a subset of AI."],
@@ -478,7 +478,7 @@ class TestRAGASModels(unittest.TestCase):
 
     def test_request_valid_with_ground_truth(self):
         """Valid request with ground truth should parse correctly."""
-        request = RAGASEvaluationRequest(
+        request = HeuristicEvaluationRequest(
             query="What is ML?",
             answer="Machine learning is AI.",
             contexts=["ML is a subset of AI."],
@@ -489,7 +489,7 @@ class TestRAGASModels(unittest.TestCase):
     def test_request_empty_query_fails(self):
         """Empty query should fail validation (min_length=1)."""
         with self.assertRaises(Exception):  # ValidationError
-            RAGASEvaluationRequest(
+            HeuristicEvaluationRequest(
                 query="",
                 answer="Some answer",
                 contexts=["context"],
@@ -498,15 +498,15 @@ class TestRAGASModels(unittest.TestCase):
     def test_request_empty_contexts_fails(self):
         """Empty contexts list should fail validation (min_length=1)."""
         with self.assertRaises(Exception):  # ValidationError
-            RAGASEvaluationRequest(
+            HeuristicEvaluationRequest(
                 query="query",
                 answer="answer",
                 contexts=[],
             )
 
     def test_metrics_defaults(self):
-        """RAGASMetrics should have correct defaults."""
-        metrics = RAGASMetrics()
+        """HeuristicMetrics should have correct defaults."""
+        metrics = HeuristicMetrics()
         self.assertEqual(metrics.faithfulness, 0.0)
         self.assertEqual(metrics.answer_relevancy, 0.0)
         self.assertEqual(metrics.context_precision, 0.0)
@@ -515,8 +515,8 @@ class TestRAGASModels(unittest.TestCase):
         self.assertIsNone(metrics.answer_similarity)
 
     def test_metrics_boundary_values(self):
-        """RAGASMetrics should accept boundary values 0 and 1."""
-        metrics = RAGASMetrics(
+        """HeuristicMetrics should accept boundary values 0 and 1."""
+        metrics = HeuristicMetrics(
             faithfulness=0.0,
             answer_relevancy=1.0,
             context_precision=0.0,
@@ -704,3 +704,146 @@ class TestMetricEdgeCases(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNegativeCosineRegression(unittest.TestCase):
+    """EVAL-001 (issue #237): a valid negative cosine must not 500."""
+
+    @classmethod
+    def setUpClass(cls):
+        from app.main import app
+
+        cls.app = app
+
+    def setUp(self):
+        self.client = TestClient(self.app)
+
+        class AntiCorrelated:
+            calls = 0
+
+            async def embed_single(self, text):
+                AntiCorrelated.calls += 1
+                return [1.0, 0.0] if AntiCorrelated.calls % 2 == 1 else [-1.0, 0.0]
+
+        self._fake = AntiCorrelated()
+        from app.api.deps import get_current_active_user, get_embedding_service
+
+        self._get_embedding_service = get_embedding_service
+        self._get_current_active_user = get_current_active_user
+        self.app.dependency_overrides[get_embedding_service] = lambda: self._fake
+        self.app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": 1, "username": "admin", "role": "admin", "is_active": True,
+            "must_change_password": 0,
+        }
+        self._patcher = patch("app.config.settings.eval_enabled", True, create=True)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self.app.dependency_overrides.pop(self._get_embedding_service, None)
+        self.app.dependency_overrides.pop(self._get_current_active_user, None)
+
+    def _payload(self):
+        return {
+            "query": "What is the deadline?",
+            "answer": "The deadline is October 15.",
+            "contexts": ["Deadline: October 15."],
+            "ground_truth": "Completely unrelated text here.",
+        }
+
+    def test_negative_cosine_returns_200_with_negative_similarity(self):
+        response = self.client.post("/api/eval/heuristic", json=self._payload())
+        self.assertEqual(response.status_code, 200)
+        sim = response.json()["metrics"]["answer_similarity"]
+        self.assertIsNotNone(sim)
+        self.assertLess(sim, 0.0)
+        self.assertGreaterEqual(sim, -1.0)
+
+    def test_alias_route_returns_identical_schema(self):
+        canonical = self.client.post("/api/eval/heuristic", json=self._payload())
+        alias = self.client.post("/api/eval/ragas", json=self._payload())
+        self.assertEqual(canonical.status_code, 200)
+        self.assertEqual(alias.status_code, 200)
+        self.assertEqual(
+            sorted(canonical.json()["metrics"].keys()),
+            sorted(alias.json()["metrics"].keys()),
+        )
+
+    def test_alias_route_returns_identical_values_and_details(self):
+        # PRR-013: the deprecated alias must return the SAME computed body,
+        # not merely the same key set. evaluation_time_ms is excluded as a
+        # timing value; metrics (including the deterministic lexical
+        # heuristics and the cosine) and details must be identical.
+        canonical = self.client.post("/api/eval/heuristic", json=self._payload())
+        alias = self.client.post("/api/eval/ragas", json=self._payload())
+        self.assertEqual(canonical.json()["metrics"], alias.json()["metrics"])
+        self.assertEqual(canonical.json()["details"], alias.json()["details"])
+
+    def test_alias_marked_deprecated_in_openapi(self):
+        response = self.client.get("/openapi.json")
+        spec = response.json()
+        alias_entry = spec["paths"]["/api/eval/ragas"]
+        self.assertTrue(
+            alias_entry["post"].get("deprecated") is True
+            or "deprecated" in alias_entry["post"].get("description", "").lower()
+        )
+        canonical_entry = spec["paths"]["/api/eval/heuristic"]["post"]
+        self.assertNotIn("ragas", canonical_entry.get("operationId", "").lower())
+
+
+class TestLiveEvalDuplicateIdsRegression(unittest.TestCase):
+    """EVAL-002 (issue #237): duplicate benchmark ids must fail validation."""
+
+    @classmethod
+    def setUpClass(cls):
+        from app.main import app
+
+        cls.app = app
+
+    def setUp(self):
+        import tempfile
+
+        self.client = TestClient(self.app)
+        from app.api.deps import get_current_active_user, get_rag_engine
+
+        self._get_rag_engine = get_rag_engine
+        self._get_current_active_user = get_current_active_user
+
+        engine = MagicMock()
+
+        async def retrieve_eval_results(query, vault_id=None, top_k=None):
+            from app.services.eval_adapter import RetrievalOutcome
+
+            return RetrievalOutcome(status="ok", retrieved_ids=["doc-a"])
+
+        engine.retrieve_eval_results = retrieve_eval_results
+        self.app.dependency_overrides[get_rag_engine] = lambda: engine
+        self.app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": 1, "username": "admin", "role": "admin", "is_active": True,
+            "must_change_password": 0,
+        }
+        self._tmpdir = tempfile.mkdtemp()
+        self._patcher = patch("app.config.settings.eval_enabled", True, create=True)
+        self._data_patcher = patch(
+            "app.services.eval_adapter._get_runs_dir",
+            lambda: __import__("pathlib").Path(self._tmpdir),
+        )
+        self._patcher.start()
+        self._data_patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._data_patcher.stop()
+        self.app.dependency_overrides.pop(self._get_rag_engine, None)
+        self.app.dependency_overrides.pop(self._get_current_active_user, None)
+
+    def test_duplicate_benchmark_ids_return_422(self):
+        payload = {
+            "benchmark": [
+                {"id": "q1", "query": "first", "relevant_ids": ["doc-a"]},
+                {"id": "q1", "query": "second", "relevant_ids": ["doc-b"]},
+            ]
+        }
+        response = self.client.post("/api/eval/live", json=payload)
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("duplicate", str(response.json()).lower())

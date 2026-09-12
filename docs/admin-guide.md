@@ -545,6 +545,25 @@ ab -n 100 -c 10 http://localhost:9090/health
 
 ## Evaluation
 
+### Heuristic Answer Evaluation
+
+The `/api/eval/heuristic` endpoint computes lexical-overlap approximation metrics (faithfulness, answer relevancy, context precision/recall/relevancy, and an embedding-cosine `answer_similarity` on `[-1, 1]` — negative means anti-correlated) over a supplied query/answer/contexts triple. These are hand-rolled sanity-check heuristics, not library-computed reference metrics.
+
+**Access:** Admin-only (`require_admin_role`).
+**Feature flag:** Requires `EVAL_ENABLED=true` in `.env` (defaults to `false`).
+
+The legacy `/api/eval/ragas` path remains as a **deprecated alias** of `/api/eval/heuristic` (identical responses; marked deprecated in OpenAPI).
+
+### Quality Reports and Replayable Evaluation Cases
+
+Users report quality problems per chat message (`incorrect_answer`, `missing_source`, `stale_source`, `bad_extraction`) from the chat UI via `POST /api/quality/reports`; each report is bound to the message's turn identity and provenance (config/release reference plus the file hashes of the cited sources). Operators:
+
+1. list reports with `GET /api/quality/reports?session_id=<id>`;
+2. convert a report into a replayable evaluation case with an expected outcome via `POST /api/quality/reports/{id}/convert` (admin);
+3. compare before/after replays of the case via `POST /api/quality/eval-cases/{id}/compare` (admin), which returns fact-coverage and citation-validity deltas.
+
+See `docs/eval-operator-workflow.md` for the full labeling workflow, the tuning/held-out discipline, baseline/candidate run comparison, and the opt-in live-judge adapter (never used in CI).
+
 ### Live Retrieval Benchmark
 
 The `/api/eval/live` endpoint runs a retrieval-quality benchmark against the **live** RAG pipeline, computing MRR, nDCG@k, and recall@k from ground-truth query results. This bridges the offline eval harness with production retrieval quality measurement.
