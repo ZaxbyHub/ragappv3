@@ -83,7 +83,11 @@ RUN pip install --no-cache-dir -r requirements-lock.txt
 # Like the apt/pip steps above, this needs network access at build time; for
 # restricted/airgapped builds pass a proxy via Docker's standard build args
 # (HTTP_PROXY/HTTPS_PROXY) or pre-seed the model from a mirror.
-RUN python -m spacy download en_core_web_sm
+# requirements-lock.txt does not carry spacy (it arrives with the
+# unstructured[all-docs] extras the nightly tier installs); download the
+# model only when spacy is actually present so the locked-dependency
+# image stays buildable (BUILD-002 docker smoke, #258).
+RUN python -c "import spacy" 2>/dev/null     && python -m spacy download en_core_web_sm     || echo "spacy not installed - skipping en_core_web_sm download"
 
 # Copy backend code
 COPY backend/app ./app
