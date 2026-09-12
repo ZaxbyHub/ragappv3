@@ -32,14 +32,17 @@ _TEST_FPT_EMPTY = hashlib.sha256(b"").hexdigest()
 
 
 @pytest.fixture
-def mock_settings_admin_mode():
+def mock_settings_admin_mode(tmp_path):
     """Mock settings for users_enabled=False (admin token mode)."""
     mock = MagicMock()
     mock.users_enabled = False
     mock.admin_secret_token = "test-token"
     mock.jwt_secret_key = "test-secret-key"
     mock.jwt_algorithm = "HS256"
-    mock.sqlite_path = "./test.db"
+    # Hermetic per-test DB (tmp_path): the shared relative "./test.db"
+    # collided across xdist workers/orderings on CI Linux (PR #577:
+    # sqlite3.OperationalError unable to open database file).
+    mock.sqlite_path = str(tmp_path / "deps_auth_test.db")
     with patch("app.api.deps.settings", mock, create=True):
         with patch("app.services.auth_service.settings", mock, create=True):
             with patch("app.config.settings", mock, create=True):
@@ -47,14 +50,17 @@ def mock_settings_admin_mode():
 
 
 @pytest.fixture
-def mock_settings_jwt_mode():
+def mock_settings_jwt_mode(tmp_path):
     """Mock settings for users_enabled=True (JWT auth mode)."""
     mock = MagicMock()
     mock.users_enabled = True
     mock.admin_secret_token = "test-token"
     mock.jwt_secret_key = "test-secret-key"
     mock.jwt_algorithm = "HS256"
-    mock.sqlite_path = "./test.db"
+    # Hermetic per-test DB (tmp_path): the shared relative "./test.db"
+    # collided across xdist workers/orderings on CI Linux (PR #577:
+    # sqlite3.OperationalError unable to open database file).
+    mock.sqlite_path = str(tmp_path / "deps_auth_test.db")
     with patch("app.api.deps.settings", mock, create=True):
         with patch("app.services.auth_service.settings", mock, create=True):
             with patch("app.config.settings", mock, create=True):
@@ -103,14 +109,16 @@ class TestGetCurrentUserAdminToken:
         }
 
     @pytest.mark.asyncio
-    async def test_get_current_user_rejects_default_token(self, mock_db):
+    async def test_get_current_user_rejects_default_token(self, mock_db, tmp_path):
         """users_enabled=False, admin_secret_token='', token='admin-secret-token' → 403."""
         from app.api.deps import get_current_active_user
 
         mock = MagicMock()
         mock.users_enabled = False
         mock.admin_secret_token = ""  # Empty → default token is insecure
-        mock.sqlite_path = "./test.db"
+        # Hermetic per-test DB (tmp_path): the shared relative "./test.db"
+        # collided across xdist workers/orderings on CI Linux (PR #577).
+        mock.sqlite_path = str(tmp_path / "deps_auth_test.db")
 
         mock_conn, mock_cursor = mock_db
 
@@ -126,14 +134,16 @@ class TestGetCurrentUserAdminToken:
         assert "change default admin token" in exc_info.value.detail.lower()
 
     @pytest.mark.asyncio
-    async def test_get_current_user_accepts_explicit_default_token(self, mock_db):
+    async def test_get_current_user_accepts_explicit_default_token(self, mock_db, tmp_path):
         """users_enabled=False, admin_secret_token='admin-secret-token', token='admin-secret-token' → 200."""
         from app.api.deps import get_current_active_user
 
         mock = MagicMock()
         mock.users_enabled = False
         mock.admin_secret_token = "admin-secret-token"  # Explicit default token
-        mock.sqlite_path = "./test.db"
+        # Hermetic per-test DB (tmp_path): the shared relative "./test.db"
+        # collided across xdist workers/orderings on CI Linux (PR #577).
+        mock.sqlite_path = str(tmp_path / "deps_auth_test.db")
 
         mock_conn, mock_cursor = mock_db
 
@@ -1024,6 +1034,28 @@ class TestGetCurrentUserJWT:
 
 class TestEvaluatePolicy:
     """Tests for evaluate_policy RBAC engine."""
+
+
+    @pytest.fixture(autouse=True)
+    def _hermetic_policy_db(self, tmp_path, monkeypatch):
+        """Hermetic DB for evaluate_policy (PR #577 CI fix).
+
+        evaluate_policy opens the real settings-derived pool; unpatched, the
+        pool path depends on global settings state leaked by whichever tests
+        ran earlier in this xdist worker (CI Linux failed with
+        sqlite3.OperationalError under some orderings). Point deps.settings at
+        a per-test absolute path so the engine opens a throwaway file.
+        """
+        from types import SimpleNamespace
+
+        from app.api import deps as _deps
+
+        monkeypatch.setattr(
+            _deps,
+            "settings",
+            SimpleNamespace(sqlite_path=str(tmp_path / "policy_engine.db")),
+            raising=False,
+        )
 
     def _vault_policy_db(self):
         conn = sqlite3.connect(":memory:", check_same_thread=False)
