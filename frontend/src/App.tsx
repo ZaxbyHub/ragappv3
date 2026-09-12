@@ -11,6 +11,8 @@ import type { NavItemId } from "@/components/layout/navigationTypes";
 import { Loader2 } from "lucide-react";
 import { APP_BASENAME } from "@/lib/paths";
 import ReconnectingBanner from "@/components/ReconnectingBanner";
+import { CommandPalette } from "@/components/shared/CommandPalette";
+import { DocumentsTableSkeleton } from "@/components/documents/DocumentsTableSkeleton";
 
 // Toggle mock-data mode via: VITE_TEST_MODE=true npm run dev
 // Gated on import.meta.env.DEV so it is statically false (and dead-code
@@ -46,8 +48,25 @@ const CanvasPage = lazy(() => import("@/components/canvas/CanvasPage"));
 
 function PageLoader() {
   return (
-    <div className="flex h-screen w-full items-center justify-center">
-      <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+    <div className="flex h-screen w-full items-center justify-center" role="status" aria-label="Loading page">
+      <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" aria-hidden="true" />
+    </div>
+  );
+}
+
+// Documents-page-shaped Suspense fallback (issue #258 / legacy-14): routes
+// that own a page-level skeleton use it instead of the generic PageLoader so
+// the shell never flashes a full-screen spinner for a known page shape.
+// Bounded to DocumentsPage (the one page with an existing table skeleton);
+// every other route keeps the global PageLoader fallback.
+function DocumentsPageFallback() {
+  return (
+    <div
+      className="space-y-6 animate-in fade-in duration-300 pb-12"
+      role="status"
+      aria-label="Loading documents page"
+    >
+      <DocumentsTableSkeleton />
     </div>
   );
 }
@@ -131,6 +150,10 @@ function MainAppShell({ children, testMode = false }: { children: React.ReactNod
 
   return (
     <TestModeProvider testMode={testMode}>
+      {/* Global command palette (issue #258 / legacy-14): Ctrl/Cmd+K opens a
+          navigation palette from any shell route. Closed state renders
+          nothing, so it is layout-inert. */}
+      <CommandPalette />
       <PageShell
         activeItem={activeItem}
         onItemSelect={handleItemSelect}
@@ -215,7 +238,11 @@ function App() {
                 element={
                   <ProtectedRoute testMode={TEST_MODE}>
                     <MainAppShell testMode={TEST_MODE}>
-                      <DocumentsPage />
+                      {/* Inner Suspense: the shell stays mounted while the
+                          page chunk loads; fallback matches the page shape. */}
+                      <Suspense fallback={<DocumentsPageFallback />}>
+                        <DocumentsPage />
+                      </Suspense>
                     </MainAppShell>
                   </ProtectedRoute>
                 }

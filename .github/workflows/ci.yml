@@ -3,6 +3,9 @@ name: CI
 on:
   pull_request:
     branches: [master]
+  push:
+    branches: [master]
+  merge_group:
 
 jobs:
   frontend:
@@ -16,7 +19,7 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
-          node-version: "20.19.0"
+          node-version: "22.14.0"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -34,6 +37,9 @@ jobs:
       - name: Type check
         run: npm run typecheck
 
+      - name: Type check interface contracts
+        run: npm run typecheck:contracts
+
       - name: Lint
         run: npm run lint
 
@@ -45,6 +51,9 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Coverage gate (api + stores contract surfaces)
+        run: npm run test:coverage
 
       - name: Build
         run: npm run build
@@ -72,6 +81,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Runtime version contract check
+        run: python scripts/check_runtime_contract.py
+
       - name: Config and env contract check
         run: python scripts/check_config_contract.py
 
@@ -86,6 +98,42 @@ jobs:
 
       - name: Secretscan ignore validation
         run: python scripts/check_secretscan.py
+
+  # BUILD-002: detect whether this run touches the docker build surface, so the
+  # docker-smoke job below only spends CI minutes when the image definition
+  # actually changed (Dockerfile, frontend/Dockerfile, docker-compose.yml).
+  changes:
+    name: Detect docker scope
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            docker:
+              - Dockerfile
+              - frontend/Dockerfile
+              - docker-compose.yml
+
+  # BUILD-002: smoke-build the root image (no push) whenever the docker surface
+  # changes, so a green CI run proves the shipped image still builds under the
+  # runtime pins enforced by scripts/check_runtime_contract.py.
+  docker-smoke:
+    name: Docker build smoke
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build root image (no push)
+        run: docker build --tag ragappv3:ci-smoke .
 
   sast:
     name: SAST (bandit)

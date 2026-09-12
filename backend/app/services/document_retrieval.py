@@ -364,7 +364,17 @@ class DocumentRetrievalService:
 
         Args:
             results: List of raw search results from vector store
-            top_k: Maximum number of results to return (defaults to retrieval_top_k)
+            top_k: TWO-MODE contract (issue #258 TEST-001). When the caller
+                EXPLICITLY passes a non-None top_k it is a HARD CAP: the final
+                returned list is sliced to at most that many sources. When
+                top_k is omitted (None) NO cap is applied here — every source
+                that survives the relevance filter (and window expansion) is
+                returned. The omitted form is load-bearing by design: the
+                agentic RetrievalTool consumes the full within-threshold set
+                uncapped (agentic_tools.py), the token-budget-governed main
+                query path (rag_engine) packs context after receiving
+                everything above threshold, and the eval path caps explicitly
+                at its own call site.
             reranked: If True, skip distance filtering (reranker score is the signal)
             indexed_file_ids: If provided, filter out chunks whose file_id is not in
                 this set. Used to hide chunks belonging to files still being ingested
@@ -376,9 +386,6 @@ class DocumentRetrievalService:
         Sets self.no_match = True when all results exceed the distance threshold
         and an empty list is returned.
         """
-        if top_k is None:
-            top_k = self.retrieval_top_k
-
         # Reset no_match flag at start of filtering
         self.no_match = False
 
@@ -513,6 +520,12 @@ class DocumentRetrievalService:
                 self.max_distance_threshold,
             )
             self.no_match = True
+
+        # Issue #258 (TEST-001): an EXPLICITLY-passed top_k is a hard cap on
+        # the returned sources. An omitted top_k (None) deliberately does NOT
+        # cap — see the two-mode contract in the docstring.
+        if top_k is not None:
+            sources = sources[:top_k]
 
         logger.debug("Filtering complete: %d results returned", len(sources))
         return sources

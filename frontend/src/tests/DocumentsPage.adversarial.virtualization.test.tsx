@@ -10,7 +10,7 @@
  * the virtualizer's handling of adversarial inputs.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render as rtlRender, screen, waitFor, act } from "@testing-library/react";
+import { render as rtlRender, screen, waitFor, act, fireEvent } from "@testing-library/react";
 import "@testing-library/jest-dom";
 import { MemoryRouter } from "react-router-dom";
 
@@ -648,31 +648,73 @@ describe("DocumentsPage ADVERSARIAL - Virtualization Attack Vectors", () => {
   // 5. RAPIDLY CHANGING DOCUMENT ARRAYS
   // ===========================================================================
   describe("Rapidly changing document arrays", () => {
+    /** Rows of the (desktop) virtualized documents table. */
+    function tableRowCount(root: HTMLElement): number {
+      return root.querySelectorAll("table tbody tr[role='row']").length;
+    }
+
+    function makeDocuments(count: number) {
+      // Terminal status everywhere: no processing/pending docs → the adaptive
+      // status poller never arms a timer → nothing races the growth steps.
+      return Array.from({ length: count }, (_, j) => ({
+        id: String(j + 1),
+        filename: `doc_${j + 1}.pdf`,
+        size: 1024,
+        created_at: "2024-01-01",
+        metadata: { status: "processed", chunk_count: 5 },
+      }));
+    }
+
     it("should handle rapid document additions", async () => {
       const { listDocuments } = await import("@/lib/api");
 
-      let result: ReturnType<typeof render>;
+      // FU-009 rewrite (issue #258): the previous design mounted and unmounted
+      // the full DocumentsPage 50 times against useDocumentPolling's real
+      // timer machinery — unawaited polling promises raced under load and the
+      // test needed a 30s band-aid timeout (issue #494). The rerender pattern
+      // (mirroring the non-flaky removals test below and the AC24 pin) mounts
+      // ONCE and grows the list through the page's genuine query-driven
+      // refetch path: each search keystroke is a new server-side query →
+      // refetch → new list, zero remounts.
+      const documentsRef: { current: ReturnType<typeof makeDocuments> } = { current: [] };
+      // mockReset, not just the suite's clearAllMocks: earlier tests in this
+      // file queue mockResolvedValueOnce payloads (e.g. 500-doc stress
+      // responses) that mockClear does NOT drain — a leftover once-response
+      // would hijack this test's first fetches.
+      listDocuments.mockReset();
+      listDocuments.mockImplementation(() =>
+        Promise.resolve({
+          documents: documentsRef.current,
+          total: documentsRef.current.length,
+        })
+      );
 
-      // Rapidly add documents
-      for (let i = 0; i < 50; i++) {
-        const docs = Array.from({ length: i + 1 }, (_, j) => ({
-          id: String(j + 1),
-          filename: `doc_${j + 1}.pdf`,
-          size: 1024,
-          created_at: "2024-01-01",
-          metadata: { status: "processed", chunk_count: 5 },
-        }));
+      documentsRef.current = makeDocuments(1);
 
-        listDocuments.mockResolvedValueOnce({ documents: docs });
+      await act(async () => {
+        const result = render(<DocumentsPage />);
+        container = result.container;
+        unmount = result.unmount;
+      });
 
+      await waitFor(() => expect(tableRowCount(container)).toBe(1));
+      // Initial load only: exactly one list fetch for the single mount.
+      expect(listDocuments).toHaveBeenCalledTimes(1);
+
+      const search = screen.getByPlaceholderText("Search documents and metadata...");
+      for (let step = 2; step <= 50; step++) {
+        documentsRef.current = makeDocuments(step);
         await act(async () => {
-          result = render(<DocumentsPage />);
-          container = result.container;
-          unmount = result.unmount;
+          fireEvent.change(search, { target: { value: `growth-${step}` } });
         });
+        // The rendered virtualized row count must TRACK the data (1..50),
+        // not merely "not crash".
+        await waitFor(() => expect(tableRowCount(container)).toBe(step), { timeout: 5_000 });
       }
-      // Stress tests render the full DocumentsPage dozens of times; the 5s
-      // default testTimeout is not enough on loaded CI workers.
+
+      // Exactly the initial fetch plus 49 query-driven refetches — the growth
+      // went through the page's data path, not a test-side store poke.
+      expect(listDocuments).toHaveBeenCalledTimes(50);
     }, 30000);
 
     it("should handle rapid document removals", async () => {

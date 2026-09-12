@@ -89,7 +89,7 @@ export function ManageGroupsSheet({
           {/* Groups List */}
           <ScrollArea className="flex-1 -mx-6 px-6">
             {isLoading ? (
-              <div className="space-y-3">
+              <div className="space-y-3" role="status" aria-label="Loading groups">
                 {Array.from({ length: 5 }).map((_, i) => (
                   <div key={i} className="flex items-center gap-3 p-3 rounded-sm border">
                     <Skeleton className="h-4 w-4" />
