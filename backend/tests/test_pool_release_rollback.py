@@ -1,5 +1,4 @@
-"""Regression tests for issue #548 (finding C03): pooled connections must be
-reset on release.
+"""Regression tests for issue #548: pooled connections must be reset on release.
 
 Covers:
 - ``release_connection`` rolls back an open transaction before the connection
@@ -15,6 +14,17 @@ Covers:
   fires, and never fires for clean connections.
 - ``_validate_connection``'s error-path rollback and clean-connection FK
   semantics are preserved.
+
+Coverage note for issue #548's test item (2): the issue prescribes driving
+``set_flag`` into its version-miss branch and then having a second borrower
+commit an unrelated write. The version-miss UPDATE matches zero rows, so that
+path abandons an EMPTY transaction — there is no "first handler's row" for a
+set_flag trigger, and the literal composite assertion would be vacuous. The
+scenario is therefore covered compositionally: ``test_set_flag_version_miss_rolls_back``
+pins the set_flag-dirty-release half and ``test_phantom_commit_prevented`` pins
+the abandoned-row half via a raw INSERT (mirroring the audit's P-B probe);
+``test_set_flag_miss_then_second_borrower_commit`` additionally runs the
+literal composite end-to-end as an integration pin.
 """
 import logging
 import sqlite3
@@ -280,3 +290,160 @@ def test_release_connection_warns_on_dirty_release(pool, caplog):
         assert [r for r in caplog.records if "pool_release_rollback" in r.getMessage()] == []
     finally:
         pool.release_connection(c2)
+
+
+# ---------------------------------------------------------------------------
+# PR-review feedback additions (PRR-001, PRR-005, PRR-006)
+# ---------------------------------------------------------------------------
+
+
+def test_set_flag_miss_then_second_borrower_commit(tmp_path, monkeypatch):
+    """Literal composite of issue #548 test item (2): drive set_flag into its
+    version-miss branch, then have a second borrower commit an unrelated
+    write. The borrower's own row must be durably visible, the flag row must
+    be untouched, and the borrowed connections must come back clean.
+
+    Note: the version-miss UPDATE matches zero rows, so set_flag abandons an
+    EMPTY transaction — the phantom-commit mechanism for a real abandoned ROW
+    is pinned separately by test_phantom_commit_prevented (see module docstring).
+    """
+    from app.services.maintenance import MaintenanceFlag
+
+    p = SQLiteConnectionPool(sqlite_path=_tmp_db_path(tmp_path), max_size=1)
+    conn = p.get_connection()
+    conn.execute(
+        """
+        CREATE TABLE system_flags (
+            name TEXT PRIMARY KEY,
+            value INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            version INTEGER NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO system_flags (name, value, reason, version) VALUES (?, 0, '', 5)",
+        (MaintenanceService.FLAG_NAME,),
+    )
+    conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY, v TEXT)")
+    conn.commit()
+    p.release_connection(conn)
+
+    svc = MaintenanceService(p)
+    monkeypatch.setattr(
+        svc,
+        "get_flag",
+        lambda: MaintenanceFlag(enabled=True, reason="", version=0, updated_at=None),
+    )
+    with pytest.raises(MaintenanceError):
+        svc.set_flag(enabled=True, reason="composite-probe")
+
+    # Second borrower: its own write must survive its commit.
+    b = p.get_connection()
+    assert not b.in_transaction
+    b.execute("INSERT INTO unrelated (id, v) VALUES (1, 'b-row')")
+    b.commit()
+    pool_release_connection = p.release_connection
+    pool_release_connection(b)
+
+    check = p.get_connection()
+    try:
+        assert not check.in_transaction
+        assert check.execute("SELECT COUNT(*) FROM unrelated").fetchone()[0] == 1
+        row = check.execute(
+            "SELECT value, reason, version FROM system_flags WHERE name = ?",
+            (MaintenanceService.FLAG_NAME,),
+        ).fetchone()
+        assert tuple(row) == (0, "", 5)
+    finally:
+        p.release_connection(check)
+    p.close_all()
+
+
+def test_release_connection_with_closed_connection_does_not_raise(tmp_path):
+    """PRR-005: releasing an already-closed connection must not raise — the
+    guard degrades to no-op (in_transaction raises ProgrammingError, a
+    sqlite3.Error subclass) — and the pool self-heals on the next checkout
+    (_validate_connection discards the dead connection)."""
+    p = SQLiteConnectionPool(sqlite_path=_tmp_db_path(tmp_path), max_size=2)
+    dead = p._create_connection()
+    dead.close()
+
+    # Must not raise (pre-fix code would not raise either — the guard's
+    # wrapped in_transaction access keeps it that way defensively).
+    p.release_connection(dead)
+
+    healthy = p.get_connection()
+    try:
+        assert not healthy.in_transaction
+        healthy.execute("SELECT 1")
+    finally:
+        p.release_connection(healthy)
+    p.close_all()
+
+
+class _RollbackFailingConnProxy:
+    """Proxy over a real connection whose rollback() raises sqlite3.Error.
+
+    sqlite3.Connection attributes are read-only C slots, so failure injection
+    requires a delegating proxy (same pattern as test_auth_atomicity.py).
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        object.__setattr__(self, "_real", real)
+
+    @property
+    def in_transaction(self) -> bool:  # type: ignore[override]
+        return object.__getattribute__(self, "_real").in_transaction
+
+    def rollback(self) -> None:
+        raise sqlite3.OperationalError("injected rollback failure")
+
+    def close(self) -> None:
+        object.__getattribute__(self, "_real").close()
+
+    def execute(self, *args, **kwargs):
+        return object.__getattribute__(self, "_real").execute(*args, **kwargs)
+
+    def commit(self) -> None:
+        object.__getattribute__(self, "_real").commit()
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+
+def test_release_connection_rollback_failure_logged_not_raised(tmp_path, caplog):
+    """PRR-006: when rollback() itself fails on a dirty connection, the guard
+    logs a second pool_release_rollback WARNING and never propagates; the
+    pool-full close path still completes."""
+    p = SQLiteConnectionPool(sqlite_path=_tmp_db_path(tmp_path), max_size=1)
+    queued = p.get_connection()
+    queued.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    queued.commit()
+    p.release_connection(queued)  # fill the queue -> next release takes Full branch
+
+    real = p._create_connection()
+    proxy = _RollbackFailingConnProxy(real)
+    proxy.execute("INSERT INTO t (id) VALUES (1)")  # open a transaction on the real conn
+    assert proxy.in_transaction
+
+    with caplog.at_level(logging.WARNING, logger="app.models.database"):
+        p.release_connection(proxy)  # type: ignore[arg-type]
+
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "pool_release_rollback" in r.getMessage()
+    ]
+    assert len(warnings) == 2  # dirty-release warning + rollback-failed warning
+    assert "rollback_failed=1" in warnings[1].getMessage()
+    # The proxy was closed by the Full branch (idempotent on the real conn).
+    with pytest.raises(sqlite3.ProgrammingError):
+        real.execute("SELECT 1")
+    # The queued connection and the pool remain usable.
+    again = p.get_connection()
+    try:
+        assert not again.in_transaction
+    finally:
+        p.release_connection(again)
+    p.close_all()

@@ -46,7 +46,7 @@ update this doc when a convention genuinely changes.
 - All connections come from `SQLiteConnectionPool` (`get_pool(path)`, cached per path). WAL mode, `busy_timeout=30000`, and **`PRAGMA foreign_keys = ON`** are set on every connection — rely on FK `ON DELETE CASCADE` rather than manual cleanup.
 - Schema lives in the `SCHEMA` constant in `app/models/database.py`. Tables/indexes use `CREATE TABLE/INDEX IF NOT EXISTS`. FTS5 virtual tables (`*_fts`) have auto-sync triggers.
 - **Migrations** are idempotent functions named `migrate_add_*(sqlite_path)`: open conn → check `PRAGMA table_info`/existence → `ALTER TABLE` if needed → commit. Register every new migration in `run_migrations`.
-- Multi-statement atomic writes use an explicit transaction (`BEGIN IMMEDIATE` … `commit()`/`rollback()`). Before starting one, clear any dangling implicit transaction (`if conn.in_transaction: conn.rollback()`) — a prior best-effort call may have left one open.
+- Multi-statement atomic writes use an explicit transaction (`BEGIN IMMEDIATE` … `commit()`/`rollback()`). Before starting one, clear any dangling implicit transaction (`if conn.in_transaction: conn.rollback()`) — a prior best-effort call may have left one open. Backstop: `SQLiteConnectionPool.release_connection` rolls back any transaction a handler leaves open at release (issue #548) and logs `WARNING pool_release_rollback` — if you see that event, fix the leaking call site rather than relying on the pool.
 
 ### Services
 - Service classes take a `db: sqlite3.Connection` (SQLite-backed, e.g. `TagStore(conn)`) or a `db_path: Path` (LanceDB-backed, e.g. `VectorStore`).

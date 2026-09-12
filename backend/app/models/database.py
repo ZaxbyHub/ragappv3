@@ -5065,18 +5065,15 @@ class SQLiteConnectionPool:
             dirty = False
         if dirty:
             logger.warning(
-                "pool_release_rollback sqlite_path=%s: connection returned to "
-                "the pool with an open transaction; rolled back",
+                "pool_release_rollback sqlite_path=%s dirty_release=1",
                 self.sqlite_path,
             )
             try:
                 conn.rollback()
             except sqlite3.Error:
                 logger.warning(
-                    "pool_release_rollback sqlite_path=%s: rollback of dirty "
-                    "connection failed",
+                    "pool_release_rollback sqlite_path=%s rollback_failed=1",
                     self.sqlite_path,
-                    exc_info=True,
                 )
 
         try:
