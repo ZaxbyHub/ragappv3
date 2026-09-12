@@ -80,16 +80,14 @@ class Settings(BaseSettings):
     """Application settings with environment variable support."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        # docker-compose forwards documented keys as `- KEY=${KEY:-}`, which
-        # injects an EMPTY STRING for every key the operator's .env omits.
-        # Without this flag pydantic treats "" as a provided value and the
-        # int/float/bool fields fail coercion at startup (PR #576 review F2):
-        # an empty value must behave exactly like an unset one.
-        env_ignore_empty=True,
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
+    # NOTE (PR #576 review F2): empty-string values are MEANINGFUL here —
+    # OLLAMA_EMBEDDING_URL="" disables embeddings, RERANKER_URL="" selects
+    # local mode, REDIS_URL="" selects the in-memory limiter. The compose
+    # file therefore forwards documented keys in short form (`- KEY`), which
+    # OMITS unset keys entirely instead of injecting "" — do not add
+    # env_ignore_empty=True, it would silently break those contracts.
 
     # Server configuration
     port: int = 9090
