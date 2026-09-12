@@ -1,13 +1,15 @@
 """
-Unit tests for FR-007: IMAP SEARCH charset fix.
+Unit tests for FR-007 / issue #494 EMAIL-003: IMAP SEARCH charset contract.
 
-Verifies that the IMAP search uses charset=None for UNSEEN searches
-to avoid charset encoding issues with simple ASCII-only criteria.
+Verifies that the IMAP search passes UNSEEN as the criteria with
+charset=None, matching the installed aioimaplib 2.0.1 signature
+``search(*criteria, charset='utf-8')`` (charset is keyword-only and the
+default 'utf-8' prefixes the wire command with "CHARSET utf-8").
 
-The fix changed line 222 from:
-    search('UTF-8', 'UNSEEN')
-to:
-    search(None, 'UNSEEN')
+History: the FR-007 fix changed ``search('UTF-8', 'UNSEEN')`` to
+``search(None, 'UNSEEN')`` — a positional None that aioimaplib serializes
+as an EMPTY criterion (double space on the wire). Issue #494 Group 9
+corrected the form to ``search('UNSEEN', charset=None)``.
 """
 
 import asyncio
@@ -86,43 +88,55 @@ class FakeBackgroundProcessor:
 
 
 class TrackingIMAPClient:
-    """Fake IMAP client that tracks search() call arguments."""
+    """Fake IMAP client mirroring the installed aioimaplib 2.0.1 contracts
+    (issue #494 Group 9): greeting returns None on success; commands return
+    ``aioimaplib.Response(result, lines)`` namedtuples; ``search`` takes
+    criteria positionally with a keyword-only charset and records calls as
+    ``(criteria_tuple, charset)``.
+    """
 
     def __init__(self):
         self.selected_mailbox = None
-        self.search_calls = []  # List of (charset, criterion) tuples
+        self.search_calls = []  # List of (criteria_tuple, charset) records
         self.fetched_uids = []
         self.logged_out = False
         self.emails = {}  # uid -> email data
 
     async def wait_hello_from_server(self):
-        return 'OK'
+        return None  # aioimaplib 2.0.1 returns None on success
 
     async def login(self, username, password):
-        return ('OK', None)
+        return aioimaplib.Response('OK', [b'LOGIN completed'])
 
     async def select(self, mailbox):
         self.selected_mailbox = mailbox
-        return ('OK', None)
+        return aioimaplib.Response('OK', [b'1 EXISTS'])
 
-    async def search(self, charset, criterion):
+    async def search(self, *criteria, charset='utf-8'):
         """Track search calls for verification."""
-        self.search_calls.append((charset, criterion))
+        self.search_calls.append((criteria, charset))
         uids = ' '.join(self.emails.keys()).encode()
-        return ('OK', [uids])
+        return aioimaplib.Response('OK', [uids])
 
-    async def fetch(self, uid, parts):
+    async def fetch(self, uid, message_parts):
         if uid in self.emails:
             email_data = self.emails[uid]
-            if 'RFC822.SIZE' in parts:
-                return ('OK', [(b'1 (RFC822.SIZE 100)',)])
-            elif 'RFC822' in parts:
-                return ('OK', [(b'1 (RFC822)', email_data['content'])])
-        return ('OK', [])
+            if 'RFC822.SIZE' in message_parts:
+                size = len(email_data['content'])
+                return aioimaplib.Response(
+                    'OK', [f'{uid} FETCH (UID {uid} RFC822.SIZE {size})'.encode()]
+                )
+            elif 'RFC822' in message_parts:
+                content = email_data['content']
+                opening = f'{uid} FETCH (UID {uid} RFC822 {{{len(content)}}}'
+                return aioimaplib.Response(
+                    'OK', [opening.encode(), content, b')']
+                )
+        return aioimaplib.Response('OK', [])
 
     async def logout(self):
         self.logged_out = True
-        return ('OK', None)
+        return aioimaplib.Response('OK', [b'BYE'])
 
 
 class TestIMAPSearchCharset(unittest.IsolatedAsyncioTestCase):
@@ -167,10 +181,13 @@ class TestIMAPSearchCharset(unittest.IsolatedAsyncioTestCase):
         return SQLiteConnectionPool(db_path, max_size=2)
 
     async def test_poll_once_search_uses_none_charset(self):
-        """Test _poll_once calls search() with charset=None for UNSEEN criterion.
+        """Test _poll_once calls search() with criteria ('UNSEEN',) and
+        charset=None.
 
-        This verifies FR-007 fix: search(None, 'UNSEEN') instead of
-        search('UTF-8', 'UNSEEN') to avoid charset encoding issues.
+        This verifies the issue #494 EMAIL-003 contract:
+        search('UNSEEN', charset=None) — the keyword-only charset form of
+        the installed aioimaplib 2.0.1 signature — instead of the buggy
+        positional search(None, 'UNSEEN').
         """
         fake_imap = TrackingIMAPClient()
 
@@ -184,13 +201,16 @@ class TestIMAPSearchCharset(unittest.IsolatedAsyncioTestCase):
             # Verify exactly one search call
             self.assertEqual(len(fake_imap.search_calls), 1)
 
-            # Verify the charset is None and criterion is 'UNSEEN'
-            charset, criterion = fake_imap.search_calls[0]
-            self.assertIsNone(charset, "charset should be None (not 'UTF-8')")
-            self.assertEqual(criterion, 'UNSEEN', "criterion should be 'UNSEEN'")
+            # Verify the criteria are ('UNSEEN',) and the charset is None
+            criteria, charset = fake_imap.search_calls[0]
+            self.assertEqual(criteria, ('UNSEEN',), "criteria should be ('UNSEEN',)")
+            self.assertIsNone(
+                charset,
+                "charset should be None (not the library default 'utf-8')"
+            )
 
     async def test_poll_once_search_charset_is_not_utf8(self):
-        """Test search() is NOT called with 'UTF-8' charset.
+        """Test search() is NOT called with 'UTF-8' (or 'utf-8') charset.
 
         This is the negative test case for FR-007: the original bug
         was using search('UTF-8', 'UNSEEN') which can cause charset
@@ -201,12 +221,15 @@ class TestIMAPSearchCharset(unittest.IsolatedAsyncioTestCase):
         with patch('app.services.email_service.aioimaplib.IMAP4_SSL', return_value=fake_imap):
             await self.service._poll_once()
 
-            # Verify no search call uses 'UTF-8' as charset
-            for charset, criterion in fake_imap.search_calls:
-                self.assertNotEqual(
-                    charset, 'UTF-8',
-                    "search() should not be called with 'UTF-8' charset"
-                )
+            # Verify no search call uses a non-None charset or a positional
+            # None criterion (the pre-#494 buggy form)
+            for i, (criteria, charset) in enumerate(fake_imap.search_calls):
+                with self.subTest(call_index=i):
+                    self.assertIsNone(
+                        charset,
+                        f"search call {i} charset should be None"
+                    )
+                    self.assertEqual(criteria, ('UNSEEN',))
 
     async def test_poll_once_search_charset_none_with_multiple_calls(self):
         """Test search() always uses charset=None even with multiple searches.
@@ -220,10 +243,10 @@ class TestIMAPSearchCharset(unittest.IsolatedAsyncioTestCase):
             await self.service._poll_once()
 
             # All search calls should use charset=None
-            for i, (charset, criterion) in enumerate(fake_imap.search_calls):
+            for i, (criteria, charset) in enumerate(fake_imap.search_calls):
                 with self.subTest(call_index=i):
                     self.assertIsNone(charset, f"search call {i} charset should be None")
-                    self.assertEqual(criterion, 'UNSEEN', f"search call {i} criterion should be 'UNSEEN'")
+                    self.assertEqual(criteria, ('UNSEEN',), f"search call {i} criteria should be ('UNSEEN',)")
 
 
 class TestIMAPSearchCharsetWithMock(unittest.IsolatedAsyncioTestCase):
@@ -265,16 +288,26 @@ class TestIMAPSearchCharsetWithMock(unittest.IsolatedAsyncioTestCase):
         return SQLiteConnectionPool(db_path, max_size=2)
 
     async def test_search_called_with_exact_arguments(self):
-        """Test search() is called with the exact arguments: (None, 'UNSEEN').
+        """Test search() is called with criteria ('UNSEEN',) and charset=None.
 
-        Uses mock to assert the call arguments directly.
+        Uses mock to assert the call arguments directly against the
+        installed aioimaplib 2.0.1 signature
+        ``search(*criteria, charset='utf-8')`` (issue #494 EMAIL-003).
         """
         fake_imap = AsyncMock()
-        fake_imap.wait_hello_from_server = AsyncMock(return_value='OK')
-        fake_imap.login = AsyncMock(return_value=('OK', None))
-        fake_imap.select = AsyncMock(return_value=('OK', None))
-        fake_imap.search = AsyncMock(return_value=('OK', [b'']))
-        fake_imap.logout = AsyncMock(return_value=('OK', None))
+        fake_imap.wait_hello_from_server = AsyncMock(return_value=None)
+        fake_imap.login = AsyncMock(
+            return_value=aioimaplib.Response('OK', [b'LOGIN completed'])
+        )
+        fake_imap.select = AsyncMock(
+            return_value=aioimaplib.Response('OK', [b'1 EXISTS'])
+        )
+        fake_imap.search = AsyncMock(
+            return_value=aioimaplib.Response('OK', [b''])
+        )
+        fake_imap.logout = AsyncMock(
+            return_value=aioimaplib.Response('OK', [b'BYE'])
+        )
 
         with patch('app.services.email_service.aioimaplib.IMAP4_SSL', return_value=fake_imap):
             await self.service._poll_once()
@@ -282,40 +315,54 @@ class TestIMAPSearchCharsetWithMock(unittest.IsolatedAsyncioTestCase):
             # Verify search was called exactly once
             fake_imap.search.assert_called_once()
 
-            # Get the call args
+            # Get the call args: criteria positional, charset keyword-only
             call_args = fake_imap.search.call_args
-            # call_args is (args, kwargs) - args[0] is charset, args[1] is criterion
-            charset = call_args[0][0]
-            criterion = call_args[0][1]
-
-            # Assert charset is None (not 'UTF-8')
+            self.assertEqual(call_args.args, ('UNSEEN',))
             self.assertIsNone(
-                charset,
-                f"search() should be called with charset=None, not '{charset}'"
+                call_args.kwargs.get('charset'),
+                f"search() should be called with charset=None, not "
+                f"{call_args.kwargs.get('charset')!r}"
             )
-            # Assert criterion is 'UNSEEN'
-            self.assertEqual(criterion, 'UNSEEN')
 
     async def test_search_not_called_with_utf8_charset(self):
-        """Verify search() is never called with 'UTF-8' charset.
+        """Verify search() is never called with 'UTF-8' charset or a
+        positional None criterion.
 
-        This is a regression test ensuring the bug doesn't get reintroduced.
+        This is a regression test ensuring the FR-007 bug (charset as a
+        positional argument) and the #494 bug (positional None criterion)
+        don't get reintroduced.
         """
         fake_imap = AsyncMock()
-        fake_imap.wait_hello_from_server = AsyncMock(return_value='OK')
-        fake_imap.login = AsyncMock(return_value=('OK', None))
-        fake_imap.select = AsyncMock(return_value=('OK', None))
-        fake_imap.search = AsyncMock(return_value=('OK', [b'']))
-        fake_imap.logout = AsyncMock(return_value=('OK', None))
+        fake_imap.wait_hello_from_server = AsyncMock(return_value=None)
+        fake_imap.login = AsyncMock(
+            return_value=aioimaplib.Response('OK', [b'LOGIN completed'])
+        )
+        fake_imap.select = AsyncMock(
+            return_value=aioimaplib.Response('OK', [b'1 EXISTS'])
+        )
+        fake_imap.search = AsyncMock(
+            return_value=aioimaplib.Response('OK', [b''])
+        )
+        fake_imap.logout = AsyncMock(
+            return_value=aioimaplib.Response('OK', [b'BYE'])
+        )
 
         with patch('app.services.email_service.aioimaplib.IMAP4_SSL', return_value=fake_imap):
             await self.service._poll_once()
 
-            # Check all search calls don't use 'UTF-8'
+            # Check all search calls avoid the buggy forms
             for call in fake_imap.search.call_args_list:
-                charset = call[0][0]
+                self.assertNotIn(
+                    'UTF-8', call.args,
+                    "search() was called with 'UTF-8' - this is the bug FR-007 fixes"
+                )
+                self.assertNotIn(
+                    None, call.args,
+                    "search() was called with a positional None criterion - "
+                    "this serializes as an empty criterion on the wire"
+                )
                 self.assertNotEqual(
-                    charset, 'UTF-8',
+                    call.kwargs.get('charset'), 'UTF-8',
                     "search() was called with 'UTF-8' charset - this is the bug that FR-007 fixes"
                 )
 

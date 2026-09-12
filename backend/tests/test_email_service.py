@@ -90,7 +90,18 @@ class FakeBackgroundProcessor:
 
 
 class FakeIMAPClient:
-    """Fake aioimaplib.IMAP4_SSL for testing."""
+    """Fake aioimaplib.IMAP4_SSL mirroring the installed aioimaplib 2.0.1
+    contracts (issue #494 Group 9):
+
+    - ``wait_hello_from_server()`` returns None on success;
+    - ``login``/``select``/``search``/``fetch``/``store``/``logout`` return
+      ``aioimaplib.Response(result, lines)`` namedtuples;
+    - ``fetch`` lines are a flat list of bytes: the untagged FETCH metadata
+      line ending with a ``{N}`` literal size hint, the N literal message
+      bytes, the closing ``)`` line, then the tagged status line;
+    - ``search(*criteria, charset='utf-8')`` takes criteria positionally
+      with a keyword-only charset, matching the library signature.
+    """
 
     def __init__(self):
         self.selected_mailbox = None
@@ -101,40 +112,49 @@ class FakeIMAPClient:
         self.stored_flags = {}  # uid -> list of store calls
 
     async def wait_hello_from_server(self):
-        return 'OK'
+        return None  # aioimaplib 2.0.1 returns None on success
 
     async def login(self, username, password):
-        return ('OK', None)
+        return aioimaplib.Response('OK', [b'LOGIN completed'])
 
     async def select(self, mailbox):
         self.selected_mailbox = mailbox
-        return ('OK', None)
+        return aioimaplib.Response('OK', [b'1 EXISTS'])
 
-    async def search(self, charset, criterion):
+    async def search(self, *criteria, charset='utf-8'):
         self.searched = True
         uids = ' '.join(self.emails.keys()).encode()
-        return ('OK', [uids])
+        return aioimaplib.Response('OK', [uids])
 
-    async def fetch(self, uid, parts):
+    async def fetch(self, uid, message_parts):
         if uid in self.emails:
             email_data = self.emails[uid]
-            if 'RFC822.SIZE' in parts:
+            if 'RFC822.SIZE' in message_parts:
                 size = len(email_data['content'])
-                return ('OK', [(f'{uid} (RFC822.SIZE {size})'.encode(),)])
-            elif 'RFC822' in parts:
-                # Real aioimaplib returns: [(b'uid (RFC822 {size})', b'...email content...')]
-                # where data[0][0] is the response string and data[0][1] is the email bytes
-                return ('OK', [(b'1 (RFC822)', email_data['content'])])
-        return ('OK', [])
+                return aioimaplib.Response(
+                    'OK',
+                    [f'{uid} FETCH (UID {uid} RFC822.SIZE {size})'.encode()]
+                )
+            elif 'RFC822' in message_parts:
+                # Real protocol shape: metadata line with a {N} literal
+                # announcement, the N literal bytes, the closing line, then
+                # the tagged status line.
+                content = email_data['content']
+                opening = f'{uid} FETCH (UID {uid} RFC822 {{{len(content)}}}'
+                return aioimaplib.Response(
+                    'OK',
+                    [opening.encode(), content, b')', b'a1 OK Fetch completed']
+                )
+        return aioimaplib.Response('OK', [])
 
     async def store(self, uid, *args):
         """Record a STORE command (e.g. +FLAGS \\Seen) for test assertions."""
         self.stored_flags.setdefault(uid, []).append(args)
-        return ('OK', None)
+        return aioimaplib.Response('OK', [b'STORE completed'])
 
     async def logout(self):
         self.logged_out = True
-        return ('OK', None)
+        return aioimaplib.Response('OK', [b'BYE'])
 
 
 class TestVaultNameExtraction(unittest.TestCase):
@@ -567,8 +587,8 @@ class TestIMAPConnection(unittest.IsolatedAsyncioTestCase):
     async def test_connect_with_backoff_auth_failure_no_retry(self, mock_wait_for):
         """Test auth failure doesn't trigger retry."""
         fake_imap = FakeIMAPClient()
-        # Make login fail
-        fake_imap.login = AsyncMock(return_value=('NO', None))
+        # Make login fail (real aioimaplib 2.0.1 Response shape)
+        fake_imap.login = AsyncMock(return_value=aioimaplib.Response('NO', []))
 
         with patch('app.services.email_service.aioimaplib.IMAP4_SSL', return_value=fake_imap):
             with self.assertRaises(Exception) as ctx:

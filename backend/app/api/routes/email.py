@@ -63,29 +63,32 @@ async def _get_unseen_count(
             )
 
         # Authenticate
-        result = await imap_client.wait_hello_from_server()
-        if result != 'OK':
-            return -1
+        # aioimaplib 2.0.1 contract: wait_hello_from_server() returns None
+        # on success; a failed greeting raises (asyncio.TimeoutError etc.),
+        # handled by the except clause below.
+        await imap_client.wait_hello_from_server()
 
-        result, _ = await imap_client.login(
+        response = await imap_client.login(
             email_service.settings.imap_username,
             email_service.settings.imap_password.get_secret_value()
         )
-        if result != 'OK':
+        if response.result != 'OK':
             return -1
 
-        # Select mailbox
-        result = await imap_client.select(email_service.settings.imap_mailbox)
-        if result != 'OK':
+        # Select mailbox (aioimaplib 2.0.1 returns a Response namedtuple)
+        response = await imap_client.select(email_service.settings.imap_mailbox)
+        if response.result != 'OK':
             return -1
 
-        # Search for UNSEEN emails
-        result, data = await imap_client.search(None, 'UNSEEN')
-        if result != 'OK':
+        # Search for UNSEEN emails. aioimaplib 2.0.1's search() takes
+        # criteria positionally with a keyword-only charset; passing
+        # charset=None keeps the wire command a plain "SEARCH UNSEEN".
+        response = await imap_client.search('UNSEEN', charset=None)
+        if response.result != 'OK':
             return -1
 
-        # Count UIDs
-        uids = data[0].split()
+        # Count UIDs from the first response line (bytes, e.g. b"1 2 3")
+        uids = response.lines[0].split() if response.lines else []
         return len(uids)
 
     except (asyncio.TimeoutError, OSError, ConnectionError) as e:

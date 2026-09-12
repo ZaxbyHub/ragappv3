@@ -87,7 +87,7 @@ export function RetrievalSettings({
               type="number"
               min={5}
               max={100}
-              value={formData.initial_retrieval_top_k || 20}
+              value={formData.initial_retrieval_top_k ?? 20}
               onChange={(e) => onChange("initial_retrieval_top_k", e.target.value)}
               className={errors.initial_retrieval_top_k ? "border-destructive" : ""}
             />
@@ -107,7 +107,7 @@ export function RetrievalSettings({
               type="number"
               min={1}
               max={20}
-              value={formData.reranker_top_n || 5}
+              value={formData.reranker_top_n ?? 5}
               onChange={(e) => onChange("reranker_top_n", e.target.value)}
               className={errors.reranker_top_n ? "border-destructive" : ""}
             />
@@ -155,7 +155,7 @@ export function RetrievalSettings({
                 min={0}
                 max={1}
                 step={0.1}
-                value={formData.hybrid_alpha || 0.5}
+                value={formData.hybrid_alpha ?? 0.5}
                 onChange={(e) => onChange("hybrid_alpha", e.target.value)}
                 className={`w-24 ${errors.hybrid_alpha ? "border-destructive" : ""}`}
               />
@@ -164,7 +164,7 @@ export function RetrievalSettings({
                 min={0}
                 max={1}
                 step={0.1}
-                value={formData.hybrid_alpha || 0.5}
+                value={formData.hybrid_alpha ?? 0.5}
                 onChange={(e) => onChange("hybrid_alpha", e.target.value)}
                 aria-label="Hybrid Alpha"
                 className="flex-1"

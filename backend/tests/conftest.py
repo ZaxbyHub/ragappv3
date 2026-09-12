@@ -260,6 +260,18 @@ def pytest_configure(config):
     Sets environment variables and clears all app.* modules from the
     import cache so they re-import with test-compatible settings.
     """
+    # config.Settings resolves data_dir (and thus sqlite_path) against the
+    # CURRENT WORKING DIRECTORY. The sqlite pool creates connections without
+    # mkdir(parents=True), so under xdist any worker that reaches a real
+    # pool before another worker's tests have created ./data fails with
+    # "sqlite3.OperationalError: unable to open database file" (PR #576 CI:
+    # test_deps_auth flaked exactly this way once this PR added enough new
+    # tests to shift worker scheduling). Create the directory up front, on
+    # every worker, before collection hands out the first test.
+    try:
+        os.makedirs("data", exist_ok=True)
+    except OSError:
+        pass
     # pandas' is_pyarrow_array() looks up pyarrow.Array from sys.modules at
     # call time. Many test files stub sys.modules['pyarrow'] with a bare
     # types.ModuleType that has no Array attribute, causing AttributeError.
@@ -297,10 +309,13 @@ def pytest_configure(config):
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
     # Force the rate limiter to in-memory storage for the test suite. No test
     # exercises real-Redis limiting, and without this the module-global limiter
-    # (now wired to settings.redis_url, which defaults to redis://localhost)
-    # would make each autouse limiter.reset() block ~4s on a Redis connection
-    # timeout. This matches CI, which sets REDIS_URL="" with no Redis service.
-    os.environ["REDIS_URL"] = ""
+    # (wired to settings.redis_url, which defaults to redis://localhost) would
+    # make each autouse limiter.reset() block ~4s on a Redis connection
+    # timeout. CI sets REDIS_URL="" with no Redis service; since PR #576's
+    # env_ignore_empty=True makes "" behave like unset (→ the redis:// default),
+    # name the memory backend explicitly — _resolve_storage_uri passes it
+    # through and build_limiter's memory:// branch skips Redis entirely.
+    os.environ["REDIS_URL"] = "memory://"
 
     app_keys = [
         k for k in list(sys.modules.keys()) if k == "app" or k.startswith("app.")
