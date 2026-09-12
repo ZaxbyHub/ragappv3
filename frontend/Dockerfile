@@ -1,8 +1,9 @@
 # Build stage
-# Digest pin (issue #404 / #391) freezes the base image for supply-chain
-# integrity; dependabot (docker ecosystem, "/frontend") opens PRs on new
-# digests.
-FROM node:26-alpine@sha256:ef24c5053d50fdc3e4e56eb4e7ddb7861874ab0fdc797046ba897581deb8e868 AS build
+# Pinned to node 22.11 to match CI (ci.yml node-version "22.11.0"); parity is
+# enforced by scripts/check_runtime_contract.py. Digest pin (issue #404 / #391)
+# freezes the base image for supply-chain integrity; dependabot (docker
+# ecosystem, "/frontend") opens PRs on new digests.
+FROM node:22.11-alpine@sha256:b64ced2e7cd0a4816699fe308ce6e8a08ccba463c757c00c14cd372e3d2c763e AS build
 
 WORKDIR /app
 
@@ -50,7 +51,7 @@ RUN npm run build
 
 # Final stage
 # Digest pin (issue #404 / #391); dependabot (docker, "/frontend") maintains.
-FROM nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3
+FROM nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913
 
 LABEL maintainer="RAGAPP Team"
 LABEL description="RAGAPP Frontend - Multi-stage build"

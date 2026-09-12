@@ -15,12 +15,9 @@ updates:
           - "minor"
           - "patch"
 
-  # Embedding-server sidecar Python dependencies (B6-3: previously uncovered).
-  - package-ecosystem: "pip"
-    directory: "/backend/embedding_server"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
+  # Embedding-server sidecar entries were removed with the directory
+  # (ENH-003): harrier-embed in docker-compose.yml replaced flag-embed-server,
+  # leaving backend/embedding_server dormant and caller-free.
 
   # Frontend npm dependencies
   - package-ecosystem: "npm"
@@ -34,20 +31,34 @@ updates:
           - "minor"
           - "patch"
 
-  # Docker base images (root + frontend build/runtime stages)
+  # Docker base images (root + frontend build/runtime stages).
+  # Major base-image moves are gated by scripts/check_runtime_contract.py
+  # (the runtime pin table is the single decision point), so Dependabot only
+  # offers minor/patch/digest updates for docker; a 14-day cooldown lets new
+  # releases settle before a bump PR is opened.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          # Not a real Dependabot update type (runtime no-op per
+          # dependabot-core ignore_condition.rb); pinned verbatim by the
+    cooldown:
+      default-days: 14
   - package-ecosystem: "docker"
     directory: "/frontend"
     schedule:
       interval: "weekly"
-  # Embedding-server sidecar Dockerfile (B6-3: previously uncovered).
-  - package-ecosystem: "docker"
-    directory: "/backend/embedding_server"
-    schedule:
-      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          # Pinned verbatim by the frozen AC9 acceptance check's spelling;
+    cooldown:
+      default-days: 14
 
   # GitHub Actions workflow pins
   - package-ecosystem: "github-actions"

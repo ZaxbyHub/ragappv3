@@ -1,0 +1,71 @@
+name: Nightly
+
+# ENH-007 / legacy-10: the PR gate runs on the reduced CI dependency set
+# (requirements-ci.txt; heavy parsers stubbed by test modules), so the real
+# document pipeline never executes there. This scheduled tier installs the
+# FULL parser stack from backend/requirements.txt (which carries
+# unstructured[all-docs] plus the pdf/docx/pptx/xlsx extras) and:
+#   1. runs the committed real_docs fixture parser tests (table extraction
+#      per format + the image-only scanned-page zero-text contract) together
+#      with the lifespan FTS validation suite,
+#   2. runs the FULL backend suite as a plain full run — the whole-tree
+#      execution doubles as the cross-file isolation check,
+#   3. runs the parser bake-off harness and uploads its benchmark markdown
+#      as an artifact (nothing is committed).
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  full-deps:
+    name: Full deps (real parsers + full suite + bake-off)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install system parser dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libmagic1 poppler-utils tesseract-ocr
+
+      - name: Install full parser stack (backend/requirements.txt incl. unstructured[all-docs])
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          pip install pytest-xdist
+
+      - name: Verify the real parser stack is importable
+        run: |
+          python -c "import unstructured; from unstructured.partition.auto import partition; print('unstructured', unstructured.__version__)"
+
+      - name: Real-parser fixture tests (real_docs + lifespan FTS validation)
+        run: pytest --tb=short -v -s tests/test_real_docs_parsing.py tests/test_lifespan_fts_validation.py
+
+      - name: Full backend suite (plain full run = cross-file isolation check)
+        run: pytest --tb=short -q --timeout=300 -n auto tests/
+        env:
+          REDIS_URL: ""
+
+      - name: Parser bake-off (unstructured hi_res vs fast; Docling/marker when installed)
+        working-directory: ${{ github.workspace }}
+        run: python scripts/parser_bakeoff.py
+
+      - name: Upload parser bake-off benchmark
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: parser-bakeoff
+          path: docs/benchmarks/parser-bakeoff.md
+          if-no-files-found: error
