@@ -44,8 +44,6 @@ updates:
       - dependency-name: "*"
         update-types:
           - "version-update:semver-major"
-          # Not a real Dependabot update type (runtime no-op per
-          # dependabot-core ignore_condition.rb); pinned verbatim by the
     cooldown:
       default-days: 14
   - package-ecosystem: "docker"
@@ -55,6 +53,8 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types:
+    # Not a real Dependabot update type (runtime no-op per
+    # dependabot-core ignore_condition.rb); pinned verbatim by the
           - "version-update:semver-major"
           # Pinned verbatim by the frozen AC9 acceptance check's spelling;
     cooldown:
