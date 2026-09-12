@@ -53,24 +53,57 @@ class TestLegacyStringConversion(unittest.TestCase):
             self._settings_with(chunk_size="not-a-number")
 
 
-class TestEnvIgnoreEmpty(unittest.TestCase):
-    """F2 — empty env values behave like unset (compose ${KEY:-} contract)."""
+class TestComposeShortFormForwarding(unittest.TestCase):
+    r"""F2 — compose forwards documented keys via the SHORT passthrough form.
 
-    def test_empty_typed_env_vars_use_defaults(self):
-        with patch.dict(
-            os.environ,
-            {"IMAP_PORT": "", "DB_POOL_MAX_SIZE": "", "INSTANT_MAX_TOKENS": ""},
-            clear=False,
-        ):
-            from app.config import Settings
+    \`- KEY\` (no \`=\`) omits unset keys entirely, so compose never injects an
+    empty string into typed int/float/bool fields (the original F2 crash:
+    \`- KEY=\${KEY:-}\` + partial .env → pydantic int_parsing failure at
+    startup). Empty-string values remain MEANINGFUL in Settings (e.g.
+    REDIS_URL="" → in-memory limiter), so env_ignore_empty must stay OFF —
+    pinned by test_non_numeric_string_legacy_value_fails_loudly's sibling
+    semantics and the REDIS_URL="" conftest contract.
+    """
 
-            s = Settings(**BASE_KWARGS)
-            # Defaults per config.py (993 / 10 / 4096); the point is: no
-            # ValidationError. Assert the exact documented defaults so a
-            # default change surfaces here intentionally.
-            self.assertEqual(s.imap_port, 993)
-            self.assertEqual(s.db_pool_max_size, 10)
-            self.assertEqual(s.instant_max_tokens, 4096)
+    def test_documented_typed_keys_forwarded_short_form(self):
+        import re
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[2]
+        compose = (repo / "docker-compose.yml").read_text(encoding="utf-8")
+        match = re.search(r"^  knowledgevault:", compose, re.M)
+        assert match, "knowledgevault service not found"
+        tail = compose[match.end():]
+        next_svc = re.search(r"^  [a-zA-Z_-]+:", tail, re.M)
+        block = tail[: next_svc.start()] if next_svc else tail
+        env_at = block.find("environment:")
+        env_lines = block[env_at:].splitlines()
+
+        forwarded = {}
+        for line in env_lines:
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                entry = stripped[2:]
+                key, sep, value = entry.partition("=")
+                forwarded[key.strip()] = value if sep else None
+
+        # These typed keys crashed via ${KEY:-} empty injection pre-fix.
+        # The invariant: an unset .env key must resolve to OMITTED (short
+        # form) or a REAL default — never an empty string, which fails
+        # int/float/bool coercion at startup.
+        for key in ("IMAP_PORT", "DB_POOL_MAX_SIZE", "INSTANT_MAX_TOKENS",
+                    "AUTO_SCAN_ENABLED", "MAINTENANCE_MODE"):
+            self.assertIn(key, forwarded, f"{key} missing from compose env")
+            value = forwarded[key]
+            if value is None:
+                continue  # short passthrough form — omitted when unset
+            resolved_for_unset = value.split(":-", 1)[-1].rstrip("}") if ":-" in value else value
+            self.assertNotEqual(
+                resolved_for_unset.strip(),
+                "",
+                f"{key}={value!r} injects an empty string for an unset .env "
+                "key — typed fields fail startup coercion (review F2)",
+            )
 
 
 class TestInstantEnableThinkingUpdate(unittest.TestCase):
