@@ -43,7 +43,7 @@ export function getJwtAccessToken(): string | null {
 // the current scoped one. document.cookie collapses duplicates last-wins,
 // so the read may surface the stale value. When multiple candidates exist,
 // purge the broader-path shadows and re-read so the scoped cookie wins.
-function getCsrfCookie(): string | null {
+export function getCsrfCookie(): string | null {
   const read = () => {
     const match = document.cookie
       .split('; ')
@@ -93,7 +93,9 @@ export function resetCsrfToken(): void {
 
 /**
  * Get the cached CSRF token.
- * @internal Internal use only - prefer ensureCsrfToken() for actual usage
+ * Lifecycle keepalive callers use this non-blocking cache read when a refresh
+ * has cleared the in-memory token; awaited requests should prefer
+ * ensureCsrfToken() so the cookie/network fallback can run.
  */
 export function getCsrfToken(): string | null {
   return _csrfToken;

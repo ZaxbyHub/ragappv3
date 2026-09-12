@@ -1,4 +1,4 @@
-import { apiClient, API_BASE_URL, _jwtAccessToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatMetadataFilter, CitationEnforcement, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry } from "./core";
+import { apiClient, API_BASE_URL, _jwtAccessToken, getCsrfCookie, getCsrfToken, ChatStreamCallbacks, ChatMessage, Source, UsedMemory, WikiReference, KMSReference, CitationValidationDebug, ChatMetadataFilter, CitationEnforcement, ChatSession, ChatSessionDetail, ChatSessionMessage, CreateSessionRequest, AddMessageRequest, ChatHistoryItem, ensureCsrfToken, refreshAccessToken, isTokenNearExpiry } from "./core";
 import { setChatHistory as storageSetChatHistory, getChatHistory as storageGetChatHistory } from "../storage";
 
 // ============================================================================
@@ -383,6 +383,47 @@ export async function addChatMessagesBatch(
       saved.push(await addChatMessage(sessionId, message));
     }
     return saved;
+  }
+}
+
+/**
+ * Best-effort lifecycle save for a pagehide event (issue #552).
+ *
+ * Keepalive requests cannot wait for CSRF-token discovery or response parsing.
+ * Reuse the cached token or the readable CSRF cookie; when both are
+ * unavailable, fail closed without sending rather than fabricating credentials
+ * or starting another lifecycle request. The request body is bounded to the
+ * browser keepalive quota, and HTTP status failures are intentionally not
+ * observable or retryable during pagehide. Hard termination remains outside
+ * the guarantee.
+ */
+const KEEPALIVE_BODY_LIMIT_BYTES = 64 * 1024;
+
+export async function addChatMessagesBatchKeepalive(
+  sessionId: number,
+  messages: AddMessageRequest[],
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const csrfToken = getCsrfToken() ?? getCsrfCookie();
+  if (!csrfToken) return;
+  headers["X-CSRF-Token"] = csrfToken;
+  if (_jwtAccessToken) headers.Authorization = "Bearer " + _jwtAccessToken;
+
+  const body = JSON.stringify({ messages });
+  if (new TextEncoder().encode(body).byteLength > KEEPALIVE_BODY_LIMIT_BYTES) return;
+
+  try {
+    await fetch(API_BASE_URL + "/chat/sessions/" + sessionId + "/messages/batch", {
+      method: "POST",
+      credentials: "include",
+      headers,
+      body,
+      keepalive: true,
+    });
+  } catch {
+    // pagehide is best effort: there is no safe opportunity to retry.
   }
 }
 

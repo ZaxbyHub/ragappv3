@@ -25,8 +25,9 @@ ordered, all-or-nothing write.
   `POST /chat/sessions/{id}/truncate` (persistently trim history above a
   durable `seq` boundary — the server-side operation behind retry/edit). The
   truncate boundary is `keep_seq` (highest server-issued seq to KEEP, so the
-  boundary stays exact even when local rows were never persisted, e.g. after
-  Stop); the legacy positional `keep_count` is still accepted for
+  boundary stays exact even when an older client left a local turn unsaved);
+  the legacy
+  positional `keep_count` is still accepted for
   compatibility, and requests supplying neither are rejected with 422.
   Existing single-message `POST …/messages` is unchanged and also accepts the
   new optional fields, so older clients keep working; a new frontend hitting a
@@ -42,6 +43,12 @@ ordered, all-or-nothing write.
   - A dropped/truncated stream surfaces as an *Interrupted* state with a Retry
     affordance, keeping the partial answer and original input; the partial turn
     is saved with status `interrupted`, never as success (CHAT-004, LIVE-01).
+  - Pressing Stop now durably saves the user question and any partial answer
+    as one interrupted batch; stopping before the first token saves only the
+    question. A `pagehide` uses the same batch payload through Fetch keepalive
+    as a best-effort final save.
+  - Browser keepalive payloads remain subject to browser size limits, and a
+    hard process termination that does not deliver `pagehide` cannot be saved.
   - A mid-stream server failure keeps the question and partial answer
     durably with status `failed` (retryable after reload) instead of losing
     the exchange; a pre-content failure still persists nothing (LIVE-01).

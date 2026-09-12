@@ -3,7 +3,9 @@ import {
   chatStream,
   createChatSession,
   addChatMessagesBatch,
+  addChatMessagesBatchKeepalive,
   type ChatMessage,
+  type AddMessageRequest,
   type ChatMetadataFilter,
   type ChatSessionMessage,
   type WikiReference,
@@ -29,6 +31,11 @@ export interface UseSendMessageReturn {
   sendDirect: (content: string, historyMessages: Message[]) => Promise<void>;
   /** Current pipeline stage (Searching/Reading/Drafting) before content streams, or null. */
   currentStage: string | null;
+}
+
+interface CurrentTurnPersistence {
+  persistStop: () => void;
+  persistPagehide: () => void;
 }
 
 export function useSendMessage(
@@ -63,6 +70,10 @@ export function useSendMessage(
   // Ref to track the current streaming assistant message ID so the useEffect
   // can update it even after the closure that created it has returned.
   const assistantMessageIdRef = useRef<string | null>(null);
+
+  // Lifecycle persistence is owned by this hook so navigation aborts can
+  // continue discarding old-session work through the shared store path.
+  const currentTurnPersistenceRef = useRef<CurrentTurnPersistence | null>(null);
 
   /**
    * Core send primitive. Accepts content and a history snapshot directly so
@@ -201,7 +212,8 @@ export function useSendMessage(
       // per turn. status "complete" on success, "interrupted" for a partially
       // streamed turn, "failed" after a mid-stream server error with partial
       // content — none of these are ever saved as a successful answer, and
-      // empty content is never persisted at all (LIVE-01). A failed batch
+      // no empty assistant row is persisted (LIVE-01); explicit Stop/pagehide
+      // may persist the user row by itself. A failed batch
       // commits nothing server-side, so the visible retry below can never
       // duplicate a successful sibling write (UI-002).
       const migrateId = (oldId: string, saveResult: ChatSessionMessage) => {
@@ -219,62 +231,111 @@ export function useSendMessage(
         replaceMessageId(oldId, dbId, { created_at: saveResult.created_at, saveState: "saved" });
       };
 
-      const persistTurn = (assistantStatus: "complete" | "interrupted" | "failed") => {
+      type PersistOptions = {
+        allowEmptyAssistant?: boolean;
+        keepalive?: boolean;
+      };
+
+      const buildTurnPayload = (
+        assistantStatus: "complete" | "interrupted" | "failed",
+        allowEmptyAssistant: boolean,
+      ) => {
+        const storeState = useChatStore.getState();
+        const assistantMsg = storeState.messagesById[assistantMessageId];
+        const userMsg = storeState.messagesById[userMessage.id];
+        // Abandoned stream (loadChat/newChat cleared the store): skip both
+        // saves so no dangling rows land in the old session (issue #235).
+        if (!assistantMsg || !userMsg) return null;
+
+        // Stop/pagehide can run before coalesced content reaches the store.
+        const assistantContent = streamedContent || assistantMsg.content;
+        if (!assistantContent.trim() && !allowEmptyAssistant) {
+          // LIVE-01/PRR-001: pre-content server failures are never persisted.
+          updateMessage(assistantMessageId, {
+            error: "The model returned an empty response. Try again.",
+          });
+          return null;
+        }
+
+        const messages: AddMessageRequest[] = [
+          { role: "user", content, turn_id: turnId },
+        ];
+        if (assistantContent.trim()) {
+          messages.push({
+            role: "assistant",
+            content: assistantContent,
+            sources: assistantMsg.sources ?? undefined,
+            memories: assistantMsg.memoriesUsed ?? undefined,
+            wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
+            kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
+            mode: assistantMsg.mode,
+            turn_id: turnId,
+            status: assistantStatus,
+            citation_confidence: assistantMsg.citationConfidence,
+            unverifiable_claims: assistantMsg.unverifiableClaims,
+            currency_warnings: assistantMsg.currencyWarnings,
+            citation_enforcement: assistantMsg.citationEnforcement,
+          });
+        }
+        return { assistantMsg, messages };
+      };
+
+      let turnPersistenceClaimed = false;
+      const claimTurnPersistence = (): boolean => {
+        if (turnPersistenceClaimed) return false;
+        turnPersistenceClaimed = true;
+        return true;
+      };
+
+      const persistTurn = (
+        assistantStatus: "complete" | "interrupted" | "failed",
+        options: PersistOptions = {},
+      ): Promise<void> => {
+        const prepared = buildTurnPayload(
+          assistantStatus,
+          options.allowEmptyAssistant ?? false,
+        );
+        if (!prepared) return Promise.resolve();
+
+        if (options.keepalive) {
+          const persistPromise = addChatMessagesBatchKeepalive(sessionId, prepared.messages);
+          const { setPendingTurnPersist } = useChatStore.getState();
+          setPendingTurnPersist(persistPromise);
+          void persistPromise.finally(() => {
+            if (useChatStore.getState().pendingTurnPersist === persistPromise) {
+              useChatStore.getState().setPendingTurnPersist(null);
+            }
+          });
+          return persistPromise;
+        }
+
         const persistPromise = (async () => {
-          const storeState = useChatStore.getState();
-          const assistantMsg = storeState.messagesById[assistantMessageId];
-          const userMsg = storeState.messagesById[userMessage.id];
-          // Abandoned stream (loadChat/newChat cleared the store): skip both
-          // saves so no dangling rows land in the old session (issue #235).
-          if (!assistantMsg || !userMsg) return;
-          if (!assistantMsg.content.trim()) {
-            // LIVE-01/PRR-001: an empty answer — including a pre-content
-            // server failure — is never persisted; surface a retryable error
-            // instead of writing empty rows.
-            updateMessage(assistantMessageId, {
-              error: "The model returned an empty response. Try again.",
-            });
-            return;
+          const { assistantMsg, messages } = prepared;
+          if (messages.length > 1) {
+            updateMessage(assistantMessageId, { saveState: "saving" });
           }
-          updateMessage(assistantMessageId, { saveState: "saving" });
           updateMessage(userMessage.id, { saveState: "saving" });
           try {
-            const saved = await addChatMessagesBatch(sessionId, [
-              { role: "user", content, turn_id: turnId },
-              {
-                role: "assistant",
-                content: assistantMsg.content,
-                sources: assistantMsg.sources ?? undefined,
-                memories: assistantMsg.memoriesUsed ?? undefined,
-                wiki_refs: streamedWikiRefs.length > 0 ? streamedWikiRefs : undefined,
-                kms_refs: streamedKmsRefs.length > 0 ? streamedKmsRefs : undefined,
-                mode: assistantMsg.mode,
-                turn_id: turnId,
-                status: assistantStatus,
-                citation_confidence: assistantMsg.citationConfidence,
-                unverifiable_claims: assistantMsg.unverifiableClaims,
-                currency_warnings: assistantMsg.currencyWarnings,
-                citation_enforcement: assistantMsg.citationEnforcement,
-              },
-            ]);
+            const saved = await addChatMessagesBatch(sessionId, messages);
             const [userSaveResult, assistantSaveResult] = saved;
-            migrateId(userMessage.id, userSaveResult);
-            migrateId(assistantMessageId, assistantSaveResult);
+            if (userSaveResult) migrateId(userMessage.id, userSaveResult);
+            if (assistantMsg && assistantSaveResult) {
+              migrateId(assistantMessageId, assistantSaveResult);
+            }
             await refreshHistory(true);
             useChatShellStore.getState().requestSessionListRefresh();
           } catch (err) {
             console.error("Failed to save chat messages:", err);
-            // UI-002: a failed save must be visible and retryable with the
-            // answer and original input intact — never a silent loss.
+            if (messages.length > 1) {
+              updateMessage(assistantMessageId, { saveState: "failed" });
+            }
             updateMessage(assistantMessageId, {
-              saveState: "failed",
               error: "Couldn't save this exchange. Retry to avoid losing it.",
             });
             updateMessage(userMessage.id, { saveState: "failed" });
           }
         })();
-        // PRR-003: expose the in-flight save so revision operations (retry/
-        // edit truncate, fork) can await it instead of racing it.
+        // PRR-003: expose the in-flight save so revision operations can await it.
         const { setPendingTurnPersist } = useChatStore.getState();
         setPendingTurnPersist(persistPromise);
         void persistPromise.finally(() => {
@@ -283,6 +344,34 @@ export function useSendMessage(
           }
         });
         return persistPromise;
+      };
+
+      const turnPersistence: CurrentTurnPersistence = {
+        persistStop: () => {
+          if (!claimTurnPersistence()) return;
+          updateMessage(assistantMessageId, {
+            content: streamedContent,
+            status: "interrupted",
+            candidateSources: undefined,
+          });
+          currentTurnPersistenceRef.current = null;
+          void persistTurn("interrupted", { allowEmptyAssistant: true });
+        },
+        persistPagehide: () => {
+          if (!claimTurnPersistence()) return;
+          currentTurnPersistenceRef.current = null;
+          void persistTurn("interrupted", {
+            allowEmptyAssistant: true,
+            keepalive: true,
+          });
+        },
+      };
+      currentTurnPersistenceRef.current = turnPersistence;
+
+      const clearTurnPersistence = () => {
+        if (currentTurnPersistenceRef.current === turnPersistence) {
+          currentTurnPersistenceRef.current = null;
+        }
       };
 
       // Metadata filter (issue #510 AC-16): snapshot at send time from the
@@ -392,6 +481,11 @@ export function useSendMessage(
             updateMessage(assistantMessageId, { citationEnforcement: enforcement });
           },
           onError: (error) => {
+            // An orphan stream must not clean up a newer send. A pagehide save
+            // leaves this generation alive so its later terminal callback can
+            // still clear the UI, while a session switch/Stop bumps the token
+            // and makes this callback a no-op.
+            if (sendGenRef.current !== gen) return;
             // Flush any buffered streaming content before reading store state
             // (UI-PERF-2): rAF-batched appends may not have fired yet, so
             // synchronously drain the buffer to avoid losing the partial tail.
@@ -408,15 +502,19 @@ export function useSendMessage(
             const isAbort =
               error.name === "AbortError" || /aborted|abort/i.test(error.message);
             if (isAbort) {
-              // User-cancelled turn: mark stopped, never silently retried,
-              // and not persisted (the partial answer stays visible locally).
+              // Shared transport-abort branch: mark stopped, never silently
+              // retried, and do not persist here. Explicit Stop claims its
+              // save before invoking this abort path.
               updateMessage(assistantMessageId, { candidateSources: undefined });
+              clearTurnPersistence();
               setIsStreaming(false);
               setAbortFn(null);
               setStreamingMessageId(null);
               sendingRef.current = false;
               return;
             }
+            const ownsPersistence = claimTurnPersistence();
+            clearTurnPersistence();
             if (error.name === "ChatInterruptedError") {
               // CHAT-004: EOF before the completion marker. Mark the turn
               // retryable, keep the partial answer visible, and persist it as
@@ -431,7 +529,7 @@ export function useSendMessage(
               setAbortFn(null);
               setStreamingMessageId(null);
               sendingRef.current = false;
-              void persistTurn("interrupted");
+              if (ownsPersistence) void persistTurn("interrupted");
               return;
             }
             const isNetworkError =
@@ -457,9 +555,15 @@ export function useSendMessage(
             setAbortFn(null);
             setStreamingMessageId(null);
             sendingRef.current = false;
-            void persistTurn("failed");
+            if (ownsPersistence) void persistTurn("failed");
           },
           onComplete: async () => {
+            // A pagehide callback may have already claimed the one-shot save.
+            // Terminal cleanup still belongs to this live generation; only the
+            // durable persistence call is skipped when the claim is consumed.
+            if (sendGenRef.current !== gen) return;
+            const ownsPersistence = claimTurnPersistence();
+            clearTurnPersistence();
             // Flush any buffered streaming content before reading store state
             // (UI-PERF-2): rAF-batched appends may not have fired yet when the
             // stream completes, so synchronously drain the buffer to avoid
@@ -476,7 +580,7 @@ export function useSendMessage(
             setAbortFn(null);
             setStreamingMessageId(null);
             sendingRef.current = false;
-            await persistTurn("complete");
+            if (ownsPersistence) await persistTurn("complete");
           },
         },
         activeVaultId ?? undefined,
@@ -502,6 +606,7 @@ export function useSendMessage(
       // message write in that flow.
       setAbortFn(() => {
         abort();
+        clearTurnPersistence();
         sendingRef.current = false;
       });
     },
@@ -556,6 +661,7 @@ export function useSendMessage(
     // pressed during session creation has no stream to abort, and without
     // this bump the send would start generating once creation resolved.
     sendGenRef.current += 1;
+    currentTurnPersistenceRef.current?.persistStop();
     useChatStore.getState().stopStreaming();
     sendingRef.current = false;
   }, []);
@@ -593,6 +699,14 @@ export function useSendMessage(
     if (messageId === null) return;
     updateMessage(messageId, { content });
   }, [content, updateMessage]);
+
+  useEffect(() => {
+    const handlePagehide = () => {
+      currentTurnPersistenceRef.current?.persistPagehide();
+    };
+    window.addEventListener("pagehide", handlePagehide);
+    return () => window.removeEventListener("pagehide", handlePagehide);
+  }, []);
 
   return { handleSend, handleStop, handleKeyDown, handleInputChange, sendDirect, currentStage };
 }
