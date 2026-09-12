@@ -10,6 +10,9 @@ Drift definition (intent-based, see docs/engineering/skill-conventions.md):
 a repo-specific skill that is present in two or more trees must be present in
 all three with byte-identical content. Runner-specific, framework-vendored,
 adapter, and generated skills are allowlisted and exempt from the rule.
+Adapter skills (ADAPTER_SKILLS) are stricter: the canonical copy AND every
+adapter-tree copy must exist — canonical-only and canonical+one-adapter
+layouts are reported as drift naming the missing trees.
 
 Canonical-tree precedence (.agents > .claude > .opencode):
 docs/releases/pending/skills-narrowed-directives.md documents that
@@ -199,12 +202,15 @@ def check_drift() -> list[str]:
             continue
         present_in = [t for t in TREES if (ROOT / t / skill / "SKILL.md").is_file()]
 
-        if len(present_in) < 2:
-            # Legitimate single-tree skill (allowlisted or just unused elsewhere).
+        if skill in ADAPTER_SKILLS:
+            # Adapter skills need the COMPLETE layout: canonical protocol plus
+            # every adapter-tree copy. Checked before the len<2 skip so a
+            # canonical-only (or canonical+one) layout cannot pass silently.
+            findings.extend(_check_adapter(skill))
             continue
 
-        if skill in ADAPTER_SKILLS:
-            findings.extend(_check_adapter(skill, present_in))
+        if len(present_in) < 2:
+            # Legitimate single-tree skill (allowlisted or just unused elsewhere).
             continue
 
         # Shared repo-specific skill: must be in all three trees, byte-identical.
@@ -236,8 +242,13 @@ def _dirs_equal(a: Path, b: Path) -> bool:
     return True
 
 
-def _check_adapter(skill: str, present_in: list[str]) -> list[str]:
-    """Validate the adapter relationship for an adapter skill."""
+def _check_adapter(skill: str) -> list[str]:
+    """Validate the adapter relationship for an adapter skill.
+
+    Completeness is mandatory: the canonical copy plus BOTH adapter-tree
+    copies. TOOL-001: a missing adapter tree is reported explicitly instead
+    of being accepted as a partial mirror.
+    """
     findings: list[str] = []
     canonical_path = ROOT / ".opencode" / "skills" / skill / "SKILL.md"
     if not canonical_path.is_file():
@@ -248,7 +259,7 @@ def _check_adapter(skill: str, present_in: list[str]) -> list[str]:
         return findings
 
     canonical_lines = sum(1 for _ in canonical_path.open(encoding="utf-8"))
-    for tree in present_in:
+    for tree in TREES:
         if tree == ".opencode/skills":
             continue
         adapter = ROOT / tree / skill / "SKILL.md"

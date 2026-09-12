@@ -44,6 +44,10 @@ export function useDocumentPolling({
   const [documents, setDocuments] = useState<Document[]>([]);
   const [stats, setStats] = useState<DocumentStatsResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  // True when the LAST list fetch failed (cleared by a successful one). Drives
+  // the page-level retry affordance — an empty list after a failure must not
+  // read as an empty vault (issue #258 / legacy-14).
+  const [listError, setListError] = useState(false);
   const [wikiStatusMap, setWikiStatusMap] = useState<Record<string, DocumentWikiStatus>>({});
   const [compilingDocIds, setCompilingDocIds] = useState<Set<string>>(new Set());
   // Total documents matching the current query (drives the "load more" control),
@@ -79,12 +83,14 @@ export function useDocumentPolling({
       if (fetchGenerationRef.current !== generation) return;
       setDocuments(response?.documents || []);
       setTotal(response?.total ?? 0);
+      setListError(false);
     } catch (err) {
       if (fetchGenerationRef.current !== generation) return;
       console.error("Failed to fetch documents:", err);
       toast.error(err instanceof Error ? err.message : "Failed to load documents");
       setDocuments([]);
       setTotal(0);
+      setListError(true);
     }
   }, [activeVaultId, search, sortBy, sortOrder, tagFilterId, folderFilterId, pageSize]);
 
@@ -291,6 +297,7 @@ export function useDocumentPolling({
     stats,
     setStats,
     loading,
+    listError,
     fetchDocuments,
     fetchStats,
     wikiStatusMap,

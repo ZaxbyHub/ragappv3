@@ -1,10 +1,12 @@
 """
 Integration tests for performance optimization changes:
 - Task 3.1: fail_fast backward compatibility
-- Task 3.3: Parallel overflow retry ordering
+- Task 3.3: Parallel overflow retry ordering (issue #258 TEST-007: injected at
+  the HTTP boundary so the REAL _embed_batch_with_retry / _handle_overflow_retry
+  split executes — no patching of the method under test)
 - Task 2.5: Optimize mode conditional execution
 """
-import asyncio
+import json
 import os
 import sys
 
@@ -26,6 +28,7 @@ except ImportError:
 
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from app.services.embeddings import EmbeddingError, EmbeddingService
@@ -42,7 +45,11 @@ def mock_settings():
     """Mock settings for all tests."""
     with patch('app.services.embeddings.settings') as mock_settings, \
          patch('app.services.embeddings.assert_url_safe'):
-        mock_settings.ollama_embedding_url = "http://localhost:11434/api/embeddings"
+        # TEI-mode endpoint: /embed path resolves to mode="tei" so
+        # _embed_batch_api takes the native batch route through the REAL
+        # _embed_batch_with_retry (the legacy /api/embeddings URL would
+        # fan out per-item instead — issue #258 TEST-007 rewrite).
+        mock_settings.ollama_embedding_url = "http://127.0.0.1:8080/embed"
         mock_settings.embedding_model = "nomic-embed-text"
         mock_settings.embedding_doc_prefix = ""
         mock_settings.embedding_query_prefix = ""
@@ -125,71 +132,158 @@ class TestFailFast:
         assert failed_indices == []
 
 
-class TestParallelOverflowRetry:
-    """Tests for parallel overflow retry (Task 3.3).
+class _OverflowEmbeddingServer:
+    """Stateful mock embedding server for the HTTP boundary (issue #258 TEST-007).
 
-    Tests the actual _handle_overflow_retry path by patching
-    _embed_batch_with_retry to simulate token overflow and retry behavior.
+    Requests carrying MORE than ``max_texts_per_request`` texts get a 500 whose
+    body matches the llama.cpp token-overflow pattern ("input (N tokens) is too
+    large") so production treats it as overflow; smaller requests get a 200
+    with deterministic PER-TEXT vectors in the TEI raw-array shape.
     """
 
-    @pytest.mark.asyncio
-    async def test_overflow_retry_fallback_to_sequential(self):
-        """Sequential fallback works when parallel gather fails during overflow."""
+    def __init__(self, max_texts_per_request: int) -> None:
+        self.max_texts_per_request = max_texts_per_request
+        self.overflow_responses = 0
+        self.ok_responses = 0
+        self.served_batch_sizes: list = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        texts = payload.get("inputs", [])
+        self.served_batch_sizes.append(len(texts))
+        if len(texts) > self.max_texts_per_request:
+            self.overflow_responses += 1
+            tokens = len(texts) * 1024
+            body = (
+                f"{{\"error\":{{\"message\":\"input ({tokens} tokens) is too large, "
+                f"current batch size exceeds the context window\","
+                f"\"code\":500}}}}"
+            )
+            return httpx.Response(
+                500, text=body, headers={"content-type": "application/json"}
+            )
+        self.ok_responses += 1
+        return httpx.Response(
+            200,
+            text=json.dumps([_vector_for_text(t) for t in texts]),
+            headers={"content-type": "application/json"},
+        )
+
+
+def _vector_for_text(text: str) -> list:
+    """Deterministic per-text vector: distinct texts get distinct vectors."""
+    signature = [ord(c) for c in text]
+    return [float(len(text))] + [
+        float((i * 131 + s * 31) % 997) for i, s in enumerate(signature)
+    ]
+
+
+class TestParallelOverflowRetry:
+    """Tests for parallel overflow retry (Task 3.3), issue #258 TEST-007.
+
+    The overflow is injected at the HTTP boundary (httpx.MockTransport on the
+    service client), NOT by patching ``_embed_batch_with_retry`` — the legacy
+    form mocked the method whose recovery is the named contract and then
+    asserted tautologies. Here the REAL ``embed_batch`` → ``_embed_batch_api``
+    → ``_embed_batch_with_retry`` → ``_handle_overflow_retry`` recursion
+    executes against the mock wire.
+    """
+
+    def _service_with_mock_wire(self, server: _OverflowEmbeddingServer):
+        """Build an EmbeddingService whose HTTP client rides the MockTransport."""
         service = EmbeddingService()
-        texts = ["text"] * 20
+        # HTTP-boundary seam: swap the persistent client so every production
+        # request (payload build, POST, status/parse handling) runs for real
+        # against the mock wire.
+        service._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(server.handler)
+        )
+        return service
 
-        call_count = [0]
+    @pytest.mark.asyncio
+    async def test_overflow_retry_order_preserved(self, mock_settings):
+        """A successful recursive overflow preserves all 20 unique inputs, in order.
 
-        async def mock_embed_with_retry(*args, **kwargs):
-            call_count[0] += 1
-            # Simulate token overflow error that triggers _handle_overflow_retry
-            # For overflow retry, we need to raise an HTTPError with the specific message
-            from httpx import HTTPError
-            raise HTTPError("input (4096 tokens) is too large")
+        20 texts -> 500 -> split -> 10+10 -> 500 -> split -> 5+5 -> 200 (with a
+        5-text server limit): every returned embedding must be per-text EXACT
+        (order + content) and pairwise unique — an all-None result or a
+        reversed/duplicated split fails.
+        """
+        server = _OverflowEmbeddingServer(max_texts_per_request=5)
+        service = self._service_with_mock_wire(server)
+        try:
+            texts = [
+                f"issue-258 overflow order text #{i:02d} — unique payload"
+                for i in range(20)
+            ]
 
-        with patch(
-            'app.services.embeddings.EmbeddingService._embed_batch_with_retry',
-            side_effect=mock_embed_with_retry,
-        ):
             result = await service.embed_batch(texts, batch_size=20, fail_fast=False)
             assert isinstance(result, tuple)
             embeddings, failed_indices = result
-            # After max retries, embeddings should be empty (all batches failed)
-            # but the test verifies the retry mechanism was exercised
-            assert len(failed_indices) > 0  # After retries exhausted, batch fails
+
+            # The real split executed at the HTTP layer: the 20-text request
+            # overflowed, then smaller sub-batches were served (and succeeded).
+            assert server.overflow_responses >= 1
+            assert server.ok_responses >= 4  # four 5-text leaf batches
+            assert any(
+                0 < size < 20 for size in server.served_batch_sizes
+            ), "no sub-batch was ever served — the split did not execute"
+
+            # No failures, and exactly one embedding per input.
+            assert failed_indices == []
+            assert len(embeddings) == 20
+            for i, (text, vector) in enumerate(zip(texts, embeddings)):
+                assert isinstance(vector, list), f"vector {i} is not a list"
+                assert vector == _vector_for_text(text), (
+                    f"vector {i} does not match its input text "
+                    f"(order or content corrupted)"
+                )
+
+            # All 20 embeddings are pairwise unique.
+            assert len({tuple(v) for v in embeddings}) == 20, (
+                "duplicate embeddings returned by the split"
+            )
+        finally:
+            await service.close()
 
     @pytest.mark.asyncio
-    async def test_overflow_retry_order_preserved(self):
-        """Overflow retry preserves chunk order via left+right concatenation."""
-        service = EmbeddingService()
-        texts = [f"chunk-{i}" for i in range(20)]
+    async def test_overflow_retry_exhaustion_reports_failed_batch(self, mock_settings):
+        """Overflow that cannot split far enough fails the batch — visibly.
 
-        # Use a mock that returns different values for left/right chunks
-        # to verify order is preserved through concatenation
-        call_count = [0]
+        An always-overflowing server drives the real recursion down to the
+        minimum split size (the parallel gather fails and the sequential
+        fallback branch executes inside _handle_overflow_retry); with
+        fail_fast=False the batch is reported in failed_indices with None
+        placeholders — never a silent short or reordered success.
+        """
+        # Stop the split at 8 texts so the bounded-retry tree stays shallow.
+        mock_settings.embedding_batch_min_sub_size = 8
+        # Threshold 0 = EVERY request overflows: the recursion can never
+        # succeed, so it must terminate via the minimum-split-size guard.
+        server = _OverflowEmbeddingServer(max_texts_per_request=0)
+        service = self._service_with_mock_wire(server)
+        try:
+            texts = [f"issue-258 exhaust text #{i:02d}" for i in range(20)]
 
-        async def mock_embed_with_retry(client, batch_texts, max_retries, min_sub_size, retry_count=0, config=None):
-            call_count[0] += 1
-            # First call with 20 items -> overflow
-            if len(batch_texts) == 20 and call_count[0] == 1:
-                from httpx import HTTPError
-                raise HTTPError("input (4096 tokens) is too large")
-            # After split, returns embeddings for the sub-batch
-            # Return unique values based on chunk index to verify order
-            return [[float(i)] * 1024 for i in range(len(batch_texts))]
-
-        with patch(
-            'app.services.embeddings.EmbeddingService._embed_batch_with_retry',
-            side_effect=mock_embed_with_retry,
-        ):
             result = await service.embed_batch(texts, batch_size=20, fail_fast=False)
             assert isinstance(result, tuple)
             embeddings, failed_indices = result
 
-            # Verify no failures - overflow retry should have succeeded
-            # Note: With max retries, the batch will eventually fail, but we verify
-            # that the retry mechanism was exercised
-            assert len(embeddings) >= 0  # embeddings may be empty after max retries
+            # The retry tree really ran over the wire: the oversized batch
+            # overflowed and progressively smaller sub-batches were attempted.
+            assert server.overflow_responses >= 3
+            assert server.ok_responses == 0
+            assert any(
+                size < 20 for size in server.served_batch_sizes
+            ), "no smaller sub-batch was attempted — the split did not execute"
+
+            # The single 20-text batch is reported failed with a None
+            # placeholder per text.
+            assert failed_indices == [0]
+            assert len(embeddings) == 20
+            assert all(e is None for e in embeddings)
+        finally:
+            await service.close()
 
 
 class TestOptimizeMode:
