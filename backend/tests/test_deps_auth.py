@@ -1035,6 +1035,28 @@ class TestGetCurrentUserJWT:
 class TestEvaluatePolicy:
     """Tests for evaluate_policy RBAC engine."""
 
+
+    @pytest.fixture(autouse=True)
+    def _hermetic_policy_db(self, tmp_path, monkeypatch):
+        """Hermetic DB for evaluate_policy (PR #577 CI fix).
+
+        evaluate_policy opens the real settings-derived pool; unpatched, the
+        pool path depends on global settings state leaked by whichever tests
+        ran earlier in this xdist worker (CI Linux failed with
+        sqlite3.OperationalError under some orderings). Point deps.settings at
+        a per-test absolute path so the engine opens a throwaway file.
+        """
+        from types import SimpleNamespace
+
+        from app.api import deps as _deps
+
+        monkeypatch.setattr(
+            _deps,
+            "settings",
+            SimpleNamespace(sqlite_path=str(tmp_path / "policy_engine.db")),
+            raising=False,
+        )
+
     def _vault_policy_db(self):
         conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.execute(
