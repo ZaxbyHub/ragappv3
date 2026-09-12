@@ -15,10 +15,12 @@ Attack vectors tested:
 
 Implementation note (issue #152 / H5): this module previously used the raw
 ``requests`` library against a live backend at ``http://localhost:9090`` and
-``@skipUnless(check_backend_available())`` gated every class, which meant the
-entire file was skipped in CI (no live backend runs in the CI job). It now
-exercises the real CSRF protection in-process via FastAPI's ``TestClient`` (same
-pattern as ``test_csrf_auth.py``), so coverage runs in CI.
+gated every class on a reachability probe evaluated at import time, which meant
+the entire file was skipped in CI (no live backend runs in the CI job) and, on
+a host with an unrelated listener on 9090, drove real register calls at that
+foreign service. It now exercises the real CSRF protection in-process via
+FastAPI's ``TestClient`` (same pattern as ``test_csrf_auth.py``), so coverage
+runs in CI.
 
 Three tiers:
   * Tier 1 — most attack-vector tests run through ``TestClient`` against the
@@ -30,7 +32,8 @@ Three tiers:
     adversarial intent.
   * Tier 3 — two tests that rely on raw/duplicate HTTP header semantics that
     ``httpx`` (TestClient's transport) does not express identically to a real
-    socket server are kept live-backend gated with an explicit rationale.
+    socket server keep their live-backend requirement via ``@pytest.mark.live``
+    (opt in with ``RAGAPP_LIVE_TESTS=1``; see ``tests/conftest.py``).
 """
 
 import concurrent.futures
@@ -42,6 +45,8 @@ import sys
 import tempfile
 import time
 import unittest
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -94,17 +99,6 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, init_db, run_migrations
 from app.security import CSRFManager
-
-
-def _backend_available() -> bool:
-    """Only used by the Tier-3 live-backend tests (raw header semantics)."""
-    try:
-        import requests  # local import; not a CI dependency
-
-        resp = requests.get("http://localhost:9090/api/csrf-token", timeout=3)
-        return resp.status_code == 200
-    except Exception:
-        return False
 
 
 def random_username(prefix="atk"):
@@ -670,12 +664,10 @@ class TestCSRFForgery(_CSRFAdversarialBase):
                 resp.status_code, 403, "URL-encoded token bypassed CSRF validation"
             )
 
-    @unittest.skipUnless(
-        _backend_available(),
-        "Tier 3: double-cookie attack requires raw Cookie-header semantics "
-        "that httpx (TestClient) does not express identically to a real socket "
-        "server. Run against a live backend at http://localhost:9090.",
-    )
+    # Tier 3: requires a real backend at http://localhost:9090 — raw
+    # Cookie-header semantics that httpx does not express identically to a real
+    # socket server. Opt in with RAGAPP_LIVE_TESTS=1 (tests/conftest.py).
+    @pytest.mark.live
     def test_double_cookie_attack(self):
         """Sending two CSRF cookies (cookie splitting) must not bypass validation.
 
@@ -863,12 +855,10 @@ class TestCSRFEdgeCases(_CSRFAdversarialBase):
                 f"{method.upper()} /csrf-token returned {resp.status_code} instead of 405",
             )
 
-    @unittest.skipUnless(
-        _backend_available(),
-        "Tier 3: duplicate X-CSRF-Token headers require raw header semantics "
-        "that httpx (TestClient) does not express identically to a real socket "
-        "server. Run against a live backend at http://localhost:9090.",
-    )
+    # Tier 3: requires a real backend at http://localhost:9090 — duplicate
+    # X-CSRF-Token header semantics that httpx does not express identically to
+    # a real socket server. Opt in with RAGAPP_LIVE_TESTS=1.
+    @pytest.mark.live
     def test_multiple_csrf_headers_sent(self):
         """If multiple X-CSRF-Token headers are sent, the request should fail.
 

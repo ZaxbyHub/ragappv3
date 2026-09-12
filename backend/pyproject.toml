@@ -23,6 +23,15 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
+# Any marker used in tests/ must be registered here (or come from a plugin).
+# The `live` marker gates tests that perform real network I/O: tests/conftest.py
+# skips them with a visible reason unless RAGAPP_LIVE_TESTS=1 (issue #563 / C10
+# — replaces import-time probes of localhost:9090 that silently skipped in CI
+# and drove foreign listeners on dev hosts).
+addopts = "--strict-markers"
+markers = [
+    "live: performs real network I/O; skipped unless RAGAPP_LIVE_TESTS=1",
+]
 
 # Coverage gating (H4). Scoped to the SSRF guard modules — these are small,
 # fully exercised in CI, and the security-critical surface this issue's SSRF
