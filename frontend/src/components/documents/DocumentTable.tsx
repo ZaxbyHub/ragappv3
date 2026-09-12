@@ -1,6 +1,6 @@
 import { useRef } from "react";
 import { Link } from "react-router-dom";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { useVirtualizer, type VirtualItem } from "@tanstack/react-virtual";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -118,6 +118,28 @@ export function DocumentTable({
     overscan: 5,
   });
 
+  // Unmeasured-container fallback: until the virtualizer has measured its
+  // scroll container (first ResizeObserver tick) — or inside any 0-height
+  // container — the visible window is empty and the table would render ZERO
+  // rows even though documents exist. Render the fetched window directly so
+  // the table is never blank while unmeasured; the virtualizer takes over as
+  // soon as a real rect arrives. (72 matches estimateSize above.)
+  const ESTIMATED_ROW_HEIGHT = 72;
+  const virtualItems = tableVirtualizer.getVirtualItems();
+  const rowItems: VirtualItem[] =
+    virtualItems.length > 0 || documents.length === 0
+      ? virtualItems
+      : documents.map(
+          (_, index): VirtualItem => ({
+            index,
+            key: index,
+            start: index * ESTIMATED_ROW_HEIGHT,
+            size: ESTIMATED_ROW_HEIGHT,
+            end: (index + 1) * ESTIMATED_ROW_HEIGHT,
+            lane: 0,
+          })
+        );
+
   return (
     <Card className="hidden sm:block">
       <CardContent className="p-0">
@@ -207,7 +229,7 @@ export function DocumentTable({
             <tbody
               style={{ height: `${tableVirtualizer.getTotalSize()}px`, position: "relative" }}
             >
-              {tableVirtualizer.getVirtualItems().map((virtualItem) => {
+              {rowItems.map((virtualItem) => {
                 const doc = documents[virtualItem.index];
                 const docId = String(doc.id);
                 const isSelected = Boolean(selectedIds.has(docId));

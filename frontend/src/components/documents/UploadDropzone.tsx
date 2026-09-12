@@ -60,7 +60,10 @@ export function UploadDropzone({
         isDragActive ? "border-primary bg-primary/5" : "border-border"
       } ${!hasSelectedVault || !canWriteActiveVault ? "opacity-60 cursor-not-allowed" : ""}`}
     >
-      <input {...getInputProps()} />
+      {/* Visually-hidden-equivalent label: the dropzone root is the click
+          surface, but the rendered <input type="file"> still needs an
+          accessible name (ENH-005 axe `label` rule). */}
+      <input {...getInputProps()} aria-label="Upload files" />
       {!hasActiveVaultId && (
         <div className="text-muted-foreground text-sm p-4 text-center">
           Select a vault to upload documents.

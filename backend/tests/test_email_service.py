@@ -20,8 +20,6 @@ from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import pytest
-
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -1043,8 +1041,14 @@ class TestEmailServiceIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved_id, vault_id)
 
 
-class TestSaveAttachmentSentinel(unittest.TestCase):
+class TestSaveAttachmentSentinel(unittest.IsolatedAsyncioTestCase):
     """Test _save_attachment sentinel pattern prevents double-close.
+
+    IsolatedAsyncioTestCase (issue #258 / TEST-005): the four test methods
+    are ``async def`` — on a plain sync ``unittest.TestCase`` base neither
+    pytest-asyncio nor plain unittest ever awaited them, so the fd-close /
+    unlink assertions below were vacuous passes. The async base makes the
+    bodies execute for real.
 
     Verifies:
     1. On successful save, fd is closed exactly once
@@ -1082,17 +1086,24 @@ class TestSaveAttachmentSentinel(unittest.TestCase):
         return SQLiteConnectionPool(db_path, max_size=2)
 
     def _create_attachment_part(self, payload):
-        """Helper to create an email attachment part."""
+        """Helper to create an email attachment part.
+
+        Latent-fixture fix (issue #258 / TEST-005): the original kwargs were
+        ``main_type``/``sub_type`` — ``EmailMessage.add_attachment`` accepts
+        ``maintype``/``subtype`` (the same spelling the integration tests in
+        this file use), so the helper raised TypeError the moment the async
+        bodies actually started executing. The bodies had never run before
+        (sync-base defect), which is why the breakage was invisible.
+        """
         msg = EmailMessage()
         msg.add_attachment(
             payload,
-            filename='test.txt',
-            main_type='text',
-            sub_type='plain'
+            maintype='text',
+            subtype='plain',
+            filename='test.txt'
         )
         return msg.iter_attachments().__next__()
 
-    @pytest.mark.asyncio
     async def test_save_attachment_success_closes_fd_once(self):
         """On successful save, fd is closed exactly once (no leak, no double-close)."""
         from unittest.mock import AsyncMock, patch
@@ -1117,7 +1128,6 @@ class TestSaveAttachmentSentinel(unittest.TestCase):
         # Verify fd was closed exactly once
         self.assertEqual(len(close_calls), 1, f"Expected 1 close call, got {len(close_calls)}")
 
-    @pytest.mark.asyncio
     async def test_save_attachment_error_closes_fd_once(self):
         """On OSError during write, fd is closed exactly once via sentinel."""
         from unittest.mock import patch
@@ -1143,7 +1153,6 @@ class TestSaveAttachmentSentinel(unittest.TestCase):
         # Verify fd was closed exactly once (sentinel prevents double-close)
         self.assertEqual(len(close_calls), 1, f"Expected 1 close call, got {len(close_calls)}")
 
-    @pytest.mark.asyncio
     async def test_save_attachment_error_unlinks_temp_file(self):
         """On error, temp file is unlinked."""
         from unittest.mock import patch
@@ -1168,7 +1177,6 @@ class TestSaveAttachmentSentinel(unittest.TestCase):
         # Verify unlink was called to clean up temp file
         self.assertEqual(len(unlink_calls), 1, f"Expected 1 unlink call, got {len(unlink_calls)}")
 
-    @pytest.mark.asyncio
     async def test_save_attachment_sentinel_prevents_double_close(self):
         """Sentinel pattern (fd=None) prevents double-close even when finally runs after except."""
         from unittest.mock import patch

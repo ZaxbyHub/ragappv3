@@ -40,6 +40,28 @@ from app.services.auth_service import TokenInvalidError
 # =============================================================================
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_policy_db(tmp_path, monkeypatch):
+    """Hermetic DB for every evaluate_policy call in this module (PR #577 CI fix).
+
+    evaluate_policy opens the real settings-derived pool; unpatched, the pool
+    path depends on global settings state leaked by whichever tests ran
+    earlier in this xdist worker (CI Linux failed with
+    sqlite3.OperationalError under some orderings). Point deps.settings at a
+    per-test absolute path so the engine opens a throwaway file.
+    """
+    from types import SimpleNamespace
+
+    from app.api import deps as _deps
+
+    monkeypatch.setattr(
+        _deps,
+        "settings",
+        SimpleNamespace(sqlite_path=str(tmp_path / "policy_engine.db")),
+        raising=False,
+    )
+
+
 class TestAuthHeaderInjection:
     """Attack vectors against Authorization header parsing."""
 
@@ -178,6 +200,7 @@ class TestOversizedToken:
 
 class TestEvaluatePolicyNegativeResourceId:
     """Attack vectors against evaluate_policy with negative resource IDs."""
+
 
     @pytest.mark.asyncio
     async def test_evaluate_policy_negative_resource_id_minus1(self):

@@ -24,7 +24,9 @@ editing.
 ## Prerequisites
 
 - **Python 3.11** (CI pins 3.11 — see the caveat below)
-- **Node.js ≥ 20.19.0** (`frontend/package.json` `engines`)
+- **Node.js ≥ 22.14.0** (`frontend/package.json` `engines`; the runtime pin
+  is enforced across CI, both Dockerfiles and this doc by
+  `scripts/check_runtime_contract.py`)
 - Local LLM/embedding services (Ollama + embedding container) or Docker — see
   [`README.md`](README.md) and [`INSTALLATION.md`](INSTALLATION.md)
 
@@ -78,17 +80,16 @@ frontend, and embedding/LLM services together.
 
 ## Before you push — run the CI gates locally
 
-CI (`.github/workflows/ci.yml`) has four required jobs. Reproduce them locally
-so your PR goes green on the first try:
+CI (`.github/workflows/ci.yml`) runs the Frontend, Quality contracts, SAST,
+Backend, and Docker build smoke jobs. Reproduce them locally so your PR goes
+green on the first try:
 
 **Backend** (from `backend/`):
 
 ```bash
 ruff check .
-# CI-targeted subset:
-pytest --tb=short -q tests/test_path_prefix.py tests/test_auth_routes.py tests/test_main_catchall.py tests/test_csrf_auth.py tests/test_change_password.py tests/test_deps_auth_must_change_password.py tests/test_settings_ssrf.py tests/test_embeddings_cache.py
-# ...and the tests for the area you changed, e.g.:
-pytest -q tests/test_tags_routes.py
+# CI runs the FULL suite (plus the tests for the area you changed locally):
+pytest --tb=short -n auto tests/
 ```
 
 **Frontend** (from `frontend/`):
@@ -103,9 +104,12 @@ npm run build
 **Quality contracts** (from repo root):
 
 ```bash
+python scripts/check_runtime_contract.py   # runtime pins: Docker/CI/engines/docs parity
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py   # SAST baseline/scope/workflow integrity
+python scripts/check_skill_sync.py      # skill-tree mirror drift
+python scripts/check_secretscan.py      # .secretscanignore validity
 ```
 
 **SAST** (from repo root; requires `bandit` from `backend/requirements-dev.txt`):

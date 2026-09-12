@@ -8,6 +8,9 @@ Tests cover:
    threshold ARE rejected)
 3. The old heuristic any("_rerank_score" in r...) is no longer present in the
    filter_relevant body.
+4. An EXPLICITLY-passed top_k is a hard cap on the returned list in both
+   reranked modes (issue #258 TEST-001; omitted-top_k behavior is pinned in
+   test_issue258_retrieval_contract_explicit.py).
 """
 
 import os
@@ -231,30 +234,37 @@ async def test_reranked_false_default_is_reranked_false(service, results_beyond_
 
 
 # ---------------------------------------------------------------------------
-# Tests — top_k is respected regardless of reranked
+# Tests — explicit top_k is a hard cap regardless of reranked
+#
+# Issue #258 (TEST-001): an EXPLICITLY-passed top_k slices the returned list
+# to exactly that length. (Omitting top_k returns the full within-threshold
+# set — that omitted-mode contract is pinned in
+# test_issue258_retrieval_contract_explicit.py.)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_reranked_true_respects_top_k(service, results_within_threshold):
-    """top_k is used as retrieval_top_k when set; all within-threshold results are returned."""
+async def test_reranked_true_explicit_top_k_hard_caps(service, results_within_threshold):
+    """Explicit top_k caps the result list even when reranked=True skips the distance filter."""
     sources = await service.filter_relevant(
         results_within_threshold, top_k=2, reranked=True
     )
-    # All 3 results in results_within_threshold are within distance threshold,
-    # so all 3 are returned (top_k is the cap but distance filter lets them all through).
-    assert len(sources) == 3
+    # 3 within-threshold records exist, but explicit top_k=2 is a hard cap.
+    assert len(sources) == 2
+    # The cap keeps the ranked prefix (input order is the relevance order).
+    assert [s.text for s in sources] == ["close doc 1", "close doc 2"]
 
 
 @pytest.mark.asyncio
-async def test_reranked_false_respects_top_k(service, results_within_threshold):
-    """top_k is used as retrieval_top_k when set; all within-threshold results are returned."""
+async def test_reranked_false_explicit_top_k_hard_caps(service, results_within_threshold):
+    """Explicit top_k caps the result list when the distance filter also applies."""
     sources = await service.filter_relevant(
         results_within_threshold, top_k=1, reranked=False
     )
-    # All 3 results in results_within_threshold are within distance threshold,
-    # so all 3 are returned (top_k is the cap but distance filter lets them all through).
-    assert len(sources) == 3
+    # All 3 records are within the distance threshold, but explicit top_k=1
+    # is a hard cap applied after filtering.
+    assert len(sources) == 1
+    assert sources[0].text == "close doc 1"
 
 
 # ---------------------------------------------------------------------------

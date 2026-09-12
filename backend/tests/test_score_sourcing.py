@@ -210,10 +210,11 @@ async def test_reranked_true_rerank_score_nan_falls_back_to_distance(service, ba
     sources = await service.filter_relevant([record], reranked=True)
 
     assert len(sources) == 1
-    # NaN != NaN, so we use math.isnan instead
-    import math
-
-    assert math.isnan(sources[0].score) or sources[0].score == 0.3
+    # EXACT fallback: the runtime band check (0.0 <= x <= 1.0) rejects NaN,
+    # so the score must fall back to the distance (0.3) — never NaN itself.
+    # (Legacy form asserted `math.isnan(score) or score == 0.3`, which also
+    # passed when NaN leaked through — issue #258 TEST-001 / C1b.)
+    assert sources[0].score == 0.3
 
 
 # ---------------------------------------------------------------------------

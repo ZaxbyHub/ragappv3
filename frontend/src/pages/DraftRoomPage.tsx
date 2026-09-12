@@ -108,7 +108,12 @@ function DraftRow({ draft, vaultName }: { draft: DraftSummary; vaultName: string
 
 function DraftListSkeleton() {
   return (
-    <ul className="divide-y divide-border rounded-md border border-border" data-testid="draft-list-skeleton">
+    <ul
+      className="divide-y divide-border rounded-md border border-border"
+      data-testid="draft-list-skeleton"
+      role="status"
+      aria-label="Loading drafts"
+    >
       {Array.from({ length: 5 }).map((_, index) => (
         <li key={index} className="flex flex-col gap-2 p-3 lg:flex-row lg:items-center lg:gap-4">
           <Skeleton className="h-5 w-48" />

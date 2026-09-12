@@ -4,7 +4,7 @@
   "version": "1.0.3",
   "type": "module",
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=22.14.0"
   },
   "scripts": {
     "dev": "vite",
@@ -12,8 +12,10 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:a11y": "vitest run src/a11y.smoke.test.tsx",
+    "test:coverage": "vitest run --coverage src/lib/api src/stores",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "typecheck:contracts": "tsc --noEmit -p tsconfig.contracts.json",
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
@@ -67,6 +69,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^6.1.1",
+    "@vitest/coverage-v8": "^4.1.11",
     "axe-core": "^4.13.0",
     "eslint": "^10.9.1",
     "eslint-plugin-jsx-a11y-x": "^0.2.0",

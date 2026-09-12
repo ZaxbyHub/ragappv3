@@ -39,7 +39,9 @@ const API_PROXY_TARGET = 'http://localhost:9090'
 export interface ApiProxyOptions {
   target: string
   changeOrigin: boolean
-  rewrite: (requestPath: string) => string
+  // Optional: Vite treats an absent rewrite as an identity pass-through, so
+  // the root-mount proxy below omits it deliberately (BUILD-001).
+  rewrite?: (requestPath: string) => string
 }
 
 export function normalizeViteBase(value?: string | null): string {

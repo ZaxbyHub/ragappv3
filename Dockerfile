@@ -1,10 +1,12 @@
 # Stage 1: Build Frontend
-# Pinned to node 20.19 to match CI (ci.yml node-version "20.19.0") so a green
-# CI run proves the shipped image builds (B6-2, #289). node:26 diverged from CI
-# and could build/run differently than what CI validated.
+# Pinned to node 22.14 (current LTS line; node 20 is EOL since 2026-04-30) to match
+# CI (ci.yml node-version "22.14.0") so a green CI run proves the shipped image
+# builds. Parity across this FROM, frontend/Dockerfile, ci.yml, package.json
+# engines and CONTRIBUTING.md is enforced by scripts/check_runtime_contract.py
+# (Quality contracts job) — move majors through that gate, not by editing here.
 # Digest pin (issue #404 / #391) freezes the base image for supply-chain
 # integrity; dependabot (docker ecosystem, "/") opens PRs on new digests.
-FROM node:26.8-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS frontend-builder
+FROM node:22.14-alpine@sha256:9bef0ef1e268f60627da9ba7d7605e8831d5b56ad07487d24d1aa386336d1944 AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -13,8 +15,12 @@ ARG VITE_APP_BASENAME=/
 ARG VITE_API_URL=
 ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
 ENV VITE_API_URL=${VITE_API_URL}
-# validate_vite_env inlined to avoid dependency on external file
-RUN node -e "
+# validate_vite_env inlined to avoid dependency on external file.
+# BuildKit heredoc form: the previous unquoted multi-line `RUN node -e "..."`
+# was un-parseable Dockerfile syntax (every JS line read as a Dockerfile
+# instruction — "unknown instruction: const"); nothing exercised it until the
+# docker build smoke job (BUILD-002, #258).
+RUN <<'NODEJS' node
 const raw = process.env.VITE_APP_BASENAME ?? '';
 const hasCtrl = function(s) {
   for (const ch of s) { const c = ch.charCodeAt(0); if (c < 32 || c === 127) return true; }
@@ -38,14 +44,15 @@ try {
   console.error('Fix VITE_APP_BASENAME and rebuild.');
   process.exit(1);
 }
-"
+NODEJS
 RUN npm run build
 
 # Stage 2: Backend with Unstructured dependencies
 # Pinned to python 3.11 to match CI (ci.yml python-version "3.11") so a green
-# CI run proves the shipped image builds and runs (B6-2, #289).
+# CI run proves the shipped image builds and runs (B6-2, #289). Parity is
+# enforced by scripts/check_runtime_contract.py (Quality contracts job).
 # Digest pin (issue #404 / #391); dependabot (docker, "/") maintains updates.
-FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4 AS backend
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534 AS backend
 
 # Install system dependencies for Unstructured
 # Note: libmagic1 needed for python-magic on Linux
@@ -76,7 +83,11 @@ RUN pip install --no-cache-dir -r requirements-lock.txt
 # Like the apt/pip steps above, this needs network access at build time; for
 # restricted/airgapped builds pass a proxy via Docker's standard build args
 # (HTTP_PROXY/HTTPS_PROXY) or pre-seed the model from a mirror.
-RUN python -m spacy download en_core_web_sm
+# requirements-lock.txt does not carry spacy (it arrives with the
+# unstructured[all-docs] extras the nightly tier installs); download the
+# model only when spacy is actually present so the locked-dependency
+# image stays buildable (BUILD-002 docker smoke, #258).
+RUN python -c "import spacy" 2>/dev/null     && python -m spacy download en_core_web_sm     || echo "spacy not installed - skipping en_core_web_sm download"
 
 # Copy backend code
 COPY backend/app ./app
