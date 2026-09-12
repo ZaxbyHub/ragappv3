@@ -203,12 +203,20 @@ class SettingsUpdate(BaseModel):
         "instant_memory_context_top_k",
         "instant_max_tokens",
         "thinking_max_tokens",
-        "instant_enable_thinking",
     )
     @classmethod
     def validate_per_mode_positive_ints(cls, v):
         if v is not None and v <= 0:
             raise ValueError("must be a positive integer")
+        return v
+
+    @field_validator("instant_enable_thinking")
+    @classmethod
+    def validate_instant_enable_thinking(cls, v):
+        # bool field — must NOT share the positive-int group above: `False <= 0`
+        # is True in Python, which rejected the documented default (PR #576 F3).
+        if v is None:
+            raise ValueError("instant_enable_thinking must be true or false")
         return v
 
     @field_validator("chunk_size_chars")
@@ -1181,19 +1189,32 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
     """
     thinking_client = getattr(app.state, "thinking_llm_client", None)
     instant_client = getattr(app.state, "instant_llm_client", None)
+    # Review F5 (PR #576): max_tokens and the instant thinking kwarg are read
+    # at client construction; rebind them alongside URL/model so a saved
+    # change takes effect without a restart.
     if thinking_client is not None and (
-        update.ollama_chat_url is not None or update.chat_model is not None
+        update.ollama_chat_url is not None
+        or update.chat_model is not None
+        or update.thinking_max_tokens is not None
     ):
         thinking_client.reconfigure(
             base_url=settings.ollama_chat_url,
             model=settings.chat_model,
+            max_tokens=settings.thinking_max_tokens,
         )
     if instant_client is not None and (
-        update.instant_chat_url is not None or update.instant_chat_model is not None
+        update.instant_chat_url is not None
+        or update.instant_chat_model is not None
+        or update.instant_max_tokens is not None
+        or update.instant_enable_thinking is not None
     ):
         instant_client.reconfigure(
             base_url=settings.instant_chat_url,
             model=settings.instant_chat_model,
+            max_tokens=settings.instant_max_tokens,
+            chat_template_kwargs=(
+                None if settings.instant_enable_thinking else {"enable_thinking": False}
+            ),
         )
     if update.ingestion_llm_mode is not None:
         background_processor = getattr(app.state, "background_processor", None)
@@ -1360,10 +1381,17 @@ def _embedding_probe_payload(url: str) -> dict:
     if path.rstrip("/").endswith("/embed"):
         # Native TEI serves a single model, so no model field is sent.
         return {"inputs": "ping"}
-    if "/api/embeddings" in path or not path:
+    if "/api/embeddings" in path:
         return {"model": settings.embedding_model, "prompt": "ping"}
-    # Unknown URL shape — the OpenAI form is the most common dialect.
-    return {"model": settings.embedding_model, "input": "ping"}
+    # No explicit path: mirror _detect_provider_mode's PORT-based resolution
+    # (review F6, PR #576) — bare :8080 is TEI, bare :1234 is LM Studio
+    # OpenAI; anything else defaults to the legacy Ollama dialect.
+    port = urlparse(url).port
+    if port == 8080:
+        return {"inputs": "ping"}
+    if port == 1234:
+        return {"model": settings.embedding_model, "input": "ping"}
+    return {"model": settings.embedding_model, "prompt": "ping"}
 
 
 @router.get("/settings/connection")

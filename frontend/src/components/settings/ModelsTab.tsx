@@ -616,6 +616,20 @@ export function ModelsTab({
             onChange={onChange}
             source={effectiveSources.thinking_max_tokens}
           />
+          <div className="flex items-center space-x-2">
+            <Checkbox
+              id="instant-enable-thinking"
+              checked={formData.instant_enable_thinking}
+              onCheckedChange={(checked) => onChange("instant_enable_thinking", checked === true)}
+            />
+            <Label htmlFor="instant-enable-thinking" className="text-sm font-normal">
+              Enable thinking in Instant mode
+            </Label>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Off (default) sends enable_thinking=false with every Instant request — correct for
+            Gemma-4-style templates. On omits the kwarg so the model template default governs.
+          </p>
         </CardContent>
       </Card>
 

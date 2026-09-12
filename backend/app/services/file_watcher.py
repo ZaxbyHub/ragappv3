@@ -6,6 +6,7 @@ for new files and enqueues them for processing via BackgroundProcessor.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -141,15 +142,30 @@ class FileWatcher:
             # auto-scan disabled) — nothing to reconcile.
             return
         enabled = bool(getattr(cfg, "auto_scan_enabled", False))
+
+        def _log_lifecycle_failure(fut: "concurrent.futures.Future") -> None:
+            # The scheduling caller is a sync settings route on a worker
+            # thread; it never inspects these futures. A silently-dropped
+            # exception here leaves _running inconsistent with reality
+            # (review F7, PR #576), so surface it in the logs.
+            try:
+                fut.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.error("FileWatcher lifecycle transition failed: %s", exc)
+
         if enabled:
             if self._running:
                 # Cadence may have changed: wake the loop so the next cycle
                 # picks up the new interval.
                 loop.call_soon_threadsafe(self._wake_event.set)
             else:
-                asyncio.run_coroutine_threadsafe(self.start(), loop)
+                fut = asyncio.run_coroutine_threadsafe(self.start(), loop)
+                fut.add_done_callback(_log_lifecycle_failure)
         elif self._running:
-            asyncio.run_coroutine_threadsafe(self.stop(), loop)
+            fut = asyncio.run_coroutine_threadsafe(self.stop(), loop)
+            fut.add_done_callback(_log_lifecycle_failure)
 
     async def scan_once(self) -> int:
         """

@@ -48,6 +48,19 @@ def apply_legacy_settings_conversion(data: Mapping[str, object]) -> dict:
         legacy_value = converted.get(legacy_field)
         if legacy_value is None:
             continue
+        # pydantic-settings delivers env/.env values as STRINGS into the
+        # mode="before" validator; multiply numerically, never lexically
+        # ("512" * 4 == "512512512512" — PR #576 review F1).
+        if isinstance(legacy_value, str):
+            try:
+                legacy_value = int(legacy_value.strip())
+            except ValueError:
+                logger.warning(
+                    "Deprecated: '%s' value %r is not an integer; ignoring.",
+                    legacy_field,
+                    legacy_value,
+                )
+                continue
         if converted.get(new_field) is None:
             converted[new_field] = legacy_value * factor
             logger.warning(
@@ -67,7 +80,15 @@ class Settings(BaseSettings):
     """Application settings with environment variable support."""
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # docker-compose forwards documented keys as `- KEY=${KEY:-}`, which
+        # injects an EMPTY STRING for every key the operator's .env omits.
+        # Without this flag pydantic treats "" as a provided value and the
+        # int/float/bool fields fail coercion at startup (PR #576 review F2):
+        # an empty value must behave exactly like an unset one.
+        env_ignore_empty=True,
     )
 
     # Server configuration

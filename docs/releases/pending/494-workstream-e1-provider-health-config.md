@@ -27,7 +27,7 @@ deactivates the prior one in the same transaction.
 
 Settings contract: startup replay now consumes the exported `PERSISTED_FUNCTIONAL_FIELDS`
 single-source list (the 20-field save/replay drift — ingestion mode, instant skip flags, wiki
-lint + curator settings — is closed and guarded by an import-time equality check); the file
+lint + curator settings — is closed and guarded by a startup-time equality check (first persisted-settings load)); the file
 watcher reconciles start/stop/cadence on save without an app restart; legacy fields
 (`chunk_size`, `chunk_overlap`, `vector_top_k`) convert through one shared implementation at
 construction *and* on the live update path; `retrieval_window=0` is accepted and documented as

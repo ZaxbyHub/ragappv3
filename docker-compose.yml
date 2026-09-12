@@ -215,6 +215,12 @@ services:
       # build args), HOST_DATA_DIR (bind-mount host path), HF_TOKEN
       # (harrier-embed sidecar). Secrets (ADMIN_SECRET_TOKEN, JWT_SECRET_KEY)
       # stay explicit above — never forwarded with implicit defaults.
+      # Credential-bearing keys that ARE forwarded with an implicit empty
+      # default (review F4, PR #576): HEALTH_CHECK_API_KEY (gated by the
+      # limiter-bypass check) and the IMAP_* block (gated by IMAP_ENABLED).
+      # An empty value behaves like unset (Settings env_ignore_empty), so a
+      # missing credential deactivates the feature instead of crashing —
+      # it is never silently populated from anywhere but the operator's .env.
       # ------------------------------------------------------------------
       # Auth & security
       - USERS_ENABLED=${USERS_ENABLED:-}

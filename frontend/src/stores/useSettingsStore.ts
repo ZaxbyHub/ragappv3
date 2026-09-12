@@ -58,6 +58,7 @@ export interface SettingsFormData {
   instant_memory_context_top_k: number;
   instant_max_tokens: number;
   thinking_max_tokens: number;
+  instant_enable_thinking: boolean;
   // Wiki & curator (PR B + PR C)
   wiki_enabled: boolean;
   wiki_compile_on_ingest: boolean;
@@ -140,6 +141,7 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   instant_memory_context_top_k: "models",
   instant_max_tokens: "models",
   thinking_max_tokens: "models",
+  instant_enable_thinking: "models",
   wiki_enabled: "wiki",
   wiki_compile_on_ingest: "wiki",
   wiki_compile_on_query: "wiki",
@@ -278,6 +280,7 @@ const defaultFormData: SettingsFormData = {
   instant_memory_context_top_k: 2,
   instant_max_tokens: 4096,
   thinking_max_tokens: 32768,
+  instant_enable_thinking: false,
   wiki_enabled: true,
   wiki_compile_on_ingest: true,
   wiki_compile_on_query: true,
@@ -375,6 +378,7 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     instant_memory_context_top_k: settings.instant_memory_context_top_k ?? 2,
     instant_max_tokens: settings.instant_max_tokens ?? 4096,
     thinking_max_tokens: settings.thinking_max_tokens ?? 32768,
+    instant_enable_thinking: settings.instant_enable_thinking ?? false,
     wiki_enabled: settings.wiki_enabled ?? true,
     wiki_compile_on_ingest: settings.wiki_compile_on_ingest ?? true,
     wiki_compile_on_query: settings.wiki_compile_on_query ?? true,

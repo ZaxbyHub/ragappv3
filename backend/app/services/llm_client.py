@@ -93,6 +93,11 @@ class LLMError(Exception):
     pass
 
 
+# Sentinel for LLMClient.reconfigure: "leave chat_template_kwargs unchanged".
+# None itself is a meaningful value there (omit the kwarg from the payload).
+_KEEP_TEMPLATE_KWARGS = object()
+
+
 class LLMClient:
     """OpenAI-compatible LLM chat client."""
 
@@ -152,8 +157,14 @@ class LLMClient:
         self,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        chat_template_kwargs: object = _KEEP_TEMPLATE_KWARGS,
     ) -> None:
-        """Hot-update base_url and/or model in place.
+        """Hot-update base_url, model, default max_tokens and/or template kwargs in place.
+
+        ``chat_template_kwargs`` uses a sentinel default because ``None`` is a
+        MEANINGFUL value here (omit the kwarg from the payload — instant-mode
+        thinking enabled); pass ``_KEEP_TEMPLATE_KWARGS`` to leave it unchanged.
 
         Per-request URLs are computed from ``self.base_url`` at call time, so
         in-place updates take effect immediately without recreating the
@@ -178,6 +189,16 @@ class LLMClient:
         if model is not None and model != self.model:
             self.model = model
             changed = True
+        if max_tokens is not None and max_tokens != self.max_tokens:
+            # Review F5 (PR #576): a saved instant/thinking_max_tokens change
+            # must reach the running client, not wait for a restart.
+            self.max_tokens = max_tokens
+            changed = True
+        if chat_template_kwargs is not _KEEP_TEMPLATE_KWARGS:
+            normalized = chat_template_kwargs or None
+            if normalized != self.chat_template_kwargs:
+                self.chat_template_kwargs = normalized
+                changed = True
         if changed:
             self._circuit_breaker.reset()
 
