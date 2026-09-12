@@ -57,7 +57,7 @@ ALLOWED_RUNTIME: dict[str, dict[str, str]] = {
     # Plan-critic R1 item 7: the Node pin is MINOR-EXACT ("22.11.0") so the
     # contract asserts the same minor across ci.yml setup-node, package.json
     # engines (>=22.11.0), Dockerfile FROM tags, and CONTRIBUTING.md.
-    "node": {"major": "22", "minor": "11"},
+    "node": {"major": "22", "minor": "12"},
     "python": {"version": "3.11"},
 }
 

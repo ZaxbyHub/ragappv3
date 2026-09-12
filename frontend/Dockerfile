@@ -3,7 +3,7 @@
 # enforced by scripts/check_runtime_contract.py. Digest pin (issue #404 / #391)
 # freezes the base image for supply-chain integrity; dependabot (docker
 # ecosystem, "/frontend") opens PRs on new digests.
-FROM node:22.11-alpine@sha256:b64ced2e7cd0a4816699fe308ce6e8a08ccba463c757c00c14cd372e3d2c763e AS build
+FROM node:22.12-alpine@sha256:b64ced2e7cd0a4816699fe308ce6e8a08ccba463c757c00c14cd372e3d2c763e AS build
 
 WORKDIR /app
 

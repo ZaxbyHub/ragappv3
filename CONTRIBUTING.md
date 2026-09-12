@@ -24,7 +24,7 @@ editing.
 ## Prerequisites
 
 - **Python 3.11** (CI pins 3.11 — see the caveat below)
-- **Node.js ≥ 22.11.0** (`frontend/package.json` `engines`; the runtime pin
+- **Node.js ≥ 22.12.0** (`frontend/package.json` `engines`; the runtime pin
   is enforced across CI, both Dockerfiles and this doc by
   `scripts/check_runtime_contract.py`)
 - Local LLM/embedding services (Ollama + embedding container) or Docker — see

@@ -41,7 +41,7 @@ note covers all seven plan groups (G1–G7) of the approved fix plan
 
 ### G3 — build/CI contract (BUILD-001/002, TOOL-001)
 
-- Runtime re-pin: **Node.js 22.11.0 LTS (minor-exact) + Python 3.11** across
+- Runtime re-pin: **Node.js 22.12.0 LTS (minor-exact) + Python 3.11** across
   ci.yml `setup-node`/`setup-python`, root `Dockerfile`,
   `frontend/Dockerfile`, `frontend/package.json` engines and CONTRIBUTING.md.
   `scripts/check_runtime_contract.py` is the single mechanical decision
@@ -99,7 +99,7 @@ emitting a committed benchmark markdown) (C12/C13).
 
 - **INSTALLATION.md rebuilt on the maintained flow** (validated by the new
   `scripts/check_installation_doc.py`, wired into the Quality-contracts CI
-  job): versions aligned to the runtime contract (Node 22.11 / Python 3.11
+  job): versions aligned to the runtime contract (Node 22.12 / Python 3.11
   across the prerequisites table, brew/nodesource setup, LTS guidance); the
   zero-arg `init_db()` snippets (which raised TypeError —
   `init_db(sqlite_path)` is required) replaced with
@@ -141,8 +141,8 @@ wired. Every repair is pinned by a mechanical check (frozen pytest nodes and
 
 ## Migration steps
 
-- **Local dev Node floor is now 22.11** — `frontend/package.json` engines
-  enforces `>=22.11.0` (CI, both Dockerfiles and CONTRIBUTING are aligned;
+- **Local dev Node floor is now 22.12** — `frontend/package.json` engines
+  enforces `>=22.12.0` (CI, both Dockerfiles and CONTRIBUTING are aligned;
   `scripts/check_runtime_contract.py` fails any drift).
 - Python stays 3.11 everywhere (CI, images, docs) — no action.
 - **`backend/embedding_server/` removal**: the sidecar was dormant (no

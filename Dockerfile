@@ -6,7 +6,7 @@
 # (Quality contracts job) — move majors through that gate, not by editing here.
 # Digest pin (issue #404 / #391) freezes the base image for supply-chain
 # integrity; dependabot (docker ecosystem, "/") opens PRs on new digests.
-FROM node:22.11-alpine@sha256:b64ced2e7cd0a4816699fe308ce6e8a08ccba463c757c00c14cd372e3d2c763e AS frontend-builder
+FROM node:22.12-alpine@sha256:b64ced2e7cd0a4816699fe308ce6e8a08ccba463c757c00c14cd372e3d2c763e AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -15,8 +15,12 @@ ARG VITE_APP_BASENAME=/
 ARG VITE_API_URL=
 ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
 ENV VITE_API_URL=${VITE_API_URL}
-# validate_vite_env inlined to avoid dependency on external file
-RUN node -e "
+# validate_vite_env inlined to avoid dependency on external file.
+# BuildKit heredoc form: the previous unquoted multi-line `RUN node -e "..."`
+# was un-parseable Dockerfile syntax (every JS line read as a Dockerfile
+# instruction — "unknown instruction: const"); nothing exercised it until the
+# docker build smoke job (BUILD-002, #258).
+RUN <<'NODEJS' node
 const raw = process.env.VITE_APP_BASENAME ?? '';
 const hasCtrl = function(s) {
   for (const ch of s) { const c = ch.charCodeAt(0); if (c < 32 || c === 127) return true; }
@@ -40,7 +44,7 @@ try {
   console.error('Fix VITE_APP_BASENAME and rebuild.');
   process.exit(1);
 }
-"
+NODEJS
 RUN npm run build
 
 # Stage 2: Backend with Unstructured dependencies
