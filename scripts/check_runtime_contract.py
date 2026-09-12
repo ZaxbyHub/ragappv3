@@ -54,7 +54,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # runtime: update this table, then re-align every surface listed in the
 # module docstring to match. Nothing else in this file encodes versions.
 ALLOWED_RUNTIME: dict[str, dict[str, str]] = {
-    "node": {"major": "22"},
+    # Plan-critic R1 item 7: the Node pin is MINOR-EXACT ("22.11.0") so the
+    # contract asserts the same minor across ci.yml setup-node, package.json
+    # engines (>=22.11.0), Dockerfile FROM tags, and CONTRIBUTING.md.
+    "node": {"major": "22", "minor": "11"},
     "python": {"version": "3.11"},
 }
 
@@ -109,6 +112,24 @@ def from_statements(dockerfile_text: str) -> list[tuple[str, str]]:
     return result
 
 
+def _expected_node() -> str:
+    """Minor-exact node pin, e.g. '22.11'."""
+    n_ = ALLOWED_RUNTIME["node"]
+    return f"{n_['major']}.{n_['minor']}"
+
+
+def _node_version_ok(version: str) -> tuple[bool, str]:
+    """True when a pinned node version string matches the minor-exact contract."""
+    digits = re.search(r"(\d+)\.(\d+)", version)
+    if not digits:
+        return False, f"unparseable node version {version!r}"
+    major, minor = digits.group(1), digits.group(2)
+    exp = ALLOWED_RUNTIME["node"]
+    if major != exp["major"] or minor != exp["minor"]:
+        return False, f"node {major}.{minor}, contract requires {_expected_node()}.x"
+    return True, ""
+
+
 def check_dockerfiles(failures: list[str]) -> None:
     for surface in DOCKERFILE_SURFACES:
         path = ROOT / surface
@@ -116,12 +137,9 @@ def check_dockerfiles(failures: list[str]) -> None:
             continue
         for image, version in from_statements(path.read_text(encoding="utf-8")):
             if image == "node":
-                major = version.split(".")[0]
-                if major != ALLOWED_RUNTIME["node"]["major"]:
-                    failures.append(
-                        f"{surface}: FROM {image}:{version} is node major {major}, "
-                        f"contract requires {ALLOWED_RUNTIME['node']['major']}"
-                    )
+                ok, why = _node_version_ok(version)
+                if not ok:
+                    failures.append(f"{surface}: FROM {image}:{version} is {why}")
             elif image == "python":
                 if version != ALLOWED_RUNTIME["python"]["version"]:
                     failures.append(
@@ -134,12 +152,10 @@ def check_ci_versions(failures: list[str]) -> None:
     ci_text = read(".github/workflows/ci.yml")
     for match in CI_NODE_VERSION_RE.finditer(ci_text):
         version = match.group(1)
-        major = version.split(".")[0]
-        if major != ALLOWED_RUNTIME["node"]["major"]:
+        ok, why = _node_version_ok(version)
+        if not ok:
             failures.append(
-                f".github/workflows/ci.yml: setup-node node-version {version!r} is "
-                f"node major {major}, contract requires "
-                f"{ALLOWED_RUNTIME['node']['major']}"
+                f".github/workflows/ci.yml: setup-node node-version {version!r} is {why}"
             )
     for match in CI_PYTHON_VERSION_RE.finditer(ci_text):
         version = match.group(1)
@@ -163,23 +179,35 @@ def check_package_engines(failures: list[str]) -> None:
             "minimum version"
         )
         return
-    major = match.group(0)
-    if major != ALLOWED_RUNTIME["node"]["major"]:
+    digits = re.search(r"(\d+)\.(\d+)", engines_node)
+    if not digits:
         failures.append(
-            f"frontend/package.json: engines.node {engines_node!r} floors node major "
-            f"{major}, contract requires {ALLOWED_RUNTIME['node']['major']}"
+            f"frontend/package.json: engines.node {engines_node!r} lacks a "
+            "major.minor pin"
+        )
+        return
+    major, minor = digits.group(1), digits.group(2)
+    exp = ALLOWED_RUNTIME["node"]
+    # engines is a FLOOR: within the contract major, the minor must be >= the
+    # contract minor (a higher floor is still contract-compliant).
+    if major != exp["major"] or int(minor) < int(exp["minor"]):
+        failures.append(
+            f"frontend/package.json: engines.node {engines_node!r} floors node "
+            f"{major}.{minor}, contract requires >={_expected_node()}"
         )
 
 
 def check_contributing(failures: list[str]) -> None:
     text = read("CONTRIBUTING.md")
-    for match in CONTRIBUTING_NODE_RE.finditer(text):
-        major = match.group(1)
-        if major != ALLOWED_RUNTIME["node"]["major"]:
+    node_re = re.compile(
+        r"(?i)\bnode(?:\.js)?\b[^\n]{0,40}?\b(\d{1,2})\.(\d+)"
+    )
+    for match in node_re.finditer(text):
+        ok, why = _node_version_ok(f"{match.group(1)}.{match.group(2)}")
+        if not ok:
             failures.append(
                 "CONTRIBUTING.md: Node.js prerequisite mention "
-                f"{match.group(0).strip()!r} is node major {major}, contract "
-                f"requires {ALLOWED_RUNTIME['node']['major']}"
+                f"{match.group(0).strip()!r} is {why}"
             )
     for match in CONTRIBUTING_PYTHON_RE.finditer(text):
         version = match.group(1)

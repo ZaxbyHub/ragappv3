@@ -1,10 +1,12 @@
 # Stage 1: Build Frontend
-# Pinned to node 20.19 to match CI (ci.yml node-version "20.19.0") so a green
-# CI run proves the shipped image builds (B6-2, #289). node:26 diverged from CI
-# and could build/run differently than what CI validated.
+# Pinned to node 22.11 (current LTS; node 20 is EOL since 2026-04-30) to match
+# CI (ci.yml node-version "22.11.0") so a green CI run proves the shipped image
+# builds. Parity across this FROM, frontend/Dockerfile, ci.yml, package.json
+# engines and CONTRIBUTING.md is enforced by scripts/check_runtime_contract.py
+# (Quality contracts job) — move majors through that gate, not by editing here.
 # Digest pin (issue #404 / #391) freezes the base image for supply-chain
 # integrity; dependabot (docker ecosystem, "/") opens PRs on new digests.
-FROM node:26.8-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS frontend-builder
+FROM node:22.11-alpine@sha256:b64ced2e7cd0a4816699fe308ce6e8a08ccba463c757c00c14cd372e3d2c763e AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -43,9 +45,10 @@ RUN npm run build
 
 # Stage 2: Backend with Unstructured dependencies
 # Pinned to python 3.11 to match CI (ci.yml python-version "3.11") so a green
-# CI run proves the shipped image builds and runs (B6-2, #289).
+# CI run proves the shipped image builds and runs (B6-2, #289). Parity is
+# enforced by scripts/check_runtime_contract.py (Quality contracts job).
 # Digest pin (issue #404 / #391); dependabot (docker, "/") maintains updates.
-FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4 AS backend
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534 AS backend
 
 # Install system dependencies for Unstructured
 # Note: libmagic1 needed for python-magic on Linux

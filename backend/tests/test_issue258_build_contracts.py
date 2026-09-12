@@ -161,7 +161,7 @@ def test_ac9_dependabot_base_image_major_ignore_and_cooldown():
                 for update_type in entry.get("update-types", [])
             }
             print(f"{directory}: ignore={sorted(ignored_types)} cooldown={update.get('cooldown')}")
-            assert "version-update:semantic-major" in ignored_types, (
+            assert "version-update:semver-major" in ignored_types, (
                 f"dependabot docker entry {directory} must ignore major base-image "
                 "bumps (the runtime contract gate owns major moves)"
             )

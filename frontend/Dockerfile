@@ -1,8 +1,9 @@
 # Build stage
-# Digest pin (issue #404 / #391) freezes the base image for supply-chain
-# integrity; dependabot (docker ecosystem, "/frontend") opens PRs on new
-# digests.
-FROM node:26-alpine@sha256:aadf416b2cdce311a8811ba3f0608a61b77dbf997500e2eafe781b51f6a0b019 AS build
+# Pinned to node 22.11 to match CI (ci.yml node-version "22.11.0"); parity is
+# enforced by scripts/check_runtime_contract.py. Digest pin (issue #404 / #391)
+# freezes the base image for supply-chain integrity; dependabot (docker
+# ecosystem, "/frontend") opens PRs on new digests.
+FROM node:22.11-alpine@sha256:b64ced2e7cd0a4816699fe308ce6e8a08ccba463c757c00c14cd372e3d2c763e AS build
 
 WORKDIR /app
 
