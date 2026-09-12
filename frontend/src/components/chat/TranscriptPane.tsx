@@ -449,8 +449,9 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
 
   // PRR-020: anchor the server truncate at the highest durable seq among the
   // KEPT rows instead of a local array index — a local index diverges from
-  // server seq whenever a turn exists locally but was never persisted (Stop,
-  // empty response, failed save), so a positional keep_count would delete the
+  // server seq whenever a turn exists locally but was never persisted (empty
+  // response, failed save, pre-token Stop's user-only save, or an older client
+  // without lifecycle support), so a positional keep_count would delete the
   // wrong range and duplicate Q&A pairs after reload.
   const durableKeepSeq = (keptIds: string[], byId: Record<string, Message>): number => {
     let keepSeq = 0;
