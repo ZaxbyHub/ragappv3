@@ -5,7 +5,7 @@ Application configuration using Pydantic Settings.
 import logging
 import warnings
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Mapping, Optional
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -14,6 +14,53 @@ from app.services.document_artifacts import RASTER_IMAGE_EXTENSIONS
 from app.utils.paths import normalize_root_path
 
 logger = logging.getLogger(__name__)
+
+# Legacy → new settings-field migration table (issue #494 CONFIG-004).
+#
+# Each row is (legacy field, replacement field, conversion factor). The
+# factors are pinned by issue #494 acceptance check C15:
+#   chunk_size       → chunk_size_chars   (x4: 4 chars per token)
+#   chunk_overlap    → chunk_overlap_chars (x4: 4 chars per token)
+#   vector_top_k     → retrieval_top_k     (x1: same unit — chunk count)
+LEGACY_SETTINGS_CONVERSIONS: tuple[tuple[str, str, int], ...] = (
+    ("chunk_size", "chunk_size_chars", 4),
+    ("chunk_overlap", "chunk_overlap_chars", 4),
+    ("vector_top_k", "retrieval_top_k", 1),
+)
+
+
+def apply_legacy_settings_conversion(data: Mapping[str, object]) -> dict:
+    """Apply deprecated legacy settings values onto their replacement fields.
+
+    THE single implementation of the legacy→new precedence, shared by Settings
+    construction (``_convert_legacy_fields_at_construction`` below) and the
+    live settings API (``app/api/routes/settings.py``, issue #494 CONFIG-004):
+
+      - an explicit replacement-field value (not None) is NEVER overridden;
+      - a legacy value present while its replacement is absent produces the
+        converted replacement value (factors in ``LEGACY_SETTINGS_CONVERSIONS``);
+      - neither present → untouched (field defaults apply).
+
+    Returns a new dict; the input mapping is not mutated.
+    """
+    converted = dict(data)
+    for legacy_field, new_field, factor in LEGACY_SETTINGS_CONVERSIONS:
+        legacy_value = converted.get(legacy_field)
+        if legacy_value is None:
+            continue
+        if converted.get(new_field) is None:
+            converted[new_field] = legacy_value * factor
+            logger.warning(
+                "Deprecated: '%s' is deprecated. Use '%s' instead. "
+                "Auto-converting %s=%s to %s=%s.",
+                legacy_field,
+                new_field,
+                legacy_field,
+                legacy_value,
+                new_field,
+                legacy_value * factor,
+            )
+    return converted
 
 
 class Settings(BaseSettings):
@@ -63,6 +110,15 @@ class Settings(BaseSettings):
     32768 preserves the prior hardcoded budget exactly. Configurable so operators
     can shrink the thinking-mode token budget without editing source (issue #395
     DD-rag-005). Must be >= 1 (see validate_per_mode_positive_ints)."""
+    instant_enable_thinking: bool = False
+    """Whether Instant-mode chat requests should leave the model's chat-template
+    thinking mode enabled. False (default) sends ``enable_thinking: False`` via
+    ``chat_template_kwargs`` — the behavior Instant traffic has always had and
+    the correct setting for Gemma-4-style deployments whose templates default to
+    thinking. True omits the kwarg entirely so the provider/model template
+    default governs (for future Instant models that legitimately want thinking).
+    Documented call-role setting per issue #494 FU-005; per-provider capability
+    tables belong to model qualification (F2), not this switch."""
     # Library vault mapping for file watcher
     library_vault_id: Optional[int] = None
 
@@ -95,7 +151,10 @@ class Settings(BaseSettings):
     embedding_query_prefix: str = ""
     """Prefix to prepend to queries during embedding."""
     retrieval_window: int = 1
-    """Window size for retrieval context expansion."""
+    """Window size for retrieval context expansion. 0 disables neighbor-chunk
+    expansion entirely (document_retrieval skips expand_window when the value
+    is not > 0); positive values expand each retrieved chunk by that many
+    neighboring chunks. Documented UI range 0-3."""
     embedding_batch_size: int = 64
     """Number of texts to send per embedding API request. Capped at 128 for TEI compatibility."""
     embedding_batch_max_retries: int = 3
@@ -875,6 +934,27 @@ class Settings(BaseSettings):
         return v
 
     # Migration validators for backward compatibility
+    @model_validator(mode="before")
+    @classmethod
+    def _convert_legacy_fields_at_construction(cls, data):
+        """Apply legacy→new conversion BEFORE field validation (issue #494 CONFIG-004).
+
+        The per-field migration validators below (migrate_chunk_size_chars
+        etc.) run in field-declaration order, and the legacy fields
+        (chunk_size etc.) are declared AFTER the new fields in this model —
+        so ``values.data`` never contains the legacy value when those
+        validators run, and ``Settings(chunk_size=512)`` used to silently
+        yield the DEFAULT chunk_size_chars (2000) instead of the converted
+        2048. Running the shared converter (``apply_legacy_settings_conversion``,
+        the same implementation the live settings API uses) over the complete
+        input dict first makes the conversion work at construction time. The
+        pinned per-field validators keep their exact behavior for direct
+        invocations and for explicit-value passthrough.
+        """
+        if isinstance(data, dict):
+            return apply_legacy_settings_conversion(data)
+        return data
+
     @field_validator("chunk_size_chars", mode="before")
     @classmethod
     def migrate_chunk_size_chars(cls, v: int | None, values) -> int:

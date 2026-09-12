@@ -1,13 +1,15 @@
 import json
+import logging
 import sqlite3
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, field_validator, model_validator
 
 from app.api.deps import get_csrf_manager, get_current_active_user, get_db, require_role
-from app.config import settings
+from app.config import apply_legacy_settings_conversion, settings
 from app.limiter import limiter
 from app.security import CSRFManager, csrf_protect, issue_csrf_token
 from app.services.model_provider_policy import ProviderPolicyError, _parse_strict_origin
@@ -15,6 +17,8 @@ from app.services.ssrf import URLBlocked, assert_url_safe
 from app.services.ssrf_transport import SSRFSafeTransport
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 class SettingsUpdate(BaseModel):
@@ -79,6 +83,7 @@ class SettingsUpdate(BaseModel):
     instant_memory_context_top_k: Optional[int] = None
     instant_max_tokens: Optional[int] = None
     thinking_max_tokens: Optional[int] = None
+    instant_enable_thinking: Optional[bool] = None
 
     # Instant-mode latency skips (trade quality for speed in Instant mode only)
     instant_skip_query_transformation: Optional[bool] = None
@@ -198,6 +203,7 @@ class SettingsUpdate(BaseModel):
         "instant_memory_context_top_k",
         "instant_max_tokens",
         "thinking_max_tokens",
+        "instant_enable_thinking",
     )
     @classmethod
     def validate_per_mode_positive_ints(cls, v):
@@ -236,8 +242,15 @@ class SettingsUpdate(BaseModel):
     @field_validator("retrieval_window")
     @classmethod
     def validate_retrieval_window(cls, v):
-        if v is not None and v <= 0:
-            raise ValueError("retrieval_window must be a positive integer")
+        # 0 is a documented, meaningful value: it disables neighbor-chunk
+        # expansion (document_retrieval.py gates expand_window on
+        # ``retrieval_window > 0``), matching the UI's documented 0-3 range.
+        # Only negative values are invalid (issue #494 CONFIG-005).
+        if v is not None and v < 0:
+            raise ValueError(
+                "retrieval_window must be a non-negative integer "
+                "(0 disables neighbor-chunk expansion)"
+            )
         return v
 
     @field_validator("auto_scan_interval_minutes")
@@ -562,6 +575,7 @@ ALLOWED_FIELDS = [
     "instant_memory_context_top_k",
     "instant_max_tokens",
     "thinking_max_tokens",
+    "instant_enable_thinking",
     "instant_skip_query_transformation",
     "instant_skip_retrieval_evaluation",
     "instant_skip_distillation_synthesis",
@@ -612,6 +626,24 @@ ALLOWED_FIELDS = [
 ]
 
 
+# ── Persistence/replay contract (issue #494 CONFIG-003) ─────────────────────
+# Single source of truth for which persisted settings must survive a restart:
+# every ALLOWED_FIELDS entry the settings API persists into ``settings_kv``
+# and the startup replay (app/lifespan.py ``_load_persisted_settings``)
+# restores onto the Settings singleton. Exclusions would go here — a field
+# that is saveable but intentionally NOT replayed at startup must be listed
+# in ``_PERSISTED_REPLAY_EXCLUSIONS`` with a reason, so the drift that caused
+# CONFIG-003 (21 saveable fields silently reverting to defaults on restart)
+# cannot recur.
+_PERSISTED_REPLAY_EXCLUSIONS: tuple[str, ...] = (
+    # (none today — every saveable field is functional and replayable)
+)
+
+PERSISTED_FUNCTIONAL_FIELDS: list[str] = [
+    field for field in ALLOWED_FIELDS if field not in _PERSISTED_REPLAY_EXCLUSIONS
+]
+
+
 # Curator fields that must be non-empty when wiki_llm_curator_enabled is true.
 # Enforced at PUT-time so the backend never silently accepts a half-configured
 # curator (which would then surface as a runtime error during compile).
@@ -630,15 +662,27 @@ _MULTIMODAL_URL_FIELD = "multimodal_chat_url"
 
 
 def _persist_settings(conn: sqlite3.Connection, update: SettingsUpdate) -> None:
-    """Save changed settings to the settings_kv table."""
+    """Save changed settings to the settings_kv table.
+
+    Persists the legacy→new-converted view (``apply_legacy_settings_conversion``):
+    when a deprecated legacy field (e.g. chunk_size) is saved without its
+    replacement, the derived replacement value (chunk_size_chars = x4) is
+    persisted alongside it, so the saved state survives a restart consistently
+    instead of reverting the conversion (issue #494 CONFIG-004).
+    """
     try:
-        for field in ALLOWED_FIELDS:
-            value = getattr(update, field)
-            if value is not None:
-                conn.execute(
-                    "INSERT OR REPLACE INTO settings_kv (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                    (field, json.dumps(value)),
-                )
+        values = apply_legacy_settings_conversion(
+            {
+                field: getattr(update, field)
+                for field in ALLOWED_FIELDS
+                if getattr(update, field) is not None
+            }
+        )
+        for field, value in values.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO settings_kv (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (field, json.dumps(value)),
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -711,7 +755,16 @@ def _validate_updated_urls(update: SettingsUpdate) -> None:
 
 
 def _validate_settings_update(update: SettingsUpdate) -> dict[str, object]:
-    """Validate a settings update and return changed values."""
+    """Validate a settings update and return changed values.
+
+    The returned dict applies the legacy→new conversion precedence (issue
+    #494 CONFIG-004) via the SAME shared converter Settings construction uses
+    (``app.config.apply_legacy_settings_conversion``): when a deprecated
+    legacy field (chunk_size / chunk_overlap / vector_top_k) is provided
+    without its replacement, the derived replacement value is included
+    (chunk_size x4 → chunk_size_chars etc.) so ``_apply_validated_settings``
+    applies it to the singleton; an explicit replacement field always wins.
+    """
     _validate_updated_urls(update)
     values: dict[str, object] = {}
     for field in ALLOWED_FIELDS:
@@ -722,7 +775,7 @@ def _validate_settings_update(update: SettingsUpdate) -> dict[str, object]:
         raise HTTPException(
             status_code=400, detail="No valid fields provided for update"
         )
-    return values
+    return apply_legacy_settings_conversion(values)
 
 
 class SettingsResponse(BaseModel):
@@ -750,6 +803,7 @@ class SettingsResponse(BaseModel):
     instant_memory_context_top_k: int = 2
     instant_max_tokens: int = 4096
     thinking_max_tokens: int = 32768
+    instant_enable_thinking: bool = False
     instant_skip_query_transformation: bool = True
     instant_skip_retrieval_evaluation: bool = True
     instant_skip_distillation_synthesis: bool = True
@@ -901,6 +955,7 @@ def _build_settings_dict() -> dict:
         "instant_memory_context_top_k": settings.instant_memory_context_top_k,
         "instant_max_tokens": settings.instant_max_tokens,
         "thinking_max_tokens": settings.thinking_max_tokens,
+        "instant_enable_thinking": settings.instant_enable_thinking,
         "instant_skip_query_transformation": settings.instant_skip_query_transformation,
         "instant_skip_retrieval_evaluation": settings.instant_skip_retrieval_evaluation,
         "instant_skip_distillation_synthesis": settings.instant_skip_distillation_synthesis,
@@ -1178,6 +1233,30 @@ def _apply_settings_update(update: SettingsUpdate) -> SettingsResponse:
     return _apply_validated_settings(values)
 
 
+def _reconcile_file_watcher(request: Request) -> None:
+    """Reconcile the running FileWatcher with the saved auto-scan settings.
+
+    Issue #494 CONFIG-001: the watcher used to be started once at app startup
+    and never re-evaluated, so saving ``auto_scan_enabled`` /
+    ``auto_scan_interval_minutes`` had no effect until a restart. Lifespan
+    stores the watcher on ``app.state.file_watcher``; ``FileWatcher.reconcile``
+    is thread-safe (it marshals lifecycle transitions onto the event loop that
+    owns the watch task), so it is safe to call from these sync handlers.
+    Failures must never fail the save itself — the persisted value still
+    applies on the next startup.
+    """
+    watcher = getattr(request.app.state, "file_watcher", None)
+    if watcher is None:
+        return
+    try:
+        watcher.reconcile(settings)
+    except Exception:
+        logger.exception(
+            "FileWatcher reconcile failed after settings save (saved values "
+            "still apply at next startup)"
+        )
+
+
 @router.get("/settings/", response_model=SettingsResponse, include_in_schema=False)
 @router.get("/settings", response_model=SettingsResponse)
 def get_settings(
@@ -1214,6 +1293,11 @@ def post_settings(
     _persist_settings(conn, update)
     _apply_validated_settings(values)
     _hot_rebind_llm_clients(request.app, update)
+    if (
+        update.auto_scan_enabled is not None
+        or update.auto_scan_interval_minutes is not None
+    ):
+        _reconcile_file_watcher(request)
     # Re-derive effective_sources now that we've persisted.
     result = SettingsResponse.model_validate(
         {**_build_settings_dict(), "effective_sources": _compute_effective_sources(conn)}
@@ -1237,6 +1321,11 @@ def put_settings(
     _persist_settings(conn, update)
     _apply_validated_settings(values)
     _hot_rebind_llm_clients(request.app, update)
+    if (
+        update.auto_scan_enabled is not None
+        or update.auto_scan_interval_minutes is not None
+    ):
+        _reconcile_file_watcher(request)
     result = SettingsResponse.model_validate(
         {**_build_settings_dict(), "effective_sources": _compute_effective_sources(conn)}
     )
@@ -1252,9 +1341,45 @@ def get_csrf_token(
     return {"csrf_token": token}
 
 
+def _embedding_probe_payload(url: str) -> dict:
+    """Build the minimal embedding request for the connectivity probe.
+
+    Mirrors ``EmbeddingService._build_payload``'s provider dialects (issue
+    #494 OPS-007): embedding endpoints are POST-only, so the probe must speak
+    the same body shape the service itself sends —
+      - OpenAI ``/v1/embeddings`` and modern Ollama ``/api/embed``:
+        ``{"model", "input"}``;
+      - native TEI ``/embed``: ``{"inputs"}`` (single-model server, no model
+        field);
+      - legacy Ollama ``/api/embeddings`` and bare hosts: per-item
+        ``{"model", "prompt"}``.
+    """
+    path = urlparse(url).path
+    if "/v1/embeddings" in path or path.rstrip("/").endswith("/api/embed"):
+        return {"model": settings.embedding_model, "input": "ping"}
+    if path.rstrip("/").endswith("/embed"):
+        # Native TEI serves a single model, so no model field is sent.
+        return {"inputs": "ping"}
+    if "/api/embeddings" in path or not path:
+        return {"model": settings.embedding_model, "prompt": "ping"}
+    # Unknown URL shape — the OpenAI form is the most common dialect.
+    return {"model": settings.embedding_model, "input": "ping"}
+
+
 @router.get("/settings/connection")
 async def test_connection(user: dict = Depends(get_current_active_user)):
-    """Test connectivity to Ollama endpoints and reranker."""
+    """Test connectivity to Ollama endpoints and reranker.
+
+    The embeddings target is probed with a minimal POST embedding request
+    (embedding endpoints are POST-only; a GET probe made every healthy
+    provider answer 405 and report disconnected — issue #494 OPS-007).
+    Any 2xx response means the endpoint is ready. Chat and reranker targets
+    keep the GET probe. Result fields distinguish failure modes: an
+    ``error`` entry prefixed ``transport failure`` means the endpoint was
+    unreachable; an HTTP status with ``ok=False`` means the request was
+    served but the probe failed (e.g. inference error on the embeddings
+    POST).
+    """
     targets = {
         "embeddings": settings.ollama_embedding_url,
         "chat": settings.ollama_chat_url,
@@ -1280,18 +1405,36 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
                         "error": f"SSRF blocked: {exc}",
                     }
                     continue
-                response = await client.get(url)
-                results[name] = {
-                    "url": url,
-                    "status": response.status_code,
-                    "ok": response.status_code < 300,
-                }
+                if name == "embeddings":
+                    # POST-only endpoint: probe with a real (minimal)
+                    # embedding request so 2xx == actually ready to embed.
+                    response = await client.post(
+                        url, json=_embedding_probe_payload(url)
+                    )
+                    result = {
+                        "url": url,
+                        "status": response.status_code,
+                        "ok": response.status_code < 300,
+                    }
+                    if response.status_code >= 300:
+                        result["error"] = (
+                            "embedding inference failed "
+                            f"(HTTP {response.status_code})"
+                        )
+                    results[name] = result
+                else:
+                    response = await client.get(url)
+                    results[name] = {
+                        "url": url,
+                        "status": response.status_code,
+                        "ok": response.status_code < 300,
+                    }
             except Exception as exc:
                 results[name] = {
                     "url": url,
                     "status": None,
                     "ok": False,
-                    "error": str(exc),
+                    "error": f"transport failure: {exc}",
                 }
 
         # Only add local mode result if reranker wasn't tested (i.e., reranker_url was not set)

@@ -600,11 +600,14 @@ class TestConnectionEndpoint(unittest.TestCase):
     @patch("app.api.routes.settings.httpx.AsyncClient")
     def test_connection_endpoint_with_reranker(self, mock_async_client):
         """Test GET /api/settings/connection tests reranker when configured."""
-        # Mock the async client context manager
+        # Mock the async client context manager. The embeddings target is
+        # probed via POST (issue #494 OPS-007: embedding endpoints are
+        # POST-only), chat/reranker via GET.
         mock_client_instance = AsyncMock()
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_client_instance.get = AsyncMock(return_value=mock_response)
+        mock_client_instance.post = AsyncMock(return_value=mock_response)
         mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client_instance)
 
         # Set reranker URL in settings
@@ -633,11 +636,13 @@ class TestConnectionEndpoint(unittest.TestCase):
     @patch("app.api.routes.settings.httpx.AsyncClient")
     def test_connection_endpoint_reranker_failure(self, mock_async_client):
         """Test GET /api/settings/connection handles reranker failure."""
-        # Mock the async client context manager
+        # Mock the async client context manager (POST probe for embeddings,
+        # GET for chat/reranker — all failing the same way here).
         mock_client_instance = AsyncMock()
         mock_response = MagicMock()
         mock_response.status_code = 500
         mock_client_instance.get = AsyncMock(return_value=mock_response)
+        mock_client_instance.post = AsyncMock(return_value=mock_response)
         mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client_instance)
 
         # Set reranker URL in settings
@@ -660,9 +665,11 @@ class TestConnectionEndpoint(unittest.TestCase):
     @patch("app.api.routes.settings.httpx.AsyncClient")
     def test_connection_endpoint_reranker_exception(self, mock_async_client):
         """Test GET /api/settings/connection handles reranker connection exception."""
-        # Mock the async client context manager
+        # Mock the async client context manager (both probe verbs fail with a
+        # transport-level exception, as an unreachable host would).
         mock_client_instance = AsyncMock()
         mock_client_instance.get = AsyncMock(side_effect=Exception("Connection refused"))
+        mock_client_instance.post = AsyncMock(side_effect=Exception("Connection refused"))
         mock_async_client.return_value.__aenter__ = AsyncMock(return_value=mock_client_instance)
 
         # Set reranker URL in settings
