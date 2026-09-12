@@ -117,6 +117,8 @@ class DraftJobProcessor:
         self._engine = engine
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._generation = 0
+        self._startup_reset_task: Optional[asyncio.Task] = None
         # Throttle for the unwired-engine compile warning (issue #532 review,
         # PRR-024): the poll loop calls ``_claim_next_job`` every interval, so
         # without this flag the same "engine not wired" condition would log
@@ -145,28 +147,56 @@ class DraftJobProcessor:
     async def start(self) -> None:
         if self._running:
             return
+        self._generation += 1
+        generation = self._generation
         self._running = True
         try:
             # Startup recovery must complete before the poll loop begins and
             # before HTTP traffic is accepted (SPEC section 10.1 item 6).
-            await asyncio.to_thread(self._recover_on_startup)
-            self._task = asyncio.create_task(self._poll_loop())
+            reset_task = self._startup_reset_task
+            if reset_task is None:
+                reset_coro = asyncio.to_thread(self._recover_on_startup)
+                try:
+                    reset_task = asyncio.create_task(reset_coro)
+                except BaseException:
+                    reset_coro.close()
+                    raise
+                self._startup_reset_task = reset_task
+                reset_task.add_done_callback(self._consume_startup_reset)
+            # A thread-backed recovery cannot be cancelled; sharing this task
+            # prevents a cancelled start from overlapping a later retry.
+            await asyncio.shield(reset_task)
+            if generation != self._generation or not self._running:
+                return
+            poll_coro = self._poll_loop()
+            try:
+                self._task = asyncio.create_task(poll_coro)
+            except BaseException:
+                # We own the coroutine until create_task accepts it. Closing
+                # it here avoids a warning when publication itself fails.
+                poll_coro.close()
+                raise
         except BaseException:
             # The caller wraps this in a timeout and swallows the result, so
             # without this reset a cancelled recovery would leave _running=True
             # with no poll loop: a processor that reports started, accepts
             # stop(), and silently never runs a job. CancelledError is a
             # BaseException, hence the broad catch.
-            self._running = False
+            if generation == self._generation:
+                self._running = False
+                self._task = None
             raise
         logger.info("DraftJobProcessor started")
 
     async def stop(self) -> None:
+        self._generation += 1
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
+        task = self._task
+        self._task = None
+        if task and not task.done():
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
         for bg in list(self._bg_tasks):
@@ -182,6 +212,26 @@ class DraftJobProcessor:
                 pass
         self._bg_tasks.clear()
         logger.info("DraftJobProcessor stopped")
+
+    def _consume_startup_reset(self, task: asyncio.Task) -> None:
+        """Observe detached recovery failures and clear only the owned task."""
+        try:
+            if not task.cancelled():
+                error = task.exception()
+                if error is not None:
+                    logger.debug(
+                        "DraftJobProcessor startup recovery failed",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+        except asyncio.CancelledError:
+            pass
+        except BaseException:
+            logger.debug(
+                "DraftJobProcessor startup recovery result could not be consumed",
+                exc_info=True,
+            )
+        if getattr(self, "_startup_reset_task", None) is task:
+            self._startup_reset_task = None
 
     # ------------------------------------------------------------------
     # Startup recovery

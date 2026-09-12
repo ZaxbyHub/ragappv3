@@ -431,7 +431,7 @@ class ArtifactEnrichmentService:
 
         # Claim atom stage running (short claim; release before provider call).
         with self.pool.connection() as conn:
-            st.claim_atom_stage(
+            claimed = st.claim_atom_stage(
                 conn, file_id=file_id, generation_hash=generation_hash, atom_pk=atom_pk,
                 stage=st.ENRICH_STAGE, input_fingerprint=input_fingerprint,
                 implementation_version=settings.multimodal_impl_version,
@@ -440,6 +440,10 @@ class ArtifactEnrichmentService:
                 config_id=settings.multimodal_schema_version,
             )
             conn.commit()
+        if not claimed:
+            # Another worker already owns this exact generation/fingerprint.
+            # Do not replace its running claim or transmit the same atom twice.
+            return {"atom_id": atom_id, "outcome": "in_progress"}
 
         try:
             raw_evidence = atom.get("raw_text") or ""

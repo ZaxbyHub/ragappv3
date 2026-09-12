@@ -231,6 +231,7 @@ class TestRecoveryDeadlockRegression:
                 email_subject=None,
                 email_sender=None,
                 file_id=None,
+                _maintenance_checked=False,
             ):
                 item = TaskItem(
                     file_path=file_path,
@@ -250,6 +251,10 @@ class TestRecoveryDeadlockRegression:
             # 4. Call start() with a timeout — if the deadlock exists,
             # this will raise asyncio.TimeoutError
             await asyncio.wait_for(processor.start(), timeout=5.0)
+
+            recovery_task = getattr(processor, "_startup_recovery_task", None)
+            assert recovery_task is not None
+            await asyncio.wait_for(recovery_task, timeout=5.0)
 
             # 5. Verify workers consumed the items (queue should drain)
             await asyncio.wait_for(processor.queue.join(), timeout=5.0)
@@ -341,6 +346,7 @@ class TestStrandedRowRecovery:
                 email_subject=None,
                 email_sender=None,
                 file_id=None,
+                _maintenance_checked=False,
             ):
                 item = TaskItem(
                     file_path=file_path,
@@ -430,6 +436,7 @@ class TestStrandedRowRecovery:
                 email_subject=None,
                 email_sender=None,
                 file_id=None,
+                _maintenance_checked=False,
             ):
                 item = TaskItem(
                     file_path=file_path,

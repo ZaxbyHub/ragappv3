@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import logging
 import re
+import warnings
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,7 +34,8 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
     # artifact-delete sweep task is spawned alongside it (issue #460). The
     # deferred-retry scheduler (issue #513 W11) is spawned right after the
     # reindex worker, and the periodic orphan-rescan sweep (issue #513 W25)
-    # after the artifact-delete sweep.
+    # after the artifact-delete sweep. Detached startup recovery is published
+    # last, after every worker and periodic task is owned.
     assert created_workers == [
         "worker-0",
         "worker-1",
@@ -42,7 +45,94 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
         "vector-delete-sweep",
         "artifact-delete-sweep",
         "orphan-rescan",
+        "startup-recovery",
     ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_start_publishes_one_owned_task_set():
+    from app.services.background_tasks import BackgroundProcessor
+
+    processor = BackgroundProcessor()
+    processor.processor = MagicMock()
+    processor.processor.pool = None
+    release_recovery = asyncio.Event()
+
+    async def blocked_recovery():
+        await release_recovery.wait()
+
+    processor._run_startup_recovery = blocked_recovery
+    with patch("app.services.background_tasks.settings") as mock_settings:
+        mock_settings.ingestion_worker_count = 1
+        await asyncio.gather(processor.start(), processor.start())
+
+    try:
+        assert processor._running
+        assert not processor._starting
+        assert len(processor._worker_tasks) == 1
+        assert processor._startup_recovery_task is not None
+        assert processor._startup_recovery_task.get_name() == "startup-recovery"
+    finally:
+        await processor.stop(timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_start_publication_failure_rolls_back_and_can_retry():
+    import app.services.background_tasks as bt_mod
+    from app.services.background_tasks import BackgroundProcessor
+
+    processor = BackgroundProcessor()
+    processor.processor = MagicMock()
+    processor.processor.pool = None
+    original_create_task = bt_mod.asyncio.create_task
+    original_gather = bt_mod.asyncio.gather
+    created_tasks = []
+    rejected_coroutines = []
+    rollback_starting = []
+
+    def fail_at_artifact_sweep(coro, name=None):
+        if name == "artifact-delete-sweep":
+            rejected_coroutines.append(coro)
+            raise RuntimeError("synthetic task publication failure")
+        task = original_create_task(coro, name=name)
+        created_tasks.append(task)
+        return task
+
+    def observe_rollback(*args, **kwargs):
+        rollback_starting.append(processor._starting)
+        return original_gather(*args, **kwargs)
+
+    with warnings.catch_warnings(record=True) as publication_warnings:
+        warnings.simplefilter("always", RuntimeWarning)
+        with patch.object(bt_mod.asyncio, "create_task", side_effect=fail_at_artifact_sweep):
+            with patch.object(bt_mod.asyncio, "gather", side_effect=observe_rollback):
+                with pytest.raises(RuntimeError, match="synthetic task publication failure"):
+                    await processor.start()
+
+        rejected = rejected_coroutines.pop()
+        assert rejected.cr_frame is None
+        del rejected
+        gc.collect()
+
+    assert not any(
+        issubclass(warning.category, RuntimeWarning)
+        and "was never awaited" in str(warning.message)
+        for warning in publication_warnings
+    )
+
+    assert rollback_starting == [True]
+    assert not processor._starting
+    assert not processor._running
+    assert processor._worker_tasks == []
+    assert processor._startup_recovery_task is None
+    assert all(task.done() for task in created_tasks)
+
+    await processor.start()
+    try:
+        assert processor._running
+        assert not processor._starting
+    finally:
+        await processor.stop(timeout=1.0)
 
 
 @pytest.mark.asyncio
