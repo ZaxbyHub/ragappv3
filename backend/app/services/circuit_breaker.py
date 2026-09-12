@@ -16,6 +16,25 @@ logger = logging.getLogger(__name__)
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+def is_outage_status(status_code: int) -> bool:
+    """Classify an HTTP status as a provider outage (breaker-worthy).
+
+    5xx server errors and 429 rate-limiting mean the provider is unavailable
+    or overloaded — retryable outages that should count toward opening the
+    circuit breaker. Other 4xx statuses are input/configuration errors that
+    would fail identically on every retry and must NOT trip the breaker
+    (OPS-002, issue #494). Shared by every breaker-wrapped HTTP call site
+    (embeddings, chat completion, reranking) so the classification cannot
+    drift between them (review RP-002, PR #576).
+    """
+    if not isinstance(status_code, int):
+        # Non-int statuses (mock transports, exotic adapters) are not
+        # classifiable — treat as non-outage rather than raising inside the
+        # breaker path.
+        return False
+    return status_code >= 500 or status_code == 429
+
+
 class CircuitBreakerState(Enum):
     """Circuit breaker states."""
     CLOSED = "closed"

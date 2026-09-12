@@ -20,7 +20,13 @@ except ImportError:  # pragma: no cover
     redis = None  # type: ignore[assignment]
 
 from app.config import settings
-from app.services.circuit_breaker import CircuitBreakerError, embeddings_cb
+from app.services.circuit_breaker import (
+    CircuitBreakerError,
+    embeddings_cb,
+)
+from app.services.circuit_breaker import (
+    is_outage_status as _is_outage_status,
+)
 from app.services.redis_io import redis_call
 from app.services.ssrf import assert_url_safe
 from app.utils.secrets import redact_url
@@ -104,16 +110,7 @@ class EmbeddingDimensionMismatchError(EmbeddingError):
         )
 
 
-def _is_outage_status(status_code: int) -> bool:
-    """Classify an HTTP status as a provider outage (breaker-worthy).
 
-    5xx server errors and 429 rate-limiting mean the provider is unavailable
-    or overloaded — retryable outages that should count toward opening the
-    circuit breaker. Other 4xx statuses are input/configuration errors that
-    would fail identically on every retry and must NOT trip the breaker
-    (OPS-002, issue #494).
-    """
-    return status_code >= 500 or status_code == 429
 
 
 def _httpcore_live_pool_counts(

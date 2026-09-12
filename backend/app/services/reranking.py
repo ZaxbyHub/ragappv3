@@ -22,7 +22,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from app.config import settings
-from app.services.circuit_breaker import CircuitBreakerError, reranking_cb
+from app.services.circuit_breaker import (
+    CircuitBreakerError,
+    is_outage_status,
+    reranking_cb,
+)
 from app.services.ssrf import assert_url_safe
 
 logger = logging.getLogger(__name__)
@@ -298,14 +302,18 @@ class RerankingService:
         # JSON decoding stays outside — a malformed body is not an outage.
         async def _checked_post() -> httpx.Response:
             response = await self._http_client.post(url, json=payload)
-            response.raise_for_status()
+            # Outage statuses only inside the wrap (review RP-002, PR #576):
+            # ordinary 4xx are input errors, not provider outages.
+            if is_outage_status(response.status_code):
+                response.raise_for_status()
             return response
 
         try:
             response = await reranking_cb(_checked_post)()
-            data = response.json()
         except CircuitBreakerError:
             raise
+        response.raise_for_status()
+        data = response.json()
 
         # data is list of {"index": int, "score": float}
         # Sort by score descending before slicing to ensure correct results

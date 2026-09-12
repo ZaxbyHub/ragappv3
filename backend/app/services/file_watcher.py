@@ -311,8 +311,16 @@ class FileWatcher:
             finally:
                 for task in pending:
                     task.cancel()
+                # Consume the wake INSIDE the loop body, immediately after the
+                # wait returns (review RP-001, PR #576): the event stays set
+                # until explicitly cleared, so clearing it anywhere else (in
+                # start(), or after the loop — which stop()'s task-cancel path
+                # skips entirely) lets every subsequent wait resolve instantly
+                # and turns the periodic scan into an unbounded busy loop.
+                self._wake_event.clear()
 
-        # Clear the wake so a subsequent start() begins with a clean signal.
+        # Belt-and-suspenders for a clean loop exit (the cancel path above
+        # already covers stop()-during-wait).
         self._wake_event.clear()
 
     @property

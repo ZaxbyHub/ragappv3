@@ -15,6 +15,7 @@ from app.services.circuit_breaker import (
     CircuitBreakerError,
     CircuitBreakerState,
     create_llm_circuit_breaker,
+    is_outage_status,
 )
 from app.services.ssrf import assert_url_safe
 from app.utils.assistant_sanitizer import sanitize_assistant_content
@@ -350,10 +351,17 @@ class LLMClient:
             # outage signal.
             async def _checked_post() -> httpx.Response:
                 response = await client.post(url, json=payload)
-                response.raise_for_status()
+                # Only OUTAGE statuses charge the breaker inside the wrap
+                # (review RP-002, PR #576): ordinary 4xx are input/config
+                # errors that would recur on every retry — raising them
+                # here would open the shared breaker off a misconfigured
+                # request, not a provider outage.
+                if is_outage_status(response.status_code):
+                    response.raise_for_status()
                 return response
 
             response = await self._circuit_breaker(_checked_post)()
+            response.raise_for_status()
             data = response.json()
 
             if "choices" not in data or not data["choices"]:
@@ -747,8 +755,12 @@ class LLMClient:
                 self._circuit_breaker.record_failure()
             raise LLMError(f"Streaming request timed out after {self.timeout}s") from e
         except httpx.HTTPStatusError as e:
-            async with self._circuit_breaker._lock:
-                self._circuit_breaker.record_failure()
+            # Charge the breaker for OUTAGE statuses only (review RP-002,
+            # PR #576): ordinary 4xx are input/config errors that would
+            # recur on every retry, not provider outages.
+            if is_outage_status(e.response.status_code):
+                async with self._circuit_breaker._lock:
+                    self._circuit_breaker.record_failure()
             # Read response content first to avoid ResponseNotRead error in streaming context
             try:
                 response_text = (await e.response.aread()).decode(
