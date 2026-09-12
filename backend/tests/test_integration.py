@@ -2,10 +2,21 @@
 Integration tests for the KnowledgeVault RAG application.
 
 These tests cover end-to-end flows including:
-- Upload -> Index -> Chat flow
 - Memory search operations
-- Document deletion
 - Error handling for embedding/chat downtime
+- Upload validation error cases
+- Health / memory-management error paths
+
+NOTE (issue #258 / TEST-008): the former theater versions of the
+"upload -> index -> chat" flow (fully-mocked DocumentProcessor, never chatted
+against indexed data) and the mocked document-deletion tests (mocked
+VectorStore class; the success case never created a row and never called
+DELETE; the not-found case was a bare pass) were REMOVED. The real-worker /
+real-store replacements live in ``test_issue258_e2e_real_worker.py``:
+upload -> REAL in-process worker drain -> persisted 'indexed' -> chat
+retrieval of the actually-stored chunk text, and real row + real on-disk
+file + stored vectors -> DELETE -> row gone, vectors gone, second DELETE
+404.
 
 Run with: python -m pytest backend/tests/test_integration.py -v
 """
@@ -417,125 +428,12 @@ class TestIntegration(unittest.TestCase):
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # ==========================================================================
-    # Test: Upload -> Index -> Chat Flow
+    # Test: Chat streaming
+    #
+    # The former "upload -> index -> chat" theater test (fully-mocked
+    # DocumentProcessor; never chatted against indexed data) was removed —
+    # see test_issue258_e2e_real_worker.py for the real-worker version.
     # ==========================================================================
-
-    @patch("app.api.routes.documents.DocumentProcessor")
-    def test_upload_index_chat_flow(self, mock_processor_class):
-        """Test complete flow: upload document, index it, then chat with RAG."""
-        from fastapi.testclient import TestClient
-
-        from app.main import app
-
-        # Setup mocks for app state
-        setup_app_state(app)
-
-        client = TestClient(app)
-
-        # Setup mock processor
-        mock_processor = MagicMock()
-        mock_processor_class.return_value = mock_processor
-        mock_processor._check_duplicate_in_flight.return_value = None  # no duplicate
-        mock_processor._insert_or_get_file_record.return_value = 123   # file_id
-
-        # Mock process_file to return a processed document
-        mock_result = MagicMock()
-        mock_result.file_id = 123
-        mock_result.chunks = [
-            MagicMock(text="Chunk 1 content", chunk_index=0),
-            MagicMock(text="Chunk 2 content", chunk_index=1),
-        ]
-        mock_processor.process_file = AsyncMock(return_value=mock_result)
-
-        # Step 1: Upload a document
-        test_content = b"This is a test document content for integration testing."
-        response = client.post(
-            "/api/documents/upload?vault_id=1",
-            files={"file": ("test_doc.txt", BytesIO(test_content), "text/plain")},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        upload_data = response.json()
-        self.assertIn("file_id", upload_data)
-        # status is now 'pending' (queued for async processing), not 'indexed'
-        self.assertIn(upload_data["status"], ["pending", "indexed"])
-        # Verify the upload actually enqueued background processing
-        app.state.background_processor.enqueue.assert_called_once()
-
-        # Step 2: Verify document is listed
-        response = client.get("/api/documents")
-        self.assertEqual(response.status_code, 200)
-        docs_data = response.json()
-        self.assertIn("documents", docs_data)
-
-    def test_chat_with_indexed_document(self):
-        """Test chat endpoint returns response with sources."""
-        from fastapi.testclient import TestClient
-
-        from app.api.deps import get_rag_engine
-        from app.main import app
-        from app.services.rag_engine import RAGEngine
-
-        # Setup mocks for app state
-        setup_app_state(app)
-
-        client = TestClient(app)
-
-        # Setup fake vector store with search results
-        self.fake_vector_store.search_results = [
-            {
-                "text": "This is relevant information from the document.",
-                "file_id": "123",
-                "metadata": {"source_file": "test_doc.txt"},
-                "score": 0.95,
-            }
-        ]
-
-        # Setup fake memory
-        fake_memory = MagicMock()
-        fake_memory.content = "Remember this important fact"
-        self.fake_memory_store._memories = [fake_memory]
-
-        from app.config import settings as app_settings
-
-        # Create RAG engine with fake services
-        rag_engine = RAGEngine(
-            embedding_service=self.fake_embedding_service,
-            vector_store=self.fake_vector_store,
-            memory_store=self.fake_memory_store,
-            llm_client=self.fake_llm_client,
-        )
-        # Disable atomic visibility filter (no files in test DB)
-        rag_engine._get_indexed_file_ids = MagicMock(return_value=None)
-        # Override dependency to use our fake RAG engine
-        app.dependency_overrides[get_rag_engine] = lambda: rag_engine
-
-        # FakeEmbeddingService returns identical embeddings, so context distillation
-        # would deduplicate all chunks. Disable it for this test.
-        with patch.object(app_settings, "context_distillation_enabled", False):
-            try:
-                # Send chat request
-                response = client.post(
-                    "/api/chat",
-                    json={
-                        "message": "What information is in the document?",
-                        "history": [],
-                        "stream": False,
-                    },
-                )
-
-                self.assertEqual(response.status_code, 200)
-                chat_data = response.json()
-                self.assertIn("content", chat_data)
-                self.assertIn("sources", chat_data)
-                self.assertIn("memories_used", chat_data)
-
-                # Verify sources are included
-                self.assertEqual(len(chat_data["sources"]), 1)
-                self.assertEqual(chat_data["sources"][0]["file_id"], "123")
-            finally:
-                # Clean up dependency override
-                app.dependency_overrides.pop(get_rag_engine, None)
 
     @patch("app.api.routes.chat.get_rag_engine")
     def test_chat_streaming_response(self, mock_get_rag_engine):
@@ -664,88 +562,13 @@ class TestIntegration(unittest.TestCase):
 
     # ==========================================================================
     # Test: Document Delete
+    #
+    # The three former mocked deletion tests were removed (issue #258 /
+    # TEST-008): they patched the VectorStore class, the "success" case never
+    # created a row and never called DELETE, and the not-found case was a
+    # bare pass. The real row/file/vectors -> DELETE -> gone + second 404
+    # coverage lives in test_issue258_e2e_real_worker.py.
     # ==========================================================================
-
-    @patch("app.api.routes.documents.VectorStore")
-    def test_document_delete_without_existing_doc(self, mock_vector_store_class):
-        """Test document deletion returns 404 for non-existent document."""
-        from fastapi.testclient import TestClient
-
-        from app.main import app
-
-        # Setup mocks for app state
-        setup_app_state(app)
-
-        client = TestClient(app)
-
-        # Mock vector store
-        mock_vector_store = MagicMock()
-        mock_vector_store_class.return_value = mock_vector_store
-        mock_vector_store.delete_by_file = MagicMock(return_value=2)
-        mock_vector_store.db = MagicMock()
-        mock_vector_store.db.table_names.return_value = ["chunks"]
-
-        # Try delete of non-existent document (auth skipped when no token configured)
-        response = client.delete("/api/documents/1")
-        self.assertEqual(response.status_code, 404)  # Document not found
-
-    @patch("app.api.routes.documents.SecretManager")
-    @patch("app.api.routes.documents.VectorStore")
-    def test_document_delete_success(
-        self, mock_vector_store_class, mock_secret_manager_class
-    ):
-        """Test successful document deletion removes file and chunks."""
-        from fastapi.testclient import TestClient
-
-        from app.main import app
-
-        # Setup mocks for app state
-        setup_app_state(app)
-
-        client = TestClient(app)
-
-        # Setup mocks
-        mock_vector_store = MagicMock()
-        mock_vector_store_class.return_value = mock_vector_store
-        mock_vector_store.db = MagicMock()
-        mock_vector_store.db.table_names.return_value = ["chunks"]
-        mock_vector_store.delete_by_file = MagicMock(return_value=2)
-        mock_vector_store.connect = MagicMock()
-        mock_vector_store.close = MagicMock()
-
-        mock_secret_manager = MagicMock()
-        mock_secret_manager.get_hmac_key.return_value = (b"test_key", "v1")
-        mock_secret_manager_class.return_value = mock_secret_manager
-
-        # First create a document by uploading
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write("Test document content")
-            temp_file = f.name
-
-        try:
-            # This would normally require proper auth setup
-            # For integration test, we verify the delete flow structure
-            response = client.get("/api/documents")
-            self.assertIn(response.status_code, [200, 401])
-        finally:
-            if os.path.exists(temp_file):
-                os.unlink(temp_file)
-
-    def test_document_delete_not_found(self):
-        """Test deleting a non-existent document returns 404."""
-        from fastapi.testclient import TestClient
-
-        from app.main import app
-
-        # Setup mocks for app state
-        setup_app_state(app)
-
-        TestClient(app)
-
-        # This requires authentication to test properly
-        # The endpoint should return 404 for non-existent documents
-        # We verify the API structure is correct
-        pass  # Would need auth setup to test fully
 
     # ==========================================================================
     # Test: Error Cases for Embedding/Chat Downtime
