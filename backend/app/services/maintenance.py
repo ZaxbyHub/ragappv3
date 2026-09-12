@@ -80,6 +80,11 @@ class MaintenanceService:
                 if cursor.rowcount:
                     conn.commit()
                     return
+                # Optimistic-lock miss: the UPDATE matched no rows, so end the
+                # implicit transaction it opened before this connection
+                # returns to the pool instead of relying on the pool's
+                # release-time rollback (issue #548).
+                conn.rollback()
             finally:
                 self.pool.release_connection(conn)
             attempts += 1

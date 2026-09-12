@@ -5038,6 +5038,13 @@ class SQLiteConnectionPool:
         """
         Release a connection back to the pool.
 
+        A connection holding an open transaction is rolled back first, so no
+        borrower can inherit another handler's uncommitted work (issue #548):
+        the next caller's commit() would otherwise durably persist the
+        abandoned rows, and the PRAGMA foreign_keys re-issued by
+        _validate_connection silently no-ops inside the stale transaction.
+        The warning is the signal that some call site still leaks.
+
         Args:
             conn: The connection to release back to the pool.
 
@@ -5046,6 +5053,31 @@ class SQLiteConnectionPool:
         """
         if self._closed:
             raise RuntimeError("Connection pool has been closed")
+
+        # The guard must never raise: a raise here would bypass the
+        # pool-full close below and, in get_db's bare finally, mask the
+        # handler's original exception. in_transaction access is wrapped
+        # separately from rollback() because it raises ProgrammingError on
+        # an already-closed connection.
+        try:
+            dirty = conn.in_transaction
+        except sqlite3.Error:
+            dirty = False
+        if dirty:
+            logger.warning(
+                "pool_release_rollback sqlite_path=%s: connection returned to "
+                "the pool with an open transaction; rolled back",
+                self.sqlite_path,
+            )
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                logger.warning(
+                    "pool_release_rollback sqlite_path=%s: rollback of dirty "
+                    "connection failed",
+                    self.sqlite_path,
+                    exc_info=True,
+                )
 
         try:
             self._pool.put_nowait(conn)
