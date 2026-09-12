@@ -222,6 +222,10 @@ services:
       # missing credential deactivates the feature instead of crashing —
       # it is never silently populated from anywhere but the operator's .env.
       # ------------------------------------------------------------------
+      # Concurrency: forwarded so the health module's worker guard
+      # (health.py _warn_multi_worker_cache) is live on scale-out
+      # deployments — default 1 keeps the single-worker default silent.
+      - WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
       # Auth & security
       - USERS_ENABLED=${USERS_ENABLED:-}
       - JWT_ALGORITHM=${JWT_ALGORITHM:-}
