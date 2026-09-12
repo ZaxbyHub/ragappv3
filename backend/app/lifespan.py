@@ -239,9 +239,10 @@ def _load_persisted_settings(sqlite_path: str) -> None:
         # reading this list (backend/tests/test_issue494_settings_replay_drift.py
         # C12a extracts it with ast; test_lifespan_wiki_settings_reload.py
         # greps it). The equality guard right below makes any drift between
-        # the two lists an immediate, loud failure at import time — the
-        # hand-maintained-list drift that caused CONFIG-003 (21 saveable fields
-        # silently reverting to defaults on restart) cannot recur silently.
+        # the two lists a loud failure the first time persisted settings are
+        # loaded — the hand-maintained-list drift that caused CONFIG-003 (21
+        # saveable fields silently reverting to defaults on restart) cannot
+        # recur silently.
         NEW_DIRECT_KEYS = [
             "chunk_size_chars",
             "chunk_overlap_chars",

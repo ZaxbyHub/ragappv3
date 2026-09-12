@@ -89,26 +89,74 @@ class TestHealthModuleWorkerGuard(unittest.TestCase):
             "settings check so multi-worker deployments cannot silently "
             "rely on per-worker caches",
         )
-        # Amendment (plan-critic Round 1): the guard must be referenced in the
-        # module's own source — scanning dir(health) catches imports too, but
-        # only a same-module reference proves the cache code path consults it.
-        import inspect
-        source = inspect.getsource(health)
-        wired = []
-        for guard_name in guards:
-            references = source.count(guard_name)
-            # One reference is the definition itself; a wired guard appears
-            # at least twice (definition + use) or is imported-but-unused=0.
-            if references >= 2 or (callable(getattr(health, guard_name, None)) and references >= 2):
-                wired.append(guard_name)
+        # Amendment 2 (implementation review, NEEDS_REVISION item 1): the
+        # reference-count wiring test above still passes when the CALL SITE is
+        # commented out (the function body itself references the constant).
+        # The decisive discriminator is runtime: the guard must actually be
+        # invoked when the /api/health endpoint serves a request. Spy on every
+        # callable guard symbol and drive one real request through the route
+        # (same harness shape as the AC29 check: TestClient without lifespan
+        # startup, checker dependencies overridden).
+        from unittest import mock
+
+        from fastapi.testclient import TestClient
+
+        from app.api.deps import get_llm_health_checker, get_model_checker
+        from app.main import app
+
+        class _StubChecker:
+            async def check_all(self):
+                return {"backend": True, "embeddings": True, "chat": True}
+
+            async def check_models(self):
+                return {"ok": True, "models": {}}
+
+        class _StubVectorStore:
+            def get_stats(self):
+                return {"total_chunks": 0}
+
+        callables_to_spy = [
+            name
+            for name in guards
+            if callable(getattr(health, name, None))
+        ]
         self.assertNotEqual(
-            wired,
+            callables_to_spy,
             [],
-            "worker guard symbols exist in health.py but none is referenced "
-            "by the module's own code — a never-consumed constant cannot "
-            "protect the module-level deep-health cache; wire the guard into "
-            "the refresh/serve path (e.g. log-once warning when "
-            "WEB_CONCURRENCY != 1)",
+            "no callable worker guard to verify on the request path — a "
+            "constant alone cannot act when a multi-worker deployment serves "
+            "requests",
+        )
+        had_vs = hasattr(app.state, "vector_store")
+        orig_vs = getattr(app.state, "vector_store", None)
+        app.state.vector_store = _StubVectorStore()
+        app.dependency_overrides[get_llm_health_checker] = lambda: _StubChecker()
+        app.dependency_overrides[get_model_checker] = lambda: _StubChecker()
+        spies = {}
+        try:
+            for name in callables_to_spy:
+                spies[name] = mock.patch.object(
+                    health, name, wraps=getattr(health, name)
+                ).start()
+            client = TestClient(app)
+            resp = client.get("/api/health")
+            self.assertEqual(resp.status_code, 200)
+        finally:
+            mock.patch.stopall()
+            app.dependency_overrides.pop(get_llm_health_checker, None)
+            app.dependency_overrides.pop(get_model_checker, None)
+            if had_vs:
+                app.state.vector_store = orig_vs
+            else:
+                delattr(app.state, "vector_store")
+        invoked = [name for name, spy in spies.items() if spy.called]
+        self.assertNotEqual(
+            invoked,
+            [],
+            "worker guard is defined but NOT invoked when /api/health serves "
+            "a request — a commented-out or dead call site is a no-op guard; "
+            "the serve path must call the warning/assertion helper on every "
+            "request (or at first serve)",
         )
 
 
