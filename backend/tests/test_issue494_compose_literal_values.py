@@ -28,7 +28,7 @@ LITERAL_ALLOWED = {
     "HOST_DATA_DIR",
     "HF_TOKEN",
     # Container-internal paths/values pinned by the image + volume contract:
-    # DATA_DIR must agree with the Dockerfile WORKDIR and the /app/data volume;
+    # DATA_DIR must agree with the container-internal /app/data volume mount;
     # the two feature flags below are deliberately pinned off in the compose
     # deployment until their features graduate.
     "DATA_DIR",
@@ -88,10 +88,9 @@ class TestComposeForwardingShape(unittest.TestCase):
         )
 
     def test_exception_list_keys_are_pinned_or_absent(self):
-        for key in LITERAL_ALLOWED:
-            if key in {"PORT", "VITE_APP_BASENAME", "VITE_API_URL", "HOST_DATA_DIR", "HF_TOKEN"}:
-                continue  # not backend-env keys at all
-        # DATA_DIR must stay pinned to the container-internal contract path.
+        # Non-backend keys (PORT, VITE_*, HOST_DATA_DIR, HF_TOKEN) never reach
+        # this environment block; DATA_DIR must stay pinned to the
+        # container-internal contract path.
         forwarded = dict(_backend_env_entries())
         self.assertEqual(
             forwarded.get("DATA_DIR"),

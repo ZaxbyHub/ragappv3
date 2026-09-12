@@ -1190,7 +1190,8 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
     thinking_client = getattr(app.state, "thinking_llm_client", None)
     instant_client = getattr(app.state, "instant_llm_client", None)
     # Review F5 (PR #576): max_tokens and the instant thinking kwarg are read
-    # at client construction; rebind them alongside URL/model so a saved
+    # at client construction; always pass the current settings values here —
+    # reconfigure's own per-field diff check skips no-op updates — so a saved
     # change takes effect without a restart.
     if thinking_client is not None and (
         update.ollama_chat_url is not None
