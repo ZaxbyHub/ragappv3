@@ -3,8 +3,14 @@
  *
  * Visible across tab switches so the user never loses sight of unsaved
  * changes. Save is disabled when invalid; Discard is disabled when
- * clean. Surfaces the count of dirty fields and a per-tab summary so
- * the user knows what's pending without scrolling.
+ * clean. Surfaces the count of dirty fields and a per-tab summary so the
+ * user knows what's pending without scrolling.
+ *
+ * When idle (clean, not saving) the region is removed from the
+ * accessibility tree via aria-hidden rather than merely faded out, and
+ * the status text renders nothing — an idle page must not expose an
+ * "Unsaved changes" region or an unsolicited "Saving…" to assistive tech.
+ * The saving indicator (save in flight) stays exposed.
  */
 import { Button } from "@/components/ui/button";
 import { Loader2, Undo2 } from "lucide-react";
@@ -35,6 +41,7 @@ export function SaveDiscardFooter({
       )}
       role="region"
       aria-label="Unsaved changes"
+      aria-hidden={!visible}
     >
       <div className="flex items-center justify-between gap-4 px-4 py-3">
         <div className="text-sm">
@@ -46,9 +53,9 @@ export function SaveDiscardFooter({
             <span>
               {dirtyCount} unsaved {dirtyCount === 1 ? "change" : "changes"}
             </span>
-          ) : (
+          ) : saving ? (
             <span className="text-muted-foreground">Saving…</span>
-          )}
+          ) : null}
         </div>
         <div className="flex items-center gap-2">
           <Button

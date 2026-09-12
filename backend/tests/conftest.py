@@ -260,6 +260,18 @@ def pytest_configure(config):
     Sets environment variables and clears all app.* modules from the
     import cache so they re-import with test-compatible settings.
     """
+    # config.Settings resolves data_dir (and thus sqlite_path) against the
+    # CURRENT WORKING DIRECTORY. The sqlite pool creates connections without
+    # mkdir(parents=True), so under xdist any worker that reaches a real
+    # pool before another worker's tests have created ./data fails with
+    # "sqlite3.OperationalError: unable to open database file" (PR #576 CI:
+    # test_deps_auth flaked exactly this way once this PR added enough new
+    # tests to shift worker scheduling). Create the directory up front, on
+    # every worker, before collection hands out the first test.
+    try:
+        os.makedirs("data", exist_ok=True)
+    except OSError:
+        pass
     # pandas' is_pyarrow_array() looks up pyarrow.Array from sys.modules at
     # call time. Many test files stub sys.modules['pyarrow'] with a bare
     # types.ModuleType that has no Array attribute, causing AttributeError.

@@ -21,6 +21,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
 import {
   Tabs,
   TabsContent,
@@ -97,8 +98,10 @@ function SettingsPageContent({
     reindexRequired,
     setSettings,
     initializeForm,
+    initializeFormAfterSave,
     setSaving,
     setError,
+    setLoadError,
     setReindexRequired,
     updateFormField,
     validateForm,
@@ -111,6 +114,10 @@ function SettingsPageContent({
   const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<SettingsTab>("overview");
   const [reindexDialogOpen, setReindexDialogOpen] = useState(false);
+  // Retry counter for the initial-load error card: incrementing it re-runs
+  // the load effect (state-driven retry). The effect body does not read
+  // the value — the dependency alone re-triggers the fetch.
+  const [loadAttempt, setLoadAttempt] = useState(0);
 
   useEffect(() => {
     if (testMode) {
@@ -128,13 +135,17 @@ function SettingsPageContent({
       })
       .catch((err) => {
         if (mounted) {
-          setError(err instanceof Error ? err.message : "Failed to load settings");
+          // setLoadError records the failure AND clears `loading` — the
+          // plain setError left the skeleton rendered forever (UI-029).
+          setLoadError(
+            err instanceof Error ? err.message : "Failed to load settings",
+          );
         }
       });
     return () => {
       mounted = false;
     };
-  }, [setSettings, initializeForm, setError, testMode]);
+  }, [setSettings, initializeForm, setLoadError, testMode, loadAttempt]);
 
   const dirtySet = dirtyFields();
   const dirtyCount = dirtySet.size;
@@ -172,12 +183,18 @@ function SettingsPageContent({
     setSaving(true);
     setError(null);
     try {
+      // Snapshot the form exactly as submitted: fields whose live value
+      // moves on from this snapshot while the request is in flight are
+      // post-submit edits that must survive the post-save re-init.
+      const submitSnapshot: SettingsFormData = { ...formData };
       const payload = pickDirtyPayload(formData, loadedFormData);
       const updated = await updateSettings(payload);
       setSettings(updated);
       // Re-initialize so the snapshot reflects the new persisted state
-      // and dirtyFields drops to zero.
-      initializeForm(updated);
+      // and dirtyFields drops to zero — while re-applying any edits the
+      // user made while the save was in flight so they are not silently
+      // dropped and stay dirty (UI-031).
+      initializeFormAfterSave(updated, submitSnapshot);
       // The sidebar nav gate (useDraftRoomVisible) reads capabilities via a
       // 5-minute-staleTime query — invalidate it so a saved toggle takes
       // effect immediately instead of waiting out the cache.
@@ -245,8 +262,17 @@ function SettingsPageContent({
   if (error && !settings) {
     return (
       <Card>
-        <CardContent className="py-8">
+        <CardContent className="py-8 space-y-4">
           <p className="text-destructive text-center">Error: {error}</p>
+          <div className="flex justify-center">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setLoadAttempt((n) => n + 1)}
+            >
+              Retry
+            </Button>
+          </div>
         </CardContent>
       </Card>
     );

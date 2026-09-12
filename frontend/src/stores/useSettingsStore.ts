@@ -58,6 +58,7 @@ export interface SettingsFormData {
   instant_memory_context_top_k: number;
   instant_max_tokens: number;
   thinking_max_tokens: number;
+  instant_enable_thinking: boolean;
   // Wiki & curator (PR B + PR C)
   wiki_enabled: boolean;
   wiki_compile_on_ingest: boolean;
@@ -140,6 +141,7 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   instant_memory_context_top_k: "models",
   instant_max_tokens: "models",
   thinking_max_tokens: "models",
+  instant_enable_thinking: "models",
   wiki_enabled: "wiki",
   wiki_compile_on_ingest: "wiki",
   wiki_compile_on_query: "wiki",
@@ -217,10 +219,21 @@ export interface SettingsState {
   setLoading: (loading: boolean) => void;
   setSaving: (saving: boolean) => void;
   setError: (error: string | null) => void;
+  /** Failed initial load: records the error AND clears ``loading`` so the
+   * skeleton does not render forever (UI-029). */
+  setLoadError: (error: string) => void;
   setErrors: (errors: SettingsErrors) => void;
   setSaveStatus: (status: "idle" | "success" | "error") => void;
 
   initializeForm: (settings: SettingsResponse) => void;
+  /** Post-save re-initialization that preserves edits made while the save
+   * request was in flight (UI-031): fields whose live value moved on from
+   * ``submitSnapshot`` are re-applied over the server snapshot so they
+   * stay in ``formData`` and remain dirty. */
+  initializeFormAfterSave: (
+    settings: SettingsResponse,
+    submitSnapshot: SettingsFormData,
+  ) => void;
 
   validateForm: () => boolean;
 
@@ -267,6 +280,7 @@ const defaultFormData: SettingsFormData = {
   instant_memory_context_top_k: 2,
   instant_max_tokens: 4096,
   thinking_max_tokens: 32768,
+  instant_enable_thinking: false,
   wiki_enabled: true,
   wiki_compile_on_ingest: true,
   wiki_compile_on_query: true,
@@ -364,6 +378,7 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     instant_memory_context_top_k: settings.instant_memory_context_top_k ?? 2,
     instant_max_tokens: settings.instant_max_tokens ?? 4096,
     thinking_max_tokens: settings.thinking_max_tokens ?? 32768,
+    instant_enable_thinking: settings.instant_enable_thinking ?? false,
     wiki_enabled: settings.wiki_enabled ?? true,
     wiki_compile_on_ingest: settings.wiki_compile_on_ingest ?? true,
     wiki_compile_on_query: settings.wiki_compile_on_query ?? true,
@@ -419,6 +434,191 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
   };
 }
 
+/**
+ * Per-field validators shared by ``validateForm`` (submit time) and
+ * ``updateFormField``'s error re-sync (change time), so change-time and
+ * submit-time validation cannot diverge (UI-030). A validator returns its
+ * error message, or undefined when the field (and every rule that writes
+ * to it) passes. Cross-field rules live in the validator of the field the
+ * error is reported on (e.g. chunk_overlap_chars reads chunk_size_chars).
+ */
+const FIELD_VALIDATORS: Partial<
+  Record<keyof SettingsFormData, (data: SettingsFormData) => string | undefined>
+> = {
+  chunk_size_chars: (d) =>
+    d.chunk_size_chars <= 0
+      ? "Chunk size must be a positive integer"
+      : undefined,
+  chunk_overlap_chars: (d) => {
+    if (d.chunk_overlap_chars < 0)
+      return "Chunk overlap must be a non-negative integer";
+    if (d.chunk_overlap_chars >= d.chunk_size_chars)
+      return "Chunk overlap must be less than chunk size";
+    return undefined;
+  },
+  retrieval_top_k: (d) =>
+    d.retrieval_top_k <= 0
+      ? "Retrieval top-k must be a positive integer"
+      : undefined,
+  auto_scan_interval_minutes: (d) =>
+    d.auto_scan_interval_minutes <= 0
+      ? "Scan interval must be a positive integer"
+      : undefined,
+  embedding_batch_size: (d) =>
+    d.embedding_batch_size < 1 || d.embedding_batch_size > 128
+      ? "Embedding batch size must be between 1 and 128"
+      : undefined,
+  max_distance_threshold: (d) =>
+    d.max_distance_threshold < 0 || d.max_distance_threshold > 1
+      ? "Distance threshold must be between 0 and 1"
+      : undefined,
+  retrieval_window: (d) =>
+    d.retrieval_window < 0 || d.retrieval_window > 3
+      ? "Retrieval window must be between 0 and 3"
+      : undefined,
+  vector_metric: (d) =>
+    ["cosine", "euclidean", "dot_product"].includes(d.vector_metric)
+      ? undefined
+      : "Vector metric must be cosine, euclidean, or dot_product",
+  initial_retrieval_top_k: (d) =>
+    d.initial_retrieval_top_k !== undefined &&
+    (d.initial_retrieval_top_k < 5 || d.initial_retrieval_top_k > 100)
+      ? "Initial retrieval top-k must be between 5 and 100"
+      : undefined,
+  reranker_top_n: (d) =>
+    d.reranker_top_n !== undefined &&
+    (d.reranker_top_n < 1 || d.reranker_top_n > 20)
+      ? "Reranker top-n must be between 1 and 20"
+      : undefined,
+  hybrid_alpha: (d) =>
+    d.hybrid_alpha !== undefined &&
+    (d.hybrid_alpha < 0 || d.hybrid_alpha > 1)
+      ? "Hybrid alpha must be between 0 and 1"
+      : undefined,
+  ollama_embedding_url: (d) =>
+    d.ollama_embedding_url && !/^https?:\/\//.test(d.ollama_embedding_url)
+      ? "URL must start with http:// or https://"
+      : undefined,
+  ollama_chat_url: (d) =>
+    d.ollama_chat_url && !/^https?:\/\//.test(d.ollama_chat_url)
+      ? "URL must start with http:// or https://"
+      : undefined,
+  instant_chat_url: (d) =>
+    d.instant_chat_url && !/^https?:\/\//.test(d.instant_chat_url)
+      ? "URL must start with http:// or https://"
+      : undefined,
+  instant_chat_model: (d) =>
+    d.default_chat_mode === "instant" && !d.instant_chat_model.trim()
+      ? "Instant chat model is required"
+      : undefined,
+  default_chat_mode: (d) =>
+    ["instant", "thinking"].includes(d.default_chat_mode)
+      ? undefined
+      : "Default chat mode must be instant or thinking",
+  ingestion_llm_mode: (d) =>
+    ["instant", "thinking", "disabled"].includes(d.ingestion_llm_mode)
+      ? undefined
+      : "Ingestion LLM mode must be instant, thinking, or disabled",
+  instant_initial_retrieval_top_k: (d) =>
+    d.instant_initial_retrieval_top_k <= 0 ||
+    !Number.isInteger(d.instant_initial_retrieval_top_k)
+      ? "Instant initial retrieval top-k must be a positive integer"
+      : undefined,
+  instant_reranker_top_n: (d) =>
+    d.instant_reranker_top_n <= 0 ||
+    !Number.isInteger(d.instant_reranker_top_n)
+      ? "Instant reranker top-n must be a positive integer"
+      : undefined,
+  instant_memory_context_top_k: (d) =>
+    d.instant_memory_context_top_k <= 0 ||
+    !Number.isInteger(d.instant_memory_context_top_k)
+      ? "Instant memory context top-k must be a positive integer"
+      : undefined,
+  instant_max_tokens: (d) =>
+    d.instant_max_tokens <= 0 || !Number.isInteger(d.instant_max_tokens)
+      ? "Instant max tokens must be a positive integer"
+      : undefined,
+  thinking_max_tokens: (d) =>
+    d.thinking_max_tokens <= 0 || !Number.isInteger(d.thinking_max_tokens)
+      ? "Thinking max tokens must be a positive integer"
+      : undefined,
+  wiki_llm_curator_url: (d) => {
+    if (!d.wiki_llm_curator_enabled) return undefined;
+    if (!d.wiki_llm_curator_url.trim())
+      return "Curator URL is required when curator is enabled";
+    if (!/^https?:\/\//.test(d.wiki_llm_curator_url))
+      return "Curator URL must start with http:// or https://";
+    return undefined;
+  },
+  wiki_llm_curator_model: (d) =>
+    d.wiki_llm_curator_enabled && !d.wiki_llm_curator_model.trim()
+      ? "Curator model is required when curator is enabled"
+      : undefined,
+  wiki_llm_curator_temperature: (d) =>
+    d.wiki_llm_curator_temperature < 0 ||
+    d.wiki_llm_curator_temperature > 1
+      ? "Temperature must be between 0.0 and 1.0"
+      : undefined,
+  wiki_llm_curator_max_input_chars: (d) =>
+    d.wiki_llm_curator_max_input_chars < 1000 ||
+    d.wiki_llm_curator_max_input_chars > 24000
+      ? "Max input chars must be between 1000 and 24000"
+      : undefined,
+  wiki_llm_curator_timeout_sec: (d) =>
+    d.wiki_llm_curator_timeout_sec < 10 || d.wiki_llm_curator_timeout_sec > 600
+      ? "Timeout must be between 10 and 600 seconds"
+      : undefined,
+  wiki_llm_curator_concurrency: (d) =>
+    d.wiki_llm_curator_concurrency < 1 || d.wiki_llm_curator_concurrency > 4
+      ? "Concurrency must be between 1 and 4"
+      : undefined,
+  wiki_llm_curator_mode: (d) =>
+    ["draft", "active_if_verified"].includes(d.wiki_llm_curator_mode)
+      ? undefined
+      : "Mode must be 'draft' or 'active_if_verified'",
+};
+
+/**
+ * Cross-field validation dependencies: a changed form field mapped to the
+ * OTHER fields whose validators read it. Editing either side of a
+ * cross-field rule re-syncs the rule's error entry (UI-030).
+ */
+const VALIDATION_DEPENDENTS: Partial<
+  Record<keyof SettingsFormData, ReadonlyArray<keyof SettingsFormData>>
+> = {
+  chunk_size_chars: ["chunk_overlap_chars"],
+  default_chat_mode: ["instant_chat_model"],
+  wiki_llm_curator_enabled: ["wiki_llm_curator_url", "wiki_llm_curator_model"],
+};
+
+/**
+ * Re-syncs validation errors after ``field`` changed. Only fields that
+ * already carry an error entry (the changed field itself plus its
+ * cross-field dependents) are recomputed: errors are planted by a failed
+ * submit (``validateForm``) and must clear or refresh as the user edits,
+ * but a fresh edit does not error until the next submit attempt — stale
+ * errors can no longer keep Save disabled (UI-030).
+ */
+function resyncFieldErrors(
+  errors: SettingsErrors,
+  formData: SettingsFormData,
+  field: keyof SettingsFormData,
+): SettingsErrors {
+  const targets: ReadonlyArray<keyof SettingsFormData> = [
+    field,
+    ...(VALIDATION_DEPENDENTS[field] ?? []),
+  ];
+  if (!targets.some((t) => t in errors)) return errors;
+  const next = { ...errors };
+  targets.forEach((t) => {
+    if (!(t in next)) return;
+    const message = FIELD_VALIDATORS[t]?.(formData);
+    if (message) next[t] = message;
+    else delete next[t];
+  });
+  return next;
+}
+
 export const useSettingsStore = create<SettingsState>((set, get) => ({
   settings: null,
   formData: { ...defaultFormData },
@@ -463,15 +663,23 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   },
 
   updateFormField: (field, value) => {
-    set((state) => ({
-      formData: { ...state.formData, [field]: value },
-      saveStatus: "idle",
-    }));
+    set((state) => {
+      const formData = { ...state.formData, [field]: value };
+      return {
+        formData,
+        // Re-sync live validation for the changed field (and its cross-field
+        // dependents) so a failed submit's errors clear/refresh on edit
+        // instead of sticking until Discard (UI-030).
+        errors: resyncFieldErrors(state.errors, formData, field),
+        saveStatus: "idle",
+      };
+    });
   },
 
   setLoading: (loading) => set({ loading }),
   setSaving: (saving) => set({ saving }),
   setError: (error) => set({ error }),
+  setLoadError: (error) => set({ error, loading: false }),
   setErrors: (errors) => set({ errors }),
   setSaveStatus: (saveStatus) => set({ saveStatus }),
 
@@ -485,188 +693,37 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     });
   },
 
+  initializeFormAfterSave: (settings, submitSnapshot) => {
+    const serverSnapshot = fromSettings(settings);
+    const live = get().formData;
+    const next = { ...serverSnapshot };
+    (Object.keys(live) as Array<keyof SettingsFormData>).forEach((k) => {
+      // The live value moved on from what was submitted — an edit made
+      // while the save was in flight. Re-apply it over the server
+      // snapshot so it survives and stays dirty (UI-031). (Same indexed
+      // write cast as SettingsPage's pickDirtyPayload — all fields are
+      // scalar, so the value type is preserved.)
+      if (live[k] !== submitSnapshot[k]) {
+        (next as Record<string, unknown>)[k] = live[k];
+      }
+    });
+    set({
+      formData: next,
+      loadedFormData: serverSnapshot,
+      loading: false,
+      error: null,
+    });
+  },
+
   validateForm: () => {
     const { formData } = get();
     const newErrors: SettingsErrors = {};
-
-    if (formData.chunk_size_chars <= 0) {
-      newErrors.chunk_size_chars = "Chunk size must be a positive integer";
-    }
-    if (formData.chunk_overlap_chars < 0) {
-      newErrors.chunk_overlap_chars = "Chunk overlap must be a non-negative integer";
-    }
-    if (formData.retrieval_top_k <= 0) {
-      newErrors.retrieval_top_k = "Retrieval top-k must be a positive integer";
-    }
-    if (formData.auto_scan_interval_minutes <= 0) {
-      newErrors.auto_scan_interval_minutes =
-        "Scan interval must be a positive integer";
-    }
-    if (
-      formData.embedding_batch_size < 1 ||
-      formData.embedding_batch_size > 128
-    ) {
-      newErrors.embedding_batch_size =
-        "Embedding batch size must be between 1 and 128";
-    }
-    if (formData.chunk_overlap_chars >= formData.chunk_size_chars) {
-      newErrors.chunk_overlap_chars =
-        "Chunk overlap must be less than chunk size";
-    }
-    if (
-      formData.max_distance_threshold < 0 ||
-      formData.max_distance_threshold > 1
-    ) {
-      newErrors.max_distance_threshold =
-        "Distance threshold must be between 0 and 1";
-    }
-    if (formData.retrieval_window < 0 || formData.retrieval_window > 3) {
-      newErrors.retrieval_window = "Retrieval window must be between 0 and 3";
-    }
-    const validMetrics = ["cosine", "euclidean", "dot_product"];
-    if (!validMetrics.includes(formData.vector_metric)) {
-      newErrors.vector_metric =
-        "Vector metric must be cosine, euclidean, or dot_product";
-    }
-    if (
-      formData.initial_retrieval_top_k !== undefined &&
-      (formData.initial_retrieval_top_k < 5 ||
-        formData.initial_retrieval_top_k > 100)
-    ) {
-      newErrors.initial_retrieval_top_k =
-        "Initial retrieval top-k must be between 5 and 100";
-    }
-    if (
-      formData.reranker_top_n !== undefined &&
-      (formData.reranker_top_n < 1 || formData.reranker_top_n > 20)
-    ) {
-      newErrors.reranker_top_n = "Reranker top-n must be between 1 and 20";
-    }
-    if (
-      formData.hybrid_alpha !== undefined &&
-      (formData.hybrid_alpha < 0 || formData.hybrid_alpha > 1)
-    ) {
-      newErrors.hybrid_alpha = "Hybrid alpha must be between 0 and 1";
-    }
-    if (
-      formData.ollama_embedding_url &&
-      !/^https?:\/\//.test(formData.ollama_embedding_url)
-    ) {
-      newErrors.ollama_embedding_url = "URL must start with http:// or https://";
-    }
-    if (
-      formData.ollama_chat_url &&
-      !/^https?:\/\//.test(formData.ollama_chat_url)
-    ) {
-      newErrors.ollama_chat_url = "URL must start with http:// or https://";
-    }
-    if (
-      formData.instant_chat_url &&
-      !/^https?:\/\//.test(formData.instant_chat_url)
-    ) {
-      newErrors.instant_chat_url = "URL must start with http:// or https://";
-    }
-    if (
-      formData.default_chat_mode === "instant" &&
-      !formData.instant_chat_model.trim()
-    ) {
-      newErrors.instant_chat_model = "Instant chat model is required";
-    }
-    if (!["instant", "thinking"].includes(formData.default_chat_mode)) {
-      newErrors.default_chat_mode =
-        "Default chat mode must be instant or thinking";
-    }
-    if (
-      !["instant", "thinking", "disabled"].includes(formData.ingestion_llm_mode)
-    ) {
-      newErrors.ingestion_llm_mode =
-        "Ingestion LLM mode must be instant, thinking, or disabled";
-    }
-    if (
-      formData.instant_initial_retrieval_top_k <= 0 ||
-      !Number.isInteger(formData.instant_initial_retrieval_top_k)
-    ) {
-      newErrors.instant_initial_retrieval_top_k =
-        "Instant initial retrieval top-k must be a positive integer";
-    }
-    if (
-      formData.instant_reranker_top_n <= 0 ||
-      !Number.isInteger(formData.instant_reranker_top_n)
-    ) {
-      newErrors.instant_reranker_top_n =
-        "Instant reranker top-n must be a positive integer";
-    }
-    if (
-      formData.instant_memory_context_top_k <= 0 ||
-      !Number.isInteger(formData.instant_memory_context_top_k)
-    ) {
-      newErrors.instant_memory_context_top_k =
-        "Instant memory context top-k must be a positive integer";
-    }
-    if (
-      formData.instant_max_tokens <= 0 ||
-      !Number.isInteger(formData.instant_max_tokens)
-    ) {
-      newErrors.instant_max_tokens =
-        "Instant max tokens must be a positive integer";
-    }
-    if (
-      formData.thinking_max_tokens <= 0 ||
-      !Number.isInteger(formData.thinking_max_tokens)
-    ) {
-      newErrors.thinking_max_tokens =
-        "Thinking max tokens must be a positive integer";
-    }
-
-    // Curator: required-when-enabled (frontend mirror of backend invariant).
-    if (formData.wiki_llm_curator_enabled) {
-      if (!formData.wiki_llm_curator_url.trim()) {
-        newErrors.wiki_llm_curator_url =
-          "Curator URL is required when curator is enabled";
-      } else if (!/^https?:\/\//.test(formData.wiki_llm_curator_url)) {
-        newErrors.wiki_llm_curator_url =
-          "Curator URL must start with http:// or https://";
-      }
-      if (!formData.wiki_llm_curator_model.trim()) {
-        newErrors.wiki_llm_curator_model =
-          "Curator model is required when curator is enabled";
-      }
-    }
-    if (
-      formData.wiki_llm_curator_temperature < 0 ||
-      formData.wiki_llm_curator_temperature > 1
-    ) {
-      newErrors.wiki_llm_curator_temperature =
-        "Temperature must be between 0.0 and 1.0";
-    }
-    if (
-      formData.wiki_llm_curator_max_input_chars < 1000 ||
-      formData.wiki_llm_curator_max_input_chars > 24000
-    ) {
-      newErrors.wiki_llm_curator_max_input_chars =
-        "Max input chars must be between 1000 and 24000";
-    }
-    if (
-      formData.wiki_llm_curator_timeout_sec < 10 ||
-      formData.wiki_llm_curator_timeout_sec > 600
-    ) {
-      newErrors.wiki_llm_curator_timeout_sec =
-        "Timeout must be between 10 and 600 seconds";
-    }
-    if (
-      formData.wiki_llm_curator_concurrency < 1 ||
-      formData.wiki_llm_curator_concurrency > 4
-    ) {
-      newErrors.wiki_llm_curator_concurrency =
-        "Concurrency must be between 1 and 4";
-    }
-    if (
-      !["draft", "active_if_verified"].includes(formData.wiki_llm_curator_mode)
-    ) {
-      newErrors.wiki_llm_curator_mode =
-        "Mode must be 'draft' or 'active_if_verified'";
-    }
-
+    (Object.keys(FIELD_VALIDATORS) as Array<keyof SettingsFormData>).forEach(
+      (field) => {
+        const message = FIELD_VALIDATORS[field]?.(formData);
+        if (message) newErrors[field] = message;
+      },
+    );
     set({ errors: newErrors });
     return Object.keys(newErrors).length === 0;
   },

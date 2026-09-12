@@ -3,13 +3,16 @@ Lifespan context manager for FastAPI application startup and shutdown.
 """
 
 import asyncio
+import json
 import logging
 import sqlite3
 from contextlib import asynccontextmanager
+from typing import Union, get_args, get_origin
 
 from fastapi import FastAPI
 
-from app.config import settings
+from app.api.routes.settings import PERSISTED_FUNCTIONAL_FIELDS
+from app.config import Settings, settings
 from app.middleware.logging import SensitiveFieldFilter
 from app.models.database import SQLiteConnectionPool, get_pool, run_migrations
 from app.security import CSRFManager
@@ -43,6 +46,75 @@ from app.services.wiki_retrieval import WikiRetrievalService
 from app.utils.request_context import JsonFormatter, RequestIdFilter
 
 logger = logging.getLogger(__name__)  # noqa: E402
+
+
+# ── Persisted-settings replay decoding (issue #494 CONFIG-003) ──────────────
+# Typed converters for ``settings_kv`` values, derived from the Settings field
+# annotations so each persisted field decodes to its real runtime type. This
+# covers the 21 previously-drifted fields (ingestion_llm_mode str,
+# instant_skip_* bool, wiki_lint_enabled bool, wiki_llm_curator_* str/int/
+# float/bool, instant_enable_thinking bool) and fixes the Optional-annotated
+# fields (vector_top_k etc.), whose None default previously made the
+# runtime-type inference setattr the raw JSON STRING onto the singleton.
+
+def _decode_persisted_bool(raw: str) -> bool:
+    return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _decode_persisted_int(raw: str) -> int:
+    return int(raw)
+
+
+def _decode_persisted_float(raw: str) -> float:
+    return float(raw)
+
+
+def _decode_persisted_str(raw: str) -> str:
+    # Values are written with json.dumps (json-quoted); fall back to the raw
+    # text for hand-edited rows instead of failing the restore.
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return raw
+
+
+def _decode_persisted_json(raw: str):
+    # Lists/dicts (e.g. multimodal_allowed_model_origins). A non-JSON row is
+    # returned as-is; the per-field validation gate below rejects mismatches.
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return raw
+
+
+_PERSISTED_SCALAR_DECODERS = {
+    bool: _decode_persisted_bool,
+    int: _decode_persisted_int,
+    float: _decode_persisted_float,
+    str: _decode_persisted_str,
+}
+
+
+def _build_persisted_field_decoders() -> dict:
+    """Map every PERSISTED_FUNCTIONAL_FIELDS entry to its typed decoder."""
+    converters: dict = {}
+    for field_name in PERSISTED_FUNCTIONAL_FIELDS:
+        field_info = Settings.model_fields.get(field_name)
+        annotation = field_info.annotation if field_info is not None else None
+        if annotation is None:
+            continue
+        # Unwrap Optional[X] → X so None-defaulted fields decode as their
+        # concrete scalar type instead of hitting a NoneType branch.
+        if get_origin(annotation) is Union:
+            non_none = [arg for arg in get_args(annotation) if arg is not type(None)]
+            annotation = non_none[0] if non_none else str
+        converters[field_name] = _PERSISTED_SCALAR_DECODERS.get(
+            annotation, _decode_persisted_json
+        )
+    return converters
+
+
+_PERSISTED_FIELD_DECODERS = _build_persisted_field_decoders()
 
 
 def select_ingestion_llm_client(app: FastAPI, mode: str):
@@ -124,8 +196,6 @@ def _validate_setting_value(key: str, value) -> bool:
 
 def _load_persisted_settings(sqlite_path: str) -> None:
     """Load user-configurable settings from DB if they were previously saved."""
-    import json
-
     conn = sqlite3.connect(sqlite_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -158,7 +228,21 @@ def _load_persisted_settings(sqlite_path: str) -> None:
                 except Exception as e:
                     logger.warning(f"Failed to restore persisted setting {key}: {e}")
 
-        # New fields — load directly without legacy conversion
+        # Every remaining persisted functional field replays through the typed
+        # converter map (issue #494 CONFIG-003).
+        #
+        # NEW_DIRECT_KEYS is the literal mirror of PERSISTED_FUNCTIONAL_FIELDS
+        # — the list exported by app/api/routes/settings.py as the single
+        # source of truth shared with the save path (ALLOWED_FIELDS minus the
+        # documented exclusions; empty today). The literal form is load-bearing:
+        # the replay-contract checks verify the startup replay set by statically
+        # reading this list (backend/tests/test_issue494_settings_replay_drift.py
+        # C12a extracts it with ast; test_lifespan_wiki_settings_reload.py
+        # greps it). The equality guard right below makes any drift between
+        # the two lists a loud failure the first time persisted settings are
+        # loaded — the hand-maintained-list drift that caused CONFIG-003 (21
+        # saveable fields silently reverting to defaults on restart) cannot
+        # recur silently.
         NEW_DIRECT_KEYS = [
             "chunk_size_chars",
             "chunk_overlap_chars",
@@ -188,11 +272,18 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "instant_chat_url",
             "instant_chat_model",
             "default_chat_mode",
+            "ingestion_llm_mode",
             "instant_initial_retrieval_top_k",
             "instant_reranker_top_n",
             "instant_memory_context_top_k",
             "instant_max_tokens",
             "thinking_max_tokens",
+            "instant_enable_thinking",
+            # Instant-mode latency skips
+            "instant_skip_query_transformation",
+            "instant_skip_retrieval_evaluation",
+            "instant_skip_distillation_synthesis",
+            "instant_skip_followup_rewrite",
             "retrieval_consolidated_rerank",
             "retrieval_kms_overlap",
             "prompt_budget_enabled",
@@ -207,6 +298,22 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "wiki_compile_on_ingest",
             "wiki_compile_on_query",
             "wiki_compile_after_indexing",
+            "wiki_lint_enabled",
+            # Optional LLM Wiki Curator
+            "wiki_llm_curator_enabled",
+            "wiki_llm_curator_url",
+            "wiki_llm_curator_model",
+            "wiki_llm_curator_temperature",
+            "wiki_llm_curator_max_input_chars",
+            "wiki_llm_curator_max_output_tokens",
+            "wiki_llm_curator_timeout_sec",
+            "wiki_llm_curator_concurrency",
+            "wiki_llm_curator_mode",
+            "wiki_llm_curator_require_quote_match",
+            "wiki_llm_curator_require_chunk_id",
+            "wiki_llm_curator_run_on_ingest",
+            "wiki_llm_curator_run_on_query",
+            "wiki_llm_curator_run_on_manual",
             "draft_room_enabled",
             # Multimodal artifact enrichment (issue #461)
             "multimodal_enrichment_enabled",
@@ -227,27 +334,44 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             # Query-time retrieval-first VLM master switch (issue #462)
             "multimodal_query_vision_enabled",
         ]
-        for key in NEW_DIRECT_KEYS:
+        if sorted(NEW_DIRECT_KEYS) != sorted(
+            k for k in PERSISTED_FUNCTIONAL_FIELDS if k not in legacy_keys
+        ):
+            raise RuntimeError(
+                "app/lifespan.py NEW_DIRECT_KEYS drifted from "
+                "app/api/routes/settings.py PERSISTED_FUNCTIONAL_FIELDS — "
+                "update the literal to mirror the exported list "
+                "(issue #494 CONFIG-003 drift guard)"
+            )
+        # Iterate the exported single source of truth; the guard above
+        # guarantees the literal mirror (plus the legacy-loop keys above)
+        # covers exactly this set.
+        for key in PERSISTED_FUNCTIONAL_FIELDS:
             if key in persisted:
                 try:
                     if not hasattr(settings, key):
                         logger.warning(f"Unknown persisted setting {key}, skipping")
                         continue
-                    expected_type = type(getattr(settings, key))
-                    raw = persisted[key]
-                    if expected_type is type(None):  # NoneType - just set as string
-                        converted = raw
-                    elif expected_type is bool:
-                        converted = str(raw).lower() in ("true", "1", "yes", "on")
-                    elif expected_type is int:
-                        converted = int(raw)
-                    elif expected_type is float:
-                        converted = float(raw)
+                    decoder = _PERSISTED_FIELD_DECODERS.get(key)
+                    if decoder is not None:
+                        converted = decoder(persisted[key])
                     else:
-                        try:
-                            converted = json.loads(raw)
-                        except (json.JSONDecodeError, ValueError):
+                        # Fallback: infer from the current value's runtime type.
+                        expected_type = type(getattr(settings, key))
+                        raw = persisted[key]
+                        if expected_type is type(None):  # NoneType - just set as string
                             converted = raw
+                        elif expected_type is bool:
+                            converted = str(raw).lower() in ("true", "1", "yes", "on")
+                        elif expected_type is int:
+                            converted = int(raw)
+                        elif expected_type is float:
+                            converted = float(raw)
+                        else:
+                            try:
+                                converted = json.loads(raw)
+                            except (json.JSONDecodeError, ValueError):
+                                converted = raw
                     if _validate_setting_value(key, converted):
                         setattr(settings, key, converted)
                 except Exception as e:

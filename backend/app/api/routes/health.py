@@ -9,6 +9,7 @@ historically coerced into "down".
 
 import asyncio
 import logging
+import os
 import sqlite3
 import time
 
@@ -45,6 +46,29 @@ _deep_cache: dict = {"services": None, "ts": 0.0}
 # test clients that run the app on fresh loops per request.
 _deep_refresh_in_flight = False
 _refresh_tasks: set = set()  # keep strong refs so tasks aren't GC'd mid-flight
+
+# Per-process in-memory cache (deps.py convention). Multi-worker deployments
+# (uvicorn --workers > 1, WEB_CONCURRENCY != 1, multiple replicas) do NOT
+# share these globals: each worker keeps its own copy, so the single-flight
+# refresh and the services_age_seconds freshness claim are per-worker only.
+# The guard below encodes that constraint and warns once per process when the
+# module cache is served under more than one worker (issue #494 FU-006).
+_SINGLE_WORKER_ASSERTION = os.getenv("WEB_CONCURRENCY", "1") == "1"
+_worker_warning_emitted = False
+
+
+def _warn_multi_worker_cache() -> None:
+    """Log once per process when the cache runs under WEB_CONCURRENCY != 1."""
+    global _worker_warning_emitted
+    if _SINGLE_WORKER_ASSERTION or _worker_warning_emitted:
+        return
+    _worker_warning_emitted = True
+    logger.warning(
+        "WEB_CONCURRENCY=%s: the /health last-known status cache is "
+        "per-worker — single-flight refresh and services_age_seconds are NOT "
+        "shared across workers",
+        os.getenv("WEB_CONCURRENCY", "1"),
+    )
 
 
 def _cache_age() -> float:
@@ -189,6 +213,8 @@ async def health_check(
     With deep=true, runs the full LLM/service/model/vector checks inline and
     refreshes the last-known cache.
     """
+    _warn_multi_worker_cache()
+
     result = {
         "status": "ok",
         "services": {"backend": True, "embeddings": None, "chat": None, "vector_store": None},

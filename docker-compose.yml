@@ -204,6 +204,84 @@ services:
       - CHUNK_ENRICHMENT_ENABLED=${CHUNK_ENRICHMENT_ENABLED:-false}
       - MULTI_SCALE_INDEXING_ENABLED=${MULTI_SCALE_INDEXING_ENABLED:-true}
       - MULTI_SCALE_CHUNK_SIZES=${MULTI_SCALE_CHUNK_SIZES:-768,1536}
+      # ------------------------------------------------------------------
+      # Issue #494 (CONFIG-007 / AC17): every ACTIVE (uncommented) KEY=
+      # variable documented in .env.example is forwarded into the backend
+      # container so tuning it in .env reaches the containerized backend.
+      # Two forms, deliberately:
+      #   - `- KEY` (short passthrough) for typed int/float/bool keys: an
+      #     unset key is OMITTED entirely, so compose never injects "" into
+      #     a field that would fail startup coercion (review F2, PR #576).
+      #   - `- KEY=${KEY:-}` for str keys pinned by check_config_contract
+      #     (APP_ROOT_PATH, MULTIMODAL_*): "" is their documented default.
+      # Empty-string values remain MEANINGFUL in Settings (REDIS_URL="" →
+      # in-memory limiter) — do NOT add env_ignore_empty=True.
+      # Secrets (ADMIN_SECRET_TOKEN, JWT_SECRET_KEY) stay explicit above.
+      # Keep in sync with .env.example (guarded by
+      # backend/tests/test_issue494_compose_env_forwarding.py and
+      # ..._compose_literal_values.py).
+      # ------------------------------------------------------------------
+      - EVAL_ENABLED
+      # Concurrency: forwarded so the health module's worker guard
+      # (health.py _warn_multi_worker_cache) is live on scale-out
+      # deployments — default 1 keeps the single-worker default silent.
+      - WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
+      # Auth & security
+      - USERS_ENABLED
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-}
+      - ADMIN_RATE_LIMIT=${ADMIN_RATE_LIMIT:-}
+      - HEALTH_CHECK_API_KEY=${HEALTH_CHECK_API_KEY:-}
+      - CSRF_TOKEN_TTL
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}
+      # Model tuning & validation
+      - ENABLE_MODEL_VALIDATION
+      - INSTANT_ENABLE_THINKING
+      # Document processing & retrieval
+      - CHUNK_SIZE_CHARS
+      - CHUNK_OVERLAP_CHARS
+      - DOCUMENT_PARSING_STRATEGY=${DOCUMENT_PARSING_STRATEGY:-}
+      - RETRIEVAL_TOP_K
+      - MAX_DISTANCE_THRESHOLD
+      - VECTOR_METRIC=${VECTOR_METRIC:-}
+      - RETRIEVAL_WINDOW
+      - ALLOWED_EXTENSIONS=${ALLOWED_EXTENSIONS:-}
+      # Embedding tuning
+      - EMBEDDING_BATCH_MAX_RETRIES
+      - EMBEDDING_BATCH_MIN_SUB_SIZE
+      - EMBEDDING_DOC_PREFIX=${EMBEDDING_DOC_PREFIX:-}
+      - EMBEDDING_QUERY_PREFIX=${EMBEDDING_QUERY_PREFIX:-}
+      # Opt-in RAG features
+      - CONTEXTUAL_CHUNKING_CONCURRENCY
+      - MULTI_SCALE_OVERLAP_RATIO
+      - QUERY_TRANSFORMATION_ENABLED
+      - RETRIEVAL_EVALUATION_ENABLED
+      # Concurrency & pool sizing
+      - VECTOR_SEARCH_CONCURRENCY
+      - SEARCH_SEMAPHORE_TIMEOUT_SECONDS
+      - WRITE_LOCK_TIMEOUT_SECONDS
+      - ACTIVE_USER_CACHE_TTL_SECONDS
+      - MEMORY_STORE_POOL_SIZE
+      - DB_POOL_MAX_SIZE
+      # Legacy/deprecated aliases (still honored for backward compatibility)
+      - CHUNK_SIZE
+      - CHUNK_OVERLAP
+      - MAX_CONTEXT_CHUNKS
+      - VECTOR_TOP_K
+      - RAG_RELEVANCE_THRESHOLD
+      # Auto-scan & maintenance mode
+      - AUTO_SCAN_ENABLED
+      - AUTO_SCAN_INTERVAL_MINUTES
+      - MAINTENANCE_MODE
+      # IMAP email ingestion
+      - IMAP_ENABLED
+      - IMAP_HOST=${IMAP_HOST:-}
+      - IMAP_PORT
+      - IMAP_USE_SSL
+      - IMAP_USERNAME=${IMAP_USERNAME:-}
+      - IMAP_PASSWORD=${IMAP_PASSWORD:-}
+      - IMAP_MAILBOX=${IMAP_MAILBOX:-}
+      - IMAP_POLL_INTERVAL
+      - IMAP_MAX_ATTACHMENT_SIZE
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

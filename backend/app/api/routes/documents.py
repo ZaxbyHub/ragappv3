@@ -3122,15 +3122,27 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             raise HTTPException(status_code=400, detail="Filename cannot be empty")
     # For all other validation errors, return standard 422
     # Convert errors to dict format for JSON serialization
+    from fastapi.encoders import jsonable_encoder
     from fastapi.responses import JSONResponse
 
-    error_dicts = [
-        {
+    error_dicts = []
+    for error in errors:
+        entry = {
             "loc": error.get("loc"),
             "msg": error.get("msg"),
             "type": error.get("type"),
-            "input": error.get("input"),
         }
-        for error in errors
-    ]
+        try:
+            # Issue #494 (API-001): the raw error 'input' can be non-JSON
+            # (e.g. bytes when a text/plain body hits a JSON endpoint);
+            # encode it safely instead of letting JSONResponse serialization
+            # fail inside the handler and surface a 500 to the client.
+            entry["input"] = jsonable_encoder(error.get("input"))
+        except Exception as exc:
+            # Still unencodable: omit the echo rather than break the
+            # documented {"detail": [{loc, msg, type}]} envelope.
+            logger.debug(
+                "omitting unencodable validation 'input' from 422 detail: %s", exc
+            )
+        error_dicts.append(entry)
     return JSONResponse(status_code=422, content={"detail": error_dicts})

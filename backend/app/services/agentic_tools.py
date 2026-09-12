@@ -354,11 +354,17 @@ class SynthesisTool(AgenticTool):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[SynthesisTool] LLM synthesis failed: %s", exc)
-            # Fall back to raw text on LLM error
+            # LLM-003 (issue #494): a failed synthesis must surface as a
+            # failure — returning the echoed input text with success=True
+            # masked provider outages as successful answers. The planner
+            # caller handles success=False by falling back to the retrieval
+            # tool's output. (The no-client-configured path above is a
+            # designed pass-through and stays success=True.)
             return ToolResult(
                 output=text,
                 sources=list(sources),
-                success=True,
+                success=False,
+                error=str(exc),
             )
 
 

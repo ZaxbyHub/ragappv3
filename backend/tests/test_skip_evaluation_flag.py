@@ -42,6 +42,10 @@ class TestExecuteRetrievalSkipEvaluationFlag:
     @pytest.fixture
     def mock_settings(self):
         with patch("app.services.rag_engine.settings") as mock:
+            # Pin maintenance off: the OPS-005 gates (#494) read
+            # settings.maintenance_mode, and an unset MagicMock attribute is
+            # truthy, which would short-circuit the fallback this file tests.
+            mock.maintenance_mode = False
             mock.retrieval_evaluation_enabled = True
             mock.instant_skip_retrieval_evaluation = False  # don't skip due to mode
             mock.context_max_tokens = 0
@@ -173,6 +177,10 @@ class TestOrchestrateSubQueryRetrievalSkipEvaluation:
     @pytest.fixture
     def mock_settings(self):
         with patch("app.services.rag_engine.settings") as mock:
+            # Pin maintenance off: the OPS-005 gates (#494) read
+            # settings.maintenance_mode, and an unset MagicMock attribute is
+            # truthy, which would short-circuit the fallback this file tests.
+            mock.maintenance_mode = False
             mock.retrieval_evaluation_enabled = True
             mock.instant_skip_retrieval_evaluation = False
             mock.context_max_tokens = 0

@@ -49,7 +49,10 @@ class LLMHealthChecker:
         """
         Check if the embedding service is healthy.
 
-        Calls EmbeddingService.embed_single("ping") with a short timeout.
+        Calls ``EmbeddingService.embed_probe(timeout)`` — a cache-bypassing
+        ping embedding with a per-request short timeout. The probe uses the
+        service's shared persistent client (no new pool) and never mutates
+        service state.
 
         Returns:
             Status dict with:
@@ -62,17 +65,13 @@ class LLMHealthChecker:
             if service is None:
                 service = EmbeddingService()
 
-            # Temporarily override timeout for health check
-            original_timeout = service.timeout
-            service.timeout = self.timeout
-
-            try:
-                # Attempt to embed a simple ping message
-                await service.embed_single("ping")
-                return {"ok": True, "error": None}
-            finally:
-                # Restore original timeout
-                service.timeout = original_timeout
+            # Deep-health probe (OPS-003/OPS-004, issue #494): bypasses the
+            # L1/Redis caches and applies the checker's short timeout
+            # per-request. The shared service and its persistent client are
+            # never mutated (the old timeout field-mutation never reached
+            # the already-built transport).
+            await service.embed_probe(self.timeout)
+            return {"ok": True, "error": None}
 
         except EmbeddingError as e:
             return {"ok": False, "error": f"Embedding service error: {str(e)}"}

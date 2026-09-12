@@ -16,7 +16,7 @@ import tempfile
 from datetime import datetime
 from email.header import decode_header
 from email.message import EmailMessage
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import aioimaplib
 import bleach
@@ -36,6 +36,44 @@ MAX_EMAIL_SIZE = 50 * 1024 * 1024  # 50MB in bytes
 
 # Maximum number of attachments per email (default 10)
 MAX_ATTACHMENTS_PER_EMAIL = 10
+
+# Literal size hint at the end of an untagged FETCH metadata line, e.g.
+# b"7 FETCH (UID 7 RFC822 {1234}" announces a 1234-byte literal (RFC 3501).
+_FETCH_LITERAL_HINT_RE = re.compile(rb'\{(\d+)\}$')
+
+
+def _extract_rfc822_literal(lines: Sequence[bytes]) -> Optional[bytes]:
+    """
+    Extract the RFC822 literal payload from aioimaplib fetch response lines.
+
+    aioimaplib 2.0.1's fetch() returns ``Response(result, lines)`` where
+    ``lines`` is a flat list of bytes entries: the untagged FETCH metadata
+    line(s) (a line announcing a literal ends with a ``{N}`` size hint),
+    then the N literal message bytes, then a closing ``)`` line and the
+    tagged status line. The literal is the entry directly after a ``{N}``
+    metadata line, with a length matching the announced size.
+
+    Args:
+        lines: Response.lines from an (RFC822) fetch
+
+    Returns:
+        The literal message bytes, or None if no literal payload is present
+    """
+    for index, line in enumerate(lines):
+        if not isinstance(line, (bytes, bytearray)):
+            continue
+        hint = _FETCH_LITERAL_HINT_RE.search(line)
+        if hint is None:
+            continue
+        expected_size = int(hint.group(1))
+        if index + 1 >= len(lines):
+            continue
+        literal = lines[index + 1]
+        if not isinstance(literal, (bytes, bytearray)):
+            continue
+        if len(literal) == expected_size:
+            return bytes(literal)
+    return None
 
 
 class EmailIngestionService:
@@ -241,13 +279,16 @@ class EmailIngestionService:
             await imap_client.select(self.settings.imap_mailbox)
             logger.debug(f"Selected mailbox: {self.settings.imap_mailbox}")
 
-            # Search for UNSEEN emails
-            result, data = await imap_client.search(None, 'UNSEEN')
-            if result != 'OK':
-                logger.warning(f"IMAP search failed: {result}")
+            # Search for UNSEEN emails. aioimaplib 2.0.1's search() takes
+            # criteria positionally with a keyword-only charset; passing
+            # charset=None keeps the wire command a plain "SEARCH UNSEEN"
+            # (the default charset='utf-8' would prefix "CHARSET utf-8").
+            response = await imap_client.search('UNSEEN', charset=None)
+            if response.result != 'OK':
+                logger.warning(f"IMAP search failed: {response.result}")
                 return
 
-            uids = data[0].split()
+            uids = response.lines[0].split() if response.lines else []
             logger.info(f"Found {len(uids)} UNSEEN emails")
 
             # Process each email
@@ -313,10 +354,12 @@ class EmailIngestionService:
                         timeout=30
                     )
 
-                # Authenticate (never log password)
-                result = await imap_client.wait_hello_from_server()
-                if result != 'OK':
-                    raise Exception(f"IMAP server greeting failed: {result}")
+                # Authenticate (never log password).
+                # aioimaplib 2.0.1 contract: wait_hello_from_server() returns
+                # None on success; a failed greeting surfaces as
+                # asyncio.TimeoutError / an aioimaplib error, which the
+                # backoff handling below already catches.
+                await imap_client.wait_hello_from_server()
 
                 result, _ = await imap_client.login(
                     self.settings.imap_username,
@@ -378,13 +421,19 @@ class EmailIngestionService:
             Exception: If email processing fails
         """
         # Check email size before fetching to prevent DoS
-        result, data = await imap_client.fetch(uid, '(RFC822.SIZE)')
-        if result != 'OK' or not data[0]:
+        response = await imap_client.fetch(uid, '(RFC822.SIZE)')
+        if response.result != 'OK' or not response.lines:
             logger.warning(f"Failed to fetch email size for UID {uid}")
             return
 
-        # Extract size from response (format: "123 (RFC822.SIZE {size})")
-        size_match = re.search(r'RFC822\.SIZE (\d+)', str(data[0]))
+        # Extract size from the metadata lines
+        # (format: b"123 (UID 123 RFC822.SIZE 456)")
+        size_match = None
+        for line in response.lines:
+            if isinstance(line, (bytes, bytearray)):
+                size_match = re.search(rb'RFC822\.SIZE (\d+)', line)
+                if size_match:
+                    break
         if size_match:
             email_size = int(size_match.group(1))
             if email_size > MAX_EMAIL_SIZE:
@@ -415,12 +464,16 @@ class EmailIngestionService:
                 return
 
         # Fetch email content
-        result, data = await imap_client.fetch(uid, '(RFC822)')
-        if result != 'OK' or not data[0]:
+        response = await imap_client.fetch(uid, '(RFC822)')
+        if response.result != 'OK' or not response.lines:
             logger.warning(f"Failed to fetch email UID {uid}")
             return
 
-        raw_email = data[0][1]  # Extract email bytes
+        # Extract the RFC822 literal payload from the flat response lines
+        raw_email = _extract_rfc822_literal(response.lines)
+        if raw_email is None:
+            logger.warning(f"No RFC822 literal payload found for email UID {uid}")
+            return
         msg: EmailMessage = email.message_from_bytes(raw_email, policy=email.policy.default)
 
         # Extract subject and sender
