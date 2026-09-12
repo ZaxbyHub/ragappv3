@@ -10,9 +10,9 @@
       "SEVERITY.LOW": 69,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 72815,
+      "loc": 73713,
       "nosec": 0,
-      "skipped_tests": 37
+      "skipped_tests": 38
     },
     "backend/app/__init__.py": {
       "CONFIDENCE.HIGH": 0,
@@ -140,7 +140,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 520,
+      "loc": 549,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -232,6 +232,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 359,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/api/routes/quality_reports.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 327,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +400,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 188,
+      "loc": 190,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -465,7 +478,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5111,
+      "loc": 5163,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -478,7 +491,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 147,
+      "loc": 148,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -985,9 +998,35 @@
       "SEVERITY.LOW": 3,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 378,
+      "loc": 393,
       "nosec": 0,
       "skipped_tests": 0
+    },
+    "backend/app/services/eval_compare.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 186,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/services/eval_judge.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 134,
+      "nosec": 0,
+      "skipped_tests": 1
     },
     "backend/app/services/eval_metrics.py": {
       "CONFIDENCE.HIGH": 0,
@@ -998,7 +1037,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 50,
+      "loc": 68,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1389,6 +1428,19 @@
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
       "loc": 142,
+      "nosec": 0,
+      "skipped_tests": 0
+    },
+    "backend/app/services/semantic_checks.py": {
+      "CONFIDENCE.HIGH": 0,
+      "CONFIDENCE.LOW": 0,
+      "CONFIDENCE.MEDIUM": 0,
+      "CONFIDENCE.UNDEFINED": 0,
+      "SEVERITY.HIGH": 0,
+      "SEVERITY.LOW": 0,
+      "SEVERITY.MEDIUM": 0,
+      "SEVERITY.UNDEFINED": 0,
+      "loc": 134,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3231,7 +3283,7 @@
       "test_name": "try_except_pass"
     },
     {
-      "code": "80     settings.users_enabled\n81     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n82 ):\n",
+      "code": "81     settings.users_enabled\n82     and settings.jwt_secret_key == \"change-me-to-a-random-64-char-string\"\n83 ):\n",
       "col_offset": 35,
       "end_col_offset": 73,
       "filename": "backend/app/main.py",
@@ -3242,9 +3294,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 81,
+      "line_number": 82,
       "line_range": [
-        81
+        82
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
