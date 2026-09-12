@@ -4,7 +4,9 @@ import { Checkbox } from "@/components/ui/checkbox";
 
 export function DocumentsTableSkeleton() {
   return (
-    <>
+    // Context label: the inner Skeleton primitives all announce a generic
+    // "Loading..."; this wrapper tells screen-reader users WHAT is loading.
+    <div role="status" aria-label="Loading documents">
       {/* Desktop Table Skeleton (hidden on mobile) */}
       <Card className="hidden sm:block">
         <CardContent className="p-0">
@@ -29,7 +31,9 @@ export function DocumentsTableSkeleton() {
                 {[...Array(5)].map((_, i) => (
                   <tr key={i} className="border-b">
                     <td className="p-4">
-                      <Checkbox disabled />
+                      {/* Placeholder rows: name the checkboxes so the loading
+                          state passes axe button-name (ENH-005). */}
+                      <Checkbox disabled aria-label={`Select document ${i + 1}`} />
                     </td>
                     <td className="p-4">
                       <div className="flex items-center gap-2">
@@ -91,6 +95,6 @@ export function DocumentsTableSkeleton() {
           </Card>
         ))}
       </div>
-    </>
+    </div>
   );
 }
