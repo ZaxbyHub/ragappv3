@@ -64,7 +64,9 @@ def _record_failed_attempt_db(db, user_id: int) -> int:
     under concurrency.
     """
     try:
-        # Clear any dangling implicit transaction (e.g., from the login SELECT).
+        # Defense in depth: a prior DML statement can leave an implicit
+        # transaction open (a plain SELECT cannot under isolation_level=""),
+        # and an open transaction would make the BEGIN IMMEDIATE below fail.
         if db.in_transaction:
             db.rollback()
         db.execute("BEGIN IMMEDIATE")
@@ -194,12 +196,13 @@ def _rotate_refresh_token_block(
             logger.warning("Failed to revoke family on refresh reuse", exc_info=True)
         finally:
             # F-1: close the EXCLUSIVE transaction before the connection returns to the
-            # pool. Without this, a failed record_security_event leaves the DELETE above
-            # in an open transaction and release_connection() does not roll back, so the
-            # next request reuses a poisoned connection. ROLLBACK also discards that
-            # DELETE — when audit logging fails the family revocation is abandoned (only
-            # this request gets a 401); this matches the sibling stale_token_fetchone
-            # branch above and is accepted for parity.
+            # pool. A failed record_security_event leaves the DELETE above in an open
+            # transaction; the pool now rolls back a dirty release as defense in depth
+            # (issue #548), but the explicit ROLLBACK keeps this branch's discard
+            # semantics local and independent of connection lifecycle: it discards
+            # that DELETE — when audit logging fails the family revocation is
+            # abandoned (only this request gets a 401). This matches the sibling
+            # stale_token_fetchone branch above and is accepted for parity.
             if exclusive_started and db.in_transaction:
                 db.execute("ROLLBACK")
         raise HTTPException(status_code=401, detail="Refresh token already used", headers={"WWW-Authenticate": "Bearer"})
@@ -304,7 +307,10 @@ async def register(
     try:
         def _register_db():
             try:
-                # Clear any dangling implicit transaction from a prior SELECT.
+                # Defense in depth: a prior DML statement can leave an implicit
+                # transaction open (a plain SELECT cannot under
+                # isolation_level=""), and an open transaction would make the
+                # BEGIN IMMEDIATE below fail.
                 if db.in_transaction:
                     db.rollback()
                 db.execute("BEGIN IMMEDIATE")
