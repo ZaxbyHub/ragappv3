@@ -32,12 +32,12 @@ RAGAPPv3 is a Retrieval-Augmented Generation (RAG) knowledge base application wi
 | Component | Minimum Version | Purpose |
 |-----------|----------------|---------|
 | Python | 3.11+ | Backend runtime |
-| Node.js | 22.12+ (LTS) | Frontend build |
+| Node.js | 22.14+ (LTS) | Frontend build |
 | npm | Bundled with Node.js 22 | Package management |
 | Git | 2.40+ | Source control |
 | Ollama | 0.1.0+ | Local LLM inference |
 
-> The runtime contract (Node.js 22.12 / Python 3.11) is enforced mechanically
+> The runtime contract (Node.js 22.14 / Python 3.11) is enforced mechanically
 > across CI, the Docker images and `frontend/package.json` engines by
 > `scripts/check_runtime_contract.py` — this table agrees with that contract.
 
@@ -73,7 +73,7 @@ pip --version
 
 ```powershell
 # Download from https://nodejs.org/en/download
-# Choose the Node.js 22 LTS line (>= 22.12.0)
+# Choose the Node.js 22 LTS line (>= 22.14.0)
 
 # Verify installation
 node --version
