@@ -1,0 +1,22 @@
+{
+  "schema_version": "1",
+  "tuning_case_ids": [
+    "case-001",
+    "case-002",
+    "case-003",
+    "case-004",
+    "case-005",
+    "wiki-001",
+    "wiki-002",
+    "wiki-003",
+    "wiki-004",
+    "wiki-005"
+  ],
+  "held_out_case_ids": [
+    "wiki-006",
+    "wiki-007",
+    "wiki-008",
+    "wiki-009",
+    "wiki-010"
+  ]
+}

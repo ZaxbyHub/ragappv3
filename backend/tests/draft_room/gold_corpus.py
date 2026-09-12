@@ -1078,9 +1078,13 @@ def score_citation_accuracy(
     passage occurs in that document. An empty citation list scores ``1.0``.
 
     ``passage_found`` uses :func:`normalize_for_match`, so a citation is not
-    penalised for re-wrapping lines or changing case. ``exact_offset`` is the
-    character offset of the passage in the document's normalized text when the
-    passage appears literally, and ``-1`` otherwise.
+    penalised for re-wrapping lines or changing case. An **empty or
+    whitespace-only passage is not a valid citation** (issue #237, EVAL-004):
+    the empty string is contained in every document, so containment credit
+    requires the normalized passage to be non-empty. The separately
+    documented vacuous case — an empty citation *list* — still scores 1.0.
+    ``exact_offset`` is the character offset of the passage in the document's
+    normalized text when the passage appears literally, and ``-1`` otherwise.
 
     This is an oracle-backed deterministic metric: it is literal containment
     against the fixture bytes. It is **not** an LLM judge and it never calls a
@@ -1103,7 +1107,10 @@ def score_citation_accuracy(
             )
             continue
         text = corpus.text(doc_id)
-        found = normalize_for_match(passage) in normalize_for_match(text)
+        norm_passage = normalize_for_match(passage)
+        # EVAL-004 (issue #237): an empty/whitespace-only passage is contained
+        # in every text and therefore carries no located-passage evidence.
+        found = bool(norm_passage) and norm_passage in normalize_for_match(text)
         offset = text.find(passage) if passage else -1
         checks.append(
             CitationCheck(

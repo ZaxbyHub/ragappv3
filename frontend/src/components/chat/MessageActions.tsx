@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { updateMessageFeedback } from "@/lib/api";
+import { QualityReportDialog } from "./QualityReportDialog";
 
 // =============================================================================
 // stripCitations — remove [S1] / [Source:…] markers from message text
@@ -280,6 +281,15 @@ export function AssistantMessageActions({
   onCopy,
   onOpenDocumentInCanvas,
 }: AssistantMessageActionsProps) {
+  // Issue #237 (PRODUCT-ENH-12): structured quality reporting on the exact
+  // message — only reachable when the message is persisted (id + session).
+  const [reportOpen, setReportOpen] = useState(false);
+  const canReport =
+    Boolean(messageId) &&
+    Boolean(sessionId) &&
+    !isNaN(Number(messageId)) &&
+    !isNaN(Number(sessionId));
+
   return (
     <div className="flex items-center gap-0.5 mt-3 opacity-60 group-hover:opacity-100 focus-within:opacity-100 pointer-coarse:opacity-100 transition-opacity duration-200">
       <TooltipProvider>
@@ -361,6 +371,32 @@ export function AssistantMessageActions({
           serverFeedback={serverFeedback}
           onFeedback={onFeedback}
         />
+
+        {canReport && (
+          <>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className={TOUCH_TARGET_44}
+                  onClick={() => setReportOpen(true)}
+                  aria-label="Report a quality problem"
+                  data-testid="quality-report-button"
+                >
+                  <AlertCircle className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent><p>Report a quality problem</p></TooltipContent>
+            </Tooltip>
+            <QualityReportDialog
+              open={reportOpen}
+              onOpenChange={setReportOpen}
+              sessionId={Number(sessionId)}
+              messageId={Number(messageId)}
+            />
+          </>
+        )}
       </TooltipProvider>
     </div>
   );

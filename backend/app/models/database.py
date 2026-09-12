@@ -1569,6 +1569,41 @@ CREATE INDEX IF NOT EXISTS idx_prompt_ab_exposures_experiment_id ON prompt_ab_ex
 # definition, shared by SCHEMA and by their respective migrate_add_* functions,
 # and therefore cannot drift apart.
 # static DDL only
+# Quality reports / eval cases (issue #237, PRODUCT-ENH-12): structured
+# user-facing quality feedback bound to the immutable message identity and
+# provenance available at HEAD, and operator-converted replayable eval cases.
+# Also created by migrate_add_quality_reports / migrate_add_quality_eval_cases
+# (repo double-definition pattern).
+_QUALITY_REPORTS_DDL = """
+CREATE TABLE IF NOT EXISTS quality_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    note TEXT,
+    turn_id TEXT,
+    seq INTEGER,
+    config_ref TEXT NOT NULL,
+    source_file_hashes TEXT NOT NULL DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_reports_session
+    ON quality_reports(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS quality_eval_cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_id INTEGER NOT NULL REFERENCES quality_reports(id) ON DELETE CASCADE,
+    query TEXT NOT NULL,
+    expected_outcome TEXT NOT NULL,
+    provenance TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_quality_eval_cases_report
+    ON quality_eval_cases(report_id);
+"""
+
 SCHEMA = (
     _BASE_SCHEMA
     + _DRAFT_ROOM_CORE_DDL
@@ -1584,6 +1619,7 @@ SCHEMA = (
     # app.models.migration_journal and also created by
     # migrate_add_migration_journal (repo double-definition pattern).
     + MIGRATION_JOURNAL_DDL
+    + _QUALITY_REPORTS_DDL
 )  # nosec B608
 
 
@@ -1724,6 +1760,8 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_kms_tables(sqlite_path)
     migrate_add_kms_refs(sqlite_path)
     migrate_add_chat_turn_columns(sqlite_path)
+    migrate_add_quality_reports(sqlite_path)
+    migrate_add_quality_eval_cases(sqlite_path)
     migrate_add_document_reindex_jobs(sqlite_path)
     migrate_add_tags_tables(sqlite_path)
     migrate_add_folders(sqlite_path)
@@ -2617,6 +2655,35 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_session_seq ON chat_messages(session_id, seq)"
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_quality_reports(sqlite_path: str) -> None:
+    """Migration: create the quality_reports table (issue #237, PRODUCT-ENH-12).
+
+    Executes the same ``_QUALITY_REPORTS_DDL`` block appended to the SCHEMA
+    constant, so fresh and migrated databases converge by construction.
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.executescript(_QUALITY_REPORTS_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_quality_eval_cases(sqlite_path: str) -> None:
+    """Migration: create the quality_eval_cases table (issue #237, PRODUCT-ENH-12).
+
+    Executes the same ``_QUALITY_REPORTS_DDL`` block appended to the SCHEMA
+    constant (the DDL carries both tables; the split mirrors the two-table
+    registration convention while keeping a single shared DDL constant).
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.executescript(_QUALITY_REPORTS_DDL)
         conn.commit()
     finally:
         conn.close()

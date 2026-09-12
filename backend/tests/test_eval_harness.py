@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tests.eval.eval_harness import (
     CaseResult,
     EvalRunner,
+    GoldenCase,
     citation_validity,
     fact_coverage,
     load_jsonl,
@@ -311,3 +312,130 @@ class TestArtifactMetrics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRanCountFromPresence(unittest.TestCase):
+    """EVAL-003 (issue #237): ran_count derives from result presence."""
+
+    def _runner(self):
+        cases = [
+            GoldenCase(id="mem-1", query="q1", expected_memories=["M1"]),
+            GoldenCase(id="nomatch-1", query="q2", expect_no_match=True),
+            GoldenCase(id="art-1", query="q3", expected_artifact_ids=["a9"]),
+            GoldenCase(id="absent-1", query="q4", expected_chunk_ids=["c1"]),
+        ]
+        return EvalRunner(cases, top_k=5)
+
+    def test_specialized_completed_cases_count(self):
+        runner = self._runner()
+        runner.add_result(
+            CaseResult(id="mem-1", cited_memory_labels=["M1"], retrieval_status="ok")
+        )
+        runner.add_result(
+            CaseResult(id="nomatch-1", no_match_returned=True, retrieval_status="ok")
+        )
+        runner.add_result(
+            CaseResult(id="art-1", retrieved_artifact_ids=["a9"], retrieval_status="ok")
+        )
+        summary = runner.summarize()
+        self.assertEqual(summary["case_count"], 4)
+        self.assertEqual(summary["ran_count"], 3)
+        self.assertEqual(summary["retrieval_status_counts"], {"ok": 3})
+        self.assertEqual(summary["memory_recall_mean"], 1.0)
+        self.assertEqual(summary["no_match_correct_rate"], 1.0)
+        self.assertEqual(summary["artifact_recall_at_k_mean"], 1.0)
+
+
+class TestDuplicateGoldenIdRejection(unittest.TestCase):
+    """EVAL-002 class (issue #237): golden ids must be unique."""
+
+    def test_runner_rejects_duplicate_case_ids(self):
+        with self.assertRaises(ValueError) as ctx:
+            EvalRunner(
+                [
+                    GoldenCase(id="dup", query="a"),
+                    GoldenCase(id="dup", query="b"),
+                ]
+            )
+        self.assertIn("duplicate", str(ctx.exception))
+
+    def test_load_jsonl_rejects_duplicate_case_ids(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "golden.jsonl"
+            path.write_text(
+                '{"id": "x", "query": "a"}' + chr(10) + '{"id": "x", "query": "b"}' + chr(10),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                load_jsonl(path)
+            self.assertIn("duplicate", str(ctx.exception))
+
+
+class TestHonestReportingKeys(unittest.TestCase):
+    """AC7 (issue #237): denominators, uncertainty, definitions."""
+
+    def _summary(self):
+        runner = EvalRunner(
+            [
+                GoldenCase(id="a", query="qa", expected_chunk_ids=["c1"], expected_facts=["October 15"]),
+                GoldenCase(id="b", query="qb", expected_facts=["VP of Finance"]),
+                GoldenCase(id="c", query="qc", expected_chunk_ids=["c9"]),
+            ],
+            top_k=5,
+        )
+        runner.add_result(
+            CaseResult(id="a", retrieved_chunk_ids=["c1"], answer="It is October 15.", retrieval_status="ok")
+        )
+        runner.add_result(
+            CaseResult(id="b", answer="The VP of Finance signed it.", retrieval_status="ok")
+        )
+        return runner
+
+    def test_new_keys_present_and_existing_keys_intact(self):
+        summary = self._summary().summarize()
+        for key in (
+            "case_count", "ran_count", "top_k", "recall_at_k_mean", "mrr_mean",
+            "ndcg_at_k_mean", "citation_validity_mean", "memory_recall_mean",
+            "wiki_recall_mean", "fact_coverage_mean", "unsupported_citation_total",
+            "no_match_correct_rate", "retrieval_status_counts",
+        ):
+            self.assertIn(key, summary)
+        for key in ("metric_n", "metric_skipped", "uncertainty", "metric_definitions"):
+            self.assertIn(key, summary)
+
+    def test_metric_n_matches_contributions(self):
+        runner = self._summary()
+        summary = runner.summarize()
+        metrics = {m.id: m for m in runner.evaluate()}
+        for key, n in summary["metric_n"].items():
+            attr = key[:-5] if key.endswith("_mean") else "no_match_correct"
+            expected = sum(1 for m in metrics.values() if getattr(m, attr) is not None)
+            self.assertEqual(n, expected, key)
+
+    def test_uncertainty_brackets_and_documents_method(self):
+        summary = self._summary().summarize()
+        for key, entry in summary["uncertainty"].items():
+            value = summary[key]
+            self.assertIsInstance(entry["method"], str)
+            self.assertTrue(entry["method"])
+            self.assertLessEqual(entry["low"] - 1e-12, value)
+            self.assertGreaterEqual(entry["high"] + 1e-12, value)
+
+    def test_no_definition_labels_ragas(self):
+        summary = self._summary().summarize()
+        for key, definition in summary["metric_definitions"].items():
+            self.assertIsInstance(definition, str)
+            self.assertTrue(definition.strip())
+            self.assertNotIn("ragas", definition.lower())
+
+    def test_summarize_is_deterministic(self):
+        runner = self._summary()
+        import json as _json
+
+        self.assertEqual(
+            _json.dumps(runner.summarize(), sort_keys=True),
+            _json.dumps(runner.summarize(), sort_keys=True),
+        )

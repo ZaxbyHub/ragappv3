@@ -1,14 +1,15 @@
 """
 Evaluation API routes for RAG pipeline metrics.
 
-NOTE: the ``/eval/ragas`` route computes **lexical-overlap approximation**
-metrics (bigram/trigram overlap, keyword overlap, query/ground-truth word-set
-overlap, optional embedding cosine), NOT metrics from the ``ragas`` library.
-The route and model names retain the ``RAGAS`` prefix for API stability, but
-the values are approximations intended for quick local sanity-checks of RAG
-output, not the rigorous reference-based metrics the upstream ``ragas``
-package provides. ``ragas`` is intentionally NOT a runtime dependency (it is
-absent from all requirements files); the endpoint is gated solely on
+NOTE: the heuristic evaluation route computes **lexical-overlap
+approximation** metrics (bigram/trigram overlap, keyword overlap,
+query/ground-truth word-set overlap, optional embedding cosine), NOT metrics
+from any external library. The canonical route is ``POST /eval/heuristic``
+(issue #343 recorded this rename); ``POST /eval/ragas`` remains as a
+deprecated alias for API stability. ``answer_similarity`` is a raw cosine on
+``[-1, 1]`` — anti-correlated embeddings are valid and score negative. The
+``ragas`` package is intentionally NOT a runtime dependency (it is absent
+from all requirements files); the endpoints are gated solely on
 ``settings.eval_enabled``.
 """
 
@@ -16,7 +17,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.api.deps import get_embedding_service, get_rag_engine, require_admin_role
 from app.services.embeddings import EmbeddingService
@@ -26,11 +27,11 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-class RAGASEvaluationRequest(BaseModel):
+class HeuristicEvaluationRequest(BaseModel):
     """Request model for the lexical-overlap evaluation endpoint.
 
-    Despite the legacy ``RAGAS`` prefix (kept for API stability), the metrics
-    computed here are lexical-overlap approximations, not upstream-ragas values.
+    The metrics computed here are lexical-overlap approximations, not values
+    from any external evaluation library.
     """
 
     query: str = Field(..., min_length=1, description="User query to evaluate")
@@ -43,12 +44,14 @@ class RAGASEvaluationRequest(BaseModel):
     )
 
 
-class RAGASMetrics(BaseModel):
-    """Lexical-overlap approximation metrics (NOT upstream ragas values).
+class HeuristicMetrics(BaseModel):
+    """Lexical-overlap approximation metrics.
 
-    The ``RAGAS`` name is retained for API stability; each field below is a
-    hand-rolled heuristic (n-gram/keyword/word-set overlap, or embedding
-    cosine for ``answer_similarity``). See ``eval.py`` module docstring.
+    Each field below is a hand-rolled heuristic (n-gram/keyword/word-set
+    overlap, or embedding cosine for ``answer_similarity``). ``answer_similarity``
+    is a raw embedding cosine on [-1, 1]: 1.0 = identical direction,
+    0.0 = orthogonal or zero-norm vector, -1.0 = anti-correlated — a negative
+    value is a valid measurement of semantic disagreement, not an error.
     """
 
     faithfulness: float = Field(
@@ -65,17 +68,21 @@ class RAGASMetrics(BaseModel):
         0.0, ge=0.0, le=1.0, description="Context relevance to query"
     )
     answer_similarity: Optional[float] = Field(
-        None, ge=0.0, le=1.0, description="Similarity to ground truth"
+        None,
+        ge=-1.0,
+        le=1.0,
+        description="Embedding cosine to ground truth on [-1, 1]; negative means anti-correlated",
     )
 
 
-class RAGASEvaluationResponse(BaseModel):
+class HeuristicEvaluationResponse(BaseModel):
     """Response model for the lexical-overlap evaluation endpoint.
 
-    Note: ``metrics`` are lexical-overlap approximations, not upstream ragas.
+    Note: ``metrics`` are lexical-overlap approximations, not library-computed
+    reference metrics.
     """
 
-    metrics: RAGASMetrics
+    metrics: HeuristicMetrics
     evaluation_time_ms: int
     details: Dict[str, Any] = Field(default_factory=dict)
 
@@ -413,19 +420,26 @@ async def _calculate_answer_similarity(
         return None
 
 
-@router.post("/eval/ragas", response_model=RAGASEvaluationResponse)
-async def ragas_evaluation(
-    request: RAGASEvaluationRequest,
+@router.post(
+    "/eval/ragas",
+    response_model=HeuristicEvaluationResponse,
+    deprecated=True,
+    description="Deprecated alias of /eval/heuristic (kept for API stability; see issue #343).",
+)
+@router.post("/eval/heuristic", response_model=HeuristicEvaluationResponse)
+async def heuristic_evaluation(
+    request: HeuristicEvaluationRequest,
     embedding_service: EmbeddingService = Depends(get_embedding_service),
     user: dict = Depends(require_admin_role),
 ):
     """
     Evaluate RAG pipeline output with lexical-overlap approximation metrics.
 
-    NOTE: despite the legacy route path (``/eval/ragas``) and the ``RAGAS``
-    model names, these are **hand-rolled lexical heuristics**, NOT metrics
-    computed by the upstream ``ragas`` library (which is not a dependency).
-    They are intended for quick local sanity-checks, not rigorous evaluation.
+    NOTE: these are **hand-rolled lexical heuristics**, NOT metrics computed
+    by any external evaluation library (none is a dependency). They are
+    intended for quick local sanity-checks, not rigorous evaluation. The
+    canonical route is ``/eval/heuristic``; ``/eval/ragas`` is a deprecated
+    alias returning identical results.
 
     Calculates (all lexical-overlap approximations unless noted):
     - Faithfulness: answer-sentence n-gram overlap with retrieved contexts
@@ -433,13 +447,14 @@ async def ragas_evaluation(
     - Context Precision: query/contexts word-set overlap
     - Context Recall: ground-truth/contexts word-set overlap
     - Context Relevancy: average query/contexts word-set overlap
-    - Answer Similarity: embedding cosine to ground truth (if provided)
+    - Answer Similarity: embedding cosine to ground truth on [-1, 1]
+      (if provided; negative = anti-correlated, which is valid)
 
     Args:
-        request: RAGASEvaluationRequest containing query, answer, contexts
+        request: HeuristicEvaluationRequest containing query, answer, contexts
 
     Returns:
-        RAGASEvaluationResponse with computed metrics and evaluation details
+        HeuristicEvaluationResponse with computed metrics and evaluation details
 
     Raises:
         HTTPException: 400 if request validation fails, 500 on evaluation error
@@ -452,11 +467,11 @@ async def ragas_evaluation(
             detail="Evaluation endpoint is disabled. Set EVAL_ENABLED=true to enable.",
         )
 
-    # NOTE: the `ragas` library is intentionally NOT imported here. The route
-    # previously gated on `import ragas` purely as an install-presence check,
-    # but ragas was never called and is absent from all requirements files.
+    # NOTE: no external evaluation library is imported here. The route
+    # previously gated on an ``import ragas`` install-presence check, but the
+    # library was never called and is absent from all requirements files.
     # The metrics above are lexical-overlap heuristics; the gate is solely
-    # `eval_enabled` (see module docstring).
+    # ``eval_enabled`` (see module docstring).
 
     import time
 
@@ -481,7 +496,7 @@ async def ragas_evaluation(
 
         evaluation_time_ms = int((time.time() - start_time) * 1000)
 
-        metrics = RAGASMetrics(
+        metrics = HeuristicMetrics(
             faithfulness=faithfulness,
             answer_relevancy=answer_relevancy,
             context_precision=context_precision,
@@ -498,7 +513,7 @@ async def ragas_evaluation(
         }
 
         logger.info(
-            "RAGAS evaluation completed: faithfulness=%.3f, relevancy=%.3f, precision=%.3f, "
+            "Heuristic evaluation completed: faithfulness=%.3f, relevancy=%.3f, precision=%.3f, "
             "recall=%.3f, time_ms=%d",
             faithfulness,
             answer_relevancy,
@@ -507,12 +522,12 @@ async def ragas_evaluation(
             evaluation_time_ms,
         )
 
-        return RAGASEvaluationResponse(
+        return HeuristicEvaluationResponse(
             metrics=metrics, evaluation_time_ms=evaluation_time_ms, details=details
         )
 
     except Exception:
-        logger.exception("RAGAS evaluation failed")
+        logger.exception("Heuristic evaluation failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -536,7 +551,12 @@ class LiveBenchmarkItem(BaseModel):
 
 
 class LiveEvalRequest(BaseModel):
-    """Request model for live retrieval benchmark endpoint."""
+    """Request model for live retrieval benchmark endpoint.
+
+    Benchmark item ids must be unique: the adapter associates retrieved
+    rankings by id, so a duplicate id would silently score one item against
+    another's ranking (issue #237, EVAL-002).
+    """
 
     benchmark: List[LiveBenchmarkItem] = Field(
         ...,
@@ -549,6 +569,17 @@ class LiveEvalRequest(BaseModel):
     top_k: Optional[int] = Field(
         None, ge=1, description="Override recall@k / nDCG@k k value"
     )
+
+    @model_validator(mode="after")
+    def _reject_duplicate_benchmark_ids(self) -> "LiveEvalRequest":
+        seen: set = set()
+        for item in self.benchmark:
+            if item.id in seen:
+                raise ValueError(
+                    f"duplicate benchmark item id: {item.id!r} — benchmark ids must be unique"
+                )
+            seen.add(item.id)
+        return self
 
 
 class LiveEvalResponse(BaseModel):
