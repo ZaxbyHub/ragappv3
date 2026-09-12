@@ -96,11 +96,12 @@ v1 tradeoff:
   behavior that applies to every job equally; it is not specific to this gate.
   Mitigation belongs to branch-protection / required-status-check policy
   (configurable on `master`), not to the workflow itself.
-- **Scope is `backend/app` only (low):** `backend/embedding_server/` and
-  `backend/scripts/` are not bandit-scanned. They remain under `ruff check .`
-  (the whole `backend/` tree), and `embedding_server` is not in the production
-  deployment (`docker-compose.yml` runs HuggingFace TEI). Widening the scope is a
-  reasonable follow-up; it was scoped to `backend/app` for the v1 gate.
+- **Scope is `backend/app` only (low):** `backend/scripts/` is not
+  bandit-scanned. It remains under `ruff check .` (the whole `backend/`
+  tree). The dormant `backend/embedding_server/` sidecar was removed
+  entirely (issue #258 ENH-003); `docker-compose.yml` runs HuggingFace TEI
+  for embeddings. Widening the scope is a reasonable follow-up; it was
+  scoped to `backend/app` for the v1 gate.
 - **Line-based keying coincidence (low):** two findings sharing an identical
   `(test_id, file, line_number)` collapse to one key. Bandit rarely emits two
   distinct findings on the same line/test, so this is theoretical. Line-based
