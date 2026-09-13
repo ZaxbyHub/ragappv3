@@ -355,8 +355,16 @@ describe("useSendMessage issue #552 acceptance coverage", () => {
     const state = useChatStore.getState();
     expect(state.isStreaming).toBe(true);
     expect(state.streamingMessageId).toBe(secondAssistantId);
-    expect(state.messagesById[secondAssistantId!]).toMatchObject({
-      content: "new partial answer",
+    // onMessage appends are rAF-buffered: the hook flushes the buffer to React
+    // state a frame later, and the sync into the store lands in the effect
+    // after that. The stale terminal callbacks above return early (generation
+    // guard) and deliberately do not flush the buffer, so poll for the
+    // streamed content instead of racing the flush — this assertion read the
+    // store before the buffered flush landed in loaded full-suite runs.
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().messagesById[secondAssistantId!]).toMatchObject({
+        content: "new partial answer",
+      });
     });
 
     await act(async () => {
