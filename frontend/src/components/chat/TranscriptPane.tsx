@@ -184,13 +184,17 @@ const MessageRow = memo(function MessageRow({
   // live-stream error paths already stamp `error` on the message (which
   // renders its own retry banner inside AssistantMessage), so this banner
   // targets the restored rows — status set, no error string. Never shown
-  // while a stream is active.
+  // while a stream is active. "pending" (issue #553) counts as interrupted
+  // for assistant rows: it marks a turn the server pre-wrote but never
+  // finalized (crash mid-generation) — the answer never arrived, so the
+  // turn stays retryable.
   const showInterruptedStatusBanner =
     safeMessage.role === "assistant" &&
     !isStreaming &&
     !safeMessage.error &&
     (safeMessage.status === "interrupted" ||
       safeMessage.status === "partial" ||
+      safeMessage.status === "pending" ||
       safeMessage.status === "failed");
 
   return (

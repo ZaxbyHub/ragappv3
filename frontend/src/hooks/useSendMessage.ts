@@ -590,6 +590,13 @@ export function useSendMessage(
         useChatModeStore.getState().citationMode,
         Object.keys(metadataFilter).length > 0 ? metadataFilter : undefined,
         scopeDocumentIds ?? undefined,
+        // Issue #553: opt this turn into the server-side durable write — the
+        // server pre-writes the user row (status "pending") before the first
+        // token and finalizes the assistant row under this turn_id, so a
+        // proxy drop, tab close, or crash never loses the turn. persistTurn
+        // (still called at the terminal events below) becomes an idempotent
+        // reconcile against those rows.
+        { sessionId, turnId },
       );
 
       // The scope applied to this question only — it is consumed once the

@@ -31,8 +31,9 @@ export interface Message {
   citationEnforcement?: CitationEnforcement;
   /** Durable turn linkage (issue #507): shared by a turn's user+assistant rows. */
   turnId?: string;
-  /** Assistant terminal state (issue #507). "complete" is the default; "interrupted"/"partial" render retryable. */
-  status?: "complete" | "partial" | "interrupted" | "failed";
+  /** Assistant terminal state (issue #507). "complete" is the default; "interrupted"/"partial" render retryable.
+   * "pending" (issue #553) is the server's pre-write state for a turn that never finalized. */
+  status?: "pending" | "complete" | "partial" | "interrupted" | "failed";
   /** Durable save acknowledgment, separate from answer completion (UI-002). */
   saveState?: "saving" | "saved" | "failed";
   /** Per-session durable order (issue #507), as returned by the backend. */

@@ -956,3 +956,314 @@ async def test_fork_preserves_honesty_fields_across_reload(tmp_path):
         assert forked[1]["citation_enforcement"] == enforcement
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Issue #553: server-side turn writes, turn_id reconcile, uniqueness
+# ---------------------------------------------------------------------------
+
+
+def _prewrite_pending_row(conn, session_id, turn_id, content="Question"):
+    """Insert the server-side pending user row the way the stream pre-write
+    does (issue #553): plain INSERT + seq/turn_id/status side-write."""
+    cursor = conn.execute(
+        "INSERT INTO chat_messages (session_id, role, content, created_at) "
+        "VALUES (?, 'user', ?, CURRENT_TIMESTAMP)",
+        (session_id, content),
+    )
+    pre_id = cursor.lastrowid
+    conn.execute(
+        "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 "
+        "FROM chat_messages WHERE session_id = ?), "
+        "turn_id = ?, status = 'pending' WHERE id = ?",
+        (session_id, turn_id, pre_id),
+    )
+    conn.commit()
+    pre_row = conn.execute(
+        "SELECT id, seq FROM chat_messages WHERE id = ?", (pre_id,)
+    ).fetchone()
+    return pre_row
+
+
+@pytest.mark.asyncio
+async def test_batch_reconciles_server_prewritten_turn_in_place(tmp_path):
+    """A batch save for a turn the server already pre-wrote (status pending)
+    UPDATEs the durable row (id and seq preserved) instead of duplicating it,
+    and the response returns the reconciled durable ids (issue #553)."""
+    db_path = tmp_path / "turns-reconcile.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        conn.commit()
+        turn_id = "recon-turn-1"
+        pre_row = _prewrite_pending_row(conn, session_id, turn_id)
+
+        response = await chat_routes.add_messages_batch(
+            _mock_request(),
+            session_id,
+            chat_routes.BatchAddMessagesRequest(
+                messages=[
+                    _msg("user", "Question", turn_id=turn_id),
+                    _msg("assistant", "Answer", turn_id=turn_id, status="complete"),
+                ]
+            ),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            rag_engine=None,
+            _csrf_token="t",
+        )
+
+        rows = conn.execute(
+            "SELECT id, role, status, turn_id, seq FROM chat_messages "
+            "WHERE session_id = ? ORDER BY seq, id",
+            (session_id,),
+        ).fetchall()
+        user_rows = [r for r in rows if r[1] == "user"]
+        assistant_rows = [r for r in rows if r[1] == "assistant"]
+        assert len(user_rows) == 1, f"expected one user row, got {rows}"
+        assert len(assistant_rows) == 1
+        # The reconcile updated the pre-written row in place: same id, same seq.
+        assert user_rows[0][0] == pre_row[0]
+        assert user_rows[0][4] == pre_row[1]
+        # The assistant row is a fresh insert with the next seq.
+        assert assistant_rows[0][4] == pre_row[1] + 1
+        # The response carries the reconciled durable ids (never lastrowid
+        # placeholders) so the client adopts the existing rows.
+        assert [m["id"] for m in response["messages"]] == [
+            pre_row[0],
+            assistant_rows[0][0],
+        ]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_batch_cannot_duplicate_turn(tmp_path):
+    """Replaying the identical batch payload for one turn_id twice leaves
+    exactly one row pair — the reconcile is idempotent (issue #553; named
+    alongside test_concurrent_batches_assign_unique_monotonic_seq by the
+    issue's required-tests section)."""
+    db_path = tmp_path / "turns-dup-batch.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        conn.commit()
+        turn_id = "dup-turn-1"
+        body = chat_routes.BatchAddMessagesRequest(
+            messages=[
+                _msg("user", "Question", turn_id=turn_id),
+                _msg("assistant", "Answer", turn_id=turn_id, status="complete"),
+            ]
+        )
+        for _ in range(2):
+            await chat_routes.add_messages_batch(
+                _mock_request(),
+                session_id,
+                body,
+                conn,
+                {"id": 1},
+                evaluate=_allow,
+                rag_engine=None,
+                _csrf_token="t",
+            )
+
+        rows = conn.execute(
+            "SELECT role, turn_id FROM chat_messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+        assert sorted(r[0] for r in rows) == ["assistant", "user"]
+    finally:
+        conn.close()
+
+
+def test_unique_index_rejects_duplicate_turn_role_rows(tmp_path):
+    """The (session_id, turn_id, role) partial unique index rejects a second
+    row for the same role in one turn, allows the user+assistant pair, and
+    never conflicts on legacy NULL turn_id rows (issue #553)."""
+    db_path = tmp_path / "turns-unique.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        conn.commit()
+
+        def insert(role, content, turn_id):
+            return conn.execute(
+                "INSERT INTO chat_messages "
+                "(session_id, role, content, seq, turn_id, created_at) "
+                "VALUES (?, ?, ?, "
+                "(SELECT COALESCE(MAX(seq), 0) + 1 FROM chat_messages "
+                " WHERE session_id = ?), ?, CURRENT_TIMESTAMP)",
+                (session_id, role, content, session_id, turn_id),
+            )
+
+        insert("user", "first", "turn-u1")
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            insert("user", "second", "turn-u1")
+            conn.commit()
+        conn.rollback()
+        # The user+assistant PAIR for one turn is allowed (roles differ).
+        insert("assistant", "reply", "turn-u1")
+        conn.commit()
+        # Legacy NULL turn_id rows never conflict.
+        insert("assistant", "legacy-1", None)
+        insert("assistant", "legacy-2", None)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_migration_dedupe_keeps_most_informative_row(tmp_path):
+    """The one-time pre-index dedupe keeps exactly one row per
+    (session, turn, role) preferring 'complete' over 'interrupted'/'failed'
+    over 'pending'/NULL, then longest content, then highest id; a re-run is a
+    no-op once the index exists (issue #553)."""
+    db_path = tmp_path / "turns-dedupe.db"
+    # Seed a post-#507, pre-#553 database: the turn columns exist (and hold
+    # duplicate rows from client double-saves) but the unique index does not.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(
+            """
+            DROP TABLE IF EXISTS chat_messages;
+            CREATE TABLE chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                sources TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                seq INTEGER,
+                turn_id TEXT,
+                status TEXT
+            );
+            CREATE TABLE chat_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vault_id INTEGER NOT NULL,
+                user_id INTEGER,
+                title TEXT,
+                forked_from_session_id INTEGER,
+                fork_message_index INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        session_id = conn.execute(
+            "INSERT INTO chat_sessions (vault_id, user_id, title) VALUES (1, 1, NULL)"
+        ).lastrowid
+        # One turn, role='user', three duplicate writes from pre-#553
+        # double-saves with different statuses; plus a NULL-turn legacy row
+        # and a clean second turn that must be untouched.
+        rows = [
+            (session_id, "user", "pending variant", None, 1),          # pending
+            (session_id, "user", "interrupted variant longer", None, 1),  # interrupted, longest
+            (session_id, "user", "complete answer", None, 1),          # complete, short
+            (session_id, "assistant", "legacy row", None, None),       # NULL turn
+            (session_id, "user", "other turn", "turn-2", 2),           # other turn
+        ]
+        for sid, role, content, turn, _ in rows:
+            conn.execute(
+                "INSERT INTO chat_messages (session_id, role, content, created_at) "
+                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (sid, role, content),
+            )
+        # Stamp turn_id/status on the duplicate set the way #507 clients did.
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM chat_messages ORDER BY id"
+        ).fetchall()]
+        conn.execute("UPDATE chat_messages SET turn_id='turn-1', status='pending' WHERE id=?", (ids[0],))
+        conn.execute("UPDATE chat_messages SET turn_id='turn-1', status='interrupted' WHERE id=?", (ids[1],))
+        conn.execute("UPDATE chat_messages SET turn_id='turn-1', status='complete' WHERE id=?", (ids[2],))
+        conn.execute("UPDATE chat_messages SET turn_id='turn-2', status='complete' WHERE id=?", (ids[4],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    migrate_add_chat_turn_columns(str(db_path))
+
+    conn = _connect(db_path)
+    try:
+        survivors = conn.execute(
+            "SELECT turn_id, role, status, content FROM chat_messages "
+            "WHERE turn_id = 'turn-1' ORDER BY id"
+        ).fetchall()
+        # Exactly one survivor for turn-1/user: status priority puts
+        # 'complete' first even though 'interrupted' is longer.
+        assert len(survivors) == 1
+        assert survivors[0][2] == "complete"
+        # NULL-turn legacy row and the clean second turn untouched.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE turn_id IS NULL"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE turn_id = 'turn-2'"
+        ).fetchone()[0] == 1
+        # The unique index now exists.
+        index_names = {
+            row[1] for row in conn.execute("PRAGMA index_list(chat_messages)")
+        }
+        assert "idx_chat_messages_session_turn_role" in index_names
+    finally:
+        conn.close()
+
+    # Re-running the migration is a no-op (index exists → no re-delete).
+    migrate_add_chat_turn_columns(str(db_path))
+    conn = _connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE turn_id = 'turn-1'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_fork_keeps_turn_fields_after_prewrite_and_reconcile(tmp_path):
+    """Fork copies turn fields by position over (seq, id) order; a
+    server-pre-written user row reconciled by a later batch must keep its seq
+    so the fork still pairs the turn's rows correctly (issue #553)."""
+    db_path = tmp_path / "turns-fork-recon.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        conn.commit()
+        turn_id = "fork-turn-1"
+        _prewrite_pending_row(conn, session_id, turn_id)
+        await chat_routes.add_messages_batch(
+            _mock_request(),
+            session_id,
+            chat_routes.BatchAddMessagesRequest(
+                messages=[
+                    _msg("user", "Question", turn_id=turn_id),
+                    _msg("assistant", "Answer", turn_id=turn_id, status="complete"),
+                ]
+            ),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            rag_engine=None,
+            _csrf_token="t",
+        )
+        response = await chat_routes.fork_session(
+            _mock_request(),
+            session_id,
+            chat_routes.ForkSessionRequest(message_index=1),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+        )
+        forked = response["messages"]
+        assert [m["role"] for m in forked] == ["user", "assistant"]
+        assert {m["turn_id"] for m in forked} == {turn_id}
+    finally:
+        conn.close()

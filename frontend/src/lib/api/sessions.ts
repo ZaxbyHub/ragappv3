@@ -190,6 +190,7 @@ export function chatStream(
   citationMode?: string,
   metadataFilter?: ChatMetadataFilter,
   documentIds?: number[],
+  durableTurn?: { sessionId: number; turnId: string },
 ): () => void {
   const abortController = new AbortController();
   // Build the request body once and reuse for both the initial POST and
@@ -206,6 +207,14 @@ export function chatStream(
     // documents' chunks. Omitted entirely when unset so old backends never
     // see an empty list.
     ...(documentIds != null && documentIds.length > 0 && { document_ids: documentIds }),
+    // Durable server-side turn write (issue #553): the client's turn_id is
+    // the idempotency key the server pre-writes and finalizes under. Omitted
+    // when unset so pre-#553 backends never see unknown fields matter (they
+    // ignore extras) and this call stays shape-compatible.
+    ...(durableTurn != null && {
+      session_id: durableTurn.sessionId,
+      turn_id: durableTurn.turnId,
+    }),
   });
 
   const startStream = async () => {

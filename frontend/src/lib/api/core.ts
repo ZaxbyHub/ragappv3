@@ -801,8 +801,10 @@ export interface ChatSessionMessage {
   seq?: number | null;
   /** Client-generated UUID linking a turn's user+assistant rows. Null on legacy rows. */
   turn_id?: string | null;
-  /** Assistant terminal state. Null on legacy rows renders as complete. */
-  status?: "complete" | "partial" | "interrupted" | "failed" | null;
+  /** Assistant terminal state. Null on legacy rows renders as complete.
+   * "pending" (issue #553) marks a turn the server pre-wrote but never
+   * finalized (in-flight from another client, or a crash before stream end). */
+  status?: "pending" | "complete" | "partial" | "interrupted" | "failed" | null;
   /** Citation confidence scores persisted with the answer (DEEP-D-01). */
   citation_confidence?: Record<string, number> | null;
   /** Unverifiable claims persisted with the answer (DEEP-D-01). */
