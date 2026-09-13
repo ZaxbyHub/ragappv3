@@ -113,7 +113,14 @@ roles, not capacity claims.
   your ingress; the compose deployment does not publish an extra port for
   it. Metric families: `ragapp_chat_turns_total`, `ragapp_queue_depth`,
   `ragapp_queue_wait_seconds`, `ragapp_provider_calls_total`,
-  `ragapp_embedding_cache_hits_total`.
+  `ragapp_embedding_cache_hits_total`. Note: the chat route records queue
+  depth snapshots only where the engine's admission API exposes them; the
+  queue-wait gauge is the primary saturation signal. **Stage durations and
+  first-useful-content latencies are per-process** (kept in the instance
+  snapshot via `Telemetry.snapshot()`); the cross-process shard aggregates
+  the counter/gauge families above only — a multi-replica deployment reads
+  stage latency from each replica's own telemetry instance, not the shared
+  `/metrics` sum.
 - Correlation: every chat turn carries a `turn_id` (the inbound
   `X-Request-ID` when present) on the SSE done event; outbound provider
   calls carry W3C `traceparent` + the same `X-Request-ID`. Log lines carry

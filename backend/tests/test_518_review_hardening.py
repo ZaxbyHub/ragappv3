@@ -292,10 +292,9 @@ def test_embedding_cache_hit_recorded(monkeypatch):
 
 
 def test_non_stream_llm_metrics_comes_from_engine_done_chunk():
-    from app.api.deps import get_rag_engine, get_vector_store
+    from app.api.deps import get_db, get_rag_engine, get_vector_store
     from app.api.routes import chat as chat_module
     from app.api.routes.chat import get_current_active_user
-    from app.api.deps import get_db
 
     async def fake_query(*args, **kwargs):
         # Engine yields done WITHOUT llm_metrics — the route must not invent
