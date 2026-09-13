@@ -209,8 +209,13 @@ describe("useSendMessage — evidence candidates", () => {
     });
 
     expect(messagesWithCandidates()).toEqual([]);
+    const firstStopPayload = apiMocks.addChatMessagesBatch.mock.calls[0][1] as Array<
+      Record<string, unknown>
+    >;
+    expect(firstStopPayload).toHaveLength(1);
+    expect(firstStopPayload[0]).toMatchObject({ role: "user", content: "one" });
     const assistantPayload = (
-      apiMocks.addChatMessagesBatch.mock.calls[0][1] as Array<Record<string, unknown>>
+      apiMocks.addChatMessagesBatch.mock.calls.at(-1)?.[1] as Array<Record<string, unknown>>
     ).find((m) => m.role === "assistant");
     expect(assistantPayload).toBeDefined();
     expect(Object.keys(assistantPayload!)).not.toContain("candidateSources");

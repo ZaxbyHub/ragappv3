@@ -22,8 +22,8 @@ import { useChatStore } from "@/stores/useChatStore";
 import { useChatModeStore } from "@/stores/useChatModeStore";
 
 // Stub fetch for the send-path tests. The chat/stream response never
-// resolves; each test asserts the recorded request, then stops the send so
-// in-flight guards reset and nothing is persisted.
+// resolves; each test asserts the recorded request, then abandons the
+// session so in-flight guards reset without exercising Stop persistence.
 const fetchMock = vi.fn();
 vi.stubGlobal("fetch", fetchMock);
 
@@ -205,9 +205,9 @@ describe("metadata_filter serialization into the chat stream request (issue #510
       body = JSON.parse(String(call[1].body)) as Record<string, unknown>;
     });
 
-    // Stop the never-resolving stream so guards reset and nothing persists.
+    // Abandon the never-resolving stream so guards reset without persistence.
     act(() => {
-      result.current.handleStop();
+      useChatStore.getState().newChat();
     });
     return body as Record<string, unknown>;
   };

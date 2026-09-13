@@ -321,6 +321,30 @@ def pytest_configure(config):
         del sys.modules[key]
 
 
+def pytest_collection_modifyitems(config, items):
+    """Skip live-marked tests unless explicitly opted in (issue #563 / C10).
+
+    Tests that perform real network I/O (the Tier-3 live-backend tests in
+    test_csrf_adversarial.py) are marked ``@pytest.mark.live``. Without an
+    explicit opt-in they are skipped with a visible reason instead of probing
+    ``localhost:9090`` — the import-time probes this replaces silently skipped
+    in CI and, worse, drove real register/token requests at whatever unrelated
+    service answered on 9090 on a developer machine. Set ``RAGAPP_LIVE_TESTS=1``
+    to run them; an opted-in run against a dead backend then fails loudly by
+    design (an explicit opt-in that finds no backend is a real failure signal,
+    not something to hide). Collection (and therefore this hook) runs once on
+    the xdist controller, so workers inherit the skip markers.
+    """
+    if os.environ.get("RAGAPP_LIVE_TESTS", "") == "1":
+        return
+    skip_live = pytest.mark.skip(
+        reason="live test (real network I/O); opt in with RAGAPP_LIVE_TESTS=1"
+    )
+    for item in items:
+        if item.get_closest_marker("live"):
+            item.add_marker(skip_live)
+
+
 # ── JWT_SECRET_KEY guard ──────────────────────────────────────────
 # Some test files (e.g. test_service_account_authenticates_to_routes)
 # may momentarily delete os.environ["JWT_SECRET_KEY"] in their

@@ -53,6 +53,9 @@ Repository contract job:
   unparseable globs, adversarial positive samples are not ignored, or
   adversarial negative samples are over-matched. Stale and overly-broad globs
   emit advisory (non-fatal) warnings.
+- `python scripts/check_test_collection_scope.py` — fails if a pytest test
+  file (`test_*.py` / `*_test.py`) exists outside `backend/tests/`, where
+  `pytest tests/` would never collect it (issue #563 / C11).
 
 SAST job:
 
@@ -101,6 +104,7 @@ python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py
 python scripts/check_skill_sync.py
 python scripts/check_secretscan.py
+python scripts/check_test_collection_scope.py
 python scripts/run_bandit.py
 ```
 
