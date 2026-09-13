@@ -295,6 +295,7 @@ def test_non_stream_llm_metrics_comes_from_engine_done_chunk():
     from app.api.deps import get_rag_engine, get_vector_store
     from app.api.routes import chat as chat_module
     from app.api.routes.chat import get_current_active_user
+    from app.api.deps import get_db
 
     async def fake_query(*args, **kwargs):
         # Engine yields done WITHOUT llm_metrics — the route must not invent
@@ -308,6 +309,13 @@ def test_non_stream_llm_metrics_comes_from_engine_done_chunk():
     ready_vs = MagicMock()
     ready_vs._ready = True
 
+    # Hermetic: the non-stream path persists the turn through a pooled
+    # SQLite connection; under the parallel full suite that pool can fail
+    # connection creation (known cwd/xdist environmental contention). The
+    # persistence seam is not under test — stub it.
+    fake_conn = MagicMock()
+    fake_conn.in_transaction = False
+
     app = FastAPI()
     app.include_router(chat_module.router, prefix="/api")
     app.dependency_overrides[get_rag_engine] = lambda: _Engine()
@@ -315,6 +323,7 @@ def test_non_stream_llm_metrics_comes_from_engine_done_chunk():
         "id": 1, "username": "u", "email": "u@e", "role": "admin",
     }
     app.dependency_overrides[get_vector_store] = lambda: ready_vs
+    app.dependency_overrides[get_db] = lambda: fake_conn
 
     client = TestClient(app)
     with patch.object(

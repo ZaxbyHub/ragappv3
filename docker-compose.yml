@@ -226,6 +226,20 @@ services:
       # (health.py _warn_multi_worker_cache) is live on scale-out
       # deployments — default 1 keeps the single-worker default silent.
       - WEB_CONCURRENCY=${WEB_CONCURRENCY:-1}
+      # Shared inference admission + telemetry (issue #518, E3). Budgets
+      # default generous (see .env.example); ADMISSION_STORE_URL empty =
+      # process-local budgets, redis:// shares them across replicas.
+      - ADMISSION_ENABLED=${ADMISSION_ENABLED:-true}
+      - ADMISSION_CHAT_BUDGET=${ADMISSION_CHAT_BUDGET:-8}
+      - ADMISSION_INSTANT_BUDGET=${ADMISSION_INSTANT_BUDGET:-4}
+      - ADMISSION_EMBEDDING_BUDGET=${ADMISSION_EMBEDDING_BUDGET:-4}
+      - ADMISSION_RERANKING_BUDGET=${ADMISSION_RERANKING_BUDGET:-4}
+      - ADMISSION_VISION_BUDGET=${ADMISSION_VISION_BUDGET:-2}
+      - ADMISSION_BACKGROUND_BUDGET=${ADMISSION_BACKGROUND_BUDGET:-2}
+      - ADMISSION_QUEUE_MAX_SIZE=${ADMISSION_QUEUE_MAX_SIZE:-64}
+      - ADMISSION_DEADLINE_SECONDS=${ADMISSION_DEADLINE_SECONDS:-}
+      - ADMISSION_STORE_URL=${ADMISSION_STORE_URL:-}
+      - TELEMETRY_ENABLED=${TELEMETRY_ENABLED:-true}
       # Auth & security
       - USERS_ENABLED
       - JWT_ALGORITHM=${JWT_ALGORITHM:-}
