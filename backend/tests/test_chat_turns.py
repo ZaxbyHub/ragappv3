@@ -1267,3 +1267,110 @@ async def test_fork_keeps_turn_fields_after_prewrite_and_reconcile(tmp_path):
         assert {m["turn_id"] for m in forked} == {turn_id}
     finally:
         conn.close()
+
+
+@pytest.mark.asyncio
+async def test_truncate_keep_seq_with_server_prewritten_pending_tail(tmp_path):
+    """Issue #553 AC9: with a server-pre-written pending row at the tail
+    (the stream pre-write's row, mid-generation), truncate keep_seq still
+    computes the correct boundary - the pending tail is removed, the counts
+    are exact, and post-truncate batch saves continue the seq monotonically
+    from the anchor. Shipped twin of frozen checks C8/C9."""
+    db_path = tmp_path / "turns-truncate-pending.db"
+    init_db(str(db_path))
+    run_migrations(str(db_path))
+    conn = _connect(db_path)
+    try:
+        session_id = _make_session(conn)
+        conn.commit()
+        # One completed turn (user seq 1 + assistant seq 2, NULL turn ids -
+        # legacy shape is still legal under the partial index), then the
+        # server pre-write lands the NEXT turn's user row (seq 3, pending)
+        # and generation is cut off before any assistant row exists.
+        await chat_routes.add_messages_batch(
+            _mock_request(),
+            session_id,
+            chat_routes.BatchAddMessagesRequest(
+                messages=[
+                    _msg("user", "first question"),
+                    _msg("assistant", "first answer", status="complete"),
+                ]
+            ),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            rag_engine=None,
+            _csrf_token="t",
+        )
+        _prewrite_pending_row(conn, session_id, "pending-turn-1", "second question")
+
+        rows_before = conn.execute(
+            "SELECT seq, status FROM chat_messages WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        assert [r[0] for r in rows_before] == [1, 2, 3]
+        assert rows_before[2][1] == "pending"
+
+        # Truncate anchored at the completed turn (keep_seq=2): the pending
+        # tail must go with everything above the boundary.
+        result = await chat_routes.truncate_session_messages(
+            _mock_request(),
+            session_id,
+            chat_routes.TruncateSessionRequest(keep_seq=2),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            _csrf_token="t",
+        )
+        assert result["remaining_count"] == 2
+        assert result["tail_seq"] == 2
+        remaining = conn.execute(
+            "SELECT seq, status FROM chat_messages WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+        assert [r[0] for r in remaining] == [1, 2]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM chat_messages WHERE session_id = ? AND status = 'pending'",
+            (session_id,),
+        ).fetchone()[0] == 0
+
+        # keep_seq=0 clears everything including a newly pre-written row.
+        _prewrite_pending_row(conn, session_id, "pending-turn-2", "third question")
+        result = await chat_routes.truncate_session_messages(
+            _mock_request(),
+            session_id,
+            chat_routes.TruncateSessionRequest(keep_seq=0),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            _csrf_token="t",
+        )
+        assert result["remaining_count"] == 0
+        assert result["tail_seq"] == 0
+
+        # After the clear, a new batch save continues seq monotonically from
+        # the current max (the invariant is unique monotonic seq per session).
+        await chat_routes.add_messages_batch(
+            _mock_request(),
+            session_id,
+            chat_routes.BatchAddMessagesRequest(
+                messages=[
+                    _msg("user", "retry question"),
+                    _msg("assistant", "retry answer", status="complete"),
+                ]
+            ),
+            conn,
+            {"id": 1},
+            evaluate=_allow,
+            rag_engine=None,
+            _csrf_token="t",
+        )
+        seqs = [r[0] for r in conn.execute(
+            "SELECT seq FROM chat_messages WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()]
+        assert len(seqs) == len(set(seqs))
+        assert seqs == sorted(seqs)
+        assert len(seqs) == 2
+    finally:
+        conn.close()
