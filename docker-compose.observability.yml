@@ -7,12 +7,14 @@
 # port) and log/output telemetry into Grafana Alloy, which can fan out to
 # Tempo (traces) and Loki (logs). Entirely optional: the base compose file
 # has no observability dependencies and air-gapped installs are unaffected.
-# OTLP/OTel export from the backend remains an optional pip extra — see
-# docs/operations.md (GenAI semantic conventions are Development status).
+# Direct OTLP export from the backend is available via the pinned optional
+# pip extra backend/requirements-otel.txt + OTEL_EXPORTER_OTLP_ENDPOINT
+# (see docs/operations.md; GenAI semantic conventions are Development
+# status).
 
 services:
   alloy:
-    image: grafana/alloy:latest
+    image: grafana/alloy:v1.5.1
     restart: unless-stopped
     command:
       - run

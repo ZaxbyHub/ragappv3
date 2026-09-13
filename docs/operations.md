@@ -127,11 +127,16 @@ roles, not capacity claims.
   the request id via the RequestIdFilter registered in the logging setup
   (app/lifespan.py).
 - Optional OTel export: the OpenTelemetry packages are NOT base
-  dependencies — air-gapped installs are unaffected. To add OTLP export,
-  install `opentelemetry-sdk` + `opentelemetry-exporter-otlp` and front the
-  /metrics or OTLP endpoint with a collector; the GenAI semantic
-  conventions are Development status as of 2026-09 (open-telemetry/
-  semantic-conventions-genai has no stable release) — pin the version you
-  use and do not describe them as stable. An optional observability stack
-  overlay (Alloy → Tempo/Loki) is provided in
+  dependencies — air-gapped installs are unaffected. To enable OTLP export
+  of the ragapp_* counters, install the PINNED optional extra
+  (`pip install -r requirements.txt -r requirements-otel.txt` inside
+  backend/ — api/sdk/otlp-http exporter all ==1.29.0) and set
+  `OTEL_EXPORTER_OTLP_ENDPOINT`; `init_telemetry()` then bridges the
+  counters to an OTLP MetricExporter (import-guarded: without the packages
+  or the endpoint, nothing OTel-related loads and the app is unchanged).
+  The GenAI semantic conventions are Development status as of 2026-09
+  (open-telemetry/semantic-conventions-genai has no stable release) — the
+  pins above are the version boundary; bump them consciously and do not
+  describe the conventions as stable. An optional observability stack
+  overlay (Alloy collector) is provided in
   `docker-compose.observability.yml`.

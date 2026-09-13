@@ -14,10 +14,16 @@ collector upgrade path is documented in docs/operations.md.)
 
 ``TELEMETRY_ENABLED=false`` (or ``Telemetry(enabled=False)``) is inert:
 recorders are no-ops, snapshots stay empty, no ``ragapp_`` samples are
-rendered, and no correlation headers are produced. OTLP/OTel export is an
-optional extra — nothing here requires the OpenTelemetry packages (see
-docs/operations.md for the optional-collector setup; the GenAI semantic
-conventions it uses are Development status, version-pinned there).
+rendered, and no correlation headers are produced.
+
+OTLP export is an OPTIONAL EXTRA: installing the pinned packages from
+backend/requirements-otel.txt and setting OTEL_EXPORTER_OTLP_ENDPOINT
+activates ``maybe_init_otel_export()`` (called from ``init_telemetry``),
+which bridges the counters here to an OTLP metric exporter. Without the
+packages or the endpoint nothing OTel-related loads. The GenAI semantic
+conventions (open-telemetry/semantic-conventions-genai) are Development
+status with no stable release as of 2026-09 — pin the exact version you
+deploy and do not describe them as stable (docs/operations.md).
 """
 
 import hashlib
@@ -75,6 +81,7 @@ class Telemetry:
         self._provider_calls: Dict[str, Dict[str, int]] = {}
         self._embedding_cache_hits = 0
         self._shard_name = f"telemetry-{os.getpid()}-{secrets.token_hex(4)}.json"
+        self._otel_observers: list = []
 
     # ----------------------------------------------------------- recorders
 
@@ -85,6 +92,7 @@ class Telemetry:
         # Write-through: the shard is the cross-process aggregation surface,
         # so counters land on disk as they are recorded (not only on scrape).
         self._flush_shard()
+        self._notify_otel_observers()
 
     def record_stage(self, turn_id: str, stage: str, duration_seconds: float) -> None:
         if not self.enabled or not turn_id:
@@ -146,6 +154,17 @@ class Telemetry:
             },
             "embedding_cache_hits": self._embedding_cache_hits,
         }
+
+    def attach_otel_observer(self, observer) -> None:
+        """Register the OTLP bridge observer (called on its export cadence)."""
+        self._otel_observers.append(observer)
+
+    def _notify_otel_observers(self) -> None:
+        for observer in list(self._otel_observers):
+            try:
+                observer(None)
+            except Exception:  # noqa: BLE001 — export must never break records
+                logger.debug("otel observer failed", exc_info=True)
 
     def reset(self) -> None:
         self._chat_turns = 0
@@ -272,6 +291,7 @@ def init_telemetry(registry_dir: Optional[Path] = None) -> Telemetry:
         enabled=bool(getattr(settings, "telemetry_enabled", True)),
         registry_dir=registry_dir,
     )
+    maybe_init_otel_export()
     return _singleton
 
 
@@ -317,3 +337,69 @@ def register_metrics_route(app) -> None:
         return PlainTextResponse(
             get_telemetry().metrics_text(), media_type="text/plain"
         )
+
+
+# Pinned alongside backend/requirements-otel.txt (the optional extra).
+_OTLP_EXPORT_ENV = "OTEL_EXPORTER_OTLP_ENDPOINT"
+_otel_export_started = False
+
+
+def maybe_init_otel_export() -> bool:
+    """Bridge the telemetry counters to OTLP when the optional extra is on.
+
+    Activation requires BOTH the pinned optional packages
+    (backend/requirements-otel.txt) AND ``OTEL_EXPORTER_OTLP_ENDPOINT``.
+    Returns True when an OTLP pipeline was started. Import failures are
+    the documented off-state, not an error: air-gapped installs never
+    install the extra and this function is a no-op.
+    """
+    import os
+
+    global _otel_export_started
+    if _otel_export_started:
+        return True
+    endpoint = os.environ.get(_OTLP_EXPORT_ENV, "").strip()
+    if not endpoint:
+        return False
+    try:
+        from opentelemetry import metrics as otel_metrics
+        from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+            OTLPMetricExporter,
+        )
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import (
+            PeriodicExportingMetricReader,
+        )
+    except ImportError:
+        logger.info(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is set but the optional OTel extra "
+            "is not installed (backend/requirements-otel.txt); OTLP export "
+            "stays off."
+        )
+        return False
+
+    telemetry = get_telemetry()
+    reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=endpoint)
+    )
+    provider = MeterProvider(metric_readers=[reader])
+    meter = provider.get_meter("ragapp.telemetry")
+    counter = meter.create_counter("ragapp_chat_turns_total")
+    # Publish the aggregate on each export interval by reading the same
+    # snapshot /metrics serves — the shard aggregate, so replicas sum.
+    observed = {"last": 0}
+
+    def _observe(_options):
+        # Fired on each chat-turn record; the OTel reader exports the
+        # accumulated counter on its own cadence.
+        totals = telemetry._aggregate_counts()
+        delta = totals["chat_turns"] - observed["last"]
+        observed["last"] = totals["chat_turns"]
+        if delta > 0:
+            counter.add(delta)
+
+    otel_metrics.set_meter_provider(provider)
+    telemetry.attach_otel_observer(_observe)
+    _otel_export_started = True
+    logger.info("OTLP metric export started (endpoint configured)")
+    return True

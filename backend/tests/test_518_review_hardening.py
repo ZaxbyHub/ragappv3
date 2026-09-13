@@ -499,3 +499,46 @@ async def test_engine_vision_and_rerank_consult_admission():
     ]
     assert vision_calls, "518-H VISION NOT WIRED at the vision evidence phase"
     assert rerank_calls, "518-H RERANKING NOT WIRED at the rerank phase"
+
+
+# ---------------------------------------------------------------------------
+# 9. OTel optional-extra export hook (final-critic round-1 revision).
+# ---------------------------------------------------------------------------
+
+
+def test_otel_export_hook_inert_without_endpoint_or_packages(monkeypatch):
+    from app.services import telemetry as telemetry_module
+
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    assert telemetry_module.maybe_init_otel_export() is False, (
+        "518-H OTEL HOOK NOT OFF: export started with no endpoint configured"
+    )
+    # With an endpoint but no packages installed, the import guard is the
+    # documented off-state (opentelemetry is not a base dependency).
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+    try:
+        import opentelemetry  # noqa: F401
+
+        has_pkg = True
+    except ImportError:
+        has_pkg = False
+    if not has_pkg:
+        assert telemetry_module.maybe_init_otel_export() is False, (
+            "518-H OTEL HOOK NOT IMPORT-GUARDED: started without the "
+            "optional extra installed"
+        )
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+
+def test_otel_optional_extra_pins_present():
+    from pathlib import Path
+
+    req = (
+        Path(__file__).resolve().parents[1] / "requirements-otel.txt"
+    ).read_text(encoding="utf-8")
+    for pin in (
+        "opentelemetry-api==",
+        "opentelemetry-sdk==",
+        "opentelemetry-exporter-otlp-proto-http==",
+    ):
+        assert pin in req, f"518-H OTEL PIN MISSING: {pin} absent from requirements-otel.txt"

@@ -46,15 +46,8 @@ def backup_sqlite(output_dir: Path) -> Path:
     sqlite_path = Path(settings.sqlite_path)
     nonce = secrets.token_bytes(12)
     aesgcm = AESGCM(key)
-    with tempfile.NamedTemporaryFile(
-        suffix=".db", delete=False, dir=str(output_dir)
-    ) as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        data = snapshot_sqlite(sqlite_path)
-        ciphertext = aesgcm.encrypt(nonce, data, None)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    data = snapshot_sqlite(sqlite_path)
+    ciphertext = aesgcm.encrypt(nonce, data, None)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     backup_path = output_dir / f"db_{timestamp}_k{version}.enc"
     with open(backup_path, "wb") as fout:
