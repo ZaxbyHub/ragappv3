@@ -235,16 +235,13 @@ async def retry_document(
         row = await asyncio.to_thread(cursor.fetchone)
         if not row:
             raise HTTPException(status_code=404, detail="Document not found")
-
         # Ensure processor is running
         if not background_processor.is_running:
             await background_processor.start()
-
         enqueued = await background_processor.enqueue(
             row["file_path"], vault_id=row["vault_id"], file_id=file_id
         )
         retry_status = "scheduled" if enqueued else "already_in_progress"
-
         user_id = (
             str(current_user["id"])
             if current_user and current_user.get("id")
