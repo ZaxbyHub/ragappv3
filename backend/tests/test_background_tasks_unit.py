@@ -1,11 +1,18 @@
+"""Collected pytest coverage for the queue-processor worker-loop contract (issue #563 / C11).
+
+Ported from ``backend/test_background_tasks_unit.py``, a standalone script at
+the package root that pytest never collected. It exercises the asyncio
+queue-processor pattern — singleton access, start/stop lifecycle, queue drain,
+and graceful shutdown with pending items — against a minimal in-file processor
+double, exactly as the original script did; production-side equivalents for
+``BackgroundProcessor`` live in ``tests/test_singleton_processor.py``.
 """
-Unit test for BackgroundProcessor singleton pattern and worker loop.
-Tests the core logic without requiring full dependencies.
-"""
+
 import asyncio
 
+import pytest
 
-# Create a minimal mock implementation for testing
+
 class MockTask:
     def __init__(self, file_path: str, attempt: int = 1):
         self.file_path = file_path
@@ -72,7 +79,7 @@ class MockProcessor:
 
     async def _process_task(self, task):
         # Simulate processing
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.01)
         self.processed.append(task.file_path)
 
     @property
@@ -84,17 +91,18 @@ class MockProcessor:
         return self.queue.qsize()
 
 
-# Singleton implementation for testing
+# Singleton instance for the tests below
 _processor_instance = None
 
-def get_mock_processor(
-    max_retries=3,
-    retry_delay=1.0,
-):
+
+def get_mock_processor(max_retries=3, retry_delay=1.0):
     global _processor_instance
     if _processor_instance is None:
-        _processor_instance = MockProcessor(max_retries=max_retries, retry_delay=retry_delay)
+        _processor_instance = MockProcessor(
+            max_retries=max_retries, retry_delay=retry_delay
+        )
     return _processor_instance
+
 
 def reset_mock_processor():
     global _processor_instance
@@ -103,114 +111,89 @@ def reset_mock_processor():
     _processor_instance = None
 
 
-async def test_singleton_pattern():
-    """Test that get_mock_processor returns the same instance."""
-    reset_mock_processor()
+@pytest.fixture()
+def processor_factory():
+    """Hand out fresh mock processors, containing the module global per test."""
+    global _processor_instance
 
-    processor1 = get_mock_processor()
+    def _factory():
+        reset_mock_processor()
+        return get_mock_processor()
+
+    yield _factory
+
+    # The test's own event loop is already closed by the time fixture
+    # finalizers run, so a processor leaked by a FAILED test cannot be stopped:
+    # MockProcessor.stop() awaits a worker task bound to that closed loop and
+    # reset_mock_processor() would call asyncio.create_task without a running
+    # loop (PRR-004, reproduced empirically). The leaked instance is inert once
+    # its loop is closed — clear the module global unconditionally.
+    _processor_instance = None
+
+
+async def test_singleton_pattern(processor_factory):
+    """get_mock_processor returns the same instance across calls."""
+    processor1 = processor_factory()
     processor2 = get_mock_processor()
 
-    assert processor1 is processor2, "get_mock_processor should return singleton instance"
-    print("[PASS] Singleton pattern works correctly")
-    return processor1
+    assert processor1 is processor2, (
+        "get_mock_processor should return the singleton instance"
+    )
 
 
-async def test_processor_lifecycle(processor):
-    """Test that processor can start and stop correctly."""
+async def test_processor_lifecycle(processor_factory):
+    """The processor starts and stops cleanly."""
+    processor = processor_factory()
+
     assert not processor.is_running, "Processor should not be running initially"
 
     await processor.start()
     assert processor.is_running, "Processor should be running after start()"
-    print("[PASS] Processor starts correctly")
 
     await processor.stop(timeout=5.0)
     assert not processor.is_running, "Processor should not be running after stop()"
-    print("[PASS] Processor stops correctly")
 
 
-async def test_processor_queues_items():
-    """Test that processor can queue and process items."""
-    reset_mock_processor()
-    processor = get_mock_processor()
-
-    # Create test items
+async def test_processor_queues_items(processor_factory):
+    """Enqueued items drain through the worker loop to the task handler."""
+    processor = processor_factory()
     test_items = ["file1.txt", "file2.txt", "file3.txt"]
 
     await processor.start()
 
-    # Queue items
     for item in test_items:
         await processor.enqueue(item)
 
-    assert processor.queue_size == len(test_items), f"Queue should have {len(test_items)} items"
-    print(f"[PASS] Items enqueued, queue size: {processor.queue_size}")
+    assert processor.queue_size == len(test_items), (
+        f"Queue should have {len(test_items)} items"
+    )
 
-    # Wait for processing
-    max_wait = 10
-    waited = 0
-    while processor.queue_size > 0 and waited < max_wait:
-        await asyncio.sleep(0.5)
-        waited += 0.5
+    waited = 0.0
+    while processor.queue_size > 0 and waited < 10.0:
+        await asyncio.sleep(0.05)
+        waited += 0.05
 
     assert processor.queue_size == 0, "Queue should be empty after processing"
-    assert len(processor.processed) == len(test_items), f"All {len(test_items)} items should be processed"
-    print(f"[PASS] All {len(test_items)} items processed successfully")
+    assert len(processor.processed) == len(test_items), (
+        f"All {len(test_items)} items should be processed"
+    )
 
     await processor.stop(timeout=5.0)
-    reset_mock_processor()
 
 
-async def test_graceful_shutdown_with_pending_items():
-    """Test that processor processes all items before shutdown."""
-    reset_mock_processor()
-    processor = get_mock_processor()
-
-    # Create test items
+async def test_graceful_shutdown_with_pending_items(processor_factory):
+    """The processor processes all queued items before shutdown completes."""
+    processor = processor_factory()
     test_items = ["fileA.txt", "fileB.txt"]
 
     await processor.start()
 
-    # Queue items
     for item in test_items:
         await processor.enqueue(item)
 
-    # Initiate shutdown immediately (without waiting)
+    # Initiate shutdown immediately (without waiting for the queue to drain)
     await processor.stop(timeout=5.0)
 
-    # All items should still be processed
-    assert len(processor.processed) == len(test_items), f"All {len(test_items)} items should be processed before shutdown"
-    print(f"[PASS] Graceful shutdown works - all {len(test_items)} items processed")
-
-    reset_mock_processor()
-
-
-async def main():
-    print("Testing BackgroundProcessor singleton pattern and worker loop...")
-    print("=" * 60)
-
-    try:
-        processor = await test_singleton_pattern()
-        await test_processor_lifecycle(processor)
-
-        reset_mock_processor()
-        await test_processor_queues_items()
-
-        reset_mock_processor()
-        await test_graceful_shutdown_with_pending_items()
-
-        print("=" * 60)
-        print("All tests passed!")
-        return 0
-
-    except Exception as e:
-        print(f"Test failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
-    finally:
-        reset_mock_processor()
-
-
-if __name__ == "__main__":
-    exit_code = asyncio.run(main())
-    exit(exit_code)
+    assert len(processor.processed) == len(test_items), (
+        f"All {len(test_items)} items should be processed before shutdown"
+    )

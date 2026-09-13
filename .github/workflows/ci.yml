@@ -99,6 +99,9 @@ jobs:
       - name: Secretscan ignore validation
         run: python scripts/check_secretscan.py
 
+      - name: Test collection scope check
+        run: python scripts/check_test_collection_scope.py
+
   # BUILD-002: detect whether this run touches the docker build surface, so the
   # docker-smoke job below only spends CI minutes when the image definition
   # actually changed (Dockerfile, frontend/Dockerfile, docker-compose.yml).
@@ -188,6 +191,7 @@ jobs:
         run: ruff check .
 
       - name: Test
-        run: pytest --tb=short -v --timeout=300 -n auto --cov --cov-report=term-missing tests/
+        # -rs: itemize skips (live-marker skips must be visible, not silent — issue #563)
+        run: pytest --tb=short -v --timeout=300 -rs -n auto --cov --cov-report=term-missing tests/
         env:
           REDIS_URL: ""
