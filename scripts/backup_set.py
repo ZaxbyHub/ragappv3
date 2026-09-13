@@ -20,6 +20,8 @@ docs/operations.md and docs/admin-guide.md.
 
 import argparse
 import hashlib
+import json
+import os
 import secrets
 import shutil
 import sys
@@ -68,6 +70,23 @@ def _copy_tree(src: Path, dst: Path) -> None:
         shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
+def _restrict_permissions(root: Path) -> None:
+    """Tighten a written tree to owner-only (0700 dirs / 0600 files).
+
+    Backup/restore trees contain user documents and a decrypted database;
+    the default umask on shared hosts would leave them group/world readable
+    (swarm review, LOW hardening).
+    """
+    if not root.exists():
+        return
+    os.chmod(root, 0o700)
+    for path in root.rglob("*"):
+        try:
+            os.chmod(path, 0o700 if path.is_dir() else 0o600)
+        except OSError:  # pragma: no cover — read-only mount/locked file
+            pass
+
+
 def create_backup_set(
     output_dir: Path,
     *,
@@ -95,6 +114,9 @@ def create_backup_set(
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)
     sqlite_artifact = output_dir / SQLITE_ARTIFACT
     sqlite_artifact.write_bytes(nonce + ciphertext)
+    # Owner-only: the encrypted snapshot still binds the deployment's data
+    # shape; keep the backup set itself restrictive.
+    os.chmod(sqlite_artifact, 0o600)
     items: List[dict] = [
         {
             "name": "app.db",
@@ -126,15 +148,20 @@ def create_backup_set(
         )
 
     # --- Vault directories ---
+    # Manifest paths are data_dir-relative: vaults live at
+    # <data_dir>/vaults/<id> (config.py vault_dir), so the artifact path is
+    # "vaults/<id>" — a bare leaf name would restore vaults to the wrong
+    # location (Copilot review on PR #589).
     for vault_dir in vault_dirs:
         name = vault_dir.name
-        target = output_dir / name
+        vault_rel = f"vaults/{name}"
+        target = output_dir / vault_rel
         _copy_tree(vault_dir, target)
         items.append(
             {
                 "name": name,
                 "kind": "vault",
-                "path": name,
+                "path": vault_rel,
                 "files": _digest_tree(target),
             }
         )
@@ -154,11 +181,11 @@ def create_backup_set(
 
     manifest_path = output_dir / MANIFEST_NAME
     manifest_path.write_text(
-        __import__("json").dumps(
-            {"schema": MANIFEST_SCHEMA, "items": items}, indent=2
-        ),
+        json.dumps({"schema": MANIFEST_SCHEMA, "items": items}, indent=2),
         encoding="utf-8",
     )
+    _restrict_permissions(output_dir)
+    os.chmod(manifest_path, 0o600)
     return manifest_path
 
 

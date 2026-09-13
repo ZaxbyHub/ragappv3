@@ -298,7 +298,11 @@ class DraftJobProcessor:
                     job.draft_id,
                 )
                 # E3 admission (issue #518): background budget for draft
-                # jobs; rejection flows into the bounded failure handler.
+                # jobs. Unlike the wiki/kms compile loops there is no
+                # per-job failure handler here: a rejection surfaces as a
+                # poll-loop error below (logged, backoff, keep polling) and
+                # the already-claimed row is recovered by the existing
+                # startup orphan recovery — no silent retry bookkeeping.
                 async with get_admission_controller().admit(
                     AdmissionClass.BACKGROUND, foreground=False
                 ):

@@ -13,6 +13,9 @@ backup -> mutate -> restore -> verify end to end with fakes.
 import argparse
 import hashlib
 import json
+import os
+import re
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -25,12 +28,27 @@ sys.path.append(str(ROOT))
 
 from backend.app.config import settings
 from backend.app.services.secret_manager import SecretManager
+from scripts.backup_set import _restrict_permissions
 
 MANIFEST_NAME = "backup_manifest.json"
+
+# SQLite identifiers cannot be bound as parameters; every interpolated table
+# name in this module is validated against this pattern first.
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class RestoreError(Exception):
     """A backup set failed verification or could not be restored."""
+
+
+def _contained(base: Path, candidate: Path) -> bool:
+    """True when ``candidate`` resolves inside ``base`` (no ``..`` escapes,
+    no absolute-path hijacks — swarm review F-005)."""
+    try:
+        candidate.resolve().relative_to(base.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _default_key_provider() -> tuple:
@@ -58,7 +76,16 @@ def _count_sqlite_rows(db_path: Path) -> int:
         ]
         total = 0
         for table in tables:
-            total += conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            if not _IDENTIFIER_RE.fullmatch(table):
+                # Belt-and-braces: sqlite_master names come from the
+                # decrypted backup, not user input, but identifiers cannot
+                # be bound parameters — validate before interpolation.
+                raise RestoreError(
+                    f"unexpected table name in restored db: {table!r}"
+                )
+            total += conn.execute(
+                f'SELECT COUNT(*) FROM "{table}"'  # nosec B608 — identifier validated against _IDENTIFIER_RE above; no values interpolated
+            ).fetchone()[0]
         return total
     finally:
         conn.close()
@@ -90,9 +117,24 @@ def restore_backup_set(
         kind = item.get("kind")
         name = item.get("name", "?")
         ok = True
+        # Path containment (swarm review F-005): every manifest path must
+        # stay inside the backup set on the source side and inside the
+        # destination root on the restore side — a crafted manifest must
+        # never rmtree/copytree outside either root.
+        item_path = str(item.get("path", ""))
+        if not item_path:
+            raise RestoreError(f"manifest item {name!r} has no path")
+        if not _contained(backup_dir, backup_dir / item_path):
+            raise RestoreError(
+                f"manifest path escapes the backup set: {item_path!r}"
+            )
+        if not _contained(dest_root, dest_root / item_path):
+            raise RestoreError(
+                f"manifest path escapes the destination root: {item_path!r}"
+            )
 
         if kind == "sqlite":
-            artifact = backup_dir / item["path"]
+            artifact = backup_dir / item_path
             if not artifact.exists():
                 raise RestoreError(f"sqlite artifact missing: {artifact}")
             if _sha256_file(artifact) != item.get("sha256"):
@@ -101,41 +143,61 @@ def restore_backup_set(
                 )
             blob = artifact.read_bytes()
             nonce, ciphertext = blob[:12], blob[12:]
-            key, _version = provider()
+            key, key_version = provider()
             try:
                 plain = AESGCM(key).decrypt(nonce, ciphertext, None)
             except Exception as exc:
+                hint = ""
+                manifest_version = item.get("key_version")
+                if manifest_version and str(manifest_version) != str(
+                    key_version
+                ):
+                    hint = (
+                        " (manifest was encrypted under key version "
+                        f"{manifest_version!r}; the current provider serves "
+                        f"{key_version!r})"
+                    )
                 raise RestoreError(
-                    f"sqlite artifact failed to decrypt: {exc}"
+                    f"sqlite artifact failed to decrypt: {exc}{hint}"
                 ) from exc
             dest_db = dest_root / "app.db"
             dest_db.write_bytes(plain)
+            os.chmod(dest_db, 0o600)
             sqlite_rows = _count_sqlite_rows(dest_db)
 
         elif kind in ("lancedb", "vault", "draft_room"):
-            src_dir = backup_dir / item["path"]
+            src_dir = backup_dir / item_path
             if not src_dir.exists():
                 raise RestoreError(f"{kind} artifact missing: {src_dir}")
-            expected_files = item.get("files", {})
+            expected_files = item.get("files") or {}
+            if not expected_files:
+                # An empty/missing files map would "verify" zero digests and
+                # still report success — that falsifies the module contract
+                # (swarm review F-005).
+                raise RestoreError(
+                    f"{kind} artifact {item_path!r} binds no file digests; "
+                    "an unverifiable tree is not restorable"
+                )
             for rel, digest in expected_files.items():
                 candidate = src_dir / rel
+                if not _contained(src_dir, candidate):
+                    raise RestoreError(
+                        f"manifest file escapes the artifact tree: {rel!r}"
+                    )
                 if not candidate.exists():
                     raise RestoreError(
                         f"manifest file missing from backup set: {rel}"
                     )
                 if _sha256_file(candidate) != digest:
                     raise RestoreError(
-                        f"artifact digest mismatch: {item['path']}/{rel}"
+                        f"artifact digest mismatch: {item_path}/{rel}"
                     )
-            dest_dir = dest_root / item["path"]
+            dest_dir = dest_root / item_path
             dest_dir.parent.mkdir(parents=True, exist_ok=True)
             if dest_dir.exists():
-                import shutil
-
                 shutil.rmtree(dest_dir)
-            import shutil
-
             shutil.copytree(src_dir, dest_dir)
+            _restrict_permissions(dest_dir)
             if kind == "lancedb":
                 for table_entry in item.get("tables", []):
                     table_name = table_entry["table"]
@@ -160,6 +222,30 @@ def restore_backup_set(
     }
 
 
+def _cli_lancedb_factory(
+    dest_root: Path,
+) -> Callable[[str], object]:
+    """Open the RESTORED lancedb tree lazily and return a table factory.
+
+    The operator CLI must actually perform the documented tag checkout
+    (swarm review NEW-LANCEDB-UNWIRED): the module docstring,
+    docs/operations.md and the admin guide all promise
+    ``checkout(tag)`` on restore, which never ran when main() omitted the
+    factory. Connection is deferred to the first call so it happens AFTER
+    the lancedb tree has been restored into ``dest_root``.
+    """
+    import lancedb
+
+    state: dict = {}
+
+    def factory(name: str):
+        if "db" not in state:
+            state["db"] = lancedb.connect(str(dest_root / "lancedb"))
+        return state["db"].open_table(name)
+
+    return factory
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Restore and verify a backup set (see scripts/backup_set.py)"
@@ -174,7 +260,16 @@ def main() -> None:
     args = parser.parse_args()
     dest = args.dest or Path(settings.data_dir)
 
-    report = restore_backup_set(args.backup_dir, dest)
+    try:
+        factory = _cli_lancedb_factory(dest)
+    except ImportError:
+        raise SystemExit(
+            "restore requires the lancedb package to check out tagged "
+            "table versions; install the backend requirements first"
+        )
+    report = restore_backup_set(
+        args.backup_dir, dest, lancedb_factory=factory
+    )
     print(json.dumps(report, indent=2))
 
 

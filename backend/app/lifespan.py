@@ -1000,6 +1000,21 @@ async def lifespan(app: FastAPI):
         await app.state.draft_job_processor.stop()
     if getattr(app.state, "kms_compile_processor", None):
         await app.state.kms_compile_processor.stop()
+    # E3 admission shutdown (issue #518, swarm review F-006): after all
+    # background workers have drained, release their admission slots,
+    # reject further admits and close a Redis shared store's connection
+    # pool. Must run AFTER the processor stop() calls above — those drains
+    # hold background leases until they finish.
+    try:
+        from app.services.admission import get_admission_controller
+
+        controller = get_admission_controller()
+        await controller.shutdown()
+        close = getattr(controller.store, "close", None)
+        if close is not None:
+            await close()
+    except Exception:
+        logger.exception("Admission shutdown failed")
     # Close both underlying LLM clients. The ``llm_client`` attr is an
     # alias of ``thinking_llm_client`` so closing it separately is
     # unnecessary; ``LLMClient.close()`` is also idempotent.
