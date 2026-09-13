@@ -14,6 +14,11 @@ from datetime import UTC, datetime
 from typing import List, Optional
 
 from app.config import settings
+from app.services.admission import (
+    AdmissionClass,
+    AdmissionRejected,
+    get_admission_controller,
+)
 
 from ..models.database import SQLiteConnectionPool
 from .document_processor import DocumentProcessingError, DocumentProcessor
@@ -1786,7 +1791,18 @@ class BackgroundProcessor:
             if task is None:
                 continue
 
-            await self._process_task_wrapper(task)
+            # E3 admission (issue #518): ingestion work shares the background
+            # device budget. Under interactive pressure the admit is rejected
+            # (foreground preference) — defer by requeueing after a short
+            # backoff; the queue bound keeps the retry bounded.
+            try:
+                async with get_admission_controller().admit(
+                    AdmissionClass.BACKGROUND, foreground=False
+                ):
+                    await self._process_task_wrapper(task)
+            except AdmissionRejected:
+                await self.queue.put(task)
+                await asyncio.sleep(0.5)
 
     async def _enrichment_worker_loop(self) -> None:
         """Process optional enrichment after base indexing completes."""
@@ -1798,14 +1814,17 @@ class BackgroundProcessor:
             except asyncio.TimeoutError:
                 continue
             try:
-                await self.processor.run_enrichment_job(
-                    file_id=item.file_id,
-                    file_path=item.file_path,
-                    vault_id=item.vault_id,
-                    file_hash=item.file_hash,
-                    chunks=item.chunks,
-                    document_text=item.document_text,
-                )
+                async with get_admission_controller().admit(
+                    AdmissionClass.BACKGROUND, foreground=False
+                ):
+                    await self.processor.run_enrichment_job(
+                        file_id=item.file_id,
+                        file_path=item.file_path,
+                        vault_id=item.vault_id,
+                        file_hash=item.file_hash,
+                        chunks=item.chunks,
+                        document_text=item.document_text,
+                    )
             except Exception:
                 logger.exception("Enrichment job failed for file_id=%s", item.file_id)
                 if self.shutdown_event.is_set():

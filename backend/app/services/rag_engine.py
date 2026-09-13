@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import sqlite3
+from contextlib import AsyncExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +23,12 @@ from typing import (
 
 from app.config import settings
 from app.models.chat_mode import ChatMode
+from app.services.admission import (
+    AdmissionClass,
+    AdmissionRejected,
+    chat_gate_held,
+    get_admission_controller,
+)
 from app.services.answer_contract import build_answer_contract
 from app.services.citation_validator import (
     parse_citations,
@@ -1323,7 +1330,27 @@ class RAGEngine:
                     if vt == 'original'
                 ] or [('original', retrieval_query)]
             embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
-            raw_embeddings = await asyncio.gather(*embed_tasks, return_exceptions=True)
+            # E3 admission (issue #518): the embedding device budget is shared
+            # process-wide (and cross-process via ADMISSION_STORE_URL).
+            try:
+                async with get_admission_controller().admit(
+                    AdmissionClass.EMBEDDING
+                ):
+                    raw_embeddings = await asyncio.gather(
+                        *embed_tasks, return_exceptions=True
+                    )
+            except AdmissionRejected as exc:
+                if stream:
+                    _merge_request_llm_failure(
+                        {"status": "admission_rejected", "detail": str(exc)}
+                    )
+                    yield {
+                        "type": "error",
+                        "message": f"Embedding admission rejected: {exc}",
+                        "code": "ADMISSION_REJECTED",
+                    }
+                    return
+                raise RAGEngineError(f"Embedding admission rejected: {exc}")
 
             for (variant_type, _), result in zip(variants_to_embed, raw_embeddings):
                 if isinstance(result, EmbeddingError):
@@ -1824,13 +1851,19 @@ class RAGEngine:
                 for c in relevant_chunks
             ):
                 try:
-                    vision_result = await vision_context.service.run(
-                        query=user_input,
-                        sources=relevant_chunks,
-                        vault_id=vault_id,
-                        user=vision_context.user,
-                        evaluate=vision_context.evaluate,
-                    )
+                    # E3 admission (issue #518): vision-device budget; an
+                    # AdmissionRejected degrades to the stored proxy via the
+                    # per-source failure handler below (never fails the turn).
+                    async with get_admission_controller().admit(
+                        AdmissionClass.VISION
+                    ):
+                        vision_result = await vision_context.service.run(
+                            query=user_input,
+                            sources=relevant_chunks,
+                            vault_id=vault_id,
+                            user=vision_context.user,
+                            evaluate=vision_context.evaluate,
+                        )
                     apply_vision_to_sources(vision_result, relevant_chunks)
                     trace.vision_eligible = vision_result.eligible
                     trace.vision_selected = vision_result.selected
@@ -1904,28 +1937,64 @@ class RAGEngine:
         # FR-015: Signal "Drafting" stage — the LLM is now generating tokens.
         yield {"type": "stage", "stage": STAGE_DRAFTING}
 
-        if stream:
-            async for chunk in self._stream_llm_response(
-                messages, client=active_client, max_tokens=effective_max_tokens,
-                temperature=temperature,
-                finish_reason_capture=llm_finish_reason_capture,
-            ):
-                chunk_type = chunk.get("type", "unknown")
-                logger.debug("[query] Yielding '%s' chunk (stream)", chunk_type)
-                if chunk_type == "content":
-                    assembled_response.append(chunk.get("content", ""))
-                yield chunk
-        else:
-            async for chunk in self._get_llm_response(
-                messages, client=active_client, max_tokens=effective_max_tokens,
-                temperature=temperature,
-                finish_reason_capture=llm_finish_reason_capture,
-            ):
-                chunk_type = chunk.get("type", "unknown")
-                logger.debug("[query] Yielding '%s' chunk (non-stream)", chunk_type)
-                if chunk_type == "content":
-                    assembled_response.append(chunk.get("content", ""))
-                yield chunk
+        # E3 admission (issue #518): generation-phase budget, shared by every
+        # chat/instant consumer. When the chat route already holds the
+        # route-level CHAT gate for this request (chat_gate_held), the engine
+        # skips its own acquire — route+engine never double-acquire the same
+        # key (explicit no-nesting contract; see app/services/admission.py).
+        generation_admission_class = (
+            AdmissionClass.INSTANT if mode == ChatMode.INSTANT else AdmissionClass.CHAT
+        )
+        generation_gate = AsyncExitStack()
+        if not chat_gate_held():
+            try:
+                await generation_gate.enter_async_context(
+                    get_admission_controller().admit(generation_admission_class)
+                )
+            except AdmissionRejected as exc:
+                _merge_request_llm_failure(
+                    {"status": "admission_rejected", "detail": str(exc)}
+                )
+                yield {
+                    "type": "error",
+                    "message": f"Generation admission rejected: {exc}",
+                    "code": "ADMISSION_REJECTED",
+                }
+                return
+        try:
+            async with generation_gate:
+                if stream:
+                    async for chunk in self._stream_llm_response(
+                        messages, client=active_client, max_tokens=effective_max_tokens,
+                        temperature=temperature,
+                        finish_reason_capture=llm_finish_reason_capture,
+                    ):
+                        chunk_type = chunk.get("type", "unknown")
+                        logger.debug("[query] Yielding '%s' chunk (stream)", chunk_type)
+                        if chunk_type == "content":
+                            assembled_response.append(chunk.get("content", ""))
+                        yield chunk
+                else:
+                    async for chunk in self._get_llm_response(
+                        messages, client=active_client, max_tokens=effective_max_tokens,
+                        temperature=temperature,
+                        finish_reason_capture=llm_finish_reason_capture,
+                    ):
+                        chunk_type = chunk.get("type", "unknown")
+                        logger.debug("[query] Yielding '%s' chunk (non-stream)", chunk_type)
+                        if chunk_type == "content":
+                            assembled_response.append(chunk.get("content", ""))
+                        yield chunk
+        except AdmissionRejected as exc:
+            _merge_request_llm_failure(
+                {"status": "admission_rejected", "detail": str(exc)}
+            )
+            yield {
+                "type": "error",
+                "message": f"Generation admission rejected: {exc}",
+                "code": "ADMISSION_REJECTED",
+            }
+            return
 
         # FULL-ENH-01 (issue #511 B2): surface the provider-reported
         # finish_reason (e.g. "length" — the answer was cut by the output
@@ -2503,9 +2572,12 @@ class RAGEngine:
             agg_rerank_success = None
             if self.reranking_enabled and self.reranking_service and deduped:
                 try:
-                    reranked_chunks, consolidated_success = (
-                        await self.reranking_service.rerank(
-                            query=user_input,
+                    async with get_admission_controller().admit(
+                        AdmissionClass.RERANKING
+                    ):
+                        reranked_chunks, consolidated_success = (
+                            await self.reranking_service.rerank(
+                                query=user_input,
                             chunks=deduped,
                             top_n=effective_reranker_top_n,
                         )
@@ -2806,15 +2878,23 @@ class RAGEngine:
                 and not defer_rerank
             ):
                 try:
-                    reranked_chunks, rerank_success = await self.reranking_service.rerank(
-                        query=user_input,
-                        chunks=vector_results,
-                        top_n=(
-                            override_reranker_top_n
-                            if override_reranker_top_n is not None
-                            else self.reranker_top_n
-                        ),
-                    )
+                    # E3 admission (issue #518): reranker-device budget. An
+                    # AdmissionRejected is caught by the existing graceful
+                    # handler below — rerank is skipped, scores stay distance.
+                    async with get_admission_controller().admit(
+                        AdmissionClass.RERANKING
+                    ):
+                        reranked_chunks, rerank_success = (
+                            await self.reranking_service.rerank(
+                                query=user_input,
+                                chunks=vector_results,
+                                top_n=(
+                                    override_reranker_top_n
+                                    if override_reranker_top_n is not None
+                                    else self.reranker_top_n
+                                ),
+                            )
+                        )
                     if reranked_chunks:
                         vector_results = reranked_chunks
                     logger.info(

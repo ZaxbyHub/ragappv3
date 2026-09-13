@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from contextlib import AsyncExitStack
 from html import escape as _xml_escape
 from typing import Any, Callable, Dict, List, Literal, Optional, Set
 
@@ -33,6 +34,13 @@ from app.limiter import limiter
 from app.models.chat_mode import ChatMode
 from app.models.database import get_pool
 from app.security import csrf_protect
+from app.services.admission import (
+    AdmissionClass,
+    AdmissionRejected,
+    get_admission_controller,
+    mark_chat_gate,
+    reset_chat_gate,
+)
 from app.services.citation_validator import repair_against_sources_and_memories
 from app.services.metadata_filter import MetadataFilter
 from app.services.rag_engine import RAGEngine, RAGEngineError
@@ -369,7 +377,7 @@ def stream_chat_response(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    async def event_generator():
+    async def _event_generator_inner():
         collected_content = []
         sources = []
         memories_used = []
@@ -601,6 +609,30 @@ def stream_chat_response(
             )
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
+
+    async def event_generator():
+        # E3 admission (issue #518): route-level CHAT gate, held for the whole
+        # stream. The engine's generation-phase gate is reentrant under this
+        # lease (controller _my_holds), so route+engine never double-count.
+        # Rejection yields the protocol error+done pair (ENH-016: every
+        # terminal path emits done).
+        async with AsyncExitStack() as admission_stack:
+            try:
+                await admission_stack.enter_async_context(
+                    get_admission_controller().admit(AdmissionClass.CHAT)
+                )
+            except AdmissionRejected as exc:
+                logger.warning("Chat stream admission rejected: %s", exc)
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Chat capacity is saturated; retry shortly', 'code': 'ADMISSION_REJECTED'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance'})}\n\n"
+                return
+            # Mark this request as already chat-gated so the engine's
+            # generation-phase gate skips its own acquire (no same-key
+            # nesting; see app/services/admission.py).
+            gate_token = mark_chat_gate()
+            admission_stack.callback(lambda: reset_chat_gate(gate_token))
+            async for event in _event_generator_inner():
+                yield event
 
     return StreamingResponse(
         event_generator(),
@@ -835,23 +867,32 @@ async def chat(
         service=VisionEvidenceService(), user=user, evaluate=evaluate
     )
     try:
-        return await non_stream_chat_response(
-            body.message,
-            history,
-            rag_engine,
-            vault_id=body.vault_id,
-            mode=effective_mode,
-            require_vault=require_vault,
-            user_id=user.get("id"),
-            include_global=include_global,
-            can_write_memory=can_write_memory,
-            temperature=body.temperature,
-            retrieval_mode=body.retrieval_mode,
-            citation_mode=body.citation_mode,
-            metadata_filter=body.metadata_filter,
-            vision_context=vision_context,
-            document_ids=body.document_ids,
-        )
+        # E3 admission (issue #518): route-level CHAT gate for the non-stream
+        # path (reentrant with the engine's generation gate). Saturation is a
+        # bounded overload response, never an unbounded queue.
+        try:
+            async with get_admission_controller().admit(AdmissionClass.CHAT):
+                return await non_stream_chat_response(
+                    body.message,
+                    history,
+                    rag_engine,
+                    vault_id=body.vault_id,
+                    mode=effective_mode,
+                    require_vault=require_vault,
+                    user_id=user.get("id"),
+                    include_global=include_global,
+                    can_write_memory=can_write_memory,
+                    temperature=body.temperature,
+                    retrieval_mode=body.retrieval_mode,
+                    citation_mode=body.citation_mode,
+                    metadata_filter=body.metadata_filter,
+                    vision_context=vision_context,
+                    document_ids=body.document_ids,
+                )
+        except AdmissionRejected as exc:
+            raise HTTPException(
+                status_code=503, detail="chat admission rejected"
+            ) from exc
     except Exception:
         logger.exception("[chat] UNHANDLED EXCEPTION during chat processing")
         raise
