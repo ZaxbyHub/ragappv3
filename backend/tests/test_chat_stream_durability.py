@@ -7,11 +7,12 @@ opt-out compat, pre-write failure semantics, duplicate pre-write idempotency,
 admission-rejection writing nothing, and the stream-auth session validation.
 
 Disconnect scenarios drive ``stream_chat_response``'s generator directly and
-``aclose()`` it mid-stream: TestClient's ASGI transport buffers the response
-and never surfaces ``http.disconnect``, so it cannot produce a mid-stream
-disconnect; ``aclose()`` throws GeneratorExit into the generator at its yield
-point, which is exactly the unwinding Starlette's disconnect cancellation
-produces and therefore exercises the same cancellation-safe backstop.
+CANCEL the consuming task mid-stream: TestClient's ASGI transport buffers
+the response and never surfaces ``http.disconnect``, so it cannot produce a
+mid-stream disconnect; task cancellation lands CancelledError at the
+generator's suspension point, which is exactly the unwinding Starlette's
+disconnect path produces and therefore exercises the same cancellation-safe
+finalize backstop.
 
 Harness note: this module must not contain the double-submit-token parameter
 name as a contiguous substring anywhere in its source. conftest's autouse
@@ -208,7 +209,8 @@ def env():
 
 
 # ---------------------------------------------------------------------------
-# Disconnect scenarios: direct generator + aclose() (see module docstring)
+# Disconnect scenarios: direct generator + task cancellation (see the
+# module docstring)
 # ---------------------------------------------------------------------------
 
 
