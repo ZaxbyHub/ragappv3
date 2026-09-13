@@ -388,6 +388,8 @@ class _Lease:
             except Exception:  # noqa: BLE001 — store outage: keep trying
                 controller._mark_degraded()
                 continue
+            if alive:
+                controller._clear_degraded_if_set()
             if not alive:
                 # Slot was swept while we were still running (store-side
                 # race). Do not resurrect it: mark revoked so release()
@@ -481,6 +483,16 @@ class AdmissionController:
                 "admission store degraded: failing open (see docs/operations.md)"
             )
         self._degraded = True
+
+    def _clear_degraded_if_set(self) -> None:
+        """Recovery side of the degraded flag (issue #518: the admission
+        tests require 'backend unavailable/recovered', not a sticky flag).
+        Called after any SUCCESSFUL store operation — occupancy, acquire,
+        or lease refresh. A concurrent failure simply re-marks; the plain
+        bool write is GIL-atomic."""
+        if self._degraded:
+            logger.warning("admission store recovered: clearing degraded state")
+            self._degraded = False
 
     def budget_for(self, admission_class: AdmissionClass) -> int:
         key = self.class_budgets[admission_class]
@@ -667,6 +679,10 @@ class AdmissionController:
             self._mark_degraded()
             degraded_store = True
             occupancy = -1
+        if not degraded_store:
+            # The occupancy read succeeded — the store is healthy again
+            # (issue #518 'backend unavailable/recovered').
+            self._clear_degraded_if_set()
         budget = self.budgets.get(key, 1)
         if occupancy >= budget > 0:
             return False

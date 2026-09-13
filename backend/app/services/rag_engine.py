@@ -821,6 +821,12 @@ class RAGEngine:
         # request-local values.
         _set_request_llm_metrics({})
         _request_distillation_provenance.set([])
+        # E3 stage durations (#518): measured per-phase wall time for this
+        # turn — planning (query understanding up to the Searching signal),
+        # searching (retrieval/embedding), reading (context assembly), and
+        # the existing generation recording. Function-local timers only:
+        # the engine singleton is shared across concurrent query() calls.
+        _planning_started = time.perf_counter()
         self._last_llm_metrics = {}
         self._last_distillation_provenance = []
         # Per-query controls (issue #510): retrieval_mode / citation_mode are
@@ -1295,6 +1301,12 @@ class RAGEngine:
 
         # FR-015: Signal "Searching" stage to the SSE stream so the user sees
         # feedback before the first content token arrives.
+        get_telemetry().record_stage(
+            current_turn_id() or "",
+            "planning",
+            time.perf_counter() - _planning_started,
+        )
+        _searching_started = time.perf_counter()
         yield {"type": "stage", "stage": STAGE_SEARCHING}
 
         # ------------------------------------------------------------------
@@ -1836,6 +1848,12 @@ class RAGEngine:
 
         # FR-015: Signal "Reading" stage — retrieval + distillation are complete;
         # the LLM now reads the assembled context.
+        get_telemetry().record_stage(
+            current_turn_id() or "",
+            "searching",
+            time.perf_counter() - _searching_started,
+        )
+        _reading_started = time.perf_counter()
         yield {"type": "stage", "stage": STAGE_READING}
 
         # Issue #462 — retrieval-first vision evidence (LATE FUSION). Runs ONLY
@@ -1937,6 +1955,11 @@ class RAGEngine:
         llm_finish_reason_capture: Dict[str, Optional[str]] = {}
 
         # FR-015: Signal "Drafting" stage — the LLM is now generating tokens.
+        get_telemetry().record_stage(
+            current_turn_id() or "",
+            "reading",
+            time.perf_counter() - _reading_started,
+        )
         yield {"type": "stage", "stage": STAGE_DRAFTING}
         _generation_started = time.perf_counter()
 

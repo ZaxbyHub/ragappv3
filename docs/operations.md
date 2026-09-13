@@ -203,3 +203,24 @@ roles, not capacity claims.
   describe the conventions as stable. An optional observability stack
   overlay (Alloy collector) is provided in
   `docker-compose.observability.yml`.
+
+## Tracing (OpenTelemetry spans)
+
+- Spans ride the SAME optional extra as the OTLP metric bridge
+  (`backend/requirements-otel.txt` + `OTEL_EXPORTER_OTLP_ENDPOINT`).
+  Installing the extra and enabling telemetry turns on: one FastAPI
+  server span per request (`http.*` attributes, no user content), one
+  `gen_ai` client span per LLM / embeddings / rerank provider call
+  (`gen_ai.operation.name`, `gen_ai.request.model`), and outbound W3C
+  `traceparent` values derived from the ACTIVE span context instead of
+  the deterministic per-turn synthesis (the synthesis remains the
+  fallback when tracing is off).
+- The OTLP bridge additionally exports a
+  `gen_ai.client.operation.duration` counter by
+  `gen_ai.operation.name`, fed by the per-turn stage recorder
+  (planning / searching / reading / generation). The GenAI semantic
+  conventions are Development status — pinned in the extra, never
+  described as stable.
+- Without the extra (the default, air-gapped install) the tracer is a
+  no-op shim: nothing imports `opentelemetry`, the span middleware is
+  never registered, and the request path is unchanged.

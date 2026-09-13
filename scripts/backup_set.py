@@ -19,11 +19,13 @@ docs/operations.md and docs/admin-guide.md.
 """
 
 import argparse
+import logging
 import hashlib
 import json
 import os
 import secrets
 import shutil
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +39,8 @@ sys.path.append(str(ROOT))
 from backend.app.config import settings
 from backend.app.services.secret_manager import SecretManager
 from scripts.backup_sqlite import snapshot_sqlite
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "backup_manifest.json"
 MANIFEST_SCHEMA = "ragapp-backup-set/1"
@@ -87,6 +91,50 @@ def _restrict_permissions(root: Path) -> None:
             pass
 
 
+def _snapshot_generation_binding(snapshot_bytes: bytes) -> Optional[dict]:
+    """Latest authoritative index-generation row FROM THE SNAPSHOT BYTES.
+
+    Writes the plaintext snapshot to a private temp file and reads it
+    READ-ONLY (``Connection.deserialize`` proved unreliable for large
+    snapshots on this sqlite build), selecting the highest-id
+    ``index_generation:%`` row from ``migration_journal`` — the C1
+    authoritative generation at snapshot time (issue #518: bind the
+    manifest to the generation actually frozen in the set, never the live
+    DB's newer rows). Returns None when the snapshot has no such row
+    (fresh installs); readers treat absence as legacy.
+    """
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".snap.db")
+    try:
+        os.write(fd, snapshot_bytes)
+        os.close(fd)
+        conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                "SELECT id, migration_name, detail FROM migration_journal"
+                " WHERE migration_name LIKE 'index_generation:%'"
+                " ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        logger.warning(
+            "generation binding unreadable from snapshot; manifest will"
+            " carry no generation field",
+            exc_info=True,
+        )
+        return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    if row is None:
+        return None
+    return {"id": int(row[0]), "name": str(row[1]), "detail": str(row[2] or "")}
+
+
 def create_backup_set(
     output_dir: Path,
     *,
@@ -111,6 +159,10 @@ def create_backup_set(
     # --- SQLite: WAL-safe snapshot, then encrypt ---
     nonce = secrets.token_bytes(12)
     plaintext = snapshot_sqlite(Path(settings.sqlite_path))
+    # E3 closure (#518, G6): read the authoritative generation journal row
+    # FROM THE SNAPSHOT BYTES (not the live DB), so the manifest binds the
+    # generation that is actually frozen inside this encrypted artifact.
+    generation_binding = _snapshot_generation_binding(plaintext)
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)
     sqlite_artifact = output_dir / SQLITE_ARTIFACT
     sqlite_artifact.write_bytes(nonce + ciphertext)
@@ -134,15 +186,28 @@ def create_backup_set(
         tag = f"backup-{timestamp}"
         for name, table in (lancedb_tables or {}).items():
             table_tag = f"{tag}-{name}"
-            table.create_tag(table_tag)
+            # Real lancedb (>= 0.3x) manages tags through ``table.tags``;
+            # ``create_tag`` remains supported for the frozen test fakes
+            # and any older table objects (G5: the real path is exercised
+            # by test_518_restore_drill_real.py).
+            create_tag = getattr(table, "create_tag", None)
+            if create_tag is not None:
+                create_tag(table_tag)
+            else:
+                table.tags.create(table_tag, int(table.version))
             tables_out.append({"table": name, "tag": table_tag})
         _copy_tree(lancedb_dir, backup_lancedb)
+        # Manifest binding (#518): the lancedb item records the C1
+        # authoritative generation (migration_journal row id + its SQLite
+        # rowid) read from the SNAPSHOT, so restore can verify the restored
+        # journal matches the vector tree this set froze.
         items.append(
             {
                 "name": LANCEDB_DIRNAME,
                 "kind": "lancedb",
                 "path": LANCEDB_DIRNAME,
                 "tables": tables_out,
+                "generation": generation_binding,
                 "files": _digest_tree(backup_lancedb),
             }
         )

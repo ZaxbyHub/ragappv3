@@ -5,6 +5,7 @@ OpenAI-compatible LLM chat client using httpx.
 import json
 import logging
 import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
@@ -19,7 +20,10 @@ from app.services.circuit_breaker import (
     is_outage_status,
 )
 from app.services.ssrf import assert_url_safe
-from app.services.telemetry import correlation_headers as _correlation_headers
+from app.services.telemetry import (
+    correlation_headers as _correlation_headers,
+)
+from app.services.telemetry import start_span
 from app.utils.assistant_sanitizer import sanitize_assistant_content
 
 logger = logging.getLogger(__name__)
@@ -430,7 +434,16 @@ class LLMClient:
                     response.raise_for_status()
                 return response
 
-            response = await self._circuit_breaker(_checked_post)()
+            # E3 closure (#518): gen_ai client span for the non-stream
+            # chat call — no-op without the optional OTel extra.
+            with start_span(
+                "gen_ai chat",
+                attributes={
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": str(payload.get("model", "")),
+                },
+            ):
+                response = await self._circuit_breaker(_checked_post)()
             response.raise_for_status()
             data = response.json()
 
@@ -591,6 +604,17 @@ class LLMClient:
         _reasoning_last_at: Optional[float] = None
 
         stream_succeeded = False
+        # E3 closure (#518): gen_ai client span for the streaming chat call.
+        # Entered manually (not via ``with``) so the large stream-consumption
+        # block keeps its existing indentation; exited in the finally below
+        # so the span covers the whole stream, error or not.
+        _genai_stream_span = start_span(
+            "gen_ai chat stream",
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.request.model": str(payload.get("model", "")),
+            },
+        ).__enter__()
         try:
             # E3 telemetry (issue #518): propagate correlation headers when
             # bound; kwarg omitted when empty (strict test fakes compat).
@@ -890,6 +914,7 @@ class LLMClient:
                 self._circuit_breaker.record_failure()
             raise LLMError(f"Streaming request failed: {str(e)}") from e
         finally:
+            _genai_stream_span.__exit__(*sys.exc_info())
             if stream_succeeded:
                 async with self._circuit_breaker._lock:
                     self._circuit_breaker.record_success()

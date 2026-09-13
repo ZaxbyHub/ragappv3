@@ -28,7 +28,10 @@ from app.services.circuit_breaker import (
     reranking_cb,
 )
 from app.services.ssrf import assert_url_safe
-from app.services.telemetry import correlation_headers as _correlation_headers
+from app.services.telemetry import (
+    correlation_headers as _correlation_headers,
+)
+from app.services.telemetry import start_span
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +321,15 @@ class RerankingService:
             return response
 
         try:
-            response = await reranking_cb(_checked_post)()
+            # E3 closure (#518): gen_ai client span for the rerank call.
+            with start_span(
+                "gen_ai rerank",
+                attributes={
+                    "gen_ai.operation.name": "rerank",
+                    "gen_ai.request.model": str(payload.get("model", "")),
+                },
+            ):
+                response = await reranking_cb(_checked_post)()
         except CircuitBreakerError:
             raise
         response.raise_for_status()
