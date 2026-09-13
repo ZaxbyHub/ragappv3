@@ -333,4 +333,20 @@ def ready_vector_store():
         if hasattr(app.state, "_vector_store_fixture_set"):
             delattr(app.state, "_vector_store_fixture_set")
 
+@pytest.fixture(autouse=True)
+def _reset_turn_correlation_context():
+    """Test isolation (issue #518): clear the per-turn correlation
+    contextvar after every test.
 
+    Sync tests bind ``set_current_turn`` in the pytest runner context
+    (no task boundary), so without a reset the value leaks into every
+    later test and makes outbound telemetry attach correlation headers
+    where a test expected a bare request.
+    """
+    yield
+    try:
+        from app.services.telemetry import set_current_turn
+
+        set_current_turn(None)
+    except ImportError:  # pragma: no cover — telemetry module absent
+        pass

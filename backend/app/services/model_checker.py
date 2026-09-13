@@ -22,6 +22,7 @@ import httpx
 from app.config import settings
 from app.services.circuit_breaker import CircuitBreakerError, model_checker_cb
 from app.services.ssrf import assert_url_safe
+from app.services.telemetry import correlation_headers as _correlation_headers
 
 
 class ModelCheckerError(Exception):
@@ -342,7 +343,13 @@ class ModelChecker:
         url = f"{_derive_base(base_url)}/api/tags"
 
         try:
-            response = await client.get(url, timeout=timeout)
+            _corr = _correlation_headers()
+            if _corr:
+                response = await client.get(
+                    url, timeout=timeout, headers=_corr
+                )
+            else:
+                response = await client.get(url, timeout=timeout)
             response.raise_for_status()
             try:
                 data = response.json()

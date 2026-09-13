@@ -18,6 +18,7 @@ from app.services.circuit_breaker import (
     is_outage_status,
 )
 from app.services.ssrf import assert_url_safe
+from app.services.telemetry import correlation_headers as _correlation_headers
 from app.utils.assistant_sanitizer import sanitize_assistant_content
 
 logger = logging.getLogger(__name__)
@@ -243,12 +244,17 @@ class LLMClient:
         """Async context manager exit."""
         await self.close()
 
-    def _ensure_started(self) -> httpx.AsyncClient:
-        """Ensure the client has been started and return it."""
+    async def _ensure_started(self) -> httpx.AsyncClient:
+        """Ensure the client has been started and return it.
+
+        Lazily starts the client when a caller skipped explicit start()
+        (production always starts clients via lifespan; lazy start makes
+        direct-construction usage — as in diagnostics and tests — work
+        instead of raising, matching EmbeddingService's constructor-built
+        client).
+        """
         if self._client is None:
-            raise RuntimeError(
-                "LLMClient not started. Call start() before using the client."
-            )
+            await self.start()
         return self._client
 
     def _log_pool_stats(self) -> None:
@@ -325,7 +331,7 @@ class LLMClient:
             max_tokens = (
                 self.max_tokens if self.max_tokens is not None else _DEFAULT_MAX_TOKENS
             )
-        client = self._ensure_started()
+        client = await self._ensure_started()
         url = f"{self.base_url}/v1/chat/completions"
 
         payload = {
@@ -350,7 +356,17 @@ class LLMClient:
             # response validation stay outside — a malformed body is not an
             # outage signal.
             async def _checked_post() -> httpx.Response:
-                response = await client.post(url, json=payload)
+                # E3 telemetry (issue #518): propagate traceparent/X-Request-ID
+                # when a correlation identity is bound; the kwarg is omitted
+                # when empty so minimal fakes (test doubles with strict
+                # signatures) keep working.
+                _corr = _correlation_headers()
+                if _corr:
+                    response = await client.post(
+                        url, json=payload, headers=_corr
+                    )
+                else:
+                    response = await client.post(url, json=payload)
                 # Only OUTAGE statuses charge the breaker inside the wrap
                 # (review RP-002, PR #576): ordinary 4xx are input/config
                 # errors that would recur on every retry — raising them
@@ -440,7 +456,7 @@ class LLMClient:
             max_tokens = (
                 self.max_tokens if self.max_tokens is not None else _DEFAULT_MAX_TOKENS
             )
-        client = self._ensure_started()
+        client = await self._ensure_started()
         url = f"{self.base_url}/v1/chat/completions"
 
         payload = {
@@ -506,7 +522,16 @@ class LLMClient:
 
         stream_succeeded = False
         try:
-            async with client.stream("POST", url, json=payload) as response:
+            # E3 telemetry (issue #518): propagate correlation headers when
+            # bound; kwarg omitted when empty (strict test fakes compat).
+            _corr = _correlation_headers()
+            if _corr:
+                stream_ctx = client.stream(
+                    "POST", url, json=payload, headers=_corr
+                )
+            else:
+                stream_ctx = client.stream("POST", url, json=payload)
+            async with stream_ctx as response:
                 response.raise_for_status()
 
                 # Validate content-type for SSE

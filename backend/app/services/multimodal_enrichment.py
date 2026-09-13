@@ -48,6 +48,7 @@ from app.services.multimodal_prompts import (
 )
 from app.services.security_audit import record_security_event
 from app.services.ssrf_transport import SSRFSafeTransport
+from app.services.telemetry import correlation_headers as _correlation_headers
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +221,13 @@ class MultimodalProviderClient:
             )
         async with self._semaphore:
             try:
-                resp = await self._client.post(url, json=payload)
+                _corr = _correlation_headers()
+                if _corr:
+                    resp = await self._client.post(
+                        url, json=payload, headers=_corr
+                    )
+                else:
+                    resp = await self._client.post(url, json=payload)
             except httpx.TimeoutException as exc:
                 raise MultimodalProviderError(ERR_TIMEOUT, retryable=True) from exc
             except httpx.RequestError as exc:

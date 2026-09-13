@@ -29,9 +29,15 @@ from app.services.circuit_breaker import (
 )
 from app.services.redis_io import redis_call
 from app.services.ssrf import assert_url_safe
+from app.services.telemetry import correlation_headers as _correlation_headers
+from app.services.telemetry import get_telemetry as _get_telemetry
 from app.utils.secrets import redact_url
 
 logger = logging.getLogger(__name__)
+
+
+def _telemetry():
+    return _get_telemetry()
 
 
 class LRUCache:
@@ -607,6 +613,7 @@ class EmbeddingService:
         # L1: check in-process LRU first (fastest path)
         cached = self._embed_cache.get(cache_key)
         if cached is not None:
+            _telemetry().record_embedding_cache(True)
             return cached
 
         # L2: check Redis shared cache. redis_call runs the sync client call in
@@ -619,6 +626,7 @@ class EmbeddingService:
                 if raw is not None:
                     embedding = json.loads(raw)
                     self._redis_hits += 1
+                    _telemetry().record_embedding_cache(True)
                     # Backfill L1 so hot path stays fast
                     self._embed_cache.set(cache_key, embedding)
                     return embedding
@@ -636,10 +644,21 @@ class EmbeddingService:
             # normally (recording a SUCCESS) and the status raise happened
             # outside the wrap, so outage responses never tripped it.
             async def _checked_post() -> httpx.Response:
-                response = await self._client.post(
-                    config.url,
-                    json=self._build_payload(text_to_embed, config),
-                )
+                # E3 telemetry (issue #518): correlation headers only when a
+                # turn identity is bound — kwarg omitted when empty so strict
+                # test fakes with fixed signatures keep working.
+                _corr = _correlation_headers()
+                if _corr:
+                    response = await self._client.post(
+                        config.url,
+                        json=self._build_payload(text_to_embed, config),
+                        headers=_corr,
+                    )
+                else:
+                    response = await self._client.post(
+                        config.url,
+                        json=self._build_payload(text_to_embed, config),
+                    )
                 if response.status_code != 200 and _is_outage_status(
                     response.status_code
                 ):
@@ -802,11 +821,20 @@ class EmbeddingService:
         config = self._request_config()
 
         async def _checked_probe_post() -> httpx.Response:
-            response = await self._client.post(
-                config.url,
-                json=self._build_payload("ping", config),
-                timeout=timeout,
-            )
+            _corr = _correlation_headers()
+            if _corr:
+                response = await self._client.post(
+                    config.url,
+                    json=self._build_payload("ping", config),
+                    timeout=timeout,
+                    headers=_corr,
+                )
+            else:
+                response = await self._client.post(
+                    config.url,
+                    json=self._build_payload("ping", config),
+                    timeout=timeout,
+                )
             if response.status_code != 200 and _is_outage_status(
                 response.status_code
             ):

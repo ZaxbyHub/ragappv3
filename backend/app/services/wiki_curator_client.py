@@ -37,6 +37,7 @@ from app.services.curator_ssrf import (
     CuratorURLBlocked,
     assert_curator_url_safe,
 )
+from app.services.telemetry import correlation_headers as _correlation_headers
 from app.utils.assistant_sanitizer import sanitize_assistant_content
 
 logger = logging.getLogger(__name__)
@@ -128,7 +129,13 @@ class CuratorClient:
                 follow_redirects=False,
                 transport=SSRFSafeTransport(),
             ) as client:
-                resp = await client.post(self.endpoint, json=payload)
+                _corr = _correlation_headers()
+                if _corr:
+                    resp = await client.post(
+                        self.endpoint, json=payload, headers=_corr
+                    )
+                else:
+                    resp = await client.post(self.endpoint, json=payload)
             if resp.status_code >= 300:
                 raise httpx.HTTPStatusError(
                     f"Curator returned HTTP {resp.status_code}: {resp.text[:200]}",

@@ -28,6 +28,7 @@ from app.services.circuit_breaker import (
     reranking_cb,
 )
 from app.services.ssrf import assert_url_safe
+from app.services.telemetry import correlation_headers as _correlation_headers
 
 logger = logging.getLogger(__name__)
 
@@ -301,7 +302,15 @@ class RerankingService:
         # wrap, so error statuses recorded a SUCCESS on the breaker.
         # JSON decoding stays outside — a malformed body is not an outage.
         async def _checked_post() -> httpx.Response:
-            response = await self._http_client.post(url, json=payload)
+            # E3 telemetry (issue #518): correlation headers only when bound;
+            # kwarg omitted when empty (strict test fakes keep working).
+            _corr = _correlation_headers()
+            if _corr:
+                response = await self._http_client.post(
+                    url, json=payload, headers=_corr
+                )
+            else:
+                response = await self._http_client.post(url, json=payload)
             # Outage statuses only inside the wrap (review RP-002, PR #576):
             # ordinary 4xx are input errors, not provider outages.
             if is_outage_status(response.status_code):

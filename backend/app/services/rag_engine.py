@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import sqlite3
+import time
 from contextlib import AsyncExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ from app.services.prompt_builder import PromptBuilderService, calculate_primary_
 from app.services.query_transformer import QueryPlanner, QueryTransformer
 from app.services.rag_trace import RAGTrace
 from app.services.retrieval_evaluator import RetrievalEvaluator
+from app.services.telemetry import _status_to_outcome, current_turn_id, get_telemetry
 from app.services.vector_store import SearchSemaphoreTimeoutError, VectorStore
 from app.services.vision_evidence import (
     VisionRunContext,
@@ -1936,6 +1938,7 @@ class RAGEngine:
 
         # FR-015: Signal "Drafting" stage — the LLM is now generating tokens.
         yield {"type": "stage", "stage": STAGE_DRAFTING}
+        _generation_started = time.perf_counter()
 
         # E3 admission (issue #518): generation-phase budget, shared by every
         # chat/instant consumer. When the chat route already holds the
@@ -1995,6 +1998,20 @@ class RAGEngine:
                 "code": "ADMISSION_REJECTED",
             }
             return
+        # E3 telemetry (issue #518): measured generation stage duration and
+        # the provider outcome for this turn (ok/partial/unavailable/empty).
+        get_telemetry().record_stage(
+            current_turn_id() or "",
+            "generation",
+            time.perf_counter() - _generation_started,
+        )
+        _final_status = (_request_llm_metrics.get() or {}).get("status")
+        try:
+            get_telemetry().record_provider_call(
+                "llm", _status_to_outcome(_final_status)
+            )
+        except ValueError:  # pragma: no cover — closed outcome set
+            logger.debug("unmapped provider status %r", _final_status)
 
         # FULL-ENH-01 (issue #511 B2): surface the provider-reported
         # finish_reason (e.g. "length" — the answer was cut by the output

@@ -11,6 +11,8 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
+import uuid
 from contextlib import AsyncExitStack
 from html import escape as _xml_escape
 from typing import Any, Callable, Dict, List, Literal, Optional, Set
@@ -44,6 +46,11 @@ from app.services.admission import (
 from app.services.citation_validator import repair_against_sources_and_memories
 from app.services.metadata_filter import MetadataFilter
 from app.services.rag_engine import RAGEngine, RAGEngineError
+from app.services.telemetry import (
+    current_turn_id,
+    get_telemetry,
+    set_current_turn,
+)
 from app.services.vector_store import SearchSemaphoreTimeoutError
 from app.services.vision_evidence import VisionEvidenceService, VisionRunContext
 from app.services.wiki_citation_helpers import (
@@ -51,6 +58,7 @@ from app.services.wiki_citation_helpers import (
 )
 from app.services.wiki_store import WikiStore
 from app.utils.assistant_sanitizer import sanitize_chat_messages_content
+from app.utils.request_context import request_id_var
 
 # Track background tasks to prevent garbage collection
 _background_tasks: Set[asyncio.Task] = set()
@@ -378,6 +386,8 @@ def stream_chat_response(
         )
 
     async def _event_generator_inner():
+        _turn_started = time.perf_counter()
+        _first_content_recorded = False
         collected_content = []
         sources = []
         memories_used = []
@@ -452,6 +462,14 @@ def stream_chat_response(
                     if chunk_type == "content":
                         content = chunk.get("content", "")
                         collected_content.append(content)
+                        if not _first_content_recorded:
+                            # E3 telemetry (issue #518): first-useful-content
+                            # latency for this turn.
+                            _first_content_recorded = True
+                            get_telemetry().record_first_useful_content(
+                                current_turn_id() or "",
+                                time.perf_counter() - _turn_started,
+                            )
                         yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
                     elif chunk_type == "error":
                         logger.warning("Streaming error chunk received from RAG engine: %s", chunk.get('message', 'unknown'))
@@ -561,6 +579,7 @@ def stream_chat_response(
         # SC-017: include ab_experiment_id and ab_variant for outcome comparison
         done_payload: Dict[str, Any] = {
             "type": "done",
+            "turn_id": current_turn_id(),
             "sources": sources,
             "memories_used": memories_used,
             "wiki_used": wiki_used,
@@ -611,9 +630,16 @@ def stream_chat_response(
             task.add_done_callback(_background_tasks.discard)
 
     async def event_generator():
+        # E3 telemetry (issue #518): bind the per-turn correlation id (the
+        # inbound request id when the logging middleware stamped one), record
+        # the turn, and measure the admission queue wait.
+        turn_id = request_id_var.get() or f"turn-{uuid.uuid4().hex}"
+        set_current_turn(turn_id)
+        get_telemetry().record_chat_turn(turn_id)
+        _queue_wait_started = time.monotonic()
         # E3 admission (issue #518): route-level CHAT gate, held for the whole
-        # stream. The engine's generation-phase gate is reentrant under this
-        # lease (controller _my_holds), so route+engine never double-count.
+        # stream. The engine's generation-phase gate is skipped under this
+        # lease (chat_gate_held marker), so route+engine never double-count.
         # Rejection yields the protocol error+done pair (ENH-016: every
         # terminal path emits done).
         async with AsyncExitStack() as admission_stack:
@@ -631,6 +657,9 @@ def stream_chat_response(
             # nesting; see app/services/admission.py).
             gate_token = mark_chat_gate()
             admission_stack.callback(lambda: reset_chat_gate(gate_token))
+            get_telemetry().record_queue_wait(
+                "chat", time.monotonic() - _queue_wait_started
+            )
             async for event in _event_generator_inner():
                 yield event
 
@@ -866,6 +895,11 @@ async def chat(
     vision_context = VisionRunContext(
         service=VisionEvidenceService(), user=user, evaluate=evaluate
     )
+    # E3 telemetry (issue #518): per-turn correlation for the non-stream
+    # path (the stream generator binds its own).
+    _turn_id = request_id_var.get() or f"turn-{uuid.uuid4().hex}"
+    set_current_turn(_turn_id)
+    get_telemetry().record_chat_turn(_turn_id)
     try:
         # E3 admission (issue #518): route-level CHAT gate for the non-stream
         # path (reentrant with the engine's generation gate). Saturation is a
