@@ -405,3 +405,31 @@ def _guard_multimodal_vision_flag():
             f"{before!r} -> {after!r} (use patch.object(settings, ...) for "
             "scoped flag mutations — see tests/test_settings_leak_guardrail.py)"
         )
+
+
+@pytest.fixture(autouse=True)
+def _reset_admission_and_telemetry_singletons():
+    """Reset the admission-controller and telemetry singletons between tests.
+
+    Both are module-level globals (``app.services.admission._controller``,
+    ``app.services.telemetry._singleton``) that persist across the full test
+    run. Tests that patch Settings or construct custom controllers/telemetry
+    instances would otherwise leak their wiring into later tests (the same
+    class of cross-test pollution the rate-limiter and pool resets above
+    guard against — swarm review LOW finding, issue #518 round 2).
+    """
+    for teardown in (False, True):
+        try:
+            from app.services.admission import reset_admission_controller
+
+            reset_admission_controller()
+        except (ImportError, AttributeError):
+            pass
+        try:
+            from app.services.telemetry import reset_telemetry
+
+            reset_telemetry()
+        except (ImportError, AttributeError):
+            pass
+        if not teardown:
+            yield

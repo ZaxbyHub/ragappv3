@@ -16,6 +16,8 @@ import json
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from app.services.admission import AdmissionClass, get_admission_controller
+
 if TYPE_CHECKING:
     from app.models.database import SQLiteConnectionPool
 
@@ -104,7 +106,12 @@ class KMSCompileProcessor:
                 )
 
                 try:
-                    result = await asyncio.to_thread(self._dispatch, job)
+                    # E3 admission (issue #518): background budget for compile
+                    # work; rejection flows into the bounded retry handler.
+                    async with get_admission_controller().admit(
+                        AdmissionClass.BACKGROUND, foreground=False
+                    ):
+                        result = await asyncio.to_thread(self._dispatch, job)
                     await asyncio.to_thread(self._complete_job, job.id, result)
                     logger.info("KMSCompileProcessor: completed job id=%d", job.id)
                 except Exception as exc:

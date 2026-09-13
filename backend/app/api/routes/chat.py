@@ -11,6 +11,9 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
+import uuid
+from contextlib import AsyncExitStack
 from html import escape as _xml_escape
 from typing import Any, Callable, Dict, List, Literal, Optional, Set
 
@@ -33,9 +36,21 @@ from app.limiter import limiter
 from app.models.chat_mode import ChatMode
 from app.models.database import get_pool
 from app.security import csrf_protect
+from app.services.admission import (
+    AdmissionClass,
+    AdmissionRejected,
+    get_admission_controller,
+    mark_chat_gate,
+    reset_chat_gate,
+)
 from app.services.citation_validator import repair_against_sources_and_memories
 from app.services.metadata_filter import MetadataFilter
 from app.services.rag_engine import RAGEngine, RAGEngineError
+from app.services.telemetry import (
+    current_turn_id,
+    get_telemetry,
+    set_current_turn,
+)
 from app.services.vector_store import SearchSemaphoreTimeoutError
 from app.services.vision_evidence import VisionEvidenceService, VisionRunContext
 from app.services.wiki_citation_helpers import (
@@ -43,6 +58,7 @@ from app.services.wiki_citation_helpers import (
 )
 from app.services.wiki_store import WikiStore
 from app.utils.assistant_sanitizer import sanitize_chat_messages_content
+from app.utils.request_context import request_id_var
 
 # Track background tasks to prevent garbage collection
 _background_tasks: Set[asyncio.Task] = set()
@@ -369,7 +385,9 @@ def stream_chat_response(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
-    async def event_generator():
+    async def _event_generator_inner():
+        _turn_started = time.perf_counter()
+        _first_content_recorded = False
         collected_content = []
         sources = []
         memories_used = []
@@ -444,6 +462,14 @@ def stream_chat_response(
                     if chunk_type == "content":
                         content = chunk.get("content", "")
                         collected_content.append(content)
+                        if not _first_content_recorded:
+                            # E3 telemetry (issue #518): first-useful-content
+                            # latency for this turn.
+                            _first_content_recorded = True
+                            get_telemetry().record_first_useful_content(
+                                current_turn_id() or "",
+                                time.perf_counter() - _turn_started,
+                            )
                         yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
                     elif chunk_type == "error":
                         logger.warning("Streaming error chunk received from RAG engine: %s", chunk.get('message', 'unknown'))
@@ -553,6 +579,7 @@ def stream_chat_response(
         # SC-017: include ab_experiment_id and ab_variant for outcome comparison
         done_payload: Dict[str, Any] = {
             "type": "done",
+            "turn_id": current_turn_id(),
             "sources": sources,
             "memories_used": memories_used,
             "wiki_used": wiki_used,
@@ -601,6 +628,40 @@ def stream_chat_response(
             )
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
+
+    async def event_generator():
+        # E3 telemetry (issue #518): bind the per-turn correlation id (the
+        # inbound request id when the logging middleware stamped one), record
+        # the turn, and measure the admission queue wait.
+        turn_id = request_id_var.get() or f"turn-{uuid.uuid4().hex}"
+        set_current_turn(turn_id)
+        get_telemetry().record_chat_turn(turn_id)
+        _queue_wait_started = time.monotonic()
+        # E3 admission (issue #518): route-level CHAT gate, held for the whole
+        # stream. The engine's generation-phase gate is skipped under this
+        # lease (chat_gate_held marker), so route+engine never double-count.
+        # Rejection yields the protocol error+done pair (ENH-016: every
+        # terminal path emits done).
+        async with AsyncExitStack() as admission_stack:
+            try:
+                await admission_stack.enter_async_context(
+                    get_admission_controller().admit(AdmissionClass.CHAT)
+                )
+            except AdmissionRejected as exc:
+                logger.warning("Chat stream admission rejected: %s", exc)
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Chat capacity is saturated; retry shortly', 'code': 'ADMISSION_REJECTED'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance'})}\n\n"
+                return
+            # Mark this request as already chat-gated so the engine's
+            # generation-phase gate skips its own acquire (no same-key
+            # nesting; see app/services/admission.py).
+            gate_token = mark_chat_gate()
+            admission_stack.callback(lambda: reset_chat_gate(gate_token))
+            get_telemetry().record_queue_wait(
+                "chat", time.monotonic() - _queue_wait_started
+            )
+            async for event in _event_generator_inner():
+                yield event
 
     return StreamingResponse(
         event_generator(),
@@ -834,24 +895,45 @@ async def chat(
     vision_context = VisionRunContext(
         service=VisionEvidenceService(), user=user, evaluate=evaluate
     )
+    # E3 telemetry (issue #518): per-turn correlation for the non-stream
+    # path (the stream generator binds its own).
+    _turn_id = request_id_var.get() or f"turn-{uuid.uuid4().hex}"
+    set_current_turn(_turn_id)
+    get_telemetry().record_chat_turn(_turn_id)
     try:
-        return await non_stream_chat_response(
-            body.message,
-            history,
-            rag_engine,
-            vault_id=body.vault_id,
-            mode=effective_mode,
-            require_vault=require_vault,
-            user_id=user.get("id"),
-            include_global=include_global,
-            can_write_memory=can_write_memory,
-            temperature=body.temperature,
-            retrieval_mode=body.retrieval_mode,
-            citation_mode=body.citation_mode,
-            metadata_filter=body.metadata_filter,
-            vision_context=vision_context,
-            document_ids=body.document_ids,
-        )
+        # E3 admission (issue #518): route-level CHAT gate for the non-stream
+        # path. mark_chat_gate() makes the engine's generation-phase gate
+        # skip its own acquire (explicit no-nesting contract — see
+        # app/services/admission.py); without it, budget-sized concurrent
+        # non-stream requests deadlock (swarm review F-002). Saturation is a
+        # bounded overload response, never an unbounded queue.
+        try:
+            async with get_admission_controller().admit(AdmissionClass.CHAT):
+                gate_token = mark_chat_gate()
+                try:
+                    return await non_stream_chat_response(
+                        body.message,
+                        history,
+                        rag_engine,
+                        vault_id=body.vault_id,
+                        mode=effective_mode,
+                        require_vault=require_vault,
+                        user_id=user.get("id"),
+                        include_global=include_global,
+                        can_write_memory=can_write_memory,
+                        temperature=body.temperature,
+                        retrieval_mode=body.retrieval_mode,
+                        citation_mode=body.citation_mode,
+                        metadata_filter=body.metadata_filter,
+                        vision_context=vision_context,
+                        document_ids=body.document_ids,
+                    )
+                finally:
+                    reset_chat_gate(gate_token)
+        except AdmissionRejected as exc:
+            raise HTTPException(
+                status_code=503, detail="chat admission rejected"
+            ) from exc
     except Exception:
         logger.exception("[chat] UNHANDLED EXCEPTION during chat processing")
         raise

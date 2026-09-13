@@ -52,15 +52,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BACKEND = ROOT / "backend"
 CONFIG = BACKEND / ".bandit"
-# Bandit records the path it is given as each finding's ``filename``. Pass a
-# repo-relative target so the baseline stores portable paths (e.g.
-# ``backend/app/...``) rather than a machine-specific absolute path. Separators
+# Bandit records the path it is given as each finding's ``filename``. Pass
+# repo-relative targets so the baseline stores portable paths (e.g.
+# ``backend/app/...``) rather than machine-specific absolute paths. Separators
 # are normalized to forward slashes in ``_normalize``.
-TARGET = "backend/app"
+#
+# The operator-facing backup/restore scripts are scanned too (swarm review
+# NEW-SAST-SCOPE-GAP): they handle attacker-reachable manifest paths and
+# decrypt secrets — leaving them out of TARGET is why a path-traversal bug
+# shipped unflagged despite the SAST gate passing.
+TARGETS = ("backend/app", "scripts/backup_set.py", "scripts/restore.py")
 BASELINE = BACKEND / "security" / "bandit-baseline.json"
 
 
-def _run_bandit_json(target: str, extra: list[str]) -> tuple[int, dict | None]:
+def _run_bandit_json(targets: tuple[str, ...], extra: list[str]) -> tuple[int, dict | None]:
     """Run bandit with JSON output to a temp file; return (exit_code, parsed_json).
 
     bandit exits non-zero when it finds issues, which is expected when generating a
@@ -82,7 +87,7 @@ def _run_bandit_json(target: str, extra: list[str]) -> tuple[int, dict | None]:
             "-c",
             str(CONFIG),
             "-r",
-            target,
+            *targets,
             "-f",
             "json",
             "-o",
@@ -142,8 +147,20 @@ def _normalize_for_commit(data: dict) -> dict:
 
 
 def _norm_path(fname: str) -> str:
-    """Normalize a finding path to forward slashes for stable cross-platform keys."""
-    return fname.replace("\\", "/") if fname else fname
+    """Normalize a finding path for stable cross-platform keys.
+
+    Backslashes become forward slashes (Windows vs Linux), and a leading
+    ``./`` is stripped: bandit records explicit file targets as
+    ``./scripts/foo.py`` while directory targets come out as
+    ``backend/app/...`` — normalizing both keeps the committed baseline
+    identical on every platform.
+    """
+    if not fname:
+        return fname
+    fname = fname.replace("\\", "/")
+    if fname.startswith("./"):
+        fname = fname[2:]
+    return fname
 
 
 def _finding_key(result: dict) -> str:
@@ -192,7 +209,7 @@ def update_baseline() -> int:
     """Regenerate the committed baseline with normalized paths + no timestamp."""
     BASELINE.parent.mkdir(parents=True, exist_ok=True)
     prev_keys = _load_baseline_keys(BASELINE)
-    exit_code, data = _run_bandit_json(TARGET, [])
+    exit_code, data = _run_bandit_json(TARGETS, [])
     if data is None:
         sys.stderr.write("run_bandit: failed to generate baseline JSON\n")
         return 1
@@ -260,7 +277,7 @@ def gated_scan() -> int:
 
     # A full JSON scan always returns bandit exit 1 when any finding exists; that
     # is expected and is not itself a failure. We decide pass/fail from the diff.
-    _exit_code, data = _run_bandit_json(TARGET, [])
+    _exit_code, data = _run_bandit_json(TARGETS, [])
     if data is None:
         sys.stderr.write("run_bandit: failed to run bandit for the gated scan\n")
         return 1

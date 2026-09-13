@@ -11,6 +11,8 @@ import json
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from app.services.admission import AdmissionClass, get_admission_controller
+
 if TYPE_CHECKING:
     from app.models.database import SQLiteConnectionPool
 
@@ -102,7 +104,12 @@ class WikiCompileProcessor:
                 )
 
                 try:
-                    result = await asyncio.to_thread(self._dispatch, job)
+                    # E3 admission (issue #518): background budget for compile
+                    # work; rejection flows into the bounded retry handler.
+                    async with get_admission_controller().admit(
+                        AdmissionClass.BACKGROUND, foreground=False
+                    ):
+                        result = await asyncio.to_thread(self._dispatch, job)
                     if result.get("cancelled") == "wiki_compile_disabled":
                         # WIKI-001 (#515): the flags went off between enqueue
                         # and claim — _dispatch already marked the job

@@ -1,0 +1,17 @@
+// Grafana Alloy collection config (issue #518 E3 optional overlay).
+// Scrapes the backend Prometheus exposition. Fan-out endpoints for
+// Tempo/Loki are intentionally left as placeholders — point them at your
+// existing stack.
+
+prometheus.scrape "ragapp" {
+  targets = [{
+    __address__ = "knowledgevault:9090",
+  }]
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://tempo:3200/api/prom/push" // placeholder — replace
+  }
+}

@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from app.api.deps import _evaluate_policy
 from app.config import settings
 from app.services import draft_pipeline
+from app.services.admission import AdmissionClass, get_admission_controller
 from app.services.document_extraction import DocumentExtractionError
 from app.services.draft_events import build_event, get_draft_event_bus
 from app.services.draft_store import DraftNotFoundError, DraftStore, sha256_text
@@ -296,7 +297,16 @@ class DraftJobProcessor:
                     job.id,
                     job.draft_id,
                 )
-                await self._run_job(job)
+                # E3 admission (issue #518): background budget for draft
+                # jobs. Unlike the wiki/kms compile loops there is no
+                # per-job failure handler here: a rejection surfaces as a
+                # poll-loop error below (logged, backoff, keep polling) and
+                # the already-claimed row is recovered by the existing
+                # startup orphan recovery — no silent retry bookkeeping.
+                async with get_admission_controller().admit(
+                    AdmissionClass.BACKGROUND, foreground=False
+                ):
+                    await self._run_job(job)
             except asyncio.CancelledError:
                 raise
             except Exception:

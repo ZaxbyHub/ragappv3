@@ -228,6 +228,44 @@ class Settings(BaseSettings):
     write_lock_timeout_seconds: float = 30.0
     """Timeout in seconds for write lock acquisitions. Prevents indefinite deadlock if a write operation hangs."""
 
+    # ── Shared inference admission (issue #518, Workstream E3) ──────────────
+    # Per-endpoint/per-device admission budgets shared by chat, Instant,
+    # embedding, reranking, vision and background workers. Defaults are
+    # conservative and deliberately generous (>= the per-process semaphores
+    # they complement) so enabling admission does not change throughput;
+    # tighten only after baseline observation. Set ADMISSION_STORE_URL to a
+    # redis:// URL to share budgets across uvicorn workers/replicas — empty
+    # means process-local (the documented single-process boundary).
+    admission_enabled: bool = True
+    """Enable shared inference admission. False = zero-overhead pass-through."""
+    admission_chat_budget: int = 8
+    """Concurrent chat (thinking-mode) generation admits. Generous by design (no bound exists today)."""
+    admission_instant_budget: int = 4
+    """Concurrent instant-mode generation admits."""
+    admission_embedding_budget: int = 4
+    """Concurrent embedding admits (mirrors embedding_global_concurrent_batches)."""
+    admission_reranking_budget: int = 4
+    """Concurrent reranking admits (rerank is sequential per request; 4 is generous)."""
+    admission_vision_budget: int = 2
+    """Concurrent vision/multimodal admits (mirrors multimodal_concurrency)."""
+    admission_background_budget: int = 2
+    """Concurrent background-work admits (mirrors ingestion_worker_count)."""
+    admission_queue_max_size: int = 64
+    """Per-class bound on queued waiters; beyond it requests are rejected immediately (queue_full)."""
+    admission_deadline_seconds: Optional[float] = None
+    """Default queue deadline per admit in seconds. None = no deadline (conservative default)."""
+    admission_store_url: str = ""
+    """Shared admission store URL (redis://...). Empty = process-local MemoryAdmissionStore."""
+
+    # ── Telemetry (issue #518, Workstream E3) ───────────────────────────────
+    telemetry_enabled: bool = True
+    """Enable turn correlation, measured stage/queue/provider metrics and /metrics. OTel export is an optional extra."""
+    telemetry_registry_dir: str = ""
+    """Shared shard directory for multiprocess /metrics aggregation. Empty =
+    single-process counters; set per deployment (all workers share one dir)
+    when running uvicorn/workers > 1 (swarm review F-008)."""
+
+
     # ── Embedding model validation configuration ───────────────────────────────────
     strict_embedding_model_check: bool = True
     """Enable strict validation that the live TEI model matches EMBEDDING_MODEL at startup."""
@@ -973,6 +1011,19 @@ class Settings(BaseSettings):
         if isinstance(data, dict):
             return apply_legacy_settings_conversion(data)
         return data
+
+    @field_validator("admission_deadline_seconds", mode="before")
+    @classmethod
+    def coerce_empty_admission_deadline(cls, v):
+        """Treat an empty string as "unset".
+
+        Compose long-form forwarding (``${VAR:-}``) and a copied
+        ``.env.example`` both inject ``""`` for unset keys; without this
+        coercion pydantic raises float_parsing at import time.
+        """
+        if v is None or v == "":
+            return None
+        return v
 
     @field_validator("chunk_size_chars", mode="before")
     @classmethod

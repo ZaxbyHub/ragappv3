@@ -39,7 +39,14 @@ CI_FILE = ROOT / ".github" / "workflows" / "ci.yml"
 RUN_BANDIT = ROOT / "scripts" / "run_bandit.py"
 BASELINE = ROOT / "backend" / "security" / "bandit-baseline.json"
 
-EXPECTED_TARGET = "backend/app"
+EXPECTED_TARGETS = (
+    "backend/app",
+    # Operator-facing backup/restore scripts joined the scan with the
+    # issue-518 E3 work (swarm review NEW-SAST-SCOPE-GAP): they parse
+    # manifests and decrypt secrets, so they must be inside the gate.
+    "scripts/backup_set.py",
+    "scripts/restore.py",
+)
 ALLOW_EXPANSION = os.environ.get("SAST_ALLOW_BASELINE_EXPANSION") == "1"
 
 
@@ -111,24 +118,24 @@ def check_workflow_integrity() -> bool:
 
 
 def check_scope_integrity() -> bool:
-    """C-003: run_bandit.py's TARGET must be the expected backend/app."""
+    """C-003: run_bandit.py's TARGETS tuple must be exactly the expected set."""
     if not RUN_BANDIT.exists():
         fail(f"{RUN_BANDIT.relative_to(ROOT)} not found")
         return False
     text = RUN_BANDIT.read_text(encoding="utf-8")
-    # Match the module-level TARGET assignment. Anchored to avoid matching
-    # comments or substrings; the value is a quoted literal.
-    m = re.search(r'^TARGET\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    # Match the module-level TARGETS tuple assignment. Anchored to avoid
+    # matching comments or substrings; each element is a quoted literal.
+    m = re.search(r'^TARGETS\s*=\s*\(([^)]*)\)', text, re.MULTILINE)
     if not m:
         fail(
-            "C-003: could not find a module-level `TARGET = \"...\"` assignment in "
+            "C-003: could not find a module-level `TARGETS = (...)` assignment in "
             "scripts/run_bandit.py — scan scope is not verifiable"
         )
         return False
-    target = m.group(1)
-    if target != EXPECTED_TARGET:
+    targets = tuple(re.findall(r'["\']([^"\']+)["\']', m.group(1)))
+    if targets != EXPECTED_TARGETS:
         fail(
-            f"C-003: run_bandit.py TARGET is {target!r}, expected {EXPECTED_TARGET!r}. "
+            f"C-003: run_bandit.py TARGETS is {targets!r}, expected {EXPECTED_TARGETS!r}. "
             "Shrinking or redirecting the SAST scope requires updating the expected "
             "value in scripts/check_sast_baseline.py deliberately."
         )

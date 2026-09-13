@@ -5,6 +5,9 @@ import hashlib
 import logging
 import re
 import sqlite3
+import time
+from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import (
@@ -21,6 +24,12 @@ from typing import (
 
 from app.config import settings
 from app.models.chat_mode import ChatMode
+from app.services.admission import (
+    AdmissionClass,
+    AdmissionRejected,
+    chat_gate_held,
+    get_admission_controller,
+)
 from app.services.answer_contract import build_answer_contract
 from app.services.citation_validator import (
     parse_citations,
@@ -50,6 +59,7 @@ from app.services.prompt_builder import PromptBuilderService, calculate_primary_
 from app.services.query_transformer import QueryPlanner, QueryTransformer
 from app.services.rag_trace import RAGTrace
 from app.services.retrieval_evaluator import RetrievalEvaluator
+from app.services.telemetry import _status_to_outcome, current_turn_id, get_telemetry
 from app.services.vector_store import SearchSemaphoreTimeoutError, VectorStore
 from app.services.vision_evidence import (
     VisionRunContext,
@@ -69,6 +79,39 @@ except ImportError:  # pragma: no cover — defensive; raised if flag enabled wi
 
 # RRF constant for sub-query fusion (standard value).
 _SUB_QUERY_RRF_K = 60
+
+# Request-local generation state (OBS-002, issue #518).
+#
+# ``RAGEngine`` is a process-wide singleton shared by every concurrent chat
+# request on one event loop, so request-scoped values must NEVER live only on
+# instance attributes: a request that fails before a successful LLM attempt
+# would read the previous request's values (the OBS-002 stale-metrics defect).
+# These contextvars are bound per request at the top of ``query()``; helpers
+# below write BOTH the request-local value (used to build the terminal ``done``
+# payload) and, on success only, the legacy ``self._last_llm_metrics`` mirror
+# kept for backwards compatibility with direct-call consumers (pinned by
+# test_issue_249_runtime_contracts.py).
+_request_llm_metrics: ContextVar[dict] = ContextVar(
+    "_request_llm_metrics", default={}
+)
+_request_distillation_provenance: ContextVar[list] = ContextVar(
+    "_request_distillation_provenance", default=[]
+)
+
+
+def _set_request_llm_metrics(metrics: Dict[str, Any]) -> None:
+    """Replace the request-local generation metrics (success or failure)."""
+    _request_llm_metrics.set(dict(metrics or {}))
+
+
+def _merge_request_llm_failure(metrics: Dict[str, Any]) -> None:
+    """Record a failing attempt's metrics for the current request.
+
+    Used before an error chunk/error raise so the terminal ``done`` payload
+    identifies THIS request's failure instead of a previous success.
+    """
+    _request_llm_metrics.set(dict(metrics or {"status": "error"}))
+
 
 # Sentinel marking "no per-instance override set" for live-settings properties.
 # Used so a value of ``None`` can be an intentional override (e.g. for
@@ -770,6 +813,16 @@ class RAGEngine:
             vault_id,
             stream,
         )
+        # OBS-002 (issue #518): bind request-local generation state so this
+        # request's terminal ``done`` payload can never carry a previous
+        # request's metrics or distillation provenance. The instance
+        # attributes are reset too (legacy mirrors; direct-call consumers
+        # read them) but every response-facing read below uses the
+        # request-local values.
+        _set_request_llm_metrics({})
+        _request_distillation_provenance.set([])
+        self._last_llm_metrics = {}
+        self._last_distillation_provenance = []
         # Per-query controls (issue #510): retrieval_mode / citation_mode are
         # implemented controls now — resolve once into LOCAL variables and
         # thread explicitly through every retrieval call inside this query
@@ -1279,7 +1332,27 @@ class RAGEngine:
                     if vt == 'original'
                 ] or [('original', retrieval_query)]
             embed_tasks = [_embed_one(vt, t) for vt, t in variants_to_embed]
-            raw_embeddings = await asyncio.gather(*embed_tasks, return_exceptions=True)
+            # E3 admission (issue #518): the embedding device budget is shared
+            # process-wide (and cross-process via ADMISSION_STORE_URL).
+            try:
+                async with get_admission_controller().admit(
+                    AdmissionClass.EMBEDDING
+                ):
+                    raw_embeddings = await asyncio.gather(
+                        *embed_tasks, return_exceptions=True
+                    )
+            except AdmissionRejected as exc:
+                if stream:
+                    _merge_request_llm_failure(
+                        {"status": "admission_rejected", "detail": str(exc)}
+                    )
+                    yield {
+                        "type": "error",
+                        "message": f"Embedding admission rejected: {exc}",
+                        "code": "ADMISSION_REJECTED",
+                    }
+                    return
+                raise RAGEngineError(f"Embedding admission rejected: {exc}")
 
             for (variant_type, _), result in zip(variants_to_embed, raw_embeddings):
                 if isinstance(result, EmbeddingError):
@@ -1289,6 +1362,9 @@ class RAGEngine:
                         )
                         _cancel_overlap_tasks()
                         if stream:
+                            _merge_request_llm_failure(
+                                {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                            )
                             yield {
                                 "type": "error",
                                 "message": f"Original query embedding failed: {result}",
@@ -1305,6 +1381,9 @@ class RAGEngine:
                         logger.error("Query embedding failure for original query: %s", result)
                         _cancel_overlap_tasks()
                         if stream:
+                            _merge_request_llm_failure(
+                                {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                            )
                             yield {
                                 "type": "error",
                                 "message": f"Original query embedding failed: {result}",
@@ -1322,6 +1401,9 @@ class RAGEngine:
                     "[query] No query embeddings produced — all embedding attempts failed"
                 )
                 _cancel_overlap_tasks()
+                _merge_request_llm_failure(
+                    {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                )
                 if stream:
                     yield {"type": "error", "message": error_msg, "code": "EMBEDDING_ERROR"}
                     return
@@ -1662,7 +1744,12 @@ class RAGEngine:
                 )
                 relevant_chunks = distill_result.sources
                 sentence_provenance = distill_result.sentence_provenance
-                self._last_distillation_provenance = sentence_provenance
+                # OBS-002 sibling: request-local only. The legacy
+                # ``self._last_distillation_provenance`` mirror is written on
+                # GENERATION success (see the success paths in
+                # _stream_llm_response/_get_llm_response) so a failed turn
+                # never leaves provenance state behind for the next request.
+                _request_distillation_provenance.set(list(sentence_provenance or []))
                 logger.info(
                     "[query] Context distillation: kept %d sentences with provenance",
                     len(sentence_provenance),
@@ -1766,13 +1853,19 @@ class RAGEngine:
                 for c in relevant_chunks
             ):
                 try:
-                    vision_result = await vision_context.service.run(
-                        query=user_input,
-                        sources=relevant_chunks,
-                        vault_id=vault_id,
-                        user=vision_context.user,
-                        evaluate=vision_context.evaluate,
-                    )
+                    # E3 admission (issue #518): vision-device budget; an
+                    # AdmissionRejected degrades to the stored proxy via the
+                    # per-source failure handler below (never fails the turn).
+                    async with get_admission_controller().admit(
+                        AdmissionClass.VISION
+                    ):
+                        vision_result = await vision_context.service.run(
+                            query=user_input,
+                            sources=relevant_chunks,
+                            vault_id=vault_id,
+                            user=vision_context.user,
+                            evaluate=vision_context.evaluate,
+                        )
                     apply_vision_to_sources(vision_result, relevant_chunks)
                     trace.vision_eligible = vision_result.eligible
                     trace.vision_selected = vision_result.selected
@@ -1845,29 +1938,80 @@ class RAGEngine:
 
         # FR-015: Signal "Drafting" stage — the LLM is now generating tokens.
         yield {"type": "stage", "stage": STAGE_DRAFTING}
+        _generation_started = time.perf_counter()
 
-        if stream:
-            async for chunk in self._stream_llm_response(
-                messages, client=active_client, max_tokens=effective_max_tokens,
-                temperature=temperature,
-                finish_reason_capture=llm_finish_reason_capture,
-            ):
-                chunk_type = chunk.get("type", "unknown")
-                logger.debug("[query] Yielding '%s' chunk (stream)", chunk_type)
-                if chunk_type == "content":
-                    assembled_response.append(chunk.get("content", ""))
-                yield chunk
-        else:
-            async for chunk in self._get_llm_response(
-                messages, client=active_client, max_tokens=effective_max_tokens,
-                temperature=temperature,
-                finish_reason_capture=llm_finish_reason_capture,
-            ):
-                chunk_type = chunk.get("type", "unknown")
-                logger.debug("[query] Yielding '%s' chunk (non-stream)", chunk_type)
-                if chunk_type == "content":
-                    assembled_response.append(chunk.get("content", ""))
-                yield chunk
+        # E3 admission (issue #518): generation-phase budget, shared by every
+        # chat/instant consumer. When the chat route already holds the
+        # route-level CHAT gate for this request (chat_gate_held), the engine
+        # skips its own acquire — route+engine never double-acquire the same
+        # key (explicit no-nesting contract; see app/services/admission.py).
+        generation_admission_class = (
+            AdmissionClass.INSTANT if mode == ChatMode.INSTANT else AdmissionClass.CHAT
+        )
+        generation_gate = AsyncExitStack()
+        if not chat_gate_held():
+            try:
+                await generation_gate.enter_async_context(
+                    get_admission_controller().admit(generation_admission_class)
+                )
+            except AdmissionRejected as exc:
+                _merge_request_llm_failure(
+                    {"status": "admission_rejected", "detail": str(exc)}
+                )
+                yield {
+                    "type": "error",
+                    "message": f"Generation admission rejected: {exc}",
+                    "code": "ADMISSION_REJECTED",
+                }
+                return
+        try:
+            async with generation_gate:
+                if stream:
+                    async for chunk in self._stream_llm_response(
+                        messages, client=active_client, max_tokens=effective_max_tokens,
+                        temperature=temperature,
+                        finish_reason_capture=llm_finish_reason_capture,
+                    ):
+                        chunk_type = chunk.get("type", "unknown")
+                        logger.debug("[query] Yielding '%s' chunk (stream)", chunk_type)
+                        if chunk_type == "content":
+                            assembled_response.append(chunk.get("content", ""))
+                        yield chunk
+                else:
+                    async for chunk in self._get_llm_response(
+                        messages, client=active_client, max_tokens=effective_max_tokens,
+                        temperature=temperature,
+                        finish_reason_capture=llm_finish_reason_capture,
+                    ):
+                        chunk_type = chunk.get("type", "unknown")
+                        logger.debug("[query] Yielding '%s' chunk (non-stream)", chunk_type)
+                        if chunk_type == "content":
+                            assembled_response.append(chunk.get("content", ""))
+                        yield chunk
+        except AdmissionRejected as exc:
+            _merge_request_llm_failure(
+                {"status": "admission_rejected", "detail": str(exc)}
+            )
+            yield {
+                "type": "error",
+                "message": f"Generation admission rejected: {exc}",
+                "code": "ADMISSION_REJECTED",
+            }
+            return
+        # E3 telemetry (issue #518): measured generation stage duration and
+        # the provider outcome for this turn (ok/partial/unavailable/empty).
+        get_telemetry().record_stage(
+            current_turn_id() or "",
+            "generation",
+            time.perf_counter() - _generation_started,
+        )
+        _final_status = (_request_llm_metrics.get() or {}).get("status")
+        try:
+            get_telemetry().record_provider_call(
+                "llm", _status_to_outcome(_final_status)
+            )
+        except ValueError:  # pragma: no cover — closed outcome set
+            logger.debug("unmapped provider status %r", _final_status)
 
         # FULL-ENH-01 (issue #511 B2): surface the provider-reported
         # finish_reason (e.g. "length" — the answer was cut by the output
@@ -1988,7 +2132,7 @@ class RAGEngine:
                     "mode": "required",
                     "status": "satisfied",
                 }
-        done_msg["llm_metrics"] = dict(self._last_llm_metrics or {})
+        done_msg["llm_metrics"] = dict(_request_llm_metrics.get() or {})
         # Populate final-source labels on the trace for evaluation tooling.
         trace.final_sources = [
             s.get("source_label", "") for s in done_msg.get("sources", []) if s.get("source_label")
@@ -2034,7 +2178,7 @@ class RAGEngine:
             confidence_result = score_citations(
                 full_response,
                 support_texts,
-                sentence_provenance=self._last_distillation_provenance,
+                sentence_provenance=_request_distillation_provenance.get(),
             )
             trace.citation_confidence = confidence_result.citation_confidence
             trace.unverifiable_claims = list(confidence_result.unverifiable_claims)
@@ -2445,9 +2589,12 @@ class RAGEngine:
             agg_rerank_success = None
             if self.reranking_enabled and self.reranking_service and deduped:
                 try:
-                    reranked_chunks, consolidated_success = (
-                        await self.reranking_service.rerank(
-                            query=user_input,
+                    async with get_admission_controller().admit(
+                        AdmissionClass.RERANKING
+                    ):
+                        reranked_chunks, consolidated_success = (
+                            await self.reranking_service.rerank(
+                                query=user_input,
                             chunks=deduped,
                             top_n=effective_reranker_top_n,
                         )
@@ -2748,15 +2895,23 @@ class RAGEngine:
                 and not defer_rerank
             ):
                 try:
-                    reranked_chunks, rerank_success = await self.reranking_service.rerank(
-                        query=user_input,
-                        chunks=vector_results,
-                        top_n=(
-                            override_reranker_top_n
-                            if override_reranker_top_n is not None
-                            else self.reranker_top_n
-                        ),
-                    )
+                    # E3 admission (issue #518): reranker-device budget. An
+                    # AdmissionRejected is caught by the existing graceful
+                    # handler below — rerank is skipped, scores stay distance.
+                    async with get_admission_controller().admit(
+                        AdmissionClass.RERANKING
+                    ):
+                        reranked_chunks, rerank_success = (
+                            await self.reranking_service.rerank(
+                                query=user_input,
+                                chunks=vector_results,
+                                top_n=(
+                                    override_reranker_top_n
+                                    if override_reranker_top_n is not None
+                                    else self.reranker_top_n
+                                ),
+                            )
+                        )
                     if reranked_chunks:
                         vector_results = reranked_chunks
                     logger.info(
@@ -3018,6 +3173,10 @@ class RAGEngine:
                 if candidate is not target:
                     metrics["fallback_from"] = getattr(target, "base_url", None)
                 self._last_llm_metrics = metrics
+                _set_request_llm_metrics(metrics)
+                self._last_distillation_provenance = list(
+                    _request_distillation_provenance.get() or []
+                )
                 if finish_reason_capture is not None:
                     finish_reason_capture["finish_reason"] = metrics.get(
                         "finish_reason"
@@ -3027,6 +3186,10 @@ class RAGEngine:
                 last_error = exc
                 if emitted_content:
                     logger.error("[_stream_llm_response] LLMError after content: %s", exc)
+                    _merge_request_llm_failure(
+                        dict(getattr(candidate, "last_metrics", {}) or {})
+                        or {"status": "error", "error": str(exc), "stream": True}
+                    )
                     yield {"type": "error", "message": str(exc), "code": "LLM_ERROR"}
                     return
                 logger.warning(
@@ -3035,6 +3198,10 @@ class RAGEngine:
                     exc,
                 )
         if last_error is not None:
+            _merge_request_llm_failure(
+                dict(getattr(candidate, "last_metrics", {}) or {})
+                or {"status": "error", "error": str(last_error), "stream": True}
+            )
             yield {"type": "error", "message": str(last_error), "code": "LLM_ERROR"}
 
     async def _get_llm_response(
@@ -3081,6 +3248,10 @@ class RAGEngine:
                         getattr(candidate, "base_url", "<unknown>"),
                     )
                 self._last_llm_metrics = metrics
+                _set_request_llm_metrics(metrics)
+                self._last_distillation_provenance = list(
+                    _request_distillation_provenance.get() or []
+                )
                 if finish_reason_capture is not None:
                     finish_reason_capture["finish_reason"] = metrics.get(
                         "finish_reason"
@@ -3095,6 +3266,10 @@ class RAGEngine:
                     exc,
                 )
         if last_error is not None:
+            _merge_request_llm_failure(
+                dict(getattr(candidate, "last_metrics", {}) or {})
+                or {"status": "error", "error": str(last_error)}
+            )
             raise RAGEngineError(f"LLM chat failed: {last_error}") from last_error
 
     def _fallback_clients(self, primary: LLMClient) -> List[LLMClient]:

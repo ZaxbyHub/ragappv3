@@ -145,6 +145,12 @@ if settings.allowed_hosts:
     )
 
 app.include_router(health_router, prefix="/api")
+
+# E3 telemetry (issue #518): GET /metrics — Prometheus exposition of the
+# measured turn/stage/queue/provider metrics (multiprocess-aggregated).
+from app.services.telemetry import register_metrics_route  # noqa: E402
+
+register_metrics_route(app)
 app.include_router(draft_room_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 app.include_router(canvas_router, prefix="/api")

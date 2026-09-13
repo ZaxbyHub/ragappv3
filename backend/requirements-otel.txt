@@ -1,0 +1,15 @@
+# Optional telemetry extra (issue #518, Workstream E3).
+#
+# NOT installed by default — air-gapped/base installs are unaffected and the
+# app runs fully without it. Install together with the base requirements
+# ONLY when exporting ragapp_* counters over OTLP:
+#   pip install -r requirements.txt -r requirements-otel.txt
+# and set OTEL_EXPORTER_OTLP_ENDPOINT (see docs/operations.md).
+#
+# Versions are PINNED deliberately: the GenAI semantic conventions these
+# packages carry (open-telemetry/semantic-conventions-genai) are Development
+# status with no stable release as of 2026-09 — do not describe them as
+# stable, and bump pins consciously.
+opentelemetry-api==1.29.0
+opentelemetry-sdk==1.29.0
+opentelemetry-exporter-otlp-proto-http==1.29.0

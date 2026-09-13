@@ -14,6 +14,11 @@ from datetime import UTC, datetime
 from typing import List, Optional
 
 from app.config import settings
+from app.services.admission import (
+    AdmissionClass,
+    AdmissionRejected,
+    get_admission_controller,
+)
 
 from ..models.database import SQLiteConnectionPool
 from .document_processor import DocumentProcessingError, DocumentProcessor
@@ -1786,7 +1791,35 @@ class BackgroundProcessor:
             if task is None:
                 continue
 
-            await self._process_task_wrapper(task)
+            # E3 admission (issue #518): ingestion work shares the background
+            # device budget. Under interactive pressure the admit is rejected
+            # (foreground preference) — defer through the retry scheduler.
+            # Balanced bookkeeping (swarm review F-007): the get() above
+            # consumed a join() unit, so task_done() must run on EVERY path
+            # that does not reach _process_task_wrapper (whose finally calls
+            # it); the re-delivery is a producer-side put by the scheduler,
+            # never an inline re-put from this consumer.
+            try:
+                async with get_admission_controller().admit(
+                    AdmissionClass.BACKGROUND, foreground=False
+                ):
+                    await self._process_task_wrapper(task)
+            except AdmissionRejected as exc:
+                self.queue.task_done()
+                if not self._schedule_retry(
+                    queue=self.queue, item=task, delay=0.5
+                ):
+                    # Retry backlog full or shutdown began: fail the task
+                    # outright rather than wedge the queue drain.
+                    logger.error(
+                        "Ingestion admission deferral for %s could not be "
+                        "scheduled (retry backlog full or shutdown); "
+                        "treating as permanent failure",
+                        task.file_path,
+                    )
+                    self._mark_task_permanently_failed(
+                        task, f"admission rejected: {exc.reason}"
+                    )
 
     async def _enrichment_worker_loop(self) -> None:
         """Process optional enrichment after base indexing completes."""
@@ -1798,14 +1831,17 @@ class BackgroundProcessor:
             except asyncio.TimeoutError:
                 continue
             try:
-                await self.processor.run_enrichment_job(
-                    file_id=item.file_id,
-                    file_path=item.file_path,
-                    vault_id=item.vault_id,
-                    file_hash=item.file_hash,
-                    chunks=item.chunks,
-                    document_text=item.document_text,
-                )
+                async with get_admission_controller().admit(
+                    AdmissionClass.BACKGROUND, foreground=False
+                ):
+                    await self.processor.run_enrichment_job(
+                        file_id=item.file_id,
+                        file_path=item.file_path,
+                        vault_id=item.vault_id,
+                        file_hash=item.file_hash,
+                        chunks=item.chunks,
+                        document_text=item.document_text,
+                    )
             except Exception:
                 logger.exception("Enrichment job failed for file_id=%s", item.file_id)
                 if self.shutdown_event.is_set():

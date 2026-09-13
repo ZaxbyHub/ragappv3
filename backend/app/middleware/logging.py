@@ -7,7 +7,7 @@ import uuid
 from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-from app.utils.request_context import request_id_var
+from app.utils.request_context import is_safe_request_id, request_id_var
 
 SCRUB_FIELDS = {
     "message",
@@ -76,7 +76,15 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        # Trust boundary (swarm review F-004): a client may deliver an
+        # X-Request-ID with obs-text bytes (latin-1-decoded, unvalidated) or
+        # absurd length. Regenerate anything not safe to propagate outbound.
+        raw_request_id = request.headers.get("X-Request-ID")
+        request_id = (
+            raw_request_id
+            if is_safe_request_id(raw_request_id)
+            else str(uuid.uuid4())
+        )
         request.state.request_id = request_id
         # Propagate request_id to service-layer loggers via contextvar
         token = request_id_var.set(request_id)
