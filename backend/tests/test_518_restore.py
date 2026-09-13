@@ -253,7 +253,11 @@ def test_restore_drill_recovers_pre_mutation_state(tmp_path):
         "from backup-time state"
     )
     assert (
-        dest / "vault-7" / "uploads" / "file.txt"
+        # AMEND (COPILOT-VAULT-PATH, issue-518 round 2): vault artifacts
+        # restore under <dest>/vaults/<id>, matching the live
+        # settings.vault_dir layout (config.py); the pre-fix bare-leaf
+        # path restored vaults to the wrong location.
+        dest / "vaults" / "vault-7" / "uploads" / "file.txt"
     ).read_bytes() == VAULT_FILE_ORIGINAL
     assert (
         dest / "draft-room" / "in.txt"

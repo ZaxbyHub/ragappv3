@@ -3,12 +3,16 @@
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
 #
-# Collects the backend's Prometheus exposition (GET /metrics on the backend
-# port) and log/output telemetry into Grafana Alloy, which can fan out to
-# Tempo (traces) and Loki (logs). Entirely optional: the base compose file
-# has no observability dependencies and air-gapped installs are unaffected.
-# Direct OTLP export from the backend is available via the pinned optional
-# pip extra backend/requirements-otel.txt + OTEL_EXPORTER_OTLP_ENDPOINT
+# What this overlay ACTUALLY configures out of the box (swarm review,
+# honesty fix): an Alloy container that scrapes the backend's Prometheus
+# exposition (GET /metrics on the backend port) and is wired to fan out to
+# a remote_write endpoint. Trace and log collection are NOT configured —
+# the Tempo/Loki endpoints in observability/alloy/config.alloy are marked
+# placeholders you must point at your existing stack. Entirely optional:
+# the base compose file has no observability dependencies and air-gapped
+# installs are unaffected. Direct OTLP export from the backend is
+# available via the pinned optional pip extra
+# backend/requirements-otel.txt + OTEL_EXPORTER_OTLP_ENDPOINT
 # (see docs/operations.md; GenAI semantic conventions are Development
 # status).
 

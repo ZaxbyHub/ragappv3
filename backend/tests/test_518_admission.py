@@ -96,6 +96,19 @@ async def _wait_for(task, timeout=2.0):
     return await asyncio.wait_for(task, timeout)
 
 
+async def _park(ticks: int = 3) -> None:
+    """Deterministically let a created waiter task reach its queue lane.
+
+    AMEND (F-014, issue-518 round 2): replaces real-time sleeps — a waiter
+    registers itself in the hub lane synchronously on its first execution
+    slice (before its first true suspension), so a few event-loop ticks
+    suffice regardless of runner load; a 0.05 s sleep raced the scheduler
+    on loaded CI runners.
+    """
+    for _ in range(ticks):
+        await asyncio.sleep(0)
+
+
 
 
 def _controller(store=None, **kwargs):
@@ -252,7 +265,7 @@ async def test_cancelled_waiter_releases_queue_slot():
             entered.append("ran")
 
     waiter = asyncio.create_task(disconnected_client())
-    await asyncio.sleep(0.05)
+    await _park()
     assert await ctrl.queue_depth(AdmissionClass.CHAT) >= 1
 
     waiter.cancel()
@@ -284,7 +297,7 @@ async def test_queue_full_rejects_immediately_without_retry_storm():
                 pass
 
     waiter = asyncio.create_task(queued_waiter())
-    await asyncio.sleep(0.05)
+    await _park()
 
     started = time.monotonic()
     with pytest.raises(AdmissionRejected) as excinfo:

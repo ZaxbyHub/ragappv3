@@ -11,6 +11,7 @@ done chunk only.
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -59,15 +60,21 @@ async def test_preempted_background_holder_completes_normally():
         instance_id="w1",
     )
     outcomes = []
+    bg_started = asyncio.Event()
+    bg_release = asyncio.Event()
 
     async def background_work():
         outcomes.append("bg-start")
-        await asyncio.sleep(0.15)
+        bg_started.set()
+        await bg_release.wait()
         outcomes.append("bg-done")
 
     bg_task = asyncio.create_task(background_work())
-    await asyncio.sleep(0.01)
+    # Deterministic handoff (F-014): the event proves the work is running
+    # without racing a wall-clock sleep on a loaded runner.
+    await bg_started.wait()
     async with ctrl.admit(AdmissionClass.BACKGROUND):
+        bg_release.set()
         await bg_task
     assert outcomes == ["bg-start", "bg-done"], outcomes
 
@@ -75,10 +82,10 @@ async def test_preempted_background_holder_completes_normally():
     # task itself completed — no cancellation.
     holder_cm = ctrl.admit(AdmissionClass.BACKGROUND)
     await holder_cm.__aenter__()
-    started = asyncio.get_event_loop().time()
+    started = time.monotonic()
     async with ctrl.admit(AdmissionClass.CHAT):
         pass
-    elapsed = asyncio.get_event_loop().time() - started
+    elapsed = time.monotonic() - started
     assert elapsed < 1.0, (
         "518-H PREEMPTION STALLED: foreground not admitted past background holder"
     )

@@ -38,19 +38,39 @@ roles, not capacity claims.
   at or above the per-process semaphores they complement — so enabling
   admission does not change current throughput; tighten only after baseline
   observation via `GET /metrics`.
-- Foreground preference: when interactive work is blocked and only
-  background holders occupy a budget, one local background holder is
-  logically evicted (its task keeps running; its later release is a no-op).
-  Background work never preempts interactive work and is never starved —
-  queued background items all complete once interactive pressure subsides.
+- Budget semantics, honestly stated (swarm review F-010/F-011): embedding,
+  vision and background budgets are set EQUAL to the per-process
+  semaphores that still bind underneath — raising only the
+  `ADMISSION_*_BUDGET` does NOT raise those ceilings; raise both together.
+  Chat and instant had NO prior bound: their admission budgets are NEW
+  caps, on by default (`ADMISSION_ENABLED=true`); a deployment that
+  previously ran more than 8 concurrent chat streams (or 4 instant) will
+  start queueing at those numbers with zero `.env` changes.
+- With the shipped settings mapping each class has its OWN budget key
+  (one measured endpoint role per class: thinking LLM, instant LLM, TEI
+  :8080, TEI :8081, vision, background). Foreground-preference eviction
+  between chat and background holders only engages when classes SHARE a
+  budget key — with the shipped mapping they do not, so admission never
+  evicts across classes in a default deployment (the capability exists for
+  custom controllers that map several classes onto one device budget).
+- Foreground preference (shared-key deployments): when interactive work is
+  blocked and only background holders occupy a budget, one local
+  (same-process) background holder is logically evicted (its task keeps
+  running; its later release is a no-op). Background work never preempts
+  interactive work and is never starved — queued background items all
+  complete once interactive pressure subsides.
 - Overload is bounded: queues hold at most `ADMISSION_QUEUE_MAX_SIZE`
   in-flight + queued requests per class; beyond that the request is
   rejected immediately (SSE `ADMISSION_REJECTED` error + done on the stream
   path, HTTP 503 on the non-stream path). A queued request whose deadline
   (`ADMISSION_DEADLINE_SECONDS`) expires is rejected, never executed.
-- Holders past their TTL are swept on the next acquire, so a crashed worker
-  cannot wedge a budget. On graceful shutdown the controller releases all
-  in-flight slots and rejects new admits.
+- Leases: a live holder renews (heartbeats every ttl/3), so a long
+  thinking-mode generation NEVER loses its slot to the 30 s TTL; the TTL
+  exists solely to reap holders whose process died without releasing, and
+  runs on the next acquire. On graceful shutdown the controller releases
+  all in-flight slots, cancels renewal heartbeats, closes a Redis store's
+  connection pool and rejects new admits (wired in `app/lifespan.py`
+  AFTER background workers drain).
 - Degradation: if the shared store (Redis) is unreachable, admission fails
   OPEN — requests proceed — and the controller exposes `.degraded`; the
   operator-visible signal is the absence of admission metrics progression
@@ -76,12 +96,15 @@ roles, not capacity claims.
 ## Operator recovery actions
 
 - Overloaded chat (queue_full rejections): raise the relevant
-  `ADMISSION_*_BUDGET`, or set `ADMISSION_ENABLED=false` to restore
-  pre-admission behavior immediately (no restart needed for the flag to be
-  read at controller construction; restart applies it process-wide).
+  `ADMISSION_*_BUDGET` — for embedding/vision/background also raise the
+  matching per-process semaphore (the budget alone cannot exceed it; see
+  the budget-semantics note above). `ADMISSION_ENABLED` is read once at
+  controller construction: setting it in `.env` requires a RESTART to
+  apply (there is no runtime toggle).
 - Stuck budgets after a crash: holders expire via TTL automatically
-  (`ADMISSION_*` defaults use a 30 s lease TTL). Restarting the backend also
-  releases all local slots on shutdown.
+  (`ADMISSION_*` defaults use a 30 s lease TTL; live holders renew, so a
+  TTL expiry only happens for a process that died). Restarting the backend
+  also releases all local slots on shutdown.
 - Restore from backup: stop the stack, run `python scripts/restore.py
   <backup-set-dir> --dest <data-dir>` (verifies every digest and checks out
   the tagged LanceDB generations), then restart. See Scheduled backups.
@@ -95,8 +118,19 @@ roles, not capacity claims.
   `backup-*` BEFORE the copy, manifest with sha256 digests binding app.db +
   lancedb + vaults + draft-room):
   `python scripts/backup_set.py --output backups/set-$(date +%Y%m%d-%H%M%S)`
+- **Encryption scope, stated plainly (swarm review F-009): only `app.db` is
+  encrypted** (AES-GCM, key from the `AES_KEY`/`AES_KEY_V1` environment
+  variable via SecretManager — set it before backup AND restore, or the
+  sqlite artifact cannot decrypt). The lancedb, vault and draft-room trees
+  in a backup set are PLAINTEXT copies of your documents: store sets on
+  restricted, operator-controlled storage (the separate host below), not a
+  broadly writable share. Set files are written owner-only (0600/0700)
+  where the OS supports it.
 - Restore + verify drill: `python scripts/restore.py backups/set-...
-  --dest ./data-restored` then compare. The CI restore drill is
+  --dest ./data-restored` then compare. The CLI verifies every manifest
+  digest, rejects paths that escape the set or destination, and checks out
+  the tagged LanceDB generations (restores vaults under `<dest>/vaults/`,
+  matching live layout). The CI restore drill is
   `backend/tests/test_518_restore.py` (runs in the backend job).
 - Schedule under the existing deployment support (no new scheduler
   service): Linux cron `0 2 * * * cd /path/to/ragappv3 && python
@@ -109,18 +143,22 @@ roles, not capacity claims.
 ## Telemetry surface
 
 - `GET /metrics` (same port as the app, internal-network default): counts
-  and durations only — no user content, no secrets. Restrict scraping at
-  your ingress; the compose deployment does not publish an extra port for
-  it. Metric families: `ragapp_chat_turns_total`, `ragapp_queue_depth`,
-  `ragapp_queue_wait_seconds`, `ragapp_provider_calls_total`,
-  `ragapp_embedding_cache_hits_total`. Note: the chat route records queue
-  depth snapshots only where the engine's admission API exposes them; the
-  queue-wait gauge is the primary saturation signal. **Stage durations and
-  first-useful-content latencies are per-process** (kept in the instance
-  snapshot via `Telemetry.snapshot()`); the cross-process shard aggregates
-  the counter/gauge families above only — a multi-replica deployment reads
-  stage latency from each replica's own telemetry instance, not the shared
-  `/metrics` sum.
+  and durations only — no user content, no secrets. **It is unauthenticated
+  and served on the SAME port as the rest of the API** — "no extra port
+  published" is a deployment fact, not an access control; restrict scraping
+  at your ingress. Metric families: `ragapp_chat_turns_total`,
+  `ragapp_queue_depth`, `ragapp_queue_wait_seconds`,
+  `ragapp_provider_calls_total`, `ragapp_embedding_cache_hits_total`.
+  Multiprocess aggregation: set `TELEMETRY_REGISTRY_DIR` to one shared
+  writable directory (all workers/replicas) and the counter/gauge families
+  above are summed across shards; empty = single-process counters. Note:
+  the chat route records queue depth snapshots only where the engine's
+  admission API exposes them; the queue-wait gauge is the primary
+  saturation signal. **Stage durations and first-useful-content latencies
+  are per-process** (kept in the instance snapshot via
+  `Telemetry.snapshot()`); a multi-replica deployment reads stage latency
+  from each replica's own telemetry instance, not the shared `/metrics`
+  sum.
 - Correlation: every chat turn carries a `turn_id` (the inbound
   `X-Request-ID` when present) on the SSE done event; outbound provider
   calls carry W3C `traceparent` + the same `X-Request-ID`. Log lines carry

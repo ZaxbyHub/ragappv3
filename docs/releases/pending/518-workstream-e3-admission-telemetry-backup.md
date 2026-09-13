@@ -42,3 +42,48 @@
   172.16.50.159: 2x RTX 2000E Ada 16 GB + 1x RTX 1000, TEI 1.9.3,
   harrier-oss-v1-0.6b :8080, bge-reranker-v2-m3 :8081) and an optional
   `docker-compose.observability.yml` overlay.
+
+## Migration
+
+- No database or data migration; all changes are additive (new modules,
+  settings, scripts, docs).
+- New environment keys (`ADMISSION_*`, `TELEMETRY_ENABLED`,
+  `TELEMETRY_REGISTRY_DIR`) are documented in `.env.example` and forwarded
+  by `docker-compose.yml`. `ADMISSION_DEADLINE_SECONDS` uses the compose
+  SHORT form and is commented out in `.env.example` — an empty value is
+  coerced to unset by a `mode="before"` validator, so `docker compose up`
+  and `cp .env.example .env` both start cleanly (swarm review F-001).
+- Backup sets now record vault artifacts under `vaults/<id>` manifest
+  paths, matching the live `<data_dir>/vaults/<id>` layout; restore places
+  them back there (Copilot review). Sets created by pre-release drafts of
+  these scripts are not supported — no released set exists.
+
+## Breaking changes
+
+- Chat and instant generation now have admission caps (8 and 4 concurrent
+  by default) where none existed before, ON by default. Deployments that
+  ran more concurrent streams will begin queueing/rejecting at those
+  numbers; raise `ADMISSION_CHAT_BUDGET`/`ADMISSION_INSTANT_BUDGET` or set
+  `ADMISSION_ENABLED=false` (restart required) to restore prior behavior.
+- The non-stream chat route can now return HTTP 503 (`chat admission
+  rejected`) under saturation; the stream path emits the SSE error code
+  `ADMISSION_REJECTED` before `done`.
+
+## Known caveats
+
+- Only `app.db` is encrypted in a backup set; the lancedb/vault/draft-room
+  trees are plaintext document copies — store sets on restricted storage
+  and set `AES_KEY`/`AES_KEY_V1` before backup AND restore (F-009).
+- Embedding/vision/background admission budgets equal their underlying
+  per-process semaphores: relieving saturation requires raising BOTH, not
+  just the budget (F-010).
+- `GET /metrics` is unauthenticated on the same port as the API — restrict
+  at ingress (F-012).
+- Admission live-holder leases renew every ttl/3 (30 s default), so long
+  generations keep their slots; the TTL only reaps dead processes (F-003).
+  `ADMISSION_ENABLED` is read at process start — there is no runtime
+  toggle (F-006/F-011).
+- The OTLP export path is an optional pinned extra; with
+  `OTEL_EXPORTER_OTLP_ENDPOINT` set on EVERY replica sharing one
+  `TELEMETRY_REGISTRY_DIR`, per-replica pushes over-count — enable export
+  on one replica per shared dir.
