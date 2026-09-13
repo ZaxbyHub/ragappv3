@@ -2655,6 +2655,59 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_session_seq ON chat_messages(session_id, seq)"
         )
+
+        # Issue #553: enforce one durable row per (session, turn, role) so the
+        # turn_id-keyed reconcile is idempotent at the storage layer, not just
+        # by client discipline. A turn legitimately has TWO rows sharing one
+        # turn_id (user + assistant), so the constraint is role-aware; legacy
+        # rows (turn_id NULL) are excluded by the partial index and never
+        # conflict or get deleted.
+        #
+        # Pre-existing duplicate (session, turn, role) rows — exactly the
+        # double-save defect this PR closes — would make the unique index
+        # unbuildable, so the FIRST run (index absent) first collapses each
+        # duplicate group to a single survivor, keeping the most informative
+        # row: status 'complete' first, then 'interrupted'/'failed', then
+        # 'pending'/NULL; ties broken by longest content, then highest id
+        # (latest write wins among equals, matching the reconcile's
+        # update-in-place semantics). Dropped duplicates are lesser variants
+        # of the SAME turn; when same-rank duplicates differ in content the
+        # shorter variant is unrecoverable from the server (recovery source:
+        # the client transcript that produced the turn). Gating on index
+        # existence makes both the scan and the delete one-time per database —
+        # later connects only run the idempotent CREATE ... IF NOT EXISTS.
+        turn_role_index_exists = any(
+            idx_row[1] == "idx_chat_messages_session_turn_role"
+            for idx_row in conn.execute("PRAGMA index_list(chat_messages)").fetchall()
+        )
+        if not turn_role_index_exists:
+            conn.execute(
+                """
+                DELETE FROM chat_messages
+                WHERE turn_id IS NOT NULL
+                  AND id NOT IN (
+                    SELECT id FROM (
+                      SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY session_id, turn_id, role
+                        ORDER BY (CASE status WHEN 'complete' THEN 3
+                                              WHEN 'interrupted' THEN 2
+                                              WHEN 'failed' THEN 2
+                                              ELSE 1 END) DESC,
+                                 LENGTH(COALESCE(content, '')) DESC,
+                                 id DESC
+                      ) AS rn
+                      FROM chat_messages WHERE turn_id IS NOT NULL
+                    ) ranked WHERE ranked.rn = 1
+                  )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_session_turn_role
+                ON chat_messages(session_id, turn_id, role)
+                WHERE turn_id IS NOT NULL
+                """
+            )
         conn.commit()
     finally:
         conn.close()

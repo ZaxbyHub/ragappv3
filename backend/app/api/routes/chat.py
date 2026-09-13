@@ -171,6 +171,14 @@ class ChatStreamRequest(BaseModel):
     # same server-side retrieval restriction as ChatRequest.document_ids,
     # including the 100-id cap.
     document_ids: Optional[List[int]] = Field(default=None, max_length=100)
+    # Durable server-side turn write (issue #553). turn_id is the client's
+    # idempotency key for the turn (≤64 chars, same bound as
+    # AddMessageRequest.turn_id) and session_id names the chat session the
+    # turn belongs to. Both optional: absent fields mean the client did not
+    # opt into server-side durability and the stream writes nothing (exactly
+    # the pre-#553 behavior).
+    session_id: Optional[int] = None
+    turn_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class CreateSessionRequest(BaseModel):
@@ -350,6 +358,248 @@ def _evidence_sse_line(candidates: List[Dict[str, Any]]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Durable server-side turn writes (issue #553)
+# ---------------------------------------------------------------------------
+
+# Terminal assistant statuses the stream itself can choose. "pending" is the
+# pre-write status of the user row; "partial" stays reserved (issue #507
+# release note) — no writer in this PR emits it.
+_TURN_STATUS_COMPLETE = "complete"
+_TURN_STATUS_INTERRUPTED = "interrupted"
+_TURN_STATUS_FAILED = "failed"
+
+
+def _prewrite_user_turn(
+    db_pool, session_id: int, turn_id: str, content: str
+) -> Dict[str, Any]:
+    """Insert the durable user row for a turn BEFORE generation starts.
+
+    Same INSERT + side-write shape as ``add_message``: plain INSERT, then
+    ``seq = MAX(seq)+1`` / ``turn_id`` / ``status='pending'`` in the
+    connection's implicit transaction, committed here. Pure-sync; callers run
+    it via ``asyncio.to_thread``. Never raises — every failure maps to
+    ``ok=False`` so the stream continues with server-side writes disabled.
+
+    A duplicate (session, turn_id, role='user') — a double-delivered stream
+    POST for the same turn — is NOT an error: the durable turn already exists,
+    so the stream continues with server-side writes enabled and the finalize
+    upserts onto the existing rows.
+    """
+    result: Dict[str, Any] = {
+        "ok": False,
+        "duplicate": False,
+        "is_first_user_row": False,
+        "title_is_null": True,
+    }
+    try:
+        with db_pool.connection() as conn:
+            session_row = conn.execute(
+                "SELECT title FROM chat_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if session_row is None:
+                logger.warning(
+                    "durable turn pre-write: session %s not found", session_id
+                )
+                return result
+            result["title_is_null"] = session_row[0] is None
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO chat_messages (session_id, role, content, created_at) "
+                    "VALUES (?, 'user', ?, CURRENT_TIMESTAMP)",
+                    (session_id, content),
+                )
+                new_id = cursor.lastrowid
+                conn.execute(
+                    "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 "
+                    "FROM chat_messages WHERE session_id = ?), "
+                    "turn_id = ?, status = 'pending' WHERE id = ?",
+                    (session_id, turn_id, new_id),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                # Double delivery of the same stream POST: the user row for
+                # this turn already exists. Durability is already guaranteed;
+                # clear the failed statement and keep server-side writes on.
+                if conn.in_transaction:
+                    conn.rollback()
+                result["duplicate"] = True
+                logger.info(
+                    "durable turn pre-write: turn %s already exists in session %s; "
+                    "continuing on the existing row",
+                    turn_id,
+                    session_id,
+                )
+            user_count = conn.execute(
+                "SELECT COUNT(*) FROM chat_messages "
+                "WHERE session_id = ? AND role = 'user'",
+                (session_id,),
+            ).fetchone()[0]
+            result["ok"] = True
+            result["is_first_user_row"] = user_count == 1
+            return result
+    except Exception as exc:  # noqa: BLE001 — durability must never fail the stream
+        logger.warning(
+            "durable turn pre-write failed (session %s turn %s): %s",
+            session_id,
+            turn_id,
+            exc,
+        )
+        return result
+
+
+def _upsert_assistant_turn(conn, payload: Dict[str, Any]) -> None:
+    """Upsert the assistant row for a durable turn (issue #553).
+
+    Keyed on ``(session_id, turn_id, role='assistant')``: UPDATE in place when
+    a row exists (seq preserved), else INSERT + assign the next per-session
+    seq. A concurrent writer that wins the race makes our INSERT's turn-id
+    assignment raise IntegrityError (unique index
+    ``idx_chat_messages_session_turn_role``); we then adopt the existing row.
+    The caller owns ``commit()`` — it MUST be called from the same thread
+    before the finalized flag is set (issue-tracer plan, critic R2).
+    Pure-sync so it can run in a ``to_thread`` worker or inline inside a
+    cancellation-safe ``finally``.
+    """
+    session_id = payload["session_id"]
+    turn_id = payload["turn_id"]
+    status = payload["status"]
+    content = sanitize_chat_messages_content(payload["content"])
+    sources_json = json.dumps(payload["sources"]) if payload.get("sources") else None
+    memories_json = (
+        json.dumps(payload["memories"]) if payload.get("memories") else None
+    )
+    wiki_refs_json = (
+        json.dumps(payload["wiki_refs"]) if payload.get("wiki_refs") else None
+    )
+    kms_refs_json = (
+        json.dumps(payload["kms_refs"]) if payload.get("kms_refs") else None
+    )
+    citation_json = (
+        json.dumps(payload["citation_confidence"])
+        if payload.get("citation_confidence")
+        else None
+    )
+    claims_json = (
+        json.dumps(payload["unverifiable_claims"])
+        if payload.get("unverifiable_claims")
+        else None
+    )
+    currency_json = (
+        json.dumps(payload["currency_warnings"])
+        if payload.get("currency_warnings")
+        else None
+    )
+    enforcement_json = (
+        json.dumps(payload["citation_enforcement"])
+        if payload.get("citation_enforcement")
+        else None
+    )
+    mode = payload.get("mode")
+
+    existing = conn.execute(
+        "SELECT id FROM chat_messages "
+        "WHERE session_id = ? AND turn_id = ? AND role = 'assistant'",
+        (session_id, turn_id),
+    ).fetchone()
+
+    if existing is not None:
+        conn.execute(
+            "UPDATE chat_messages SET content = ?, sources = ?, memories = ?, "
+            "wiki_refs = ?, kms_refs = ?, mode = ?, status = ?, "
+            "citation_confidence = ?, unverifiable_claims = ?, "
+            "currency_warnings = ?, citation_enforcement = ? WHERE id = ?",
+            (
+                content, sources_json, memories_json, wiki_refs_json,
+                kms_refs_json, mode, status, citation_json, claims_json,
+                currency_json, enforcement_json, existing[0],
+            ),
+        )
+        return
+
+    try:
+        cursor = conn.execute(
+            "INSERT INTO chat_messages "
+            "(session_id, role, content, sources, memories, wiki_refs, created_at) "
+            "VALUES (?, 'assistant', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (session_id, content, sources_json, memories_json, wiki_refs_json),
+        )
+        new_id = cursor.lastrowid
+        conn.execute(
+            "UPDATE chat_messages SET seq = (SELECT COALESCE(MAX(seq), 0) + 1 "
+            "FROM chat_messages WHERE session_id = ?), "
+            "turn_id = ?, status = ?, mode = ?, kms_refs = ?, "
+            "citation_confidence = ?, unverifiable_claims = ?, "
+            "currency_warnings = ?, citation_enforcement = ? WHERE id = ?",
+            (
+                session_id, turn_id, status, mode, kms_refs_json,
+                citation_json, claims_json, currency_json, enforcement_json,
+                new_id,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        # A concurrent finalize won the race (e.g. the eager path racing the
+        # disconnect backstop). Adopt the surviving row: clear the failed
+        # statement, re-SELECT, and update it in place.
+        if conn.in_transaction:
+            conn.rollback()
+        existing = conn.execute(
+            "SELECT id FROM chat_messages "
+            "WHERE session_id = ? AND turn_id = ? AND role = 'assistant'",
+            (session_id, turn_id),
+        ).fetchone()
+        if existing is None:
+            raise
+        conn.execute(
+            "UPDATE chat_messages SET content = ?, sources = ?, memories = ?, "
+            "wiki_refs = ?, kms_refs = ?, mode = ?, status = ?, "
+            "citation_confidence = ?, unverifiable_claims = ?, "
+            "currency_warnings = ?, citation_enforcement = ? WHERE id = ?",
+            (
+                content, sources_json, memories_json, wiki_refs_json,
+                kms_refs_json, mode, status, citation_json, claims_json,
+                currency_json, enforcement_json, existing[0],
+            ),
+        )
+
+
+def _finalize_durable_turn_sync(db_pool, turn_state: Dict[str, Any], status: str) -> bool:
+    """Cancellation-safe finalize: pure-sync DB work, no ``await``.
+
+    Used both by the eager post-completion path (wrapped in ``to_thread``)
+    and directly by the disconnect backstop ``finally``, which runs during
+    CancelledError/GeneratorExit unwinding where an ``await`` would re-raise.
+    Returns True when the assistant row was durably finalized (or correctly
+    skipped); False only when a non-empty-content row existed but the write
+    failed — in every case the stream itself is unaffected.
+    """
+    try:
+        content = turn_state["payload"].get("content") or "".join(
+            turn_state["collected_content"]
+        )
+        if not content.strip():
+            # LIVE-01 parity: never persist an empty assistant row. The user
+            # row (written pending at pre-write) is the durable record.
+            turn_state["finalized"] = True
+            return True
+        payload = dict(turn_state["payload"])
+        payload["status"] = status
+        payload["content"] = content
+        with db_pool.connection() as conn:
+            _upsert_assistant_turn(conn, payload)
+            conn.commit()
+        turn_state["finalized"] = True
+        return True
+    except Exception as exc:  # noqa: BLE001 — durability must never fail the stream
+        logger.warning(
+            "durable turn finalize failed (session %s turn %s): %s",
+            turn_state["payload"].get("session_id"),
+            turn_state["payload"].get("turn_id"),
+            exc,
+        )
+        return False
+
+
 def stream_chat_response(
     message: str,
     history: List[Dict[str, Any]],
@@ -366,6 +616,9 @@ def stream_chat_response(
     can_write_memory: bool = False,
     vision_context: Optional[VisionRunContext] = None,
     document_ids: Optional[List[int]] = None,
+    durable_session_id: Optional[int] = None,
+    durable_turn_id: Optional[str] = None,
+    db_pool: Optional[object] = None,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
@@ -373,6 +626,13 @@ def stream_chat_response(
     Yields SSE events with JSON data chunks from the RAG engine.
     Each event is formatted as: data: {json}\n\n
     Ends with a done event containing sources and memories_used.
+
+    Issue #553 durable turns: when ``durable_session_id``/``durable_turn_id``
+    and a ``db_pool`` are supplied, the user row is pre-written with
+    ``status='pending'`` before any token streams, and the assistant row is
+    finalized at stream end (complete / interrupted / failed) keyed on the
+    client's ``turn_id`` — so a proxy drop, tab close, or crash never loses
+    the question or the partial answer from server history.
     """
     if rag_engine is None:
 
@@ -385,10 +645,42 @@ def stream_chat_response(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
+    # Shared mutable state between the outer and inner generators. The inner
+    # generator appends to ``collected_content`` in place and refreshes the
+    # payload fields at the done chunk; the outer generator's finally reads
+    # them to finalize the durable assistant row (issue #553).
+    turn_state: Dict[str, Any] = {
+        "finalized": False,
+        "prewrite_ok": False,
+        # Assistant terminal status chosen by the inner generator's terminal
+        # branches; None until then (the backstop maps None -> interrupted).
+        "status": None,
+        "collected_content": [],
+        "payload": {
+            "session_id": durable_session_id,
+            "turn_id": durable_turn_id,
+            "content": "",
+            "mode": None,
+            "sources": None,
+            "memories": None,
+            "wiki_refs": None,
+            "kms_refs": None,
+            "citation_confidence": None,
+            "unverifiable_claims": None,
+            "currency_warnings": None,
+            "citation_enforcement": None,
+        },
+    }
+    durable_active = (
+        durable_session_id is not None
+        and bool(durable_turn_id)
+        and db_pool is not None
+    )
+
     async def _event_generator_inner():
         _turn_started = time.perf_counter()
         _first_content_recorded = False
-        collected_content = []
+        collected_content = turn_state["collected_content"]
         sources = []
         memories_used = []
         wiki_used: List[Dict[str, Any]] = []
@@ -423,6 +715,7 @@ def stream_chat_response(
                 _mode_exc,
             )
             resolved_mode = ChatMode.THINKING
+        turn_state["payload"]["mode"] = resolved_mode.value
         yield f"data: {json.dumps({'type': 'mode', 'mode': resolved_mode.value})}\n\n"
 
         try:
@@ -473,8 +766,9 @@ def stream_chat_response(
                         yield f"data: {json.dumps({'type': 'content', 'content': content})}\n\n"
                     elif chunk_type == "error":
                         logger.warning("Streaming error chunk received from RAG engine: %s", chunk.get('message', 'unknown'))
+                        turn_state["status"] = _TURN_STATUS_FAILED
                         yield f"data: {json.dumps({'type': 'error', 'message': 'Chat stream failed', 'code': chunk.get('code', 'UNKNOWN_ERROR')})}\n\n"
-                        yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
                         return
                     elif chunk_type == "fallback":
                         content = chunk.get("content", "")
@@ -504,6 +798,18 @@ def stream_chat_response(
                         citation_enforcement = chunk.get("citation_enforcement")
                         answer_contract = chunk.get("answer_contract")
                         llm_metrics = chunk.get("llm_metrics")
+                        # Issue #553 durable turn: capture the done payload's
+                        # persistence-relevant fields for the finalize upsert.
+                        turn_state["payload"].update({
+                            "sources": sources,
+                            "memories": memories_used,
+                            "wiki_refs": wiki_used,
+                            "kms_refs": kms_used,
+                            "citation_confidence": citation_confidence,
+                            "unverifiable_claims": unverifiable_claims,
+                            "currency_warnings": currency_warnings,
+                            "citation_enforcement": citation_enforcement,
+                        })
             finally:
                 # Client disconnect or terminal return: drop the pending
                 # __anext__ so the provider generator is not left running.
@@ -513,17 +819,19 @@ def stream_chat_response(
             logger.warning(
                 "RAG engine error in stream_chat_response: %s", exc
             )
+            turn_state["status"] = _TURN_STATUS_FAILED
             error_msg = "Chat processing failed"
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'CHAT_PROCESSING_FAILED'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
             return
         except SearchSemaphoreTimeoutError as exc:
             logger.warning(
                 "Search semaphore timeout in stream_chat_response: %s", exc
             )
+            turn_state["status"] = _TURN_STATUS_FAILED
             error_msg = "Search temporarily unavailable"
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'SEARCH_UNAVAILABLE'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
             return
         except Exception as e:
             logger.exception(
@@ -538,12 +846,13 @@ def stream_chat_response(
                 str(e),
             )
             # Send safe generic message to client; full details already logged above
+            turn_state["status"] = _TURN_STATUS_FAILED
             error_msg = "An error occurred during chat processing"
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'INTERNAL_ERROR'})}\n\n"
             # ENH-016: every terminal path must emit the protocol completion
             # marker, or clients treating transport close as protocol EOF will
             # classify the failure as a stalled/interrupted stream.
-            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
             return
 
         # Citation validation pass: parse the assembled assistant content and
@@ -577,6 +886,13 @@ def stream_chat_response(
         # Yield final done event with sources, memories, wiki, and score_type.
         # SC-015: include prompt_version identifier in response
         # SC-017: include ab_experiment_id and ab_variant for outcome comparison
+        # Issue #553 durable turn: the stream completed normally; the persisted
+        # content is the citation-repaired text when repairs applied (same
+        # canonical content the client is handed below).
+        turn_state["status"] = _TURN_STATUS_COMPLETE
+        turn_state["payload"]["content"] = (
+            repaired_content if repaired_content is not None else full_content
+        )
         done_payload: Dict[str, Any] = {
             "type": "done",
             "turn_id": current_turn_id(),
@@ -632,8 +948,15 @@ def stream_chat_response(
     async def event_generator():
         # E3 telemetry (issue #518): bind the per-turn correlation id (the
         # inbound request id when the logging middleware stamped one), record
-        # the turn, and measure the admission queue wait.
-        turn_id = request_id_var.get() or f"turn-{uuid.uuid4().hex}"
+        # the turn, and measure the admission queue wait. Issue #553: when the
+        # client supplied a durable turn_id, THAT id wins — telemetry, the SSE
+        # done payload's turn_id echo, and the durable chat rows then all
+        # share the client's own key.
+        turn_id = (
+            durable_turn_id
+            if durable_turn_id
+            else (request_id_var.get() or f"turn-{uuid.uuid4().hex}")
+        )
         set_current_turn(turn_id)
         get_telemetry().record_chat_turn(turn_id)
         _queue_wait_started = time.monotonic()
@@ -650,7 +973,7 @@ def stream_chat_response(
             except AdmissionRejected as exc:
                 logger.warning("Chat stream admission rejected: %s", exc)
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Chat capacity is saturated; retry shortly', 'code': 'ADMISSION_REJECTED'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance', 'turn_id': current_turn_id()})}\n\n"
                 return
             # Mark this request as already chat-gated so the engine's
             # generation-phase gate skips its own acquire (no same-key
@@ -660,8 +983,92 @@ def stream_chat_response(
             get_telemetry().record_queue_wait(
                 "chat", time.monotonic() - _queue_wait_started
             )
-            async for event in _event_generator_inner():
-                yield event
+
+            if durable_active:
+                # Issue #553: write the durable user row (status 'pending')
+                # BEFORE the first token streams. A saturated/rejected request
+                # never reaches here, so a turn that never started writes
+                # nothing. Failure (or a missing session) disables server-side
+                # writes for this stream — the stream itself must never fail
+                # because durability bookkeeping failed.
+                prewrite = await asyncio.to_thread(
+                    _prewrite_user_turn,
+                    db_pool,
+                    durable_session_id,
+                    durable_turn_id,
+                    message,
+                )
+                turn_state["prewrite_ok"] = prewrite["ok"]
+                # Auto-title ownership (issue #553): the pre-write is now the
+                # writer of a session's first user message, so it owns the
+                # first-turn auto-name trigger that add_messages_batch's
+                # COUNT-based check can no longer see. Same fire-and-forget
+                # semantics and fallback as the batch endpoint.
+                if (
+                    prewrite["ok"]
+                    and prewrite["title_is_null"]
+                    and prewrite["is_first_user_row"]
+                ):
+                    llm_client = getattr(rag_engine, "llm_client", None)
+                    if llm_client is not None:
+                        title_task = asyncio.create_task(
+                            _auto_name_session(
+                                durable_session_id, message, llm_client
+                            )
+                        )
+                        _background_tasks.add(title_task)
+                        title_task.add_done_callback(_background_tasks.discard)
+                    else:
+                        try:
+                            with db_pool.connection() as conn:
+                                conn.execute(
+                                    "UPDATE chat_sessions SET title = 'New conversation', "
+                                    "updated_at = CURRENT_TIMESTAMP "
+                                    "WHERE id = ? AND title IS NULL",
+                                    (durable_session_id,),
+                                )
+                                conn.commit()
+                        except Exception as title_exc:  # noqa: BLE001
+                            logger.warning(
+                                "auto-title fallback failed (session %s): %s",
+                                durable_session_id,
+                                title_exc,
+                            )
+
+            try:
+                async for event in _event_generator_inner():
+                    yield event
+                # Normal termination (complete, or failed-with-done-payload):
+                # finalize the durable assistant row eagerly in a worker
+                # thread while the connection is still healthy. Commit
+                # happens inside the helper, inside the thread; only a
+                # successful return sets the finalized flag.
+                if durable_active and turn_state["prewrite_ok"]:
+                    await asyncio.to_thread(
+                        _finalize_durable_turn_sync,
+                        db_pool,
+                        turn_state,
+                        turn_state["status"] or _TURN_STATUS_INTERRUPTED,
+                    )
+            finally:
+                # Disconnect backstop (issue #553): proxy drop, tab close, or
+                # Stop cancels the response task and lands here during
+                # CancelledError/GeneratorExit unwinding, where an await would
+                # re-raise — so the finalize is pure-sync (pool checkout +
+                # execute + commit, no await). Gated on a successful pre-write:
+                # with no durable user row, an assistant row would orphan the
+                # answer from its question, and the client batch remains the
+                # writer of record for that turn.
+                if (
+                    durable_active
+                    and turn_state["prewrite_ok"]
+                    and not turn_state["finalized"]
+                ):
+                    _finalize_durable_turn_sync(
+                        db_pool,
+                        turn_state,
+                        turn_state["status"] or _TURN_STATUS_INTERRUPTED,
+                    )
 
     return StreamingResponse(
         event_generator(),
@@ -997,6 +1404,24 @@ async def get_stream_auth(
                     detail="Searching all vaults requires admin access. Please select a specific vault.",
                 )
             can_write_memory = True
+        # Issue #553: when the client opts into server-side turn durability it
+        # names the session the turn belongs to. That session is the same
+        # durable resource add_messages_batch writes to, so apply the same
+        # checks here (404 unknown session, 403 without vault WRITE) — inside
+        # this short-lived connection block, before the stream starts.
+        if body.session_id is not None:
+            durable_session_row = conn.execute(
+                "SELECT id, vault_id FROM chat_sessions WHERE id = ?",
+                (body.session_id,),
+            ).fetchone()
+            if durable_session_row is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if not await _evaluate_policy(
+                conn, user, "vault", durable_session_row[1], "write"
+            ):
+                raise HTTPException(
+                    status_code=403, detail="No write access to this vault"
+                )
         # Stash the role-derived flags on the user dict so chat_stream can
         # thread them into the RAG engine without re-opening a connection.
         user["_include_global_memories"] = is_admin
@@ -1055,6 +1480,13 @@ async def chat_stream(
         can_write_memory=can_write_memory,
         vision_context=vision_context,
         document_ids=body.document_ids,
+        # Issue #553: server-side durable turn write. The request-scoped pool
+        # handle (not get_pool) preserves the S-003 no-double-connection
+        # invariant on the request path; the generator takes only short-lived
+        # checkouts from it (get_stream_auth precedent).
+        durable_session_id=body.session_id,
+        durable_turn_id=body.turn_id,
+        db_pool=getattr(request.app.state, "db_pool", None),
     )
 
 
@@ -2184,12 +2616,6 @@ async def add_messages_batch(
 
     # Validate and prepare every row BEFORE touching the database so a bad row
     # cannot leave a partially applied turn behind.
-    count_result = await asyncio.to_thread(
-        conn.execute, "SELECT COUNT(*) FROM chat_messages WHERE session_id = ?", (session_id,)
-    )
-    message_count_row = await asyncio.to_thread(count_result.fetchone)
-    is_first_message = message_count_row[0] == 0
-
     prepared = []
     for item in body.messages:
         if not item.content:
@@ -2217,29 +2643,56 @@ async def add_messages_batch(
             }
         )
 
-    # Auto-title on the turn that carries the first user message — same guard
-    # and fire-and-forget semantics as the single-message endpoint.
-    if is_first_message and session_row[1] is None and prepared[0]["role"] == "user":
-        if rag_engine and rag_engine.llm_client is not None:
-            task = asyncio.create_task(
-                _auto_name_session(session_id, prepared[0]["content"], rag_engine.llm_client)
-            )
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
-        else:
-            await asyncio.to_thread(
-                conn.execute,
-                "UPDATE chat_sessions SET title = 'New conversation', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (session_id,),
-            )
-
     try:
         # Atomicity follows the add_message model: the pool's connections use
         # python sqlite3's implicit transactions, so the first INSERT opens
         # one transaction that the final commit closes; any failure rolls the
         # whole batch back (never a partial turn on disk).
+        #
+        # Issue #553 reconcile: a row carrying a turn_id whose durable row the
+        # server already wrote (stream pre-write / finalize, or a retried
+        # batch) UPDATES that row in place — seq preserved, the EXISTING row
+        # id returned — instead of inserting a duplicate. Rows without a
+        # turn_id (pre-#507 clients) keep the legacy insert path verbatim.
         saved_ids: List[int] = []
         for row in prepared:
+            existing_id: Optional[int] = None
+            if row["turn_id"]:
+                existing_result = await asyncio.to_thread(
+                    conn.execute,
+                    "SELECT id FROM chat_messages "
+                    "WHERE session_id = ? AND turn_id = ? AND role = ?",
+                    (session_id, row["turn_id"], row["role"]),
+                )
+                existing_row = await asyncio.to_thread(existing_result.fetchone)
+                if existing_row is not None:
+                    existing_id = existing_row[0]
+            if existing_id is not None:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "UPDATE chat_messages SET content = ?, sources = ?, memories = ?, "
+                    "wiki_refs = ?, status = ?, citation_confidence = ?, "
+                    "unverifiable_claims = ?, currency_warnings = ?, "
+                    "citation_enforcement = ?, mode = ?, kms_refs = ? WHERE id = ?",
+                    (
+                        row["content"],
+                        row["sources_json"],
+                        row["memories_json"],
+                        row["wiki_refs_json"],
+                        row["status"],
+                        row["citation_json"],
+                        row["claims_json"],
+                        row["currency_json"],
+                        row["enforcement_json"],
+                        row["mode"],
+                        row["kms_refs_json"],
+                        existing_id,
+                    ),
+                )
+                # The reconciled row keeps its durable id (never lastrowid) so
+                # the response below returns the row the client must adopt.
+                saved_ids.append(existing_id)
+                continue
             cursor = await asyncio.to_thread(
                 conn.execute,
                 """
@@ -2287,6 +2740,43 @@ async def add_messages_batch(
     except Exception:
         await asyncio.to_thread(conn.rollback)
         raise
+
+    # Auto-title on the turn that carries the session's first user message
+    # (issue #553 revision): the trigger fires when the session is untitled
+    # and THIS batch holds every user row the session has. That generalizes
+    # the old COUNT(*)==0 check so it still fires after a server pre-write
+    # exists (pre-write-failure recovery, pre-wrote-but-untitled sessions)
+    # while keeping the CHAT-007 role guard (assistant-only batches have no
+    # user rows) and never firing on later turns.
+    user_rows_in_payload = sum(1 for row in prepared if row["role"] == "user")
+    if user_rows_in_payload > 0 and session_row[1] is None:
+        user_count_result = await asyncio.to_thread(
+            conn.execute,
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE session_id = ? AND role = 'user'",
+            (session_id,),
+        )
+        user_count_row = await asyncio.to_thread(user_count_result.fetchone)
+        if user_count_row[0] == user_rows_in_payload:
+            first_user_row = next(
+                row for row in prepared if row["role"] == "user"
+            )
+            if rag_engine and rag_engine.llm_client is not None:
+                task = asyncio.create_task(
+                    _auto_name_session(
+                        session_id, first_user_row["content"], rag_engine.llm_client
+                    )
+                )
+                _background_tasks.add(task)
+                task.add_done_callback(_background_tasks.discard)
+            else:
+                await asyncio.to_thread(
+                    conn.execute,
+                    "UPDATE chat_sessions SET title = 'New conversation', updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND title IS NULL",
+                    (session_id,),
+                )
+                await asyncio.to_thread(conn.commit)
 
     # Return the saved rows in insertion order with their assigned seq values.
     placeholders = ",".join("?" for _ in saved_ids)
