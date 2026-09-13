@@ -20,6 +20,7 @@ classifier keys on that substring and would disable the HTTP bypass this
 suite relies on (see tests/conftest.py).
 """
 import asyncio
+import json
 import os
 import shutil
 import sqlite3
@@ -83,9 +84,22 @@ from app.api.routes.chat import get_stream_auth  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models.database import get_pool, init_db, run_migrations  # noqa: E402
 
-# Small settle window so a disconnect-side finalize is observably durable
-# before assertions read the database.
-SETTLE_SECONDS = 0.25
+# Row-arrival assertions poll via _wait_for; the writes they wait on are
+# ordered before the generator returns (awaited to_thread on completion;
+# pure-sync disconnect finally), so polling is belt-and-braces against CI
+# load, not a correctness dependency (PR review PRR-014).
+
+
+def _wait_for(predicate, timeout=5.0, interval=0.02):
+    """Poll predicate until truthy or the timeout expires (PR review
+    PRR-014: fixed sleeps are load-sensitive; polling is not)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 def _is_content_event(text: str) -> bool:
@@ -259,7 +273,9 @@ async def test_prewrite_lands_before_first_token_and_disconnect_keeps_it(env):
     turn_id = "pretoken-turn-1"
     response = env.make_stream(turn_id)
     await _consume_until(response, lambda text: '"mode"' in text)
-    await asyncio.sleep(SETTLE_SECONDS)
+    assert _wait_for(
+        lambda: len([r for r in env.rows() if r[0] == "user"]) == 1
+    )
 
     rows = env.rows()
     user_rows = [r for r in rows if r[0] == "user"]
@@ -276,7 +292,9 @@ async def test_disconnect_without_client_batch_persists_interrupted_turn(env):
     turn_id = "dod-turn-1"
     response = env.make_stream(turn_id)
     await _consume_until(response, _is_content_event)
-    await asyncio.sleep(SETTLE_SECONDS)
+    assert _wait_for(
+        lambda: len([r for r in env.rows() if r[0] == "assistant"]) == 1
+    )
 
     rows = env.rows()
     user_rows = [r for r in rows if r[0] == "user"]
@@ -307,9 +325,11 @@ async def test_disconnect_without_client_batch_persists_interrupted_turn(env):
 
 def test_completion_persists_complete_assistant_row(env):
     """AC2: a fully consumed stream finalizes the assistant row with status
-    complete and the joined content."""
+    complete and the joined content, and the done payload echoes the
+    client's turn_id (PR review PRR-010)."""
     turn_id = "complete-turn-1"
     saw_done = False
+    done_turn_id = None
     with env.client().stream(
         "POST", "/api/chat/stream", json=env.payload(turn_id)
     ) as response:
@@ -317,8 +337,13 @@ def test_completion_persists_complete_assistant_row(env):
         for line in response.iter_lines():
             if _is_done_event(line):
                 saw_done = True
+                payload = json.loads(line[len("data: "):])
+                done_turn_id = payload.get("turn_id")
     assert saw_done
-    time.sleep(SETTLE_SECONDS)
+    assert done_turn_id == turn_id
+    assert _wait_for(
+        lambda: len([r for r in env.rows() if r[0] == "assistant"]) == 1
+    )
     rows = env.rows()
     user_rows = [r for r in rows if r[0] == "user"]
     assistant_rows = [r for r in rows if r[0] == "assistant"]
@@ -344,7 +369,8 @@ def test_request_without_durable_fields_writes_nothing(env):
             if _is_done_event(line):
                 saw_done = True
     assert saw_done
-    time.sleep(SETTLE_SECONDS)
+    # No durable path exists for this request shape at all (durable_active is
+    # False), so there is no writer to settle — assert immediately.
     assert env.all_rows() == 0
 
 
@@ -359,10 +385,13 @@ def test_prewrite_autotitles_untitled_session(env):
         assert response.status_code == 200
         for _ in response.iter_lines():
             pass
-    title = env.conn.execute(
-        "SELECT title FROM chat_sessions WHERE id = ?", (env.session_id,)
-    ).fetchone()[0]
-    assert title == "New conversation"
+
+    def _titled():
+        return env.conn.execute(
+            "SELECT title FROM chat_sessions WHERE id = ?", (env.session_id,)
+        ).fetchone()[0] == "New conversation"
+
+    assert _wait_for(_titled)
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +423,9 @@ def test_prewrite_failure_disables_server_writes_and_batch_reconciles(env):
                 if _is_done_event(line):
                     saw_done = True
         assert saw_done
-        time.sleep(SETTLE_SECONDS)
+        # The pre-write failure is synchronous inside the request and the
+        # backstop is gated on pre-write success, so there is no writer to
+        # settle — assert immediately.
         # No user row (pre-write failed) and no orphan assistant row.
         assert env.rows() == []
     finally:
@@ -441,7 +472,9 @@ async def test_duplicate_prewrite_is_idempotent_and_finalize_upserts(env):
     response = env.make_stream(turn_id)
     async for _ in response.body_iterator:
         pass
-    await asyncio.sleep(SETTLE_SECONDS)
+    assert _wait_for(
+        lambda: len([r for r in env.rows() if r[0] == "assistant"]) == 1
+    )
     rows = env.rows()
     assert sorted(r[0] for r in rows) == ["assistant", "user"]
 
@@ -468,7 +501,7 @@ async def test_admission_rejection_writes_nothing(env):
                 events.append(text)
     assert any("ADMISSION_REJECTED" in e for e in events)
     assert any(_is_done_event(e) for e in events)
-    await asyncio.sleep(SETTLE_SECONDS)
+    # Rejection happens before the pre-write, so no writer exists to settle.
     assert env.all_rows() == 0
 
 
@@ -560,3 +593,59 @@ async def test_stream_auth_rejects_unknown_session_and_readonly_vault(env):
             )
             user = await get_stream_auth(request, body)
             assert user["_can_write_memory"] is True
+
+
+def test_turn_id_over_64_chars_is_rejected(env):
+    """PR review PRR-011: the stream request enforces the same ≤64-char
+    turn_id bound as the batch endpoint (422, not a silent accept)."""
+    resp = env.client().post(
+        "/api/chat/stream",
+        json=_payload_with_turn("t" * 65, env.session_id),
+    )
+    assert resp.status_code == 422
+
+
+def _payload_with_turn(turn_id, session_id):
+    return {
+        "messages": [{"role": "user", "content": "What is the plan?"}],
+        "vault_id": 1,
+        "session_id": session_id,
+        "turn_id": turn_id,
+    }
+
+
+async def test_stream_auth_rejects_write_to_inaccessible_vault_session(env):
+    """PR review PRR-012: a session living in a vault the caller cannot
+    write is 403, even though its id is valid — the vault_id comes from the
+    session row, not the request body."""
+    env.conn.execute(
+        "INSERT INTO vaults (id, name) VALUES (99, 'other-vault')"
+    )
+    env.conn.commit()
+    other_session = env.conn.execute(
+        "INSERT INTO chat_sessions (vault_id, user_id, title) "
+        "VALUES (99, 1, NULL)"
+    ).lastrowid
+    env.conn.commit()
+
+    request = MagicMock()
+    request.app = app
+
+    async def _fake_user(conn, req, header, cookie):
+        return {"id": 1, "role": "member"}
+
+    async def _deny_vault_99(conn, user, kind, vault_id, action):
+        return vault_id != 99
+
+    with patch.object(chat_routes, "_resolve_active_user", _fake_user), patch.object(
+        chat_routes, "_evaluate_policy", _deny_vault_99
+    ):
+        body = chat_routes.ChatStreamRequest(
+            messages=[{"role": "user", "content": "q"}],
+            vault_id=1,
+            session_id=other_session,
+            turn_id="t",
+        )
+        with pytest.raises(Exception) as excinfo:
+            await get_stream_auth(request, body)
+        assert getattr(excinfo.value, "status_code", None) == 403

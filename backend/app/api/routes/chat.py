@@ -768,7 +768,7 @@ def stream_chat_response(
                         logger.warning("Streaming error chunk received from RAG engine: %s", chunk.get('message', 'unknown'))
                         turn_state["status"] = _TURN_STATUS_FAILED
                         yield f"data: {json.dumps({'type': 'error', 'message': 'Chat stream failed', 'code': chunk.get('code', 'UNKNOWN_ERROR')})}\n\n"
-                        yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
                         return
                     elif chunk_type == "fallback":
                         content = chunk.get("content", "")
@@ -822,7 +822,7 @@ def stream_chat_response(
             turn_state["status"] = _TURN_STATUS_FAILED
             error_msg = "Chat processing failed"
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'CHAT_PROCESSING_FAILED'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
             return
         except SearchSemaphoreTimeoutError as exc:
             logger.warning(
@@ -831,7 +831,7 @@ def stream_chat_response(
             turn_state["status"] = _TURN_STATUS_FAILED
             error_msg = "Search temporarily unavailable"
             yield f"data: {json.dumps({'type': 'error', 'message': error_msg, 'code': 'SEARCH_UNAVAILABLE'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
             return
         except Exception as e:
             logger.exception(
@@ -852,7 +852,7 @@ def stream_chat_response(
             # ENH-016: every terminal path must emit the protocol completion
             # marker, or clients treating transport close as protocol EOF will
             # classify the failure as a stalled/interrupted stream.
-            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': score_type, 'turn_id': current_turn_id()})}\n\n"
             return
 
         # Citation validation pass: parse the assembled assistant content and
@@ -973,7 +973,7 @@ def stream_chat_response(
             except AdmissionRejected as exc:
                 logger.warning("Chat stream admission rejected: %s", exc)
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Chat capacity is saturated; retry shortly', 'code': 'ADMISSION_REJECTED'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance', 'turn_id': current_turn_id()})}\n\n"
                 return
             # Mark this request as already chat-gated so the engine's
             # generation-phase gate skips its own acquire (no same-key
@@ -1023,7 +1023,8 @@ def stream_chat_response(
                             with db_pool.connection() as conn:
                                 conn.execute(
                                     "UPDATE chat_sessions SET title = 'New conversation', "
-                                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                    "updated_at = CURRENT_TIMESTAMP "
+                                    "WHERE id = ? AND title IS NULL",
                                     (durable_session_id,),
                                 )
                                 conn.commit()
@@ -2771,7 +2772,8 @@ async def add_messages_batch(
             else:
                 await asyncio.to_thread(
                     conn.execute,
-                    "UPDATE chat_sessions SET title = 'New conversation', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    "UPDATE chat_sessions SET title = 'New conversation', updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND title IS NULL",
                     (session_id,),
                 )
                 await asyncio.to_thread(conn.commit)

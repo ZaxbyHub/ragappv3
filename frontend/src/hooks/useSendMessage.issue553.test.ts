@@ -118,6 +118,16 @@ describe("useSendMessage issue #553 server-side durable turn wiring", () => {
         expect.objectContaining({ turn_id: durableArg.turnId }),
       ]),
     );
+    // The local temp ids are replaced by the server's durable ids
+    // (migrateId/replaceMessageId) once the reconcile resolves — every row
+    // in the store carries the mock backend's returned id shape and the
+    // saved saveState (PR review PRR-018).
+    const savedIds = store.messageIds;
+    expect(savedIds).toHaveLength(2);
+    for (const id of savedIds) {
+      expect(store.messagesById[id]?.saveState).toBe("saved");
+      expect(store.messagesById[id]?.created_at).toBeTruthy();
+    }
   });
 
   it("creates a session first and opts the new session's first turn in", async () => {

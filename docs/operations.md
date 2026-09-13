@@ -160,7 +160,10 @@ roles, not capacity claims.
   from each replica's own telemetry instance, not the shared `/metrics`
   sum.
 - Correlation: every chat turn carries a `turn_id` (the inbound
-  `X-Request-ID` when present) on the SSE done event; outbound provider
+  `X-Request-ID` when present, or the client-generated `turn_id` from the
+  `POST /chat/stream` body when the client opts into server-side durable
+  turns — issue #553) on the SSE done event, including error terminal
+  paths; outbound provider
   calls carry W3C `traceparent` + the same `X-Request-ID`. Log lines carry
   the request id via the RequestIdFilter registered in the logging setup
   (app/lifespan.py).
