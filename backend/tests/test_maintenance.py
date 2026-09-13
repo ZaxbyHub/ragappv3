@@ -305,6 +305,37 @@ class TestMaintenanceMiddlewareDispatch(unittest.TestCase):
         self.assertEqual(upload.json()["error"], "maintenance")
         self.assertEqual(upload.headers.get("Retry-After"), "300")
 
+    def test_fail_open_when_pool_exhausted_on_mutating_request(self):
+        """PR #593 review F-003: the documented fail-open path for pool
+        exhaustion (RuntimeError from get_connection, not sqlite3.Error) —
+        the middleware must warn and allow, not propagate."""
+        import logging
+
+        held = [self.pool.get_connection() for _ in range(2)]
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        capture = Capture(level=logging.WARNING)
+        root = logging.getLogger()
+        root.addHandler(capture)
+        try:
+            resp = self.client.post("/api/documents/upload")
+        finally:
+            root.removeHandler(capture)
+            for conn in held:
+                self.pool.release_connection(conn)
+        self.assertEqual(resp.status_code, 200)
+        maintenance_warnings = [
+            r for r in records if "maintenance" in (r.name or "").lower()
+        ]
+        self.assertTrue(
+            maintenance_warnings,
+            "expected a maintenance-logger WARNING on pool-exhaustion fail-open",
+        )
+
     def test_fail_open_warns_when_flag_row_is_missing(self):
         import logging
 
@@ -520,6 +551,94 @@ class TestBackgroundProcessorEnqueueMaintenance(unittest.TestCase):
             calls["n"],
             0,
             "enqueue must serve the flag from the cache, not a pooled checkout",
+        )
+
+
+
+class TestFlagCacheRaceRegression(unittest.TestCase):
+    """PR #593 review F-001: a cache-miss read whose SELECT started before a
+    concurrent set_flag commit must NOT write the stale value back over the
+    invalidation (generation guard). Deterministic interleave via a
+    once-only release hook, mirroring the confirmed reproduction probe."""
+
+    def setUp(self):
+        self.temp_fd, self.temp_db_path = tempfile.mkstemp(suffix='.db')
+        os.close(self.temp_fd)
+        init_db(self.temp_db_path)
+        self.pool = SQLiteConnectionPool(self.temp_db_path, max_size=2)
+        self.service = MaintenanceService(self.pool, flag_cache_ttl_seconds=60.0)
+
+    def tearDown(self):
+        self.pool.close_all()
+        if os.path.exists(self.temp_db_path):
+            os.remove(self.temp_db_path)
+
+    def test_stale_read_cannot_repoison_cache_after_toggle(self):
+        import threading
+
+        # Warm + invalidate so the reader is on a cache miss.
+        self.assertFalse(self.service.get_flag_cached().enabled)
+        self.service._invalidate_flag_cache()
+
+        original_release = self.pool.release_connection
+        read_started = threading.Event()
+        release_read = threading.Event()
+        paused_once = []
+
+        def slow_release(conn):
+            # Pause ONLY the reader's first release: its SELECT has read the
+            # old (disabled) value; its write-back has not happened yet.
+            original_release(conn)
+            if not paused_once:
+                paused_once.append(True)
+                read_started.set()
+                release_read.wait(timeout=10)
+
+        self.pool.release_connection = slow_release
+        reader_result = {}
+
+        def reader():
+            reader_result["flag"] = self.service.get_flag_cached()
+
+        reader_t = threading.Thread(target=reader)
+        reader_t.start()
+        self.assertTrue(read_started.wait(timeout=5))
+
+        # Toggle commits + invalidates WHILE the reader's stale value is
+        # in hand (pre-fix, the reader then re-poisons the cache).
+        self.service.set_flag(True, "race regression")
+        release_read.set()
+        reader_t.join(timeout=10)
+
+        self.assertFalse(
+            reader_result["flag"].enabled,
+            "reader's DB SELECT predated the toggle, so it read the old value",
+        )
+        # The generation guard must discard the stale write-back: the very
+        # next cached read sees the toggle.
+        self.assertTrue(self.service.get_flag_cached().enabled)
+
+    def test_get_flag_async_runs_off_the_calling_thread(self):
+        """PR #593 review (fresh-002): pin that get_flag_async dispatches the
+        pooled read to a worker thread, not the caller's thread."""
+        import threading
+
+        seen_threads = []
+        original_get_flag = self.service.get_flag
+
+        def recording_get_flag():
+            seen_threads.append(threading.get_ident())
+            return original_get_flag()
+
+        self.service.get_flag = recording_get_flag
+        import asyncio
+
+        asyncio.run(self.service.get_flag_async())
+        self.assertEqual(len(seen_threads), 1)
+        self.assertNotEqual(
+            seen_threads[0],
+            threading.get_ident(),
+            "get_flag_async must run the pooled read off the calling thread",
         )
 
 
