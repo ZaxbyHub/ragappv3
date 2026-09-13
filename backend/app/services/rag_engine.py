@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import sqlite3
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import (
@@ -69,6 +70,39 @@ except ImportError:  # pragma: no cover — defensive; raised if flag enabled wi
 
 # RRF constant for sub-query fusion (standard value).
 _SUB_QUERY_RRF_K = 60
+
+# Request-local generation state (OBS-002, issue #518).
+#
+# ``RAGEngine`` is a process-wide singleton shared by every concurrent chat
+# request on one event loop, so request-scoped values must NEVER live only on
+# instance attributes: a request that fails before a successful LLM attempt
+# would read the previous request's values (the OBS-002 stale-metrics defect).
+# These contextvars are bound per request at the top of ``query()``; helpers
+# below write BOTH the request-local value (used to build the terminal ``done``
+# payload) and, on success only, the legacy ``self._last_llm_metrics`` mirror
+# kept for backwards compatibility with direct-call consumers (pinned by
+# test_issue_249_runtime_contracts.py).
+_request_llm_metrics: ContextVar[dict] = ContextVar(
+    "_request_llm_metrics", default={}
+)
+_request_distillation_provenance: ContextVar[list] = ContextVar(
+    "_request_distillation_provenance", default=[]
+)
+
+
+def _set_request_llm_metrics(metrics: Dict[str, Any]) -> None:
+    """Replace the request-local generation metrics (success or failure)."""
+    _request_llm_metrics.set(dict(metrics or {}))
+
+
+def _merge_request_llm_failure(metrics: Dict[str, Any]) -> None:
+    """Record a failing attempt's metrics for the current request.
+
+    Used before an error chunk/error raise so the terminal ``done`` payload
+    identifies THIS request's failure instead of a previous success.
+    """
+    _request_llm_metrics.set(dict(metrics or {"status": "error"}))
+
 
 # Sentinel marking "no per-instance override set" for live-settings properties.
 # Used so a value of ``None`` can be an intentional override (e.g. for
@@ -770,6 +804,16 @@ class RAGEngine:
             vault_id,
             stream,
         )
+        # OBS-002 (issue #518): bind request-local generation state so this
+        # request's terminal ``done`` payload can never carry a previous
+        # request's metrics or distillation provenance. The instance
+        # attributes are reset too (legacy mirrors; direct-call consumers
+        # read them) but every response-facing read below uses the
+        # request-local values.
+        _set_request_llm_metrics({})
+        _request_distillation_provenance.set([])
+        self._last_llm_metrics = {}
+        self._last_distillation_provenance = []
         # Per-query controls (issue #510): retrieval_mode / citation_mode are
         # implemented controls now — resolve once into LOCAL variables and
         # thread explicitly through every retrieval call inside this query
@@ -1289,6 +1333,9 @@ class RAGEngine:
                         )
                         _cancel_overlap_tasks()
                         if stream:
+                            _merge_request_llm_failure(
+                                {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                            )
                             yield {
                                 "type": "error",
                                 "message": f"Original query embedding failed: {result}",
@@ -1305,6 +1352,9 @@ class RAGEngine:
                         logger.error("Query embedding failure for original query: %s", result)
                         _cancel_overlap_tasks()
                         if stream:
+                            _merge_request_llm_failure(
+                                {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                            )
                             yield {
                                 "type": "error",
                                 "message": f"Original query embedding failed: {result}",
@@ -1322,6 +1372,9 @@ class RAGEngine:
                     "[query] No query embeddings produced — all embedding attempts failed"
                 )
                 _cancel_overlap_tasks()
+                _merge_request_llm_failure(
+                    {"status": "embedding_error", "error_code": "EMBEDDING_ERROR"}
+                )
                 if stream:
                     yield {"type": "error", "message": error_msg, "code": "EMBEDDING_ERROR"}
                     return
@@ -1662,7 +1715,12 @@ class RAGEngine:
                 )
                 relevant_chunks = distill_result.sources
                 sentence_provenance = distill_result.sentence_provenance
-                self._last_distillation_provenance = sentence_provenance
+                # OBS-002 sibling: request-local only. The legacy
+                # ``self._last_distillation_provenance`` mirror is written on
+                # GENERATION success (see the success paths in
+                # _stream_llm_response/_get_llm_response) so a failed turn
+                # never leaves provenance state behind for the next request.
+                _request_distillation_provenance.set(list(sentence_provenance or []))
                 logger.info(
                     "[query] Context distillation: kept %d sentences with provenance",
                     len(sentence_provenance),
@@ -1988,7 +2046,7 @@ class RAGEngine:
                     "mode": "required",
                     "status": "satisfied",
                 }
-        done_msg["llm_metrics"] = dict(self._last_llm_metrics or {})
+        done_msg["llm_metrics"] = dict(_request_llm_metrics.get() or {})
         # Populate final-source labels on the trace for evaluation tooling.
         trace.final_sources = [
             s.get("source_label", "") for s in done_msg.get("sources", []) if s.get("source_label")
@@ -2034,7 +2092,7 @@ class RAGEngine:
             confidence_result = score_citations(
                 full_response,
                 support_texts,
-                sentence_provenance=self._last_distillation_provenance,
+                sentence_provenance=_request_distillation_provenance.get(),
             )
             trace.citation_confidence = confidence_result.citation_confidence
             trace.unverifiable_claims = list(confidence_result.unverifiable_claims)
@@ -3018,6 +3076,10 @@ class RAGEngine:
                 if candidate is not target:
                     metrics["fallback_from"] = getattr(target, "base_url", None)
                 self._last_llm_metrics = metrics
+                _set_request_llm_metrics(metrics)
+                self._last_distillation_provenance = list(
+                    _request_distillation_provenance.get() or []
+                )
                 if finish_reason_capture is not None:
                     finish_reason_capture["finish_reason"] = metrics.get(
                         "finish_reason"
@@ -3027,6 +3089,10 @@ class RAGEngine:
                 last_error = exc
                 if emitted_content:
                     logger.error("[_stream_llm_response] LLMError after content: %s", exc)
+                    _merge_request_llm_failure(
+                        dict(getattr(candidate, "last_metrics", {}) or {})
+                        or {"status": "error", "error": str(exc), "stream": True}
+                    )
                     yield {"type": "error", "message": str(exc), "code": "LLM_ERROR"}
                     return
                 logger.warning(
@@ -3035,6 +3101,10 @@ class RAGEngine:
                     exc,
                 )
         if last_error is not None:
+            _merge_request_llm_failure(
+                dict(getattr(candidate, "last_metrics", {}) or {})
+                or {"status": "error", "error": str(last_error), "stream": True}
+            )
             yield {"type": "error", "message": str(last_error), "code": "LLM_ERROR"}
 
     async def _get_llm_response(
@@ -3081,6 +3151,10 @@ class RAGEngine:
                         getattr(candidate, "base_url", "<unknown>"),
                     )
                 self._last_llm_metrics = metrics
+                _set_request_llm_metrics(metrics)
+                self._last_distillation_provenance = list(
+                    _request_distillation_provenance.get() or []
+                )
                 if finish_reason_capture is not None:
                     finish_reason_capture["finish_reason"] = metrics.get(
                         "finish_reason"
@@ -3095,6 +3169,10 @@ class RAGEngine:
                     exc,
                 )
         if last_error is not None:
+            _merge_request_llm_failure(
+                dict(getattr(candidate, "last_metrics", {}) or {})
+                or {"status": "error", "error": str(last_error)}
+            )
             raise RAGEngineError(f"LLM chat failed: {last_error}") from last_error
 
     def _fallback_clients(self, primary: LLMClient) -> List[LLMClient]:
