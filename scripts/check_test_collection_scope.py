@@ -20,8 +20,11 @@ pytest files and are invisible to this contract by construction, so no
 frontend allowlist entry is needed; only Python test filenames are policed.
 
 Hidden directories (``.git``, ``.venv*``, ``.agents/issue-traces``, ...),
-``node_modules``, and ``__pycache__`` are pruned from the walk: vendored,
-generated, and agent-artifact trees are not pytest collection surfaces.
+``node_modules``, ``__pycache__``, and the non-hidden virtualenv names
+``venv``/``env``/``ENV`` (INSTALLATION.md's ``python -m venv venv`` is
+non-hidden and ships hundreds of packaged test files inside site-packages)
+are pruned from the walk: vendored, generated, virtualenv, and
+agent-artifact trees are not pytest collection surfaces.
 
 Exit codes: 0 = clean, 1 = violations found (each offender printed).
 Run from the repository root.
@@ -30,7 +33,7 @@ Run from the repository root.
 import sys
 from pathlib import Path
 
-PRUNE_DIRS = {"__pycache__", "node_modules"}
+PRUNE_DIRS = {"__pycache__", "node_modules", "venv", "env", "ENV"}
 TEST_FILE_SUFFIXES = (".py",)
 
 
