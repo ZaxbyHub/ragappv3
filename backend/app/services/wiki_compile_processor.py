@@ -36,6 +36,8 @@ class WikiCompileProcessor:
         self._pool = pool
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._generation = 0
+        self._startup_reset_task: Optional[asyncio.Task] = None
         # Strong references to detached background tasks (e.g. delayed
         # auto-retry resets) so CPython does not garbage-collect them
         # mid-flight (issue #276 E2-3). Tasks remove themselves on completion
@@ -45,21 +47,56 @@ class WikiCompileProcessor:
     async def start(self) -> None:
         if self._running:
             return
+        self._generation += 1
+        generation = self._generation
         self._running = True
-        await asyncio.to_thread(self._reset_orphans)
-        self._task = asyncio.create_task(self._poll_loop())
+        try:
+            reset_task = self._startup_reset_task
+            if reset_task is None or reset_task.done():
+                reset_coro = asyncio.to_thread(self._reset_orphans)
+                try:
+                    reset_task = asyncio.create_task(reset_coro)
+                except BaseException:
+                    reset_coro.close()
+                    raise
+                self._startup_reset_task = reset_task
+                reset_task.add_done_callback(self._consume_startup_reset)
+            # A thread-backed reset cannot be cancelled; sharing this task
+            # prevents a cancelled start from overlapping a later retry.
+            await asyncio.shield(reset_task)
+            if generation != self._generation or not self._running:
+                return
+            poll_coro = self._poll_loop()
+            try:
+                self._task = asyncio.create_task(poll_coro)
+            except BaseException:
+                # We own the coroutine until create_task accepts it. Closing
+                # it here avoids a warning when publication itself fails.
+                poll_coro.close()
+                raise
+        except BaseException:
+            # A cancelled or failed orphan reset must not leave a false-running
+            # processor that prevents the next startup attempt from retrying.
+            if generation == self._generation:
+                self._running = False
+                self._task = None
+            raise
         logger.info("WikiCompileProcessor started")
 
     async def stop(self) -> None:
+        self._generation += 1
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
+        task = self._task
+        self._task = None
+        if task and not task.done():
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-        # Cancel any in-flight detached reset tasks so they do not outlive the
-        # processor (issue #276 E2-3).
+        # Cancel any in-flight detached per-job reset tasks so they do not
+        # outlive the processor (issue #276 E2-3). Startup reset ownership is
+        # intentionally retained above so a retry cannot overlap its thread.
         for bg in list(self._bg_tasks):
             bg.cancel()
         for bg in list(self._bg_tasks):
@@ -68,9 +105,32 @@ class WikiCompileProcessor:
             except asyncio.CancelledError:
                 pass
             except Exception:
-                pass
+                logger.debug(
+                    "WikiCompileProcessor: detached task failed during shutdown",
+                    exc_info=True,
+                )
         self._bg_tasks.clear()
         logger.info("WikiCompileProcessor stopped")
+
+    def _consume_startup_reset(self, task: asyncio.Task) -> None:
+        """Observe detached reset failures and clear only the owned task."""
+        try:
+            if not task.cancelled():
+                error = task.exception()
+                if error is not None:
+                    logger.debug(
+                        "WikiCompileProcessor startup reset failed",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+        except asyncio.CancelledError:
+            pass
+        except BaseException:
+            logger.debug(
+                "WikiCompileProcessor startup reset result could not be consumed",
+                exc_info=True,
+            )
+        if getattr(self, "_startup_reset_task", None) is task:
+            self._startup_reset_task = None
 
     # ------------------------------------------------------------------
     # Startup orphan recovery
@@ -222,7 +282,8 @@ class WikiCompileProcessor:
                         job_id, attempt, RESET_RETRY_ATTEMPTS, exc, delay,
                     )
                     await asyncio.sleep(delay)
-        assert last_exc is not None
+        if last_exc is None:
+            raise RuntimeError("WikiCompileProcessor reset retry exhausted without an error")
         raise last_exc
 
     def _spawn_delayed_reset(self, job_id: int, backoff: float) -> None:

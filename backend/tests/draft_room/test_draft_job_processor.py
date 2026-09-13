@@ -551,21 +551,26 @@ class TestStartCancellation(DraftJobProcessorTestBase):
         poll loop task exists. Without the reset the processor then reports
         itself running, accepts stop(), and silently never claims a job.
         """
-        started = asyncio.Event()
+        started = threading.Event()
+        release = threading.Event()
 
         def _slow_recover():
             started.set()
-            time.sleep(5)
+            release.wait(timeout=5)
 
         with patch.object(self.processor, "_recover_on_startup", _slow_recover):
             task = asyncio.create_task(self.processor.start())
-            await asyncio.wait_for(started.wait(), timeout=5)
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
         self.assertFalse(self.processor._running)
         self.assertIsNone(self.processor._task)
+        reset_task = self.processor._startup_reset_task
+        self.assertIsNotNone(reset_task)
+        release.set()
+        await reset_task
 
 
 class TestStartupRecovery(DraftJobProcessorTestBase):

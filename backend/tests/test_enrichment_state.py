@@ -1,8 +1,10 @@
 """Tests for atom-scoped enrichment state machine + fingerprints (issue #461)."""
 
 import os
+import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -132,6 +134,76 @@ class TestStageMachine(StateTestBase):
         )
         self.assertEqual(derived["description"], "d")
         self.assertEqual(derived["retrieval_aids"], ["a"])
+
+    def test_pending_claim_is_compare_and_set_under_concurrent_claims(self) -> None:
+        """Only one caller may promote the same pending stage to running."""
+        fp = self._fp()
+        self.conn.execute(
+            "INSERT INTO ingestion_stage_states "
+            "(file_id, atom_id, generation_hash, stage, status, input_fingerprint) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (self.file_id, self.atom_pk, self.gen, st.ENRICH_STAGE, st.PENDING, fp),
+        )
+        self.conn.commit()
+
+        # Autocommit connections let both callers reach the UPDATE barrier after
+        # their INSERT OR IGNORE has observed the pre-existing pending row.
+        connections = [
+            sqlite3.connect(self.db_path, isolation_level=None, check_same_thread=False)
+            for _ in range(2)
+        ]
+        for conn in connections:
+            conn.row_factory = sqlite3.Row
+        update_barrier = threading.Barrier(2)
+        results: list[bool] = []
+        errors: list[BaseException] = []
+
+        class BarrierConnection:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, params=()):
+                if "UPDATE ingestion_stage_states SET status" in sql:
+                    update_barrier.wait(timeout=5)
+                return self._conn.execute(sql, params)
+
+        def claim(conn) -> None:
+            try:
+                results.append(
+                    st.claim_atom_stage(
+                        BarrierConnection(conn),
+                        file_id=self.file_id,
+                        generation_hash=self.gen,
+                        atom_pk=self.atom_pk,
+                        stage=st.ENRICH_STAGE,
+                        input_fingerprint=fp,
+                        implementation_version="1",
+                        model_id="m",
+                        prompt_id="v1",
+                        config_id="v1",
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - failure detail below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=claim, args=(conn,)) for conn in connections]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+        for conn in connections:
+            conn.close()
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [False, True])
+        row = self.conn.execute(
+            "SELECT status, input_fingerprint FROM ingestion_stage_states "
+            "WHERE file_id = ? AND atom_id = ? AND generation_hash = ? AND stage = ?",
+            (self.file_id, self.atom_pk, self.gen, st.ENRICH_STAGE),
+        ).fetchone()
+        self.assertEqual(row["status"], st.RUNNING)
+        self.assertEqual(row["input_fingerprint"], fp)
 
     def test_stale_fingerprint_rejection(self) -> None:
         fp1 = self._fp(generation_hash="genA")

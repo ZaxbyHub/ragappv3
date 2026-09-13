@@ -6,6 +6,7 @@ documents with retry logic and graceful shutdown.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -44,6 +45,10 @@ STRANDED_PROCESSING_TIMEOUT_MINUTES = 30
 # best-effort: if the bounded queue is saturated, bow out with a warning and
 # leave the row for a later sweep instead of blocking startup on the backlog.
 STRANDED_REENQUEUE_TIMEOUT_SECONDS = 30.0
+
+# Keep a large missing-file backlog from running a synchronous recovery loop
+# without returning control to the event loop (issue #591 C4).
+RECOVERY_COOPERATIVE_YIELD_EVERY = 32
 
 # Retry cap for pending vector-store deletes (Issue #219). Rows that exceed
 # this are left in place and logged for operator visibility — we never delete
@@ -170,6 +175,10 @@ class TaskItem:
     # fresh enqueue of the same file creates a new TaskItem with the flag
     # unset, so cancellation never leaks into later legitimate work.
     cancelled: bool = False
+    # A recovery enqueue owns a process-local reservation until its task (and
+    # any deferred retry) settles. Normal route tasks that were queued during
+    # the recovery SELECT are skipped while this claim is active.
+    recovery_claim: bool = False
 
 
 @dataclass
@@ -314,6 +323,12 @@ class BackgroundProcessor:
         self._atom_enrichment_worker_task: Optional[asyncio.Task] = None
         self._vector_delete_sweep_task: Optional[asyncio.Task] = None
         self._artifact_delete_sweep_task: Optional[asyncio.Task] = None
+        # ``asyncio.to_thread`` work cannot be cancelled once the worker
+        # thread has started. Keep strong ownership of artifact sweep workers
+        # so a cancelled outer recovery task cannot lose track of them. Real
+        # SQLite pools use a standalone connection in that worker, so pool
+        # shutdown never races a still-running sweep.
+        self._artifact_sweep_tasks: set[asyncio.Task] = set()
         self._reindex_worker_task: Optional[asyncio.Task] = None
         # Deferred-retry scheduler (issue #513 W11 / RC-6): workers hand
         # retryable items to this bounded backlog; the dedicated scheduler
@@ -333,7 +348,23 @@ class BackgroundProcessor:
         # is not recovered by age alone while it is still running.
         self._active_file_ids: set = set()
         self._active_file_ids_lock = asyncio.Lock()
+        # Recovery reservations close the SELECT -> action window: a route
+        # enqueue either wins before recovery claims a row, or is suppressed
+        # while the recovery-owned task is queued/running.
+        self._recovery_file_ids: set = set()
+        # Count queued tasks instead of storing only membership. The upload
+        # route and deferred retry path can publish two TaskItems for one file;
+        # a set loses ownership when the first item is dequeued.
+        self._queued_file_ids: dict[int, int] = {}
+        self._reindex_job_ids: set[int] = set()
         self._running = False
+        self._starting = False
+        self._startup_recovery_task: Optional[asyncio.Task] = None
+        # New reindex work waits until startup has classified pre-existing
+        # running rows, so detached recovery cannot interrupt a live request.
+        self._reindex_start_gate = asyncio.Event()
+        self._reindex_start_gate.set()
+        self._startup_recovery_cutoff: Optional[str] = None
         self.maintenance_service = maintenance_service
         self._write_semaphore: Optional[asyncio.Semaphore] = None
 
@@ -362,76 +393,153 @@ class BackgroundProcessor:
         waiting for a consumer. Spawning workers first ensures the consumers
         exist before any enqueue happens.
         """
-        if self._running:
-            logger.warning("Background processor is already running")
+        if self._running or self._starting:
+            logger.warning("Background processor is already running or starting")
             return
 
-        self._running = True
+        self._starting = True
         self.shutdown_event.clear()
+        self._reindex_start_gate.clear()
+        # Detached recovery only owns rows that predate this start.
+        self._startup_recovery_cutoff = datetime.now(UTC).isoformat()
 
-        # Step 1: configure write semaphore (before any worker can consume)
-        worker_count = settings.ingestion_worker_count
-        if worker_count > 1:
-            self._write_semaphore = asyncio.Semaphore(1)
-            self.processor._write_semaphore = self._write_semaphore
-        else:
+        created_tasks: List[asyncio.Task] = []
+
+        def create_owned_task(coro, *, name: str) -> asyncio.Task:
+            """Create a task and close its coroutine if publication fails."""
+            try:
+                task = asyncio.create_task(coro, name=name)
+            except BaseException:
+                coro.close()
+                raise
+            created_tasks.append(task)
+            return task
+
+        try:
+            # Step 1: configure write semaphore (before any worker can consume)
+            worker_count = settings.ingestion_worker_count
+            if worker_count > 1:
+                self._write_semaphore = asyncio.Semaphore(1)
+                self.processor._write_semaphore = self._write_semaphore
+            else:
+                self._write_semaphore = None
+                self.processor._write_semaphore = None
+
+            # Step 2: spawn workers BEFORE recovery so consumers exist when
+            # the recovery sweep enqueues stranded rows. Workers will be idle
+            # but available to consume recovered items.
+            self._worker_tasks = []
+            for i in range(worker_count):
+                task = create_owned_task(self._worker_loop(), name=f"worker-{i}")
+                self._worker_tasks.append(task)
+            self._enrichment_worker_task = create_owned_task(
+                self._enrichment_worker_loop(), name="enrichment-worker"
+            )
+            if self.multimodal_service is not None:
+                self._atom_enrichment_worker_task = create_owned_task(
+                    self._atom_enrichment_worker_loop(), name="atom-enrichment-worker"
+                )
+            self._reindex_worker_task = create_owned_task(
+                self._reindex_worker_loop(), name="reindex-worker"
+            )
+            # Deferred-retry scheduler (issue #513 W11): deliver retry tickets into
+            # the bounded work queues once their backoff elapses.
+            self._retry_scheduler_task = create_owned_task(
+                self._retry_scheduler_loop(), name="retry-scheduler"
+            )
+
+            # Publish all periodic tasks before detached startup recovery. Each
+            # loop sleeps before its first tick, so publication does not create
+            # a startup double-run window.
+            self._vector_delete_sweep_task = create_owned_task(
+                self._vector_delete_sweep_loop(), name="vector-delete-sweep"
+            )
+            self._artifact_delete_sweep_task = create_owned_task(
+                self._artifact_delete_sweep_loop(), name="artifact-delete-sweep"
+            )
+            self._orphan_rescan_task = create_owned_task(
+                self._orphan_rescan_loop(), name="orphan-rescan"
+            )
+            self._startup_recovery_task = create_owned_task(
+                self._run_startup_recovery(),
+                name="startup-recovery",
+            )
+
+            # No await occurs between the guard and successful publication.
+            self._running = True
+            self._starting = False
+            logger.info(f"Background processor started with {worker_count} worker(s)")
+        except BaseException:
+            for task in created_tasks:
+                task.cancel()
+            if created_tasks:
+                await asyncio.gather(*created_tasks, return_exceptions=True)
+            self._worker_tasks = []
+            self._enrichment_worker_task = None
+            self._atom_enrichment_worker_task = None
+            self._reindex_worker_task = None
+            self._retry_scheduler_task = None
+            self._vector_delete_sweep_task = None
+            self._artifact_delete_sweep_task = None
+            self._orphan_rescan_task = None
+            self._startup_recovery_task = None
             self._write_semaphore = None
             self.processor._write_semaphore = None
+            self._running = False
+            self._starting = False
+            raise
 
-        # Step 2: spawn workers BEFORE recovery so consumers exist when
-        # the recovery sweep enqueues stranded rows. Workers will be idle
-        # but available to consume recovered items.
-        self._worker_tasks = []
-        for i in range(worker_count):
-            task = asyncio.create_task(self._worker_loop(), name=f"worker-{i}")
-            self._worker_tasks.append(task)
-        self._enrichment_worker_task = asyncio.create_task(
-            self._enrichment_worker_loop(), name="enrichment-worker"
+    async def _run_startup_recovery(self) -> None:
+        """Run startup recovery phases in order without coupling readiness."""
+        phases = (
+            (
+                "stranded pending rows",
+                lambda: self._recover_stranded_pending_rows(
+                    require_older_than_minutes=None
+                ),
+            ),
+            (
+                "interrupted reindex jobs",
+                self._recover_interrupted_reindex_jobs,
+            ),
+            (
+                "stranded enrichment rows",
+                lambda: self._recover_stranded_enrichment_rows(
+                    startup_cutoff=self._startup_recovery_cutoff
+                ),
+            ),
+            (
+                "stranded atom enrichment rows",
+                lambda: self._recover_stranded_atom_enrichment_rows(
+                    startup_cutoff=self._startup_recovery_cutoff
+                ),
+            ),
+            ("pending atom enrichment", self._resume_pending_atom_enrichment),
+            ("pending vector deletes", self.retry_pending_vector_deletes),
+            ("pending artifact deletes", self.sweep_pending_artifact_deletes),
         )
-        if self.multimodal_service is not None:
-            self._atom_enrichment_worker_task = asyncio.create_task(
-                self._atom_enrichment_worker_loop(), name="atom-enrichment-worker"
-            )
-        self._reindex_worker_task = asyncio.create_task(self._reindex_worker_loop(), name="reindex-worker")
-        # Deferred-retry scheduler (issue #513 W11): deliver retry tickets into
-        # the bounded work queues once their backoff elapses.
-        self._retry_scheduler_task = asyncio.create_task(
-            self._retry_scheduler_loop(), name="retry-scheduler"
-        )
-
-        # Step 3: NOW run recovery. Workers are ready to consume.
-        # Startup stranded-row sweep (issue #513 W25 / AC28): rows that already
-        # reached a post-parse stage are orphans by definition at startup
-        # (single-process SQLite) and are recovered regardless of age; rows
-        # still inside a parse stage stay age-gated so a long legitimate parse
-        # is never stolen by a restart alone.
-        await self._recover_stranded_pending_rows(
-            require_older_than_minutes=None, ignore_active=set()
-        )
-        await self._recover_interrupted_reindex_jobs()
-        await self._recover_stranded_enrichment_rows()
-        await self._recover_stranded_atom_enrichment_rows()
-        await self._resume_pending_atom_enrichment()
-        await self.retry_pending_vector_deletes()
-        await self.sweep_pending_artifact_deletes()
-        # Re-run the vector-delete reconciliation hourly so orphaned chunks
-        # from a failed delete are cleaned without waiting for a restart.
-        self._vector_delete_sweep_task = asyncio.create_task(
-            self._vector_delete_sweep_loop(), name="vector-delete-sweep"
-        )
-        # Re-run the binary-asset cleanup reconciliation (issue #460) hourly so
-        # post-commit asset unlink failures are collected without a restart.
-        self._artifact_delete_sweep_task = asyncio.create_task(
-            self._artifact_delete_sweep_loop(), name="artifact-delete-sweep"
-        )
-        # Periodic stranded-row rescan (issue #513 W25 / FU-007): orphans that
-        # appear AFTER startup are recovered without waiting for a restart,
-        # honoring the live-job lease and the stranded processing timeout.
-        self._orphan_rescan_task = asyncio.create_task(
-            self._orphan_rescan_loop(), name="orphan-rescan"
-        )
-
-        logger.info(f"Background processor started with {worker_count} worker(s)")
+        try:
+            for phase_name, phase in phases:
+                try:
+                    await phase()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — continue independent recovery phases
+                    logger.exception("Startup recovery phase failed: %s", phase_name)
+                finally:
+                    if phase_name == "interrupted reindex jobs":
+                        self._reindex_start_gate.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - defensive supervisor guard
+            logger.exception("Startup recovery supervisor failed unexpectedly")
+            raise
+        finally:
+            # If cancellation or an unexpected BaseException interrupts an
+            # earlier phase, do not leave the reindex worker waiting forever.
+            # Ordinary phase failures still follow the named-phase ordering
+            # above, so the gate opens early only for an aborted recovery.
+            self._reindex_start_gate.set()
 
     async def _orphan_rescan_loop(self) -> None:
         """Periodically re-run the stranded-row recovery (issue #513 W25).
@@ -551,8 +659,44 @@ class BackgroundProcessor:
         try:
             from .artifact_store import sweep_pending_asset_deletes
 
-            with self.processor.pool.connection() as conn:
-                removed, remaining = sweep_pending_asset_deletes(conn)
+            def run_sweep() -> tuple[int, int]:
+                def invoke(conn) -> tuple[int, int]:
+                    try:
+                        return sweep_pending_asset_deletes(conn)
+                    except StopIteration as exc:
+                        # ``asyncio.Future`` cannot transport StopIteration
+                        # from an executor; normalize it so the outer
+                        # best-effort guard can log and continue. Narrow test
+                        # seams and unusual cursor adapters can raise it.
+                        raise RuntimeError(
+                            "Artifact cleanup sweep stopped unexpectedly"
+                        ) from exc
+
+                # Cancelling ``to_thread`` cannot stop the underlying
+                # synchronous sweep.  A standalone SQLite connection keeps a
+                # worker that outlives a cancelled startup task independent of
+                # the application pool, which may be closed immediately during
+                # lifespan shutdown. Narrow test doubles without ``sqlite_path``
+                # retain the pooled connection seam.
+                sqlite_path = getattr(self.processor.pool, "sqlite_path", None)
+                if sqlite_path is not None:
+                    from ..models.database import get_db_connection
+
+                    conn = get_db_connection(str(sqlite_path))
+                    try:
+                        return invoke(conn)
+                    finally:
+                        conn.close()
+
+                with self.processor.pool.connection() as conn:
+                    return invoke(conn)
+
+            sweep_task = asyncio.create_task(
+                asyncio.to_thread(run_sweep), name="artifact-delete-sweep-worker"
+            )
+            self._artifact_sweep_tasks.add(sweep_task)
+            sweep_task.add_done_callback(self._artifact_sweep_tasks.discard)
+            removed, remaining = await asyncio.shield(sweep_task)
             if remaining:
                 logger.warning(
                     "Artifact cleanup: %d removed, %d pending (will retry)",
@@ -576,6 +720,67 @@ class BackgroundProcessor:
                 raise
             except Exception:  # noqa: BLE001 — sweep must never kill the loop
                 logger.exception("Periodic artifact-delete sweep failed")
+
+    async def _claim_recovery_file(self, file_id: int) -> bool:
+        """Reserve a row for recovery across the SELECT -> action window."""
+        async with self._active_file_ids_lock:
+            if (
+                file_id in self._active_file_ids
+                or file_id in self._queued_file_ids
+                or file_id in self._recovery_file_ids
+            ):
+                return False
+            self._recovery_file_ids.add(file_id)
+            return True
+
+    async def _release_recovery_file(self, file_id: int) -> None:
+        async with self._active_file_ids_lock:
+            self._recovery_file_ids.discard(file_id)
+
+    def _mark_file_queued_locked(self, file_id: int) -> None:
+        """Record one queued task while ``_active_file_ids_lock`` is held."""
+        self._queued_file_ids[file_id] = self._queued_file_ids.get(file_id, 0) + 1
+
+    def _unmark_file_queued_locked(self, file_id: int) -> None:
+        """Release one queued-task ownership while the lock is held."""
+        count = self._queued_file_ids.get(file_id, 0)
+        if count <= 1:
+            self._queued_file_ids.pop(file_id, None)
+        else:
+            self._queued_file_ids[file_id] = count - 1
+
+    async def _enqueue_recovery(
+        self,
+        *,
+        file_path: str,
+        source: str,
+        vault_id: int,
+        file_id: int,
+    ) -> object:
+        """Enqueue a recovery-owned item while preserving test seams.
+
+        A few focused tests replace ``enqueue`` with a narrow coroutine seam.
+        Passing the private ownership marker only when the active callable
+        accepts it keeps those seams valid while production retains the marker
+        needed to hold the reservation through worker processing.
+        """
+        kwargs = {
+            "file_path": file_path,
+            "source": source,
+            "vault_id": vault_id,
+            "file_id": file_id,
+            "_maintenance_checked": True,
+        }
+        try:
+            enqueue_parameters = inspect.signature(self.enqueue).parameters
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            enqueue_parameters = {}
+        if "_recovery_claim" in enqueue_parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in enqueue_parameters.values()
+        ):
+            kwargs["_recovery_claim"] = True
+        return await self.enqueue(**kwargs)
 
     async def _recover_stranded_pending_rows(
         self,
@@ -684,11 +889,24 @@ class BackgroundProcessor:
         if not stranded and not processing_stranded:
             return
 
+        # Recovery uses one maintenance snapshot per sweep. Normal enqueue
+        # callers still read the live flag for every item; only these recovery
+        # calls reuse the already-completed check.
+        if self.maintenance_service:
+            maintenance_flag = await asyncio.to_thread(
+                self.maintenance_service.get_flag
+            )
+            if maintenance_flag and maintenance_flag.enabled:
+                logger.info("Skipping stranded-row recovery during maintenance mode")
+                return
+
         logger.info(
             "Recovering %d stranded async-upload row(s) left at status=pending/phase=queued",
             len(stranded),
         )
-        for row in stranded:
+        for row_index, row in enumerate(stranded, start=1):
+            if row_index > 1 and row_index % RECOVERY_COOPERATIVE_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
             try:
                 row_id = row["id"] if hasattr(row, "keys") else row[0]
                 file_path = row["file_path"] if hasattr(row, "keys") else row[1]
@@ -696,6 +914,8 @@ class BackgroundProcessor:
                 source = (
                     (row["source"] if hasattr(row, "keys") else row[3]) or "upload"
                 )
+                if not await self._claim_recovery_file(int(row_id)):
+                    continue
                 # If the saved file no longer exists on disk, mark error
                 # rather than re-enqueueing — the worker would just fail.
                 from pathlib import Path as _Path
@@ -711,11 +931,16 @@ class BackgroundProcessor:
                             )
                             conn.commit()
                     except Exception:  # pragma: no cover - defensive
-                        pass
+                        logger.debug(
+                            "Failed to mark missing stranded file row id=%s as error",
+                            row_id,
+                            exc_info=True,
+                        )
+                    await self._release_recovery_file(int(row_id))
                     continue
                 try:
                     await asyncio.wait_for(
-                        self.enqueue(
+                        self._enqueue_recovery(
                             file_path=file_path,
                             source=source,
                             vault_id=int(vault_id),
@@ -731,12 +956,17 @@ class BackgroundProcessor:
                         "the next recovery sweep",
                         row_id,
                     )
+                    await self._release_recovery_file(int(row_id))
                     continue
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning("Failed to re-enqueue stranded row id=%s: %s", row, e)
+                row_id = row["id"] if hasattr(row, "keys") else row[0]
+                await self._release_recovery_file(int(row_id))
 
         # Recover stuck processing rows
-        for row in processing_stranded:
+        for row_index, row in enumerate(processing_stranded, start=1):
+            if row_index > 1 and row_index % RECOVERY_COOPERATIVE_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
             try:
                 row_id = row["id"] if hasattr(row, "keys") else row[0]
                 file_path = row["file_path"] if hasattr(row, "keys") else row[1]
@@ -744,6 +974,8 @@ class BackgroundProcessor:
                 source = (
                     (row["source"] if hasattr(row, "keys") else row[3]) or "upload"
                 )
+                if not await self._claim_recovery_file(int(row_id)):
+                    continue
 
                 from pathlib import Path as _Path
                 if not _Path(file_path).exists():
@@ -755,6 +987,7 @@ class BackgroundProcessor:
                             (row_id,),
                         )
                         conn.commit()
+                    await self._release_recovery_file(int(row_id))
                     continue
 
                 with self.processor.pool.connection() as conn:
@@ -773,7 +1006,7 @@ class BackgroundProcessor:
                 # saturated queue cannot stall startup (PRR-011).
                 try:
                     await asyncio.wait_for(
-                        self.enqueue(
+                        self._enqueue_recovery(
                             file_path=file_path,
                             source=source,
                             vault_id=int(vault_id),
@@ -789,9 +1022,12 @@ class BackgroundProcessor:
                         "for the next recovery sweep",
                         row_id,
                     )
+                    await self._release_recovery_file(int(row_id))
                     continue
             except Exception as e:
                 logger.warning("Failed to recover processing row %s: %s", row, e)
+                row_id = row["id"] if hasattr(row, "keys") else row[0]
+                await self._release_recovery_file(int(row_id))
 
         if processing_stranded:
             logger.info(
@@ -846,10 +1082,15 @@ class BackgroundProcessor:
         requeued = 0
         for row in pending:
             job_id = row["id"] if hasattr(row, "keys") else row[0]
+            job_id = int(job_id)
+            if job_id in self._reindex_job_ids:
+                continue
+            self._reindex_job_ids.add(job_id)
             try:
-                self.reindex_queue.put_nowait(ReindexTaskItem(job_id=int(job_id)))
+                self.reindex_queue.put_nowait(ReindexTaskItem(job_id=job_id))
                 requeued += 1
             except asyncio.QueueFull:
+                self._reindex_job_ids.discard(job_id)
                 logger.warning(
                     "Reindex queue full during startup recovery; %d pending "
                     "job(s) left for the next restart or manual trigger",
@@ -948,7 +1189,11 @@ class BackgroundProcessor:
                         )
                         conn.commit()
                 except Exception:  # pragma: no cover - defensive
-                    pass
+                    logger.debug(
+                        "Failed to record vector-delete retry attempt for row id=%s",
+                        row_id,
+                        exc_info=True,
+                    )
                 continue
 
             try:
@@ -965,23 +1210,45 @@ class BackgroundProcessor:
                     "Failed to clear pending vector delete row id=%s: %s", row_id, e
                 )
 
-    async def _recover_stranded_enrichment_rows(self) -> None:
+    async def _recover_stranded_enrichment_rows(
+        self, *, startup_cutoff: Optional[str] = None
+    ) -> None:
         """Mark interrupted post-index enrichment as failed without touching indexed files."""
         if self.processor is None or self.processor.pool is None:
             return
+        cutoff = startup_cutoff or getattr(self, "_startup_recovery_cutoff", None)
         try:
             with self.processor.pool.connection() as conn:
-                cursor = conn.execute(
-                    """
-                    UPDATE files
-                    SET enrichment_status = 'error',
-                        enrichment_error = 'Enrichment interrupted or queued before completion; base index remains available',
-                        enrichment_updated_at = ?
-                    WHERE status = 'indexed'
-                      AND enrichment_status IN ('pending', 'processing')
-                    """,
-                    (datetime.now(UTC).isoformat(),),
-                )
+                if cutoff is not None:
+                    # ``enrichment_updated_at`` is written when the route or
+                    # worker enters pending/processing.  Comparing its SQLite
+                    # timestamp value (with a created_at fallback for legacy
+                    # rows) prevents startup recovery from touching work
+                    # submitted after this start began.
+                    cursor = conn.execute(
+                        """
+                        UPDATE files
+                        SET enrichment_status = 'error',
+                            enrichment_error = 'Enrichment interrupted or queued before completion; base index remains available',
+                            enrichment_updated_at = ?
+                        WHERE status = 'indexed'
+                          AND enrichment_status IN ('pending', 'processing')
+                          AND julianday(COALESCE(enrichment_updated_at, created_at)) < julianday(?)
+                        """,
+                        (datetime.now(UTC).isoformat(), cutoff),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE files
+                        SET enrichment_status = 'error',
+                            enrichment_error = 'Enrichment interrupted or queued before completion; base index remains available',
+                            enrichment_updated_at = ?
+                        WHERE status = 'indexed'
+                          AND enrichment_status IN ('pending', 'processing')
+                        """,
+                        (datetime.now(UTC).isoformat(),),
+                    )
                 recovered = cursor.rowcount
                 conn.commit()
         except Exception as e:  # pragma: no cover - defensive
@@ -991,7 +1258,9 @@ class BackgroundProcessor:
         if recovered:
             logger.info("Recovered %d stranded enrichment row(s)", recovered)
 
-    async def _recover_stranded_atom_enrichment_rows(self) -> None:
+    async def _recover_stranded_atom_enrichment_rows(
+        self, *, startup_cutoff: Optional[str] = None
+    ) -> None:
         """Reclaim stranded atom-scoped 'enrich' stage rows (running -> pending).
 
         This is distinct from the file-level chunk-enrichment recovery above: it
@@ -1005,7 +1274,12 @@ class BackgroundProcessor:
             from . import enrichment_state as est
 
             with self.processor.pool.connection() as conn:
-                recovered = est.recover_stranded_atom_stages(conn)
+                cutoff = startup_cutoff or getattr(
+                    self, "_startup_recovery_cutoff", None
+                )
+                recovered = est.recover_stranded_atom_stages(
+                    conn, startup_cutoff=cutoff
+                )
                 conn.commit()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Stranded atom enrichment recovery sweep failed: %s", exc)
@@ -1086,7 +1360,9 @@ class BackgroundProcessor:
                     (est.ENRICH_STAGE,),
                 ).fetchall()
             seen: set[tuple[int, int]] = set()
-            for row in rows + backfill_rows:
+            for row_index, row in enumerate(rows + backfill_rows, start=1):
+                if row_index > 1 and row_index % RECOVERY_COOPERATIVE_YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
                 if self.shutdown_event.is_set():
                     break
                 key = (row["file_id"], row["vault_id"])
@@ -1541,6 +1817,29 @@ class BackgroundProcessor:
 
         logger.info("Stopping background processor...")
 
+        # Detached startup recovery owns its enqueue side effects. Cancel and
+        # await it before queue draining so shutdown cannot race a new enqueue.
+        startup_recovery_task = getattr(self, "_startup_recovery_task", None)
+        if startup_recovery_task is not None:
+            startup_recovery_task.cancel()
+            await asyncio.gather(startup_recovery_task, return_exceptions=True)
+            self._startup_recovery_task = None
+
+        # The outer recovery task may have been cancelled while a synchronous
+        # artifact sweep is still running in a worker thread. Cancel and await
+        # the owned asyncio tasks so shutdown observes their cancellation and
+        # never leaves an orphaned task behind. ``asyncio.to_thread`` cannot
+        # interrupt the underlying call; production sweeps use a standalone
+        # connection, so this gather remains bounded while that thread drains.
+        artifact_sweep_tasks = getattr(self, "_artifact_sweep_tasks", None)
+        if artifact_sweep_tasks:
+            owned_artifact_tasks = tuple(artifact_sweep_tasks)
+            for task in owned_artifact_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*owned_artifact_tasks, return_exceptions=True)
+            artifact_sweep_tasks.clear()
+
         # Phase 1: let ingestion workers finish first. They may enqueue
         # post-index enrichment, so do not signal the enrichment worker to exit
         # until the ingestion queue has drained.
@@ -1587,6 +1886,7 @@ class BackgroundProcessor:
             self._artifact_delete_sweep_task.cancel()
             await asyncio.gather(self._artifact_delete_sweep_task, return_exceptions=True)
         if self._reindex_worker_task:
+            self._reindex_start_gate.set()
             self._reindex_worker_task.cancel()
             await asyncio.gather(self._reindex_worker_task, return_exceptions=True)
             # Reindex lifecycle ownership (issue #513 W12): with the worker
@@ -1632,6 +1932,16 @@ class BackgroundProcessor:
             except Exception as e:
                 logger.warning("Failed to flush vector store on shutdown: %s", e)
 
+        # Keep shutdown safe for the minimal processor doubles used by tests and
+        # partial-construction paths that predate these ownership registries.
+        for state_name in (
+            "_recovery_file_ids",
+            "_queued_file_ids",
+            "_reindex_job_ids",
+        ):
+            state = getattr(self, state_name, None)
+            if state is not None:
+                state.clear()
         self._running = False
         logger.info("Background processor stopped")
 
@@ -1644,7 +1954,10 @@ class BackgroundProcessor:
         email_sender: Optional[str] = None,
         file_id: Optional[int] = None,
         file_hash: Optional[str] = None,
-    ) -> None:
+        *,
+        _maintenance_checked: bool = False,
+        _recovery_claim: bool = False,
+    ) -> bool:
         """
         Add a file to the processing queue.
 
@@ -1667,10 +1980,35 @@ class BackgroundProcessor:
         Note:
             If the processor is not running, the item will still be queued
             and processed when start() is called.
+
+        Returns:
+            ``True`` when a new queue item was added, or ``False`` when the
+            file is already owned by the recovery path.
         """
-        if self.maintenance_service:
-            flag = self.maintenance_service.get_flag()
+        reservation_added = False
+        if file_id is not None:
+            async with self._active_file_ids_lock:
+                if _recovery_claim:
+                    if file_id not in self._recovery_file_ids:
+                        if (
+                            file_id in self._active_file_ids
+                            or file_id in self._queued_file_ids
+                        ):
+                            return False
+                        self._recovery_file_ids.add(file_id)
+                        reservation_added = True
+                elif file_id in self._recovery_file_ids:
+                    logger.debug(
+                        "Skipping route enqueue for file_id=%s claimed by recovery",
+                        file_id,
+                    )
+                    return False
+
+        if self.maintenance_service and not _maintenance_checked:
+            flag = await asyncio.to_thread(self.maintenance_service.get_flag)
             if flag and flag.enabled:
+                if reservation_added:
+                    await self._release_recovery_file(file_id)
                 raise DocumentProcessingError("Maintenance mode prevents enqueueing")
         task = TaskItem(
             file_path=file_path,
@@ -1681,9 +2019,22 @@ class BackgroundProcessor:
             vault_id=vault_id,
             file_id=file_id,
             file_hash=file_hash,
+            recovery_claim=_recovery_claim,
         )
-        await self.queue.put(task)
+        if file_id is not None:
+            async with self._active_file_ids_lock:
+                self._mark_file_queued_locked(file_id)
+        try:
+            await self.queue.put(task)
+        except BaseException:
+            if file_id is not None:
+                async with self._active_file_ids_lock:
+                    self._unmark_file_queued_locked(file_id)
+            if reservation_added:
+                await self._release_recovery_file(file_id)
+            raise
         logger.debug(f"Enqueued file: {file_path} (file_id={file_id})")
+        return True
 
     def cancel_pending_jobs(self, **match: object) -> int:
         """Best-effort cancellation of queued, not-yet-started ingestion tasks
@@ -1763,7 +2114,16 @@ class BackgroundProcessor:
 
     async def enqueue_reindex(self, job_id: int) -> None:
         """Add a reindex job to the reindex queue."""
-        await self.reindex_queue.put(ReindexTaskItem(job_id=job_id))
+        job_id = int(job_id)
+        if job_id in self._reindex_job_ids:
+            logger.debug("Skipping duplicate reindex enqueue for job_id=%s", job_id)
+            return
+        self._reindex_job_ids.add(job_id)
+        try:
+            await self.reindex_queue.put(ReindexTaskItem(job_id=job_id))
+        except BaseException:
+            self._reindex_job_ids.discard(job_id)
+            raise
         logger.debug("Enqueued reindex job: %s", job_id)
 
     async def _worker_loop(self) -> None:
@@ -1895,6 +2255,7 @@ class BackgroundProcessor:
 
     async def _reindex_worker_loop(self) -> None:
         """Process reindex jobs from the reindex queue."""
+        await self._reindex_start_gate.wait()
         while True:
             if self.shutdown_event.is_set() and self.reindex_queue.empty():
                 break
@@ -1906,6 +2267,7 @@ class BackgroundProcessor:
                 await self._process_reindex_job(item.job_id)
             finally:
                 self.reindex_queue.task_done()
+                self._reindex_job_ids.discard(item.job_id)
 
     async def _process_reindex_job(self, job_id: int) -> None:
         """Process a reindex job: re-embed all stored documents with the current model.
@@ -2152,16 +2514,31 @@ class BackgroundProcessor:
         actively processing — even one stuck for hours in a long parse.
         """
         leased_id = task.file_id
-        if leased_id is not None:
-            async with self._active_file_ids_lock:
-                self._active_file_ids.add(leased_id)
+        lease_registered = False
         try:
+            if leased_id is not None:
+                async with self._active_file_ids_lock:
+                    # This dequeue consumes exactly one ownership count. Keep
+                    # any sibling same-file task visible until it is dequeued.
+                    self._unmark_file_queued_locked(leased_id)
+                    # A route task already queued when recovery claimed this
+                    # row must be consumed as a no-op; the recovery-owned task
+                    # is the sole processor for the row.
+                    if (
+                        not task.recovery_claim
+                        and leased_id in self._recovery_file_ids
+                    ):
+                        return
+                    self._active_file_ids.add(leased_id)
+                    lease_registered = True
             await self._process_task(task)
         finally:
             self.queue.task_done()
-            if leased_id is not None:
+            if leased_id is not None and lease_registered:
                 async with self._active_file_ids_lock:
                     self._active_file_ids.discard(leased_id)
+                    if task.recovery_claim:
+                        self._recovery_file_ids.discard(leased_id)
 
     async def _process_task(self, task: TaskItem) -> None:
         """
@@ -2288,8 +2665,12 @@ class BackgroundProcessor:
                 vault_id=task.vault_id,
                 file_id=task.file_id,
                 file_hash=task.file_hash,
+                recovery_claim=task.recovery_claim,
             )
-            if not self._schedule_retry(queue=self.queue, item=new_task, delay=delay):
+            retry_scheduled = self._schedule_retry(
+                queue=self.queue, item=new_task, delay=delay
+            )
+            if not retry_scheduled:
                 # Retry backlog full (or shutdown began between the checks):
                 # escalate to the permanent-failure path instead of blocking.
                 logger.error(
@@ -2299,6 +2680,20 @@ class BackgroundProcessor:
                     error_message,
                 )
                 self._mark_task_permanently_failed(task, error_message)
+            elif task.file_id is not None:
+                # The retry ticket owns a queue slot even while it waits in the
+                # deferred scheduler. This prevents recovery from claiming the
+                # same row after the active attempt settles.
+                async with self._active_file_ids_lock:
+                    self._mark_file_queued_locked(task.file_id)
+                if task.recovery_claim:
+                    # Transfer the reservation to the deferred recovery retry;
+                    # the wrapper must not release it when this attempt settles.
+                    task.recovery_claim = False
+            elif task.recovery_claim:
+                # Transfer the reservation to the deferred recovery retry;
+                # the wrapper must not release it when this attempt settles.
+                task.recovery_claim = False
         else:
             self._mark_task_permanently_failed(task, error_message)
 

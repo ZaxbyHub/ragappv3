@@ -127,32 +127,74 @@ def claim_atom_stage(
     model_id: Optional[str],
     prompt_id: Optional[str],
     config_id: Optional[str],
-) -> None:
+) -> bool:
     """Atomically claim an atom's enrichment stage as running.
 
-    Uses ``INSERT OR REPLACE`` (the partial unique index makes this idempotent per
-    atom+stage). No DB connection is held by the caller across the provider call.
+    Uses an insert-if-absent followed by a conditional compare-and-set (the
+    partial unique index makes the identity idempotent per atom+stage). A
+    same-fingerprint running claim is retained instead of being replaced; a
+    different fingerprint may supersede an older claim for the same generation,
+    and stale completions are rejected by ``complete_atom_stage``. This prevents
+    concurrent recovery/worker tasks from duplicating a provider call. No DB
+    connection is held by the caller across the provider call.
     """
-    conn.execute(
-        "INSERT OR REPLACE INTO ingestion_stage_states "
+    values = (
+        file_id,
+        atom_pk,
+        generation_hash,
+        stage,
+        RUNNING,
+        input_fingerprint,
+        implementation_version,
+        model_id,
+        prompt_id,
+        config_id,
+        _iso_now(),
+    )
+    # INSERT OR IGNORE is the atomic first-claim operation. Unlike a preliminary
+    # SELECT followed by INSERT OR REPLACE, two workers cannot both observe an
+    # absent row and then overwrite the same running claim before either provider
+    # call starts.
+    inserted = conn.execute(
+        "INSERT OR IGNORE INTO ingestion_stage_states "
         "(file_id, atom_id, generation_hash, stage, status, input_fingerprint, "
         " implementation_version, model_id, prompt_id, config_id, attempts, "
         " error_code, error_message, started_at, completed_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, NULL)",
+        values,
+    ).rowcount
+    if inserted:
+        return True
+
+    # An existing non-running claim (or a stale/different fingerprint) may be
+    # retried. Keep this as one conditional compare-and-set: two callers that
+    # both observed a pending/retryable row must not both return True and make
+    # duplicate provider calls. A different fingerprint is intentionally allowed
+    # to supersede an older claim; stale completions are rejected by
+    # complete_atom_stage's fingerprint check.
+    updated = conn.execute(
+        "UPDATE ingestion_stage_states SET status = ?, input_fingerprint = ?, "
+        "implementation_version = ?, model_id = ?, prompt_id = ?, config_id = ?, "
+        "attempts = 0, error_code = NULL, error_message = NULL, started_at = ?, "
+        "completed_at = NULL WHERE file_id = ? AND atom_id = ? AND generation_hash = ? "
+        "AND stage = ? AND NOT (status = ? AND input_fingerprint = ?)",
         (
-            file_id,
-            atom_pk,
-            generation_hash,
-            stage,
             RUNNING,
             input_fingerprint,
             implementation_version,
             model_id,
             prompt_id,
             config_id,
-            _iso_now(),
+            values[-1],
+            file_id,
+            atom_pk,
+            generation_hash,
+            stage,
+            RUNNING,
+            input_fingerprint,
         ),
-    )
+    ).rowcount
+    return updated > 0
 
 
 def complete_atom_stage(
@@ -351,17 +393,25 @@ def mark_proxy_missing_retryable(
     return status if ok else ""
 
 
-def recover_stranded_atom_stages(conn) -> int:
+def recover_stranded_atom_stages(conn, *, startup_cutoff: Optional[str] = None) -> int:
     """Reclaim stranded atom 'enrich' work (running) back to pending at startup.
 
     Returns the number of rows reclaimed. File-level chunk-enrichment recovery
     (files.enrichment_status) is intentionally separate and untouched.
     """
-    cur = conn.execute(
-        "UPDATE ingestion_stage_states SET status = ?, updated_at = ? "
-        "WHERE stage = ? AND status = ? AND atom_id IS NOT NULL",
-        (PENDING, _iso_now(), ENRICH_STAGE, RUNNING),
-    )
+    if startup_cutoff is not None:
+        cur = conn.execute(
+            "UPDATE ingestion_stage_states SET status = ?, updated_at = ? "
+            "WHERE stage = ? AND status = ? AND atom_id IS NOT NULL "
+            "AND julianday(COALESCE(started_at, updated_at)) < julianday(?)",
+            (PENDING, _iso_now(), ENRICH_STAGE, RUNNING, startup_cutoff),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE ingestion_stage_states SET status = ?, updated_at = ? "
+            "WHERE stage = ? AND status = ? AND atom_id IS NOT NULL",
+            (PENDING, _iso_now(), ENRICH_STAGE, RUNNING),
+        )
     return cur.rowcount
 
 
