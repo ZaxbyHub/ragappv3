@@ -23,6 +23,27 @@ request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default=""
 )
 
+
+def is_safe_request_id(value: object) -> bool:
+    """True when ``value`` is safe to use as a correlation id AND to emit as
+    an outbound HTTP header value: non-empty, printable ASCII, no
+    whitespace, at most 128 chars.
+
+    h11/uvicorn accept obs-text (0x80-0xFF) bytes in inbound header values
+    (RFC 7230), and Starlette latin-1-decodes them without validation — but
+    httpx refuses to SEND non-ASCII header values (UnicodeEncodeError), so an
+    unsanitized client-supplied id would raise inside circuit-breaker-wrapped
+    outbound calls. Reject unsafe ids at this trust boundary (swarm review
+    F-004).
+    """
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and value.isascii()
+        and value.isprintable()
+        and not any(c.isspace() for c in value)
+    )
+
 # Standard LogRecord attributes — everything else on a record is an "extra"
 # added by the caller and is a candidate for JSON serialization.
 _STANDARD_RECORD_ATTRS = frozenset(

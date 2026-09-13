@@ -902,27 +902,34 @@ async def chat(
     get_telemetry().record_chat_turn(_turn_id)
     try:
         # E3 admission (issue #518): route-level CHAT gate for the non-stream
-        # path (reentrant with the engine's generation gate). Saturation is a
+        # path. mark_chat_gate() makes the engine's generation-phase gate
+        # skip its own acquire (explicit no-nesting contract — see
+        # app/services/admission.py); without it, budget-sized concurrent
+        # non-stream requests deadlock (swarm review F-002). Saturation is a
         # bounded overload response, never an unbounded queue.
         try:
             async with get_admission_controller().admit(AdmissionClass.CHAT):
-                return await non_stream_chat_response(
-                    body.message,
-                    history,
-                    rag_engine,
-                    vault_id=body.vault_id,
-                    mode=effective_mode,
-                    require_vault=require_vault,
-                    user_id=user.get("id"),
-                    include_global=include_global,
-                    can_write_memory=can_write_memory,
-                    temperature=body.temperature,
-                    retrieval_mode=body.retrieval_mode,
-                    citation_mode=body.citation_mode,
-                    metadata_filter=body.metadata_filter,
-                    vision_context=vision_context,
-                    document_ids=body.document_ids,
-                )
+                gate_token = mark_chat_gate()
+                try:
+                    return await non_stream_chat_response(
+                        body.message,
+                        history,
+                        rag_engine,
+                        vault_id=body.vault_id,
+                        mode=effective_mode,
+                        require_vault=require_vault,
+                        user_id=user.get("id"),
+                        include_global=include_global,
+                        can_write_memory=can_write_memory,
+                        temperature=body.temperature,
+                        retrieval_mode=body.retrieval_mode,
+                        citation_mode=body.citation_mode,
+                        metadata_filter=body.metadata_filter,
+                        vision_context=vision_context,
+                        document_ids=body.document_ids,
+                    )
+                finally:
+                    reset_chat_gate(gate_token)
         except AdmissionRejected as exc:
             raise HTTPException(
                 status_code=503, detail="chat admission rejected"

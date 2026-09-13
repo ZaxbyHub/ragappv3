@@ -19,7 +19,9 @@ Guarantees implemented here:
   never executed;
 * cancellation — a disconnected waiter frees its queue slot (and any slot
   acquired on its behalf after cancellation is released back);
-* dead-holder recovery — holders past their TTL are swept on acquire;
+* dead-holder recovery — holders past their TTL are swept on acquire. Live
+  holders renew (heartbeat every ttl/3) so a long generation never loses its
+  slot; the TTL only reaps holders whose process died without releasing;
 * graceful shutdown — in-flight slots are released and new admits rejected;
 * fail-open degradation — an unreachable shared store never blocks requests
   (``controller.degraded`` reports the condition).
@@ -100,6 +102,17 @@ class AdmissionStore:
     async def sweep_expired(self, key: str) -> int:
         ...
 
+    async def refresh(self, key: str, holder: str, ttl_seconds: float) -> bool:
+        """Extend a live holder's TTL. Returns False when the holder is no
+        longer registered (already swept/released) — the caller must then
+        treat its slot as lost.
+
+        Concrete default for stores without per-holder expiry bookkeeping
+        (e.g. test doubles): report the holder as persistent. Stores that
+        track expiry epochs override this (both shipped stores do).
+        """
+        return True
+
 
 class MemoryAdmissionStore(AdmissionStore):
     """In-process reference store. Each key maps holder -> expiry epoch."""
@@ -150,6 +163,14 @@ class MemoryAdmissionStore(AdmissionStore):
             self._holders.pop(key, None)
         return len(stale)
 
+    async def refresh(self, key: str, holder: str, ttl_seconds: float) -> bool:
+        now = self._clock()
+        entry = self._live(key, now)
+        if holder not in entry:
+            return False
+        entry[holder] = now + max(ttl_seconds, 0.0)
+        return True
+
 
 class RedisAdmissionStore(AdmissionStore):
     """Cross-process store backed by Redis hashes (one hash per budget key).
@@ -157,6 +178,18 @@ class RedisAdmissionStore(AdmissionStore):
     Holder field values are absolute expiry epochs (synchronized-clock best
     effort). Operations are single-key atomic commands.
     """
+
+    # KEYS[1] = admission hash field key, ARGV[1] = holder, ARGV[2] = new
+    # absolute expiry epoch. Extends the expiry ONLY if the holder is still
+    # registered, so a swept/dead holder can never be resurrected by a late
+    # renewal.
+    _REFRESH_LUA = """
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then
+  redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+  return 1
+end
+return 0
+"""
 
     def __init__(self, url: str):
         import redis.asyncio as aioredis  # optional at call time
@@ -183,6 +216,16 @@ class RedisAdmissionStore(AdmissionStore):
 
     async def sweep_expired(self, key: str) -> int:
         return await self._sweep(self._field(key), time.time())
+
+    async def refresh(self, key: str, holder: str, ttl_seconds: float) -> bool:
+        # Atomic check-and-set: only a holder still registered gets its
+        # expiry extended — a swept holder is never resurrected.
+        return bool(
+            await self._redis.eval(
+                self._REFRESH_LUA, 1, self._field(key), holder,
+                time.time() + max(ttl_seconds, 0.0),
+            )
+        )
 
     async def _sweep(self, field: str, now: float) -> int:
         entry = await self._redis.hgetall(field)
@@ -317,11 +360,62 @@ class _Lease:
         self.task: Optional["asyncio.Task"] = None
         self.revoked = False
         self._released = False
+        self._renewer: Optional["asyncio.Task"] = None
+
+    def _start_renewal(self) -> None:
+        """Heartbeat the store TTL so a live holder outlives ttl_seconds.
+
+        Without renewal, any generation longer than the (crash-recovery) TTL
+        silently loses its budget slot and the device oversubscribes
+        (swarm review F-003). Renewal runs every ttl/3 while the lease is
+        held and stops on release/shutdown.
+        """
+        if not self._store_bound:
+            return
+        interval = max(self._controller.ttl_seconds / 3.0, 0.05)
+        self._renewer = asyncio.get_running_loop().create_task(
+            self._renew_loop(interval)
+        )
+
+    async def _renew_loop(self, interval: float) -> None:
+        controller = self._controller
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                alive = await controller.store.refresh(
+                    self.key, self.holder, controller.ttl_seconds
+                )
+            except Exception:  # noqa: BLE001 — store outage: keep trying
+                controller._mark_degraded()
+                continue
+            if not alive:
+                # Slot was swept while we were still running (store-side
+                # race). Do not resurrect it: mark revoked so release()
+                # skips the store release, and surface the anomaly.
+                controller._mark_degraded()
+                self.revoked = True
+                logger.warning(
+                    "admission lease %s/%s lost its slot mid-flight "
+                    "(refresh miss); device may be oversubscribed",
+                    self.key,
+                    self.holder,
+                )
+                return
+
+    async def _stop_renewal(self) -> None:
+        if self._renewer is not None:
+            self._renewer.cancel()
+            try:
+                await self._renewer
+            except asyncio.CancelledError:
+                pass
+            self._renewer = None
 
     async def release(self) -> None:
         if self._released:
             return
         self._released = True
+        await self._stop_renewal()
         if self._reentrant:
             return
         controller = self._controller
@@ -330,7 +424,7 @@ class _Lease:
             try:
                 await controller.store.release(self.key, self.holder)
             except Exception:  # noqa: BLE001 — store outage must not leak slots
-                controller._degraded = True
+                controller._mark_degraded()
         controller.hub.schedule_pump()
 
 
@@ -378,6 +472,16 @@ class AdmissionController:
     def degraded(self) -> bool:
         return self._degraded
 
+    def _mark_degraded(self) -> None:
+        """Flip the degraded flag, logging the transition once (the flag
+        previously existed but nothing ever read/alerted on it — swarm
+        review LOW finding)."""
+        if not self._degraded:
+            logger.warning(
+                "admission store degraded: failing open (see docs/operations.md)"
+            )
+        self._degraded = True
+
     def budget_for(self, admission_class: AdmissionClass) -> int:
         key = self.class_budgets[admission_class]
         return int(self.budgets.get(key, 1))
@@ -388,11 +492,14 @@ class AdmissionController:
     async def shutdown(self) -> None:
         """Release in-flight slots and reject all future admissions."""
         self._shutdown = True
-        for key, holder in list(self._local_actives):
+        # Go through the lease objects (not raw store.release) so renewal
+        # heartbeats are cancelled too — otherwise a live renewer would
+        # resurrect the slot this shutdown just released.
+        for lease in list(self._active_leases.values()):
             try:
-                await self.store.release(key, holder)
+                await lease.release()
             except Exception:  # noqa: BLE001 — best-effort release on shutdown
-                self._degraded = True
+                self._mark_degraded()
         self._local_actives.clear()
         self._reject_own_waiters("shutdown")
         self.hub.schedule_pump()
@@ -479,7 +586,7 @@ class AdmissionController:
         try:
             key_occupancy = await self.store.occupancy(key)
         except Exception:  # noqa: BLE001 — degraded store: fail open
-            self._degraded = True
+            self._mark_degraded()
             key_occupancy = -1
         if (
             key_occupancy >= 0
@@ -518,14 +625,31 @@ class AdmissionController:
                 lease = await asyncio.wait_for(future, timeout=effective_deadline)
         except asyncio.TimeoutError:
             self._unregister(admission_class, waiter)
+            await self._release_orphan_lease(admission_class, waiter)
             raise AdmissionRejected("deadline_exceeded") from None
         except asyncio.CancelledError:
             self._unregister(admission_class, waiter)
+            await self._release_orphan_lease(admission_class, waiter)
             raise
         except AdmissionRejected:
             self._unregister(admission_class, waiter)
             raise
         return lease
+
+    async def _release_orphan_lease(
+        self, admission_class: AdmissionClass, waiter: _Waiter
+    ) -> None:
+        """Release a lease the pump delivered in the race window between the
+        waiter's timeout/cancel and the pump's set_result (swarm review
+        PRR-009): the awaiting task is dying and would never release the
+        delivered lease, so the slot would sit until TTL. If the pump has
+        not created the lease yet, waiter.gone (set by _unregister) makes
+        its post-acquire check release the slot instead — either ordering
+        frees the slot."""
+        key = self.class_budgets[admission_class]
+        lease = self._active_leases.get((key, waiter.holder))
+        if lease is not None and lease.holder == waiter.holder:
+            await lease.release()
 
     async def _admit_waiter(
         self,
@@ -540,7 +664,7 @@ class AdmissionController:
         try:
             occupancy = await self.store.occupancy(key)
         except Exception:  # noqa: BLE001 — degraded store: fail open
-            self._degraded = True
+            self._mark_degraded()
             degraded_store = True
             occupancy = -1
         budget = self.budgets.get(key, 1)
@@ -552,7 +676,7 @@ class AdmissionController:
                     key, waiter.holder, self.ttl_seconds
                 )
             except Exception:  # noqa: BLE001 — degraded store: fail open
-                self._degraded = True
+                self._mark_degraded()
                 degraded_store = True
                 acquired = True
             if not acquired:
@@ -564,7 +688,7 @@ class AdmissionController:
                 try:
                     await self.store.release(key, waiter.holder)
                 except Exception:  # noqa: BLE001
-                    self._degraded = True
+                    self._mark_degraded()
             return True
         if waiter.gone or waiter.future.done():
             # The waiter vanished (deadline/cancel) while we acquired on its
@@ -573,7 +697,7 @@ class AdmissionController:
                 try:
                     await self.store.release(key, waiter.holder)
                 except Exception:  # noqa: BLE001
-                    self._degraded = True
+                    self._mark_degraded()
             return True
         lease = _Lease(
             self,
@@ -585,6 +709,7 @@ class AdmissionController:
         lease.task = waiter.task
         self._local_actives.add((key, waiter.holder))
         self._active_leases[(key, waiter.holder)] = lease
+        lease._start_renewal()
         if not waiter.future.done():
             waiter.future.set_result(lease)
         return True
@@ -597,7 +722,7 @@ class AdmissionController:
             if await self.store.occupancy(key) < self.budgets.get(key, 1):
                 return
         except Exception:  # noqa: BLE001 — degraded store: fail open
-            self._degraded = True
+            self._mark_degraded()
             return
         for active_key, holder in list(self._local_actives):
             if active_key != key:
@@ -610,7 +735,7 @@ class AdmissionController:
             try:
                 await self.store.release(active_key, holder)
             except Exception:  # noqa: BLE001 — best-effort eviction
-                self._degraded = True
+                self._mark_degraded()
             return
 
     def _forget_lease(self, lease: _Lease) -> None:

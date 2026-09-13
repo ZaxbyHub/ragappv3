@@ -237,9 +237,14 @@ services:
       - ADMISSION_VISION_BUDGET=${ADMISSION_VISION_BUDGET:-2}
       - ADMISSION_BACKGROUND_BUDGET=${ADMISSION_BACKGROUND_BUDGET:-2}
       - ADMISSION_QUEUE_MAX_SIZE=${ADMISSION_QUEUE_MAX_SIZE:-64}
-      - ADMISSION_DEADLINE_SECONDS=${ADMISSION_DEADLINE_SECONDS:-}
+      # Typed Optional[float] field: short form ONLY. The long form would
+      # inject "" when unset and crash Settings() at import (rule above).
+      - ADMISSION_DEADLINE_SECONDS
       - ADMISSION_STORE_URL=${ADMISSION_STORE_URL:-}
       - TELEMETRY_ENABLED=${TELEMETRY_ENABLED:-true}
+      # Shared shard directory for multiprocess /metrics aggregation (str;
+      # empty = single-process counters).
+      - TELEMETRY_REGISTRY_DIR=${TELEMETRY_REGISTRY_DIR:-}
       # Auth & security
       - USERS_ENABLED
       - JWT_ALGORITHM=${JWT_ALGORITHM:-}

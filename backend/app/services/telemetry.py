@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import secrets
+import time
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, Optional
@@ -211,7 +212,23 @@ class Telemetry:
         }
         shards: list = []
         if self.registry_dir is not None and self.registry_dir.exists():
+            now = time.time()
             for entry in sorted(self.registry_dir.glob("telemetry-*.json")):
+                # Retention (swarm review PRR-018): shards are named per
+                # (pid, random token), so a restarted replica leaves its
+                # dead shard behind forever. A shard not written for over
+                # an hour belongs to a dead process (live processes flush
+                # write-through on every record) — prune it during
+                # aggregation. The current process's shard is exempt.
+                try:
+                    if (
+                        entry.name != self._shard_name
+                        and now - entry.stat().st_mtime > 3600
+                    ):
+                        entry.unlink(missing_ok=True)
+                        continue
+                except OSError:  # pragma: no cover — racing unlink
+                    continue
                 try:
                     shards.append(
                         json.loads(entry.read_text(encoding="utf-8"))
@@ -283,15 +300,30 @@ _singleton: Optional[Telemetry] = None
 
 
 def init_telemetry(registry_dir: Optional[Path] = None) -> Telemetry:
-    """(Re)bind the process singleton to the current telemetry_enabled."""
+    """(Re)bind the process singleton to the current telemetry_enabled.
+
+    When ``registry_dir`` is not given, the settings-configured
+    ``telemetry_registry_dir`` applies (swarm review F-008): deployments
+    running multiple workers point it at one shared directory so
+    ``GET /metrics`` aggregates every shard; empty = single-process counters.
+    """
     global _singleton
     from app.config import settings
 
+    if registry_dir is None:
+        configured = str(
+            getattr(settings, "telemetry_registry_dir", "") or ""
+        )
+        registry_dir = Path(configured) if configured else None
     _singleton = Telemetry(
         enabled=bool(getattr(settings, "telemetry_enabled", True)),
         registry_dir=registry_dir,
     )
-    maybe_init_otel_export()
+    # OTLP export (PRR-017): only when telemetry itself is enabled — a
+    # disabled telemetry surface must never open export network connections,
+    # including from test environments where the endpoint env var may be set.
+    if _singleton.enabled:
+        maybe_init_otel_export()
     return _singleton
 
 
@@ -302,6 +334,12 @@ def get_telemetry() -> Telemetry:
     return _singleton
 
 
+def reset_telemetry() -> None:
+    """Test/teardown hook — drop the singleton (see conftest reset fixture)."""
+    global _singleton
+    _singleton = None
+
+
 def correlation_headers() -> Dict[str, str]:
     """W3C traceparent + X-Request-ID for the current turn.
 
@@ -309,6 +347,13 @@ def correlation_headers() -> Dict[str, str]:
     The identity is the current turn id, falling back to the inbound request
     id stamped by LoggingMiddleware (request_id_var) so RequestIdFilter's
     logging identity and the outbound header are the SAME value.
+
+    Defense-in-depth (swarm review F-004): an id that is not safe as an HTTP
+    header value (e.g. client-poisoned obs-text) is replaced by a
+    deterministic ASCII surrogate so outbound provider calls can never raise
+    UnicodeEncodeError inside circuit-breaker-wrapped code. The middleware
+    already regenerates unsafe inbound ids; this guards any other path that
+    sets a correlation id.
     """
     telemetry = get_telemetry()
     if not telemetry.enabled:
@@ -320,6 +365,12 @@ def correlation_headers() -> Dict[str, str]:
         turn_id = request_id_var.get() or None
     if not turn_id:
         return {}
+    from app.utils.request_context import is_safe_request_id
+
+    if not is_safe_request_id(turn_id):
+        turn_id = "gen-{}".format(
+            hashlib.sha256(turn_id.encode("utf-8", "replace")).hexdigest()[:16]
+        )
     trace_id = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()[:32]
     span_id = secrets.token_hex(8)
     return {

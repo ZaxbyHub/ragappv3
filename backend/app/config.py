@@ -260,6 +260,10 @@ class Settings(BaseSettings):
     # ── Telemetry (issue #518, Workstream E3) ───────────────────────────────
     telemetry_enabled: bool = True
     """Enable turn correlation, measured stage/queue/provider metrics and /metrics. OTel export is an optional extra."""
+    telemetry_registry_dir: str = ""
+    """Shared shard directory for multiprocess /metrics aggregation. Empty =
+    single-process counters; set per deployment (all workers share one dir)
+    when running uvicorn/workers > 1 (swarm review F-008)."""
 
 
     # ── Embedding model validation configuration ───────────────────────────────────
@@ -1007,6 +1011,19 @@ class Settings(BaseSettings):
         if isinstance(data, dict):
             return apply_legacy_settings_conversion(data)
         return data
+
+    @field_validator("admission_deadline_seconds", mode="before")
+    @classmethod
+    def coerce_empty_admission_deadline(cls, v):
+        """Treat an empty string as "unset".
+
+        Compose long-form forwarding (``${VAR:-}``) and a copied
+        ``.env.example`` both inject ``""`` for unset keys; without this
+        coercion pydantic raises float_parsing at import time.
+        """
+        if v is None or v == "":
+            return None
+        return v
 
     @field_validator("chunk_size_chars", mode="before")
     @classmethod
