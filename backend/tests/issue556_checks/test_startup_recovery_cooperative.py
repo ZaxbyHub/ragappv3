@@ -172,3 +172,39 @@ async def test_cancelled_artifact_sweep_does_not_hold_real_pool_connection(
             await asyncio.gather(*tracked_workers, return_exceptions=True)
 
     assert all(worker.done() for worker in tracked_workers)
+
+
+@pytest.mark.asyncio
+async def test_stop_drains_tracked_artifact_sweep_tasks_without_waiting_for_thread(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+):
+    pool = SQLiteConnectionPool(str(tmp_path / "artifact-stop.db"), max_size=1)
+    processor = BackgroundProcessor(pool=pool)
+    sweep_started = threading.Event()
+    sweep_finished = threading.Event()
+    release_sweep = threading.Event()
+
+    def slow_sweep(_conn):
+        sweep_started.set()
+        try:
+            assert release_sweep.wait(timeout=2.0)
+            return 0, 0
+        finally:
+            sweep_finished.set()
+
+    monkeypatch.setattr(
+        "app.services.artifact_store.sweep_pending_asset_deletes", slow_sweep
+    )
+
+    sweep = asyncio.create_task(processor.sweep_pending_artifact_deletes())
+    try:
+        assert await asyncio.to_thread(sweep_started.wait, 1.0)
+        processor._running = True
+        await asyncio.wait_for(processor.stop(timeout=0.2), timeout=1.0)
+        assert sweep.done()
+        assert not processor._artifact_sweep_tasks
+    finally:
+        release_sweep.set()
+        assert await asyncio.to_thread(sweep_finished.wait, 1.0)
+        await asyncio.gather(sweep, return_exceptions=True)
+        pool.close_all()

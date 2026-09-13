@@ -529,6 +529,12 @@ class BackgroundProcessor:
         except Exception:  # pragma: no cover - defensive supervisor guard
             logger.exception("Startup recovery supervisor failed unexpectedly")
             raise
+        finally:
+            # If cancellation or an unexpected BaseException interrupts an
+            # earlier phase, do not leave the reindex worker waiting forever.
+            # Ordinary phase failures still follow the named-phase ordering
+            # above, so the gate opens early only for an aborted recovery.
+            self._reindex_start_gate.set()
 
     async def _orphan_rescan_loop(self) -> None:
         """Periodically re-run the stranded-row recovery (issue #513 W25).
@@ -1814,6 +1820,21 @@ class BackgroundProcessor:
             await asyncio.gather(startup_recovery_task, return_exceptions=True)
             self._startup_recovery_task = None
 
+        # The outer recovery task may have been cancelled while a synchronous
+        # artifact sweep is still running in a worker thread. Cancel and await
+        # the owned asyncio tasks so shutdown observes their cancellation and
+        # never leaves an orphaned task behind. ``asyncio.to_thread`` cannot
+        # interrupt the underlying call; production sweeps use a standalone
+        # connection, so this gather remains bounded while that thread drains.
+        artifact_sweep_tasks = getattr(self, "_artifact_sweep_tasks", None)
+        if artifact_sweep_tasks:
+            owned_artifact_tasks = tuple(artifact_sweep_tasks)
+            for task in owned_artifact_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*owned_artifact_tasks, return_exceptions=True)
+            artifact_sweep_tasks.clear()
+
         # Phase 1: let ingestion workers finish first. They may enqueue
         # post-index enrichment, so do not signal the enrichment worker to exit
         # until the ingestion queue has drained.
@@ -1931,7 +1952,7 @@ class BackgroundProcessor:
         *,
         _maintenance_checked: bool = False,
         _recovery_claim: bool = False,
-    ) -> None:
+    ) -> bool:
         """
         Add a file to the processing queue.
 
@@ -1954,6 +1975,10 @@ class BackgroundProcessor:
         Note:
             If the processor is not running, the item will still be queued
             and processed when start() is called.
+
+        Returns:
+            ``True`` when a new queue item was added, or ``False`` when the
+            file is already owned by the recovery path.
         """
         reservation_added = False
         if file_id is not None:
@@ -1964,7 +1989,7 @@ class BackgroundProcessor:
                             file_id in self._active_file_ids
                             or file_id in self._queued_file_ids
                         ):
-                            return
+                            return False
                         self._recovery_file_ids.add(file_id)
                         reservation_added = True
                 elif file_id in self._recovery_file_ids:
@@ -1972,7 +1997,7 @@ class BackgroundProcessor:
                         "Skipping route enqueue for file_id=%s claimed by recovery",
                         file_id,
                     )
-                    return
+                    return False
 
         if self.maintenance_service and not _maintenance_checked:
             flag = await asyncio.to_thread(self.maintenance_service.get_flag)
@@ -2004,6 +2029,7 @@ class BackgroundProcessor:
                 await self._release_recovery_file(file_id)
             raise
         logger.debug(f"Enqueued file: {file_path} (file_id={file_id})")
+        return True
 
     def cancel_pending_jobs(self, **match: object) -> int:
         """Best-effort cancellation of queued, not-yet-started ingestion tasks

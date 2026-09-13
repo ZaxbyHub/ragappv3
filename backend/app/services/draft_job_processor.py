@@ -154,7 +154,7 @@ class DraftJobProcessor:
             # Startup recovery must complete before the poll loop begins and
             # before HTTP traffic is accepted (SPEC section 10.1 item 6).
             reset_task = self._startup_reset_task
-            if reset_task is None:
+            if reset_task is None or reset_task.done():
                 reset_coro = asyncio.to_thread(self._recover_on_startup)
                 try:
                     reset_task = asyncio.create_task(reset_coro)

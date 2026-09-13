@@ -310,21 +310,29 @@ class ArtifactEnrichmentService:
         Never holds a DB connection across a provider/filesystem call (short pooled
         claims only, matching the #460/no-connection-over-long-ops contract).
 
-        Returns ``{"proxy_records": [...], "retryable": N}`` where
+        Returns ``{"proxy_records": [...], "retryable": N, "in_progress": N}`` where
         ``proxy_records`` are to be written through the LanceDB path
         (add-then-delete) by the caller and ``retryable`` counts atoms whose
         provider outcome was transient (issue #513 W17: the worker schedules a
         bounded file-level retry instead of leaving the atom stranded until a
-        restart). On permanent/policy failures the atom stage is marked
-        accordingly and the base/raw proxy remains untouched.
+        restart). ``in_progress`` counts atoms currently owned by another
+        worker; those claims are intentionally not included in ``retryable`` so
+        this worker does not schedule a duplicate provider attempt. On
+        permanent/policy failures the atom stage is marked accordingly and the
+        base/raw proxy remains untouched.
         """
         proxy_records: list[dict[str, Any]] = []
         retryable_count = 0
+        in_progress_count = 0
 
         # Read the ordered atom list (short claim) for neighbor context.
         atoms = self._load_ordered_atoms(file_id, generation_hash)
         if not atoms:
-            return {"proxy_records": proxy_records, "retryable": retryable_count}
+            return {
+                "proxy_records": proxy_records,
+                "retryable": retryable_count,
+                "in_progress": in_progress_count,
+            }
         # Only atoms whose stage is actionable are enriched. This skips
         # already-succeeded atoms (fingerprint/status-based skip), so a
         # retry or re-run does not re-transmit unchanged atoms to the
@@ -344,14 +352,24 @@ class ArtifactEnrichmentService:
             in ("image", "chart", "table", "equation")
         ]
         if not tasks:
-            return {"proxy_records": proxy_records, "retryable": retryable_count}
+            return {
+                "proxy_records": proxy_records,
+                "retryable": retryable_count,
+                "in_progress": in_progress_count,
+            }
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, dict) and result.get("proxy_record"):
                 proxy_records.append(result["proxy_record"])
             elif isinstance(result, dict) and result.get("outcome") == "retryable":
                 retryable_count += 1
-        return {"proxy_records": proxy_records, "retryable": retryable_count}
+            elif isinstance(result, dict) and result.get("outcome") == "in_progress":
+                in_progress_count += 1
+        return {
+            "proxy_records": proxy_records,
+            "retryable": retryable_count,
+            "in_progress": in_progress_count,
+        }
 
     def _actionable_atom_pks(self, file_id: int, generation_hash: str) -> set[int]:
         """Return atom PKs whose enrich stage is pending / retryable / re-runnable."""

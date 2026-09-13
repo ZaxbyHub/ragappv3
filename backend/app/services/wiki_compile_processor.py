@@ -50,7 +50,7 @@ class WikiCompileProcessor:
         self._running = True
         try:
             reset_task = self._startup_reset_task
-            if reset_task is None:
+            if reset_task is None or reset_task.done():
                 reset_coro = asyncio.to_thread(self._reset_orphans)
                 try:
                     reset_task = asyncio.create_task(reset_coro)

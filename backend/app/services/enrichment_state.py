@@ -132,8 +132,10 @@ def claim_atom_stage(
 
     Uses an insert-if-absent followed by a conditional compare-and-set (the
     partial unique index makes the identity idempotent per atom+stage). A
-    same-fingerprint running claim is retained instead of being replaced, so
-    concurrent recovery/worker tasks cannot duplicate a provider call. No DB
+    same-fingerprint running claim is retained instead of being replaced; a
+    different fingerprint may supersede an older claim for the same generation,
+    and stale completions are rejected by ``complete_atom_stage``. This prevents
+    concurrent recovery/worker tasks from duplicating a provider call. No DB
     connection is held by the caller across the provider call.
     """
     values = (

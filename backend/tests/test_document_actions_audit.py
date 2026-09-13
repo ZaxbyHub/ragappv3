@@ -229,6 +229,46 @@ class TestRetryDocumentAuditWiring(unittest.IsolatedAsyncioTestCase):
             self.assertIn("user_id", site.split(")")[0])
 
 
+class TestRetryDocumentSchedulingOutcome(unittest.IsolatedAsyncioTestCase):
+    """The admin retry route reports whether it actually queued work."""
+
+    async def _call_route(self, enqueue_result: bool):
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = {
+            "file_path": "document.pdf",
+            "vault_id": 7,
+        }
+        processor = MagicMock(is_running=True)
+        processor.enqueue = AsyncMock(return_value=enqueue_result)
+        secret_manager = MagicMock()
+
+        with patch("app.api.routes.documents._record_document_action") as record_action:
+            result = await inspect.unwrap(retry_document)(
+                file_id=42,
+                request=MagicMock(),
+                conn=conn,
+                user={"id": "admin"},
+                csrf_token="csrf",
+                secret_manager=secret_manager,
+                background_processor=processor,
+                current_user=None,
+            )
+
+        return result, record_action
+
+    async def test_records_scheduled_when_enqueue_adds_work(self):
+        result, record_action = await self._call_route(True)
+
+        self.assertEqual(result, {"file_id": 42, "status": "scheduled"})
+        self.assertEqual(record_action.call_args.args[2], "scheduled")
+
+    async def test_records_already_in_progress_when_recovery_owns_work(self):
+        result, record_action = await self._call_route(False)
+
+        self.assertEqual(result, {"file_id": 42, "status": "already_in_progress"})
+        self.assertEqual(record_action.call_args.args[2], "already_in_progress")
+
+
 class TestDocumentActionsSchema(unittest.TestCase):
     """Tests verifying document_actions table schema includes user_id."""
 

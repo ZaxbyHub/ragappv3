@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
+from app.lifespan import _safe_await
 from app.services.background_tasks import BackgroundProcessor, TaskItem
 from app.services.document_processor import DocumentProcessingError
 
@@ -98,6 +99,26 @@ class _Pool:
 
 
 @pytest.mark.asyncio
+async def test_lifespan_safe_await_timeout_is_nonfatal():
+    """The lifespan wrapper must swallow a timed-out processor start."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_start():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    await _safe_await(slow_start(), "Background processor start", timeout=0.01)
+
+    assert started.is_set()
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
 async def test_start_returns_within_10s_while_boot_recovery_remains_active():
     processor = BackgroundProcessor(max_retries=0, retry_delay=0.01)
     started, finished, cancelled, release = (asyncio.Event() for _ in range(4))
@@ -164,7 +185,7 @@ async def test_workers_precede_recovery_and_drain_oversized_backlog(monkeypatch)
     monkeypatch.setattr(settings, "ingestion_worker_count", 1)
     processor = BackgroundProcessor(max_retries=0, retry_delay=0.01)
     workers_seen, processed, drained = [], [], asyncio.Event()
-    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp_dir:
+    with tempfile.TemporaryDirectory() as temp_dir:
         paths = [str(Path(temp_dir) / f"stranded-{i}") for i in range(4)]
 
         async def process_file(file_path, **_kwargs):
@@ -192,7 +213,7 @@ async def test_workers_precede_recovery_and_drain_oversized_backlog(monkeypatch)
 @pytest.mark.asyncio
 async def test_recovery_reads_maintenance_once_and_enqueue_stays_gated():
     pending = []
-    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp_dir:
+    with tempfile.TemporaryDirectory() as temp_dir:
         for index in range(3):
             path = Path(temp_dir) / f"pending-{index}.txt"
             path.write_text("x", encoding="utf-8")

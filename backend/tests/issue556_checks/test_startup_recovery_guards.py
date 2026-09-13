@@ -139,6 +139,27 @@ async def test_reindex_worker_waits_for_startup_recovery_gate():
 
 
 @pytest.mark.asyncio
+async def test_cancelled_startup_recovery_opens_reindex_gate():
+    processor = BackgroundProcessor()
+    processor._reindex_start_gate.clear()
+    phase_started = asyncio.Event()
+
+    async def blocked_phase(*_args, **_kwargs):
+        phase_started.set()
+        await asyncio.Event().wait()
+
+    processor._recover_stranded_pending_rows = blocked_phase
+    recovery = asyncio.create_task(processor._run_startup_recovery())
+    await asyncio.wait_for(phase_started.wait(), timeout=1.0)
+    assert not processor._reindex_start_gate.is_set()
+
+    recovery.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recovery
+    assert processor._reindex_start_gate.is_set()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_file_queue_ownership_is_ref_counted():
     processor = BackgroundProcessor()
 
@@ -146,8 +167,8 @@ async def test_duplicate_file_queue_ownership_is_ref_counted():
         return None
 
     processor._process_task = no_op
-    await processor.enqueue("same.txt", 1, file_id=7)
-    await processor.enqueue("same.txt", 1, file_id=7)
+    assert await processor.enqueue("same.txt", 1, file_id=7)
+    assert await processor.enqueue("same.txt", 1, file_id=7)
     assert processor._queued_file_ids == {7: 2}
     assert not await processor._claim_recovery_file(7)
 
@@ -157,6 +178,18 @@ async def test_duplicate_file_queue_ownership_is_ref_counted():
     await processor._process_task_wrapper(await processor.queue.get())
     assert processor._queued_file_ids == {}
     await _stop(processor)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_reports_recovery_reservation_noop():
+    processor = BackgroundProcessor()
+    assert await processor._claim_recovery_file(7)
+    try:
+        assert await processor.enqueue("same.txt", 1, file_id=7) is False
+        assert processor.queue.qsize() == 0
+    finally:
+        await processor._release_recovery_file(7)
+        await _stop(processor)
 
 
 @pytest.mark.asyncio

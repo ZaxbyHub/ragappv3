@@ -17,32 +17,23 @@ PROCESSORS = (
 @pytest.fixture(autouse=True)
 async def _cancel_tasks_created_by_test():
     baseline = asyncio.all_tasks()
-    tracked = set()
-    real_create_task = asyncio.create_task
-
-    def track(coro, *args, **kwargs):
-        task = real_create_task(coro, *args, **kwargs)
-        tracked.add(task)
-        return task
 
     def pending_tasks():
         current = asyncio.current_task()
         live = {task for task in asyncio.all_tasks() if task not in baseline and task is not current}
-        live.update(task for task in tracked if not task.done() and task is not current)
         return live
 
-    with patch.object(asyncio, "create_task", side_effect=track):
-        try:
-            yield
-        finally:
-            for _ in range(3):
-                live = pending_tasks()
-                if not live:
-                    break
-                for task in live:
-                    task.cancel()
-                await asyncio.gather(*live, return_exceptions=True)
-            assert not pending_tasks(), "test leaked a live asyncio task"
+    try:
+        yield
+    finally:
+        for _ in range(3):
+            live = pending_tasks()
+            if not live:
+                break
+            for task in live:
+                task.cancel()
+            await asyncio.gather(*live, return_exceptions=True)
+        assert not pending_tasks(), "test leaked a live asyncio task"
 
 
 def _processor(processor_type):
@@ -422,7 +413,7 @@ async def test_shared_reset_failure_only_current_B_rolls_back(processor_type):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("processor_type", PROCESSORS)
-async def test_done_reset_task_is_reused_before_identity_callback(processor_type):
+async def test_done_reset_task_is_not_reused_after_completion(processor_type):
     processor, reset_name = _processor(processor_type)
     reset = MagicMock()
     setattr(processor, reset_name, reset)
@@ -433,7 +424,7 @@ async def test_done_reset_task_is_reused_before_identity_callback(processor_type
 
     await processor.start()
     try:
-        assert reset.call_count == 0
+        assert reset.call_count == 1
         assert processor._task is not None
     finally:
         await processor.stop()
@@ -441,8 +432,11 @@ async def test_done_reset_task_is_reused_before_identity_callback(processor_type
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("processor_type", PROCESSORS)
-async def test_cancelled_reset_callback_is_consumed(processor_type):
-    processor, _reset_name = _processor(processor_type)
+async def test_cancelled_reset_task_is_replaced(processor_type):
+    processor, reset_name = _processor(processor_type)
+    reset = MagicMock()
+    setattr(processor, reset_name, reset)
+    processor._poll_loop = _blocked_poll
     cancelled = asyncio.create_task(asyncio.sleep(60))
     cancelled.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -450,13 +444,12 @@ async def test_cancelled_reset_callback_is_consumed(processor_type):
     processor._startup_reset_task = cancelled
     cancelled.add_done_callback(processor._consume_startup_reset)
 
-    with pytest.raises(asyncio.CancelledError):
-        await processor.start()
-    await asyncio.sleep(0)
-    assert processor._startup_reset_task is None
-    assert processor._running is False
-    assert processor._task is None
-    await processor.stop()
+    await processor.start()
+    try:
+        assert reset.call_count == 1
+        assert processor._task is not None
+    finally:
+        await processor.stop()
 
 
 @pytest.mark.asyncio
