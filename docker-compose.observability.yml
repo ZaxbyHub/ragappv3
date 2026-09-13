@@ -1,0 +1,30 @@
+# Optional observability overlay (issue #518, Workstream E3).
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#
+# Collects the backend's Prometheus exposition (GET /metrics on the backend
+# port) and log/output telemetry into Grafana Alloy, which can fan out to
+# Tempo (traces) and Loki (logs). Entirely optional: the base compose file
+# has no observability dependencies and air-gapped installs are unaffected.
+# OTLP/OTel export from the backend remains an optional pip extra — see
+# docs/operations.md (GenAI semantic conventions are Development status).
+
+services:
+  alloy:
+    image: grafana/alloy:latest
+    restart: unless-stopped
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+    volumes:
+      - ./observability/alloy:/etc/alloy:ro
+    ports:
+      - "127.0.0.1:12345:12345"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # Tempo/Loki/Grafana are intentionally NOT pinned here: point Alloy at
+  # your existing stack by editing observability/alloy/config.alloy. This
+  # overlay only guarantees collection from the knowledgevault service.

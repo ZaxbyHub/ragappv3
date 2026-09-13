@@ -3,6 +3,7 @@
 import argparse
 import os
 import shutil
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -39,13 +40,27 @@ except ImportError:
 
 
 def backup_sqlite_fallback(output_dir: Path) -> Path:
-    """Fallback backup function if backup_sqlite module is not available."""
+    """Fallback backup function if backup_sqlite module is not available.
+
+    WAL-safe copy (issue #518, legacy-12/C08): the raw ``shutil.copy2`` of
+    the main file was replaced by a sqlite3 backup-API snapshot — committed
+    transactions still living in the -wal file are captured even while the
+    app holds the database open.
+    """
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     backup_path = output_dir / f"app_backup_{timestamp}.db"
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     source = Path(settings.sqlite_path)
     if source.exists():
-        shutil.copy2(source, backup_path)
+        src_conn = sqlite3.connect(str(source))
+        try:
+            dst_conn = sqlite3.connect(str(backup_path))
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+        finally:
+            src_conn.close()
         print(f"Created backup at {backup_path}")
     return backup_path
 

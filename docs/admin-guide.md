@@ -49,7 +49,13 @@ BACKUP_NAME="knowledgevault_backup_${DATE}"
 # Create backup directory
 mkdir -p "${BACKUP_DIR}/${BACKUP_NAME}"
 
-# Stop containers to ensure consistency
+# Preferred (issue #518): consistent backup set WITHOUT stopping the stack —
+# WAL-safe SQLite snapshot, LanceDB tables version-tagged before copying,
+# manifest with sha256 digests binding app.db + lancedb + vaults + draft-room.
+# Run from the project root:
+python scripts/backup_set.py --output "${BACKUP_DIR}/${BACKUP_NAME}"
+
+# Cold-copy alternative (legacy): stop containers first for a raw copy
 docker compose down
 
 # Copy data (run from project root where .env is located)
@@ -121,6 +127,17 @@ crontab -e
 6. Arguments: `-File "C:\path\to\backup.ps1"`
 
 ### Restore from Backup
+
+Preferred (issue #518 backup sets): verify and restore a consistent set —
+every manifest digest is verified and the tagged LanceDB generations are
+checked out; any mismatch aborts with `RestoreError`.
+
+```bash
+# Stop the stack first
+docker compose down
+# Restore + verify into your data dir
+python scripts/restore.py "${BACKUP_DIR}/${BACKUP_NAME}" --dest "${DATA_DIR}"
+```
 
 1. Stop KnowledgeVault:
    ```bash
