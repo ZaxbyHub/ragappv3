@@ -62,6 +62,15 @@ def backend_bool_default(config_text: str, field_name: str) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def backend_empty_str_default(config_text: str, field_name: str) -> str | None:
+    """Backend str default that is the empty string (e.g. admission_store_url)."""
+    match = re.search(
+        rf'{re.escape(field_name)}:\s*str\s*=\s*""',
+        config_text,
+    )
+    return "" if match else None
+
+
 def backend_float_default(config_text: str, field_name: str) -> str | None:
     """Backend float default, as written, so 2.0 does not silently match 2."""
     match = re.search(
@@ -477,6 +486,79 @@ def main() -> int:
                 f"docker-compose.yml {env_name} default {compose_val!r} does not "
                 f"match backend default {backend_val!r}"
             )
+
+    # Shared inference admission + telemetry (issue #518, Workstream E3):
+    # every budget/queue/kill-switch default must carry the same value across
+    # backend/app/config.py, .env.example, and docker-compose.yml — mirrors
+    # the canvas_*_settings pattern above. ADMISSION_DEADLINE_SECONDS is
+    # exempt from value parity (Optional[float]=None, documented via a
+    # commented .env.example line and short-form compose forwarding — the
+    # typed-key rule); it is checked for forwarding presence below instead.
+    admission_bool_settings = {
+        "ADMISSION_ENABLED": "admission_enabled",
+        "TELEMETRY_ENABLED": "telemetry_enabled",
+    }
+    admission_int_settings = {
+        "ADMISSION_CHAT_BUDGET": "admission_chat_budget",
+        "ADMISSION_INSTANT_BUDGET": "admission_instant_budget",
+        "ADMISSION_EMBEDDING_BUDGET": "admission_embedding_budget",
+        "ADMISSION_RERANKING_BUDGET": "admission_reranking_budget",
+        "ADMISSION_VISION_BUDGET": "admission_vision_budget",
+        "ADMISSION_BACKGROUND_BUDGET": "admission_background_budget",
+        "ADMISSION_QUEUE_MAX_SIZE": "admission_queue_max_size",
+    }
+    admission_str_settings = {
+        "ADMISSION_STORE_URL": "admission_store_url",
+    }
+    for env_name, field_name, reader in (
+        *(
+            (env_name, field_name, backend_bool_default)
+            for env_name, field_name in admission_bool_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_int_default)
+            for env_name, field_name in admission_int_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_empty_str_default)
+            for env_name, field_name in admission_str_settings.items()
+        ),
+    ):
+        backend_val = reader(backend_config, field_name)
+        env_val = env_value(env_text, env_name)
+        compose_val = compose_default(compose_text, env_name)
+        if backend_val is None:
+            failures.append(
+                f"backend/app/config.py {field_name} default could not be parsed"
+            )
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match "
+                f"backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not "
+                f"match backend default {backend_val!r}"
+            )
+
+    # Optional-float deadline (issue #518): backend default None; .env.example
+    # documents it commented out (an active empty value fails pydantic float
+    # parsing — the typed-key rule) and compose forwards short-form.
+    # Guarded: forwarding + documentation presence, no value parity.
+    if not re.search(
+        r"^\s*- ADMISSION_DEADLINE_SECONDS\s*$", compose_text, re.MULTILINE
+    ):
+        failures.append(
+            "docker-compose.yml does not forward ADMISSION_DEADLINE_SECONDS "
+            "(short form required for Optional[float] — see the typed-key rule)"
+        )
+    if not re.search(
+        r"^#?\s*ADMISSION_DEADLINE_SECONDS=", env_text, re.MULTILINE
+    ):
+        failures.append(
+            ".env.example does not document ADMISSION_DEADLINE_SECONDS"
+        )
 
     for message in failures:
         fail(message)
