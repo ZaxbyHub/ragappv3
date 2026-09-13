@@ -2011,9 +2011,13 @@ class BackgroundProcessor:
             # (no per-call pooled checkout), and a read failure must fail
             # open (WARNING) instead of raising out of enqueue.
             try:
-                flag = await asyncio.to_thread(
-                    self.maintenance_service.get_flag_cached
-                )
+                # Prefer the TTL-cached read when the service provides it;
+                # fall back to the raw get_flag contract (older providers and
+                # test doubles implement only that).
+                read = getattr(
+                    self.maintenance_service, "get_flag_cached", None
+                ) or self.maintenance_service.get_flag
+                flag = await asyncio.to_thread(read)
             except Exception:
                 logger.warning(
                     "maintenance flag read failed during enqueue; failing open",
