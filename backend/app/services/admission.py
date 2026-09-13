@@ -42,6 +42,7 @@ import secrets
 import socket
 import time
 import weakref
+from abc import abstractmethod
 from collections import deque
 from contextlib import asynccontextmanager
 from enum import Enum
@@ -83,17 +84,21 @@ class AdmissionStore:
     returns how many were removed.
     """
 
+    @abstractmethod
     async def try_acquire(self, key: str, holder: str, ttl_seconds: float) -> bool:
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def release(self, key: str, holder: str) -> None:
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def occupancy(self, key: str) -> int:
-        raise NotImplementedError
+        ...
 
+    @abstractmethod
     async def sweep_expired(self, key: str) -> int:
-        raise NotImplementedError
+        ...
 
 
 class MemoryAdmissionStore(AdmissionStore):
