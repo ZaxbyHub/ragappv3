@@ -93,6 +93,28 @@ roles, not capacity claims.
 - Telemetry outage: telemetry is best-effort and never on the request
   critical path; `TELEMETRY_ENABLED=false` makes it fully inert.
 
+## Maintenance windows
+
+- `MaintenanceMiddleware` blocks only mutating methods (POST/PUT/PATCH/DELETE).
+  GET/HEAD/OPTIONS requests never consult the maintenance flag at all, so
+  DB-free routes (`/health`, `/api/health`, `/api/healthz`) stay fast and
+  pool-free even while the pool is exhausted (issue #549 C02).
+- Exempt POST routes: the admin toggle (`/api/admin/maintenance`) and the
+  auth routes (`/api/auth/login`, `/api/auth/refresh`, `/api/auth/logout`) —
+  a window longer than the access-token lifetime no longer locks every user
+  out (issue #549 C01). Registration stays blocked: a window is a data freeze
+  for account creation too.
+- The flag read on the request path is served from a short in-process TTL
+  cache (5 s) filled off the event loop. A `set_flag` toggle is visible to
+  the very next request from the same process; a toggle made in another
+  worker becomes visible within the 5 s TTL. The admin toggle route's
+  response always reads the flag fresh from SQLite.
+- If the flag read itself fails (pool exhausted, corrupted `system_flags`
+  row), the middleware logs a WARNING and fails open — the request proceeds
+  instead of returning 500. A mutating request whose cache is cold while the
+  pool is exhausted stalls up to the pool wait budget (~15 s at defaults) in
+  a worker thread, then proceeds.
+
 ## Operator recovery actions
 
 - Overloaded chat (queue_full rejections): raise the relevant
