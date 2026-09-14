@@ -79,7 +79,11 @@ class ToggleManager:
         conn.execute(self._UPSERT_SQL, (feature, int(enabled)))
 
     def update_cache(self, feature: str, enabled: bool) -> None:
-        """Update the in-memory cache after a durable commit."""
+        """Update the in-memory cache after a durable commit.
+
+        Also bumps the cache generation so in-flight stale reads (started
+        before this invalidation) are discarded instead of written back.
+        """
         with self._lock:
             self._cache[feature] = ToggleCacheEntry(
                 timestamp=time.time(), enabled=enabled
