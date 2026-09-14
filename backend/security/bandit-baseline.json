@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 64,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 76648,
+      "loc": 76649,
       "nosec": 0,
       "skipped_tests": 39
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1274,
+      "loc": 1275,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3168,7 +3168,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1471             )\n1472         if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == \"change-me-to-a-random-64-char-string\"):\n1473             raise ValueError(\n",
+      "code": "1473             )\n1474         if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == \"change-me-to-a-random-64-char-string\"):\n1475             raise ValueError(\n",
       "col_offset": 93,
       "end_col_offset": 131,
       "filename": "backend/app/config.py",
@@ -3179,9 +3179,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 1472,
+      "line_number": 1474,
       "line_range": [
-        1472
+        1474
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
