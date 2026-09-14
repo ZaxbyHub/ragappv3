@@ -6,12 +6,15 @@ search after startup does NOT trigger a full IVF_PQ rebuild (a multi-second to
 multi-minute stall on large tables).
 
 The detection must match how LanceDB actually reports an existing vector index:
-by NAME (``"embedding_idx"``), consistent with every other index check in
-``VectorStore``. A prior bug matched the literal ``"IVF_PQ"`` against
-``idx.index_type`` — but LanceDB reports the type as ``"IvfPq"`` (mixed-case, no
-underscore; verified against lancedb at runtime), so ``"IVF_PQ" in "IvfPq"`` was
-always False and seeding never fired. These tests pin the real ``index_type``
-value so the regression cannot return.
+by COLUMN and TYPE via the shared ``has_index`` helper (issue #557) — an
+IvfPq index on ``["embedding"]``. History: a prior bug matched the literal
+``"IVF_PQ"`` against ``idx.index_type`` — but LanceDB reports the type as
+``"IvfPq"`` (mixed-case, no underscore; verified against lancedb at runtime),
+so ``"IVF_PQ" in "IvfPq"`` was always False and seeding never fired (#148).
+The intermediate name-based repair matched ``idx.name == "embedding_idx"``
+relying on the engine's auto-derived name; detection is now column+type so
+the engine's naming convention is not load-bearing. These tests pin the real
+``index_type``/``columns`` values so the regression cannot return.
 """
 
 import unittest
@@ -21,10 +24,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.services.vector_store import VectorStore
 
 
-def _existing_index(name: str, index_type: str):
+def _existing_index(name: str, index_type: str, columns):
     idx = MagicMock()
     idx.name = name
     idx.index_type = index_type
+    idx.columns = columns
     return idx
 
 
@@ -50,12 +54,12 @@ def _make_store_opening_existing(indices, row_count):
 
 class TestVectorIndexSeedBaseline(unittest.IsolatedAsyncioTestCase):
     async def test_seeds_row_count_from_existing_embedding_idx(self):
-        """Existing vector index (name='embedding_idx', index_type='IvfPq') →
+        """Existing vector index (IvfPq on ['embedding']) →
         baseline seeded to the current row count so first search won't rebuild."""
-        # index_type is the REAL LanceDB value "IvfPq" — the old "IVF_PQ"
-        # substring check would miss this and leave the baseline at 0.
+        # Shape is the REAL LanceDB report for an auto-named vector index:
+        # name='embedding_idx', index_type='IvfPq', columns=['embedding'].
         store = _make_store_opening_existing(
-            indices=[_existing_index("embedding_idx", "IvfPq")],
+            indices=[_existing_index("embedding_idx", "IvfPq", ["embedding"])],
             row_count=40340,
         )
 
@@ -74,9 +78,14 @@ class TestVectorIndexSeedBaseline(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_does_not_seed_when_only_fts_index_present(self):
-        """No vector index → nothing to seed; baseline stays 0."""
+        """No vector index → nothing to seed; baseline stays 0.
+
+        The FTS index carries the REAL engine-reported shape
+        (columns=['text'], index_type='FTS') so the negative case proves the
+        column+type predicate distinguishes index kinds — not that a name
+        differs."""
         store = _make_store_opening_existing(
-            indices=[_existing_index("fts_text", "FTS")],
+            indices=[_existing_index("text_idx", "FTS", ["text"])],
             row_count=40340,
         )
 

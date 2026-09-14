@@ -31,10 +31,14 @@ _LIFESPAN_LOGGER = "app.lifespan"
 
 
 class MockIndex:
-    """Minimal double for a LanceDB index object with a .name attribute."""
+    """Shape-complete double: detection reads columns/index_type (issue #557),
+    so the double mirrors the engine-reported attributes; the engine-derived
+    name is carried but never load-bearing."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, columns=None, index_type=None):
         self.name = name
+        self.columns = columns if columns is not None else []
+        self.index_type = index_type if index_type is not None else ""
 
 
 def _mock_table(indices=None, side_effect=None):
@@ -64,9 +68,13 @@ class TestFTSValidationAtStartup(unittest.IsolatedAsyncioTestCase):
     # ── Test 1: FTS missing + hybrid enabled → ERROR logged ─────────────────────
 
     async def test_fts_missing_hybrid_enabled_logs_error(self):
-        """No 'fts_text' index → ERROR describing the problem + False."""
+        """No FTS index on 'text' → ERROR describing the problem + False
+        (the embedding index alone does not satisfy the FTS check)."""
         table = _mock_table(
-            indices=[MockIndex("other_idx"), MockIndex("embedding_idx")]
+            indices=[
+                MockIndex("other_idx"),
+                MockIndex("embedding_idx", ["embedding"], "IvfPq"),
+            ]
         )
         with self.assertLogs(_LIFESPAN_LOGGER, level="ERROR") as captured:
             result = await validate_fts_index(table)
@@ -81,9 +89,13 @@ class TestFTSValidationAtStartup(unittest.IsolatedAsyncioTestCase):
     # ── Test 2: FTS exists + hybrid enabled → no ERROR logged ──────────────────
 
     async def test_fts_exists_hybrid_enabled_no_error(self):
-        """An existing 'fts_text' index → True, and no ERROR logged."""
+        """A real-shape FTS index on 'text' (columns=['text'],
+        index_type='FTS') → True, and no ERROR logged (issue #557)."""
         table = _mock_table(
-            indices=[MockIndex("fts_text"), MockIndex("embedding_idx")]
+            indices=[
+                MockIndex("text_idx", ["text"], "FTS"),
+                MockIndex("embedding_idx", ["embedding"], "IvfPq"),
+            ]
         )
         handler = _CapturingHandler()
         logger = logging.getLogger(_LIFESPAN_LOGGER)

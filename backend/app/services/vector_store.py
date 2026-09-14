@@ -44,6 +44,28 @@ def _get_vector_search_concurrency() -> int:
     return value if isinstance(value, int) else 32
 
 
+async def has_index(table: Any, column: str, kind: str) -> bool:
+    """Return True iff ``table`` carries an index of type ``kind`` on ``column``.
+
+    Detection is by column and index type against a real LanceDB listing —
+    never by index name. ``create_index`` is called without ``name=`` in this
+    module, so LanceDB auto-derives names (``text_idx`` for FTS on ``text``,
+    ``embedding_idx`` for IvfPq on ``embedding``); the name is an
+    implementation detail of the engine version, and two name-based guards
+    have already been always-False against real tables (issue #148 ANN,
+    issue #557 FTS). Reads ``idx.columns`` / ``idx.index_type`` directly:
+    a listing entry missing those attributes raises AttributeError /
+    TypeError, which propagates to the caller's existing error policy
+    (no silent per-entry swallowing). Raises whatever ``list_indices()``
+    raises as well.
+    """
+    indices = await table.list_indices()
+    return any(
+        list(idx.columns) == [column] and idx.index_type == kind
+        for idx in indices
+    )
+
+
 def _lance_escape(value) -> str:
     """Escape a value for use in LanceDB SQL-like where clauses.
 
@@ -502,21 +524,18 @@ class VectorStore:
                 # Without this, _last_index_build_row_count stays 0 after restart
                 # and the churn-based rebuild path never triggers.
                 try:
-                    existing_indices = await self.table.list_indices()
-                    # Detect the existing ANN index by NAME, consistent with
-                    # every other index check in this class. LanceDB names a
-                    # vector index on the "embedding" column "embedding_idx"
-                    # by default. The previous check matched the literal
-                    # "IVF_PQ" against idx.index_type, but LanceDB reports the
-                    # type as "IvfPq" (mixed-case, no underscore) — so the
-                    # check was ALWAYS False, leaving _last_index_build_row_count
-                    # at 0 and forcing a full IVF_PQ rebuild on the first search
-                    # after every startup (a multi-second to multi-minute stall
-                    # on large tables).
-                    has_ivfpq = any(
-                        getattr(idx, "name", None) == "embedding_idx"
-                        for idx in existing_indices
-                    )
+                    # Detect the existing ANN index by COLUMN and TYPE via the
+                    # shared ``has_index`` helper. LanceDB reports the type as
+                    # "IvfPq" (mixed-case, no underscore) and the columns as
+                    # ["embedding"]; the index name is engine-derived
+                    # ("embedding_idx") and must not be load-bearing — the
+                    # earlier check that matched the literal "IVF_PQ" against
+                    # idx.index_type was ALWAYS False, leaving
+                    # _last_index_build_row_count at 0 and forcing a full
+                    # IVF_PQ rebuild on the first search after every startup
+                    # (issue #148). Name-based FTS detection (#557) repeated
+                    # the same class.
+                    has_ivfpq = await has_index(self.table, "embedding", "IvfPq")
                     if has_ivfpq:
                         self._last_index_build_row_count = await self.table.count_rows()
                         self._last_index_build_generation = (
@@ -547,11 +566,12 @@ class VectorStore:
                 VECTOR_INDEX_MIN_ROWS,
             )
 
-        # Create FTS index only if missing (FR-014)
+        # Create FTS index only if missing (FR-014). Detection is by column
+        # and index type (issue #557): the engine auto-names the index
+        # ("text_idx"), so a name-based guard can never match.
         fts_index_exists = False
         try:
-            indices = await self.table.list_indices()
-            fts_index_exists = any(idx.name == "fts_text" for idx in indices)
+            fts_index_exists = await has_index(self.table, "text", "FTS")
         except (OSError, RuntimeError, ValueError):
             pass
 
@@ -653,8 +673,7 @@ class VectorStore:
             row_count = await self.table.count_rows()
             if row_count < VECTOR_INDEX_MIN_ROWS:
                 return False
-            indices = await self.table.list_indices()
-            has_embedding_idx = any(idx.name == "embedding_idx" for idx in indices)
+            has_embedding_idx = await has_index(self.table, "embedding", "IvfPq")
         except (OSError, RuntimeError, ValueError) as e:
             logger.debug("Vector index freshness probe failed (%s); will take lock", e)
             return True  # uncertain → let the locked path decide
@@ -698,8 +717,7 @@ class VectorStore:
 
         has_embedding_idx = False
         try:
-            indices = await self.table.list_indices()
-            has_embedding_idx = any(idx.name == "embedding_idx" for idx in indices)
+            has_embedding_idx = await has_index(self.table, "embedding", "IvfPq")
         except (OSError, RuntimeError, ValueError) as e:
             logger.debug("Could not check existing indices: %s", e)
 
@@ -768,8 +786,7 @@ class VectorStore:
         # Check if index exists
         has_ivfpq = False
         try:
-            indices = await self.table.list_indices()
-            has_ivfpq = any(idx.name == "embedding_idx" for idx in indices)
+            has_ivfpq = await has_index(self.table, "embedding", "IvfPq")
         except (OSError, RuntimeError, ValueError):
             pass
 

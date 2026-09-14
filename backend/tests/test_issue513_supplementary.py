@@ -168,8 +168,10 @@ def artifact_root(tmp_path):
 
 
 class _FakeIndex:
-    def __init__(self, name):
+    def __init__(self, name, columns=None, index_type=None):
         self.name = name
+        self.columns = columns if columns is not None else []
+        self.index_type = index_type if index_type is not None else ""
 
 
 def _schema_names(schema) -> list:
@@ -261,7 +263,10 @@ class _FakeTable:
     async def create_index(self, column=None, config=None, replace=False):
         if replace:
             self.indices = [i for i in self.indices if i.name != f"{column}_idx"]
-        self.indices.append(_FakeIndex(f"{column}_idx"))
+        # Shape-complete entry: the app detects indexes by column+type
+        # (issue #557), so name-only fakes would read as absent.
+        kind = "FTS" if column == "text" else "IvfPq"
+        self.indices.append(_FakeIndex(f"{column}_idx", [column], kind))
         return None
 
     async def to_pandas(self):
