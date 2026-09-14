@@ -349,6 +349,28 @@ def main() -> int:
                 f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
             )
 
+    # Health-probe family (issue #551): the provider-probing health routes'
+    # rate limit must carry the same default across backend/app/config.py,
+    # .env.example, and docker-compose.yml. Mirrors the draft_str_settings
+    # pattern as its own self-documenting family.
+    health_str_settings = {
+        "HEALTH_PROBE_RATE_LIMIT": "health_probe_rate_limit",
+    }
+    for env_name, field_name in health_str_settings.items():
+        backend_val = backend_str_default(backend_config, field_name)
+        env_val = env_value(env_text, env_name)
+        compose_val = compose_default(compose_text, env_name)
+        if backend_val is None:
+            failures.append(f"backend/app/config.py {field_name} str default could not be parsed")
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} default {env_val!r} does not match backend default {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
+            )
+
     draft_list_settings = {
         "DRAFT_ALLOWED_MODEL_ORIGINS": "draft_allowed_model_origins",
         "DRAFT_SENSITIVE_ALLOWED_MODEL_ORIGINS": "draft_sensitive_allowed_model_origins",

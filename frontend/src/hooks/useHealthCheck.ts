@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import apiClient, { type HealthResponse } from "@/lib/api";
+import { useAuthStore } from "@/stores/useAuthStore";
 import type { HealthStatus } from "@/types/health";
 
 interface UseHealthCheckOptions {
@@ -34,11 +35,19 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
   const failStreak = useRef(0);
   const hadSuccess = useRef(false);
   const lastDeepAt = useRef(0);
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
 
   const checkHealth = useCallback(async () => {
+    // Deep probing now requires credentials on the backend (issue #551): an
+    // unauthenticated deep=true would 401 and flap the reconnect banner for
+    // anonymous visitors (the hook is mounted at the App root, login page
+    // included). Shallow polls still serve the server-side last-known cache
+    // and lazily refresh it, so anonymous users keep getting truthful
+    // service status without triggering provider probes.
     const deep =
-      isFirstCheck.current ||
-      Date.now() - lastDeepAt.current >= DEEP_RECHECK_INTERVAL;
+      isAuthenticated &&
+      (isFirstCheck.current ||
+        Date.now() - lastDeepAt.current >= DEEP_RECHECK_INTERVAL);
     try {
       // First check and periodic backstops include deep model probing;
       // other polls are lightweight (server serves cached last-known status)
@@ -84,7 +93,9 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
         lastChecked: new Date(),
       }));
     }
-  }, []);
+    // isAuthenticated is read inside the callback: without it the closure
+    // would pin the mount-time auth state and never send deep after login.
+  }, [isAuthenticated]);
 
   useEffect(() => {
     checkHealth();

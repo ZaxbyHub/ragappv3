@@ -770,7 +770,12 @@ class TestIntegration(unittest.TestCase):
         """Test health endpoint reflects degraded service state."""
         from fastapi.testclient import TestClient
 
-        from app.api.deps import get_llm_health_checker, get_model_checker
+        from app.api.deps import (
+            get_current_active_user,
+            get_llm_health_checker,
+            get_model_checker,
+        )
+        from app.limiter import limiter as _app_limiter
         from app.main import app
 
         # Setup mocks for app state
@@ -797,10 +802,20 @@ class TestIntegration(unittest.TestCase):
             }
         )
 
+        # Deep health is auth-gated since issue #551: drive it as an
+        # authenticated caller and keep the shared limiter bucket clean.
         app.dependency_overrides[get_llm_health_checker] = lambda: mock_llm_checker
         app.dependency_overrides[get_model_checker] = lambda: mock_model_checker
+        app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": 0,
+            "username": "admin",
+            "role": "superadmin",
+            "is_active": 1,
+            "must_change_password": 0,
+        }
 
         try:
+            _app_limiter._storage.reset()
             response = client.get("/api/health?deep=true")
             self.assertEqual(response.status_code, 200)
 
@@ -811,6 +826,8 @@ class TestIntegration(unittest.TestCase):
         finally:
             app.dependency_overrides.pop(get_llm_health_checker, None)
             app.dependency_overrides.pop(get_model_checker, None)
+            app.dependency_overrides.pop(get_current_active_user, None)
+            _app_limiter._storage.reset()
 
     # ==========================================================================
     # Test: Memory Management

@@ -15,13 +15,18 @@ import time
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import TypeAdapter
 
 from app.api.deps import (
     get_current_active_user,
     get_db,
     get_llm_health_checker,
     get_model_checker,
+    require_deep_health_probe_auth,
+    require_health_probe_auth,
 )
+from app.config import settings
+from app.limiter import limiter
 from app.services.llm_health import LLMHealthChecker
 from app.services.model_checker import ModelChecker
 
@@ -194,12 +199,44 @@ def _vector_reconciliation_status(conn: sqlite3.Connection) -> dict:
     }
 
 
+_deep_bool = TypeAdapter(bool)
+
+
+def _deep_probe_requested(request: Request) -> bool:
+    """True when the request actually asks for the expensive deep probe.
+
+    Used with slowapi's ``exempt_when`` so the route-level limit consumes the
+    bucket ONLY for deep probes: issue #551 keeps the shallow-poll contract
+    unchanged, and the frontend banner (plus NAT-shared deployments) polls it
+    anonymously every 30 s — a shallow 429 after 30 polls per egress IP would
+    flap the reconnect banner.
+
+    Parsing uses pydantic's own bool coercion — the SAME engine FastAPI uses
+    for the route's ``deep: bool = Query(False)`` parameter — so every
+    spelling pydantic reads as true (``true``/``1``/``yes``/``on``/``t``/
+    ``y``, any case) is limited as a deep probe and nothing else is. A
+    hand-rolled set here diverged from pydantic once already (``?deep=t``
+    ran the provider sweep unauthenticated and limiter-exempt; final-critic
+    round 1). Unparseable strings are shallow here and 422 at the route
+    parameter, so the gate is never weaker than the probe.
+    """
+    raw = request.query_params.get("deep")
+    if raw is None:
+        return False
+    try:
+        return _deep_bool.validate_python(raw)
+    except ValueError:
+        return False
+
+
 @router.get("/health")
+@limiter.limit(settings.health_probe_rate_limit, exempt_when=lambda r: not _deep_probe_requested(r))
 async def health_check(
     request: Request,
     deep: bool = Query(False, description="Run expensive model availability checks"),
     llm_checker: LLMHealthChecker = Depends(get_llm_health_checker),
     model_checker: ModelChecker = Depends(get_model_checker),
+    user: dict | None = Depends(require_deep_health_probe_auth),
 ):
     """
     Health check endpoint.
@@ -269,8 +306,11 @@ async def vector_reconciliation_health(
 
 
 @router.get("/llm-health/modes")
+@limiter.limit(settings.health_probe_rate_limit)
 async def llm_mode_health(
+    request: Request,
     llm_checker: LLMHealthChecker = Depends(get_llm_health_checker),
+    user: dict = Depends(require_health_probe_auth),
 ):
     """Probe both Thinking and Instant LLM endpoints.
 

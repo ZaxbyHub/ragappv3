@@ -19,7 +19,9 @@
  *
  * Wire-level facts asserted alongside the state: the mount check is sent with
  * `{ params: { deep: true } }` and the interval polls with `{ params: {} }`
- * (lightweight), read from the mocked api client's call log.
+ * (lightweight), read from the mocked api client's call log. Since issue
+ * #551 the mount check carries deep=true only for an authenticated user, so
+ * this scenario runs with the auth store set to authenticated.
  */
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -35,6 +37,7 @@ vi.mock("@/lib/api", async () => {
 });
 
 import { useHealthCheck } from "@/hooks/useHealthCheck";
+import { useAuthStore } from "@/stores/useAuthStore";
 
 const healthyDeepResponse = {
   data: {
@@ -60,16 +63,23 @@ const explicitFalseResponse = {
 };
 
 describe("useHealthCheck — last-known retention on null probes (issue #494 AC6/OPS-008, PRESERVING)", () => {
+  let priorAuthState: ReturnType<typeof useAuthStore.getState>;
+
   beforeEach(() => {
     vi.useFakeTimers();
+    priorAuthState = useAuthStore.getState();
   });
   afterEach(() => {
     vi.useRealTimers();
+    useAuthStore.setState(priorAuthState);
     mockGet.mockReset();
     vi.clearAllMocks();
   });
 
   it("retains indicators when lightweight polls return null services; explicit false still flips down", async () => {
+    // Deep probing requires credentials since issue #551; this scenario's
+    // mount check is the authenticated deep check.
+    useAuthStore.setState({ isAuthenticated: true });
     mockGet.mockResolvedValue(healthyDeepResponse as never);
     const { result } = renderHook(() => useHealthCheck({ pollInterval: 5_000 }));
 

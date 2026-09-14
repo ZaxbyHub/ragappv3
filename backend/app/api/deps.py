@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import inspect
 import logging
 import secrets
@@ -14,7 +15,7 @@ from enum import IntEnum
 from threading import Lock
 from typing import TYPE_CHECKING, Optional
 
-from fastapi import Cookie, Depends, Header, HTTPException, Request
+from fastapi import Cookie, Depends, Header, HTTPException, Query, Request
 
 from app.config import Settings, settings
 from app.models.database import SQLiteConnectionPool, get_pool
@@ -608,6 +609,80 @@ async def get_current_user_or_service_account(
         "name": sa_name,
         "username": f"sa:{sa_name}",
     }
+
+
+async def require_health_probe_auth(
+    request: Request,
+    authorization: str | None = Header(None),
+    access_token: str | None = Cookie(None),
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """Authentication gate for routes that trigger real provider generations
+    (deep health probes: ``GET /api/health?deep=true`` and
+    ``GET /api/llm-health/modes``, issue #551 C12).
+
+    Accepts either:
+
+    - header ``X-API-Key`` equal to ``settings.health_check_api_key`` — the
+      same credential the rate limiter's whitelist already honors, so
+      monitoring systems configured with only that key keep working
+      (fail-closed: when the setting is empty or unset, this path is dead);
+    - an authenticated user, resolved by calling ``get_current_active_user``
+      itself — including any ``app.dependency_overrides`` entry for it, the
+      exact pattern ``get_current_user_or_service_account`` uses, so the
+      existing test-suite override pathway keeps working.
+
+    Raises the underlying 401 otherwise.
+    """
+    key = request.headers.get("X-API-Key")
+    if (
+        key
+        and settings.health_check_api_key
+        and hmac.compare_digest(key, settings.health_check_api_key)
+    ):
+        return {
+            "id": "health-api-key",
+            "username": "health-api-key",
+            "role": "monitor",
+            "is_active": True,
+        }
+    override = request.app.dependency_overrides.get(get_current_active_user)
+    if override is not None:
+        result = override()
+        return await result if inspect.iscoroutine(result) else result
+    return await get_current_active_user(
+        request=request,
+        authorization=authorization,
+        access_token=access_token,
+        db=db,
+    )
+
+
+async def require_deep_health_probe_auth(
+    request: Request,
+    deep: bool = Query(False),
+    authorization: str | None = Header(None),
+    access_token: str | None = Cookie(None),
+    db: sqlite3.Connection = Depends(get_db),
+) -> dict | None:
+    """deep-only variant of ``require_health_probe_auth`` for ``/api/health``.
+
+    The shallow poll (``deep`` omitted/false) stays anonymous-open — it is the
+    frontend banner's heartbeat and never triggers provider work inline
+    (issue #551: "deep=false ... is unchanged"). Only an actual deep probe is
+    gated. Returns None for shallow calls, the principal for authenticated
+    deep calls, and raises the underlying 401 otherwise.
+
+    ``deep`` is parsed by FastAPI/pydantic (the same coercion the route's own
+    ``deep: bool = Query(False)`` parameter gets), so every spelling pydantic
+    accepts as true — ``true``/``1``/``yes``/``on``/``t``/``y``, any case —
+    is gated. Hand-rolling a truthy-string set here would diverge from the
+    route parameter and reopen the anonymous-probe bypass (final-critic
+    round 1: ``?deep=t`` ran the provider sweep unauthenticated).
+    """
+    if not deep:
+        return None
+    return await require_health_probe_auth(request, authorization, access_token, db)
 
 
 def get_evaluate_policy(

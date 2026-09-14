@@ -83,6 +83,16 @@ class WhitelistLimiter(Limiter):
         original path; routing has already completed before this runs.
         """
         if _should_whitelist(request):
+            # slowapi's limit decorator reads request.state.view_rate_limit
+            # unconditionally after the handler returns (even with headers
+            # disabled), and normal (non-whitelisted) requests get it set
+            # inside Limiter._check_request_limit. The whitelist early-return
+            # must set it too, or every whitelisted request to ANY decorated
+            # route 500s with AttributeError (pre-existing on master; surfaced
+            # here by the new health-probe limits, issue #551).
+            state = getattr(request, "state", None)
+            if state is not None:
+                state.view_rate_limit = None
             return
         # Normalize the scope path so trailing-slash and non-slash variants of
         # the SAME route share one rate-limit bucket (see class docstring). Guard
