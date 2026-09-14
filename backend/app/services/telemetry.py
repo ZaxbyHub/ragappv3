@@ -80,6 +80,7 @@ class Telemetry:
         self._queue_depths: Dict[str, list] = {}
         self._first_useful: Dict[str, float] = {}
         self._provider_calls: Dict[str, Dict[str, int]] = {}
+        self._stage_totals: Dict[str, float] = {}
         self._embedding_cache_hits = 0
         self._shard_name = f"telemetry-{os.getpid()}-{secrets.token_hex(4)}.json"
         self._otel_observers: list = []
@@ -100,6 +101,13 @@ class Telemetry:
             return
         self._stage_durations.setdefault(turn_id, {})[stage] = float(
             duration_seconds
+        )
+        # PR #595 review F-002: keep a running per-stage accumulator so the
+        # OTel observer can read totals in O(1) — the previous
+        # re-scan-all-history implementation blocked the event loop with
+        # O(every-turn-ever) work on every record.
+        self._stage_totals[stage] = (
+            self._stage_totals.get(stage, 0.0) + float(duration_seconds)
         )
         self._notify_otel_observers()
 
@@ -168,9 +176,14 @@ class Telemetry:
             except Exception:  # noqa: BLE001 — export must never break records
                 logger.debug("otel observer failed", exc_info=True)
 
+    def stage_totals(self) -> Dict[str, float]:
+        """Running per-stage duration totals (O(1); PR #595 review F-002)."""
+        return dict(self._stage_totals)
+
     def reset(self) -> None:
         self._chat_turns = 0
         self._stage_durations = {}
+        self._stage_totals = {}
         self._queue_waits = {}
         self._queue_depths = {}
         self._first_useful = {}
@@ -316,6 +329,9 @@ def init_telemetry(registry_dir: Optional[Path] = None) -> Telemetry:
             getattr(settings, "telemetry_registry_dir", "") or ""
         )
         registry_dir = Path(configured) if configured else None
+    global _tracer, _tracer_resolved
+    _tracer = None
+    _tracer_resolved = False
     _singleton = Telemetry(
         enabled=bool(getattr(settings, "telemetry_enabled", True)),
         registry_dir=registry_dir,
@@ -378,24 +394,46 @@ _tracer_resolved = False
 
 
 def _resolve_tracer():
-    """Resolve the span tracer once.
+    """Resolve the span tracer, installing a real pipeline when possible.
 
-    Returns the OTel tracer when BOTH the optional extra is importable AND
-    telemetry is enabled; otherwise (and permanently, on ImportError) the
-    no-op shim. The import only ever happens here, so base installs never pay
-    for (or depend on) opentelemetry.
+    With the optional extra importable and telemetry enabled, this installs
+    OUR OWN TracerProvider (PR #595 review F-001a: relying on the global
+    default left every span non-recording — nothing was ever exported, and
+    the ProxyTracer defeated the no-op gate so the middleware attached for
+    zero benefit). With an OTLP endpoint configured the provider exports
+    spans via BatchSpanProcessor; without one, spans are still REAL
+    (recording, parented, measured) and simply dropped at the end — the
+    documented export upgrade path is setting the endpoint. Without the
+    extra (the default, air-gapped install) this returns the no-op shim and
+    nothing opentelemetry-related is imported.
     """
     global _tracer, _tracer_resolved
     if _tracer_resolved:
         return _tracer
+    # Resolve telemetry FIRST: init_telemetry() resets the tracer globals
+    # (F-009 re-resolve), and it can run inside the get_telemetry() call
+    # below — mutating the globals before it would be clobbered.
+    telemetry_enabled = get_telemetry().enabled
     _tracer_resolved = True
     _tracer = _NoOpTracer()
-    if get_telemetry().enabled:
+    if telemetry_enabled:
         try:
             from opentelemetry import trace as _otel_trace
+            from opentelemetry.sdk.trace import TracerProvider as _SdkProvider
 
-            provider = _otel_trace.get_tracer_provider()
-            _tracer = provider.get_tracer("ragapp.telemetry")
+            sdk_provider = _SdkProvider()
+            endpoint = os.environ.get(_OTLP_EXPORT_ENV, "").strip()
+            if endpoint:
+                from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                    OTLPSpanExporter,
+                )
+                from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+                sdk_provider.add_span_processor(
+                    BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
+                )
+            _otel_trace.set_tracer_provider(sdk_provider)
+            _tracer = sdk_provider.get_tracer("ragapp.telemetry")
         except ImportError:
             # Documented off-state: the optional extra is not installed.
             pass
@@ -554,7 +592,9 @@ def maybe_init_otel_export() -> bool:
     # gen_ai-named operation-duration counter driven by the stage
     # recorder, so the OTLP bridge exports GenAI-convention metrics
     # alongside the ragapp_* bridge. Naming follows the Development-status
-    # semantic-conventions-genai set — do not describe as stable.
+    # semantic-conventions-genai set — do not describe as stable. The
+    # operation names here are this app's stage names (planning /
+    # searching / reading / generation), not GenAI client operations.
     genai_counter = meter.create_counter("gen_ai.client.operation.duration")
     # Publish the aggregate on each export interval by reading the same
     # snapshot /metrics serves — the shard aggregate, so replicas sum.
@@ -562,18 +602,14 @@ def maybe_init_otel_export() -> bool:
 
     def _observe(_options):
         # Fired on each chat-turn/stage record; the OTel reader exports the
-        # accumulated counters on its own cadence.
+        # accumulated counters on its own cadence. O(1) per record: reads
+        # the running accumulator, never the per-turn history (F-002).
         totals = telemetry._aggregate_counts()
         delta = totals["chat_turns"] - observed["last"]
         observed["last"] = totals["chat_turns"]
         if delta > 0:
             counter.add(delta)
-        stage_totals: Dict[str, float] = {}
-        for per_stage in telemetry._stage_durations.values():
-            for stage, duration in per_stage.items():
-                stage_totals[stage] = stage_totals.get(stage, 0.0) + float(
-                    duration
-                )
+        stage_totals = telemetry.stage_totals()
         for stage, total in stage_totals.items():
             stage_delta = total - observed["stages"].get(stage, 0.0)
             if stage_delta > 0:

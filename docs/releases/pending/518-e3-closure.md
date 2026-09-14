@@ -60,5 +60,9 @@
 - Span attributes and gen_ai metric names follow the Development-status
   GenAI semantic conventions (pinned extra; do not treat as stable).
 - The generation binding is read from the snapshot at backup time; a set
-  created by pre-closure drafts of `backup_set.py` restores with a WARNING
-  (no coherence check) — no released set exists.
+  created by pre-closure drafts of `backup_set.py` — or any snapshot taken
+  before an index generation has ever been published (fresh installs) —
+  restores with a WARNING (no coherence check). No released set exists.
+  The restore-side comparison is a structural sanity check between the
+  manifest binding and the restored journal (latest id), not tamper
+  proofing: a fully doctored set could rewrite both sides.

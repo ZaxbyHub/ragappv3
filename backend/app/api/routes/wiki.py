@@ -728,8 +728,11 @@ async def promote_memory_to_wiki(
         # inference; gate it on the shared BACKGROUND admission budget like
         # the compile processors (route-level only — the processors already
         # hold their own gate when they drive the compiler, and the
-        # controller is explicitly non-reentrant). Foreground preference
-        # lets chat preempt this work under load.
+        # controller is explicitly non-reentrant). The default
+        # foreground=True is deliberate: this is an interactive user
+        # request, so it keeps first-refusal ordering when a budget frees
+        # up (preemption itself only applies to BACKGROUND-class holders
+        # and is out of scope for this class either way — PR #595 F-006).
         try:
             async with get_admission_controller().admit(
                 AdmissionClass.BACKGROUND

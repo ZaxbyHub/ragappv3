@@ -607,14 +607,19 @@ class LLMClient:
         # E3 closure (#518): gen_ai client span for the streaming chat call.
         # Entered manually (not via ``with``) so the large stream-consumption
         # block keeps its existing indentation; exited in the finally below
-        # so the span covers the whole stream, error or not.
-        _genai_stream_span = start_span(
+        # so the span covers the whole stream, error or not. The CONTEXT
+        # MANAGER is held in a local for the whole function: exiting the
+        # span object instead of the CM, or letting the CM be GC'd early
+        # (PR #595 review F-001c), ends the span at enter time — 0ms
+        # duration, orphaned child spans, and SDK end-twice warnings.
+        _genai_stream_cm = start_span(
             "gen_ai chat stream",
             attributes={
                 "gen_ai.operation.name": "chat",
                 "gen_ai.request.model": str(payload.get("model", "")),
             },
-        ).__enter__()
+        )
+        _genai_stream_cm.__enter__()
         try:
             # E3 telemetry (issue #518): propagate correlation headers when
             # bound; kwarg omitted when empty (strict test fakes compat).
@@ -914,7 +919,7 @@ class LLMClient:
                 self._circuit_breaker.record_failure()
             raise LLMError(f"Streaming request failed: {str(e)}") from e
         finally:
-            _genai_stream_span.__exit__(*sys.exc_info())
+            _genai_stream_cm.__exit__(*sys.exc_info())
             if stream_succeeded:
                 async with self._circuit_breaker._lock:
                     self._circuit_breaker.record_success()

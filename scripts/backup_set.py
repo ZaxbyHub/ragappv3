@@ -105,10 +105,18 @@ def _snapshot_generation_binding(snapshot_bytes: bytes) -> Optional[dict]:
     """
     import tempfile
 
+    fd = -1
+    tmp_path = None
     fd, tmp_path = tempfile.mkstemp(suffix=".snap.db")
     try:
-        os.write(fd, snapshot_bytes)
+        # Write fully (short writes truncate the snapshot silently) and
+        # guarantee the fd closes even on failure (PR #595 review F-004).
+        view = memoryview(snapshot_bytes)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
         os.close(fd)
+        fd = -1
         conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
         try:
             row = conn.execute(
@@ -126,10 +134,16 @@ def _snapshot_generation_binding(snapshot_bytes: bytes) -> Optional[dict]:
         )
         return None
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     if row is None:
         return None
     return {"id": int(row[0]), "name": str(row[1]), "detail": str(row[2] or "")}

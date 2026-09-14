@@ -29,6 +29,7 @@ import hashlib
 import os
 import sys
 import time
+import unittest
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock, patch
@@ -451,3 +452,108 @@ class TestGenAiObserverPath:
         tel2.record_stage("t2", "generation", 0.2)
         assert received == [None]
         assert tel2.snapshot()["stage_durations"]["t2"]["generation"] == 0.2
+
+
+class TestRealTracerPipeline(unittest.TestCase):
+    """PR #595 review F-001: with the optional extra installed and telemetry
+    enabled, spans must be REAL (recording, SERVER kind, non-zero duration)
+    — not NonRecordingSpans from the default global provider. Skipped when
+    the otel SDK is not installed (air-gapped CI); the shim tests above
+    cover that half."""
+
+    def setUp(self):
+        # Real import guard — find_spec on a dotted name can be fooled by
+        # namespace-package shadows and NEVER pop the SDK from sys.modules
+        # (the pop dance was CI-fragile: xdist workers + import sentinels).
+        # On CI the SDK is absent -> ImportError -> skip; where it is
+        # installed, the SDK initializes cleanly in this fresh process.
+        try:
+            import opentelemetry.sdk.trace  # noqa: F401
+        except ImportError:
+            self.skipTest("opentelemetry SDK not installed")
+        telemetry.reset_telemetry()
+        telemetry._tracer = None
+        telemetry._tracer_resolved = False
+
+    def tearDown(self):
+        telemetry.reset_telemetry()
+        telemetry._tracer = None
+        telemetry._tracer_resolved = False
+
+    def _self_managed_provider(self):
+        """A real SDK provider + in-memory exporter, installed as the
+        module tracer WITHOUT touching the process-global once-sentinel:
+        deterministic regardless of which other tests ran first on this
+        xdist worker."""
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        captured = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(captured))
+        tracer = provider.get_tracer("ragapp.telemetry.test")
+        self._saved = (telemetry._tracer, telemetry._tracer_resolved)
+        telemetry._tracer = tracer
+        telemetry._tracer_resolved = True
+        return provider, captured
+
+    def _restore_tracer(self):
+        telemetry._tracer, telemetry._tracer_resolved = self._saved
+
+    def test_middleware_exports_server_span_with_duration(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from opentelemetry.trace import SpanKind
+
+        provider, captured = self._self_managed_provider()
+        from app.middleware.telemetry_span import TelemetrySpanMiddleware
+
+        app = FastAPI()
+        app.add_middleware(TelemetrySpanMiddleware)
+
+        @app.get("/ping")
+        def ping():
+            return {"ok": True}
+
+        client = TestClient(app)
+        resp = client.get("/ping")
+        self.assertEqual(resp.status_code, 200)
+
+        spans = captured.get_finished_spans()
+        self.assertEqual(len(spans), 1, spans)
+        span = spans[0]
+        self.assertEqual(span.kind, SpanKind.SERVER)
+        self.assertGreater(
+            span.end_time - span.start_time,
+            0,
+            "span must have non-zero duration",
+        )
+
+    def test_stream_span_cm_held_for_whole_lifetime(self):
+        """F-001c regression: the streaming span pattern must hold the
+        context MANAGER (not just the entered span) and exit on the CM, so
+        the span's lifetime covers the stream."""
+        import time
+
+        provider, captured = self._self_managed_provider()
+
+        # The exact pattern the streaming path uses (post-fix).
+        cm = telemetry.start_span(
+            "gen_ai chat stream",
+            attributes={"gen_ai.operation.name": "chat"},
+        )
+        cm.__enter__()
+        time.sleep(0.01)
+        cm.__exit__(None, None, None)
+
+        spans = captured.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        self.assertGreater(
+            spans[0].end_time - spans[0].start_time,
+            0,
+            "stream span must not be closed at enter time (F-001c)",
+        )
+

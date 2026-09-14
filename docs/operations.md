@@ -207,14 +207,18 @@ roles, not capacity claims.
 ## Tracing (OpenTelemetry spans)
 
 - Spans ride the SAME optional extra as the OTLP metric bridge
-  (`backend/requirements-otel.txt` + `OTEL_EXPORTER_OTLP_ENDPOINT`).
-  Installing the extra and enabling telemetry turns on: one FastAPI
-  server span per request (`http.*` attributes, no user content), one
-  `gen_ai` client span per LLM / embeddings / rerank provider call
-  (`gen_ai.operation.name`, `gen_ai.request.model`), and outbound W3C
-  `traceparent` values derived from the ACTIVE span context instead of
+  (`backend/requirements-otel.txt`). With the extra installed and
+  telemetry enabled, spans are REAL: one FastAPI server span per request
+  (SERVER kind, `http.*` attributes, no user content) and one `gen_ai`
+  client span per LLM / embeddings / rerank provider call
+  (`gen_ai.operation.name`, `gen_ai.request.model`); outbound W3C
+  `traceparent` values derive from the ACTIVE span context instead of
   the deterministic per-turn synthesis (the synthesis remains the
-  fallback when tracing is off).
+  fallback when tracing is off). Export: set
+  `OTEL_EXPORTER_OTLP_ENDPOINT` and spans ship to it via a batch
+  processor; without an endpoint the spans are recorded and measured but
+  dropped at the end of each request/call (add an exporter or collector
+  to retain them).
 - The OTLP bridge additionally exports a
   `gen_ai.client.operation.duration` counter by
   `gen_ai.operation.name`, fed by the per-turn stage recorder

@@ -82,8 +82,8 @@ class TestRealLanceRestoreDrill(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _backup(self) -> Path:
-        out = self.root / "backup"
+    def _backup(self, name: str = "backup") -> Path:
+        out = self.root / name
         fake_settings = SimpleNamespace(sqlite_path=str(self.db_path))
         with patch.object(backup_set_module, "settings", fake_settings):
             return create_backup_set(
@@ -185,6 +185,8 @@ class TestRealLanceRestoreDrill(unittest.TestCase):
         self.assertIn("generation binding mismatch", str(ctx.exception))
 
     def test_legacy_manifest_without_generation_restores_with_warning(self):
+        import logging
+
         manifest_path = self._backup()
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
         for item in data["items"]:
@@ -193,16 +195,71 @@ class TestRealLanceRestoreDrill(unittest.TestCase):
         manifest_path.write_text(json.dumps(data), encoding="utf-8")
 
         dest = self.root / "restore-legacy"
-        result = restore_backup_set(
-            manifest_path.parent,
-            dest,
-            key_provider=lambda: (_KEY, 1),
-            lancedb_factory=None,
-        )
-        # Legacy tolerance: restores fine; the WARNING is logged (checked
-        # by the log-once convention — here we assert the restore still
-        # verifies every digest).
+        with self.assertLogs("scripts.restore", level="WARNING") as captured:
+            result = restore_backup_set(
+                manifest_path.parent,
+                dest,
+                key_provider=lambda: (_KEY, 1),
+                lancedb_factory=None,
+            )
+        # Legacy tolerance: restores fine AND the promised WARNING fires
+        # (PR #595 review F-010 — the old version of this test never
+        # asserted the log record it was named for).
         self.assertTrue(result["verified"], result)
+        self.assertTrue(
+            any("no generation binding" in r.getMessage() for r in captured.records),
+            captured.output,
+        )
+
+    def test_restore_fails_when_db_is_newer_than_manifest_binding(self):
+        """PR #595 review F-003: the MAX(id) comparison must catch a set
+        that pairs a NEWER sqlite snapshot with an OLDER vector tree. Built
+        here as backup-1's binding id grafted onto backup-2's (newer)
+        snapshot."""
+        import sqlite3
+
+        manifest_path = self._backup("backup-older")  # binding = generation 1
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            publish_index_generation(
+                conn,
+                store="lancedb",
+                table_name="drill_chunks",
+                detail="newer generation",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        # Backup tags embed a per-second timestamp: wait so backup-2 gets a
+        # distinct tag name (same-second tags collide in lancedb).
+        import time
+
+        time.sleep(1.1)
+        newer_manifest_path = self._backup("backup-newer")  # binding = generation 2
+
+        # Graft backup-1's OLDER binding onto backup-2's NEWER set: the
+        # exact paired-inconsistently shape the MAX(id) check exists for.
+        newer = json.loads(newer_manifest_path.read_text(encoding="utf-8"))
+        older = json.loads(manifest_path.read_text(encoding="utf-8"))
+        older_binding = next(
+            i["generation"] for i in older["items"] if i.get("kind") == "lancedb"
+        )
+        newer_binding = next(
+            i for i in newer["items"] if i.get("kind") == "lancedb"
+        )
+        self.assertGreater(newer_binding["generation"]["id"], older_binding["id"])
+        newer_binding["generation"] = dict(older_binding)
+        newer_manifest_path.write_text(json.dumps(newer), encoding="utf-8")
+
+        dest = self.root / "restore-newer"
+        with self.assertRaises(RestoreError) as ctx:
+            restore_backup_set(
+                newer_manifest_path.parent,
+                dest,
+                key_provider=lambda: (_KEY, 1),
+                lancedb_factory=None,
+            )
+        self.assertIn("NEWER sqlite", str(ctx.exception))
 
 
 if __name__ == "__main__":
