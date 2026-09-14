@@ -1484,3 +1484,14 @@ docker compose pull && docker compose up -d
 - Setup Guide: `docs/non-technical-setup.md`
 - Draft Room Guide: `docs/draft-room.md`
 - API Docs: `http://localhost:9090/docs`
+
+## Inference budgets, telemetry and maintenance windows
+
+Runtime controls for inference admission, telemetry and maintenance live in
+`docs/operations.md` (Workstream E3, issue #518): per-device
+`ADMISSION_*` budgets shared across processes, the measured
+`GET /metrics` Prometheus surface with optional OTLP export, backup/restore
+drills, and maintenance-window semantics (which routes stay reachable and
+how flag toggles propagate). `TELEMETRY_ENABLED=false` makes the telemetry
+surface fully inert. See that guide before changing budgets or running a
+maintenance window.

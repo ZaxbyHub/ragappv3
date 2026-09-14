@@ -29,8 +29,11 @@ from app.services.circuit_breaker import (
 )
 from app.services.redis_io import redis_call
 from app.services.ssrf import assert_url_safe
-from app.services.telemetry import correlation_headers as _correlation_headers
+from app.services.telemetry import (
+    correlation_headers as _correlation_headers,
+)
 from app.services.telemetry import get_telemetry as _get_telemetry
+from app.services.telemetry import start_span
 from app.utils.secrets import redact_url
 
 logger = logging.getLogger(__name__)
@@ -670,7 +673,15 @@ class EmbeddingService:
                     )
                 return response
 
-            response = await embeddings_cb(_checked_post)()
+            # E3 closure (#518): gen_ai client span for the embeddings call.
+            with start_span(
+                "gen_ai embeddings",
+                attributes={
+                    "gen_ai.operation.name": "embeddings",
+                    "gen_ai.request.model": str(getattr(config, "model", "")),
+                },
+            ):
+                response = await embeddings_cb(_checked_post)()
 
             if response.status_code != 200:
                 # Other non-200 statuses (input/config 4xx errors) are

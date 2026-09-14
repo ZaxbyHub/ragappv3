@@ -80,6 +80,7 @@ class Telemetry:
         self._queue_depths: Dict[str, list] = {}
         self._first_useful: Dict[str, float] = {}
         self._provider_calls: Dict[str, Dict[str, int]] = {}
+        self._stage_totals: Dict[str, float] = {}
         self._embedding_cache_hits = 0
         self._shard_name = f"telemetry-{os.getpid()}-{secrets.token_hex(4)}.json"
         self._otel_observers: list = []
@@ -101,6 +102,14 @@ class Telemetry:
         self._stage_durations.setdefault(turn_id, {})[stage] = float(
             duration_seconds
         )
+        # PR #595 review F-002: keep a running per-stage accumulator so the
+        # OTel observer can read totals in O(1) — the previous
+        # re-scan-all-history implementation blocked the event loop with
+        # O(every-turn-ever) work on every record.
+        self._stage_totals[stage] = (
+            self._stage_totals.get(stage, 0.0) + float(duration_seconds)
+        )
+        self._notify_otel_observers()
 
     def record_queue_wait(self, admission_class: str, wait_seconds: float,
                           depth: int = 0) -> None:
@@ -167,9 +176,14 @@ class Telemetry:
             except Exception:  # noqa: BLE001 — export must never break records
                 logger.debug("otel observer failed", exc_info=True)
 
+    def stage_totals(self) -> Dict[str, float]:
+        """Running per-stage duration totals (O(1); PR #595 review F-002)."""
+        return dict(self._stage_totals)
+
     def reset(self) -> None:
         self._chat_turns = 0
         self._stage_durations = {}
+        self._stage_totals = {}
         self._queue_waits = {}
         self._queue_depths = {}
         self._first_useful = {}
@@ -315,6 +329,9 @@ def init_telemetry(registry_dir: Optional[Path] = None) -> Telemetry:
             getattr(settings, "telemetry_registry_dir", "") or ""
         )
         registry_dir = Path(configured) if configured else None
+    global _tracer, _tracer_resolved
+    _tracer = None
+    _tracer_resolved = False
     _singleton = Telemetry(
         enabled=bool(getattr(settings, "telemetry_enabled", True)),
         registry_dir=registry_dir,
@@ -338,6 +355,134 @@ def reset_telemetry() -> None:
     """Test/teardown hook — drop the singleton (see conftest reset fixture)."""
     global _singleton
     _singleton = None
+
+
+
+# ------------------------------------------------------------------ tracing
+# Issue #518 frontier-audit amendment: "Instrument FastAPI and httpx with
+# OpenTelemetry ... emit gen_ai.* spans". Spans are emitted through the SAME
+# optional extra as the OTLP metric bridge (backend/requirements-otel.txt):
+# when the extra is absent (the default, air-gapped install) the tracer is a
+# no-op shim and nothing here imports opentelemetry at all.
+
+
+class _NoOpSpan:
+    """Context-manager stand-in returned by the no-op tracer."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def set_attribute(self, key, value) -> None:
+        return None
+
+
+class _NoOpTracer:
+    """Zero-cost tracer used when the optional OTel extra is not installed."""
+
+    def start_as_current_span(self, name: str, **kwargs):
+        return _NoOpSpan()
+
+    def start_span(self, name: str, **kwargs):
+        return _NoOpSpan()
+
+
+_tracer = None
+_tracer_resolved = False
+
+
+def _resolve_tracer():
+    """Resolve the span tracer, installing a real pipeline when possible.
+
+    With the optional extra importable and telemetry enabled, this installs
+    OUR OWN TracerProvider (PR #595 review F-001a: relying on the global
+    default left every span non-recording — nothing was ever exported, and
+    the ProxyTracer defeated the no-op gate so the middleware attached for
+    zero benefit). With an OTLP endpoint configured the provider exports
+    spans via BatchSpanProcessor; without one, spans are still REAL
+    (recording, parented, measured) and simply dropped at the end — the
+    documented export upgrade path is setting the endpoint. Without the
+    extra (the default, air-gapped install) this returns the no-op shim and
+    nothing opentelemetry-related is imported.
+    """
+    global _tracer, _tracer_resolved
+    if _tracer_resolved:
+        return _tracer
+    # Resolve telemetry FIRST: init_telemetry() resets the tracer globals
+    # (F-009 re-resolve), and it can run inside the get_telemetry() call
+    # below — mutating the globals before it would be clobbered.
+    telemetry_enabled = get_telemetry().enabled
+    _tracer_resolved = True
+    _tracer = _NoOpTracer()
+    if telemetry_enabled:
+        try:
+            from opentelemetry import trace as _otel_trace
+            from opentelemetry.sdk.trace import TracerProvider as _SdkProvider
+
+            sdk_provider = _SdkProvider()
+            endpoint = os.environ.get(_OTLP_EXPORT_ENV, "").strip()
+            if endpoint:
+                from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+                    OTLPSpanExporter,
+                )
+                from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+                sdk_provider.add_span_processor(
+                    BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
+                )
+            _otel_trace.set_tracer_provider(sdk_provider)
+            _tracer = sdk_provider.get_tracer("ragapp.telemetry")
+        except ImportError:
+            # Documented off-state: the optional extra is not installed.
+            pass
+        except Exception:  # noqa: BLE001 — tracing must never break records
+            logger.debug("tracer resolution failed", exc_info=True)
+    return _tracer
+
+
+def get_tracer():
+    """Public tracer surface (span emission; no-op without the extra)."""
+    return _resolve_tracer()
+
+
+def _active_span_context():
+    """Return (trace_id_hex, span_id_hex) from the current span, or None.
+
+    Used by correlation_headers() so the outbound W3C traceparent carries a
+    REAL span context when tracing is active, instead of a synthesized id.
+    """
+    tracer = _resolve_tracer()
+    if isinstance(tracer, _NoOpTracer):
+        return None
+    try:
+        from opentelemetry import trace as _otel_trace
+
+        ctx = _otel_trace.get_current_span().get_span_context()
+        if ctx and ctx.is_valid:
+            return f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"
+    except Exception:  # noqa: BLE001 — correlation must never raise
+        logger.debug("span-context read failed", exc_info=True)
+    return None
+
+
+def start_span(name: str, **kwargs):
+    """Start a span (no-op context manager without the optional extra)."""
+    return _resolve_tracer().start_as_current_span(name, **kwargs)
+
+
+def register_span_middleware(app) -> None:
+    """Attach the per-request server-span middleware when tracing is live.
+
+    No-op (registers nothing) when the tracer is the shim, so default
+    installs keep the exact request path they had before.
+    """
+    if isinstance(_resolve_tracer(), _NoOpTracer):
+        return
+    from app.middleware.telemetry_span import TelemetrySpanMiddleware
+
+    app.add_middleware(TelemetrySpanMiddleware)
 
 
 def correlation_headers() -> Dict[str, str]:
@@ -371,8 +516,15 @@ def correlation_headers() -> Dict[str, str]:
         turn_id = "gen-{}".format(
             hashlib.sha256(turn_id.encode("utf-8", "replace")).hexdigest()[:16]
         )
-    trace_id = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()[:32]
-    span_id = secrets.token_hex(8)
+    # W3C traceparent from the ACTIVE span context when tracing is live
+    # (issue #518 amendment); fall back to the deterministic synthesized ids
+    # so the outbound header is stable for a given turn either way.
+    span_ctx = _active_span_context()
+    if span_ctx is not None:
+        trace_id, span_id = span_ctx
+    else:
+        trace_id = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()[:32]
+        span_id = secrets.token_hex(8)
     return {
         "traceparent": f"00-{trace_id}-{span_id}-01",
         "X-Request-ID": turn_id,
@@ -436,18 +588,36 @@ def maybe_init_otel_export() -> bool:
     provider = MeterProvider(metric_readers=[reader])
     meter = provider.get_meter("ragapp.telemetry")
     counter = meter.create_counter("ragapp_chat_turns_total")
+    # E3 closure (#518 amendment, "emit gen_ai.* spans and metrics"): a
+    # gen_ai-named operation-duration counter driven by the stage
+    # recorder, so the OTLP bridge exports GenAI-convention metrics
+    # alongside the ragapp_* bridge. Naming follows the Development-status
+    # semantic-conventions-genai set — do not describe as stable. The
+    # operation names here are this app's stage names (planning /
+    # searching / reading / generation), not GenAI client operations.
+    genai_counter = meter.create_counter("gen_ai.client.operation.duration")
     # Publish the aggregate on each export interval by reading the same
     # snapshot /metrics serves — the shard aggregate, so replicas sum.
-    observed = {"last": 0}
+    observed = {"last": 0, "stages": {}}
 
     def _observe(_options):
-        # Fired on each chat-turn record; the OTel reader exports the
-        # accumulated counter on its own cadence.
+        # Fired on each chat-turn/stage record; the OTel reader exports the
+        # accumulated counters on its own cadence. O(1) per record: reads
+        # the running accumulator, never the per-turn history (F-002).
         totals = telemetry._aggregate_counts()
         delta = totals["chat_turns"] - observed["last"]
         observed["last"] = totals["chat_turns"]
         if delta > 0:
             counter.add(delta)
+        stage_totals = telemetry.stage_totals()
+        for stage, total in stage_totals.items():
+            stage_delta = total - observed["stages"].get(stage, 0.0)
+            if stage_delta > 0:
+                genai_counter.add(
+                    stage_delta,
+                    attributes={"gen_ai.operation.name": stage},
+                )
+        observed["stages"] = stage_totals
 
     otel_metrics.set_meter_provider(provider)
     telemetry.attach_otel_observer(_observe)

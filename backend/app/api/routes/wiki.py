@@ -26,6 +26,11 @@ from app.api.deps import (
 )
 from app.config import settings
 from app.security import csrf_protect
+from app.services.admission import (
+    AdmissionClass,
+    AdmissionRejected,
+    get_admission_controller,
+)
 from app.services.wiki_compiler import WikiCompiler
 from app.services.wiki_events import get_wiki_event_bus
 from app.services.wiki_linter import WikiLinter
@@ -719,26 +724,51 @@ async def promote_memory_to_wiki(
         # executor (issue #276 A6-2). Thread-safe: the request-scoped db
         # connection is opened with check_same_thread=False and the pool hands
         # out exclusive connections, matching the to_thread pattern at 531/552.
-        result = await asyncio.to_thread(
-            compiler.promote_memory,
-            memory_id=request.memory_id,
-            vault_id=request.vault_id,
-            page_type=request.page_type,
-            target_page_id=request.target_page_id,
-            status=request.status,
-            created_by=user.get("id"),
-            # Global memories are admin-only (issue #404): a vault-writer must
-            # not be able to promote a global memory and thereby read its
-            # content. The global gate raises ValueError (→ 404 via the handler
-            # below) so a non-admin cannot distinguish "no such memory" from
-            # "global memory exists" (PRR-008 existence-oracle); the cross-vault
-            # PermissionError remains 403.
-            is_admin=user.get("role") in ("superadmin", "admin"),
-        )
+        # E3 closure (#518): this interactive route runs curator LLM
+        # inference; gate it on the shared BACKGROUND admission budget like
+        # the compile processors (route-level only — the processors already
+        # hold their own gate when they drive the compiler, and the
+        # controller is explicitly non-reentrant). The default
+        # foreground=True is deliberate: this is an interactive user
+        # request, so it keeps first-refusal ordering when a budget frees
+        # up (preemption itself only applies to BACKGROUND-class holders
+        # and is out of scope for this class either way — PR #595 F-006).
+        try:
+            async with get_admission_controller().admit(
+                AdmissionClass.BACKGROUND
+            ):
+                result = await asyncio.to_thread(
+                    compiler.promote_memory,
+                    memory_id=request.memory_id,
+                    vault_id=request.vault_id,
+                    page_type=request.page_type,
+                    target_page_id=request.target_page_id,
+                    status=request.status,
+                    created_by=user.get("id"),
+                    # Global memories are admin-only (issue #404): a
+                    # vault-writer must not be able to promote a global
+                    # memory and thereby read its content. The global gate
+                    # raises ValueError (→ 404 via the handler below) so a
+                    # non-admin cannot distinguish "no such memory" from
+                    # "global memory exists" (PRR-008 existence-oracle);
+                    # the cross-vault PermissionError remains 403.
+                    is_admin=user.get("role") in ("superadmin", "admin"),
+                )
+        except AdmissionRejected as exc:
+            logger.warning("Promote-memory admission rejected: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Wiki promotion capacity is saturated; retry shortly",
+            ) from exc
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except HTTPException:
+        # The admission-saturation 503 (and any other deliberate HTTP
+        # status) must pass through: HTTPException is an Exception, so the
+        # broad handler below would otherwise remap it to a 500.
+        raise
     except Exception:
         logger.exception("Error promoting memory to wiki")
         raise HTTPException(status_code=500, detail="Failed to promote memory to wiki")

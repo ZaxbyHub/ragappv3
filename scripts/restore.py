@@ -13,6 +13,7 @@ backup -> mutate -> restore -> verify end to end with fakes.
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -29,6 +30,8 @@ sys.path.append(str(ROOT))
 from backend.app.config import settings
 from backend.app.services.secret_manager import SecretManager
 from scripts.backup_set import _restrict_permissions
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_NAME = "backup_manifest.json"
 
@@ -215,11 +218,83 @@ def restore_backup_set(
     if not items_out:
         raise RestoreError("manifest binds no items")
 
+    _verify_generation_binding(manifest, dest_root)
+
     return {
         "verified": verified and all(entry["ok"] for entry in items_out),
         "items": items_out,
         "sqlite_rows": sqlite_rows,
     }
+
+
+def _verify_generation_binding(manifest: dict, dest_root: Path) -> None:
+    """Cross-check the C1 authoritative generation (#518 G6).
+
+    When a lancedb manifest item carries a ``generation`` binding (the row
+    the backup read FROM THE SNAPSHOT's migration_journal — the LATEST one
+    at snapshot time), the restored SQLite's LATEST index-generation row
+    must be that same id. Comparing against MAX(id) (PR #595 review F-003)
+    is what makes the check non-tautological: presence-of-id alone could
+    never fail on an honest set, because the restored DB is byte-identical
+    to the snapshot the binding came from. A restored DB NEWER than the
+    binding (an interleaved-write set that paired a newer SQLite with an
+    older vector tree) fails HERE with both ids named. A DB older than the
+    binding fails the row lookup below. This remains a structural sanity
+    check, not tamper-proofing: a fully doctored set could rewrite both
+    sides. Legacy sets without the field restore with a WARNING.
+    """
+    binding = None
+    for item in manifest.get("items", []):
+        if item.get("kind") == "lancedb":
+            binding = item.get("generation")
+            break
+    if binding is None:
+        logger.warning(
+            "manifest carries no generation binding (legacy set or fresh "
+            "install with no journal row); restore proceeds without the "
+            "C1 coherence check"
+        )
+        return
+    raw_id = binding.get("id")
+    try:
+        bound_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise RestoreError(
+            f"generation binding has a malformed id: {raw_id!r}"
+        ) from None
+    dest_db = dest_root / "app.db"
+    if not dest_db.exists():
+        raise RestoreError(
+            "generation binding present but the sqlite artifact was not "
+            "restored alongside the lancedb tree"
+        )
+    conn = sqlite3.connect(str(dest_db))
+    try:
+        row = conn.execute(
+            "SELECT MAX(id) FROM migration_journal"
+            " WHERE migration_name LIKE 'index_generation:%'"
+        ).fetchone()
+        bound_row = conn.execute(
+            "SELECT id FROM migration_journal WHERE id = ?", (bound_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if bound_row is None:
+        raise RestoreError(
+            "generation binding mismatch: the manifest binds "
+            f"migration_journal id {bound_id} "
+            f"({binding.get('name')!r}) but the restored sqlite does not "
+            "contain that row — this set pairs a sqlite snapshot with an "
+            "inconsistent vector tree; do not use it"
+        )
+    latest = int(row[0]) if row and row[0] is not None else None
+    if latest is not None and latest > bound_id:
+        raise RestoreError(
+            "generation binding mismatch: the manifest binds generation "
+            f"{bound_id} but the restored sqlite's latest index generation "
+            f"is {latest} — this set pairs a NEWER sqlite snapshot with an "
+            "OLDER vector tree; do not use it"
+        )
 
 
 def _cli_lancedb_factory(
