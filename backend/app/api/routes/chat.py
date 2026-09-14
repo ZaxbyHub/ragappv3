@@ -392,13 +392,16 @@ class _TurnStream:
     chat_stream_events table alone.
     """
 
-    __slots__ = ("session_id", "turn_id", "task", "readers")
+    __slots__ = ("session_id", "turn_id", "task", "readers", "started")
 
     def __init__(self, session_id: int, turn_id: str) -> None:
         self.session_id = session_id
         self.turn_id = turn_id
         self.task: Optional[asyncio.Task] = None
         self.readers: Set[asyncio.Event] = set()
+        # Set by the producer once its log reset (retention purge) has landed,
+        # so no reader ever fetches a half-purged or stale log.
+        self.started = asyncio.Event()
 
     @property
     def finished(self) -> bool:
@@ -496,17 +499,18 @@ def _fetch_stream_events_sync(
 
 
 def _purge_stream_events_sync(db_pool, session_id: int, turn_id: str) -> None:
-    """Bounded retention for the event log, run when a fresh generation
-    starts for ``turn_id``: (a) the session's OTHER turns' rows are dropped
-    (only a turn that could still be resumed needs frames, and a new turn
-    supersedes them), (b) rows older than a day are dropped globally. Never
-    raises — retention is best-effort housekeeping."""
+    """Log reset at fresh-generation start (issue #555).
+
+    Deletes the session's ENTIRE event log — the superseded older turns AND
+    any rows of THIS turn left over from a previous generation (client retry
+    semantics: the new generation restarts at seq 1, and stale frames of the
+    old attempt must never survive to be replayed) — plus rows older than a
+    day globally. Never raises — retention is best-effort housekeeping."""
     try:
         with db_pool.connection() as conn:
             conn.execute(
-                "DELETE FROM chat_stream_events "
-                "WHERE session_id = ? AND turn_id != ?",
-                (session_id, turn_id),
+                "DELETE FROM chat_stream_events WHERE session_id = ?",
+                (session_id,),
             )
             conn.execute(
                 "DELETE FROM chat_stream_events "
@@ -1185,13 +1189,16 @@ def stream_chat_response(
                     message,
                 )
                 turn_state["prewrite_ok"] = prewrite["ok"]
-                # Retention (issue #555): a fresh generation supersedes the
-                # session's older event-log rows; rows older than a day are
-                # dropped globally. Best-effort housekeeping.
+                # Retention / log reset (issue #555): a fresh generation
+                # starts from a clean event log — the session's older turns'
+                # rows AND any rows of this turn left over from a previous
+                # generation are purged before the first frame is logged, so
+                # a regenerate never collides with (or replays) stale frames.
                 await asyncio.to_thread(
                     _purge_stream_events_sync,
                     db_pool, durable_session_id, durable_turn_id,
                 )
+                entry.started.set()
                 # Auto-title ownership (issue #553): the pre-write is now the
                 # writer of a session's first user message, so it owns the
                 # first-turn auto-name trigger that add_messages_batch's
@@ -1290,6 +1297,11 @@ def stream_chat_response(
                 "Turn producer failed (session %s turn %s): %s",
                 durable_session_id, durable_turn_id, producer_exc,
             )
+        finally:
+            # Guaranteed reader gate release: even an early exit (admission
+            # rejection, cancellation before the purge) must not leave
+            # readers waiting on `started` — Event.set is sync-safe here.
+            entry.started.set()
 
     async def _resumable_event_stream(
         entry: Optional["stream_chat_response._TurnStream"],
@@ -1310,6 +1322,17 @@ def stream_chat_response(
         if entry is not None:
             entry.readers.add(reader_wake)
         try:
+            if entry is not None:
+                # One-time gate: do not read the log until the producer's
+                # reset (purge) has landed, so a regenerate never serves the
+                # previous generation's frames. Bounded — if the producer
+                # dies before starting, fall through to the honest close.
+                try:
+                    await asyncio.wait_for(
+                        entry.started.wait(), timeout=CHAT_HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    pass
             while True:
                 frames = await asyncio.to_thread(
                     _fetch_stream_events_sync,

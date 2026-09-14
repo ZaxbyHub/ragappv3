@@ -79,6 +79,19 @@ def _scripted_query(*args, **kwargs):
     return _gen()
 
 
+def _make_gen(*chunks_and_done):
+    """Build an async-gen FUNCTION yielding the given content chunks + done."""
+
+    def _query(*args, **kwargs):
+        async def _gen():
+            for chunk in chunks_and_done:
+                yield {"type": "content", "content": chunk}
+            yield {"type": "done", "sources": [], "memories_used": []}
+        return _gen()
+
+    return _query
+
+
 def _frames(wire: str):
     """Parse SSE wire text into (id, data_json) event blocks, comments kept
     as (None, ':...')."""
@@ -273,16 +286,36 @@ async def test_double_first_post_starts_one_generation(env):
     assert joined.count('"alpha "') == 1 and joined.count('"beta "') == 1
 
 
-async def test_regenerate_resets_event_log_seq(env):
+async def test_regenerate_purges_stale_frames_and_logs_new_generation(env):
     """A fresh generation for a finished turn (client retry semantics) purges
-    the turn's old event rows and logs the new generation from seq 1."""
+    the turn's old event rows and logs the NEW generation from seq 1. The
+    second generation uses DISTINCT content so the assertion proves the new
+    payloads actually landed (identical payloads could pass on stale rows)."""
     turn_id = "regen-turn"
+    first_gen = _make_gen("alpha ", "beta ")
+    second_gen = _make_gen("gamma ", "delta ")
+    env.engine.query = MagicMock(side_effect=[first_gen(), second_gen()])
+
     await _collect_all(env.make_stream(turn_id))
     assert await _await_for(lambda: len(env.event_rows(turn_id)) == 4)
-    await _collect_all(env.make_stream(turn_id))
+    stale_payloads = [r[1] for r in env.event_rows(turn_id)]
+    assert any('"alpha "' in p for p in stale_payloads)
+
+    reconnect_wire = "".join(await _collect_all(env.make_stream(turn_id)))
     assert await _await_for(lambda: len(env.event_rows(turn_id)) == 4)
-    seqs = [r[0] for r in env.event_rows(turn_id)]
+    rows = env.event_rows(turn_id)
+    seqs = [r[0] for r in rows]
+    payloads = [r[1] for r in rows]
+    # The log restarts at seq 1 and holds the NEW generation's frames only.
     assert seqs == [1, 2, 3, 4]
+    assert any('"gamma "' in p for p in payloads)
+    assert any('"delta "' in p for p in payloads)
+    assert not any('"alpha "' in p for p in payloads)
+    assert not any('"beta "' in p for p in payloads)
+    # The regenerate connection itself streamed the new answer (stale frames
+    # were never served on the wire).
+    assert '"gamma "' in reconnect_wire
+    assert '"alpha "' not in reconnect_wire
 
 
 async def test_cross_session_turn_id_isolation(env):
