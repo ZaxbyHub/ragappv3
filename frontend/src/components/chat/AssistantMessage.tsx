@@ -3,11 +3,12 @@ import { useState, useMemo, useCallback, useEffect, useImperativeHandle, useRef 
 import type { RefObject } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion, useReducedMotion } from "framer-motion";
-import { Bot, AlertCircle, AlertTriangle, Sparkles, Zap } from "lucide-react";
+import { Bot, AlertCircle, AlertTriangle, Brain, ChevronDown, ChevronUp, Sparkles, Zap } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import type { Message } from "@/stores/useChatStore";
 import type { Source } from "@/lib/api";
+import { getReasoningPart } from "@/lib/messageParts";
 import {
   createCanvasArtifact,
   mapFenceLanguageToExtension,
@@ -56,6 +57,52 @@ function toCanvasSourceRefs(sources: Source[] | undefined): SourceRef[] {
     source_id: source.id ?? null,
     title: source.filename ?? null,
   }));
+}
+
+/**
+ * Collapsible "Thinking for Ns" block (issue #554): provider reasoning that
+ * streamed on the reasoning_delta channel, rendered collapsed by default
+ * with the reasoning duration and token estimate. Reads through the typed
+ * message-parts model (`getReasoningPart`) rather than an ad-hoc field.
+ */
+function ReasoningBlock({
+  text,
+  durationMs,
+  tokensEstimate,
+}: {
+  text: string;
+  durationMs: number;
+  tokensEstimate: number;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const seconds = Math.max(0, Math.round(durationMs / 1000));
+  return (
+    <div className="mb-2">
+      <button
+        type="button"
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+        className="inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded-md border border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300 text-[10px] font-semibold tracking-wide hover:bg-violet-500/20 transition-colors"
+        title="Show the model's reasoning for this answer"
+      >
+        <Brain className="h-3 w-3" aria-hidden />
+        {`Thinking for ${seconds}s`}
+        {expanded ? (
+          <ChevronUp className="h-3 w-3" aria-hidden />
+        ) : (
+          <ChevronDown className="h-3 w-3" aria-hidden />
+        )}
+      </button>
+      {expanded && (
+        <div className="mt-1.5 rounded-md border border-violet-500/30 bg-violet-500/5 px-3 py-2">
+          <p className="text-xs whitespace-pre-wrap text-muted-foreground">{text}</p>
+          <p className="mt-1.5 text-[10px] font-medium text-violet-700/80 dark:text-violet-300/80">
+            {`~${tokensEstimate} tokens`}
+          </p>
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface CanvasEntryHandle {
@@ -314,6 +361,20 @@ export function AssistantMessage({
             </span>
           )}
         </div>
+
+        {/* Reasoning (issue #554) — the model's own reasoning streamed on the
+            reasoning_delta channel, collapsed by default. Rendered from the
+            typed parts model, not an ad-hoc field. */}
+        {(() => {
+          const reasoning = getReasoningPart(message.parts);
+          return reasoning ? (
+            <ReasoningBlock
+              text={reasoning.text}
+              durationMs={reasoning.durationMs}
+              tokensEstimate={reasoning.tokensEstimate}
+            />
+          ) : null;
+        })()}
 
         {/* Markdown body */}
         <MarkdownMessage

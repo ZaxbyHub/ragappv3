@@ -184,6 +184,15 @@ export function useSendMessage(
       // without waiting a render), so they read this synchronous mirror
       // instead of relying on the effect having already run.
       let streamedContent = "";
+      // Issue #554: accumulate provider reasoning deltas for this turn.
+      // Reasoning is transient display state — it becomes a typed
+      // "reasoning" part at completion and is never persisted to the
+      // session rows (no backend schema change).
+      let streamedReasoning = "";
+      let reasoningStartedAt: number | null = null;
+      let reasoningLastAt: number | null = null;
+      let reasoningMetrics: { durationMs?: number; tokensEstimate?: number } | null =
+        null;
 
       // Resolve effective chat mode using the same logic as the Composer
       // toggle so the highlighted mode and the sent payload never diverge.
@@ -444,6 +453,22 @@ export function useSendMessage(
             if (useChatStore.getState().streamingMessageId !== assistantMessageId) return;
             updateMessage(assistantMessageId, { candidateSources: candidates });
           },
+          onReasoning: (chunk) => {
+            // Issue #554: provider reasoning deltas accumulate locally and
+            // become a typed part at completion — they never enter
+            // message.content or the coalesced answer append.
+            if (sendGenRef.current !== gen) return;
+            const now = Date.now();
+            if (reasoningStartedAt === null) reasoningStartedAt = now;
+            reasoningLastAt = now;
+            streamedReasoning += chunk;
+          },
+          onReasoningMetrics: (metrics) => {
+            // Provider-measured reasoning accounting from the done event,
+            // preferred over the locally measured fallback span below.
+            if (sendGenRef.current !== gen) return;
+            reasoningMetrics = metrics;
+          },
           onFinalContent: (content) => {
             // Backend stripped invalid citations: adopt the cleaned content so
             // the hallucinated [S#] chip is removed from the rendered message
@@ -575,6 +600,32 @@ export function useSendMessage(
             // The done event delivered the final sources — the streaming-only
             // candidate preview is obsolete.
             updateMessage(assistantMessageId, { candidateSources: undefined });
+            // Issue #554: if the model reasoned, attach the typed reasoning
+            // part so the collapsible "Thinking for Ns" block renders.
+            // Duration/tokens prefer the provider-measured values from the
+            // done event; the locally measured span and a chars//4 estimate
+            // are the fallback when the backend did not report them. Parts
+            // are transient display state — persistTurn never writes them.
+            if (streamedReasoning.length > 0) {
+              const durationMs =
+                reasoningMetrics?.durationMs ??
+                (reasoningStartedAt !== null && reasoningLastAt !== null
+                  ? reasoningLastAt - reasoningStartedAt
+                  : 0);
+              const tokensEstimate =
+                reasoningMetrics?.tokensEstimate ??
+                Math.max(1, Math.floor(streamedReasoning.length / 4));
+              updateMessage(assistantMessageId, {
+                parts: [
+                  {
+                    kind: "reasoning",
+                    text: streamedReasoning,
+                    durationMs,
+                    tokensEstimate,
+                  },
+                ],
+              });
+            }
             setCurrentStage(null);
             setIsStreaming(false);
             setAbortFn(null);

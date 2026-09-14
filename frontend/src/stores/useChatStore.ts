@@ -1,11 +1,19 @@
 import { create } from "zustand";
 import { useShallow } from "zustand/shallow";
 import type { Source, UsedMemory, WikiReference, KMSReference, CitationEnforcement } from "@/lib/api";
+import type { MessagePart } from "@/lib/messageParts";
 
 export interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /**
+   * Typed message parts (issue #554): ordered text/reasoning/source parts.
+   * The reasoning display reads through this model rather than another
+   * ad-hoc field. Transient stream state — NOT persisted to the session
+   * rows (no backend schema change); absent after a reload.
+   */
+  parts?: MessagePart[];
   sources?: Source[];
   /**
    * Retrieved-but-not-yet-cited evidence candidates delivered mid-stream by

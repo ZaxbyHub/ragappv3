@@ -53,7 +53,7 @@ from app.services.eval_adapter import (
     RetrievalOutcome,
 )
 from app.services.feedback_reranker import FeedbackReranker
-from app.services.llm_client import LLMClient, LLMError
+from app.services.llm_client import LLMClient, LLMError, ReasoningDelta
 from app.services.memory_store import MemoryStore
 from app.services.prompt_builder import PromptBuilderService, calculate_primary_count
 from app.services.query_transformer import QueryPlanner, QueryTransformer
@@ -3153,6 +3153,15 @@ class RAGEngine:
                 async for chunk in candidate.chat_completion_stream(
                     messages, **stream_kwargs
                 ):
+                    if isinstance(chunk, ReasoningDelta):
+                        # Issue #554: provider reasoning rides a distinct
+                        # chunk type; it is NOT user-visible answer content,
+                        # so it must not set ``emitted_content`` (a stream
+                        # that produced only reasoning still counts as a
+                        # failed visible answer and falls through to the
+                        # next fallback client below).
+                        yield {"type": "reasoning_delta", "text": chunk.text}
+                        continue
                     emitted_content = True
                     yield {"type": "content", "content": chunk}
 

@@ -759,6 +759,21 @@ export interface ChatStreamCallbacks {
    * "evidence" SSE event (issue #508). Fires mid-stream, before content.
    */
   onEvidenceCandidates?: (candidates: Source[]) => void;
+  /**
+   * Provider reasoning deltas from the additive "reasoning_delta" SSE event
+   * (issue #554). Fires mid-stream, typically before the answer content.
+   * Optional so older consumers treat the new event type as inert.
+   */
+  onReasoning?: (chunk: string) => void;
+  /**
+   * Reasoning accounting from the done event's llm_metrics (issue #554):
+   * the provider-side reasoning span and token estimate, when the backend
+   * reports them. Fires just before onComplete.
+   */
+  onReasoningMetrics?: (metrics: {
+    durationMs?: number;
+    tokensEstimate?: number;
+  }) => void;
   onError?: (error: Error) => void;
   onComplete?: () => void;
 }

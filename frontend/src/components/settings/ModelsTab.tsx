@@ -627,8 +627,9 @@ export function ModelsTab({
             </Label>
           </div>
           <p className="text-xs text-muted-foreground">
-            Off (default) sends enable_thinking=false with every Instant request — correct for
-            Gemma-4-style templates. On omits the kwarg so the model template default governs.
+            Off (default) sends the model-family no-think control (enable_thinking=false for
+            Qwen-family models; none for unrecognized families). On sends no control so the
+            model template default governs.
           </p>
         </CardContent>
       </Card>

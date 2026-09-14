@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.services.llm_client import LLMClient
+from app.services.llm_client import LLMClient, ReasoningDelta
 
 
 @pytest.fixture(autouse=True)
@@ -229,7 +229,11 @@ class TestStreamFinishReason:
             )
         ]
         assert chunks  # something was yielded
-        assert all(isinstance(c, str) for c in chunks)
+        # Issue #554: the stream may also yield ReasoningDelta objects on
+        # the distinct reasoning channel; this suite pins the CONTENT
+        # channel contract, so discriminate by type rather than asserting
+        # the (now narrower) all-str stream.
+        assert all(isinstance(c, str) for c in chunks if not isinstance(c, ReasoningDelta))
 
     @pytest.mark.asyncio
     async def test_stream_error_metrics_leave_finish_reason_absent(self):

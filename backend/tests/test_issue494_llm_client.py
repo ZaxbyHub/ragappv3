@@ -64,7 +64,11 @@ def _llm_settings_mock() -> MagicMock:
     settings.ollama_chat_url = "http://llm-test-host:11434"
     settings.chat_model = "thinking-model"
     settings.instant_chat_url = "http://llm-test-host:1234"
-    settings.instant_chat_model = "instant-model"
+    # Qwen-family name (issue #554 REV-2): AC31a pins the Qwen-style
+    # enable_thinking=False control, which is only selected for families
+    # with a verified template mechanism; unknown families fail open with
+    # no control.
+    settings.instant_chat_model = "qwen/qwen3.5-9b"
     settings.llm_max_connections = 20
     settings.llm_max_keepalive_connections = 10
     return settings
