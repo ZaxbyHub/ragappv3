@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -25,8 +28,28 @@ class MaintenanceFlag:
 class MaintenanceService:
     FLAG_NAME = "maintenance"
 
-    def __init__(self, pool: SQLiteConnectionPool) -> None:
+    # Bounded-staleness cache for the request path (issue #549 C02): 5 s
+    # bounds how long a foreign worker's toggle can stay unseen, while
+    # set_flag's invalidation keeps same-process toggles immediate
+    # (issue #549 AC2 "within a short TTL").
+    FLAG_CACHE_TTL_SECONDS = 5.0
+
+    def __init__(
+        self,
+        pool: SQLiteConnectionPool,
+        flag_cache_ttl_seconds: float = FLAG_CACHE_TTL_SECONDS,
+    ) -> None:
         self.pool = pool
+        self.flag_cache_ttl_seconds = float(flag_cache_ttl_seconds)
+        self._flag_cache: Optional[MaintenanceFlag] = None
+        self._flag_cache_at: float = 0.0
+        # Bumped on every invalidation (issue #549 review F-001): a cache-miss
+        # read snapshots the generation before its pooled DB read and only
+        # writes the result back if the generation still matches — a toggle
+        # that commits mid-read invalidates the cache and the stale read is
+        # discarded instead of re-poisoning it.
+        self._flag_cache_generation: int = 0
+        self._flag_cache_lock = threading.Lock()
         self._ensure_flag_row()
 
     @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
@@ -63,6 +86,42 @@ class MaintenanceService:
         finally:
             self.pool.release_connection(conn)
 
+    def get_flag_cached(self) -> MaintenanceFlag:
+        """Return the flag, serving reads from a short in-process TTL cache.
+
+        The pooled read still happens on a cache miss/expiry — callers on the
+        event loop must invoke this via ``get_flag_async`` (a worker thread),
+        never directly (issue #549 C02). Concurrent misses may race; the lock
+        makes population idempotent and the loser's read is simply discarded.
+        The generation check (F-001) also discards a read whose DB SELECT
+        started before a concurrent ``set_flag`` commit — the stale value is
+        never written back over an invalidation.
+        """
+        now = time.monotonic()
+        with self._flag_cache_lock:
+            if (
+                self._flag_cache is not None
+                and now - self._flag_cache_at < self.flag_cache_ttl_seconds
+            ):
+                return self._flag_cache
+            generation = self._flag_cache_generation
+        flag = self.get_flag()
+        with self._flag_cache_lock:
+            if generation == self._flag_cache_generation:
+                self._flag_cache = flag
+                self._flag_cache_at = time.monotonic()
+        return flag
+
+    async def get_flag_async(self) -> MaintenanceFlag:
+        """Off-the-event-loop flag read for request-path callers."""
+        return await asyncio.to_thread(self.get_flag_cached)
+
+    def _invalidate_flag_cache(self) -> None:
+        with self._flag_cache_lock:
+            self._flag_cache = None
+            self._flag_cache_at = 0.0
+            self._flag_cache_generation += 1
+
     def set_flag(self, enabled: bool, reason: str = "") -> None:
         attempts = 0
         while True:
@@ -79,6 +138,11 @@ class MaintenanceService:
                 )
                 if cursor.rowcount:
                     conn.commit()
+                    # Same-process toggles must be visible to the very next
+                    # request (issue #549 AC2): drop the cached value only
+                    # after the committed UPDATE, so a failed update leaves
+                    # the previously cached state intact.
+                    self._invalidate_flag_cache()
                     return
                 # Optimistic-lock miss: the UPDATE matched no rows, so end the
                 # implicit transaction it opened before this connection

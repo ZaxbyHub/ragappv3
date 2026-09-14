@@ -288,11 +288,16 @@ def setup_app_state(app, **overrides):
     uploads_dir = test_data_dir / "uploads"
     uploads_dir.mkdir(exist_ok=True)
 
-    # Mock the maintenance service
+    # Mock the maintenance service (all three read surfaces the request
+    # path can use: raw get_flag, cached get_flag_cached, async
+    # get_flag_async — issue #549).
+    from unittest.mock import AsyncMock
+
     mock_maintenance = MagicMock()
-    mock_maintenance.get_flag.return_value = MagicMock(
-        enabled=False, reason="", version=0, updated_at=None
-    )
+    _disabled_flag = MagicMock(enabled=False, reason="", version=0, updated_at=None)
+    mock_maintenance.get_flag.return_value = _disabled_flag
+    mock_maintenance.get_flag_cached.return_value = _disabled_flag
+    mock_maintenance.get_flag_async = AsyncMock(return_value=_disabled_flag)
 
     # Build a minimal fake rag_engine for routes that read app.state.rag_engine
     from app.services.rag_engine import RAGEngine

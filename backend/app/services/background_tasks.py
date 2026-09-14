@@ -2005,7 +2005,25 @@ class BackgroundProcessor:
                     return False
 
         if self.maintenance_service and not _maintenance_checked:
-            flag = await asyncio.to_thread(self.maintenance_service.get_flag)
+            # Issue #549 C02 defect class (merged with #591's recovery
+            # reservations): the pooled SQLite read must stay off the event
+            # loop inside this async method, served from the short TTL cache
+            # (no per-call pooled checkout), and a read failure must fail
+            # open (WARNING) instead of raising out of enqueue.
+            try:
+                # Prefer the TTL-cached read when the service provides it;
+                # fall back to the raw get_flag contract (older providers and
+                # test doubles implement only that).
+                read = getattr(
+                    self.maintenance_service, "get_flag_cached", None
+                ) or self.maintenance_service.get_flag
+                flag = await asyncio.to_thread(read)
+            except Exception:
+                logger.warning(
+                    "maintenance flag read failed during enqueue; failing open",
+                    exc_info=True,
+                )
+                flag = None
             if flag and flag.enabled:
                 if reservation_added:
                     await self._release_recovery_file(file_id)
