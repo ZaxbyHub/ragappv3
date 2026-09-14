@@ -1604,6 +1604,29 @@ CREATE INDEX IF NOT EXISTS idx_quality_eval_cases_report
     ON quality_eval_cases(report_id);
 """
 
+# Per-turn stream event log (issue #555). Every replayable SSE frame of a
+# durable chat turn is persisted here keyed by (session_id, turn_id, seq) so a
+# reconnecting client that sends `Last-Event-ID` can be served exactly the
+# missed frames. `session_id` is part of the primary key because client-supplied
+# turn_ids are unique only within a session (same scoping as
+# idx_chat_messages_session_turn_role); `payload` stores the exact SSE data JSON
+# the wire carried so initial and replayed frames are byte-identical. Heartbeat
+# comments are never logged (they are transport keepalives, not events).
+#
+# The same constant is executed by migrate_add_chat_stream_events(), so a fresh
+# database and a migrated database cannot drift apart (repo double-definition
+# pattern).
+_CHAT_STREAM_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS chat_stream_events (
+    session_id INTEGER NOT NULL,
+    turn_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (session_id, turn_id, seq)
+);
+"""
+
 SCHEMA = (
     _BASE_SCHEMA
     + _DRAFT_ROOM_CORE_DDL
@@ -1614,6 +1637,7 @@ SCHEMA = (
     + _MULTIMODAL_ARTIFACT_DDL
     + _ENRICHMENT_DERIVED_DDL
     + _CANVAS_DDL
+    + _CHAT_STREAM_EVENTS_DDL
     # Recovery journal (issue #512): records migration phase/outcome, schema
     # version and authoritative index generation. Defined in
     # app.models.migration_journal and also created by
@@ -1821,6 +1845,9 @@ def run_migrations(sqlite_path: str) -> None:
     # dropped by the rebuild on pre-widen databases. After the rebuild (or its
     # early noop return) the ALTER is durable.
     migrate_add_files_extraction_diagnostics(sqlite_path)
+    # Per-turn stream event log (issue #555) — the replay source for resumable
+    # SSE chat streams. Registered last: purely additive table, no rebuilds.
+    migrate_add_chat_stream_events(sqlite_path)
 
     # Add partial unique index for duplicate hash detection (HIGH-10)
     # Wrapped in IntegrityError handler: existing databases may have duplicate
@@ -6181,6 +6208,25 @@ def migrate_add_atom_enrichment_table(sqlite_path: str) -> None:
     try:
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.executescript(_ENRICHMENT_DERIVED_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_chat_stream_events(sqlite_path: str) -> None:
+    """Migration: add the per-turn stream event log (issue #555).
+
+    Creates ``chat_stream_events`` — the replay source for resumable SSE chat
+    streams. Executes ``_CHAT_STREAM_EVENTS_DDL`` — the exact same constant
+    appended to ``SCHEMA`` — so a database created by ``init_db`` and a legacy
+    database upgraded by this migration converge on an identical schema
+    (double-definition convention). Purely additive: ``CREATE TABLE IF NOT
+    EXISTS``, no existing data touched; rollback is a plain revert (the table
+    is simply unused afterward).
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.executescript(_CHAT_STREAM_EVENTS_DDL)
         conn.commit()
     finally:
         conn.close()
