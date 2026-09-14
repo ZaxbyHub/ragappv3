@@ -385,9 +385,21 @@ export function chatStream(
         callbacks.onError?.(interruptState.error!);
         return;
       }
-      await new Promise((resolve) =>
-        setTimeout(resolve, RESUME_BACKOFF_MS * (attempt + 1))
-      );
+      // Abort-aware backoff: dispose() during the wait resolves early and
+      // the next fetch throws AbortError, ending the loop. The remaining
+      // silent window while still subscribed is bounded (<= 1.5s) and
+      // accepted: the turn is still making progress.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, RESUME_BACKOFF_MS * (attempt + 1));
+        abortController.signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true }
+        );
+      });
     }
   };
 

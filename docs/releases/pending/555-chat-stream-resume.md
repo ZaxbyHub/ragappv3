@@ -27,8 +27,9 @@ no duplicates, no gaps — instead of losing the remainder of the answer.
   not provide it.
 - **Frontend auto-resume.** `chatStream` (fetch-based client — no
   `EventSource` auto-resend) tracks the last received event id and re-POSTs
-  the same body with `Last-Event-ID` on a mid-answer break (bounded: 3
-  attempts, backoff). Non-durable calls and pre-`turn_id` clients keep the
+  the same body with `Last-Event-ID` on a mid-answer break (up to 3
+  reconnect attempts after the initial request; backoff starts at 500ms and
+  grows per attempt). Non-durable calls and pre-`turn_id` clients keep the
   previous behavior (interruption surfaces immediately; the hook marks the
   turn retryable).
 - **Scope honesty.** Only the connection-drop case is claimed. The
@@ -53,17 +54,20 @@ per-surface, not a precedent shift.
 - Clients that never send `Last-Event-ID` receive the full normal stream.
 - An admission (CHAT capacity) lease now spans the generation's real
   lifetime instead of a single connection's; a dropped client's turn
-  consumes a slot until it finishes (bounded by generation time).
-- Retention: a session's older turns' event rows are purged when a new turn
-  starts; rows older than a day are dropped opportunistically.
+  consumes a slot until it finishes (bounded by generation time). The
+  stream rate limit applies to every stream POST, reconnects included.
+- Retention: a session's whole event log is reset when a new generation
+  starts (superseded turns and any stale rows of the retrying turn); rows
+  older than a day are dropped opportunistically. A resume position beyond
+  the log's end snaps to the log end and follows new frames.
 - Event-log writes are guarded and never fail the stream; a fully
   unavailable database degrades to a clean empty stream (HTTP 200).
 
 ## Tests
 
-Backend: `tests/test_chat_stream_replay.py` (8), durability suite updated +
+Backend: `tests/test_chat_stream_replay.py` (10), durability suite updated +
 extended (14, including a producer-shutdown interrupted-finalize test and a
 broken-pool degradation test), `tests/test_chat_stream_process_kill.py`
 (skip-gated on I4/#559), schema-drift guard bumped 70 → 71.
-Frontend: `src/lib/api/__tests__/sessions.reconnect.test.ts` (reconnect
+Frontend: `frontend/src/lib/api/__tests__/sessions.reconnect.test.ts` (reconnect
 contract + id-parsing units).

@@ -19,7 +19,7 @@ persisted frames after the client's id and NEVER fabricates a done marker —
 an I4 landing that makes true process-kill resume possible must flip this
 assertion to require completion (that flip belongs to the I4 change).
 
-The hard-kill uses Process.terminate()/kill(): SIGKILL-equivalent on POSIX;
+The hard-kill uses Process.kill(): SIGKILL-equivalent on POSIX;
 TerminateProcess on Windows (this drill is opt-in and CI never sets the env).
 """
 import importlib
@@ -126,7 +126,12 @@ def test_process_kill_resume_drill():
         assert last_event_id is not None
     finally:
         process.kill()
-        process.wait(timeout=10)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Slow Windows reap: kill again so the drill cannot leave a zombie.
+            process.kill()
+            process.wait(timeout=10)
 
     # Restart against the SAME data dir: the event log survived the kill.
     process = _spawn()
@@ -159,4 +164,9 @@ def test_process_kill_resume_drill():
             )
     finally:
         process.kill()
-        process.wait(timeout=10)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            # Slow Windows reap: kill again so the drill cannot leave a zombie.
+            process.kill()
+            process.wait(timeout=10)

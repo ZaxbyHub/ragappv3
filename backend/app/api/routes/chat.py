@@ -498,6 +498,26 @@ def _fetch_stream_events_sync(
         return []
 
 
+def _max_stream_event_seq_sync(
+    db_pool, session_id: int, turn_id: str
+) -> int:
+    """Highest logged seq for a turn (0 when the log is empty). Never raises."""
+    try:
+        with db_pool.connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM chat_stream_events "
+                "WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+    except Exception as exc:  # noqa: BLE001 — readers degrade to an empty replay
+        logger.warning(
+            "chat_stream_events max-seq read failed (session %s turn %s): %s",
+            session_id, turn_id, exc,
+        )
+        return 0
+
+
 def _purge_stream_events_sync(db_pool, session_id: int, turn_id: str) -> None:
     """Log reset at fresh-generation start (issue #555).
 
@@ -779,7 +799,8 @@ def stream_chat_response(
     Generate a streaming chat response using SSE format.
 
     Yields SSE events with JSON data chunks from the RAG engine.
-    Each event is formatted as: data: {json}\n\n
+    Non-durable events are formatted as: data: {json}\n\n; durable-path
+    frames carry an id: <seq> line (fastapi.sse framing).
     Ends with a done event containing sources and memories_used.
 
     Issue #553 durable turns: when ``durable_session_id``/``durable_turn_id``
@@ -1333,6 +1354,18 @@ def stream_chat_response(
                     )
                 except asyncio.TimeoutError:
                     pass
+            if last_sent > 0:
+                # Stale/advanced resume position (plan-pinned semantics):
+                # nothing before the log's end can be replayed, so snap to
+                # the end and follow new frames instead of filtering them
+                # all out. Absorbs oversized/foreign ids (incl. bigint
+                # overflow beyond SQLite's range).
+                max_seq = await asyncio.to_thread(
+                    _max_stream_event_seq_sync,
+                    db_pool, durable_session_id, durable_turn_id,
+                )
+                if last_sent > max_seq:
+                    last_sent = max_seq
             while True:
                 frames = await asyncio.to_thread(
                     _fetch_stream_events_sync,

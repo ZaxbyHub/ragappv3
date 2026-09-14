@@ -1,8 +1,10 @@
 """Server-side durable chat turn writes on the streaming path (issue #553).
 
 Covers: the pre-write of the user row (status 'pending') before the first
-token, the interrupted finalize on mid-stream disconnect with NO client-side
-batch save (the issue's definition-of-done), the complete finalize, old-client
+token, the complete finalize (since #555 the generation outlives a dropped
+connection, so a disconnect completes the turn server-side; the #553
+interrupted finalize keeps dedicated coverage for real cancellation via the
+shutdown test), old-client
 opt-out compat, pre-write failure semantics, duplicate pre-write idempotency,
 admission-rejection writing nothing, and the stream-auth session validation.
 

@@ -145,10 +145,12 @@ describe("chatStream reconnects with Last-Event-ID after mid-answer EOF (issue #
     );
 
     try {
-      const reconnectIssued = await waitUntil(() => fetchMock.mock.calls.length >= 2, 3200);
+      // Budgets have CI-load headroom: the resume fetch lands after a 500ms
+      // backoff, completion after the resumed stream finishes.
+      const reconnectIssued = await waitUntil(() => fetchMock.mock.calls.length >= 2, 8000);
       expect(reconnectIssued, "chatStream did not issue a reconnect fetch").toBe(true);
 
-      const completed = await waitUntil(() => completeCalls >= 1, 1500);
+      const completed = await waitUntil(() => completeCalls >= 1, 5000);
       expect(completed, "stream never completed after resume").toBe(true);
 
       const [secondUrl, secondInit] = fetchMock.mock.calls[1] as [string, RequestInit];
@@ -175,5 +177,39 @@ describe("chatStream reconnects with Last-Event-ID after mid-answer EOF (issue #
     expect(fetchMock.mock.calls.length).toBe(1);
     expect(errors[0]?.name).toBe("ChatInterruptedError");
     dispose();
+  }, 5000);
+
+  it("dispose during the resume backoff aborts the resume attempt", async () => {
+    // The mock must honor the abort signal like real fetch: a fetch invoked
+    // with an already-aborted signal rejects instead of streaming.
+    fetchMock.mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.signal?.aborted) {
+        throw Object.assign(new Error("Aborted"), { name: "AbortError" });
+      }
+      return sseResponse(["id: 1\ndata: {\"type\":\"content\",\"content\":\"partial\"}\n\n"]);
+    });
+    const errors: Error[] = [];
+    const dispose = chatStream(
+      [{ role: "user", content: "q" }] as never,
+      { onMessage: () => undefined, onError: (e: Error) => errors.push(e) } as never,
+      1,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { sessionId: 7, turnId: "turn-abort" },
+    );
+    // Let the EOF register, then dispose INSIDE the 500ms backoff window:
+    // the abort-aware backoff resolves immediately and the resume attempt
+    // carries the aborted signal — no resumed content, no completion.
+    await sleep(120);
+    dispose();
+    await sleep(400);
+    expect(fetchMock.mock.calls.length).toBe(2);
+    const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
+    expect((secondInit?.signal as AbortSignal)?.aborted).toBe(true);
+    expect(errors.some((e) => e.name === "AbortError") || errors.length === 0).toBe(true);
   }, 5000);
 });

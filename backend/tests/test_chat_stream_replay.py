@@ -352,6 +352,104 @@ async def test_retention_purges_older_turn_rows_on_new_turn(env):
 # ---------------------------------------------------------------------------
 
 
+async def test_reconnect_during_live_generation_replays_missed_and_follows(env):
+    """Live-attach replay (the shipped pin for the frozen C3 contract): a
+    reconnect DURING an unfinished generation receives exactly the frames
+    after its last id — the pre-disconnect remainder once the gate releases —
+    and never re-runs the engine."""
+    turn_id = "live-attach-turn"
+    gate = asyncio.Event()
+
+    def gated_query(*args, **kwargs):
+        async def _gen():
+            yield {"type": "content", "content": "one "}
+            yield {"type": "content", "content": "two "}
+            await gate.wait()
+            yield {"type": "content", "content": "post "}
+            yield {"type": "done", "sources": [], "memories_used": []}
+        return _gen()
+
+    env.engine.query = MagicMock(side_effect=gated_query)
+    first = env.make_stream(turn_id)
+    # Consume until the "two " frame, deriving the client's last event id
+    # FROM THE WIRE (seq 1 is the mode frame; never hardcode the numbering).
+    last_id = 0
+    saw_two = asyncio.Event()
+
+    async def first_consumer():
+        nonlocal last_id
+        async for chunk in first.body_iterator:
+            text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
+            for eid, data in _frames(text):
+                if eid is not None:
+                    last_id = int(eid)
+                    if data and json.loads(data).get("content") == "two ":
+                        saw_two.set()
+        async for _ in first.body_iterator:
+            pass
+
+    task = asyncio.create_task(first_consumer())
+    await asyncio.wait_for(saw_two.wait(), timeout=10)
+    await asyncio.sleep(0)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    calls_after_first = env.engine.query.call_count
+
+    # Reconnect while the generation is STILL gated open: it must attach to
+    # the live producer, replay nothing yet (client holds the "two " id),
+    # then follow the post-gate remainder through done once the gate releases.
+    reconnect = env.make_stream(turn_id, last_event_id=last_id)
+    collect_task = asyncio.create_task(_collect_all(reconnect))
+    await asyncio.sleep(0.05)
+    gate.set()
+    frames = await asyncio.wait_for(collect_task, timeout=10)
+
+    parsed = _frames("".join(frames))
+    ids = [int(eid) for eid, _ in parsed if eid is not None]
+    assert ids == [last_id + 1, last_id + 2]
+    types = [json.loads(data).get("type") for _, data in parsed if data]
+    assert types == ["content", "done"]
+    assert json.loads(parsed[0][1])["content"] == "post "
+    assert env.engine.query.call_count == calls_after_first  # no re-generation
+
+
+async def test_reconnect_with_oversized_last_event_id_follows_new_frames(env):
+    """Plan-pinned stale-id semantics: a resume position beyond the log's end
+    snaps to the log end and FOLLOWS new frames instead of filtering them all
+    out (the pre-fix behavior was an endless-heartbeat zombie stream)."""
+    turn_id = "oversized-id-turn"
+    gate = asyncio.Event()
+
+    def gated_query(*args, **kwargs):
+        async def _gen():
+            yield {"type": "content", "content": "pre "}
+            await gate.wait()
+            yield {"type": "content", "content": "post "}
+            yield {"type": "done", "sources": [], "memories_used": []}
+        return _gen()
+
+    env.engine.query = MagicMock(side_effect=gated_query)
+    first = env.make_stream(turn_id)
+    await _consume_until(first, lambda text: '"pre "' in text)
+    # Log end after "pre ": mode(1) + pre(2). The client sends an oversized id.
+    assert await _await_for(lambda: len(env.event_rows(turn_id)) == 2)
+
+    reconnect = env.make_stream(turn_id, last_event_id=10_000)
+    collect_task = asyncio.create_task(_collect_all(reconnect))
+    await asyncio.sleep(0.05)
+    gate.set()
+    frames = await asyncio.wait_for(collect_task, timeout=10)
+
+    parsed = _frames("".join(frames))
+    ids = [int(eid) for eid, _ in parsed if eid is not None]
+    assert ids == [3, 4]  # clamped to the log end; new frames delivered
+    types = [json.loads(data).get("type") for _, data in parsed if data]
+    assert types == ["content", "done"]
+
+
 async def test_reconnect_after_producer_death_replays_without_done(env):
     """Kill the producer mid-generation (the connection-drop-only scope's
     honest boundary; full process-kill resume is I4/#559-gated): a reconnect
