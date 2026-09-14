@@ -7,8 +7,10 @@
   OpenAI-compatibility documentation lists `reasoning_effort`
   (high/medium/low/max/none) as the supported request field on that
   endpoint and documents no `think` field there (`think` is native
-  `/api/chat`-only); older deployments that do not recognize the field
-  ignore it and keep the provider default.
+  `/api/chat`-only). Deployments that do not recognize the field are
+  expected to ignore it (standard JSON-decoding behavior; derived from
+  Ollama's documentation, not verified against a live pre-`reasoning_effort`
+  deployment) and keep the provider default.
 - The instant client's no-think control is now selected by the configured
   `instant_chat_model` family instead of being hard-coded for every model:
   Qwen-family names send `chat_template_kwargs={'enable_thinking': False}`,

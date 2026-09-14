@@ -12,7 +12,7 @@ import json
 import os
 import sys
 import unittest
-from typing import AsyncIterator, Dict, Iterable, List
+from typing import Any, AsyncIterator, Dict, Iterable, List
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -70,7 +70,7 @@ def _sse_lines_from_deltas(deltas: List[Dict]) -> List[str]:
     return out
 
 
-async def _collect(gen: AsyncIterator[str]) -> str:
+async def _collect(gen: "AsyncIterator[Any]") -> str:
     # Issue #554 (REV-1): chat_completion_stream may also yield
     # ReasoningDelta objects on its distinct reasoning channel. This helper
     # pins the CONTENT channel only — join the plain-str pieces and skip

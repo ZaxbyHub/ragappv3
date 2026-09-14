@@ -174,7 +174,7 @@ def _reasoning_delta_type():
 
 class TestThinkingClientThinkControl:
     @pytest.mark.asyncio
-    async def test_stream_payload_carries_think_true(self):
+    async def test_stream_payload_carries_reasoning_effort_high(self):
         fake = FakeAsyncHTTP(
             stream_lines=_sse_lines_from_deltas([{"content": "ok"}])
         )
@@ -191,7 +191,7 @@ class TestThinkingClientThinkControl:
         )
 
     @pytest.mark.asyncio
-    async def test_non_stream_payload_carries_think_true(self):
+    async def test_non_stream_payload_carries_reasoning_effort_high(self):
         fake = FakeAsyncHTTP(non_stream_payload=_non_stream_payload())
         client = create_thinking_client()
         client._client = fake

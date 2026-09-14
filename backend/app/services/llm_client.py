@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import httpx
 
@@ -81,7 +81,9 @@ def select_no_think_chat_template_kwargs(
     """Select the family-appropriate no-think template control (issue #554).
 
     Only model families with a *verified* chat-template mechanism get a
-    control: Qwen-family names document the
+    control: Qwen-family names (matched case-insensitively as a substring,
+    so ``qwen/qwen3.5``, ``Qwen3-Coder-30B`` and org-prefixed variants all
+    match) document the
     ``chat_template_kwargs={'enable_thinking': False}`` no-think control on
     their model cards (Qwen3.5+ chat templates). Any other family —
     including empty/missing names — gets ``None``: the client logs a
@@ -486,7 +488,7 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = _UNSET_MAX_TOKENS,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator["Union[str, ReasoningDelta]", None]:
         """
         Send a streaming chat completion request and yield content chunks.
 
@@ -498,7 +500,10 @@ class LLMClient:
                 at construction — ENH-015, issue #494)
 
         Yields:
-            Content chunks as they arrive from the SSE stream
+            Plain ``str`` answer-content chunks as they arrive from the SSE
+            stream, plus :class:`ReasoningDelta` objects on the distinct
+            reasoning channel (issue #554). Consumers that only want the
+            answer must discriminate with ``isinstance(chunk, str)``.
 
         Raises:
             LLMError: If the request fails
