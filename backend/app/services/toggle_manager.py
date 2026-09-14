@@ -30,6 +30,12 @@ class ToggleManager:
         self.pool = pool
         self._cache: dict[str, ToggleCacheEntry] = {}
         self._lock = threading.Lock()
+        # Bumped on every invalidation (issue #596): a cache-miss read
+        # snapshots the generation before its pooled DB read and only writes
+        # the result back if the generation still matches — a toggle that
+        # commits mid-read invalidates the cache and the stale read is
+        # discarded instead of re-poisoning it for the full TTL.
+        self._generation = 0
 
     @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
     def get_toggle(self, feature: str, default: bool = False) -> bool:
@@ -38,6 +44,7 @@ class ToggleManager:
             entry = self._cache.get(feature)
             if entry and now - entry.timestamp < self.CACHE_TTL:
                 return entry.enabled
+            generation = self._generation
         conn = self.pool.get_connection()
         try:
             row = conn.execute(
@@ -48,7 +55,8 @@ class ToggleManager:
         finally:
             self.pool.release_connection(conn)
         with self._lock:
-            self._cache[feature] = ToggleCacheEntry(timestamp=now, enabled=value)
+            if generation == self._generation:
+                self._cache[feature] = ToggleCacheEntry(timestamp=now, enabled=value)
         return value
 
     @with_retry(max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True)
@@ -71,14 +79,20 @@ class ToggleManager:
         conn.execute(self._UPSERT_SQL, (feature, int(enabled)))
 
     def update_cache(self, feature: str, enabled: bool) -> None:
-        """Update the in-memory cache after a durable commit."""
+        """Update the in-memory cache after a durable commit.
+
+        Also bumps the cache generation so in-flight stale reads (started
+        before this invalidation) are discarded instead of written back.
+        """
         with self._lock:
             self._cache[feature] = ToggleCacheEntry(
                 timestamp=time.time(), enabled=enabled
             )
+            self._generation += 1
 
     def clear_cache(self, feature: Optional[str] = None) -> None:
         with self._lock:
+            self._generation += 1
             if feature:
                 self._cache.pop(feature, None)
             else:
