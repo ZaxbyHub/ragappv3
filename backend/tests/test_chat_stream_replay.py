@@ -300,6 +300,12 @@ async def test_regenerate_purges_stale_frames_and_logs_new_generation(env):
     assert await _await_for(lambda: len(env.event_rows(turn_id)) == 4)
     stale_payloads = [r[1] for r in env.event_rows(turn_id)]
     assert any('"alpha "' in p for p in stale_payloads)
+    # The first producer must be fully retired (registry popped by its
+    # done-callback) before the regenerate POST, or the second POST would
+    # attach as a reader of the finished producer instead of regenerating.
+    assert await _await_for(
+        lambda: chat_routes._turn_registry().get((env.session_id, turn_id)) is None
+    )
 
     reconnect_wire = "".join(await _collect_all(env.make_stream(turn_id)))
     assert await _await_for(lambda: len(env.event_rows(turn_id)) == 4)

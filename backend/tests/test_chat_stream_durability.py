@@ -352,6 +352,18 @@ async def test_shutdown_cancellation_persists_interrupted_turn(env):
     analogue, since a client disconnect no longer cancels the generation —
     finalizes the turn as interrupted with the partial content."""
     turn_id = "shutdown-turn-1"
+    # Gate the engine after the first content chunk (never released) so the
+    # producer is PROVABLY mid-generation when cancelled — an ungated scripted
+    # engine can finish before task.cancel() lands and finalize complete.
+    gate = asyncio.Event()
+
+    async def gated_query(*args, **kwargs):
+        yield {"type": "content", "content": "The plan begins "}
+        await gate.wait()
+        yield {"type": "content", "content": "with retrieval."}
+        yield {"type": "done", "sources": [], "memories_used": []}
+
+    env.engine.query = gated_query
     response = env.make_stream(turn_id)
     await _consume_until(response, _is_content_event)
     # The producer keeps running past the disconnect; cancel it directly.
