@@ -42,6 +42,6 @@ schema/config changes to undo.
 - New source-contract guardrail
   `backend/tests/test_index_detection_source_contract.py` banning name-based
   index guards and the `fts_text` literal from detection code.
-- Repaired 12 test files whose fakes asserted the fictional `fts_text`
+- Repaired 13 test files whose fakes asserted the fictional `fts_text`
   literal or name-only index shapes; fakes now mirror the real
   engine-reported index attributes.
