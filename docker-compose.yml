@@ -307,7 +307,11 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; exit(0 if urllib.request.urlopen('http://localhost:9090/health').getcode() == 200 else 1)\""]
+      # Readiness probe (/api/healthz) instead of the always-200 liveness
+      # route (/health): the backend healthcheck now fails on a failed startup
+      # migration, a vector-store model mismatch, or recent pool saturation
+      # (issue #550). /health stays pure liveness.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; exit(0 if urllib.request.urlopen('http://localhost:9090/api/healthz').getcode() == 200 else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3

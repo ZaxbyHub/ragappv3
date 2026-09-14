@@ -535,10 +535,15 @@ async def lifespan(app: FastAPI):
             if SensitiveFieldFilter not in {type(f) for f in _existing.filters}:
                 _existing.addFilter(SensitiveFieldFilter())
 
-    # Startup: Initialize database and services
+    # Startup: Initialize database and services. The outcome is recorded on
+    # app.state so the readiness probe (/api/healthz) can report a failed
+    # startup migration without a per-request pooled DB read (issues #550,
+    # #549 C02): in-memory flag, written where the migration already runs.
+    app.state.migrations_ok = True
     try:
         run_migrations(str(settings.sqlite_path))
     except Exception as e:
+        app.state.migrations_ok = False
         logger.error(
             "Database migration failed: %s — app will start with degraded database state",
             e,

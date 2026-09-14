@@ -8,6 +8,7 @@ import logging
 import shutil
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -4929,6 +4930,13 @@ class SQLiteConnectionPool:
     in multi-threaded environments.
     """
 
+    # How long a capacity wait stays reportable by the readiness probe
+    # (issue #550). 30s matches one compose healthcheck interval: a caller
+    # that was actually forced to wait for a connection marks the pool
+    # saturated for a single probe cycle, without flapping on the steady
+    # state where all `max_size` connections exist but sit idle in the queue.
+    CAPACITY_WAIT_WINDOW_SECONDS = 30.0
+
     def __init__(self, sqlite_path: str, max_size: int = 5):
         """
         Initialize the connection pool.
@@ -4943,6 +4951,28 @@ class SQLiteConnectionPool:
         self._lock = threading.Lock()
         self._created_count = 0
         self._closed = False
+        # Monotonic timestamp of the most recent checkout that found the pool
+        # at capacity and had to block (0.0 = never). Read by
+        # recent_capacity_wait(); written only via _record_capacity_wait().
+        self._last_capacity_wait_at = 0.0
+
+    def _record_capacity_wait(self) -> None:
+        """Mark that a checkout was forced to wait for a connection."""
+        with self._lock:
+            self._last_capacity_wait_at = time.monotonic()
+
+    def recent_capacity_wait(
+        self, window_seconds: float = CAPACITY_WAIT_WINDOW_SECONDS
+    ) -> bool:
+        """True when a checkout blocked on pool capacity within the window.
+
+        In-memory read only (lock-guarded timestamp); never touches a
+        connection, so the readiness path can call it without reintroducing
+        the pooled-read-on-the-event-loop defect class (issue #549 C02).
+        """
+        with self._lock:
+            last = self._last_capacity_wait_at
+        return last > 0.0 and (time.monotonic() - last) <= window_seconds
 
     def _create_connection(self) -> sqlite3.Connection:
         """
@@ -5051,7 +5081,11 @@ class SQLiteConnectionPool:
                         self._created_count -= 1
                         raise
 
-            # If at max capacity, block until a connection is available
+            # If at max capacity, block until a connection is available.
+            # Reaching this line means every connection is checked out and
+            # the caller is about to wait on the queue — record the wait so
+            # the readiness probe can report saturation (issue #550).
+            self._record_capacity_wait()
             try:
                 conn = self._pool.get(timeout=5)
                 # Validate the connection before returning it

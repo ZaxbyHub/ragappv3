@@ -289,23 +289,63 @@ async def healthz(request: Request):
     Returns 503 with a list of issues otherwise.
     Suitable for Kubernetes liveness/readiness probes and load-balancer health checks.
     Does not run expensive model availability checks.
+
+    Degraded startup states are surfaced from in-memory state only (issue #550,
+    never a per-request pooled DB read — issue #549 C02):
+
+    - a failed startup migration (recorded by lifespan on app.state) blocks readiness;
+    - a vector store left not-ready by an embedding-model mismatch blocks readiness;
+    - a DB pool that recently forced a caller to wait for a connection blocks readiness;
+    - an enabled maintenance flag is reported under "warnings" WITHOUT blocking the
+      route — maintenance is an intentional state, not a fault — and is read via the
+      cached off-loop get_flag_async() path.
     """
     state = request.app.state
     issues = []
+    warnings = []
 
     if not getattr(state, "db_pool", None):
         issues.append("db_pool not initialized")
+    if getattr(state, "migrations_ok", None) is False:
+        issues.append("database migration failed at startup")
     vector_store = getattr(state, "vector_store", None)
     if not vector_store:
         issues.append("vector_store not initialized")
     elif not getattr(vector_store, "table", None):
         issues.append("vector_store not connected")
+    elif not getattr(vector_store, "_ready", True):
+        issues.append(
+            "vector_store not ready (embedding model mismatch - reindex required)"
+        )
     if not getattr(state, "embedding_service", None):
         issues.append("embedding_service not initialized")
+    pool = getattr(state, "db_pool", None)
+    if pool is not None:
+        recent_wait = getattr(pool, "recent_capacity_wait", None)
+        if recent_wait is not None and recent_wait():
+            issues.append("db pool saturated: recent connection wait")
+
+    maintenance_service = getattr(state, "maintenance_service", None)
+    flag_getter = getattr(maintenance_service, "get_flag_async", None)
+    if flag_getter is not None:
+        try:
+            flag = await flag_getter()
+            if flag.enabled:
+                # Deliberately WITHOUT the operator-set reason string: this is an
+                # unauthenticated probe (PR #600 review PRR-001), and the reason
+                # is admin-set free text readable via GET /api/admin/maintenance.
+                warnings.append("maintenance mode enabled")
+        except Exception as exc:
+            logger.debug("healthz maintenance flag read failed (non-blocking): %s", exc)
 
     if issues:
+        content = {"status": "degraded", "issues": issues}
+        if warnings:
+            content["warnings"] = warnings
         return JSONResponse(
             status_code=503,
-            content={"status": "degraded", "issues": issues},
+            content=content,
         )
+    if warnings:
+        return {"status": "ok", "warnings": warnings}
     return {"status": "ok"}
