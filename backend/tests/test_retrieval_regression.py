@@ -4,6 +4,7 @@ Deterministic, portable, no dependency on real user data.
 Committable to version control.
 """
 
+import hashlib
 import os
 import sys
 from typing import Dict, List, Optional
@@ -257,8 +258,13 @@ class DeterministicEmbeddingService:
         text_lower = text.lower()
         set(text_lower.split())
 
-        # Create a base vector from the text hash for uniqueness
-        seed = hash(text) % (2**31)
+        # Create a base vector from the text hash for uniqueness.
+        # hashlib (NOT hash()) — built-in hash() is randomized per process by
+        # PYTHONHASHSEED, which made these "deterministic" embeddings and the
+        # corpus rank assertions flaky across CI runs (observed on PR #600:
+        # test_no_false_positives_high_recall failed then passed on a same-sha
+        # rerun with no diff change).
+        seed = int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16) % (2**31)
         rng = np.random.RandomState(seed)
         vec = (
             rng.randn(self.EMBEDDING_DIM).astype(np.float32) * 0.1
@@ -270,7 +276,7 @@ class DeterministicEmbeddingService:
             keyword_matches = sum(1 for kw in keywords if kw in text_lower)
             if keyword_matches > 0:
                 # Use doc_id hash to create a consistent vector direction for this doc
-                doc_seed = hash(doc_id) % (2**31)
+                doc_seed = int(hashlib.md5(doc_id.encode("utf-8")).hexdigest(), 16) % (2**31)
                 doc_rng = np.random.RandomState(doc_seed)
                 doc_vec = doc_rng.randn(self.EMBEDDING_DIM).astype(np.float32)
                 doc_vec /= np.linalg.norm(doc_vec)
@@ -385,6 +391,71 @@ async def test_synthetic_fixtures_are_deterministic(embedding_service):
     vec2 = await embedding_service.embed_single(text)
 
     assert vec1 == vec2, "Embeddings for the same text should be deterministic"
+
+
+def _md5_of_dna_embedding() -> str:
+    """Embed the DNA query and return an md5 digest of the vector (helper for
+    the cross-process stability test below). Constructs the service directly
+    (the embedding_service fixture cannot be called outside a test)."""
+    import asyncio
+    import json
+
+    async def _embed() -> List[float]:
+        return await DeterministicEmbeddingService().embed_single(
+            "Explain DNA structure"
+        )
+
+    vec = asyncio.run(_embed())
+    return hashlib.md5(json.dumps(vec).encode("utf-8")).hexdigest()
+
+
+def test_embeddings_stable_across_python_hash_seeds():
+    """Cross-process guard (PR #602 review): embeddings must NOT depend on
+    PYTHONHASHSEED. The within-process determinism test above cannot catch a
+    regression to built-in hash() seeding (it compares two vectors from the
+    SAME process, where hash() is still self-consistent), which is exactly how
+    the original flake survived — rank assertions only flipped across CI runs.
+    Spawn subprocesses under two different forced hash seeds and require the
+    digest to match the in-process one; a hash()-seed regression fails here."""
+    import json
+    import subprocess
+    import sys
+
+    child_code = (
+        "import sys, json, hashlib\n"
+        "sys.path.insert(0, '.')\n"
+        "import types\n"
+        "for _m in ('lancedb', 'pyarrow'):\n"
+        "    try:\n"
+        "        __import__(_m)\n"
+        "    except ImportError:\n"
+        "        sys.modules[_m] = types.ModuleType(_m)\n"
+        "import asyncio\n"
+        "from test_retrieval_regression import DeterministicEmbeddingService\n"
+        "svc = DeterministicEmbeddingService()\n"
+        "vec = asyncio.run(svc.embed_single('Explain DNA structure'))\n"
+        "print(hashlib.md5(json.dumps(vec).encode('utf-8')).hexdigest())\n"
+    )
+    digests = set()
+    for forced_seed in ("0", "12345"):
+        env = dict(os.environ, PYTHONHASHSEED=forced_seed)
+        out = subprocess.run(
+            [sys.executable, "-c", child_code],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+        )
+        assert out.returncode == 0, (
+            f"subprocess (PYTHONHASHSEED={forced_seed}) failed: {out.stderr[-500:]}"
+        )
+        digests.add(out.stdout.strip())
+    digests.add(_md5_of_dna_embedding())
+    assert len(digests) == 1, (
+        "Embeddings differ across PYTHONHASHSEED values — seeding regressed to "
+        f"process-randomized hash(): {digests}"
+    )
 
 
 @pytest.mark.asyncio
