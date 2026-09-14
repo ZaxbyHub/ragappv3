@@ -5,9 +5,19 @@ import { setChatHistory as storageSetChatHistory, getChatHistory as storageGetCh
 // SSE Streaming
 // ============================================================================
 
+// Resume-state holder for fetch-based SSE reconnection (issue #555). A
+// fetch-based client gets none of EventSource's automatic last-event-id
+// tracking, so the id from each frame's `id:` field is recorded here and the
+// caller (chatStream) resends it as the `Last-Event-ID` header when it
+// reconnects.
+export interface SSEResumeState {
+  lastEventId: string | null;
+}
+
 export async function parseSSEStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   callbacks: ChatStreamCallbacks,
+  resumeState?: SSEResumeState,
 ): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -51,6 +61,13 @@ export async function parseSSEStream(
 
     for (const line of lines) {
       const trimmed = line.trim();
+      // Issue #555: track the SSE event id (WHATWG: `id:` field, optional
+      // space; an empty value resets the last event id). Heartbeat comments
+      // (`:` prefix) carry no id and are ignored.
+      if (resumeState && trimmed.startsWith("id:")) {
+        resumeState.lastEventId = trimmed.slice(3).trim() || null;
+        continue;
+      }
       if (trimmed.startsWith("data: ")) {
         const data = trimmed.slice(6);
         if (data === "[DONE]") {
@@ -247,44 +264,73 @@ export function chatStream(
     }),
   });
 
+  // Issue #555: bounded automatic resume for durable turns. A fetch-based
+  // SSE client inherits none of EventSource's automatic last-event-id
+  // tracking, so parseSSEStream records each frame's `id:` here and the
+  // reconnect re-POSTs the same body with the `Last-Event-ID` header; the
+  // server replays exactly the missed frames. Non-durable calls (no
+  // durableTurn) keep the old behavior: the interruption surfaces
+  // immediately and the hook marks the turn retryable.
+  const MAX_RESUME_ATTEMPTS = 3;
+  const RESUME_BACKOFF_MS = 500;
+  const resumeState: SSEResumeState = { lastEventId: null };
+
   const startStream = async () => {
-    try {
-      // Pre-stream token refresh check: if JWT is close to expiring, refresh it first
-      if (_jwtAccessToken && isTokenNearExpiry(_jwtAccessToken)) {
-        const refreshedToken = await refreshAccessToken();
-        if (!refreshedToken) {
-          // Refresh failed - abort
-          callbacks.onError?.(new Error("Session expired. Please log in again."));
+    // Holder object: the callback mutates it asynchronously, and routing the
+    // flag through a property keeps the reset meaningfully observable.
+    const interruptState: { error: Error | null } = { error: null };
+    const wrappedCallbacks: ChatStreamCallbacks = {
+      ...callbacks,
+      onError: (error) => {
+        if (error instanceof Error && error.name === "ChatInterruptedError") {
+          interruptState.error = error;
           return;
         }
-      }
+        callbacks.onError?.(error);
+      },
+    };
 
-      // Get CSRF token for the POST request
-      let csrfToken: string;
+    for (let attempt = 0; ; attempt++) {
+      interruptState.error = null;
       try {
-        csrfToken = await ensureCsrfToken();
-      } catch {
-        callbacks.onError?.(new Error("Failed to get CSRF token"));
-        return;
-      }
+        // Pre-stream token refresh check: if JWT is close to expiring, refresh it first
+        if (_jwtAccessToken && isTokenNearExpiry(_jwtAccessToken)) {
+          const refreshedToken = await refreshAccessToken();
+          if (!refreshedToken) {
+            // Refresh failed - abort
+            callbacks.onError?.(new Error("Session expired. Please log in again."));
+            return;
+          }
+        }
 
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": csrfToken,
-      };
-      if (_jwtAccessToken) {
-        headers["Authorization"] = `Bearer ${_jwtAccessToken}`;
-      }
+        // Get CSRF token for the POST request
+        let csrfToken: string;
+        try {
+          csrfToken = await ensureCsrfToken();
+        } catch {
+          callbacks.onError?.(new Error("Failed to get CSRF token"));
+          return;
+        }
 
-      const response = await fetch(`${API_BASE_URL}/chat/stream`, {
-        method: "POST",
-        headers,
-        body: requestBody,
-        signal: abortController.signal,
-      });
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": csrfToken,
+        };
+        if (_jwtAccessToken) {
+          headers["Authorization"] = `Bearer ${_jwtAccessToken}`;
+        }
+        if (resumeState.lastEventId != null) {
+          headers["Last-Event-ID"] = resumeState.lastEventId;
+        }
 
-      if (!response.ok) {
-        if (response.status === 401 && _jwtAccessToken) {
+        let response = await fetch(`${API_BASE_URL}/chat/stream`, {
+          method: "POST",
+          headers,
+          body: requestBody,
+          signal: abortController.signal,
+        });
+
+        if (!response.ok && response.status === 401 && _jwtAccessToken) {
           // Check error detail — only retry on token_expired, skip token_invalid/user_inactive
           const errorBody = await response.json().catch(() => null);
           const detail = errorBody?.detail;
@@ -294,50 +340,66 @@ export function chatStream(
           );
 
           if (isTokenExpired && !isTokenInvalid) {
-            try {
-              // Backoff delay before retry (1 second, matching interceptor pattern)
-              await new Promise((resolve) => setTimeout(resolve, 1000));
+            // Backoff delay before retry (1 second, matching interceptor pattern)
+            await new Promise((resolve) => setTimeout(resolve, 1000));
 
-              const newToken = await refreshAccessToken();
-              if (newToken) {
-                headers["Authorization"] = `Bearer ${newToken}`;
-                const retryResponse = await fetch(`${API_BASE_URL}/chat/stream`, {
-                  method: "POST",
-                  headers,
-                  body: requestBody,
-                  signal: abortController.signal,
-                });
-                if (!retryResponse.ok) {
-                  throw new Error(`HTTP error! status: ${retryResponse.status}`);
-                }
-                const retryReader = retryResponse.body?.getReader();
-                if (!retryReader) {
-                  throw new Error("Response body is not readable");
-                }
-                await parseSSEStream(retryReader, callbacks);
-                return;
-              }
-            } catch {
-              // Refresh or retry failed — fall through to error
+            const newToken = await refreshAccessToken();
+            if (newToken) {
+              headers["Authorization"] = `Bearer ${newToken}`;
+              response = await fetch(`${API_BASE_URL}/chat/stream`, {
+                method: "POST",
+                headers,
+                body: requestBody,
+                signal: abortController.signal,
+              });
             }
           }
         }
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
 
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error("Response body is not readable");
-      }
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
 
-      await parseSSEStream(reader, callbacks);
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
+        const reader = response.body?.getReader();
+        if (!reader) {
+          throw new Error("Response body is not readable");
+        }
+
+        await parseSSEStream(reader, wrappedCallbacks, resumeState);
+        if (interruptState.error == null) {
+          // Completed normally, protocol error (forwarded), or user abort.
+          return;
+        }
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          return;
+        }
+        callbacks.onError?.(
+          error instanceof Error ? error : new Error(String(error))
+        );
         return;
       }
-      callbacks.onError?.(
-        error instanceof Error ? error : new Error(String(error))
-      );
+      // Mid-stream interruption: resume only durable turns (the server can
+      // only replay frames it persisted for a session/turn pair).
+      if (durableTurn == null || attempt >= MAX_RESUME_ATTEMPTS) {
+        callbacks.onError?.(interruptState.error!);
+        return;
+      }
+      // Abort-aware backoff: dispose() during the wait resolves early and
+      // the next fetch throws AbortError, ending the loop. The remaining
+      // silent window while still subscribed is bounded (<= 1.5s) and
+      // accepted: the turn is still making progress.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, RESUME_BACKOFF_MS * (attempt + 1));
+        abortController.signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true }
+        );
+      });
     }
   };
 

@@ -1,8 +1,10 @@
 """Server-side durable chat turn writes on the streaming path (issue #553).
 
 Covers: the pre-write of the user row (status 'pending') before the first
-token, the interrupted finalize on mid-stream disconnect with NO client-side
-batch save (the issue's definition-of-done), the complete finalize, old-client
+token, the complete finalize (since #555 the generation outlives a dropped
+connection, so a disconnect completes the turn server-side; the #553
+interrupted finalize keeps dedicated coverage for real cancellation via the
+shutdown test), old-client
 opt-out compat, pre-write failure semantics, duplicate pre-write idempotency,
 admission-rejection writing nothing, and the stream-auth session validation.
 
@@ -285,15 +287,44 @@ async def test_prewrite_lands_before_first_token_and_disconnect_keeps_it(env):
     assert [r for r in rows if r[0] == "assistant"] == []
 
 
-async def test_disconnect_without_client_batch_persists_interrupted_turn(env):
-    """Definition of done (issue #553 / E01a): drop the connection after the
-    first content token with NO client-side batch save; the server history
-    then holds the user row and an interrupted assistant row for the turn."""
+async def _await_for(predicate, timeout=5.0, interval=0.02):
+    """Async polling for direct-generator tests: unlike the sync ``_wait_for``
+    (fine for the HTTP-path tests whose app loop runs in another thread), this
+    yields to the event loop between polls, which the direct-generator tests
+    REQUIRE — the producer finalizes via ``asyncio.to_thread`` completions
+    that only land while the loop is free to run."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(interval)
+
+
+async def test_disconnect_lets_generation_finish_and_persists_complete_turn(env):
+    """Definition of done (issue #553 / E01a, as extended by issue #555): drop
+    the connection after the first content token with NO client-side batch
+    save. Under #555 the generation runs in the per-turn producer decoupled
+    from the connection, so instead of finalizing an interrupted partial row
+    the turn COMPLETES server-side and the full answer lands in history —
+    that completion is exactly what a reconnect replays (the #555 DoD). The
+    interrupted finalize itself keeps dedicated coverage in
+    test_shutdown_cancellation_persists_interrupted_turn below."""
     turn_id = "dod-turn-1"
     response = env.make_stream(turn_id)
     await _consume_until(response, _is_content_event)
-    assert _wait_for(
+    assert await _await_for(
         lambda: len([r for r in env.rows() if r[0] == "assistant"]) == 1
+    )
+    # The producer finalizes complete with the FULL content (not a partial
+    # interrupted fragment): the generation outlived the dropped connection.
+    assert await _await_for(
+        lambda: (
+            [r for r in env.rows() if r[0] == "assistant"][0][1] == "complete"
+            if [r for r in env.rows() if r[0] == "assistant"]
+            else False
+        )
     )
 
     rows = env.rows()
@@ -301,10 +332,10 @@ async def test_disconnect_without_client_batch_persists_interrupted_turn(env):
     assistant_rows = [r for r in rows if r[0] == "assistant"]
     assert len(user_rows) == 1
     assert len(assistant_rows) == 1
-    assert assistant_rows[0][1] == "interrupted"
+    assert assistant_rows[0][1] == "complete"
     assert user_rows[0][2] == turn_id
     assert assistant_rows[0][2] == turn_id
-    assert "The plan begins" in assistant_rows[0][4]
+    assert "The plan begins with retrieval." in assistant_rows[0][4]
 
     # Second simulated client: read history through the real GET endpoint.
     # (Bare TestClient: the context-manager form would run the app's real
@@ -314,7 +345,46 @@ async def test_disconnect_without_client_batch_persists_interrupted_turn(env):
     messages = resp.json().get("messages", [])
     by_role = {m["role"]: m for m in messages}
     assert by_role["user"]["turn_id"] == turn_id
-    assert by_role["assistant"]["status"] == "interrupted"
+    assert by_role["assistant"]["status"] == "complete"
+
+
+async def test_shutdown_cancellation_persists_interrupted_turn(env):
+    """Issue #553's cancellation-safe finalize, producer-owned (#555): only a
+    real cancellation of the turn's producer task — the process-shutdown
+    analogue, since a client disconnect no longer cancels the generation —
+    finalizes the turn as interrupted with the partial content."""
+    turn_id = "shutdown-turn-1"
+    # Gate the engine after the first content chunk (never released) so the
+    # producer is PROVABLY mid-generation when cancelled — an ungated scripted
+    # engine can finish before task.cancel() lands and finalize complete.
+    gate = asyncio.Event()
+
+    async def gated_query(*args, **kwargs):
+        yield {"type": "content", "content": "The plan begins "}
+        await gate.wait()
+        yield {"type": "content", "content": "with retrieval."}
+        yield {"type": "done", "sources": [], "memories_used": []}
+
+    env.engine.query = gated_query
+    response = env.make_stream(turn_id)
+    await _consume_until(response, _is_content_event)
+    # The producer keeps running past the disconnect; cancel it directly.
+    entry = chat_routes._turn_registry().get((env.session_id, turn_id))
+    assert entry is not None and entry.task is not None
+    entry.task.cancel()
+    try:
+        await entry.task
+    except asyncio.CancelledError:
+        pass
+    assert _wait_for(
+        lambda: len([r for r in env.rows() if r[0] == "assistant"]) == 1
+    )
+
+    rows = env.rows()
+    assistant_rows = [r for r in rows if r[0] == "assistant"]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0][1] == "interrupted"
+    assert "The plan begins" in assistant_rows[0][4]
 
 
 # ---------------------------------------------------------------------------
@@ -406,30 +476,39 @@ class _BrokenPool:
         raise RuntimeError("pool unavailable")
 
 
-def test_prewrite_failure_disables_server_writes_and_batch_reconciles(env):
-    """Decision 4 + critic R3: a failed pre-write disables server-side writes
-    for the stream (no orphan assistant row; the stream still completes), and
-    a later client batch — through the real HTTP batch endpoint — is the
-    writer of record and fires the auto-title trigger from the batch path."""
-    app.state.db_pool = _BrokenPool()
-    try:
-        turn_id = "broken-prewrite-turn"
-        saw_done = False
-        with env.client().stream(
-            "POST", "/api/chat/stream", json=env.payload(turn_id)
-        ) as response:
-            assert response.status_code == 200
-            for line in response.iter_lines():
-                if _is_done_event(line):
-                    saw_done = True
-        assert saw_done
-        # The pre-write failure is synchronous inside the request and the
-        # backstop is gated on pre-write success, so there is no writer to
-        # settle — assert immediately.
-        # No user row (pre-write failed) and no orphan assistant row.
-        assert env.rows() == []
-    finally:
-        app.state.db_pool = env.pool
+def test_prewrite_failure_disables_server_writes_and_batch_reconciles(env, monkeypatch):
+    """Decision 4 + critic R3: a failed pre-write disables server-side chat
+    writes for the stream (no orphan assistant row; the stream still
+    completes), and a later client batch — through the real HTTP batch
+    endpoint — is the writer of record and fires the auto-title trigger from
+    the batch path. Issue #555: the failure is injected at the pre-write
+    itself (the event log is now the frame delivery channel, so breaking the
+    whole pool would starve the stream rather than isolate the pre-write —
+    that degradation contract has its own test below)."""
+    def _failing_prewrite(db_pool, session_id, turn_id, content):
+        return {
+            "ok": False,
+            "duplicate": False,
+            "is_first_user_row": False,
+            "title_is_null": True,
+        }
+
+    monkeypatch.setattr(chat_routes, "_prewrite_user_turn", _failing_prewrite)
+    turn_id = "broken-prewrite-turn"
+    saw_done = False
+    with env.client().stream(
+        "POST", "/api/chat/stream", json=env.payload(turn_id)
+    ) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if _is_done_event(line):
+                saw_done = True
+    assert saw_done
+    # The pre-write failure is synchronous inside the producer and the
+    # finalize is gated on pre-write success, so there is no writer to
+    # settle — assert immediately.
+    # No user row (pre-write failed) and no orphan assistant row.
+    assert env.rows() == []
 
     resp = env.client().post(
             f"/api/chat/sessions/{env.session_id}/messages/batch",
@@ -452,6 +531,26 @@ def test_prewrite_failure_disables_server_writes_and_batch_reconciles(env):
         "SELECT title FROM chat_sessions WHERE id = ?", (env.session_id,)
     ).fetchone()[0]
     assert title == "New conversation"
+
+
+def test_broken_pool_degrades_to_clean_empty_stream(env):
+    """Issue #555 degradation contract: with the pool fully unavailable, the
+    event log cannot record or replay frames, so the reader closes the stream
+    cleanly (HTTP 200, no frames, no terminal marker) instead of 500-ing —
+    every log path is guarded and never fails the response."""
+    app.state.db_pool = _BrokenPool()
+    try:
+        saw_any = False
+        with env.client().stream(
+            "POST", "/api/chat/stream", json=env.payload("broken-pool-turn")
+        ) as response:
+            assert response.status_code == 200
+            for line in response.iter_lines():
+                if line.strip():
+                    saw_any = True
+        assert not saw_any
+    finally:
+        app.state.db_pool = env.pool
 
 
 async def test_duplicate_prewrite_is_idempotent_and_finalize_upserts(env):

@@ -49,7 +49,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # 66 -> 68: issue #516 (2026-09-10) added draft_reconcile_cursor and
 # draft_reconcile_backlog (evidence-reconciler continuation state)
 # 68 -> 70: issue #237 (AC12) adds quality_reports and quality_eval_cases (PRODUCT-ENH-12 report->case->compare)
-EXPECTED_BASE_TABLE_COUNT = 70
+# 70 -> 71: issue #555 (2026-09-14) adds chat_stream_events (per-turn SSE replay log)
+EXPECTED_BASE_TABLE_COUNT = 71
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

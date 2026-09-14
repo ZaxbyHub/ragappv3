@@ -15,10 +15,11 @@ import time
 import uuid
 from contextlib import AsyncExitStack
 from html import escape as _xml_escape
-from typing import Any, Callable, Dict, List, Literal, Optional, Set
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from fastapi.sse import format_sse_event
 from pydantic import BaseModel, Field
 
 from app.api.deps import (
@@ -370,6 +371,179 @@ _TURN_STATUS_INTERRUPTED = "interrupted"
 _TURN_STATUS_FAILED = "failed"
 
 
+# ---------------------------------------------------------------------------
+# Resumable SSE streams (issue #555): per-turn event log + Last-Event-ID
+# ---------------------------------------------------------------------------
+
+class _TurnStream:
+    """Registry entry for a live durable-turn generation (issue #555).
+
+    The producer task owns the whole turn's lifetime — E3 telemetry binding,
+    the CHAT admission lease, the durable pre-write, frame logging, and the
+    finalize paths — decoupled from any HTTP connection, so a dropped client
+    no longer stops the generation (the connection-drop resume case; the
+    process-kill case stays gated on I4/#559). ``readers`` holds one
+    asyncio.Event per attached reader; the producer sets them after each
+    logged frame so in-process readers wake immediately (a plain Event is
+    deliberately used instead of a Condition: cancelling a reader parked in
+    ``wait_for(condition.wait(), ...)`` can wedge the condition lock and
+    stall the producer, while Event.set/wait is cancellation-safe). Readers
+    also work with ``entry=None`` by tailing the persisted
+    chat_stream_events table alone.
+    """
+
+    __slots__ = ("session_id", "turn_id", "task", "readers", "started")
+
+    def __init__(self, session_id: int, turn_id: str) -> None:
+        self.session_id = session_id
+        self.turn_id = turn_id
+        self.task: Optional[asyncio.Task] = None
+        self.readers: Set[asyncio.Event] = set()
+        # Set by the producer once its log reset (retention purge) has landed,
+        # so no reader ever fetches a half-purged or stale log.
+        self.started = asyncio.Event()
+
+    @property
+    def finished(self) -> bool:
+        return self.task is not None and self.task.done()
+
+
+def _turn_registry() -> Dict[Tuple[int, str], _TurnStream]:
+    """Per-event-loop registry of live durable-turn generations.
+
+    Keyed on the running loop rather than module globals so each event loop
+    (one per test, one per worker) gets an isolated registry — production has
+    a single loop, so behavior is identical, but stale asyncio primitives from
+    a previous loop can never leak into a new one. The check-and-insert that
+    claims a turn needs no lock: it runs synchronously on the event loop with
+    no ``await`` between the lookup and the insert, so no other task can
+    interleave and start a duplicate producer.
+    """
+    loop = asyncio.get_running_loop()
+    registry = getattr(loop, "_chat_turn_registry", None)
+    if registry is None:
+        registry = {}
+        loop._chat_turn_registry = registry
+    return registry
+
+
+def _sse_frame(data_json: str, seq: int) -> str:
+    """SSE wire bytes for a logged frame (fastapi.sse canonical formatter).
+
+    The payload is the exact JSON string the producer logged, so an initial
+    connection and a reconnecting one render byte-identical frames.
+    """
+    return format_sse_event(data_str=data_json, id=str(seq)).decode("utf-8")
+
+
+def _sse_heartbeat() -> str:
+    """SSE comment keepalive — never carries an ``id:``, so no client's
+    last-event-id can advance on a heartbeat."""
+    return format_sse_event(comment="heartbeat").decode("utf-8")
+
+
+def _payload_is_terminal(payload: str) -> bool:
+    """True when the logged JSON payload ends the turn's frame stream.
+
+    The generator's every terminal path emits the ``done`` protocol marker
+    (ENH-016), so ``type == 'done'`` is the terminal predicate; an
+    unparseable payload is never treated as terminal.
+    """
+    try:
+        parsed = json.loads(payload)
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("type") == "done"
+
+
+def _log_stream_event_sync(
+    db_pool, session_id: int, turn_id: str, seq: int, payload: str
+) -> None:
+    """Persist one replayable frame. Never raises — a failed log write only
+    degrades resumability for frames from that point on; the live connection
+    and the H2 chat_messages persistence are unaffected."""
+    try:
+        with db_pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO chat_stream_events (session_id, turn_id, seq, payload) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, turn_id, seq, payload),
+            )
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001 — resumability must never fail the stream
+        logger.warning(
+            "chat_stream_events write failed (session %s turn %s seq %s): %s",
+            session_id, turn_id, seq, exc,
+        )
+
+
+def _fetch_stream_events_sync(
+    db_pool, session_id: int, turn_id: str, after_seq: int
+) -> List[Tuple[int, str]]:
+    """Frames of a turn with ``seq > after_seq``, in order. Never raises —
+    an empty list reads as 'nothing new' and the reader closes honestly."""
+    try:
+        with db_pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT seq, payload FROM chat_stream_events "
+                "WHERE session_id = ? AND turn_id = ? AND seq > ? ORDER BY seq",
+                (session_id, turn_id, after_seq),
+            ).fetchall()
+        return [(int(row[0]), str(row[1])) for row in rows]
+    except Exception as exc:  # noqa: BLE001 — readers degrade to an empty replay
+        logger.warning(
+            "chat_stream_events read failed (session %s turn %s): %s",
+            session_id, turn_id, exc,
+        )
+        return []
+
+
+def _max_stream_event_seq_sync(
+    db_pool, session_id: int, turn_id: str
+) -> int:
+    """Highest logged seq for a turn (0 when the log is empty). Never raises."""
+    try:
+        with db_pool.connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM chat_stream_events "
+                "WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+    except Exception as exc:  # noqa: BLE001 — readers degrade to an empty replay
+        logger.warning(
+            "chat_stream_events max-seq read failed (session %s turn %s): %s",
+            session_id, turn_id, exc,
+        )
+        return 0
+
+
+def _purge_stream_events_sync(db_pool, session_id: int, turn_id: str) -> None:
+    """Log reset at fresh-generation start (issue #555).
+
+    Deletes the session's ENTIRE event log — the superseded older turns AND
+    any rows of THIS turn left over from a previous generation (client retry
+    semantics: the new generation restarts at seq 1, and stale frames of the
+    old attempt must never survive to be replayed) — plus rows older than a
+    day globally. Never raises — retention is best-effort housekeeping."""
+    try:
+        with db_pool.connection() as conn:
+            conn.execute(
+                "DELETE FROM chat_stream_events WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.execute(
+                "DELETE FROM chat_stream_events "
+                "WHERE created_at < datetime('now', '-1 day')"
+            )
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001 — housekeeping only
+        logger.warning(
+            "chat_stream_events retention purge failed (session %s): %s",
+            session_id, exc,
+        )
+
+
 def _prewrite_user_turn(
     db_pool, session_id: int, turn_id: str, content: str
 ) -> Dict[str, Any]:
@@ -619,12 +793,14 @@ def stream_chat_response(
     durable_session_id: Optional[int] = None,
     durable_turn_id: Optional[str] = None,
     db_pool: Optional[object] = None,
+    last_event_id: Optional[int] = None,
 ) -> StreamingResponse:
     """
     Generate a streaming chat response using SSE format.
 
     Yields SSE events with JSON data chunks from the RAG engine.
-    Each event is formatted as: data: {json}\n\n
+    Non-durable events are formatted as: data: {json}\n\n; durable-path
+    frames carry an id: <seq> line (fastapi.sse framing).
     Ends with a done event containing sources and memories_used.
 
     Issue #553 durable turns: when ``durable_session_id``/``durable_turn_id``
@@ -633,6 +809,16 @@ def stream_chat_response(
     finalized at stream end (complete / interrupted / failed) keyed on the
     client's ``turn_id`` — so a proxy drop, tab close, or crash never loses
     the question or the partial answer from server history.
+
+    Issue #555 resumable streams: on the durable path the generation runs in
+    a per-turn producer task decoupled from the HTTP connection, and every
+    replayable frame is persisted to ``chat_stream_events`` keyed by
+    ``(session_id, turn_id, seq)``. The returned response is a READER over
+    that log: a client reconnecting with ``last_event_id`` (the SSE
+    ``Last-Event-ID`` value read by the route) receives exactly the frames
+    after its last delivered id — no duplicates, no gaps — and then follows
+    the live remainder. A client that never sends the header gets the full
+    normal stream. Non-durable calls keep the pre-#555 behavior unchanged.
     """
     if rag_engine is None:
 
@@ -952,52 +1138,70 @@ def stream_chat_response(
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
 
-    async def event_generator():
-        # E3 telemetry (issue #518): bind the per-turn correlation id (the
-        # inbound request id when the logging middleware stamped one), record
-        # the turn, and measure the admission queue wait. Issue #553: when the
-        # client supplied a durable turn_id, THAT id wins — telemetry, the SSE
-        # done payload's turn_id echo, and the durable chat rows then all
-        # share the client's own key.
-        turn_id = (
-            durable_turn_id
-            if durable_turn_id
-            else (request_id_var.get() or f"turn-{uuid.uuid4().hex}")
-        )
-        set_current_turn(turn_id)
-        get_telemetry().record_chat_turn(turn_id)
-        _queue_wait_started = time.monotonic()
-        # E3 admission (issue #518): route-level CHAT gate, held for the whole
-        # stream. The engine's generation-phase gate is skipped under this
-        # lease (chat_gate_held marker), so route+engine never double-count.
-        # Rejection yields the protocol error+done pair (ENH-016: every
-        # terminal path emits done).
-        async with AsyncExitStack() as admission_stack:
-            try:
-                await admission_stack.enter_async_context(
-                    get_admission_controller().admit(AdmissionClass.CHAT)
-                )
-            except AdmissionRejected as exc:
-                logger.warning("Chat stream admission rejected: %s", exc)
-                yield f"data: {json.dumps({'type': 'error', 'message': 'Chat capacity is saturated; retry shortly', 'code': 'ADMISSION_REJECTED'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance', 'turn_id': current_turn_id()})}\n\n"
-                return
-            # Mark this request as already chat-gated so the engine's
-            # generation-phase gate skips its own acquire (no same-key
-            # nesting; see app/services/admission.py).
-            gate_token = mark_chat_gate()
-            admission_stack.callback(lambda: reset_chat_gate(gate_token))
-            get_telemetry().record_queue_wait(
-                "chat", time.monotonic() - _queue_wait_started
-            )
+    async def _turn_producer(entry: "stream_chat_response._TurnStream") -> None:
+        """The turn's generation, decoupled from any HTTP connection (#555).
 
-            if durable_active:
+        Absorbs the per-turn work that used to live in ``event_generator`` —
+        E3 telemetry binding, the CHAT admission lease, the durable pre-write,
+        auto-title, iteration, and the finalize paths (issue #553 semantics
+        preserved: eager finalize on normal completion, pure-sync cancellation
+        backstop) — but instead of yielding frames to one socket it persists
+        every replayable frame to ``chat_stream_events`` and wakes readers.
+        Because the producer outlives connections, a dropped client no longer
+        stops the generation (connection-drop resume case); the task is only
+        cancelled by process shutdown, which lands in the cancellation-safe
+        backstop below and finalizes ``interrupted`` exactly as #553 did.
+        """
+        # Issue #518/#553: the client's durable turn_id wins the E3
+        # correlation binding for the whole turn (once per TURN — reconnect
+        # readers never re-record it).
+        set_current_turn(durable_turn_id or "")
+        get_telemetry().record_chat_turn(durable_turn_id or "")
+        _queue_wait_started = time.monotonic()
+        seq = 0
+        last_terminal = False
+
+        async def _emit(payload: str) -> None:
+            """Log one frame and wake in-process readers."""
+            nonlocal seq, last_terminal
+            seq += 1
+            await asyncio.to_thread(
+                _log_stream_event_sync,
+                db_pool, durable_session_id, durable_turn_id, seq, payload,
+            )
+            last_terminal = _payload_is_terminal(payload)
+            for reader_wake in list(entry.readers):
+                reader_wake.set()
+
+        try:
+            async with AsyncExitStack() as admission_stack:
+                # E3 admission (issue #518): the CHAT gate now spans the
+                # producer's lifetime (the real generation), not a single
+                # connection's. Rejection logs the protocol error+done pair.
+                try:
+                    await admission_stack.enter_async_context(
+                        get_admission_controller().admit(AdmissionClass.CHAT)
+                    )
+                except AdmissionRejected as exc:
+                    logger.warning("Chat stream admission rejected: %s", exc)
+                    await _emit(json.dumps({"type": "error", "message": "Chat capacity is saturated; retry shortly", "code": "ADMISSION_REJECTED"}))
+                    await _emit(json.dumps({"type": "done", "sources": [], "memories_used": [], "wiki_used": [], "kms_used": [], "score_type": "distance", "turn_id": current_turn_id()}))
+                    return
+                # Mark this request as already chat-gated so the engine's
+                # generation-phase gate skips its own acquire (no same-key
+                # nesting; see app/services/admission.py).
+                gate_token = mark_chat_gate()
+                admission_stack.callback(lambda: reset_chat_gate(gate_token))
+                get_telemetry().record_queue_wait(
+                    "chat", time.monotonic() - _queue_wait_started
+                )
+
                 # Issue #553: write the durable user row (status 'pending')
                 # BEFORE the first token streams. A saturated/rejected request
                 # never reaches here, so a turn that never started writes
                 # nothing. Failure (or a missing session) disables server-side
-                # writes for this stream — the stream itself must never fail
-                # because durability bookkeeping failed.
+                # chat_messages writes for this turn — the stream itself must
+                # never fail because durability bookkeeping failed.
                 prewrite = await asyncio.to_thread(
                     _prewrite_user_turn,
                     db_pool,
@@ -1006,6 +1210,16 @@ def stream_chat_response(
                     message,
                 )
                 turn_state["prewrite_ok"] = prewrite["ok"]
+                # Retention / log reset (issue #555): a fresh generation
+                # starts from a clean event log — the session's older turns'
+                # rows AND any rows of this turn left over from a previous
+                # generation are purged before the first frame is logged, so
+                # a regenerate never collides with (or replays) stale frames.
+                await asyncio.to_thread(
+                    _purge_stream_events_sync,
+                    db_pool, durable_session_id, durable_turn_id,
+                )
+                entry.started.set()
                 # Auto-title ownership (issue #553): the pre-write is now the
                 # writer of a session's first user message, so it owns the
                 # first-turn auto-name trigger that add_messages_batch's
@@ -1042,40 +1256,232 @@ def stream_chat_response(
                                 title_exc,
                             )
 
+                try:
+                    async for chunk in _event_generator_inner():
+                        # Heartbeat comments are transport keepalives, not
+                        # events — they are never logged and never consume a
+                        # seq; each reader emits its own while it waits.
+                        if not chunk.startswith("data: "):
+                            continue
+                        await _emit(chunk[len("data: "):].strip())
+                    # Normal termination (complete, or failed-with-done-payload):
+                    # finalize the durable assistant row eagerly in a worker
+                    # thread now that the generation is done. Commit happens
+                    # inside the helper, inside the thread; only a successful
+                    # return sets the finalized flag.
+                    if turn_state["prewrite_ok"]:
+                        await asyncio.to_thread(
+                            _finalize_durable_turn_sync,
+                            db_pool,
+                            turn_state,
+                            turn_state["status"] or _TURN_STATUS_INTERRUPTED,
+                        )
+                        turn_state["finalized"] = True
+                finally:
+                    # Cancellation backstop (#553 semantics, producer-owned):
+                    # shutdown cancels this task and lands here during
+                    # CancelledError/GeneratorExit unwinding, where an await
+                    # would re-raise — so the finalize is pure-sync (pool
+                    # checkout + execute + commit, no await), exactly the #553
+                    # disconnect backstop, now reached only on real
+                    # cancellation instead of every client disconnect.
+                    if (
+                        turn_state["prewrite_ok"]
+                        and not turn_state["finalized"]
+                    ):
+                        _finalize_durable_turn_sync(
+                            db_pool,
+                            turn_state,
+                            turn_state["status"] or _TURN_STATUS_INTERRUPTED,
+                        )
+                        turn_state["finalized"] = True
+                    # Guarantee readers terminate: a turn cut off before its
+                    # terminal frame (shutdown mid-generation) gets the
+                    # protocol error+done pair appended pure-sync, so a late
+                    # reconnect replays an honest failure instead of hanging.
+                    if seq > 0 and not last_terminal:
+                        _log_stream_event_sync(
+                            db_pool, durable_session_id, durable_turn_id,
+                            seq + 1,
+                            json.dumps({"type": "error", "message": "Chat stream interrupted", "code": "STREAM_INTERRUPTED"}),
+                        )
+                        _log_stream_event_sync(
+                            db_pool, durable_session_id, durable_turn_id,
+                            seq + 2,
+                            json.dumps({"type": "done", "sources": [], "memories_used": [], "wiki_used": [], "kms_used": [], "score_type": "distance", "turn_id": current_turn_id()}),
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as producer_exc:  # noqa: BLE001 — plumbing must not
+            # kill the turn silently; frames already logged stay replayable.
+            logger.exception(
+                "Turn producer failed (session %s turn %s): %s",
+                durable_session_id, durable_turn_id, producer_exc,
+            )
+        finally:
+            # Guaranteed reader gate release: even an early exit (admission
+            # rejection, cancellation before the purge) must not leave
+            # readers waiting on `started` — Event.set is sync-safe here.
+            entry.started.set()
+
+    async def _resumable_event_stream(
+        entry: Optional["stream_chat_response._TurnStream"],
+        start_after: int,
+    ):
+        """Reader over the per-turn event log (#555).
+
+        Replays persisted frames with ``seq > start_after`` (a reconnecting
+        client's ``Last-Event-ID``; 0 for a fresh connection), then follows
+        the live remainder via the producer's condition. Ends immediately
+        after the terminal frame, or — when the producer is gone and no
+        terminal frame exists (e.g. process death; the I4/#559 scope) — after
+        the last persisted frame, which the client surfaces as an interrupted
+        stream. Never fabricates a ``done``.
+        """
+        last_sent = start_after
+        reader_wake = asyncio.Event()
+        if entry is not None:
+            entry.readers.add(reader_wake)
+        try:
+            if entry is not None:
+                # One-time gate: do not read the log until the producer's
+                # reset (purge) has landed, so a regenerate never serves the
+                # previous generation's frames. Bounded — if the producer
+                # dies before starting, fall through to the honest close.
+                try:
+                    await asyncio.wait_for(
+                        entry.started.wait(), timeout=CHAT_HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            if last_sent > 0:
+                # Stale/advanced resume position (plan-pinned semantics):
+                # nothing before the log's end can be replayed, so snap to
+                # the end and follow new frames instead of filtering them
+                # all out. Absorbs oversized/foreign ids (incl. bigint
+                # overflow beyond SQLite's range).
+                max_seq = await asyncio.to_thread(
+                    _max_stream_event_seq_sync,
+                    db_pool, durable_session_id, durable_turn_id,
+                )
+                if last_sent > max_seq:
+                    last_sent = max_seq
+            while True:
+                frames = await asyncio.to_thread(
+                    _fetch_stream_events_sync,
+                    db_pool, durable_session_id, durable_turn_id, last_sent,
+                )
+                for frame_seq, payload in frames:
+                    yield _sse_frame(payload, frame_seq)
+                    last_sent = frame_seq
+                    if _payload_is_terminal(payload):
+                        return
+                if entry is not None and not entry.finished:
+                    try:
+                        await asyncio.wait_for(
+                            reader_wake.wait(),
+                            timeout=CHAT_HEARTBEAT_INTERVAL,
+                        )
+                    except asyncio.TimeoutError:
+                        # Engine stall: keep proxies alive. No id on comments.
+                        yield _sse_heartbeat()
+                    reader_wake.clear()
+                    continue
+                # Producer finished (or runs in another process): final
+                # drain, then an honest close without a fabricated terminal.
+                frames = await asyncio.to_thread(
+                    _fetch_stream_events_sync,
+                    db_pool, durable_session_id, durable_turn_id, last_sent,
+                )
+                if frames:
+                    continue
+                return
+        finally:
+            if entry is not None:
+                entry.readers.discard(reader_wake)
+
+    async def event_generator():
+        # Non-durable path (pre-#553 callers): generation is bound to the
+        # connection exactly as before — no event log, no resume. The durable
+        # path routes to _turn_producer + _resumable_event_stream instead.
+        # E3 telemetry (issue #518): bind the per-turn correlation id from the
+        # inbound request id, record the turn, and measure the admission
+        # queue wait.
+        turn_id = request_id_var.get() or f"turn-{uuid.uuid4().hex}"
+        set_current_turn(turn_id)
+        get_telemetry().record_chat_turn(turn_id)
+        _queue_wait_started = time.monotonic()
+        # E3 admission (issue #518): route-level CHAT gate, held for the whole
+        # stream. The engine's generation-phase gate is skipped under this
+        # lease (chat_gate_held marker), so route+engine never double-count.
+        # Rejection yields the protocol error+done pair (ENH-016: every
+        # terminal path emits done).
+        async with AsyncExitStack() as admission_stack:
             try:
-                async for event in _event_generator_inner():
-                    yield event
-                # Normal termination (complete, or failed-with-done-payload):
-                # finalize the durable assistant row eagerly in a worker
-                # thread while the connection is still healthy. Commit
-                # happens inside the helper, inside the thread; only a
-                # successful return sets the finalized flag.
-                if durable_active and turn_state["prewrite_ok"]:
-                    await asyncio.to_thread(
-                        _finalize_durable_turn_sync,
-                        db_pool,
-                        turn_state,
-                        turn_state["status"] or _TURN_STATUS_INTERRUPTED,
-                    )
-            finally:
-                # Disconnect backstop (issue #553): proxy drop, tab close, or
-                # Stop cancels the response task and lands here during
-                # CancelledError/GeneratorExit unwinding, where an await would
-                # re-raise — so the finalize is pure-sync (pool checkout +
-                # execute + commit, no await). Gated on a successful pre-write:
-                # with no durable user row, an assistant row would orphan the
-                # answer from its question, and the client batch remains the
-                # writer of record for that turn.
-                if (
-                    durable_active
-                    and turn_state["prewrite_ok"]
-                    and not turn_state["finalized"]
-                ):
-                    _finalize_durable_turn_sync(
-                        db_pool,
-                        turn_state,
-                        turn_state["status"] or _TURN_STATUS_INTERRUPTED,
-                    )
+                await admission_stack.enter_async_context(
+                    get_admission_controller().admit(AdmissionClass.CHAT)
+                )
+            except AdmissionRejected as exc:
+                logger.warning("Chat stream admission rejected: %s", exc)
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Chat capacity is saturated; retry shortly', 'code': 'ADMISSION_REJECTED'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'memories_used': [], 'wiki_used': [], 'kms_used': [], 'score_type': 'distance', 'turn_id': current_turn_id()})}\n\n"
+                return
+            # Mark this request as already chat-gated so the engine's
+            # generation-phase gate skips its own acquire (no same-key
+            # nesting; see app/services/admission.py).
+            gate_token = mark_chat_gate()
+            admission_stack.callback(lambda: reset_chat_gate(gate_token))
+            get_telemetry().record_queue_wait(
+                "chat", time.monotonic() - _queue_wait_started
+            )
+
+            async for event in _event_generator_inner():
+                yield event
+
+    if durable_active:
+        key = (durable_session_id, durable_turn_id)
+        if last_event_id is not None:
+            # Reconnect: NEVER start a second generation. Replay exactly the
+            # frames after the client's last delivered id from the event log,
+            # then follow the live remainder when the producer still runs in
+            # this process. Cross-session isolation: the log/registry are
+            # keyed by (session_id, turn_id) and the route's auth already
+            # bound this request to `durable_session_id`.
+            entry = _turn_registry().get(key)
+            return StreamingResponse(
+                _resumable_event_stream(entry, last_event_id),
+                media_type="text/event-stream",
+                headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            )
+        # Loop-atomic check-and-insert (no await between lookup and insert):
+        # a concurrent duplicate POST for a live turn attaches as a second
+        # reader of the same producer instead of starting its own.
+        registry = _turn_registry()
+        entry = registry.get(key)
+        if entry is None:
+            entry = _TurnStream(durable_session_id, durable_turn_id)
+            registry[key] = entry
+
+            def _wake_on_done(_task, e=entry) -> None:
+                # Done-callback: wake readers blocked on their events so they
+                # drain the final frames and close promptly instead of
+                # waiting out the heartbeat interval after the producer
+                # already finished.
+                for reader_wake in list(e.readers):
+                    reader_wake.set()
+
+            entry.task = asyncio.create_task(_turn_producer(entry))
+            entry.task.add_done_callback(_wake_on_done)
+            entry.task.add_done_callback(
+                lambda _task, k=key: _turn_registry().pop(k, None)
+            )
+        # A duplicate POST for a live turn attaches as a second reader of the
+        # same producer (single generation; per-connection replay from 0).
+        return StreamingResponse(
+            _resumable_event_stream(entry, 0),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
 
     return StreamingResponse(
         event_generator(),
@@ -1471,6 +1877,22 @@ async def chat_stream(
     # Issue #462 — query-time vision context (self-authorizes via the user dict on
     # a short-lived connection; no DI evaluate is available on the streaming path).
     vision_context = VisionRunContext(service=VisionEvidenceService(), user=user)
+    # Issue #555: SSE resume position. Starlette headers are case-insensitive,
+    # so `Last-Event-ID` matches any client casing. A malformed value is a 400 —
+    # silently ignoring a resume position would make a reconnecting client see
+    # duplicated frames.
+    last_event_id: Optional[int] = None
+    raw_last_event_id = request.headers.get("last-event-id")
+    if raw_last_event_id is not None:
+        try:
+            last_event_id = int(raw_last_event_id.strip())
+            if last_event_id < 0:
+                raise ValueError(raw_last_event_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Last-Event-ID must be a non-negative integer",
+            )
     return stream_chat_response(
         last_message.content,
         history,
@@ -1494,6 +1916,7 @@ async def chat_stream(
         durable_session_id=body.session_id,
         durable_turn_id=body.turn_id,
         db_pool=getattr(request.app.state, "db_pool", None),
+        last_event_id=last_event_id,
     )
 
 
