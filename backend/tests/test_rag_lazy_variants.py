@@ -26,6 +26,7 @@ backend/tests/test_rag_engine.py.
 """
 
 import contextlib
+import hashlib
 import logging
 import os
 import sys
@@ -132,7 +133,21 @@ class FakeVectorStore:
         self.searched_texts.append(mapped)
         return [
             {
-                "id": f"chunk_for_{abs(hash(mapped or 'unknown')) % 10000}",
+                # Stable across processes (PR #602): built-in hash() is
+                # PYTHONHASHSEED-randomized, which would make this id
+                # nondeterministic per run.
+                "id": (
+                    "chunk_for_"
+                    + str(
+                        int(
+                            hashlib.md5(
+                                (mapped or "unknown").encode("utf-8")
+                            ).hexdigest(),
+                            16,
+                        )
+                        % 10000
+                    )
+                ),
                 "text": f"content retrieved for query {mapped or 'unknown'}",
                 "file_id": "file_doc_1",
                 "_distance": 0.10,
