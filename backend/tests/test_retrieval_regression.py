@@ -4,6 +4,7 @@ Deterministic, portable, no dependency on real user data.
 Committable to version control.
 """
 
+import hashlib
 import os
 import sys
 from typing import Dict, List, Optional
@@ -257,8 +258,13 @@ class DeterministicEmbeddingService:
         text_lower = text.lower()
         set(text_lower.split())
 
-        # Create a base vector from the text hash for uniqueness
-        seed = hash(text) % (2**31)
+        # Create a base vector from the text hash for uniqueness.
+        # hashlib (NOT hash()) — built-in hash() is randomized per process by
+        # PYTHONHASHSEED, which made these "deterministic" embeddings and the
+        # corpus rank assertions flaky across CI runs (observed on PR #600:
+        # test_no_false_positives_high_recall failed then passed on a same-sha
+        # rerun with no diff change).
+        seed = int(hashlib.md5(text.encode("utf-8")).hexdigest(), 16) % (2**31)
         rng = np.random.RandomState(seed)
         vec = (
             rng.randn(self.EMBEDDING_DIM).astype(np.float32) * 0.1
@@ -270,7 +276,7 @@ class DeterministicEmbeddingService:
             keyword_matches = sum(1 for kw in keywords if kw in text_lower)
             if keyword_matches > 0:
                 # Use doc_id hash to create a consistent vector direction for this doc
-                doc_seed = hash(doc_id) % (2**31)
+                doc_seed = int(hashlib.md5(doc_id.encode("utf-8")).hexdigest(), 16) % (2**31)
                 doc_rng = np.random.RandomState(doc_seed)
                 doc_vec = doc_rng.randn(self.EMBEDDING_DIM).astype(np.float32)
                 doc_vec /= np.linalg.norm(doc_vec)
