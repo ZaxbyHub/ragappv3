@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
@@ -61,6 +62,43 @@ class _UnsetMaxTokens(int):
 _UNSET_MAX_TOKENS = _UnsetMaxTokens(_DEFAULT_MAX_TOKENS)
 
 
+@dataclass(frozen=True)
+class ReasoningDelta:
+    """One provider reasoning chunk, surfaced on its own typed channel.
+
+    ``chat_completion_stream`` yields these alongside (never instead of) the
+    plain-``str`` answer-content chunks (issue #554). Consumers that only
+    want the answer discriminate with ``isinstance(chunk, str)``; reasoning
+    never enters the content pipeline or the think-tag filter.
+    """
+
+    text: str
+
+
+def select_no_think_chat_template_kwargs(
+    model: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Select the family-appropriate no-think template control (issue #554).
+
+    Only model families with a *verified* chat-template mechanism get a
+    control: Qwen-family names document the
+    ``chat_template_kwargs={'enable_thinking': False}`` no-think control on
+    their model cards (Qwen3.5+ chat templates). Any other family —
+    including empty/missing names — gets ``None``: the client logs a
+    warning and sends no control, failing open rather than hard-coding a
+    Qwen-specific kwarg for a model that may not honor it (the pre-#554
+    behavior shipped it for every model, e.g. nemotron).
+    """
+    if model and "qwen" in model.lower():
+        return {"enable_thinking": False}
+    logger.warning(
+        "No verified no-think control for instant model %r; sending none "
+        "(fail open — provider default governs)",
+        model,
+    )
+    return None
+
+
 def _httpcore_live_pool_counts(
     client: httpx.AsyncClient,
 ) -> "tuple[Optional[int], Optional[int]]":
@@ -111,29 +149,41 @@ class LLMClient:
         cb_name: str = "llm",
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ):
         """
         Initialize the LLM client.
 
         Args:
-            timeout: Request timeout in seconds (default: 300.0 for model loading)
+            timeout: Request timeout in seconds (default 300.0 for model loading)
             base_url: Override for the chat endpoint. Defaults to settings.ollama_chat_url.
             model: Override for the model name. Defaults to settings.chat_model.
             cb_name: Circuit breaker name (for logging / metrics distinction).
             chat_template_kwargs: Per-client chat-template controls (e.g.
-                ``{"enable_thinking": False}`` for Gemma 4 Instant).
+                ``{"enable_thinking": False}`` for Qwen-family Instant models;
+                selected via :func:`select_no_think_chat_template_kwargs`).
             max_tokens: Default generation budget for chat_completion /
                 chat_completion_stream when the caller does not pass an
                 explicit ``max_tokens`` (ENH-015, issue #494). ``None`` keeps
                 the legacy default of 32768.
+            reasoning_effort: Provider-native reasoning control for
+                OpenAI-compatible ``/v1/chat/completions`` endpoints (issue
+                #554). Ollama documents ``reasoning_effort`` (high/medium/low/
+                max/none) on that endpoint; ``None`` sends no control field
+                and the provider default governs (``think`` is native
+                ``/api/chat``-only and is intentionally not used here).
         """
         self.base_url = (base_url or settings.ollama_chat_url).rstrip("/")
         self.model = model or settings.chat_model
         self.timeout = timeout
         self.max_tokens = max_tokens
-        # Per-client template controls (e.g. Gemma 4 Instant no-thinking).
+        # Per-client template controls (e.g. Qwen-family Instant no-thinking).
         # Copy so callers cannot mutate the live request policy after creation.
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
+        # Per-client provider-native reasoning control (issue #554). Not part
+        # of reconfigure(): it is factory-fixed so a hot rebind of URL/model
+        # never silently flips the thinking posture mid-operation.
+        self.reasoning_effort = reasoning_effort
         assert_url_safe(base_url or settings.ollama_chat_url)
         self._circuit_breaker = create_llm_circuit_breaker(name=cb_name)
         self._client: Optional[httpx.AsyncClient] = None
@@ -343,6 +393,8 @@ class LLMClient:
         }
         if self.chat_template_kwargs:
             payload["chat_template_kwargs"] = self.chat_template_kwargs
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         if response_format is not None:
             payload["response_format"] = response_format
 
@@ -468,6 +520,8 @@ class LLMClient:
         }
         if self.chat_template_kwargs:
             payload["chat_template_kwargs"] = self.chat_template_kwargs
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         started_at = time.perf_counter()
         prompt_tokens = self._prompt_token_estimate(messages)
         completion_chars = 0
@@ -519,6 +573,17 @@ class LLMClient:
         # delta-only chunk (e.g. {"delta": {}, "finish_reason": "length"}),
         # so it must be captured even when no content is streamed.
         _finish_reason: Optional[str] = None
+
+        # Issue #554: provider reasoning deltas (``reasoning_content`` is
+        # the OpenAI-compatible field used by e.g. gpt-oss/nemotron;
+        # ``reasoning`` is Ollama's /v1 field) are accumulated here and
+        # yielded on the distinct ``ReasoningDelta`` channel instead of
+        # being silently dropped. They never enter the content pipeline
+        # below, so the think-tag filter and the "reasoning never reaches
+        # the content channel" invariant are unchanged.
+        _reasoning_chars = 0
+        _reasoning_started_at: Optional[float] = None
+        _reasoning_last_at: Optional[float] = None
 
         stream_succeeded = False
         try:
@@ -601,11 +666,15 @@ class LLMClient:
                             continue
 
                         delta = choices[0].get("delta", {})
-                        # ``reasoning_content`` is the OpenAI-compatible
-                        # field used by some models (gpt-oss-120b,
-                        # nvidia_nemotron) to emit chain-of-thought.
-                        # We never expose it to users — drop it entirely
-                        # and only stream ``content`` deltas.
+                        # Issue #554: provider reasoning deltas ride their
+                        # own typed channel. ``reasoning_content`` is the
+                        # OpenAI-compatible field used by some models
+                        # (gpt-oss-120b, nvidia_nemotron); ``reasoning`` is
+                        # Ollama's /v1 field. Read the first non-empty one,
+                        # yield it as a ``ReasoningDelta``, and keep it out
+                        # of the content pipeline entirely — the answer
+                        # channel still carries only ``content`` deltas and
+                        # the think-tag filter is unchanged.
                         content = delta.get("content") or ""
 
                         # finish_reason lives on the choice object, not
@@ -616,8 +685,23 @@ class LLMClient:
                         if chunk_finish_reason:
                             _finish_reason = chunk_finish_reason
 
+                        reasoning_text = delta.get("reasoning_content")
+                        if not isinstance(reasoning_text, str) or not reasoning_text:
+                            reasoning_text = delta.get("reasoning")
+                            if not isinstance(reasoning_text, str) or not reasoning_text:
+                                reasoning_text = None
+                        if reasoning_text is not None:
+                            _now = time.perf_counter()
+                            if _reasoning_started_at is None:
+                                _reasoning_started_at = _now
+                            _reasoning_last_at = _now
+                            _reasoning_chars += len(reasoning_text)
+                            yield ReasoningDelta(text=reasoning_text)
+
                         if not content:
-                            # Pure reasoning chunk (or empty) — skip.
+                            # Pure reasoning chunk (or empty) — nothing to
+                            # add to the content pipeline (any reasoning was
+                            # yielded on its own channel above).
                             continue
 
                         _buffer += content
@@ -810,6 +894,19 @@ class LLMClient:
                     "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
                     "prompt_tokens_estimate": prompt_tokens,
                     "completion_tokens_estimate": max(1, completion_chars // 4) if completion_chars else 0,
+                    # Issue #554: reasoning accounting. The token count is a
+                    # chars//4 estimate (the provider's delta stream carries
+                    # no usage breakdown); the duration is the wall-clock
+                    # span from the first to the last reasoning delta.
+                    "reasoning_tokens_estimate": (
+                        max(1, _reasoning_chars // 4) if _reasoning_chars else 0
+                    ),
+                    "reasoning_duration_ms": (
+                        round((_reasoning_last_at - _reasoning_started_at) * 1000, 2)
+                        if _reasoning_started_at is not None
+                        and _reasoning_last_at is not None
+                        else 0.0
+                    ),
                     "finish_reason": _finish_reason,
                     "status": "ok",
                     "stream": True,
@@ -845,9 +942,19 @@ class LLMClient:
 
 
 def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
-    """Create an LLMClient configured for the Thinking backend (gpt-oss-120b / DGX Spark).
+    """Create an LLMClient configured for the Thinking backend (Ollama).
 
-    The client carries ``settings.thinking_max_tokens`` as its default
+    Talks to ``settings.ollama_chat_url`` with ``settings.chat_model``
+    (default ``gemma-4-26b-a4b-it-apex``). Carries the Ollama
+    /v1-documented reasoning control ``reasoning_effort='high'`` (issue
+    #554): Ollama's OpenAI-compatibility doc lists ``reasoning_effort``
+    (high/medium/low/max/none) as the supported
+    ``/v1/chat/completions`` request field and documents no ``think``
+    field there (``think`` is native ``/api/chat``-only). Deployments on
+    older Ollama versions that do not recognize the field ignore it, which
+    degrades to the pre-#554 provider-default behavior.
+
+    The client also carries ``settings.thinking_max_tokens`` as its default
     generation budget (ENH-015, issue #494): callers that do not pass an
     explicit ``max_tokens`` get the configured thinking budget instead of
     the legacy hardcoded 32768. An explicit per-call ``max_tokens`` still
@@ -859,6 +966,7 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
         model=settings.chat_model,
         cb_name="llm_thinking",
         max_tokens=settings.thinking_max_tokens,
+        reasoning_effort="high",
     )
 
 
@@ -879,23 +987,27 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
 
 
 def create_instant_client(timeout: float = 120.0) -> "LLMClient":
-    """Create the Instant client; Gemma 4 must use no-thinking template mode.
+    """Create the Instant client (LM Studio, ``settings.instant_chat_url``).
 
+    Default model ``settings.instant_chat_model`` (``nvidia/nemotron-3-nano-4b``).
     ``settings.instant_enable_thinking`` (FU-005, issue #494; default False)
-    selects the template mode: False keeps the historical
-    ``chat_template_kwargs={'enable_thinking': False}`` payload — the
-    correct behavior for Gemma-4-style deployments whose chat templates
-    default to thinking — while True omits the kwarg entirely so the
-    provider/model chat-template default governs. The client also carries
-    ``settings.instant_max_tokens`` as its default generation budget
-    (ENH-015, issue #494), mirroring ``create_thinking_client``.
+    selects the posture: True sends no control at all and the provider/model
+    chat-template default governs; False sends the family-appropriate
+    no-think control chosen by
+    :func:`select_no_think_chat_template_kwargs` for the configured
+    ``instant_chat_model`` (issue #554) — Qwen-family names get
+    ``chat_template_kwargs={'enable_thinking': False}``, unrecognized
+    families (e.g. the nemotron default, whose card names no template
+    mechanism) log a warning and send nothing, failing open. The client
+    also carries ``settings.instant_max_tokens`` as its default generation
+    budget (ENH-015, issue #494), mirroring ``create_thinking_client``.
     """
     # Pydantic guarantees a real bool here; the identity check keeps
     # partially mocked settings objects (tests) on the default-False branch.
     chat_template_kwargs = (
         None
         if settings.instant_enable_thinking is True
-        else {"enable_thinking": False}
+        else select_no_think_chat_template_kwargs(settings.instant_chat_model)
     )
     instant_max_tokens = getattr(settings, "instant_max_tokens", None)
     return LLMClient(

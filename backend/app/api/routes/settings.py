@@ -1209,12 +1209,20 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
         or update.instant_max_tokens is not None
         or update.instant_enable_thinking is not None
     ):
+        # Issue #554: the no-think control is family-selected from the
+        # (possibly just-swapped) instant_chat_model rather than hard-coded —
+        # so a runtime model swap installs OR removes the control per family,
+        # failing open (no control) for unrecognized families.
+        from app.services.llm_client import select_no_think_chat_template_kwargs
+
         instant_client.reconfigure(
             base_url=settings.instant_chat_url,
             model=settings.instant_chat_model,
             max_tokens=settings.instant_max_tokens,
             chat_template_kwargs=(
-                None if settings.instant_enable_thinking else {"enable_thinking": False}
+                None
+                if settings.instant_enable_thinking
+                else select_no_think_chat_template_kwargs(settings.instant_chat_model)
             ),
         )
     if update.ingestion_llm_mode is not None:

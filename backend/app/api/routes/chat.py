@@ -781,6 +781,13 @@ def stream_chat_response(
                         yield f"data: {json.dumps({'type': 'stage', 'stage': chunk['stage']})}\n\n"
                     elif chunk_type == "evidence_candidates":
                         yield _evidence_sse_line(chunk.get("candidates", []))
+                    elif chunk_type == "reasoning_delta":
+                        # Issue #554: provider reasoning on its own additive
+                        # SSE event type. Deliberately distinct from the
+                        # frontend's legacy drop-set (reasoning/
+                        # reasoning_content/thinking/thinking_content),
+                        # which keeps guarding those raw names.
+                        yield f"data: {json.dumps({'type': 'reasoning_delta', 'text': chunk.get('text', '')})}\n\n"
                     elif chunk_type == "done":
                         sources = chunk.get("sources", [])
                         memories_used = chunk.get("memories_used", [])

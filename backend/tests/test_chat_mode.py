@@ -35,3 +35,33 @@ def test_instant_mode_settings_defaults_present():
     # hardcoded 32768 (issue #395 DD-rag-005).
     assert isinstance(settings.thinking_max_tokens, int)
     assert settings.thinking_max_tokens == 32768
+
+
+def test_per_family_instant_no_think_control_selection():
+    """AC7 (issue #554): the instant client's no-think control is selected by
+    the configured model family, not hard-coded for every model."""
+    import app.services.llm_client as llm_client_mod
+
+    select = getattr(
+        llm_client_mod, "select_no_think_chat_template_kwargs", None
+    )
+    assert select is not None, (
+        "AC7-C7: app.services.llm_client must expose "
+        "select_no_think_chat_template_kwargs(model) so the no-think control "
+        "is selected per model family"
+    )
+    # Qwen family (any casing / org prefix) -> the Qwen-style template kwarg.
+    assert select("qwen/qwen3.5-122b") == {"enable_thinking": False}, (
+        "AC7-C7: Qwen-family model names must select the "
+        "chat_template_kwargs={'enable_thinking': False} control"
+    )
+    assert select("Qwen3-Coder-30B") == {"enable_thinking": False}, (
+        "AC7-C7: family matching must be case-insensitive"
+    )
+    # Unrecognized family (the configured default nemotron) and empty/missing
+    # names -> NO control at all (log and fail open, never raise).
+    assert select("nvidia/nemotron-3-nano-4b") is None, (
+        "AC7-C7: an unrecognized model family must fail open with no control"
+    )
+    assert select("") is None, "AC7-C7: empty model name must fail open"
+    assert select(None) is None, "AC7-C7: missing model name must fail open"

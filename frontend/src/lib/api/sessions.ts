@@ -82,6 +82,17 @@ export async function parseSSEStream(
             }
             continue;
           }
+          // Provider reasoning on its own additive event type (issue #554).
+          // Deliberately threaded here rather than falling through: the
+          // REASONING_TYPES drop-set below keeps guarding the legacy
+          // reasoning/reasoning_content/thinking/thinking_content names,
+          // and this handler only accepts well-formed string text.
+          if (parsed.type === 'reasoning_delta') {
+            if (typeof parsed.text === 'string') {
+              callbacks.onReasoning?.(parsed.text);
+            }
+            continue;
+          }
           // Defense in depth: drop any reasoning/thinking event regardless of
           // whether it appears as ``type`` or as a content field.
           const eventType = typeof parsed.type === "string" ? parsed.type.toLowerCase() : "";
@@ -166,6 +177,25 @@ export async function parseSSEStream(
             callbacks.onCitationEnforcement?.(parsed.citation_enforcement as CitationEnforcement);
           }
           if (eventType === "done") {
+            // Issue #554: reasoning accounting rides the done event inside
+            // llm_metrics (optional — older backends omit the keys).
+            const metrics = (
+              parsed as {
+                llm_metrics?: {
+                  reasoning_duration_ms?: unknown;
+                  reasoning_tokens_estimate?: unknown;
+                };
+              }
+            ).llm_metrics;
+            if (metrics && typeof metrics === "object") {
+              const durationMs = metrics.reasoning_duration_ms;
+              const tokensEstimate = metrics.reasoning_tokens_estimate;
+              callbacks.onReasoningMetrics?.({
+                durationMs: typeof durationMs === "number" ? durationMs : undefined,
+                tokensEstimate:
+                  typeof tokensEstimate === "number" ? tokensEstimate : undefined,
+              });
+            }
             completeOnce();
             return;
           }

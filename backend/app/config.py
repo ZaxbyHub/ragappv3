@@ -131,13 +131,15 @@ class Settings(BaseSettings):
     DD-rag-005). Must be >= 1 (see validate_per_mode_positive_ints)."""
     instant_enable_thinking: bool = False
     """Whether Instant-mode chat requests should leave the model's chat-template
-    thinking mode enabled. False (default) sends ``enable_thinking: False`` via
-    ``chat_template_kwargs`` — the behavior Instant traffic has always had and
-    the correct setting for Gemma-4-style deployments whose templates default to
-    thinking. True omits the kwarg entirely so the provider/model template
-    default governs (for future Instant models that legitimately want thinking).
-    Documented call-role setting per issue #494 FU-005; per-provider capability
-    tables belong to model qualification (F2), not this switch."""
+    thinking mode enabled. False (default) sends the family-appropriate no-think
+    control (issue #554): ``enable_thinking: False`` via ``chat_template_kwargs``
+    for Qwen-family models, and no control at all for unrecognized families
+    (fail open — e.g. the nemotron default, which documents no template
+    mechanism). True sends no control regardless of family so the provider/model
+    template default governs. Documented call-role setting per issue #494 FU-005;
+    per-provider capability tables belong to model qualification (F2), not this
+    switch."""
+
     # Library vault mapping for file watcher
     library_vault_id: Optional[int] = None
 
