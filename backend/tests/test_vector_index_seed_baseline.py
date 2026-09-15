@@ -78,14 +78,39 @@ class TestVectorIndexSeedBaseline(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_does_not_seed_when_only_fts_index_present(self):
-        """No vector index → nothing to seed; baseline stays 0.
+        """An FTS index must not trigger the ANN seed; baseline stays 0.
 
-        The FTS index carries the REAL engine-reported shape
-        (columns=['text'], index_type='FTS') so the negative case proves the
-        column+type predicate distinguishes index kinds — not that a name
-        differs."""
+        Scope note (PRR-002 review): this pins the negative case only — the
+        positive companion above proves an IvfPq-on-embedding DOES seed.
+        Together the pair fails under any broken detector (always-True or
+        always-False); the name-vs-shape discrimination pin lives in the
+        test below."""
         store = _make_store_opening_existing(
             indices=[_existing_index("text_idx", "FTS", ["text"])],
+            row_count=40340,
+        )
+
+        with patch("app.services.vector_store.pa") as mock_pa:
+            mock_pa.schema.return_value = MagicMock()
+            with patch("app.services.vector_store.settings") as mock_settings:
+                mock_settings.vector_metric = "cosine"
+                mock_settings.write_lock_timeout_seconds = 5.0
+                with patch("app.services.vector_store.FTS") as mock_fts:
+                    mock_fts.return_value = MagicMock()
+                    await store.init_table(embedding_dim=384)
+
+        self.assertEqual(store._last_index_build_row_count, 0)
+
+    async def test_does_not_seed_when_name_says_embedding_but_shape_is_not(self):
+        """Detection is column+type: an index whose NAME matches the engine
+        convention ('embedding_idx') but whose columns/index_type say
+        otherwise (FTS on 'text') must NOT seed the ANN baseline.
+
+        Discrimination pin (PRR-002 review): a name-based detector would
+        match this fake and seed — this test fails under one, which the
+        shape-only negative above cannot catch."""
+        store = _make_store_opening_existing(
+            indices=[_existing_index("embedding_idx", "FTS", ["text"])],
             row_count=40340,
         )
 

@@ -31,9 +31,20 @@ RECONCILE = BACKEND / "scripts" / "reconcile_lancedb_sqlite.py"
 DETECTION_FILES = (VECTOR_STORE, LIFESPAN, RECONCILE)
 
 # A name-based existence guard: comparing an object's `name` attribute (the
-# engine-derived index name) against a string literal, e.g.
-# `idx.name == "embedding_idx"` or `getattr(index, "name", "") == "..."`.
-_NAME_GUARD = re.compile(r"\bname\s*==\s*[\"']|[\"']\s*==\s*\w*\.?name\b|\(\s*[\"']name[\"']\s*,")
+# engine-derived index name) against a string literal, in any of the forms
+# this codebase has actually shipped:
+#   idx.name == "embedding_idx"                                 (attribute form)
+#   getattr(index, "name", "") == "embedding_idx"               (getattr form —
+#       the historical reconcile-script guard; PRR-001/TC-003)
+#   == getattr(...) reversed argument order
+# `getattr(x, "columns", ...)` and other non-name attributes must NOT match.
+_NAME_GUARD = re.compile(
+    r"\bname\s*==\s*[\"']"
+    r"|[\"']\s*==\s*\w*\.?name\b"
+    r"|\(\s*[\"']name[\"']\s*,"
+    r"|getattr\s*\([^)]*[\"']name[\"'][^)]*\)\s*=="
+    r"|==\s*getattr\s*\([^)]*[\"']name[\"']"
+)
 
 
 def _source(path: Path) -> str:
