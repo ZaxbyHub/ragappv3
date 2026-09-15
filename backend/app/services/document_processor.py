@@ -300,6 +300,48 @@ class DocumentParseError(Exception):
     pass
 
 
+# --- Ingestion error redaction (issue #562 / C26) ---------------------------
+#
+# Strings persisted to files.error_message, files.phase_message and
+# enrichment_error are returned to any vault reader, so they are built from a
+# stable code plus a fixed, content-free reason — never from the raw exception
+# text or the server-side path, which stay in the server log only. Same
+# convention as document_extraction.py's stable codes.
+
+INGEST_ERROR_PARSER_UNAVAILABLE = "PARSER_UNAVAILABLE"
+INGEST_ERROR_PARSE_FAILED = "PARSE_FAILED"
+INGEST_ERROR_FILE_MISSING = "FILE_MISSING"
+
+_INGEST_ERROR_REASONS = {
+    INGEST_ERROR_PARSER_UNAVAILABLE: "document parser is unavailable",
+    INGEST_ERROR_PARSE_FAILED: "document could not be parsed",
+    INGEST_ERROR_FILE_MISSING: "uploaded file is missing from storage",
+}
+
+# Matches document_extraction.MAX_ERROR_MESSAGE_CHARS: persisted messages are
+# bounded and content-free, so the cap never truncates a reason mid-word.
+_INGEST_ERROR_MAX_CHARS = 200
+
+
+def classify_ingest_error(exc: BaseException) -> str:
+    """Map an ingestion failure to a stable, user-facing error code."""
+    if isinstance(exc, ImportError):
+        return INGEST_ERROR_PARSER_UNAVAILABLE
+    if isinstance(exc, (FileNotFoundError, FileExistsError)):
+        return INGEST_ERROR_FILE_MISSING
+    return INGEST_ERROR_PARSE_FAILED
+
+
+def format_ingest_error(code: str) -> str:
+    """Build a persisted message: stable code + fixed content-free reason."""
+    return f"{code}: {_INGEST_ERROR_REASONS[code]}"[:_INGEST_ERROR_MAX_CHARS]
+
+
+def redact_ingest_error(exc: BaseException) -> str:
+    """Build the persisted message for a caught ingestion failure."""
+    return format_ingest_error(classify_ingest_error(exc))
+
+
 class DocumentParser:
     """
     Parser for extracting text elements from documents using unstructured.io.
@@ -1950,8 +1992,12 @@ class DocumentProcessor:
             )
             raise
         except Exception as e:
+            # Raw exception stays in the server log; enrichment_error is
+            # returned to vault readers (issue #562).
             logger.warning("Post-index enrichment failed for file_id=%s: %s", file_id, e)
-            self.set_enrichment_status(file_id, "error", str(e)[:500])
+            self.set_enrichment_status(
+                file_id, "error", redact_ingest_error(e)
+            )
 
     @with_retry(
         max_attempts=3, retry_exceptions=(sqlite3.Error,), raise_last_exception=True
@@ -3435,10 +3481,15 @@ class DocumentProcessor:
                         file_id, vault_id, generation_hash, parsed
                     )
         except Exception as e:
+            # The raw exception (server path + underlying parser error) stays
+            # in the server log only; the persisted fields are user-facing
+            # (issue #562).
+            logger.exception("Ingestion failed for file_id=%s", file_id)
+            safe_error = redact_ingest_error(e)
             # Phase 3: Update status to error on failure
             # Get connection again to update error status
             async with self._write_session() as conn:
-                self._update_status(file_id, "error", conn, error_message=str(e))
+                self._update_status(file_id, "error", conn, error_message=safe_error)
                 conn.commit()
             # Surface error in the phase fields so the frontend can render it
             # without waiting for a status-route round-trip.
@@ -3446,7 +3497,7 @@ class DocumentProcessor:
                 self.pool,
                 file_id,
                 phase="error",
-                message=str(e)[:500],
+                message=safe_error,
                 percent=None,
             )
             raise
@@ -3536,36 +3587,50 @@ class DocumentProcessor:
         """
         path = Path(file_path)
         if not path.exists():
-            # Surface as error on the existing row so the frontend can render it.
+            # Surface as error on the existing row so the frontend can render
+            # it. The persisted message is a stable code, not the server path
+            # (issue #562); the path stays in the server log.
+            logger.warning(
+                "process_existing_file: file missing for file_id=%s: %s",
+                file_id,
+                file_path,
+            )
+            safe_error = format_ingest_error(INGEST_ERROR_FILE_MISSING)
             async with self._write_session() as conn:
                 self._update_status(
                     file_id,
                     "error",
                     conn,
-                    error_message=f"File not found: {file_path}",
+                    error_message=safe_error,
                 )
                 conn.commit()
             set_phase(
                 self.pool,
                 file_id,
                 phase="error",
-                message=f"File not found: {file_path}",
+                message=safe_error,
             )
             raise FileNotFoundError(f"File not found: {file_path}")
         if not path.is_file():
+            logger.warning(
+                "process_existing_file: path is not a file for file_id=%s: %s",
+                file_id,
+                file_path,
+            )
+            safe_error = format_ingest_error(INGEST_ERROR_FILE_MISSING)
             async with self._write_session() as conn:
                 self._update_status(
                     file_id,
                     "error",
                     conn,
-                    error_message=f"Path is not a file: {file_path}",
+                    error_message=safe_error,
                 )
                 conn.commit()
             set_phase(
                 self.pool,
                 file_id,
                 phase="error",
-                message=f"Path is not a file: {file_path}",
+                message=safe_error,
             )
             raise FileNotFoundError(f"Path is not a file: {file_path}")
 
@@ -3980,14 +4045,18 @@ class DocumentProcessor:
                             auto_rebuild_handle
                         )
         except Exception as e:
+            # Raw exception stays in the server log; persisted fields are
+            # user-facing (issue #562).
+            logger.exception("Existing-file ingestion failed for file_id=%s", file_id)
+            safe_error = redact_ingest_error(e)
             async with self._write_session() as conn:
-                self._update_status(file_id, "error", conn, error_message=str(e))
+                self._update_status(file_id, "error", conn, error_message=safe_error)
                 conn.commit()
             set_phase(
                 self.pool,
                 file_id,
                 phase="error",
-                message=str(e)[:500],
+                message=safe_error,
                 percent=None,
             )
             raise

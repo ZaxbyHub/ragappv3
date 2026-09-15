@@ -260,7 +260,7 @@ async def retry_document(
         return {"file_id": file_id, "status": retry_status}
     except HTTPException:
         raise
-    except (sqlite3.Error, OSError, RuntimeError) as exc:
+    except (sqlite3.Error, OSError, RuntimeError):
         logger.exception("Error reprocessing document %d", file_id)
         user_id = (
             str(current_user["id"])
@@ -277,7 +277,7 @@ async def retry_document(
             conn,
         )
         await asyncio.to_thread(conn.commit)
-        raise HTTPException(status_code=500, detail=f"Retry failed: {exc}")
+        raise HTTPException(status_code=500, detail="Retry failed")
 
 
 @router.post("/{file_id}/retry-chunks")
@@ -347,7 +347,7 @@ async def retry_failed_chunks(
         )
         await asyncio.to_thread(conn.commit)
         raise HTTPException(status_code=409, detail=str(exc))
-    except Exception as exc:
+    except Exception:
         logger.exception("Error retrying failed chunks for document %d", file_id)
         await asyncio.to_thread(
             _record_document_action,
@@ -359,7 +359,7 @@ async def retry_failed_chunks(
             conn,
         )
         await asyncio.to_thread(conn.commit)
-        raise HTTPException(status_code=500, detail=f"Retry-chunks failed: {exc}")
+        raise HTTPException(status_code=500, detail="Retry-chunks failed")
 
     await asyncio.to_thread(
         _record_document_action,
@@ -639,6 +639,24 @@ def _parse_extraction_diagnostics(raw: Optional[str]) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _vault_relative_file_path(raw_file_path: str) -> str:
+    """Project the stored upload path to a vault-relative path (issue #562).
+
+    The API must not echo server-absolute filesystem paths. Stored values look
+    like ``<data_dir>/vaults/<vault_id>/uploads/<name>``; everything up to and
+    including the vault id is stripped. Falls back to the bare file name for
+    layouts that do not match and is a no-op for already-relative values.
+    """
+    normalized = raw_file_path.replace("\\", "/")
+    marker = "/vaults/"
+    start = normalized.find(marker)
+    if start != -1:
+        remainder = normalized[start + len(marker) :]
+        if "/" in remainder:
+            return remainder
+    return normalized.rsplit("/", 1)[-1]
+
+
 def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
     """Convert a database row to a DocumentResponse."""
     keys = row.keys()
@@ -717,7 +735,7 @@ def _row_to_document_response(row: sqlite3.Row) -> DocumentResponse:
         id=row["id"],
         file_name=file_name,
         filename=file_name,  # Frontend alias
-        file_path=row["file_path"],
+        file_path=_vault_relative_file_path(row["file_path"]),
         vault_id=row["vault_id"] if "vault_id" in keys else None,
         status=status,
         chunk_count=chunk_count,
@@ -2432,10 +2450,19 @@ async def _do_upload(
                         None,
                     )
                 except DuplicateFileError as e:
+                    # DuplicateFileError's text carries the duplicate's stored
+                    # server path — keep it in the log, not the wire (#562).
                     file_path.unlink(missing_ok=True)
+                    logger.warning(
+                        "Upload rejected as duplicate: %s (file cleaned up)",
+                        e,
+                    )
                     raise HTTPException(
                         status_code=409,
-                        detail=f"{e} (uploaded file was cleaned up)",
+                        detail=(
+                            "A file with this content already exists in this"
+                            " vault (uploaded file was cleaned up)"
+                        ),
                     )
                 row_created_by_request = preexisting_row is None
                 conn.commit()
@@ -2490,25 +2517,25 @@ async def _do_upload(
             logger.exception("Document processing error for file: %s", file_name)
             if "maintenance mode" in str(e).lower():
                 raise HTTPException(
-                    status_code=503, detail=f"Processing error: {e}"
+                    status_code=503, detail="Processing error"
                 )
-            raise HTTPException(status_code=500, detail=f"Processing error: {e}")
-        except Exception as e:
+            raise HTTPException(status_code=500, detail="Processing error")
+        except Exception:
             # W19 (C14): same compensation for any other post-registration
             # failure (enqueue failure, queueing error, ...).
             await _compensate_failed_registration(
                 db_pool, file_path, file_id, row_created_by_request
             )
             logger.exception("Unexpected error registering file: %s", file_name)
-            raise HTTPException(status_code=500, detail=f"Server error: {e}")
+            raise HTTPException(status_code=500, detail="Server error")
     except HTTPException:
         # Validation / size-limit errors already cleaned up partial files inline.
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("Error uploading file: %s", file_name)
         if temp_file_path and temp_file_path.exists():
             temp_file_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Upload failed")
 
 
 @router.post("/scan", response_model=ScanResponse)
@@ -2554,9 +2581,9 @@ async def scan_directories(
             scanned=files_enqueued,  # Frontend expects this (at least files_enqueued)
             errors=[],  # Frontend expects this field
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Error during directory scan")
-        raise HTTPException(status_code=500, detail=f"Scan failed: {e}")
+        raise HTTPException(status_code=500, detail="Scan failed")
     # Note: No finally block to stop processor - it runs continuously
 
 
@@ -2587,8 +2614,9 @@ async def reindex_documents(
 
     try:
         job_id = await asyncio.to_thread(_create_job)
-    except sqlite3.Error as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to create reindex job: {exc}")
+    except sqlite3.Error:
+        logger.exception("Failed to create reindex job for vault %s", vault_id)
+        raise HTTPException(status_code=500, detail="Failed to create reindex job")
 
     if not background_processor.is_running:
         await background_processor.start()
@@ -2860,10 +2888,10 @@ async def delete_document(
         )
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         await asyncio.to_thread(conn.rollback)
         logger.exception("Error deleting document %d", file_id)
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        raise HTTPException(status_code=500, detail="Delete failed")
 
 
 @router.post("/batch", response_model=BatchDeleteResponse)
@@ -3093,9 +3121,9 @@ async def delete_all_vault_documents(
 
     try:
         deleted_count = await asyncio.to_thread(_atomic_delete)
-    except Exception as e:
+    except Exception:
         logger.exception("Atomic delete of vault %d documents failed", vault_id)
-        raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        raise HTTPException(status_code=500, detail="Delete failed")
 
     # GC on-disk files after the rows are committed.
     for path in stored_paths:

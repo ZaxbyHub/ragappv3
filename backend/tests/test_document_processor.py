@@ -345,7 +345,12 @@ CREATE TABLE posts (
 
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "error")
-        self.assertIn("zero LanceDB rows", row["error_message"])
+        # Issue #562: persisted error_message is the stable user-facing code;
+        # the raw detail ("zero LanceDB rows") stays in the raised exception
+        # and the server log only.
+        self.assertEqual(
+            row["error_message"], "PARSE_FAILED: document could not be parsed"
+        )
 
     def test_process_file_persists_chunks_failed_on_partial_embedding_failure(self):
         """Dropped chunks from partial embedding failures are recorded (Issue #221)."""
@@ -869,7 +874,11 @@ CREATE TABLE posts (
 
         self.assertEqual(row["status"], "indexed")
         self.assertEqual(row["enrichment_status"], "error")
-        self.assertIn("Enriched embedding count mismatch", row["enrichment_error"])
+        # Issue #562: enrichment_error is the stable user-facing code; the raw
+        # mismatch detail stays in the server log only.
+        self.assertEqual(
+            row["enrichment_error"], "PARSE_FAILED: document could not be parsed"
+        )
 
     def test_post_index_enrichment_failure_does_not_change_indexed_status(self):
         """A failed enrichment job records enrichment error but leaves file indexed."""
@@ -923,7 +932,11 @@ CREATE TABLE posts (
         self.assertEqual(row["status"], "indexed")
         self.assertIsNone(row["error_message"])
         self.assertEqual(row["enrichment_status"], "error")
-        self.assertIn("LLM offline", row["enrichment_error"])
+        # Issue #562: enrichment_error is the stable user-facing code; the raw
+        # "LLM offline" detail stays in the server log only.
+        self.assertEqual(
+            row["enrichment_error"], "PARSE_FAILED: document could not be parsed"
+        )
 
     def test_cancelled_enrichment_marks_error_and_preserves_indexed_status(self):
         """Regression: cancellation after processing starts must not leave status stuck."""

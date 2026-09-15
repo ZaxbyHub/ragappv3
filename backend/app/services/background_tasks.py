@@ -22,7 +22,11 @@ from app.services.admission import (
 )
 
 from ..models.database import SQLiteConnectionPool
-from .document_processor import DocumentProcessingError, DocumentProcessor
+from .document_processor import (
+    DocumentProcessingError,
+    DocumentProcessor,
+    redact_ingest_error,
+)
 from .embeddings import EmbeddingService
 from .llm_client import LLMClient
 from .maintenance import MaintenanceService
@@ -2634,19 +2638,22 @@ class BackgroundProcessor:
 
         except DocumentProcessingError as e:
             logger.error(f"Processing error for {task.file_path}: {e}")
-            await self._handle_failure(task, str(e))
+            await self._handle_failure(task, e)
 
         except Exception as e:
             logger.error(f"Unexpected error processing {task.file_path}: {e}")
-            await self._handle_failure(task, str(e))
+            await self._handle_failure(task, e)
 
-    async def _handle_failure(self, task: TaskItem, error_message: str) -> None:
+    async def _handle_failure(self, task: TaskItem, error: BaseException | str) -> None:
         """
         Handle task failure with retry logic.
 
         Args:
             task: The failed task
-            error_message: Error message from the failure
+            error: The caught exception, or an operator-constructed constant
+                string. ``str`` is trusted verbatim (operator constants); only
+                ``BaseException`` payloads are redacted before persistence,
+                because the persisted error fields are user-facing (issue #562).
 
         Schedules a deferred retry with incremented attempt count if retries
         remain (issue #513 W11 / RC-6: the backoff sleeps in the dedicated
@@ -2695,9 +2702,9 @@ class BackgroundProcessor:
                     "Task retry for %s could not be scheduled (retry backlog "
                     "full); treating as permanent failure: %s",
                     task.file_path,
-                    error_message,
+                    error,
                 )
-                self._mark_task_permanently_failed(task, error_message)
+                self._mark_task_permanently_failed(task, error)
             elif task.file_id is not None:
                 # The retry ticket owns a queue slot even while it waits in the
                 # deferred scheduler. This prevents recovery from claiming the
@@ -2713,9 +2720,15 @@ class BackgroundProcessor:
                 # the wrapper must not release it when this attempt settles.
                 task.recovery_claim = False
         else:
-            self._mark_task_permanently_failed(task, error_message)
+            self._mark_task_permanently_failed(task, error)
 
-    def _mark_task_permanently_failed(self, task: TaskItem, error_message: str) -> None:
+    def _mark_task_permanently_failed(
+        self, task: TaskItem, error: BaseException | str
+    ) -> None:
+        # ``str`` is trusted verbatim (operator constants); only BaseException
+        # payloads are redacted, because the persisted error fields are
+        # user-facing (issue #562).
+        safe_error = error if isinstance(error, str) else redact_ingest_error(error)
         # Mark file as error in database so it doesn't stay in 'processing'
         if task.file_id is not None and self.processor.pool is not None:
             try:
@@ -2723,7 +2736,7 @@ class BackgroundProcessor:
                     conn.execute(
                         "UPDATE files SET status='error', "
                         "error_message=?, phase='error' WHERE id = ?",
-                        (error_message[:500], task.file_id),
+                        (safe_error[:500], task.file_id),
                     )
                     conn.commit()
             except Exception:
@@ -2733,7 +2746,7 @@ class BackgroundProcessor:
                 )
         logger.error(
             f"Task permanently failed for {task.file_path} "
-            f"after {self.max_retries} attempts: {error_message}"
+            f"after {self.max_retries} attempts: {error}"
         )
 
     @property
