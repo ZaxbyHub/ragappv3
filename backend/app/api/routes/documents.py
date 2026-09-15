@@ -643,9 +643,11 @@ def _vault_relative_file_path(raw_file_path: str) -> str:
     """Project the stored upload path to a vault-relative path (issue #562).
 
     The API must not echo server-absolute filesystem paths. Stored values look
-    like ``<data_dir>/vaults/<vault_id>/uploads/<name>``; everything up to and
-    including the vault id is stripped. Falls back to the bare file name for
-    layouts that do not match and is a no-op for already-relative values.
+    like ``<data_dir>/vaults/<vault_id>/uploads/<name>``; the server prefix up
+    to ``/vaults/`` is stripped, so the vault id survives as the first segment
+    (e.g. ``7/uploads/name``) — free of any server-absolute prefix. Falls back
+    to the bare file name for layouts that do not match and is a no-op for
+    already-relative values.
     """
     normalized = raw_file_path.replace("\\", "/")
     marker = "/vaults/"
