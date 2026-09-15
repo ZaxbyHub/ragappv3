@@ -23,7 +23,7 @@
  * #551 the mount check carries deep=true only for an authenticated user, so
  * this scenario runs with the auth store set to authenticated.
  */
-import { renderHook } from "@testing-library/react";
+import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockGet = vi.hoisted(() => vi.fn());
@@ -74,6 +74,102 @@ describe("useHealthCheck — last-known retention on null probes (issue #494 AC6
     useAuthStore.setState(priorAuthState);
     mockGet.mockReset();
     vi.clearAllMocks();
+    cleanup();
+  });
+
+  it("never sends deep=true on the 90s backstop when unauthenticated (PRR-005)", async () => {
+    useAuthStore.setState({ isAuthenticated: false });
+    // Real service booleans: keeps the cold-cache re-check (PRR-002) out of
+    // this pin so the backstop scheduling is isolated.
+    mockGet.mockResolvedValue(healthyDeepResponse as never);
+    const { result } = renderHook(() => useHealthCheck({ pollInterval: 30_000 }));
+
+    // Three heartbeat ticks past the 90s deep-recheck interval: an
+    // unauthenticated session must stay shallow-only on every one of them.
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.waitFor(() => expect(mockGet).toHaveBeenCalledTimes(4));
+    for (let i = 0; i < 4; i++) {
+      expect(mockGet.mock.calls[i][1]).toEqual({ params: {} });
+    }
+    expect(result.current.backend).toBe(true);
+  });
+
+  it("sends deep=true on the 90s backstop when authenticated (PRR-005 symmetric pin)", async () => {
+    useAuthStore.setState({ isAuthenticated: true });
+    mockGet.mockResolvedValue(healthyDeepResponse as never);
+    renderHook(() => useHealthCheck({ pollInterval: 30_000 }));
+
+    // Mount check is deep; ticks at 30s/60s are shallow; the 90s tick is the
+    // deep backstop again.
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await vi.advanceTimersByTimeAsync(31_000);
+    await vi.waitFor(() => expect(mockGet).toHaveBeenCalledTimes(4));
+    expect(mockGet.mock.calls[0][1]).toEqual({ params: { deep: true } });
+    expect(mockGet.mock.calls[1][1]).toEqual({ params: {} });
+    expect(mockGet.mock.calls[2][1]).toEqual({ params: {} });
+    expect(mockGet.mock.calls[3][1]).toEqual({ params: { deep: true } });
+  });
+
+  it("stays in checking state (no false down) on a cold-cache shallow poll, then resolves on re-check (PRR-002)", async () => {
+    useAuthStore.setState({ isAuthenticated: false });
+    // Cold cache: shallow response carries NO embeddings/chat keys (unknown).
+    mockGet.mockResolvedValueOnce({
+      data: { status: "ok", services: { backend: true } },
+    } as never);
+    mockGet.mockResolvedValue({
+      data: {
+        status: "ok",
+        services: { backend: true, embeddings: true, chat: true },
+      },
+    } as never);
+    const { result } = renderHook(() => useHealthCheck());
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(mockGet).toHaveBeenCalledTimes(1));
+    // Unknown services must NOT be published as down: stay in checking state.
+    expect(result.current.loading).toBe(true);
+
+    // The hook re-polls ~2s later (bounded) and resolves with real booleans.
+    await vi.advanceTimersByTimeAsync(2_100);
+    await vi.waitFor(() => expect(mockGet).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.embeddings).toBe(true);
+    expect(result.current.chat).toBe(true);
+    // The re-check (unauthenticated) is also shallow.
+    expect(mockGet.mock.calls[1][1]).toEqual({ params: {} });
+  });
+
+  it("falls back to loading=false after the bounded re-check budget is exhausted with services still unknown (PRR-002 exhaustion)", async () => {
+    useAuthStore.setState({ isAuthenticated: false });
+    // Every poll returns unknown services (backend up, embeddings/chat never
+    // populated): initial + 5 re-checks, then the hook must publish loading
+    // = false instead of spinning forever.
+    mockGet.mockResolvedValue({
+      data: { status: "ok", services: { backend: true } },
+    } as never);
+    const { result } = renderHook(() => useHealthCheck());
+
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(mockGet).toHaveBeenCalledTimes(1));
+    expect(result.current.loading).toBe(true);
+
+    // Re-checks at ~2s intervals: attempts 1..5.
+    await vi.advanceTimersByTimeAsync(10_500);
+    await vi.waitFor(() => expect(mockGet).toHaveBeenCalledTimes(6));
+    // Budget exhausted: loading resolves (no infinite spinner).
+    await vi.waitFor(() => expect(result.current.loading).toBe(false));
+    // Bounded: no further polls after the 6th (initial + 5 re-checks).
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(mockGet).toHaveBeenCalledTimes(6);
+    // Unknown services retained as the initial false (truthful fallback:
+    // amber banner may show, since the server genuinely never probed).
+    expect(result.current.backend).toBe(true);
+    expect(result.current.embeddings).toBe(false);
   });
 
   it("retains indicators when lightweight polls return null services; explicit false still flips down", async () => {

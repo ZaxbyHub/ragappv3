@@ -436,6 +436,8 @@ Depending on the number of documents and your hardware, this may take several mi
 # Verify embedding dimension is correct.
 # Since issue #551, deep=true requires authentication: send the monitoring
 # API key (HEALTH_CHECK_API_KEY) or an authenticated user session.
+# (The ${VAR:?...} guard below requires bash/zsh; in PowerShell inline the
+# key value instead, e.g. -H "X-API-Key: <your-key>".)
 curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
   "http://localhost:9090/api/health?deep=true" | jq .vector_store
 # Expected: {"ok": true, "rows": <N>, "stale_embeddings": null or absent}

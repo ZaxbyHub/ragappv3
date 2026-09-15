@@ -371,6 +371,35 @@ def main() -> int:
                 f"docker-compose.yml {env_name} default {compose_val!r} does not match backend default {backend_val!r}"
             )
 
+    # Credential family (issue #551): HEALTH_CHECK_API_KEY authenticates the
+    # provider-probing health routes, so a non-empty value in .env.example
+    # (the documented `cp .env.example .env` setup path) would ship a
+    # publicly-known credential. Backend default is "" (fail-closed);
+    # .env.example and the compose default must match (empty).
+    credential_empty_str_settings = {
+        "HEALTH_CHECK_API_KEY": "health_check_api_key",
+    }
+    for env_name, field_name in credential_empty_str_settings.items():
+        backend_val = backend_empty_str_default(backend_config, field_name)
+        env_val = env_value(env_text, env_name)
+        compose_val = compose_default(compose_text, env_name)
+        if backend_val is None:
+            failures.append(
+                f"backend/app/config.py {field_name} is not an empty-string "
+                "default; the credential contract requires \"\""
+            )
+        if env_val != backend_val:
+            failures.append(
+                f".env.example {env_name} must be empty (fail-closed), got "
+                f"{env_val!r}; backend default is {backend_val!r}"
+            )
+        if compose_val != backend_val:
+            failures.append(
+                f"docker-compose.yml {env_name} default must be empty "
+                f"(fail-closed), got {compose_val!r}; backend default is "
+                f"{backend_val!r}"
+            )
+
     draft_list_settings = {
         "DRAFT_ALLOWED_MODEL_ORIGINS": "draft_allowed_model_origins",
         "DRAFT_SENSITIVE_ALLOWED_MODEL_ORIGINS": "draft_sensitive_allowed_model_origins",

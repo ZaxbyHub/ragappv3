@@ -58,9 +58,17 @@ per call with unreachable providers).
 - **External monitoring** hitting `deep=true` or `/llm-health/modes`
   anonymously will now get 401. Either set `HEALTH_CHECK_API_KEY` and send
   `X-API-Key: <key>` (this credential also bypasses the new rate limit), or
-  authenticate as a user. **Deployment prerequisite:** with the default
-  empty `HEALTH_CHECK_API_KEY`, the X-API-Key path is dead by design — set
-  the key before upgrading if monitoring depends on it.
+  authenticate as a user. **Deployment prerequisite:** `.env.example` and
+  the docker-compose default ship `HEALTH_CHECK_API_KEY` **empty**
+  (fail-closed) — key-based monitoring is disabled until you set a real
+  secret (generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`)
+  and restart. Never keep the old public placeholder (`health-api-key`):
+  since this change it authenticates the probing routes.
+- **Rollout window:** frontend bundles cached before this deploy still send
+  `deep=true` on their first health check and will briefly flash the
+  reconnect banner for anonymous visitors until the cache-busted bundle
+  loads. The banner self-heals on the next poll; no action needed beyond
+  the normal deploy.
 - Unauthenticated **shallow** `GET /api/health` and `GET /api/healthz` are
   unchanged (frontend heartbeat, compose healthcheck): not auth-gated and
   not rate-limited — the `HEALTH_PROBE_RATE_LIMIT` bucket is consumed only

@@ -35,9 +35,22 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
   const failStreak = useRef(0);
   const hadSuccess = useRef(false);
   const lastDeepAt = useRef(0);
+  const hasRealServices = useRef(false);
+  const recheckTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const recheckAttempts = useRef(0);
+  const checkHealthRef = useRef<() => Promise<void>>(() => Promise.resolve());
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
 
-  const checkHealth = useCallback(async () => {
+  const clearRecheck = useCallback(() => {
+    if (recheckTimer.current !== null) {
+      clearTimeout(recheckTimer.current);
+      recheckTimer.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearRecheck, [clearRecheck]);
+
+  const checkHealth = useCallback(async (): Promise<void> => {
     // Deep probing now requires credentials on the backend (issue #551): an
     // unauthenticated deep=true would 401 and flap the reconnect banner for
     // anonymous visitors (the hook is mounted at the App root, login page
@@ -63,14 +76,47 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
       hadSuccess.current = true;
       const services = response.data.services;
 
+      // A shallow poll against a cold server-side cache returns null
+      // services ("not checked this cycle") with a background refresh now in
+      // flight. While we hold no real booleans yet, stay in the `loading`
+      // ("checking") state and re-poll shortly instead of publishing the
+      // initial `false`s — otherwise the banner announces an outage from
+      // unknowns (PR #606 review PRR-002). Bounded: once real booleans
+      // arrive (authoritative true OR false) this never triggers again.
+      const servicesUnknown =
+        !hasRealServices.current &&
+        services?.embeddings == null &&
+        services?.chat == null;
+      if (servicesUnknown && recheckAttempts.current < 5) {
+        recheckAttempts.current += 1;
+        clearRecheck();
+        // Indirect through the ref so the re-check always runs the latest
+        // closure (auth state may have changed since this one was created).
+        recheckTimer.current = setTimeout(() => {
+          void checkHealthRef.current();
+        }, 2000);
+      } else if (!servicesUnknown) {
+        recheckAttempts.current = 0;
+      }
+      if (services?.embeddings != null && services?.chat != null) {
+        hasRealServices.current = true;
+      }
+
       const newBackend = services?.backend ?? response.data.status === "ok";
+      // While unknown we hold the checking state; if the re-check budget is
+      // exhausted without real booleans (server sweep genuinely not landing),
+      // fall through to loading=false — the banner then shows its amber
+      // "attempting to reconnect" state, which is accurate, and the regular
+      // heartbeat keeps polling so a recovered server clears it.
+      const stillChecking =
+        servicesUnknown && !hasRealServices.current && recheckAttempts.current < 5;
 
       setHealth((prev) => ({
         backend: newBackend,
         // null/undefined = "not checked": retain last known value
         embeddings: services?.embeddings ?? prev.embeddings,
         chat: services?.chat ?? prev.chat,
-        loading: false,
+        loading: stillChecking,
         lastChecked: new Date(),
       }));
     } catch {
@@ -95,7 +141,11 @@ export function useHealthCheck(options?: UseHealthCheckOptions): HealthStatus {
     }
     // isAuthenticated is read inside the callback: without it the closure
     // would pin the mount-time auth state and never send deep after login.
-  }, [isAuthenticated]);
+  }, [isAuthenticated, clearRecheck]);
+
+  useEffect(() => {
+    checkHealthRef.current = checkHealth;
+  }, [checkHealth]);
 
   useEffect(() => {
     checkHealth();
