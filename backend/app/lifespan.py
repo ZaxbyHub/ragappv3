@@ -258,6 +258,10 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "embedding_cache_max_entries",
             "near_dup_threshold",
             "orphan_rescan_interval_seconds",
+            # Job-lease knobs (issue #559)
+            "jobs_heartbeat_interval_seconds",
+            "jobs_lease_reclaim_timeout_seconds",
+            "jobs_max_attempts",
             "reranking_enabled",
             "reranker_top_n",
             "initial_retrieval_top_k",

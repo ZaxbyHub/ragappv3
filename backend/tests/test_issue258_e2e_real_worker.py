@@ -226,6 +226,13 @@ class TestRealWorkerEndToEnd(unittest.TestCase):
         from app.config import settings
 
         self._orig_data_dir = settings.data_dir
+        # This node deliberately exercises the LEGACY in-memory transport
+        # (queue.put -> _worker_loop drain -> queue.join()). The issue #559
+        # DB-claimed lease is the production default, but the flag-off path
+        # stays a supported configuration; the lease-mode e2e lives in
+        # tests/test_559_c05_proving.py.
+        self._orig_lease_flag = settings.ingestion_job_lease_enabled
+        settings.ingestion_job_lease_enabled = False
         from app.main import app
 
         self.app = app
@@ -248,6 +255,7 @@ class TestRealWorkerEndToEnd(unittest.TestCase):
 
         self.app.dependency_overrides.pop(get_rag_engine, None)
         settings.data_dir = self._orig_data_dir
+        settings.ingestion_job_lease_enabled = self._orig_lease_flag
         self._cleanup()
 
     def test_upload_real_worker_indexed_then_retrievable(self):
