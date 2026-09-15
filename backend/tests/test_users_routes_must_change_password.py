@@ -169,8 +169,25 @@ class TestMustChangePasswordInCreateUserInsert:
         assert must_change == 1, f"Expected must_change_password=1, got {must_change}"
 
     def test_create_user_admin_sets_both_flags(self):
-        """Admin user gets is_active=1 AND must_change_password=1 atomically."""
-        self._create_user_via_api("test_admin", "admin")
+        """Admin user gets is_active=1 AND must_change_password=1 atomically.
+
+        Created by a superadmin actor: the shared assignment rule (issue
+        #560 C22) reserves admin grants at creation for superadmins."""
+        from app.security import csrf_protect
+
+        self.client.app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"
+        token = get_token(self.superadmin_id, "superadmin", "superadmin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "test_admin",
+                "password": "SecurePass123!",
+                "full_name": "Test admin",
+                "role": "admin",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, f"Failed to create admin: {response.json()}"
         is_active, must_change = self._get_user_flags_from_db("test_admin")
         assert is_active == 1, f"Expected is_active=1, got {is_active}"
         assert must_change == 1, f"Expected must_change_password=1, got {must_change}"

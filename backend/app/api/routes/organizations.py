@@ -67,9 +67,13 @@ class OrgInviteCreateRequest(BaseModel):
     @field_validator("email")
     @classmethod
     def validate_email(cls, v):
-        # Accept either a plain username (3+ non-whitespace chars without @) or a
-        # well-formed email address. This allows invites by identifier (e.g.
-        # "alice", "superadmin") as well as by email address (e.g. "a@b.com").
+        # Accept identifier-shaped strings: a plain username (3+
+        # non-whitespace chars) or a username containing '@' (usernames have
+        # no format restriction, so email-shaped usernames are legal).
+        # Redemption always matches the invitee's USERNAME (see
+        # accept_org_invite), so the create route rejects email-form
+        # identifiers that resolve to no existing user — those invites could
+        # never be redeemed (issue #560 C24).
         if not re.match(r"^([^\s@]{3,}|[^@\s]+@[^@\s]+\.[^@\s]+)$", v):
             raise ValueError("Invalid identifier format")
         return v.lower()
@@ -630,16 +634,25 @@ async def create_org_invite(
                 detail="Insufficient privileges. Organization admin or owner required",
             )
 
-        # Fail closed: if the invitee exists with a global role below member,
-        # they can never accept the invite (accept_org_invite requires
-        # require_role("member")), so reject at creation time with a clear
-        # message instead of creating a permanently dead-end invite.
+        # Fail closed at creation time for identifiers that could never be
+        # redeemed: acceptance matches the stored identifier against the
+        # invitee's USERNAME (#300's delivered design) and requires a global
+        # role of member or above.
         invitee_cursor = await asyncio.to_thread(
             conn.execute,
             "SELECT role FROM users WHERE username = ? COLLATE NOCASE",
             (req.email.lower(),),
         )
         invitee_row = await asyncio.to_thread(invitee_cursor.fetchone)
+        if invitee_row is None and "@" in req.email:
+            # An email-form identifier that is nobody's username mints a
+            # token nobody can ever redeem (issue #560 C24). Username-form
+            # identifiers may address not-yet-provisioned users (see #300)
+            # and stay allowed.
+            raise HTTPException(
+                status_code=400,
+                detail=f"No user found with username '{req.email.lower()}'; email-form invites must match an existing username",
+            )
         if invitee_row:
             invitee_level = UserRole.level(invitee_row[0])
             if invitee_level < UserRole.MEMBER.value:

@@ -202,17 +202,21 @@ class TestCreateInvite:
     """Tests for POST /api/organizations/{org_id}/invites."""
 
     def test_admin_creates_invite(self, client):
-        """Admin creates an invite successfully (201)."""
+        """Admin creates an invite successfully (201).
+
+        The identifier is username-form: unresolvable email-form identifiers
+        are rejected at creation (issue #560 C24); username-form identifiers
+        may address a not-yet-provisioned user (#300)."""
         org_id = _create_org("Test Org", 2)  # admin1 owns it
 
         response = client.post(
             f"/api/organizations/{org_id}/invites",
-            json={"email": "newuser@x.com", "role": "member"},
+            json={"email": "newuser", "role": "member"},
             headers=auth_headers(admin_token),
         )
         assert response.status_code == 201
         data = response.json()
-        assert data["email"] == "newuser@x.com"
+        assert data["email"] == "newuser"
         assert data["role"] == "member"
         assert data["invite_id"] is not None
         assert data["token"].startswith("inv_")
@@ -244,8 +248,11 @@ class TestCreateInvite:
         assert data["email"] == "member1@x.com"
         assert data["role"] == "member"
 
-    def test_admin_can_invite_nonexistent_user(self, client):
-        """Admin can invite a nonexistent (not-yet-registered) user (201)."""
+    def test_admin_cannot_invite_unresolvable_email_identifier(self, client):
+        """An email-form identifier matching no username is rejected 400 at
+        creation (issue #560 C24): the token could never be redeemed because
+        acceptance matches the identifier against the invitee's username.
+        Fails at base (201) — this is the C24 regression test."""
         org_id = _create_org("Test Org", 2)
 
         response = client.post(
@@ -253,30 +260,33 @@ class TestCreateInvite:
             json={"email": "notregistered@x.com", "role": "member"},
             headers=auth_headers(admin_token),
         )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["email"] == "notregistered@x.com"
-        assert data["role"] == "member"
+        assert response.status_code == 400
+        assert "notregistered@x.com" in response.json()["detail"]
+        assert "No user found" in response.json()["detail"]
 
     def test_admin_creates_admin_invite(self, client):
-        """Admin creates an admin invite (201)."""
+        """Admin creates an admin invite (201).
+
+        Identifier is username-form (issue #560 C24); the invite role here is
+        an ORG role, unrelated to the users.role assignment rule."""
         org_id = _create_org("Test Org", 2)
 
         response = client.post(
             f"/api/organizations/{org_id}/invites",
-            json={"email": "admininvite@x.com", "role": "admin"},
+            json={"email": "admininvite", "role": "admin"},
             headers=auth_headers(admin_token),
         )
         assert response.status_code == 201
         assert response.json()["role"] == "admin"
 
     def test_owner_creates_invite(self, client):
-        """Org owner creates an invite (201)."""
+        """Org owner creates an invite (201). Identifier is username-form
+        (issue #560 C24)."""
         org_id = _create_org("Owner Org", 1)  # superadmin as owner
 
         response = client.post(
             f"/api/organizations/{org_id}/invites",
-            json={"email": "memberinvite@x.com", "role": "member"},
+            json={"email": "memberinvite", "role": "member"},
             headers=auth_headers(superadmin_token),
         )
         assert response.status_code == 201
@@ -325,12 +335,13 @@ class TestCreateInvite:
         assert response.status_code == 422
 
     def test_custom_expires_in_days(self, client):
-        """Custom expires_in_days is respected (201)."""
+        """Custom expires_in_days is respected (201). Identifier is
+        username-form (issue #560 C24)."""
         org_id = _create_org("Test Org", 2)
 
         response = client.post(
             f"/api/organizations/{org_id}/invites",
-            json={"email": "expire@x.com", "role": "member", "expires_in_days": 14},
+            json={"email": "expire", "role": "member", "expires_in_days": 14},
             headers=auth_headers(admin_token),
         )
         assert response.status_code == 201
@@ -842,7 +853,10 @@ class TestInviteTokenSecurity:
 
         create_resp = client.post(
             f"/api/organizations/{org_id}/invites",
-            json={"email": "user@x.com", "role": "member"},
+            # Username-form identifier (issue #560 C24: unresolvable
+            # email-form identifiers are rejected at creation; this test is
+            # about token visibility, not the identifier).
+            json={"email": "user_invite1", "role": "member"},
             headers=auth_headers(admin_token),
         )
         raw = create_resp.json()["token"]
@@ -1363,7 +1377,9 @@ class TestAdversarialInviteSecurity:
         # Create first invite normally
         resp1 = client.post(
             f"/api/organizations/{org_id}/invites",
-            json={"email": "first@x.com", "role": "member"},
+            # Username-form identifier (issue #560 C24); this test is about
+            # the token_hash UNIQUE constraint, not the identifier.
+            json={"email": "first_invite", "role": "member"},
             headers=auth_headers(admin_token),
         )
         assert resp1.status_code == 201

@@ -950,6 +950,28 @@ KnowledgeVault has built-in JWT-based authentication with role-based access cont
 - `member` — Can create and update documents
 - `viewer` — Read-only access
 
+**Role assignment rule (one rule, all surfaces):** Only a `superadmin` can create `admin` or `superadmin` accounts, and only a `superadmin` can change any existing user's role (via `PATCH /api/users/{id}/role` or `PATCH /api/users/{id}`). Admins can create `member` and `viewer` accounts and edit user details; re-saving a user with their current role is a no-op, not a role change. A non-superadmin cannot modify a superadmin target at all — even a no-op role field on a superadmin account is rejected. This rule is enforced identically by every role-mutating route and by the admin UI's role dropdowns.
+
+### Vault permission matrix
+
+Vault access is granted per-vault as one of three permission levels with a strict numeric hierarchy: `read` (1) < `write` (2) < `admin` (3). An operation succeeds when the caller's effective permission level is greater than or equal to the operation's required level, so `admin` implies `write`, and `write` implies `read`. Effective permission resolves from (strongest wins): the `superadmin` app role (admin everywhere) → the app-role `admin` baseline (write everywhere) → an explicit `vault_members` row → `vault_group_access` via group membership → vault visibility (`public`/`org` grants read). See `docs/engineering/conventions.md` for the resolution-order contract.
+
+| Operation | Minimum vault permission |
+|---|---|
+| List documents | read |
+| Search documents | read |
+| View or fetch a single document or its raw artifact | read |
+| View or list chat sessions | read |
+| Upload documents | write |
+| Create chat sessions or send chat messages | write |
+| Create, update, delete, rename, move, or import wiki pages, KMS entries, folders, and memories | write |
+| Delete documents | admin |
+| Manage vault members (add, remove, update membership) | admin |
+| Grant or revoke group access to the vault | admin |
+| Update, delete, rename, or reconfigure a vault (settings, enrichment and multimodal toggles) | admin |
+
+Note the deliberate asymmetry: **viewing** chat sessions requires only `read`, but **creating** a chat session or sending messages requires `write`. A vault member granted only `read` can read documents and conversations but cannot chat, upload, or mutate content. This matrix is pinned by `backend/tests/test_vault_matrix_doc.py` and `backend/tests/test_vault_matrix_contract.py`, which parse the table above and assert each cell against the live policy evaluator (`evaluate()`), so the documentation and the code cannot drift apart.
+
 **Setup:**
 - When `USERS_ENABLED=True`, set `ADMIN_SECRET_TOKEN` in `.env` to create the first admin user
 - The initial admin can then invite existing users via a shareable invite token or create accounts manually (no email delivery — see Organization Invites below)
@@ -1008,7 +1030,7 @@ Indexes exist on `event_type`, `actor_user_id`, `target_user_id`, and `created_a
 | `user.created` | `POST /users` | An admin created a user |
 | `user.updated` | `PATCH /users/{id}` | An admin updated a user's profile |
 | `user.password_reset` | `PATCH /users/{id}/password` | An admin reset a user's password |
-| `user.role_updated` | `PATCH /users/{id}/role` | An admin changed a user's role |
+| `user.role_updated` | `PATCH /users/{id}/role` | A superadmin changed a user's role |
 | `user.active_updated` | `PATCH /users/{id}/active` | An admin enabled/disabled a user |
 | `membership.organizations_replaced` | `PUT /users/{id}/organizations` | A user's org membership set was replaced |
 | `membership.groups_replaced` | `PUT /users/{id}/groups` | A user's group membership set was replaced |
@@ -1066,6 +1088,7 @@ Organization invites allow admins to invite users via a token-based flow with ex
 - Tokens are prefixed `inv_` and expire after a configurable window (default 7 days)
 - Invites can be **resent** (new expiry) or **revoked** (immediate invalidation)
 - Each invite is tied to the inviting organization
+- The invite identifier must be the invitee's **username** — acceptance matches it against the invitee's username (user accounts have no email column). Email-form identifiers are rejected at creation unless they match an existing username, so a token that nobody can ever redeem is never minted. A username that does not exist yet may still be invited (the future user registers with that exact username to redeem)
 
 **Managing Invites:**
 

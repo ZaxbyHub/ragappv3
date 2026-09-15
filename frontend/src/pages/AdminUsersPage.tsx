@@ -47,14 +47,8 @@ import { ResetPasswordDialog } from "./AdminUsersPage/ResetPasswordDialog";
 import { ManageGroupsSheet } from "./AdminUsersPage/ManageGroupsSheet";
 import { ManageOrgsSheet } from "./AdminUsersPage/ManageOrgsSheet";
 import { CreateUserDialog } from "./AdminUsersPage/CreateUserDialog";
+import { roleOptionsFor } from "./AdminUsersPage/roleOptions";
 import type { User, UserRole, Group, OrgItem } from "./AdminUsersPage/types";
-
-const ROLE_OPTIONS: { value: UserRole; label: string }[] = [
-  { value: "superadmin", label: "Super Admin" },
-  { value: "admin", label: "Admin" },
-  { value: "member", label: "Member" },
-  { value: "viewer", label: "Viewer" },
-];
 
 function AdminUsersPageContent() {
   const testMode = useTestMode();
@@ -501,7 +495,10 @@ function AdminUsersPageContent() {
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          {ROLE_OPTIONS.map((opt) => (
+                          {roleOptionsFor(isSuperAdmin ? "superadmin" : "admin", {
+                            mode: "edit",
+                            targetRole: user.role,
+                          }).map((opt) => (
                             <SelectItem key={opt.value} value={opt.value}>
                               {opt.label}
                             </SelectItem>

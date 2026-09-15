@@ -19,6 +19,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { User, UserRole } from "./types";
+import { roleOptionsFor } from "./roleOptions";
 
 interface EditUserDialogProps {
   open: boolean;
@@ -27,13 +28,6 @@ interface EditUserDialogProps {
   onClose: () => void;
   isSuperAdmin: boolean;
 }
-
-const ROLE_OPTIONS: { value: UserRole; label: string }[] = [
-  { value: "superadmin", label: "Super Admin" },
-  { value: "admin", label: "Admin" },
-  { value: "member", label: "Member" },
-  { value: "viewer", label: "Viewer" },
-];
 
 export function EditUserDialog({
   open,
@@ -111,7 +105,10 @@ export function EditUserDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {ROLE_OPTIONS.filter((r) => r.value !== "superadmin" || isSuperAdmin).map((opt) => (
+                {roleOptionsFor(isSuperAdmin ? "superadmin" : "admin", {
+                  mode: "edit",
+                  targetRole: user?.role ?? null,
+                }).map((opt) => (
                   <SelectItem key={opt.value} value={opt.value}>
                     {opt.label}
                   </SelectItem>

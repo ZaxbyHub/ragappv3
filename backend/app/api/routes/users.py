@@ -29,6 +29,48 @@ from app.services.security_audit import safe_record_security_event
 router = APIRouter(prefix="/users", tags=["users"])
 logger = logging.getLogger(__name__)
 
+VALID_ROLES = ["superadmin", "admin", "member", "viewer"]
+
+
+def assert_can_assign_role(
+    actor_role: Optional[str], target_role: Optional[str], new_role: str
+) -> None:
+    """The single rule for who may assign which ``users.role`` value.
+
+    Every surface that mutates ``users.role`` (``create_user``,
+    ``update_user``, ``update_user_role``) must go through this helper so
+    the routes cannot drift apart again (issue #560 C22):
+
+    - Re-asserting a target's current role is a no-op, not an assignment
+      (the Edit dialog always sends the role field, so a pure name change
+      must not 403).
+    - Any actual role change on an existing user requires a superadmin
+      actor (matching the superadmin-only ``/role`` endpoint and the
+      admin-guide role glossary).
+    - At creation (``target_role`` is None) an admin may create member and
+      viewer accounts; granting ``admin`` or ``superadmin`` requires a
+      superadmin actor.
+    """
+    if new_role not in VALID_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role. Must be one of: {', '.join(VALID_ROLES)}",
+        )
+    if actor_role == "superadmin":
+        return
+    if target_role is not None:
+        if new_role == target_role:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail="Only a superadmin can change user roles",
+        )
+    if new_role not in ("member", "viewer"):
+        raise HTTPException(
+            status_code=403,
+            detail="Only a superadmin can assign the admin or superadmin role",
+        )
+
 
 class UpdateRoleRequest(BaseModel):
     role: str = Field(...)
@@ -105,21 +147,11 @@ async def create_user(
 ):
     """Create a new user (admin/superadmin only).
 
-    Only superadmin can create other superadmins.
+    Admins may create member and viewer accounts; granting admin or
+    superadmin requires a superadmin actor.
     """
-    valid_roles = ["superadmin", "admin", "member", "viewer"]
-    if body.role not in valid_roles:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid role. Must be one of: {', '.join(valid_roles)}",
-        )
-
-    # Only superadmin can create other superadmins
-    if body.role == "superadmin" and user.get("role") != "superadmin":
-        raise HTTPException(
-            status_code=403,
-            detail="Only superadmin can create superadmin users",
-        )
+    # One rule for who may assign which role (issue #560 C22).
+    assert_can_assign_role(user.get("role"), None, body.role)
 
     # Validate password strength
     try:
@@ -308,36 +340,17 @@ async def update_user(
         if user_id == user.get("id"):
             raise HTTPException(status_code=400, detail="Cannot change your own role")
 
-        # Only superadmin can assign superadmin role
-        if body.role == "superadmin" and user.get("role") != "superadmin":
-            raise HTTPException(
-                status_code=403,
-                detail="Only superadmin can assign superadmin role",
-            )
         if target_row[3] == "superadmin" and user.get("role") != "superadmin":
             raise HTTPException(
                 status_code=403,
                 detail="Only superadmin can change role of superadmin users",
             )
 
-        valid_roles = ["superadmin", "admin", "member", "viewer"]
-        if body.role not in valid_roles:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid role. Must be one of: {', '.join(valid_roles)}",
-            )
-
-        # Privilege-escalation guard: only a superadmin may grant the
-        # superadmin role or modify a user who is already a superadmin. An
-        # ordinary admin must not be able to promote anyone (including via a
-        # second account) past their own level.
-        if user.get("role") != "superadmin" and (
-            body.role == "superadmin" or target_row[3] == "superadmin"
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Only a superadmin can grant or modify the superadmin role",
-            )
+        # One rule for who may assign which role (issue #560 C22), shared
+        # with create_user and update_user_role. Re-asserting the target's
+        # current role is a no-op so the Edit dialog's always-sent role
+        # field does not 403 unrelated saves.
+        assert_can_assign_role(user.get("role"), target_row[3], body.role)
 
         update_fields.append("role = ?")
         update_values.append(body.role)
@@ -469,12 +482,11 @@ async def update_user_role(
     _csrf_token: str = Depends(csrf_protect),
 ):
     """Update user role (superadmin only). Cannot demote last superadmin."""
-    valid_roles = ["superadmin", "admin", "member", "viewer"]
-    if body.role not in valid_roles:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid role. Must be one of: {', '.join(valid_roles)}",
-        )
+    # One rule for who may assign which role (issue #560 C22): shared with
+    # create_user and update_user. The route gate already requires a
+    # superadmin actor, so the helper's value validation (400) is what does
+    # the work here.
+    assert_can_assign_role(user.get("role"), None, body.role)
 
     pool = get_pool(str(settings.sqlite_path))
     conn = pool.get_connection()
