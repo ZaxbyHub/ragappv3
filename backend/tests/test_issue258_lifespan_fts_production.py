@@ -21,8 +21,9 @@ it can pass. The contract it demands:
     ``async def validate_fts_index(table) -> bool``
 
       * ``table`` is the vector store's table object (anything exposing an
-        async ``list_indices()`` whose results have a ``.name``).
-      * Returns True iff an index named ``"fts_text"`` exists.
+        async ``list_indices()`` whose results have ``.columns`` and
+        ``.index_type`` — detection is column+type based, issue #557).
+      * Returns True iff an FTS index on the ``text`` column exists.
       * Returns False when the index is MISSING (and logs the error) — the
         missing-index condition must be observable by the caller, not just
         logged and swallowed.
@@ -37,8 +38,10 @@ import unittest
 
 
 class _Index:
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, columns=None, index_type=None) -> None:
         self.name = name
+        self.columns = columns if columns is not None else []
+        self.index_type = index_type if index_type is not None else ""
 
 
 class _FakeTable:
@@ -67,18 +70,25 @@ class TestLifespanFTSValidationSurface(unittest.IsolatedAsyncioTestCase):
         print("AC3 CHECK: FAIL — no validate_fts_index production surface in app.lifespan (block still inline)")
         from app.lifespan import validate_fts_index
 
-        # Index present -> True.
+        # Index present -> True (real engine-reported FTS shape).
         present = await validate_fts_index(
-            _FakeTable([_Index("other"), _Index("fts_text")])
+            _FakeTable(
+                [
+                    _Index("other"),
+                    _Index("text_idx", ["text"], "FTS"),
+                ]
+            )
         )
-        # AC3 CHECK — present fts_text index not reported as valid.
-        print("AC3 CHECK: FAIL — present fts_text index not reported as valid")
+        # AC3 CHECK — present FTS index not reported as valid.
+        print("AC3 CHECK: FAIL — present FTS index not reported as valid")
         self.assertIs(present, True)
 
         # Index missing -> False (observable, not swallowed into a log line).
-        missing = await validate_fts_index(_FakeTable([_Index("other")]))
-        # AC3 CHECK — missing fts_text index not reported to the caller.
-        print("AC3 CHECK: FAIL — missing fts_text index not reported to the caller")
+        missing = await validate_fts_index(
+            _FakeTable([_Index("other"), _Index("embedding_idx", ["embedding"], "IvfPq")])
+        )
+        # AC3 CHECK — missing FTS index not reported to the caller.
+        print("AC3 CHECK: FAIL — missing FTS index not reported to the caller")
         self.assertIs(missing, False)
 
         # list_indices() raising -> False, never an exception.

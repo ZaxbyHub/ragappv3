@@ -5,7 +5,8 @@ This module tests:
 1. VECTOR_INDEX_MIN_ROWS constant equals 256
 2. init_table defers vector index creation (no immediate create_index for embedding column)
 3. FTS index created when not exists
-4. FTS index skipped when already exists (list_indices returns fts_text)
+4. FTS index skipped when already exists (list_indices returns a
+   shape-complete FTS index)
 5. _maybe_create_vector_index returns early when table is None
 6. _maybe_create_vector_index skips when embedding_idx already exists
 7. _maybe_create_vector_index skips when row count < 256
@@ -137,7 +138,8 @@ class TestFTSIndexGuard(unittest.IsolatedAsyncioTestCase):
 
     async def test_fts_index_skipped_when_already_exists(self):
         """
-        Test that FTS index creation is skipped when 'fts_text' already exists.
+        Test that FTS index creation is skipped when a real-shape FTS index
+        already exists (columns=['text'], index_type='FTS' — issue #557).
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -145,9 +147,12 @@ class TestFTSIndexGuard(unittest.IsolatedAsyncioTestCase):
         mock_db = MagicMock()
         mock_db.table_names = AsyncMock(return_value=[])
 
-        # Mock existing FTS index
+        # Mock existing FTS index with the REAL engine-reported shape
+        # (auto-named 'text_idx'; detection is column+type based).
         existing_fts_index = MagicMock()
-        existing_fts_index.name = "fts_text"
+        existing_fts_index.name = "text_idx"
+        existing_fts_index.columns = ["text"]
+        existing_fts_index.index_type = "FTS"
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[existing_fts_index])
@@ -195,9 +200,11 @@ class TestMaybeCreateVectorIndex(unittest.IsolatedAsyncioTestCase):
         """
         Test that _maybe_create_vector_index skips when 'embedding_idx' is fresh.
         """
-        # Mock table with existing embedding_idx
+        # Mock table with an existing embedding index (real engine shape)
         existing_index = MagicMock()
         existing_index.name = "embedding_idx"
+        existing_index.columns = ["embedding"]
+        existing_index.index_type = "IvfPq"
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[existing_index])
@@ -379,10 +386,13 @@ class TestMaybeCreateVectorIndexLogging(unittest.IsolatedAsyncioTestCase):
 
     async def test_logs_debug_when_index_already_exists(self):
         """
-        Test that debug log is emitted when embedding_idx is already fresh.
+        Test that debug log is emitted when the embedding index is already
+        fresh (real engine shape: IvfPq on ['embedding'] — issue #557).
         """
         existing_index = MagicMock()
         existing_index.name = "embedding_idx"
+        existing_index.columns = ["embedding"]
+        existing_index.index_type = "IvfPq"
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[existing_index])
@@ -453,10 +463,14 @@ class TestMaybeCreateVectorIndexEdgeCases(unittest.IsolatedAsyncioTestCase):
 
     async def test_ignores_other_index_names(self):
         """
-        Test that other index names (not embedding_idx) are ignored.
+        Test that an index of a different KIND does not satisfy the embedding
+        check (a real-shape FTS index on 'text' is not an IvfPq on
+        'embedding' — issue #557).
         """
         other_index = MagicMock()
-        other_index.name = "some_other_index"
+        other_index.name = "text_idx"
+        other_index.columns = ["text"]
+        other_index.index_type = "FTS"
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[other_index])
@@ -467,7 +481,7 @@ class TestMaybeCreateVectorIndexEdgeCases(unittest.IsolatedAsyncioTestCase):
 
         await self.store._maybe_create_vector_index()
 
-        # count_rows should be called (embedding_idx not found)
+        # count_rows should be called (no embedding-column index found)
         mock_table.count_rows.assert_called_once()
 
     async def test_create_index_failure_logs_warning(self):

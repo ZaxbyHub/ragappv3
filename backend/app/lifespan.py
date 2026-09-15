@@ -40,7 +40,7 @@ from app.services.secret_manager import SecretManager
 from app.services.ssrf import URLBlocked, assert_url_safe
 from app.services.ssrf_transport import SSRFSafeTransport
 from app.services.toggle_manager import ToggleManager
-from app.services.vector_store import VectorStore, VectorStoreError
+from app.services.vector_store import VectorStore, VectorStoreError, has_index
 from app.services.wiki_compile_processor import WikiCompileProcessor
 from app.services.wiki_retrieval import WikiRetrievalService
 from app.utils.request_context import JsonFormatter, RequestIdFilter
@@ -467,19 +467,21 @@ async def validate_fts_index(table) -> bool:
     """Validate that the vector table carries the full-text-search index.
 
     ``table`` is the vector store's table object (anything exposing an async
-    ``list_indices()`` whose results have a ``.name`` attribute). Returns
-    True iff an index named ``"fts_text"`` exists. Returns False — after
-    logging — when the index is missing or when ``list_indices()`` itself
-    raises; a validation failure is observable via the return value and
-    never propagated, so startup always continues.
+    ``list_indices()`` whose results have ``.columns`` and ``.index_type``
+    attributes). Detection is by COLUMN and TYPE (``has_index``): the engine
+    auto-derives index names, so a name-based check can never match a table
+    this application creates (issue #557). Returns True iff an FTS index on
+    the ``text`` column exists. Returns False — after logging — when the
+    index is missing or when ``list_indices()`` itself raises; a validation
+    failure is observable via the return value and never propagated, so
+    startup always continues.
 
     Note: no production caller currently branches on the return value (the
     lifespan call site ignores it); the bool surface exists so the check is
     observable to tests and future callers.
     """
     try:
-        indices = await table.list_indices()
-        fts_index_exists = any(idx.name == "fts_text" for idx in indices)
+        fts_index_exists = await has_index(table, "text", "FTS")
         if not fts_index_exists:
             logger.error(
                 "Hybrid search is enabled but the FTS index is missing on the 'text' column. "

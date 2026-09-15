@@ -315,8 +315,15 @@ async def optimize_after_cleanup(table: Any) -> dict[str, Any]:
         result["index_action"] = "index_maintenance_skipped"
         result["index_error"] = f"list_indices failed: {exc}"
         return result
+    # Detect by column and type, not by name: the engine auto-derives index
+    # names, and name-based guards have been always-False against real tables
+    # before (ragappv3 issues #148 ANN, #557 FTS). This script stays standalone
+    # (no app.* imports), so the canonical app.services.vector_store.has_index
+    # predicate is inlined here with the script's best-effort getattr posture.
     has_embedding_idx = any(
-        getattr(index, "name", "") == "embedding_idx" for index in indices
+        list(getattr(index, "columns", None) or []) == ["embedding"]
+        and getattr(index, "index_type", "") == "IvfPq"
+        for index in indices
     )
 
     if has_embedding_idx and row_count < VECTOR_INDEX_MIN_ROWS:

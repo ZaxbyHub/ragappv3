@@ -5,7 +5,7 @@ Registered ports of the frozen issue-tracer checks C8/C9 — these behaviors
 were already correct at HEAD and must stay correct:
 
 - C8: a second init_table run must NOT recreate the FTS index (the probe
-  detects the existing 'fts_text' index), no FTS-unavailable warnings are
+  detects the existing real-shape FTS index), no FTS-unavailable warnings are
   emitted, and the fake FTS query still returns the ingested row.
 - C9: has_parent_window_text_sample() returns True only when some row's
   metadata contains a parent_window_text; plain metadata and empty tables
@@ -42,8 +42,11 @@ def _schema_names(schema):
 
 
 class FakeIndex:
-    def __init__(self, name):
+    def __init__(self, name, columns=None, index_type=None):
+        # Shape-complete: the app detects indexes by column+type (issue #557).
         self.name = name
+        self.columns = columns if columns is not None else []
+        self.index_type = index_type if index_type is not None else ""
 
 
 class FakeCursor:
@@ -139,9 +142,9 @@ class FakeFTSTable:
             {"column": column, "config": config, "replace": replace}
         )
         if column == "text":
-            self.indices.append(FakeIndex("fts_text"))
+            self.indices.append(FakeIndex("text_idx", ["text"], "FTS"))
         elif column == "embedding":
-            self.indices.append(FakeIndex("embedding_idx"))
+            self.indices.append(FakeIndex("embedding_idx", ["embedding"], "IvfPq"))
         return None
 
     async def to_pandas(self):
