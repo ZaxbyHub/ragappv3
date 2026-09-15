@@ -170,24 +170,41 @@ class CSRFManager:
         self._use_fallback = False
         self._lock = threading.Lock()
 
-        try:
-            self._redis = redis.from_url(redis_url, decode_responses=True)
-            self._redis.ping()
-            logger.info("CSRFManager connected to Redis successfully")
-        except Exception as exc:
-            logger.warning("Redis unavailable for CSRF: %s", exc)
+        if redis_url:
+            try:
+                self._redis = redis.from_url(redis_url, decode_responses=True)
+                self._redis.ping()
+                logger.info("CSRFManager connected to Redis successfully")
+            except Exception as exc:
+                logger.warning("Redis unavailable for CSRF: %s", exc)
+                self._use_fallback = True
+                self._fallback_store = None
+                self._init_fallback_store(ttl=ttl, db_path=db_path)
+        else:
+            # Documented no-Redis configuration (REDIS_URL="", used by CI and
+            # supported deployments): a quiet, supported mode — not a Redis
+            # outage. Skip the from_url attempt (an empty URL raises a scheme
+            # error that previously logged a misleading WARNING on every
+            # boot) and go straight to the durable fallback store
+            # (issue #558 C16). Mirrors the `if settings.redis_url:` guards
+            # at the sibling from_url sites (embeddings.py, query_transformer.py).
+            logger.info("CSRF Redis disabled (empty REDIS_URL); using fallback store")
             self._use_fallback = True
             self._fallback_store = None
-            # Try SQLite first (shared across workers), then fall back to in-memory
-            if db_path:
-                try:
-                    self._fallback_store = _SQLiteCSRFStore(db_path, ttl=ttl)
-                    logger.info("CSRFManager using SQLite-backed store at %s", db_path)
-                except Exception as sqlexc:
-                    logger.warning("SQLite CSRF store init failed: %s", sqlexc)
-            if not self._fallback_store:
-                self._fallback_store = _InMemoryCSRFStore(ttl=ttl)
-                logger.warning("CSRFManager using in-memory fallback (not worker-safe!)")
+            self._init_fallback_store(ttl=ttl, db_path=db_path)
+
+    def _init_fallback_store(self, ttl: int, db_path: str) -> None:
+        """Select the persistent fallback store: SQLite first (shared across
+        workers), then in-memory as the last resort."""
+        if db_path:
+            try:
+                self._fallback_store = _SQLiteCSRFStore(db_path, ttl=ttl)
+                logger.info("CSRFManager using SQLite-backed store at %s", db_path)
+            except Exception as sqlexc:
+                logger.warning("SQLite CSRF store init failed: %s", sqlexc)
+        if not self._fallback_store:
+            self._fallback_store = _InMemoryCSRFStore(ttl=ttl)
+            logger.warning("CSRFManager using in-memory fallback (not worker-safe!)")
 
     def _get_store(self):
         """Returns the active store (Redis or in-memory fallback)."""
