@@ -547,7 +547,7 @@ class BackgroundProcessor:
                         require_older_than_minutes=None
                     )
                     if not getattr(self, "_ingest_lease_enabled", False)
-                    else asyncio.to_thread(self._sync_missing_ingest_job_rows)
+                    else self._sync_missing_ingest_job_rows_gated()
                 ),
             ),
             (
@@ -646,6 +646,13 @@ class BackgroundProcessor:
         finally:
             self._jobs_barrier.set()
 
+    async def _sync_missing_ingest_job_rows_gated(self) -> None:
+        """Recovery-phase wrapper: wait out the boot migration barrier, then
+        re-run the sync, so it can never race the migration task's INSERT
+        (both target the same files rows)."""
+        await self._jobs_barrier.wait()
+        await asyncio.to_thread(self._sync_missing_ingest_job_rows)
+
     def _sync_missing_ingest_job_rows(self) -> int:
         """Synchronous core of the boot migration. Returns rows created.
 
@@ -657,6 +664,13 @@ class BackgroundProcessor:
         """
         with self.processor.pool.connection() as conn:
             ensure_jobs_schema(conn)
+            # Single explicit transaction: the INSERT and the files-row reset
+            # commit together, and a concurrent caller (migration task vs
+            # recovery phase) serializes behind BEGIN IMMEDIATE instead of
+            # racing two autocommitted statements.
+            owned = not conn.in_transaction
+            if owned:
+                conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute(
                 """
                 INSERT INTO jobs (queue, payload_json)
@@ -695,7 +709,8 @@ class BackgroundProcessor:
                   )
                 """
             )
-            conn.commit()
+            if owned:
+                conn.commit()
         return created if created and created > 0 else 0
 
     async def _ingest_janitor_loop(self) -> None:
@@ -782,7 +797,7 @@ class BackgroundProcessor:
                     cap_cursor = conn.executemany(
                         "UPDATE files SET status = 'error', phase = 'error', "
                         "error_message = 'lease_attempt_cap_exceeded' "
-                        "WHERE id = ? AND status = 'processing'",
+                        "WHERE id = ? AND status IN ('processing', 'pending')",
                         [(fid,) for fid in cap_ids],
                     )
                     cap_failed = cap_cursor.rowcount

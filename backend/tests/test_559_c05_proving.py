@@ -269,10 +269,20 @@ async def test_c05_janitor_caps_orphan_lease_at_attempt_limit_without_claim(tmp_
         assert row["worker_id"] is None
         assert row["lease_generation"] >= 2, "janitor reclaim must bump generation"
         assert row["error"] == "lease_attempt_cap_exceeded"
-        files_status = conn.execute(
-            "SELECT status FROM files WHERE id = ?", (file_id,)
-        ).fetchone()["status"]
-        assert files_status == "error"
+        # The janitor settles the job and resyncs the files row in TWO
+        # commits; wait out the second instead of racing it (PR-review
+        # diagnosed flake: CI read an intermediate files state between the
+        # two commits).
+        files_ok = await _wait_until(
+            lambda: (
+                conn.execute(
+                    "SELECT status FROM files WHERE id = ?", (file_id,)
+                ).fetchone()["status"]
+                == "error"
+            ),
+            30,
+        )
+        assert files_ok, "janitor cap-resync never reached the files row"
         await asyncio.wait_for(processor.stop(), timeout=30)
     finally:
         pool.close_all()
