@@ -1006,7 +1006,25 @@ def stream_chat_response(
             finally:
                 # Client disconnect or terminal return: drop the pending
                 # __anext__ so the provider generator is not left running.
-                if not next_chunk_task.done():
+                # When the task already finished, retrieve its outcome so
+                # asyncio does not log "Task exception was never retrieved"
+                # at ERROR (issue #558 C14: the follow-up __anext__ created
+                # after the last retrieved chunk typically completes with
+                # StopAsyncIteration while the error branch yields its two
+                # SSE frames). StopAsyncIteration is discarded silently; any
+                # other outcome keeps a DEBUG breadcrumb for triage.
+                if next_chunk_task.done():
+                    if not next_chunk_task.cancelled():
+                        outcome = next_chunk_task.exception()
+                        if outcome is not None and not isinstance(
+                            outcome, StopAsyncIteration
+                        ):
+                            logger.debug(
+                                "Discarded outcome of abandoned chat-stream "
+                                "__anext__ task: %r",
+                                outcome,
+                            )
+                else:
                     next_chunk_task.cancel()
         except RAGEngineError as exc:
             logger.warning(

@@ -611,23 +611,24 @@ class VectorStore:
         try:
             if self.table is None:
                 return False
-            # LanceDB table.search().limit(N) is an iterator of dicts; we
-            # only need the first matching record. Filter on a sentinel
-            # JSON substring to avoid pulling rows that lack parent windows.
+            # LanceDB 0.36 AsyncTable.search() is a coroutine that requires a
+            # query argument — the no-argument auto path raises
+            # UnboundLocalError inside lancedb — so a metadata-only scan is
+            # built from the synchronous query() builder instead. This keeps
+            # the WHERE clause as a real prefilter scan; on the previous
+            # `await self.table.search().where(...)` chain the .where/.limit
+            # attribute lookups ran on the coroutine object itself and every
+            # call degraded to the head(50) fallback below with a swallowed
+            # RuntimeWarning (issue #558 C13).
             try:
-                cursor = (
-                    await self.table.search()
+                rows = await (
+                    self.table.query()
                     .where(
                         "metadata LIKE '%\"parent_window_text\"%'",
-                        prefilter=True,
                     )
                     .limit(1)
+                    .to_list()
                 )
-                # ``to_list()`` returns a list (possibly empty).
-                if hasattr(cursor, "to_list"):
-                    rows = await cursor.to_list()
-                else:
-                    rows = list(cursor)
             except Exception:
                 # Older LanceDB API shapes — fall back to a row scan.
                 rows = list(await self.table.head(50))

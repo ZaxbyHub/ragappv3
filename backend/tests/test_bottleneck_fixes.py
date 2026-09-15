@@ -90,31 +90,38 @@ class TestAsyncHasParentWindow:
         assert result is True
 
     @pytest.mark.asyncio
-    async def test_uses_prefilter_in_query(self):
-        """Query uses prefilter=True for efficiency."""
+    async def test_metadata_filter_via_query_builder(self):
+        """The parent-window sample builds its metadata filter on the
+        synchronous ``table.query()`` builder.
+
+        Issue #558 C13: the previous ``await self.table.search().where(...)``
+        chain ran ``.where``/``.limit`` on the coroutine object itself, so
+        every call degraded to the head(50) fallback with a swallowed
+        RuntimeWarning — and lancedb 0.36's no-argument
+        ``AsyncTable.search()`` additionally raises internally. This pins the
+        replacement contract: ``query()`` called once, ``.where`` invoked
+        with the sentinel SQL, ``.limit(1)`` before ``to_list()``.
+        """
         from app.services.vector_store import VectorStore
 
         vs = VectorStore()
         vs.table = AsyncMock()
 
-        # Create a mock cursor for the search chain
-        mock_search_result = MagicMock()
-        mock_search_result.where.return_value.limit.return_value.to_list = AsyncMock(return_value=[])
-        mock_search_result.where.return_value.limit.return_value.to_list.__aenter__ = AsyncMock(return_value=[])
-        mock_search_result.where.return_value.limit.return_value.to_list.__aexit__ = AsyncMock()
-
-        vs.table.search = MagicMock(return_value=mock_search_result)
+        mock_query = MagicMock()
+        mock_query.where.return_value.limit.return_value.to_list = AsyncMock(
+            return_value=[]
+        )
+        vs.table.query = MagicMock(return_value=mock_query)
 
         result = await vs.has_parent_window_text_sample()
         assert result is False  # Empty list returns False
 
-        # Verify search was called
-        vs.table.search.assert_called_once()
-        # Verify where was called with prefilter argument
-        vs.table.search.return_value.where.assert_called_once()
-        # Check that prefilter=True was passed
-        call_args = vs.table.search.return_value.where.call_args
-        assert call_args is not None
+        # Verify the builder chain was used (never the no-arg search()).
+        vs.table.query.assert_called_once()
+        mock_query.where.assert_called_once_with(
+            "metadata LIKE '%\"parent_window_text\"%'"
+        )
+        mock_query.where.return_value.limit.assert_called_once_with(1)
 
 
 # =============================================================================
