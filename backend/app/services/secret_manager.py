@@ -15,8 +15,11 @@ logger = logging.getLogger(__name__)
 _HMAC_KEY_MIN_BYTES = 32
 
 # The fallback derivation may fire on every audit write; warn once per process
-# per key version instead of once per request (issue #561).
+# per key version instead of once per request (issue #561). The weak-key
+# warning below gets the same treatment: it is advisory, and on short-key
+# deployments it would otherwise repeat on every audit write.
 _fallback_warned_versions: set[str] = set()
+_weak_key_warned_versions: set[str] = set()
 
 
 class SecretManagerError(RuntimeError):
@@ -56,9 +59,12 @@ class SecretManager:
                     version,
                     env_name,
                 )
-        if len(key) < _HMAC_KEY_MIN_BYTES:
+        if len(key) < _HMAC_KEY_MIN_BYTES and version not in _weak_key_warned_versions:
             # Non-breaking: warn only. Existing deployments may use short keys;
             # raising would break them. Operators should rotate to >=32 bytes.
+            # Warned once per version: this check runs on every audit write,
+            # and an advisory warning must not scale with request volume.
+            _weak_key_warned_versions.add(version)
             logger.warning(
                 "AUDIT_HMAC_KEY for version '%s' is %d bytes; >=%d bytes is "
                 "recommended for HMAC-SHA256. Please rotate to a stronger key.",

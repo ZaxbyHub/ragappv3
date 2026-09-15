@@ -95,6 +95,9 @@ Before deploying KnowledgeVault to production, ensure the following:
   
   # Security settings
   ADMIN_SECRET_TOKEN=<secure-random-token>
+  # Audit HMAC keys are OPTIONAL: when unset, the audit HMAC falls back to a
+  # key derived from JWT_SECRET_KEY or ADMIN_SECRET_TOKEN. Set a dedicated
+  # >=32-byte key to key the audit tables independently of the auth secrets.
   AUDIT_HMAC_KEY_VERSION=v1
   AUDIT_HMAC_KEY=<your-hmac-key>
   AUDIT_HMAC_KEY_V1=<your-hmac-key-v1>

@@ -56,11 +56,21 @@ class ShippedConfigAuditBase(unittest.TestCase):
         self._temp_dir = tempfile.mkdtemp(prefix="issue561_shipped_")
         self._orig_users = settings.users_enabled
         self._orig_data_dir = settings.data_dir
+        self._orig_jwt_secret = settings.jwt_secret_key
         self._orig_state_sm = getattr(app.state, "secret_manager", None)
         self._saved_audit_env = {v: os.environ.get(v) for v in _AUDIT_KEY_VARS}
         for var in _AUDIT_KEY_VARS:
             os.environ.pop(var, None)
-        self.addCleanup(self._restore_audit_env)
+        # Reset the warn-once module state so every test observes the same
+        # first-call behavior regardless of execution order (PRR-011).
+        import app.services.secret_manager as _sm_module
+
+        self._saved_warn_state = (
+            set(_sm_module._fallback_warned_versions),
+            set(_sm_module._weak_key_warned_versions),
+        )
+        _sm_module._fallback_warned_versions.clear()
+        _sm_module._weak_key_warned_versions.clear()
         settings.data_dir = Path(self._temp_dir)
         settings.users_enabled = True
 
@@ -140,7 +150,33 @@ class ShippedConfigAuditBase(unittest.TestCase):
         # 500s must surface as HTTP responses (what a deployment observes),
         # never as in-process exceptions.
         self.client = TestClient(app, raise_server_exceptions=False)
+        # Cleanup order (unittest runs cleanups LIFO): env/warn-state restore
+        # is registered LAST so it runs FIRST, before the app teardown — any
+        # teardown code that touched secret state would then see the original
+        # environment, not the scrubbed one (PRR-015).
         self.addCleanup(self._teardown_app)
+        self.addCleanup(self._restore_warn_state)
+        self.addCleanup(self._restore_settings_and_env)
+
+    def _restore_warn_state(self):
+        import app.services.secret_manager as _sm_module
+
+        (
+            fallback_versions,
+            weak_key_versions,
+        ) = self._saved_warn_state
+        _sm_module._fallback_warned_versions.clear()
+        _sm_module._fallback_warned_versions.update(fallback_versions)
+        _sm_module._weak_key_warned_versions.clear()
+        _sm_module._weak_key_warned_versions.update(weak_key_versions)
+
+    def _restore_settings_and_env(self):
+        settings.jwt_secret_key = self._orig_jwt_secret
+        for var, value in self._saved_audit_env.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
 
     def _teardown_app(self):
         from app.models.database import _pool_cache, _pool_cache_lock
@@ -160,13 +196,6 @@ class ShippedConfigAuditBase(unittest.TestCase):
         setattr(app.state, "secret_manager", self._orig_state_sm)
         self._pool.close_all()
         shutil.rmtree(self._temp_dir, ignore_errors=True)
-
-    def _restore_audit_env(self):
-        for var, value in self._saved_audit_env.items():
-            if value is None:
-                os.environ.pop(var, None)
-            else:
-                os.environ[var] = value
 
     def _headers(self, user_id, username, role):
         ua = f"issue561-{username}-agent"
@@ -249,7 +278,7 @@ class TestDeleteAuditRow(ShippedConfigAuditBase):
 
 
 class TestRetryAuditRow(ShippedConfigAuditBase):
-    def test_retry_returns_2xx_and_writes_one_verifiable_row(self):
+    def test_retry_returns_2xx_and_writes_one_scheduled_row(self):
         file_id = self._seed_file("retry-me.txt")
         resp = self.client.post(
             f"/api/documents/admin/retry/{file_id}", headers=self._superadmin_headers()
@@ -262,10 +291,68 @@ class TestRetryAuditRow(ShippedConfigAuditBase):
         assert len(rows) == 1, (
             f"expected exactly 1 retry document_actions row, found {len(rows)}"
         )
+        assert rows[0]["status"] == "scheduled", (
+            f"retry audit row recorded status {rows[0]['status']!r}, expected"
+            " 'scheduled' — a wrong-status row must fail this test"
+        )
         fallback_key = settings.jwt_secret_key.strip().encode("utf-8")
         assert rows[0]["hmac_sha256"] == self._expected_digest(fallback_key, rows[0]), (
             "retry digest does not verify with the fallback-derived (JWT) key"
         )
+
+    def test_retry_already_in_progress_records_that_status(self):
+        file_id = self._seed_file("retry-busy.txt")
+        # Override ONLY the enqueue result for this test: the endpoint must
+        # record status 'already_in_progress' (not 'scheduled') when the
+        # background processor reports the file as already enqueued.
+        busy_bp = MagicMock()
+        busy_bp.is_running = True
+        busy_bp.enqueue = AsyncMock(return_value=False)
+        app.dependency_overrides[get_background_processor] = lambda: busy_bp
+        self.addCleanup(app.dependency_overrides.pop, get_background_processor, None)
+        resp = self.client.post(
+            f"/api/documents/admin/retry/{file_id}", headers=self._superadmin_headers()
+        )
+        assert resp.status_code in (200, 201, 204), (
+            f"retry returned {resp.status_code}: {resp.text[:300]}"
+        )
+        rows = self._audit_rows(file_id, "retry")
+        assert len(rows) == 1, f"expected exactly 1 retry row, found {len(rows)}"
+        assert rows[0]["status"] == "already_in_progress", (
+            f"expected 'already_in_progress' audit status, got {rows[0]['status']!r}"
+        )
+        fallback_key = settings.jwt_secret_key.strip().encode("utf-8")
+        assert rows[0]["hmac_sha256"] == self._expected_digest(fallback_key, rows[0]), (
+            "already_in_progress digest does not verify with the fallback key"
+        )
+
+
+class TestBatchDeleteAuditRow(ShippedConfigAuditBase):
+    def test_batch_delete_writes_one_row_per_file(self):
+        first = self._seed_file("batch-1.txt")
+        second = self._seed_file("batch-2.txt")
+        resp = self.client.post(
+            "/api/documents/batch",
+            headers=self._member_headers(),
+            json={"file_ids": [str(first), str(second)]},
+        )
+        assert resp.status_code == 200, (
+            f"batch delete itself failed: {resp.status_code} {resp.text[:300]}"
+        )
+        payload = resp.json()
+        assert payload.get("deleted_count") == 2, (
+            f"expected 2 deletions, got: {payload}"
+        )
+        for file_id in (first, second):
+            rows = self._audit_rows(file_id, "delete")
+            assert len(rows) == 1, (
+                f"expected exactly 1 delete row for file_id={file_id}, found {len(rows)}"
+            )
+            fallback_key = settings.jwt_secret_key.strip().encode("utf-8")
+            assert rows[0]["hmac_sha256"] == self._expected_digest(fallback_key, rows[0]), (
+                f"batch delete digest for file_id={file_id} does not verify with"
+                " the fallback-derived (JWT) key"
+            )
 
 
 class TestExplicitAuditKeyWins(ShippedConfigAuditBase):
@@ -297,6 +384,42 @@ class TestExplicitAuditKeyWins(ShippedConfigAuditBase):
                 " must take precedence"
             )
         finally:
+            os.environ.pop("AUDIT_HMAC_KEY_V1", None)
+
+    def test_versioned_key_wins_over_bare_key_when_both_set(self):
+        # Pins the documented precedence AUDIT_HMAC_KEY_<VERSION> ->
+        # AUDIT_HMAC_KEY (secret_manager.get_hmac_key): with BOTH set to
+        # distinct keys, the versioned key must key the digest.
+        bare_key = "issue561-bare-audit-key-0123456789abcdef-0123456789abcdef"
+        assert bare_key != _DEDICATED_AUDIT_KEY
+        os.environ["AUDIT_HMAC_KEY"] = bare_key
+        os.environ["AUDIT_HMAC_KEY_V1"] = _DEDICATED_AUDIT_KEY
+        try:
+            resp = self.client.post(
+                "/api/documents/upload?vault_id=2",
+                headers=self._member_headers(),
+                files={"file": (
+                    "precedence.txt", b"issue 561 precedence content", "text/plain"
+                )},
+            )
+            assert resp.status_code in (200, 201), (
+                f"upload itself failed: {resp.status_code} {resp.text[:300]}"
+            )
+            file_id = resp.json()["file_id"]
+            rows = self._audit_rows(file_id, "upload")
+            assert len(rows) == 1, f"expected exactly 1 upload row, found {len(rows)}"
+            versioned = _DEDICATED_AUDIT_KEY.encode("utf-8")
+            bare = bare_key.encode("utf-8")
+            assert rows[0]["hmac_sha256"] == self._expected_digest(versioned, rows[0]), (
+                "digest does not verify with the versioned AUDIT_HMAC_KEY_V1 key"
+                " — versioned key must win over bare AUDIT_HMAC_KEY"
+            )
+            assert rows[0]["hmac_sha256"] != self._expected_digest(bare, rows[0]), (
+                "digest verified with the bare AUDIT_HMAC_KEY — precedence"
+                " regressed to bare-key-first"
+            )
+        finally:
+            os.environ.pop("AUDIT_HMAC_KEY", None)
             os.environ.pop("AUDIT_HMAC_KEY_V1", None)
 
 

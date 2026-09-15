@@ -1,6 +1,6 @@
 # 561 — Write document-action audit rows on the shipped configuration
 
-**Issue:** #561 (Workstream J, PR 2 of 3; finding C23) · **Status:** in flight
+**Issue:** #561 (Workstream J, PR 2 of 3; finding C23)
 **Rebaseline:** 2026-09-11 · **Roadmap index:** #574
 
 ## Outcome
@@ -13,7 +13,7 @@ Every document action (upload, read, delete, batch delete, vault-wide delete, re
 - `SecretManager.get_hmac_key` (`backend/app/services/secret_manager.py`): unchanged env precedence (`AUDIT_HMAC_KEY_<VERSION>` → `AUDIT_HMAC_KEY`); when both are unset it now falls back to the shared derivation instead of raising, with one WARNING per process per key version naming the env override. The requested version string is returned unchanged.
 - `backend/app/services/security_audit.py`: `_audit_key` is now the shared `derive_audit_key` (same symbol name, byte-identical keys, identical warning text) — the two audit tables (`document_actions`, `security_audit_log`) can no longer diverge on key-availability behavior.
 - `.env.example`: documents `AUDIT_HMAC_KEY`/`AUDIT_HMAC_KEY_V1` as commented example entries (same convention as `# AES_KEY=`), including the fallback behavior and the ≥32-byte dedicated-key recommendation.
-- `backend/tests/test_issue561_document_actions_shipped_config.py` (new): unmocked end-to-end regression suite — real `SecretManager`, no stubbed key material — covering upload, single delete, retry (2xx + row; previously 500), and explicit-`AUDIT_HMAC_KEY_V1`-wins precedence. The three pre-existing audit suites mocked `get_hmac_key`, which is why CI never saw the failure.
+- `backend/tests/test_issue561_document_actions_shipped_config.py` (new): unmocked end-to-end regression suite — real `SecretManager`, no stubbed key material — covering upload, single delete, batch delete, retry (2xx + row; previously 500), the retry `already_in_progress` branch, versioned-vs-bare key precedence, and explicit-`AUDIT_HMAC_KEY_V1`-wins precedence. Read/download and vault-wide delete share the same choke point and are covered by the existing mocked suites; the three pre-existing audit suites mocked `get_hmac_key`, which is why CI never saw the failure.
 
 ## Rollout and rollback
 
