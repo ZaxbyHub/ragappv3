@@ -33,6 +33,9 @@ def _make_mock_table(row_count: int = 300, has_ivfpq: bool = False):
     """Return a fully-mocked LanceDB table object."""
     mock_idx = MagicMock()
     mock_idx.name = "embedding_idx"
+    # Shape-complete fake: detection reads columns/index_type (issue #557).
+    mock_idx.columns = ["embedding"]
+    mock_idx.index_type = "IvfPq"
 
     table = MagicMock()
     table.count_rows = AsyncMock(return_value=row_count)

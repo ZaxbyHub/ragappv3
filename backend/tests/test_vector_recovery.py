@@ -50,8 +50,11 @@ FULL_NEW_FORMAT_FIELDS = [
 
 
 class FakeIndex:
-    def __init__(self, name):
+    def __init__(self, name, columns=None, index_type=None):
+        # Shape-complete: the app detects indexes by column+type (issue #557).
         self.name = name
+        self.columns = columns if columns is not None else []
+        self.index_type = index_type if index_type is not None else ""
 
 
 class FakeArrowLikeField:
@@ -133,9 +136,9 @@ class FakeTable:
             {"column": column, "config": config, "replace": replace}
         )
         if column == "text":
-            self.indices.append(FakeIndex("fts_text"))
+            self.indices.append(FakeIndex("text_idx", ["text"], "FTS"))
         elif column == "embedding":
-            self.indices.append(FakeIndex("embedding_idx"))
+            self.indices.append(FakeIndex("embedding_idx", ["embedding"], "IvfPq"))
         return None
 
     async def to_pandas(self):

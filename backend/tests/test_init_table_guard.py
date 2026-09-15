@@ -130,7 +130,9 @@ class TestTableJustCreatedTracking(unittest.IsolatedAsyncioTestCase):
         # Mock table with existing FTS index
         mock_table = MagicMock()
         existing_fts = MagicMock()
-        existing_fts.name = "fts_text"
+        existing_fts.name = "text_idx"
+        existing_fts.columns = ["text"]
+        existing_fts.index_type = "FTS"
         mock_table.list_indices = AsyncMock(return_value=[existing_fts])
         mock_table.create_index = AsyncMock()
 
@@ -218,7 +220,8 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
 
     async def test_fts_index_not_recreated_when_already_exists(self):
         """
-        Test that FTS index creation is skipped when 'fts_text' already exists.
+        Test that FTS index creation is skipped when a real-shape FTS index
+        already exists (columns=['text'], index_type='FTS' — issue #557).
 
         This verifies the fts_index_exists guard prevents duplicate FTS creation.
         """
@@ -230,7 +233,9 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
 
         # Mock existing FTS index
         existing_fts = MagicMock()
-        existing_fts.name = "fts_text"
+        existing_fts.name = "text_idx"
+        existing_fts.columns = ["text"]
+        existing_fts.index_type = "FTS"
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[existing_fts])
@@ -266,7 +271,9 @@ class TestFTSIndexReplaceFalse(unittest.IsolatedAsyncioTestCase):
 
         # Mock existing FTS index
         existing_fts = MagicMock()
-        existing_fts.name = "fts_text"
+        existing_fts.name = "text_idx"
+        existing_fts.columns = ["text"]
+        existing_fts.index_type = "FTS"
 
         mock_table = MagicMock()
         mock_table.list_indices = AsyncMock(return_value=[existing_fts])

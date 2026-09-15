@@ -24,9 +24,15 @@ def _make_store():
     return store
 
 
-def _index(name: str):
+def _index(name: str, columns=None, index_type=None):
+    # Shape-complete fake: detection reads columns/index_type (issue #557),
+    # never the name.
     idx = MagicMock()
     idx.name = name
+    if columns is not None:
+        idx.columns = columns
+    if index_type is not None:
+        idx.index_type = index_type
     return idx
 
 
@@ -50,7 +56,7 @@ class TestVectorIndexFreshnessProbe:
         store = _make_store()
         rows = VECTOR_INDEX_MIN_ROWS + 100
         store.table.count_rows = AsyncMock(return_value=rows)
-        store.table.list_indices = AsyncMock(return_value=[_index("embedding_idx")])
+        store.table.list_indices = AsyncMock(return_value=[_index("embedding_idx", ["embedding"], "IvfPq")])
         # Mark the index as built for exactly this row count + generation.
         store._last_index_build_row_count = rows
         store._last_index_build_generation = store._index_mutation_generation
@@ -70,7 +76,7 @@ class TestVectorIndexFreshnessProbe:
         store = _make_store()
         rows = VECTOR_INDEX_MIN_ROWS + 100
         store.table.count_rows = AsyncMock(return_value=rows)
-        store.table.list_indices = AsyncMock(return_value=[_index("embedding_idx")])
+        store.table.list_indices = AsyncMock(return_value=[_index("embedding_idx", ["embedding"], "IvfPq")])
         store._last_index_build_row_count = rows
         # Generation advanced since last build (e.g. ingestion happened).
         store._last_index_build_generation = store._index_mutation_generation - 1

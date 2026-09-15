@@ -221,8 +221,10 @@ def parse_report(capsys):
 
 
 class FakeIndex:
-    def __init__(self, name):
+    def __init__(self, name, columns=None, index_type=None):
         self.name = name
+        self.columns = columns if columns is not None else []
+        self.index_type = index_type if index_type is not None else ""
 
 
 class FakeIvfPq:
@@ -573,7 +575,7 @@ def test_optimize_after_cleanup_drops_embedding_index_below_threshold(
                 "chunk_scale": "default",
             }
         ],
-        indices=[FakeIndex("embedding_idx")],
+        indices=[FakeIndex("embedding_idx", ["embedding"], "IvfPq")],
     )
 
     exit_code, table = run_main_with_table(

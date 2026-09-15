@@ -712,8 +712,11 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
                 with patch("app.services.vector_store.FTS") as mock_fts:
                     mock_fts.return_value = MagicMock()
 
-                    # Should crash on "any(idx.name == 'fts_text' for idx in indices)"
-                    # when indices is None
+                    # The shared has_index helper iterates the listing, so a
+                    # None result raises TypeError, which is NOT in the
+                    # init_table guard's caught tuple (OSError, RuntimeError,
+                    # ValueError) and propagates — unchanged from the
+                    # pre-helper guard behavior (issue #557).
                     with self.assertRaises(TypeError):
                         await store.init_table(embedding_dim=384)
 
@@ -721,7 +724,10 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
         """
         ATTACK VECTOR: Index object in list_indices lacks 'name' attribute.
 
-        Test handling of malformed index objects.
+        Detection (issue #557) reads columns/index_type and must not depend
+        on the name attribute at all: a name-less entry is simply
+        non-matching, init_table completes, and the create-if-missing branch
+        runs exactly once (no crash, no skip).
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
@@ -730,7 +736,7 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
 
         mock_table = MagicMock()
 
-        # Index object without 'name' attribute
+        # Index object without 'name' attribute (detection never reads it)
         mock_idx = MagicMock()
         del mock_idx.name  # Remove name attribute
 
@@ -750,9 +756,16 @@ class TestAdversarialFTSCreationEdgeCases(unittest.IsolatedAsyncioTestCase):
                 with patch("app.services.vector_store.FTS") as mock_fts:
                     mock_fts.return_value = MagicMock()
 
-                    # Should crash on accessing idx.name
-                    with self.assertRaises(AttributeError):
-                        await store.init_table(embedding_dim=384)
+                    # Non-matching listing -> creation attempted, no crash.
+                    await store.init_table(embedding_dim=384)
+
+        fts_creates = [
+            c for c in mock_table.create_index.await_args_list if c.kwargs.get("column") == "text"
+        ]
+        self.assertEqual(
+            len(fts_creates), 1,
+            "name-less listing entry must be non-matching: creation attempted once",
+        )
 
 
 class TestAdversarialTableJustCreatedState(unittest.IsolatedAsyncioTestCase):

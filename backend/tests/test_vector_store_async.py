@@ -305,8 +305,8 @@ class TestVectorStoreAddChunks(TestVectorStoreAsync):
             table.list_indices = AsyncMock(
                 side_effect=[
                     [],
-                    [type("Idx", (), {"name": "embedding_idx"})()],
-                    [type("Idx", (), {"name": "embedding_idx"})()],
+                    [type("Idx", (), {"name": "embedding_idx", "columns": ["embedding"], "index_type": "IvfPq"})()],
+                    [type("Idx", (), {"name": "embedding_idx", "columns": ["embedding"], "index_type": "IvfPq"})()],
                 ]
             )
             table.create_index = AsyncMock(return_value=None)
