@@ -36,6 +36,16 @@ class _ErrorThenRaiseEngine:
         raise RuntimeError("provider exploded after the error chunk")
 
 
+class _ErrorThenStopEngine:
+    """Yields an error chunk; the follow-up __anext__ ends the generator
+    (StopAsyncIteration) -- the outcome the branch must keep silent."""
+
+    async def query(self, *args, **kwargs):
+        yield {"type": "content", "content": "partial"}
+        yield {"type": "error", "message": "boom", "code": "X"}
+        return
+
+
 class _CollectingHandler(logging.Handler):
     def __init__(self, level=logging.DEBUG):
         super().__init__(level=level)
@@ -91,8 +101,9 @@ async def test_real_outcome_of_abandoned_task_is_debug_logged():
         assert never_retrieved == []
 
         # The real outcome keeps its DEBUG breadcrumb (discriminating
-        # assertion: deleting the DEBUG branch or the isinstance filter makes
-        # this fail).
+        # assertion: deleting the DEBUG branch makes this fail; the
+        # isinstance filter is pinned by the sibling negative test
+        # test_stop_async_iteration_outcome_stays_silent).
         breadcrumbs = [
             r
             for r in collector.records
@@ -108,3 +119,45 @@ async def test_real_outcome_of_abandoned_task_is_debug_logged():
         route_logger.removeHandler(collector)
         route_logger.setLevel(old_level)
         asyncio_logger.removeHandler(asyncio_collector)
+
+
+@pytest.mark.asyncio
+async def test_stop_async_iteration_outcome_stays_silent():
+    """The StopAsyncIteration outcome (the common case) must NOT emit the
+    DEBUG breadcrumb -- the isinstance filter is the noise gate. Deleting
+    the filter makes this test fail."""
+    route_logger = logging.getLogger("app.api.routes.chat")
+    collector = _CollectingHandler()
+    old_level = route_logger.level
+    route_logger.addHandler(collector)
+    route_logger.setLevel(logging.DEBUG)
+    try:
+        engine = _ErrorThenStopEngine()
+        resp = chat_routes.stream_chat_response("q", [], engine)
+        frames = []
+        async for frame in resp.body_iterator:
+            frames.append(frame)
+            await asyncio.sleep(0)
+        await resp.body_iterator.aclose()
+        await asyncio.sleep(0)
+        gc.collect()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        joined = "".join(frames)
+        assert '"type": "error"' in joined
+        assert '"type": "done"' in joined
+
+        discarded = [
+            r
+            for r in collector.records
+            if r.levelno == logging.DEBUG
+            and "Discarded outcome" in r.getMessage()
+        ]
+        assert discarded == [], (
+            "StopAsyncIteration outcomes must stay silent; collector saw "
+            + repr([(r.levelno, r.getMessage()[:80]) for r in discarded])
+        )
+    finally:
+        route_logger.removeHandler(collector)
+        route_logger.setLevel(old_level)
