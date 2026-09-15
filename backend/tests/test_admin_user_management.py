@@ -162,12 +162,30 @@ class TestUpdateUser:
         assert data["full_name"] == "Updated Full Name"
 
     def test_admin_can_update_role(self):
-        """Admin can change a user's role."""
-        token = get_token(self.admin_id, "admin", "admin")
+        """Role changes via PATCH /users/{id} require a superadmin actor.
+
+        Issue #560 C22: an admin attempt is rejected 403 (previously 200 —
+        the routes disagreed); the same mutation succeeds for a superadmin."""
+        admin_token = get_token(self.admin_id, "admin", "admin")
         response = self.client.patch(
             f"/users/{self.member_id}",
             json={"role": "admin"},
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+        assert response.status_code == 403, (
+            f"admin role change via PATCH must be 403, got {response.status_code}"
+        )
+        cursor = self.conn.execute(
+            "SELECT role FROM users WHERE id = ?", (self.member_id,)
+        )
+        assert cursor.fetchone()[0] == "member"
+
+        super_token = get_token(self.superadmin_id, "superadmin", "superadmin")
+        response = self.client.patch(
+            f"/users/{self.member_id}",
+            json={"role": "admin"},
+            headers={"Authorization": f"Bearer {super_token}"},
         )
 
         assert response.status_code == 200
@@ -181,11 +199,15 @@ class TestUpdateUser:
         assert cursor.fetchone()[0] == "admin"
 
     def test_admin_can_update_multiple_fields(self):
-        """Admin can update multiple fields at once."""
+        """Admin can update multiple fields at once.
+
+        The role field is sent as the target's CURRENT role (a no-op), which
+        the shared assignment rule allows so multi-field saves work — an
+        actual role change would require a superadmin (issue #560 C22)."""
         token = get_token(self.admin_id, "admin", "admin")
         response = self.client.patch(
             f"/users/{self.member_id}",
-            json={"username": "newusername", "full_name": "New Name", "role": "viewer"},
+            json={"username": "newusername", "full_name": "New Name", "role": "member"},
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -193,7 +215,7 @@ class TestUpdateUser:
         data = response.json()
         assert data["username"] == "newusername"
         assert data["full_name"] == "New Name"
-        assert data["role"] == "viewer"
+        assert data["role"] == "member"
 
     def test_non_admin_gets_403(self):
         """Non-admin user gets 403 Forbidden."""

@@ -487,7 +487,9 @@ curl -H "X-API-Key: ${HEALTH_CHECK_API_KEY:?set HEALTH_CHECK_API_KEY}" \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/users/` | List all users (admin+) |
-| PATCH | `/api/users/{id}` | Update user role or active status (admin+) |
+| PATCH | `/api/users/{id}` | Update user details — username, full name, role (admin+; actual role changes require superadmin) |
+| PATCH | `/api/users/{id}/role` | Change a user's role (superadmin only) |
+| PATCH | `/api/users/{id}/active` | Activate or deactivate a user (admin+) |
 | DELETE | `/api/users/{id}` | Delete user (superadmin only) |
 
 ### Organizations
@@ -648,7 +650,7 @@ KnowledgeVault supports JWT-based browser authentication with httpOnly refresh c
 | Role | Permissions |
 |------|-------------|
 | **Superadmin** | Full access: manage users, orgs, delete any user |
-| **Admin** | Manage users (role changes, activate/deactivate), orgs |
+| **Admin** | Manage users (create member/viewer accounts, activate/deactivate), orgs |
 | **Member** | Standard access: chat, documents, search, memory |
 | **Viewer** | Read-only access to chat and search |
 

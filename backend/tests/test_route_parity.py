@@ -137,43 +137,11 @@ class _RouteParityHarness(unittest.TestCase):
             _pool_cache.clear()
 
 
-class TestOpenApiPathParity(unittest.TestCase):
-    """Each list route contributes exactly one OpenAPI path entry.
-
-    The convention is: the non-slash variant (``""``) is registered with
-    ``include_in_schema=False`` so only the trailing-slash variant appears in
-    the generated OpenAPI doc.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        cls.paths = app.openapi()["paths"]
-
-    def test_organizations_list_single_schema_entry(self):
-        self.assertIn("/api/organizations/", self.paths)
-        self.assertNotIn("/api/organizations", self.paths)
-
-    def test_vault_members_list_single_schema_entry(self):
-        self.assertIn("/api/vaults/{vault_id}/members/", self.paths)
-        self.assertNotIn("/api/vaults/{vault_id}/members", self.paths)
-
-    def test_vault_group_access_list_single_schema_entry(self):
-        self.assertIn("/api/vaults/{vault_id}/group-access/", self.paths)
-        self.assertNotIn("/api/vaults/{vault_id}/group-access", self.paths)
-
-    def test_documents_list_get_single_schema_entry(self):
-        self.assertIn("/api/documents/", self.paths)
-        self.assertNotIn("/api/documents", self.paths)
-
-    def test_documents_list_post_single_schema_entry(self):
-        # F-PRE-002 also covers POST /documents (documents.py:1599). The
-        # pre-fix defect had BOTH /api/documents and /api/documents/ visible
-        # for POST; assert the non-slash variant is hidden for POST too.
-        self.assertIn("/api/documents/", self.paths)
-        self.assertNotIn("/api/documents", self.paths)
-        # The slash path must declare a POST operation (sanity: confirms the
-        # POST list route is still in the schema at all).
-        self.assertIn("post", self.paths["/api/documents/"])
+# The former TestOpenApiPathParity class (five hardcoded single-schema-entry
+# methods over four route groups) was replaced by the router-walking property
+# test in test_route_parity_generic.py, which asserts exactly-one-schema-
+# visible per trailing-slash twin pair across EVERY router, regardless of
+# direction (issue #560 / finding C19).
 
 
 class TestSettingsResponseModelSchema(unittest.TestCase):

@@ -577,8 +577,13 @@ class TestCreateUserEndpoint(unittest.TestCase):
         self.assertIn("Invalid role", response.json()["detail"])
 
     def test_create_user_admin_can_create_admin(self):
-        """Admin can create other admins."""
-        token = self.get_token(self.admin_id, "admin", "admin")
+        """Admin cannot create other admins; superadmin can (issue #560 C22).
+
+        Pre-fix this endpoint let any admin mint admin peers via POST /users/
+        while PATCH /users/{id}/role required superadmin — the routes
+        disagreed. The shared assignment rule now requires a superadmin actor
+        for admin/superadmin grants at creation."""
+        admin_token = self.get_token(self.admin_id, "admin", "admin")
         response = self.client.post(
             "/users/",
             json={
@@ -587,7 +592,21 @@ class TestCreateUserEndpoint(unittest.TestCase):
                 "full_name": "New Admin",
                 "role": "admin",
             },
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        super_token = self.get_token(self.superadmin_id, "superadmin", "superadmin")
+        response = self.client.post(
+            "/users/",
+            json={
+                "username": "newadmin",
+                "password": "SecurePass123",
+                "full_name": "New Admin",
+                "role": "admin",
+            },
+            headers={"Authorization": f"Bearer {super_token}"},
         )
 
         self.assertEqual(response.status_code, 200)

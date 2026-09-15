@@ -20,6 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { UserRole } from "./types";
+import { roleOptionsFor } from "./roleOptions";
 
 interface CreateUserDialogProps {
   open: boolean;
@@ -27,13 +28,6 @@ interface CreateUserDialogProps {
   onOpenChange: (open: boolean) => void;
   isSuperAdmin: boolean;
 }
-
-const ROLE_OPTIONS: { value: UserRole; label: string }[] = [
-  { value: "superadmin", label: "Super Admin" },
-  { value: "admin", label: "Admin" },
-  { value: "member", label: "Member" },
-  { value: "viewer", label: "Viewer" },
-];
 
 export function CreateUserDialog({
   open,
@@ -171,7 +165,9 @@ export function CreateUserDialog({
                   <SelectValue placeholder="Select a role" />
                 </SelectTrigger>
                 <SelectContent>
-                  {ROLE_OPTIONS.filter((r) => r.value !== "superadmin" || isSuperAdmin).map((r) => (
+                  {roleOptionsFor(isSuperAdmin ? "superadmin" : "admin", {
+                    mode: "create",
+                  }).map((r) => (
                     <SelectItem key={r.value} value={r.value}>
                       {r.label}
                     </SelectItem>

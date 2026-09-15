@@ -302,7 +302,12 @@ class TestOrgInviteViewerRejection:
 
     def test_invite_nonexistent_user_succeeds(self, db_path):
         """Inviting a user that doesn't exist yet should still succeed
-        (the user may be provisioned later with a sufficient role)."""
+        (the user may be provisioned later with a sufficient role).
+
+        The identifier is username-form on purpose: the future user registers
+        with this exact username, which is what acceptance matches against.
+        Email-form identifiers that resolve to no username are rejected at
+        creation (issue #560 C24)."""
         conn = sqlite3.connect(db_path["path"])
         org_id = _create_org(conn, db_path["admin_id"])
         conn.close()
@@ -314,7 +319,7 @@ class TestOrgInviteViewerRejection:
 
         response = client.post(
             f"/api/organizations/{org_id}/invites",
-            json={"email": "futureuser@x.com", "role": "member"},
+            json={"email": "futureuser", "role": "member"},
             headers={"Authorization": f"Bearer {token}"},
         )
 
