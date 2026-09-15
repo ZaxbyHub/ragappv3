@@ -57,8 +57,27 @@ from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_db, get_llm_health_checker, get_model_checker
+from app.api.deps import (
+    get_current_active_user,
+    get_db,
+    get_llm_health_checker,
+    get_model_checker,
+)
+from app.limiter import limiter as _app_limiter
 from app.main import app
+
+_TEST_USER = {
+    "id": 0,
+    "username": "admin",
+    "role": "superadmin",
+    "is_active": 1,
+    "must_change_password": 0,
+}
+
+
+def _reset_limiter_storage() -> None:
+    """Clear shared limiter counters (issue #551: deep health is now limited)."""
+    _app_limiter._storage.reset()
 
 
 class TestAPI(unittest.TestCase):
@@ -102,11 +121,14 @@ class TestAPI(unittest.TestCase):
             }
         )
 
-        # Override dependencies with mocks
+        # Override dependencies with mocks (deep health is auth-gated since
+        # issue #551, so the call below is an authenticated caller).
         app.dependency_overrides[get_llm_health_checker] = lambda: mock_llm_checker
         app.dependency_overrides[get_model_checker] = lambda: mock_model_checker
+        app.dependency_overrides[get_current_active_user] = lambda: _TEST_USER
 
         try:
+            _reset_limiter_storage()
             response = self.client.get("/api/health?deep=true")
             self.assertEqual(response.status_code, 200)
             data = response.json()
@@ -121,6 +143,8 @@ class TestAPI(unittest.TestCase):
         finally:
             app.dependency_overrides.pop(get_llm_health_checker, None)
             app.dependency_overrides.pop(get_model_checker, None)
+            app.dependency_overrides.pop(get_current_active_user, None)
+            _reset_limiter_storage()
 
     def test_get_api_settings_returns_expected_keys(self):
         """Test GET /api/settings returns expected configuration keys."""

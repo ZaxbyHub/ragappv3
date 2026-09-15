@@ -64,7 +64,12 @@ import pytest
 from _db_pool import SimpleConnectionPool
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_llm_health_checker, get_model_checker
+from app.api.deps import (
+    get_current_active_user,
+    get_llm_health_checker,
+    get_model_checker,
+)
+from app.limiter import limiter as _app_limiter
 
 pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
@@ -107,6 +112,21 @@ class TestHealthEndpoint(unittest.TestCase):
 
     def setUp(self):
         self.client = TestClient(app)
+        # Deep health is auth-gated since issue #551: drive these tests as an
+        # authenticated caller and keep the shared limiter bucket clean.
+        self._deep_user_override = get_current_active_user
+        app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": 0,
+            "username": "admin",
+            "role": "superadmin",
+            "is_active": 1,
+            "must_change_password": 0,
+        }
+        _app_limiter._storage.reset()
+
+    def tearDown(self):
+        app.dependency_overrides.pop(self._deep_user_override, None)
+        _app_limiter._storage.reset()
 
     def test_health_check_success(self):
         """Test health check returns ok status with mocked services."""

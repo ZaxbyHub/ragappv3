@@ -771,6 +771,11 @@ class Settings(BaseSettings):
     """Rate limit for vault creation endpoints."""
     memory_mutation_rate_limit: str = "30/minute"
     """Rate limit for memory mutation endpoints (create, update, delete)."""
+    health_probe_rate_limit: str = "30/minute"
+    """Rate limit for the provider-probing health routes (deep health, LLM
+    mode probe). These trigger real outbound LLM/embedding generations, so
+    they are limited like chat; holders of health_check_api_key are exempt
+    via the limiter whitelist (issue #551)."""
     trust_proxy_headers: bool = False
     """When True, trust X-Forwarded-For for client IP (use behind trusted reverse proxy). Default False for security."""
 

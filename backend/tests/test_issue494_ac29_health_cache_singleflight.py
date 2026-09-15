@@ -92,8 +92,13 @@ except ImportError:
 
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_llm_health_checker, get_model_checker
+from app.api.deps import (
+    get_current_active_user,
+    get_llm_health_checker,
+    get_model_checker,
+)
 from app.api.routes import health as health_module
+from app.limiter import limiter as _app_limiter
 from app.main import app
 
 EXPECTED_SERVICES = {
@@ -174,12 +179,25 @@ class TestIssue494AC29HealthLastKnownCacheSingleFlight(unittest.IsolatedAsyncioT
 
         app.dependency_overrides[get_llm_health_checker] = lambda: self.llm_checker
         app.dependency_overrides[get_model_checker] = lambda: self.model_checker
+        # Deep health is auth-gated since issue #551; the (a) deep poll below
+        # is an authenticated caller. Background refreshes are server-internal
+        # and stay unauthenticated by design.
+        app.dependency_overrides[get_current_active_user] = lambda: {
+            "id": 0,
+            "username": "admin",
+            "role": "superadmin",
+            "is_active": 1,
+            "must_change_password": 0,
+        }
+        _app_limiter._storage.reset()
 
         self.client = TestClient(app)
 
     def tearDown(self) -> None:
         app.dependency_overrides.pop(get_llm_health_checker, None)
         app.dependency_overrides.pop(get_model_checker, None)
+        app.dependency_overrides.pop(get_current_active_user, None)
+        _app_limiter._storage.reset()
         if self._had_vector_store:
             app.state.vector_store = self._orig_vector_store
         elif hasattr(app.state, "vector_store"):

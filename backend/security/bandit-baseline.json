@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 64,
       "SEVERITY.MEDIUM": 59,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 77533,
+      "loc": 77646,
       "nosec": 0,
       "skipped_tests": 39
     },
@@ -62,7 +62,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 613,
+      "loc": 684,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -205,7 +205,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 272,
+      "loc": 306,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1275,
+      "loc": 1280,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -413,7 +413,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 139,
+      "loc": 142,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1876,7 +1876,7 @@
   },
   "results": [
     {
-      "code": "314     if not settings.users_enabled:\n315         DEFAULT_TOKEN = \"admin-secret-token\"\n316 \n",
+      "code": "315     if not settings.users_enabled:\n316         DEFAULT_TOKEN = \"admin-secret-token\"\n317 \n",
       "col_offset": 24,
       "end_col_offset": 44,
       "filename": "backend/app/api/deps.py",
@@ -1887,16 +1887,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'admin-secret-token'",
-      "line_number": 315,
+      "line_number": 316,
       "line_range": [
-        315
+        316
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "333             \"is_active\": True,\n334             \"must_change_password\": False,\n335         }\n336 \n337     # User authentication enabled - validate JWT token\n338     try:\n339         payload = decode_access_token(token)\n340     except TokenExpiredError:\n341         raise HTTPException(\n342             status_code=401,\n",
+      "code": "334             \"is_active\": True,\n335             \"must_change_password\": False,\n336         }\n337 \n338     # User authentication enabled - validate JWT token\n339     try:\n340         payload = decode_access_token(token)\n341     except TokenExpiredError:\n342         raise HTTPException(\n343             status_code=401,\n",
       "col_offset": 12,
       "end_col_offset": 34,
       "filename": "backend/app/api/deps.py",
@@ -1907,16 +1907,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'False'",
-      "line_number": 334,
+      "line_number": 335,
       "line_range": [
-        328,
         329,
         330,
         331,
         332,
         333,
         334,
-        335
+        335,
+        336
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -3181,7 +3181,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1473             )\n1474         if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == \"change-me-to-a-random-64-char-string\"):\n1475             raise ValueError(\n",
+      "code": "1478             )\n1479         if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == \"change-me-to-a-random-64-char-string\"):\n1480             raise ValueError(\n",
       "col_offset": 93,
       "end_col_offset": 131,
       "filename": "backend/app/config.py",
@@ -3192,9 +3192,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 1474,
+      "line_number": 1479,
       "line_range": [
-        1474
+        1479
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",

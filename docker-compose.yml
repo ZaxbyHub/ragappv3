@@ -250,6 +250,7 @@ services:
       - JWT_ALGORITHM=${JWT_ALGORITHM:-}
       - ADMIN_RATE_LIMIT=${ADMIN_RATE_LIMIT:-}
       - HEALTH_CHECK_API_KEY=${HEALTH_CHECK_API_KEY:-}
+      - HEALTH_PROBE_RATE_LIMIT=${HEALTH_PROBE_RATE_LIMIT:-30/minute}
       - CSRF_TOKEN_TTL
       - ALLOWED_HOSTS=${ALLOWED_HOSTS:-}
       # Model tuning & validation
