@@ -33,12 +33,12 @@ class TestAsyncHasParentWindow:
         vs = VectorStore()
         vs.table = AsyncMock()
 
-        # Mock the search chain
-        mock_cursor = AsyncMock()
-        mock_cursor.to_list = AsyncMock(return_value=[])
-        mock_cursor.where.return_value.limit.return_value = mock_cursor
-
-        vs.table.search = MagicMock(return_value=mock_cursor)
+        # Mock the query() builder chain (the production call shape since #558).
+        mock_query = MagicMock()
+        mock_query.where.return_value.limit.return_value.to_list = AsyncMock(
+            return_value=[]
+        )
+        vs.table.query = MagicMock(return_value=mock_query)
 
         result = await vs.has_parent_window_text_sample()
         assert result is not None
@@ -56,38 +56,42 @@ class TestAsyncHasParentWindow:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_returns_false_when_search_returns_empty(self):
-        """Returns False when search finds no parent window rows."""
+    async def test_returns_false_when_query_returns_empty(self):
+        """Returns False when the primary query finds no parent window rows."""
         from app.services.vector_store import VectorStore
 
         vs = VectorStore()
         vs.table = AsyncMock()
 
-        mock_cursor = AsyncMock()
-        mock_cursor.to_list = AsyncMock(return_value=[])
-        mock_cursor.where.return_value.limit.return_value = mock_cursor
-
-        vs.table.search = MagicMock(return_value=mock_cursor)
+        mock_query = MagicMock()
+        mock_query.where.return_value.limit.return_value.to_list = AsyncMock(
+            return_value=[]
+        )
+        vs.table.query = MagicMock(return_value=mock_query)
 
         result = await vs.has_parent_window_text_sample()
         assert result is False
+        vs.table.query.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_returns_true_when_parent_window_found(self):
-        """Returns True when search finds rows with parent_window_text in fallback path."""
+        """Returns True when the primary query finds a parent-window row."""
         from app.services.vector_store import VectorStore
 
         vs = VectorStore()
         vs.table = AsyncMock()
 
-        # The mock chain doesn't fully work with chained MagicMock calls,
-        # so we test that the fallback path (head) correctly finds parent_window_text
-        vs.table.head = AsyncMock(return_value=[
-            {"metadata": '{"parent_window_text": "some context"}'}
-        ])
+        mock_query = MagicMock()
+        mock_query.where.return_value.limit.return_value.to_list = AsyncMock(
+            return_value=[{"metadata": '{"parent_window_text": "some context"}'}]
+        )
+        vs.table.query = MagicMock(return_value=mock_query)
 
         result = await vs.has_parent_window_text_sample()
         assert result is True
+        # The primary path decided the answer (no fallback scan happened).
+        vs.table.query.assert_called_once()
+        vs.table.head.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_metadata_filter_via_query_builder(self):
