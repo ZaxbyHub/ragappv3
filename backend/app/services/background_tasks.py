@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import List, Optional
@@ -24,12 +25,16 @@ from app.services.admission import (
 from ..models.database import SQLiteConnectionPool
 from .document_processor import DocumentProcessingError, DocumentProcessor
 from .embeddings import EmbeddingService
+from .job_lease import JobLease, ensure_jobs_schema
 from .llm_client import LLMClient
 from .maintenance import MaintenanceService
 from .multimodal_enrichment import ArtifactEnrichmentService
 from .vector_store import VectorStore, VectorStoreError
 
 logger = logging.getLogger(__name__)
+
+# Queue name for the shared jobs-lease table's ingestion rows (issue #559).
+INGESTION_QUEUE = "ingestion"
 
 # Timeout for processing rows during the PERIODIC stranded-row rescan.
 # If a row has been in status='processing' for longer than this, the periodic
@@ -179,6 +184,14 @@ class TaskItem:
     # any deferred retry) settles. Normal route tasks that were queued during
     # the recovery SELECT are skipped while this claim is active.
     recovery_claim: bool = False
+    # When set, this item is backed by a jobs-lease row (issue #559): the
+    # durable claim ledger lives in the DB, the heartbeat renews it while the
+    # worker runs, and the worker settles the row (complete/requeue/fail)
+    # when processing ends. None = legacy in-memory-only item.
+    job_id: Optional[int] = None
+    # Worker identity that claimed the backed row (fencing half; the row's
+    # current worker_id is the other half).
+    worker_id: Optional[str] = None
 
 
 @dataclass
@@ -367,6 +380,19 @@ class BackgroundProcessor:
         self._startup_recovery_cutoff: Optional[str] = None
         self.maintenance_service = maintenance_service
         self._write_semaphore: Optional[asyncio.Semaphore] = None
+        # DB-claimed ingestion lease (issue #559 stage 1). Enabled only when
+        # the env-only switch is on AND a real pool exists; without a pool the
+        # processor falls back to the legacy in-memory transport (tests).
+        self._ingest_lease_enabled = (
+            bool(getattr(settings, "ingestion_job_lease_enabled", False))
+            and pool is not None
+        )
+        # Migration barrier (Round-2 R2-3): workers and the janitor wait on
+        # this before their FIRST claim/reclaim, so the new claim path never
+        # serves a row the in-flight migration has not yet created.
+        self._jobs_barrier = asyncio.Event()
+        self._jobs_migration_task: Optional[asyncio.Task] = None
+        self._ingest_janitor_task: Optional[asyncio.Task] = None
 
     def set_llm_client(self, llm_client: Optional[LLMClient]) -> None:
         """Rebind the owned DocumentProcessor to a different ingestion LLM client."""
@@ -457,9 +483,24 @@ class BackgroundProcessor:
             self._artifact_delete_sweep_task = create_owned_task(
                 self._artifact_delete_sweep_loop(), name="artifact-delete-sweep"
             )
-            self._orphan_rescan_task = create_owned_task(
-                self._orphan_rescan_loop(), name="orphan-rescan"
-            )
+            if not getattr(self, "_ingest_lease_enabled", False):
+                # Legacy mode only: the hourly rescan re-enqueues stranded
+                # rows. In lease mode the janitor owns that settlement
+                # (issue #559), so the rescan would double-enqueue.
+                self._orphan_rescan_task = create_owned_task(
+                    self._orphan_rescan_loop(), name="orphan-rescan"
+                )
+                self._jobs_migration_task = None
+                self._ingest_janitor_task = None
+            else:
+                # Detached in-flight migration, then the lease janitor. Both
+                # gate their first pass on _jobs_barrier (R2-3).
+                self._jobs_migration_task = create_owned_task(
+                    self._run_jobs_migration(), name="jobs-migration"
+                )
+                self._ingest_janitor_task = create_owned_task(
+                    self._ingest_janitor_loop(), name="ingest-janitor"
+                )
             self._startup_recovery_task = create_owned_task(
                 self._run_startup_recovery(),
                 name="startup-recovery",
@@ -483,6 +524,8 @@ class BackgroundProcessor:
             self._artifact_delete_sweep_task = None
             self._orphan_rescan_task = None
             self._startup_recovery_task = None
+            self._jobs_migration_task = None
+            self._ingest_janitor_task = None
             self._write_semaphore = None
             self.processor._write_semaphore = None
             self._running = False
@@ -493,9 +536,18 @@ class BackgroundProcessor:
         """Run startup recovery phases in order without coupling readiness."""
         phases = (
             (
-                "stranded pending rows",
-                lambda: self._recover_stranded_pending_rows(
-                    require_older_than_minutes=None
+                # Lease mode (issue #559): stranded files rows are synced into
+                # jobs rows (no live counterpart -> a claimable row); legacy
+                # mode keeps the re-enqueue sweep.
+                "stranded pending rows"
+                if not getattr(self, "_ingest_lease_enabled", False)
+                else "missing ingest job rows",
+                (
+                    lambda: self._recover_stranded_pending_rows(
+                        require_older_than_minutes=None
+                    )
+                    if not getattr(self, "_ingest_lease_enabled", False)
+                    else self._sync_missing_ingest_job_rows_gated()
                 ),
             ),
             (
@@ -566,6 +618,424 @@ class BackgroundProcessor:
                 raise
             except Exception:  # noqa: BLE001 — rescan must never kill the loop
                 logger.exception("Periodic stranded-row rescan failed")
+
+    async def _run_jobs_migration(self) -> None:
+        """Detached boot migration for the ingestion lease (issue #559 R2-3).
+
+        Copies every files row that awaits ingestion work but has no live
+        (pending/running) jobs counterpart into the shared ``jobs`` table, and
+        resets stranded ``processing`` rows to ``pending``/``queued`` so the
+        janitor — not the restart — owns their settlement. Idempotent and
+        resumable: a boot that dies mid-migration simply re-runs it. Workers
+        and the janitor hold on ``_jobs_barrier`` until this completes.
+        """
+        try:
+            if self.processor is None or self.processor.pool is None:
+                return
+            migrated = await asyncio.to_thread(self._sync_missing_ingest_job_rows)
+            if migrated:
+                logger.info(
+                    "Jobs migration: created %d ingestion job row(s) from "
+                    "stranded files rows",
+                    migrated,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — migration must not block startup
+            logger.exception("Jobs migration failed; legacy recovery remains")
+        finally:
+            self._jobs_barrier.set()
+
+    async def _sync_missing_ingest_job_rows_gated(self) -> None:
+        """Recovery-phase wrapper: wait out the boot migration barrier, then
+        re-run the sync, so it can never race the migration task's INSERT
+        (both target the same files rows)."""
+        await self._jobs_barrier.wait()
+        await asyncio.to_thread(self._sync_missing_ingest_job_rows)
+
+    def _sync_missing_ingest_job_rows(self) -> int:
+        """Synchronous core of the boot migration. Returns rows created.
+
+        Phase semantics preserved from the pre-lease recovery: a ``pending``/
+        ``queued`` row or a stuck ``processing`` row (single-process: an
+        orphan by definition once no live jobs row covers it) becomes a
+        claimable ``jobs`` row; the processing row is reset to
+        ``pending``/``queued`` so file state matches.
+        """
+        with self.processor.pool.connection() as conn:
+            ensure_jobs_schema(conn)
+            # Single explicit transaction: the INSERT and the files-row reset
+            # commit together, and a concurrent caller (migration task vs
+            # recovery phase) serializes behind BEGIN IMMEDIATE instead of
+            # racing two autocommitted statements.
+            owned = not conn.in_transaction
+            if owned:
+                conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                INSERT INTO jobs (queue, payload_json)
+                SELECT 'ingestion', json_object(
+                    'file_path', f.file_path,
+                    'vault_id', f.vault_id,
+                    'source', COALESCE(f.source, 'upload'),
+                    'file_id', f.id,
+                    'file_hash', NULL)
+                FROM files f
+                WHERE f.status IN ('pending', 'processing')
+                  AND (f.phase IS NULL OR f.phase != 'error')
+                  AND f.id NOT IN (
+                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    FROM jobs j
+                    WHERE j.queue = 'ingestion'
+                      AND j.status IN ('pending', 'running')
+                      AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
+                  )
+                """
+            )
+            created = cursor.rowcount
+            # Files rows that are still 'processing' but now own a fresh
+            # pending jobs row: reset them so the visible state matches.
+            conn.execute(
+                """
+                UPDATE files SET status = 'pending', phase = 'queued',
+                    error_message = NULL
+                WHERE status = 'processing'
+                  AND id IN (
+                    SELECT CAST(json_extract(j.payload_json, '$.file_id') AS INTEGER)
+                    FROM jobs j
+                    WHERE j.queue = 'ingestion'
+                      AND j.status = 'pending'
+                      AND json_extract(j.payload_json, '$.file_id') IS NOT NULL
+                  )
+                """
+            )
+            if owned:
+                conn.commit()
+        return created if created and created > 0 else 0
+
+    async def _ingest_janitor_loop(self) -> None:
+        """Reclaim expired ingestion leases while the process lives (issue #559).
+
+        The first pass runs as soon as the migration barrier opens — at boot,
+        every 'running' lease left by the dead process is expired by
+        definition, so settlement starts immediately instead of waiting out
+        the first interval. A reclaimed job's files row is reset to
+        ``pending``/``queued`` (or failed at the attempts cap) right here,
+        which is what removes the boot-recovery dependence C05 exploited.
+        """
+        await self._jobs_barrier.wait()
+        interval = max(5.0, float(settings.jobs_heartbeat_interval_seconds))
+        while True:
+            if self.shutdown_event.is_set():
+                break
+            try:
+                await self._janitor_sweep_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — janitor must never kill the loop
+                logger.exception("Ingestion lease janitor sweep failed")
+            await asyncio.sleep(interval)
+
+    async def _janitor_sweep_once(self) -> None:
+        """One janitor pass: reclaim expired leases, then re-sync files rows."""
+        if self.processor is None or self.processor.pool is None:
+            return
+
+        def run_reclaim() -> int:
+            with self.processor.pool.connection() as conn:
+                lease = self._make_ingest_lease(conn)
+                return lease.reclaim_expired(queue=INGESTION_QUEUE)
+
+        settled = await asyncio.to_thread(run_reclaim)
+        if not settled:
+            return
+        logger.info(
+            "Ingestion janitor: reclaimed %d expired lease(s)", settled
+        )
+
+        def resync_files_rows() -> tuple[int, int]:
+            requeued = 0
+            cap_failed = 0
+            with self.processor.pool.connection() as conn:
+                ensure_jobs_schema(conn)
+                # Reclaimed-to-pending jobs whose files row is stuck in
+                # 'processing': reset it so the worker's next attempt starts
+                # from the same visible state the route created.
+                reset_cursor = conn.execute(
+                    """
+                    UPDATE files SET status = 'pending', phase = 'queued',
+                        error_message = NULL
+                    WHERE status = 'processing'
+                      AND id IN (
+                        SELECT CAST(json_extract(payload_json, '$.file_id') AS INTEGER)
+                        FROM jobs
+                        WHERE queue = ? AND status = 'pending'
+                          AND json_extract(payload_json, '$.file_id') IS NOT NULL
+                      )
+                    """,
+                    (INGESTION_QUEUE,),
+                )
+                requeued = reset_cursor.rowcount
+                # Jobs the janitor settled terminally at the attempts cap:
+                # fail their files rows too (only cap failures need this —
+                # worker-driven failures already wrote the files row).
+                cap_rows = conn.execute(
+                    """
+                    SELECT CAST(json_extract(payload_json, '$.file_id') AS INTEGER)
+                        AS fid
+                    FROM jobs
+                    WHERE queue = ? AND status = 'failed'
+                      AND error = 'lease_attempt_cap_exceeded'
+                      AND json_extract(payload_json, '$.file_id') IS NOT NULL
+                    """,
+                    (INGESTION_QUEUE,),
+                ).fetchall()
+                cap_ids = [
+                    int(row["fid"]) for row in cap_rows if row["fid"] is not None
+                ]
+                if cap_ids:
+                    cap_cursor = conn.executemany(
+                        "UPDATE files SET status = 'error', phase = 'error', "
+                        "error_message = 'lease_attempt_cap_exceeded' "
+                        "WHERE id = ? AND status IN ('processing', 'pending')",
+                        [(fid,) for fid in cap_ids],
+                    )
+                    cap_failed = cap_cursor.rowcount
+                conn.commit()
+            return requeued, cap_failed
+
+        requeued, cap_failed = await asyncio.to_thread(resync_files_rows)
+        if requeued:
+            logger.info(
+                "Ingestion janitor: reset %d processing files row(s) for "
+                "requeued jobs",
+                requeued,
+            )
+        if cap_failed:
+            logger.warning(
+                "Ingestion janitor: failed %d files row(s) at the attempt cap",
+                cap_failed,
+            )
+
+    def _make_ingest_lease(self, conn):
+        """Build the ingestion JobLease on ``conn``, ensuring the schema.
+
+        ``ensure_jobs_schema`` is idempotent IF-NOT-EXISTS DDL, so lease paths
+        work against any database — including the minimal temp DBs some tests
+        construct without running the full migration set.
+        """
+        ensure_jobs_schema(conn)
+        return JobLease(
+            conn,
+            reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+            max_attempts=settings.jobs_max_attempts,
+        )
+
+    async def _claim_next_ingest_job(self, worker_id: str):
+        """Claim one ingestion job row off the lease (off the event loop)."""
+        if self.processor is None or self.processor.pool is None:
+            return None
+
+        def _claim():
+            with self.processor.pool.connection() as conn:
+                lease = self._make_ingest_lease(conn)
+                return lease.claim(INGESTION_QUEUE, worker_id)
+
+        try:
+            return await asyncio.to_thread(_claim)
+        except Exception:  # noqa: BLE001 — a failed claim is retried next poll
+            logger.exception("Ingestion job claim failed")
+            return None
+
+    async def _settle_ingest_job(
+        self,
+        job_id: int,
+        worker_id: str,
+        outcome: str,
+        error: Optional[str] = None,
+        delay: Optional[float] = None,
+    ) -> bool:
+        """Settle a claimed ingestion job (complete/requeue/fail/release)."""
+
+        def _settle() -> bool:
+            with self.processor.pool.connection() as conn:
+                lease = self._make_ingest_lease(conn)
+                if outcome == "complete":
+                    return bool(lease.complete(job_id, worker_id))
+                if outcome == "fail":
+                    return bool(
+                        lease.fail(job_id, worker_id, (error or "failed")[:500])
+                    )
+                if outcome == "release":
+                    return bool(lease.release(job_id, worker_id))
+                return bool(
+                    lease.requeue(
+                        job_id,
+                        worker_id,
+                        delay_seconds=delay,
+                        error=error,
+                    )
+                )
+
+        try:
+            settled = await asyncio.to_thread(_settle)
+        except Exception:  # noqa: BLE001 — settlement failures are janitor food
+            logger.exception(
+                "Failed to settle ingestion job id=%s (%s)", job_id, outcome
+            )
+            return False
+        if not settled:
+            # Fenced off: the lease was reclaimed mid-run. The new claimant (or
+            # the janitor) owns the row now; this worker's result is void.
+            logger.warning(
+                "Ingestion job id=%s settlement (%s) fenced off — lease lost",
+                job_id,
+                outcome,
+            )
+        return settled
+
+    async def _heartbeat_loop(self, job_id: int, worker_id: str) -> None:
+        """Renew one job's lease every heartbeat interval until it settles.
+
+        Exits silently when the lease is lost (janitor reclaimed it) — the
+        worker's own settlement write will be fenced off in that case.
+        """
+        interval = max(1.0, float(settings.jobs_heartbeat_interval_seconds))
+
+        def _renew() -> bool:
+            with self.processor.pool.connection() as conn:
+                lease = self._make_ingest_lease(conn)
+                return bool(lease.heartbeat(job_id, worker_id))
+
+        while True:
+            await asyncio.sleep(interval)
+            if self.shutdown_event.is_set():
+                return
+            try:
+                renewed = await asyncio.to_thread(_renew)
+            except Exception:  # noqa: BLE001 — a dropped beat is recoverable
+                logger.debug(
+                    "Heartbeat for ingestion job id=%s failed", job_id,
+                    exc_info=True,
+                )
+                continue
+            if not renewed:
+                return
+
+    async def _process_ingest_job_row(self, job, worker_id: str) -> None:
+        """Process one DB-claimed ingestion job end to end (issue #559).
+
+        Rebuilds the TaskItem from the row payload, renews the lease heartbeat
+        while the job runs, then settles the row: complete on success,
+        requeue-with-backoff on retryable failure, terminal fail at the
+        attempts cap, and release on shutdown.
+        """
+        job_id = int(job["id"])
+        payload = json.loads(job["payload_json"] or "{}")
+        attempt = int(job["attempts"] or 1)
+        task = TaskItem(
+            file_path=payload.get("file_path") or "",
+            vault_id=int(payload.get("vault_id") or 0),
+            attempt=attempt,
+            source=payload.get("source") or "upload",
+            email_subject=payload.get("email_subject"),
+            email_sender=payload.get("email_sender"),
+            file_id=payload.get("file_id"),
+            file_hash=payload.get("file_hash"),
+            job_id=job_id,
+            worker_id=worker_id,
+        )
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(job_id, worker_id),
+            name=f"ingest-heartbeat-{job_id}",
+        )
+        outcome_error: Optional[str] = None
+        try:
+            try:
+                async with get_admission_controller().admit(
+                    AdmissionClass.BACKGROUND, foreground=False
+                ):
+                    # The RAISING core, not _process_task: the lease
+                    # transport owns retry/settlement for its durable row.
+                    await self._run_task_processing(task)
+            except AdmissionRejected as exc:
+                outcome_error = f"admission rejected: {exc.reason}"
+            except Exception as exc:  # noqa: BLE001 — outcome drives settle
+                outcome_error = str(exc)
+
+            if outcome_error is None:
+                await self._settle_ingest_job(job_id, worker_id, "complete")
+                return
+            max_attempts = int(
+                getattr(settings, "jobs_max_attempts", 0) or self.max_retries
+            )
+            if self.shutdown_event.is_set():
+                await self._settle_ingest_job(
+                    job_id, worker_id, "release", error=outcome_error
+                )
+            elif task.attempt < max_attempts:
+                delay = self.retry_delay * (2 ** (task.attempt - 1))
+                await self._settle_ingest_job(
+                    job_id,
+                    worker_id,
+                    "requeue",
+                    error=outcome_error,
+                    delay=delay,
+                )
+            else:
+                # Terminal at the durable attempt cap: carry the plan's
+                # operator-visible literal (issue #559 R2-2), preserving the
+                # last processing error as the detail.
+                await self._settle_ingest_job(
+                    job_id,
+                    worker_id,
+                    "fail",
+                    error=f"attempt_cap_exceeded: {outcome_error}"[:500],
+                )
+                self._mark_task_permanently_failed(task, outcome_error)
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+    async def _wait_ingest_jobs_settled(self) -> None:
+        """Poll until no ingestion job is pending or running (graceful stop)."""
+
+        def _count() -> int:
+            with self.processor.pool.connection() as conn:
+                ensure_jobs_schema(conn)
+                # Deferred (run_after in the future) rows are NOT outstanding
+                # work: no worker can claim them yet and no worker holds them,
+                # so waiting for them would burn the whole shutdown timeout.
+                # They survive as pending and resume on the next boot.
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE queue = ? "
+                    "AND status IN ('pending', 'running') "
+                    "AND (status = 'running' OR run_after IS NULL "
+                    "OR run_after <= CURRENT_TIMESTAMP)",
+                    (INGESTION_QUEUE,),
+                ).fetchone()
+                return int(row[0])
+
+        while True:
+            outstanding = await asyncio.to_thread(_count)
+            if outstanding == 0:
+                return
+            await asyncio.sleep(0.2)
+
+    def _release_all_ingest_leases(self) -> int:
+        """Give back every still-running ingestion lease (shutdown path)."""
+        if self.processor is None or self.processor.pool is None:
+            return 0
+        with self.processor.pool.connection() as conn:
+            ensure_jobs_schema(conn)
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'pending', worker_id = NULL, "
+                "lease_generation = lease_generation + 1, heartbeat_at = NULL "
+                "WHERE queue = ? AND status = 'running'",
+                (INGESTION_QUEUE,),
+            )
+            conn.commit()
+            return cursor.rowcount
 
     def _ensure_retry_scheduler(self) -> None:
         """Start the retry-scheduler task if it is not already running."""
@@ -1824,6 +2294,13 @@ class BackgroundProcessor:
             startup_recovery_task.cancel()
             await asyncio.gather(startup_recovery_task, return_exceptions=True)
             self._startup_recovery_task = None
+        # Same for the detached jobs migration (issue #559): short-lived, but
+        # shutdown must never race it mid-copy.
+        jobs_migration_task = getattr(self, "_jobs_migration_task", None)
+        if jobs_migration_task is not None:
+            jobs_migration_task.cancel()
+            await asyncio.gather(jobs_migration_task, return_exceptions=True)
+            self._jobs_migration_task = None
 
         # The outer recovery task may have been cancelled while a synchronous
         # artifact sweep is still running in a worker thread. Cancel and await
@@ -1865,9 +2342,23 @@ class BackgroundProcessor:
                     logger.warning(
                         "Atom enrichment queue did not drain within timeout"
                     )
+        # Phase 1b (issue #559): in lease mode, let workers drain the durable
+        # queue before the shutdown flag stops claiming — the graceful
+        # analogue of "pending queue items ARE processed before shutdown".
+        # Deferred (run_after in the future) rows are excluded from the wait
+        # (no worker can claim them mid-deferral); they survive as pending
+        # and resume on the next lease-enabled boot.
+        if getattr(self, "_ingest_lease_enabled", False):
+            try:
+                await asyncio.wait_for(
+                    self._wait_ingest_jobs_settled(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Ingestion jobs did not settle within timeout; "
+                    "unclaimed leases will be released for the next boot"
+                )
         self.shutdown_event.set()
-
-        # Phase 2: Cancel remaining workers
         if self._worker_tasks:
             for task in self._worker_tasks:
                 task.cancel()
@@ -1906,6 +2397,22 @@ class BackgroundProcessor:
             self._orphan_rescan_task.cancel()
             await asyncio.gather(self._orphan_rescan_task, return_exceptions=True)
             self._orphan_rescan_task = None
+        if getattr(self, "_ingest_janitor_task", None):
+            self._ingest_janitor_task.cancel()
+            await asyncio.gather(self._ingest_janitor_task, return_exceptions=True)
+            self._ingest_janitor_task = None
+        # Shutdown lease release (issue #559): after the workers are gone, a
+        # still-'running' ingestion row would wait out the reclaim timeout on
+        # the next boot for no reason — hand every lease back immediately.
+        if getattr(self, "_ingest_lease_enabled", False):
+            try:
+                released = await asyncio.to_thread(self._release_all_ingest_leases)
+                if released:
+                    logger.info(
+                        "Released %d ingestion lease(s) at shutdown", released
+                    )
+            except Exception:  # noqa: BLE001 — janitor reclaims on next boot
+                logger.warning("Shutdown lease release failed", exc_info=True)
         # Guarded like every other lifecycle attribute above: ``stop`` must be
         # safe on partially constructed instances (tests and shutdown paths
         # build minimal processors without running ``__init__``).
@@ -2028,6 +2535,36 @@ class BackgroundProcessor:
                 if reservation_added:
                     await self._release_recovery_file(file_id)
                 raise DocumentProcessingError("Maintenance mode prevents enqueueing")
+        job_id: Optional[int] = None
+        if getattr(self, "_ingest_lease_enabled", False):
+            # Durable claim row first (issue #559): the jobs row is the
+            # authoritative queue entry; the asyncio.Queue below is only the
+            # legacy transport and this method's return contract. A failed
+            # insert falls back to the legacy transport for this item.
+            payload = {
+                "file_path": file_path,
+                "vault_id": vault_id,
+                "source": source,
+                "email_subject": email_subject,
+                "email_sender": email_sender,
+                "file_id": file_id,
+                "file_hash": file_hash,
+            }
+
+            def _insert_job() -> int:
+                with self.processor.pool.connection() as conn:
+                    lease = self._make_ingest_lease(conn)
+                    return lease.enqueue(INGESTION_QUEUE, payload)
+
+            try:
+                job_id = await asyncio.to_thread(_insert_job)
+            except Exception:  # noqa: BLE001 — degrade to legacy transport
+                logger.warning(
+                    "Jobs-row insert failed for %s; using in-memory queue only",
+                    file_path,
+                    exc_info=True,
+                )
+                job_id = None
         task = TaskItem(
             file_path=file_path,
             attempt=1,
@@ -2038,7 +2575,13 @@ class BackgroundProcessor:
             file_id=file_id,
             file_hash=file_hash,
             recovery_claim=_recovery_claim,
+            job_id=job_id,
         )
+        if job_id is not None:
+            # Lease mode: the DB row is the queue entry; workers poll-claim it.
+            # No in-memory put — a put here would double-process the row.
+            logger.debug(f"Enqueued file to jobs lease: {file_path} (job_id={job_id})")
+            return True
         if file_id is not None:
             async with self._active_file_ids_lock:
                 self._mark_file_queued_locked(file_id)
@@ -2091,6 +2634,50 @@ class BackgroundProcessor:
             logger.error("cancel_pending_jobs called with an empty match; refusing")
             return 0
         cancelled = 0
+        # Lease mode (issue #559): queued-but-unclaimed work lives in the jobs
+        # table, not on the in-memory queue. Cancel matching pending rows; a
+        # claimed row is past cancellation exactly like a dequeued TaskItem.
+        if (
+            getattr(self, "_ingest_lease_enabled", False)
+            and self.processor is not None
+            and self.processor.pool is not None
+        ):
+            try:
+                with self.processor.pool.connection() as conn:
+                    rows = conn.execute(
+                        "SELECT id, payload_json FROM jobs "
+                        "WHERE queue = ? AND status = 'pending'",
+                        (INGESTION_QUEUE,),
+                    ).fetchall()
+                    for row in rows:
+                        payload = json.loads(row["payload_json"] or "{}")
+                        if not all(
+                            payload.get(key) == value
+                            for key, value in match.items()
+                        ):
+                            continue
+                        conn.execute(
+                            "UPDATE jobs SET status = 'cancelled', "
+                            "worker_id = NULL, heartbeat_at = NULL, "
+                            "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (row["id"],),
+                        )
+                        cancelled += 1
+                    conn.commit()
+            except Exception as exc:  # noqa: BLE001 — must never raise
+                logger.warning(
+                    "cancel_pending_jobs jobs-row pass failed after %d "
+                    "item(s): %s",
+                    cancelled,
+                    exc,
+                )
+            if cancelled:
+                logger.info(
+                    "Cancelled %d queued ingestion job row(s) matching %s",
+                    cancelled,
+                    match,
+                )
+            return cancelled
         try:
             drained: List[TaskItem] = []
             while True:
@@ -2151,53 +2738,81 @@ class BackgroundProcessor:
         Continuously processes tasks until shutdown_event is set AND queue is empty.
         Ensures all pending tasks are processed before shutdown.
         Handles retries with exponential backoff on failure.
+
+        Dual transport (issue #559): legacy in-memory TaskItems (flag off,
+        pool-less tests, or an item whose jobs-row insert failed) are consumed
+        from the queue exactly as before; when the lease is enabled, an idle
+        poll claims the oldest claimable ingestion row from the shared jobs
+        table and processes it under its lease.
         """
+        worker_id = f"ingest-{uuid.uuid4().hex[:8]}"
         while True:
             # Check if we should shutdown: shutdown_event is set AND queue is empty
             if self.shutdown_event.is_set() and self.queue.empty():
                 break
 
+            task = None
             try:
-                # Wait for task with timeout to check shutdown periodically
+                # Wait for task with timeout to check shutdown periodically.
+                # In lease mode the poll doubles as the claim tick, so the
+                # idle wait is short.
                 task = await asyncio.wait_for(
                     self.queue.get(),
-                    timeout=0.5
+                    timeout=(
+                        0.25
+                        if getattr(self, "_ingest_lease_enabled", False)
+                        else 0.5
+                    ),
                 )
             except asyncio.TimeoutError:
+                task = None
+
+            if task is not None:
+                # E3 admission (issue #518): ingestion work shares the background
+                # device budget. Under interactive pressure the admit is rejected
+                # (foreground preference) — defer through the retry scheduler.
+                # Balanced bookkeeping (swarm review F-007): the get() above
+                # consumed a join() unit, so task_done() must run on EVERY path
+                # that does not reach _process_task_wrapper (whose finally calls
+                # it); the re-delivery is a producer-side put by the scheduler,
+                # never an inline re-put from this consumer.
+                try:
+                    async with get_admission_controller().admit(
+                        AdmissionClass.BACKGROUND, foreground=False
+                    ):
+                        await self._process_task_wrapper(task)
+                except AdmissionRejected as exc:
+                    self.queue.task_done()
+                    if not self._schedule_retry(
+                        queue=self.queue, item=task, delay=0.5
+                    ):
+                        # Retry backlog full or shutdown began: fail the task
+                        # outright rather than wedge the queue drain.
+                        logger.error(
+                            "Ingestion admission deferral for %s could not be "
+                            "scheduled (retry backlog full or shutdown); "
+                            "treating as permanent failure",
+                            task.file_path,
+                        )
+                        self._mark_task_permanently_failed(
+                            task, f"admission rejected: {exc.reason}"
+                        )
                 continue
 
-            if task is None:
+            # Lease transport (issue #559): claim-driven processing. Gated on
+            # the migration barrier so no claim is served before the boot
+            # migration has created the rows (Round-2 R2-3).
+            if getattr(self, "_ingest_lease_enabled", False) is False:
                 continue
-
-            # E3 admission (issue #518): ingestion work shares the background
-            # device budget. Under interactive pressure the admit is rejected
-            # (foreground preference) — defer through the retry scheduler.
-            # Balanced bookkeeping (swarm review F-007): the get() above
-            # consumed a join() unit, so task_done() must run on EVERY path
-            # that does not reach _process_task_wrapper (whose finally calls
-            # it); the re-delivery is a producer-side put by the scheduler,
-            # never an inline re-put from this consumer.
-            try:
-                async with get_admission_controller().admit(
-                    AdmissionClass.BACKGROUND, foreground=False
-                ):
-                    await self._process_task_wrapper(task)
-            except AdmissionRejected as exc:
-                self.queue.task_done()
-                if not self._schedule_retry(
-                    queue=self.queue, item=task, delay=0.5
-                ):
-                    # Retry backlog full or shutdown began: fail the task
-                    # outright rather than wedge the queue drain.
-                    logger.error(
-                        "Ingestion admission deferral for %s could not be "
-                        "scheduled (retry backlog full or shutdown); "
-                        "treating as permanent failure",
-                        task.file_path,
-                    )
-                    self._mark_task_permanently_failed(
-                        task, f"admission rejected: {exc.reason}"
-                    )
+            if self.shutdown_event.is_set():
+                continue
+            barrier = getattr(self, "_jobs_barrier", None)
+            if barrier is not None and not barrier.is_set():
+                await barrier.wait()
+            job = await self._claim_next_ingest_job(worker_id)
+            if job is None:
+                continue
+            await self._process_ingest_job_row(job, worker_id)
 
     async def _enrichment_worker_loop(self) -> None:
         """Process optional enrichment after base indexing completes."""
@@ -2558,6 +3173,60 @@ class BackgroundProcessor:
                     if task.recovery_claim:
                         self._recovery_file_ids.discard(leased_id)
 
+    async def _run_task_processing(self, task: TaskItem) -> None:
+        """Processing core shared by both transports (issue #559).
+
+        Performs the work and the success-side enrichment fan-out and RAISES
+        on failure — retry/lease settlement is the caller's decision. The
+        legacy transport wraps this with in-memory retry handling; the lease
+        transport settles the durable row from the raised outcome.
+        """
+        if task.file_id is not None:
+            # Async upload path: the row already exists with status='pending'
+            # / phase='queued' and the duplicate check has already passed.
+            # The route-computed content hash (issue #513 W8) is forwarded
+            # when present so the file is hashed exactly once.
+            kwargs = {}
+            if task.file_hash is not None:
+                kwargs["file_hash"] = task.file_hash
+            result = await self.processor.process_existing_file(
+                file_id=task.file_id,
+                file_path=task.file_path,
+                vault_id=task.vault_id,
+                **kwargs,
+            )
+        else:
+            # Legacy path (scan/email): processor handles dup check + insert.
+            result = await self.processor.process_file(
+                task.file_path,
+                source=task.source,
+                email_subject=task.email_subject,
+                email_sender=task.email_sender,
+                vault_id=task.vault_id,
+            )
+        if result is not None:
+            if self.processor.should_enqueue_enrichment(result.chunks, result.vault_id, result.file_id):
+                self.processor.set_enrichment_status(result.file_id, "pending")
+                await self.enqueue_enrichment(
+                    EnrichmentTaskItem(
+                        file_id=result.file_id,
+                        file_path=result.file_path,
+                        vault_id=result.vault_id,
+                        file_hash=result.file_hash,
+                        chunks=result.chunks,
+                        document_text=result.document_text,
+                        attempt=0,
+                    )
+                )
+            if self.multimodal_service is not None:
+                self.enqueue_atom_enrichment(
+                    file_id=result.file_id,
+                    vault_id=result.vault_id,
+                    file_hash=result.file_hash,
+                    document_title=os.path.basename(result.file_path or ""),
+                )
+        logger.info(f"Successfully processed: {task.file_path}")
+
     async def _process_task(self, task: TaskItem) -> None:
         """
         Process a single task with retry logic.
@@ -2586,52 +3255,7 @@ class BackgroundProcessor:
         )
 
         try:
-            if task.file_id is not None:
-                # Async upload path: the row already exists with status='pending'
-                # / phase='queued' and the duplicate check has already passed.
-                # The route-computed content hash (issue #513 W8) is forwarded
-                # when present so the file is hashed exactly once.
-                kwargs = {}
-                if task.file_hash is not None:
-                    kwargs["file_hash"] = task.file_hash
-                result = await self.processor.process_existing_file(
-                    file_id=task.file_id,
-                    file_path=task.file_path,
-                    vault_id=task.vault_id,
-                    **kwargs,
-                )
-            else:
-                # Legacy path (scan/email): processor handles dup check + insert.
-                result = await self.processor.process_file(
-                    task.file_path,
-                    source=task.source,
-                    email_subject=task.email_subject,
-                    email_sender=task.email_sender,
-                    vault_id=task.vault_id,
-                )
-            if result is not None:
-                if self.processor.should_enqueue_enrichment(result.chunks, result.vault_id, result.file_id):
-                    self.processor.set_enrichment_status(result.file_id, "pending")
-                    await self.enqueue_enrichment(
-                        EnrichmentTaskItem(
-                            file_id=result.file_id,
-                            file_path=result.file_path,
-                            vault_id=result.vault_id,
-                            file_hash=result.file_hash,
-                            chunks=result.chunks,
-                            document_text=result.document_text,
-                            attempt=0,
-                        )
-                    )
-                if self.multimodal_service is not None:
-                    self.enqueue_atom_enrichment(
-                        file_id=result.file_id,
-                        vault_id=result.vault_id,
-                        file_hash=result.file_hash,
-                        document_title=os.path.basename(result.file_path or ""),
-                    )
-            logger.info(f"Successfully processed: {task.file_path}")
-
+            await self._run_task_processing(task)
         except DocumentProcessingError as e:
             logger.error(f"Processing error for {task.file_path}: {e}")
             await self._handle_failure(task, str(e))

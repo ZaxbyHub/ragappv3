@@ -50,7 +50,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # draft_reconcile_backlog (evidence-reconciler continuation state)
 # 68 -> 70: issue #237 (AC12) adds quality_reports and quality_eval_cases (PRODUCT-ENH-12 report->case->compare)
 # 70 -> 71: issue #555 (2026-09-14) adds chat_stream_events (per-turn SSE replay log)
-EXPECTED_BASE_TABLE_COUNT = 71
+# 71 -> 72: issue #559 (stage 1) adds jobs — the shared DB-claimed lease table
+# for background workers (ingestion first; wiki/KMS, reindex and draft follow).
+EXPECTED_BASE_TABLE_COUNT = 72
 
 # Curated set of critical application tables that must always exist. If any of
 # these disappears, the drift test fails with a clear message naming the table.

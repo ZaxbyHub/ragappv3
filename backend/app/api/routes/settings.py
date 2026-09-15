@@ -45,6 +45,12 @@ class SettingsUpdate(BaseModel):
     near_dup_threshold: Optional[float] = None
     orphan_rescan_interval_seconds: Optional[float] = None
 
+    # Job-lease knobs (issue #559; the *_job_lease_enabled switches are
+    # env-only by design and deliberately absent here)
+    jobs_heartbeat_interval_seconds: Optional[float] = None
+    jobs_lease_reclaim_timeout_seconds: Optional[float] = None
+    jobs_max_attempts: Optional[int] = None
+
     # Reranker config
     reranker_url: Optional[str] = None
     reranker_model: Optional[str] = None
@@ -306,6 +312,29 @@ class SettingsUpdate(BaseModel):
             raise ValueError("orphan_rescan_interval_seconds must be between 60.0 and 86400.0")
         return v
 
+    @field_validator("jobs_heartbeat_interval_seconds")
+    @classmethod
+    def validate_jobs_heartbeat_interval_seconds(cls, v):
+        if v is not None and not (5.0 <= v <= 600.0):
+            raise ValueError("jobs_heartbeat_interval_seconds must be between 5.0 and 600.0")
+        return v
+
+    @field_validator("jobs_lease_reclaim_timeout_seconds")
+    @classmethod
+    def validate_jobs_lease_reclaim_timeout_seconds(cls, v):
+        if v is not None and not (15.0 <= v <= 3600.0):
+            raise ValueError(
+                "jobs_lease_reclaim_timeout_seconds must be between 15.0 and 3600.0"
+            )
+        return v
+
+    @field_validator("jobs_max_attempts")
+    @classmethod
+    def validate_jobs_max_attempts(cls, v):
+        if v is not None and not (1 <= v <= 20):
+            raise ValueError("jobs_max_attempts must be between 1 and 20")
+        return v
+
     @field_validator("reranker_top_n")
     @classmethod
     def validate_reranker_top_n(cls, v):
@@ -454,6 +483,33 @@ class SettingsUpdate(BaseModel):
             raise ValueError("chunk_overlap must be less than chunk_size")
         return self
 
+    @model_validator(mode="after")
+    def _enforce_jobs_lease_coherence(self):
+        """Reject an update that would leave the running process with a
+        reclaim timeout <= 4x the heartbeat interval (issue #559 / R4-S16).
+
+        setattr persistence onto the settings singleton bypasses the Settings
+        model validators, so the PUT path must enforce the coherence rule
+        here against the effective (body-value-else-current) pair."""
+        from app.config import settings as _settings
+
+        heartbeat = (
+            self.jobs_heartbeat_interval_seconds
+            if self.jobs_heartbeat_interval_seconds is not None
+            else _settings.jobs_heartbeat_interval_seconds
+        )
+        reclaim = (
+            self.jobs_lease_reclaim_timeout_seconds
+            if self.jobs_lease_reclaim_timeout_seconds is not None
+            else _settings.jobs_lease_reclaim_timeout_seconds
+        )
+        if reclaim <= 4 * heartbeat:
+            raise ValueError(
+                "jobs_lease_reclaim_timeout_seconds must be > 4x "
+                "jobs_heartbeat_interval_seconds"
+            )
+        return self
+
     # ── Curator validators ────────────────────────────────────────────────
     @field_validator("wiki_llm_curator_temperature")
     @classmethod
@@ -554,6 +610,10 @@ ALLOWED_FIELDS = [
     "embedding_cache_max_entries",
     "near_dup_threshold",
     "orphan_rescan_interval_seconds",
+    # Job-lease knobs (issue #559)
+    "jobs_heartbeat_interval_seconds",
+    "jobs_lease_reclaim_timeout_seconds",
+    "jobs_max_attempts",
     "reranker_url",
     "reranker_model",
     "reranking_enabled",
@@ -849,6 +909,9 @@ class SettingsResponse(BaseModel):
     embedding_cache_max_entries: int = 50000
     near_dup_threshold: float = 0.96
     orphan_rescan_interval_seconds: float = 3600.0
+    jobs_heartbeat_interval_seconds: float = 30.0
+    jobs_lease_reclaim_timeout_seconds: float = 300.0
+    jobs_max_attempts: int = 3
 
     # Reranker config
     reranker_url: str = ""
@@ -987,6 +1050,9 @@ def _build_settings_dict() -> dict:
         "embedding_cache_max_entries": settings.embedding_cache_max_entries,
         "near_dup_threshold": settings.near_dup_threshold,
         "orphan_rescan_interval_seconds": settings.orphan_rescan_interval_seconds,
+        "jobs_heartbeat_interval_seconds": settings.jobs_heartbeat_interval_seconds,
+        "jobs_lease_reclaim_timeout_seconds": settings.jobs_lease_reclaim_timeout_seconds,
+        "jobs_max_attempts": settings.jobs_max_attempts,
         "maintenance_mode": settings.maintenance_mode,
         "auto_scan_enabled": settings.auto_scan_enabled,
         "auto_scan_interval_minutes": settings.auto_scan_interval_minutes,

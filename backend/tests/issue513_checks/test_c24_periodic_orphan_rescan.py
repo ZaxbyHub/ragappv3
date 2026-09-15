@@ -51,6 +51,12 @@ def _hermetic_env() -> None:
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
     os.environ["REDIS_URL"] = ""
     os.environ["DATA_DIR"] = _TMPDIR
+    # This check pins the LEGACY periodic-rescan contract (issue #513 AC24).
+    # Under the issue #559 DB-claimed lease the rescan is deliberately not
+    # published - the janitor owns orphan settlement - so run the processor
+    # in legacy mode here; the lease-mode settlement e2e lives in
+    # tests/test_559_c05_proving.py.
+    os.environ["INGESTION_JOB_LEASE_ENABLED"] = "false"
 
 _WAIT_S = 8.0
 
@@ -125,6 +131,9 @@ async def _scenario_part_b(db_path: str, tmp: Path) -> str:
     processor = bt.BackgroundProcessor(
         max_retries=1, retry_delay=0.01, pool=get_pool(db_path, max_size=3)
     )
+    # Legacy mode: the env var cannot reach the already-instantiated Settings
+    # singleton under pytest, so pin the transport switch directly.
+    processor._ingest_lease_enabled = False
     processed: list[int] = []
     enqueued: list[int] = []
 
@@ -214,6 +223,9 @@ async def _scenario() -> str:
     processor = bt.BackgroundProcessor(
         max_retries=1, retry_delay=0.01, pool=get_pool(db_path, max_size=3)
     )
+    # Legacy mode: the env var cannot reach the already-instantiated Settings
+    # singleton under pytest, so pin the transport switch directly.
+    processor._ingest_lease_enabled = False
     try:
         await asyncio.wait_for(processor.start(), timeout=6.0)
         cap_found, cap_detail = _periodic_capability(processor, settings)

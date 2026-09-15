@@ -1723,6 +1723,17 @@ def run_migrations(sqlite_path: str) -> None:
     init_db(sqlite_path)
     migrate_add_migration_journal(sqlite_path)
 
+    # Shared job-lease table (issue #559): one DB-claimed lease model for the
+    # background workers. Idempotent (IF NOT EXISTS), so it converges on fresh
+    # and legacy databases alike.
+    from app.services.job_lease import ensure_jobs_schema
+
+    _jobs_conn = sqlite3.connect(sqlite_path)
+    try:
+        ensure_jobs_schema(_jobs_conn)
+    finally:
+        _jobs_conn.close()
+
     # Migrate refresh token index from non-unique to unique
     conn = sqlite3.connect(sqlite_path)
     try:
