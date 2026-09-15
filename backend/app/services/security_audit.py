@@ -13,20 +13,11 @@ from typing import Any, Optional
 from fastapi import Request
 
 from app.config import settings
+from app.services.audit_keys import (
+    derive_audit_key as _audit_key,  # noqa: F401 — shared derivation (issue #561)
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _audit_key() -> bytes:
-    secret = settings.jwt_secret_key.strip() or settings.admin_secret_token.strip()
-    if not secret:
-        logger.warning(
-            "audit_key: neither JWT_SECRET_KEY nor ADMIN_SECRET_TOKEN is set; "
-            "audit HMAC will use a development fallback that is not persistent "
-            "across restarts. Set at least one secret for production."
-        )
-        secret = "development-audit-key"
-    return secret.encode("utf-8")
 
 
 def _request_ip(request: Optional[Request]) -> Optional[str]:
