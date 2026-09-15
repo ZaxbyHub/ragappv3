@@ -276,3 +276,65 @@ async def test_c05_janitor_caps_orphan_lease_at_attempt_limit_without_claim(tmp_
         await asyncio.wait_for(processor.stop(), timeout=30)
     finally:
         pool.close_all()
+
+
+@pytest.mark.asyncio
+async def test_c05_janitor_leaves_live_lease_alone(tmp_path):
+    """The janitor pass must NEVER reclaim a live (fresh-heartbeat) running
+    lease — the lease-mode analogue of the legacy rescan's live-lease guard
+    (issue #513 AC24). A fresh-heartbeat orphan and a stale crash-orphan are
+    planted side by side; only the stale one may settle."""
+    db_path, conn = _seed(tmp_path)
+    pool = SQLiteConnectionPool(db_path, max_size=2)
+    try:
+        _, stale_job_id = _plant_crash_orphan(
+            sqlite3.connect(db_path), tmp_path, attempts=settings.jobs_max_attempts
+        )
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO jobs (queue, payload_json, status, worker_id, "
+            "lease_generation, attempts, heartbeat_at, started_at) VALUES "
+            "('ingestion', '{}', 'running', 'live-worker', 7, 1, "
+            "datetime('now'), datetime('now'))"
+        )
+        conn.commit()
+        live_job_id = int(
+            conn.execute(
+                "SELECT id FROM jobs WHERE worker_id = 'live-worker'"
+            ).fetchone()[0]
+        )
+
+        processor = BackgroundProcessor(pool=pool, retry_delay=0.05)
+        await asyncio.wait_for(processor.start(), timeout=10)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SETTLE_TIMEOUT_SECONDS
+        while loop.time() < deadline:
+            if (
+                conn.execute(
+                    "SELECT status FROM jobs WHERE id = ?", (stale_job_id,)
+                ).fetchone()["status"]
+                == "failed"
+            ):
+                break
+            await asyncio.sleep(0.25)
+
+        stale = conn.execute(
+            "SELECT status FROM jobs WHERE id = ?", (stale_job_id,)
+        ).fetchone()["status"]
+        live = conn.execute(
+            "SELECT status, worker_id, lease_generation, attempts FROM jobs "
+            "WHERE id = ?",
+            (live_job_id,),
+        ).fetchone()
+        assert stale == "failed", "stale crash-orphan must be settled"
+        assert live["status"] == "running", (
+            "the janitor stole a live (fresh-heartbeat) lease"
+        )
+        assert live["worker_id"] == "live-worker"
+        assert live["lease_generation"] == 7
+        assert live["attempts"] == 1
+        await asyncio.wait_for(processor.stop(timeout=10), timeout=20)
+    finally:
+        pool.close_all()

@@ -561,6 +561,22 @@ def main() -> int:
     admission_str_settings = {
         "ADMISSION_STORE_URL": "admission_store_url",
     }
+    # DB-claimed job lease (issue #559, stage 1): the runtime switch is
+    # env-only by design (deliberately absent from SettingsUpdate) but must
+    # still carry the same value across config.py, .env.example and
+    # docker-compose.yml; the three knobs are admin-settable and typed.
+    job_lease_bool_settings = {
+        "INGESTION_JOB_LEASE_ENABLED": "ingestion_job_lease_enabled",
+    }
+    job_lease_float_settings = {
+        "JOBS_HEARTBEAT_INTERVAL_SECONDS": "jobs_heartbeat_interval_seconds",
+        "JOBS_LEASE_RECLAIM_TIMEOUT_SECONDS": (
+            "jobs_lease_reclaim_timeout_seconds"
+        ),
+    }
+    job_lease_int_settings = {
+        "JOBS_MAX_ATTEMPTS": "jobs_max_attempts",
+    }
     for env_name, field_name, reader in (
         *(
             (env_name, field_name, backend_bool_default)
@@ -573,6 +589,18 @@ def main() -> int:
         *(
             (env_name, field_name, backend_empty_str_default)
             for env_name, field_name in admission_str_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_bool_default)
+            for env_name, field_name in job_lease_bool_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_float_default)
+            for env_name, field_name in job_lease_float_settings.items()
+        ),
+        *(
+            (env_name, field_name, backend_int_default)
+            for env_name, field_name in job_lease_int_settings.items()
         ),
     ):
         backend_val = reader(backend_config, field_name)

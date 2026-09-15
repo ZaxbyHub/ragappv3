@@ -988,9 +988,15 @@ class BackgroundProcessor:
         def _count() -> int:
             with self.processor.pool.connection() as conn:
                 ensure_jobs_schema(conn)
+                # Deferred (run_after in the future) rows are NOT outstanding
+                # work: no worker can claim them yet and no worker holds them,
+                # so waiting for them would burn the whole shutdown timeout.
+                # They survive as pending and resume on the next boot.
                 row = conn.execute(
                     "SELECT COUNT(*) FROM jobs WHERE queue = ? "
-                    "AND status IN ('pending', 'running')",
+                    "AND status IN ('pending', 'running') "
+                    "AND (status = 'running' OR run_after IS NULL "
+                    "OR run_after <= CURRENT_TIMESTAMP)",
                     (INGESTION_QUEUE,),
                 ).fetchone()
                 return int(row[0])
@@ -2324,8 +2330,9 @@ class BackgroundProcessor:
         # Phase 1b (issue #559): in lease mode, let workers drain the durable
         # queue before the shutdown flag stops claiming — the graceful
         # analogue of "pending queue items ARE processed before shutdown".
-        # Deferred (run_after) rows can outlive the timeout legitimately; the
-        # release sweep below hands them back to the next boot untouched.
+        # Deferred (run_after in the future) rows are excluded from the wait
+        # (no worker can claim them mid-deferral); they survive as pending
+        # and resume on the next lease-enabled boot.
         if getattr(self, "_ingest_lease_enabled", False):
             try:
                 await asyncio.wait_for(
@@ -2737,7 +2744,7 @@ class BackgroundProcessor:
                 task = await asyncio.wait_for(
                     self.queue.get(),
                     timeout=(
-                        0.05
+                        0.25
                         if getattr(self, "_ingest_lease_enabled", False)
                         else 0.5
                     ),
