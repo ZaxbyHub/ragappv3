@@ -298,3 +298,85 @@ async def test_jobs_migration_second_run_creates_zero_rows(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2
     finally:
         pool.close_all()
+
+@pytest.mark.asyncio
+async def test_lease_mode_processing_exception_cap_persists_redacted_error(
+    tmp_path, monkeypatch
+):
+    """A genuine processing exception reaching the lease attempt cap must
+    persist a REDACTED files.error_message (issue #562): the exception
+    object is redacted at the persist boundary; its raw str() stays in the
+    jobs table (server-side sink) and the server log only. Mutation guard:
+    reverting the lease terminal branch to pass outcome_error (str)
+    re-opens the leak and this test goes red."""
+    from app.services.document_processor import (
+        INGEST_ERROR_PARSE_FAILED,
+        format_ingest_error,
+    )
+
+    class _PassingAdmit:
+        async def __aenter__(self):
+            return None
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+    class _PassingController:
+        def admit(self, *args, **kwargs):
+            return _PassingAdmit()
+
+    monkeypatch.setattr(bt, "get_admission_controller", lambda: _PassingController())
+
+    async def _explode(self, task):
+        raise ValueError(
+            "lease-cap probe raw failure C:\\server\\secret\\vaults\\1\\uploads\\f.txt"
+        )
+
+    monkeypatch.setattr(BackgroundProcessor, "_run_task_processing", _explode)
+
+    db_path, conn = _seed(tmp_path)
+    pool = SQLiteConnectionPool(db_path, max_size=2)
+    try:
+        conn.execute(
+            "INSERT INTO files (id, vault_id, file_path, file_name, file_size, "
+            "status) VALUES (7, 1, 'uploads/f.txt', 'f.txt', 10, 'processing')"
+        )
+        conn.commit()
+        real_file = tmp_path / "cap-probe.txt"
+        real_file.write_text("data")
+        processor = BackgroundProcessor(pool=pool, retry_delay=0.05)
+        await asyncio.wait_for(processor.start(), timeout=10)
+        await processor.enqueue(str(real_file), 1, file_id=7)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 60
+
+        def _terminal():
+            row = conn.execute(
+                "SELECT status FROM jobs WHERE queue = "
+                "'ingestion' AND json_extract(payload_json, '$.file_id') = 7"
+            ).fetchone()
+            return row is not None and row["status"] == "failed"
+
+        while loop.time() < deadline and not _terminal():
+            await asyncio.sleep(0.25)
+        assert _terminal(), "processing-exception job never settled terminally"
+
+        files_row = conn.execute(
+            "SELECT error_message FROM files WHERE id = 7"
+        ).fetchone()
+        assert files_row is not None
+        assert files_row["error_message"] == format_ingest_error(
+            INGEST_ERROR_PARSE_FAILED
+        )
+        assert "lease-cap probe" not in (files_row["error_message"] or "")
+
+        job_row = conn.execute(
+            "SELECT error FROM jobs WHERE "
+            "json_extract(payload_json, '$.file_id') = 7"
+        ).fetchone()
+        assert job_row["error"] is not None
+        assert "attempt_cap_exceeded" in job_row["error"]
+        await asyncio.wait_for(processor.stop(timeout=10), timeout=20)
+    finally:
+        pool.close_all()

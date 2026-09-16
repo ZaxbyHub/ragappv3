@@ -23,7 +23,11 @@ from app.services.admission import (
 )
 
 from ..models.database import SQLiteConnectionPool
-from .document_processor import DocumentProcessingError, DocumentProcessor
+from .document_processor import (
+    DocumentProcessingError,
+    DocumentProcessor,
+    redact_ingest_error,
+)
 from .embeddings import EmbeddingService
 from .job_lease import JobLease, ensure_jobs_schema
 from .llm_client import LLMClient
@@ -950,6 +954,7 @@ class BackgroundProcessor:
             name=f"ingest-heartbeat-{job_id}",
         )
         outcome_error: Optional[str] = None
+        outcome_exc: Optional[BaseException] = None
         try:
             try:
                 async with get_admission_controller().admit(
@@ -962,6 +967,12 @@ class BackgroundProcessor:
                 outcome_error = f"admission rejected: {exc.reason}"
             except Exception as exc:  # noqa: BLE001 — outcome drives settle
                 outcome_error = str(exc)
+                # Retained so the terminal branch hands the exception object
+                # (redacted at the persist boundary) to the permanent-failure
+                # path instead of its raw str(): the jobs-table error field is
+                # a server-side sink, files.error_message is user-facing
+                # (issue #562).
+                outcome_exc = exc
 
             if outcome_error is None:
                 await self._settle_ingest_job(job_id, worker_id, "complete")
@@ -992,7 +1003,9 @@ class BackgroundProcessor:
                     "fail",
                     error=f"attempt_cap_exceeded: {outcome_error}"[:500],
                 )
-                self._mark_task_permanently_failed(task, outcome_error)
+                self._mark_task_permanently_failed(
+                    task, outcome_exc if outcome_exc is not None else outcome_error
+                )
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
@@ -3258,19 +3271,22 @@ class BackgroundProcessor:
             await self._run_task_processing(task)
         except DocumentProcessingError as e:
             logger.error(f"Processing error for {task.file_path}: {e}")
-            await self._handle_failure(task, str(e))
+            await self._handle_failure(task, e)
 
         except Exception as e:
             logger.error(f"Unexpected error processing {task.file_path}: {e}")
-            await self._handle_failure(task, str(e))
+            await self._handle_failure(task, e)
 
-    async def _handle_failure(self, task: TaskItem, error_message: str) -> None:
+    async def _handle_failure(self, task: TaskItem, error: BaseException | str) -> None:
         """
         Handle task failure with retry logic.
 
         Args:
             task: The failed task
-            error_message: Error message from the failure
+            error: The caught exception, or an operator-constructed constant
+                string. ``str`` is trusted verbatim (operator constants); only
+                ``BaseException`` payloads are redacted before persistence,
+                because the persisted error fields are user-facing (issue #562).
 
         Schedules a deferred retry with incremented attempt count if retries
         remain (issue #513 W11 / RC-6: the backoff sleeps in the dedicated
@@ -3319,9 +3335,9 @@ class BackgroundProcessor:
                     "Task retry for %s could not be scheduled (retry backlog "
                     "full); treating as permanent failure: %s",
                     task.file_path,
-                    error_message,
+                    error,
                 )
-                self._mark_task_permanently_failed(task, error_message)
+                self._mark_task_permanently_failed(task, error)
             elif task.file_id is not None:
                 # The retry ticket owns a queue slot even while it waits in the
                 # deferred scheduler. This prevents recovery from claiming the
@@ -3337,9 +3353,15 @@ class BackgroundProcessor:
                 # the wrapper must not release it when this attempt settles.
                 task.recovery_claim = False
         else:
-            self._mark_task_permanently_failed(task, error_message)
+            self._mark_task_permanently_failed(task, error)
 
-    def _mark_task_permanently_failed(self, task: TaskItem, error_message: str) -> None:
+    def _mark_task_permanently_failed(
+        self, task: TaskItem, error: BaseException | str
+    ) -> None:
+        # ``str`` is trusted verbatim (operator constants); only BaseException
+        # payloads are redacted, because the persisted error fields are
+        # user-facing (issue #562).
+        safe_error = error if isinstance(error, str) else redact_ingest_error(error)
         # Mark file as error in database so it doesn't stay in 'processing'
         if task.file_id is not None and self.processor.pool is not None:
             try:
@@ -3347,7 +3369,7 @@ class BackgroundProcessor:
                     conn.execute(
                         "UPDATE files SET status='error', "
                         "error_message=?, phase='error' WHERE id = ?",
-                        (error_message[:500], task.file_id),
+                        (safe_error[:500], task.file_id),
                     )
                     conn.commit()
             except Exception:
@@ -3357,7 +3379,7 @@ class BackgroundProcessor:
                 )
         logger.error(
             f"Task permanently failed for {task.file_path} "
-            f"after {self.max_retries} attempts: {error_message}"
+            f"after {self.max_retries} attempts: {error}"
         )
 
     @property

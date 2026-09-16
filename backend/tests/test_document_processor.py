@@ -345,7 +345,12 @@ CREATE TABLE posts (
 
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "error")
-        self.assertIn("zero LanceDB rows", row["error_message"])
+        # Issue #562: persisted error_message is the stable user-facing code;
+        # the raw detail ("zero LanceDB rows") stays in the raised exception
+        # and the server log only.
+        self.assertEqual(
+            row["error_message"], "PARSE_FAILED: document could not be parsed"
+        )
 
     def test_process_file_persists_chunks_failed_on_partial_embedding_failure(self):
         """Dropped chunks from partial embedding failures are recorded (Issue #221)."""
@@ -847,15 +852,21 @@ CREATE TABLE posts (
         self.processor.embedding_service = MismatchedEmbeddingService()
         self.processor._chunk_enrichment_service = FakeEnrichmentService()
         try:
-            asyncio.run(
-                self.processor.run_enrichment_job(
-                    file_id=75,
-                    file_path=self.sql_file_path,
-                    vault_id=1,
-                    file_hash="abcdef012345",
-                    chunks=[chunk],
-                    document_text="indexed text",
+            with self.assertLogs(
+                "app.services.document_processor", level="WARNING"
+            ) as captured:
+                asyncio.run(
+                    self.processor.run_enrichment_job(
+                        file_id=75,
+                        file_path=self.sql_file_path,
+                        vault_id=1,
+                        file_hash="abcdef012345",
+                        chunks=[chunk],
+                        document_text="indexed text",
+                    )
                 )
+            self.assertIn(
+                "Enriched embedding count mismatch", "\n".join(captured.output)
             )
         finally:
             settings.chunk_enrichment_enabled = original_enabled
@@ -869,7 +880,13 @@ CREATE TABLE posts (
 
         self.assertEqual(row["status"], "indexed")
         self.assertEqual(row["enrichment_status"], "error")
-        self.assertIn("Enriched embedding count mismatch", row["enrichment_error"])
+        # Issue #562: enrichment_error carries the dedicated enrichment
+        # code (the document itself is indexed); the raw mismatch detail
+        # stays in the server log only.
+        self.assertEqual(
+            row["enrichment_error"],
+            "ENRICHMENT_FAILED: content enrichment failed; the indexed document is unaffected",
+        )
 
     def test_post_index_enrichment_failure_does_not_change_indexed_status(self):
         """A failed enrichment job records enrichment error but leaves file indexed."""
@@ -900,15 +917,21 @@ CREATE TABLE posts (
         self.processor._llm_client = object()
         self.processor._chunk_enrichment_service = FailingEnrichmentService()
         try:
-            asyncio.run(
-                self.processor.run_enrichment_job(
-                    file_id=77,
-                    file_path=self.sql_file_path,
-                    vault_id=1,
-                    file_hash="abcdef012345",
-                    chunks=[chunk],
-                    document_text="indexed text",
+            with self.assertLogs(
+                "app.services.document_processor", level="WARNING"
+            ) as captured:
+                asyncio.run(
+                    self.processor.run_enrichment_job(
+                        file_id=77,
+                        file_path=self.sql_file_path,
+                        vault_id=1,
+                        file_hash="abcdef012345",
+                        chunks=[chunk],
+                        document_text="indexed text",
+                    )
                 )
+            self.assertIn(
+                "LLM offline", "\n".join(captured.output)
             )
         finally:
             settings.chunk_enrichment_enabled = original_enabled
@@ -923,7 +946,12 @@ CREATE TABLE posts (
         self.assertEqual(row["status"], "indexed")
         self.assertIsNone(row["error_message"])
         self.assertEqual(row["enrichment_status"], "error")
-        self.assertIn("LLM offline", row["enrichment_error"])
+        # Issue #562: enrichment_error carries the dedicated enrichment
+        # code; the raw detail stays in the server log only.
+        self.assertEqual(
+            row["enrichment_error"],
+            "ENRICHMENT_FAILED: content enrichment failed; the indexed document is unaffected",
+        )
 
     def test_cancelled_enrichment_marks_error_and_preserves_indexed_status(self):
         """Regression: cancellation after processing starts must not leave status stuck."""
