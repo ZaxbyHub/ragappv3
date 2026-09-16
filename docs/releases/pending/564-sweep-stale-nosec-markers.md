@@ -28,10 +28,11 @@ could never see it, because a suppressed finding never enters the diff.
 - Marker audit across the scanned targets (`backend/app`, `scripts/backup_set.py`,
   `scripts/restore.py`): 42 markers at base. Empirical disposition (delete and
   re-scan): 35 markers suppress live B608 findings on safe, parameterized SQL —
-  retained; 18 sites gained explicit per-site rationale comments in this change,
-  while the rest already carried a trailing or adjacent rationale (the six bare
-  `# nosec B608` markers in `draft_store.py` sit directly beneath existing
-  "clause is built only from literal fragments" comments) — the issue's original
+  retained; 17 sites gained explicit per-site rationale comments in this change
+  (14 in `draft_store.py`, 3 in `draft_pipeline.py`), while the rest already
+  carried trailing or adjacent rationale (the six bare `# nosec B608` markers
+  in `draft_store.py` sit directly beneath existing "clause is built only from
+  literal fragments" comments) — the issue's original
   "every marker suppresses nothing" claim is refuted by the live run, as the
   maintainer comment anticipated. 3 markers suppressed nothing
   (`backend/app/models/database.py:1648`, `:2659`, `backend/app/services/draft_store.py:2864`)
