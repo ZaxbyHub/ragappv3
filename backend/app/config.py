@@ -203,6 +203,24 @@ class Settings(BaseSettings):
     (issue #513 W25). Each tick re-enqueues stranded pending/processing rows
     (with an active-job lease guard); the startup sweep is separate and runs
     unconditionally. Range 60.0-86400.0."""
+    jobs_heartbeat_interval_seconds: float = 30.0
+    """Interval in seconds between lease-heartbeat renewals for a running
+    ingestion job (issue #559). Must stay well below the reclaim timeout so a
+    slow-but-alive worker is never mistaken for a dead one. Range 5.0-600.0."""
+    jobs_lease_reclaim_timeout_seconds: float = 300.0
+    """Janitor reclaim timeout for ingestion job leases (issue #559): a
+    'running' job whose heartbeat is older than this is requeued (or failed at
+    the attempts cap). Must exceed 4x jobs_heartbeat_interval_seconds.
+    Range 15.0-3600.0."""
+    jobs_max_attempts: int = 3
+    """Durable attempt cap per ingestion job row (issue #559): the janitor
+    settles a row at/over this many attempts terminally instead of requeuing
+    it again. Range 1-20."""
+    ingestion_job_lease_enabled: bool = True
+    """Env-only deployment switch for the DB-claimed ingestion lease
+    (issue #559 stage 1). Deliberately NOT runtime-settable: it selects the
+    claim path at process start, and flipping it requires a restart so the
+    in-flight migration always runs before the new claim path serves work."""
 
     # ── Ingestion performance configuration ──────────────────────────────────
     ingestion_queue_max_size: int = 1000
@@ -1258,6 +1276,44 @@ class Settings(BaseSettings):
     def validate_orphan_rescan_interval_seconds(cls, v: float) -> float:
         """Validate orphan rescan interval is in range 60.0-86400.0 seconds."""
         return cls._validate_float_range(v, 60.0, 86400.0, "orphan_rescan_interval_seconds")
+
+    @field_validator("jobs_heartbeat_interval_seconds", mode="after")
+    @classmethod
+    def validate_jobs_heartbeat_interval_seconds(cls, v: float) -> float:
+        """Validate job-lease heartbeat interval is in range 5.0-600.0 seconds."""
+        return cls._validate_float_range(v, 5.0, 600.0, "jobs_heartbeat_interval_seconds")
+
+    @field_validator("jobs_lease_reclaim_timeout_seconds", mode="after")
+    @classmethod
+    def validate_jobs_lease_reclaim_timeout_seconds(cls, v: float) -> float:
+        """Validate job-lease reclaim timeout is in range 15.0-3600.0 seconds."""
+        return cls._validate_float_range(
+            v, 15.0, 3600.0, "jobs_lease_reclaim_timeout_seconds"
+        )
+
+    @field_validator("jobs_max_attempts", mode="after")
+    @classmethod
+    def validate_jobs_max_attempts(cls, v: int) -> int:
+        """Validate the durable per-job attempt cap is in range 1-20."""
+        return cls._validate_int_range(v, 1, 20, "jobs_max_attempts")
+
+    @model_validator(mode="after")
+    def validate_jobs_lease_coherence(self) -> "Settings":
+        """The janitor reclaim timeout must exceed 4x the heartbeat interval.
+
+        A reclaim timeout at or below a few heartbeat intervals would let the
+        janitor steal leases from slow-but-alive workers under ordinary event
+        loop contention (issue #559 / R4-S16).
+        """
+        if (
+            self.jobs_lease_reclaim_timeout_seconds
+            <= 4 * self.jobs_heartbeat_interval_seconds
+        ):
+            raise ValueError(
+                "jobs_lease_reclaim_timeout_seconds must be > 4x "
+                "jobs_heartbeat_interval_seconds"
+            )
+        return self
 
     @field_validator("document_parsing_strategy", mode="after")
     @classmethod
