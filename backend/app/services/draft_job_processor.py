@@ -58,7 +58,14 @@ from app.services import draft_pipeline
 from app.services.admission import AdmissionClass, get_admission_controller
 from app.services.document_extraction import DocumentExtractionError
 from app.services.draft_events import build_event, get_draft_event_bus
-from app.services.draft_store import DraftNotFoundError, DraftStore, sha256_text
+from app.services.draft_store import (
+    DraftNotFoundError,
+    DraftStore,
+    _draft_job_lease,
+    _draft_lease_enabled,
+    _LeaseLostError,
+    sha256_text,
+)
 
 if TYPE_CHECKING:
     from app.models.database import SQLiteConnectionPool
@@ -125,9 +132,21 @@ class DraftJobProcessor:
         # without this flag the same "engine not wired" condition would log
         # once per poll for the whole deferral window.
         self._warned_unwired_compile_claim = False
+        # Lease-mode identity + janitor handle (issue #559 stage 4). Claims
+        # and every fenced terminal write carry this worker id; the janitor
+        # loop recovers only leases whose heartbeat expired past the reclaim
+        # timeout, so a live-but-slow worker is never stolen.
+        self._worker_id = f"draft-proc-{id(self)}"
+        self._janitor_task: Optional[asyncio.Task] = None
         # Strong references to detached background tasks so CPython does not
         # garbage-collect them mid-flight, mirroring WikiCompileProcessor.
         self._bg_tasks: set[asyncio.Task] = set()
+
+    def _fence_kwargs(self) -> dict:
+        """Terminal-write fence kwargs in lease mode (empty in legacy mode)."""
+        if _draft_lease_enabled():
+            return {"worker_id": self._worker_id}
+        return {}
 
     def set_rag_engine(self, engine: Any) -> None:
         """Wire the live ``RAGEngine`` singleton in after construction.
@@ -194,6 +213,11 @@ class DraftJobProcessor:
         self._running = False
         task = self._task
         self._task = None
+        janitor = self._janitor_task
+        self._janitor_task = None
+        if janitor and not janitor.done():
+            janitor.cancel()
+            await asyncio.gather(janitor, return_exceptions=True)
         if task and not task.done():
             task.cancel()
             try:
@@ -335,6 +359,20 @@ class DraftJobProcessor:
     # ------------------------------------------------------------------
 
     async def _poll_loop(self) -> None:
+        if _draft_lease_enabled() and self._janitor_task is None:
+            # Lease janitor (issue #559 stage 4): recover only expired
+            # leases; startup recovery already handled all rows. Spawned
+            # here rather than in start() so start() keeps exactly two task
+            # publications (reset -> poll), the lifecycle contract pinned by
+            # test_compile_processor_startup_lifecycle_static.py.
+            janitor_coro = self._janitor_loop()
+            try:
+                self._janitor_task = asyncio.create_task(
+                    janitor_coro, name="draft-janitor"
+                )
+            except BaseException:
+                janitor_coro.close()
+                raise
         while self._running:
             try:
                 job = await asyncio.to_thread(self._claim_next_job)
@@ -347,16 +385,33 @@ class DraftJobProcessor:
                     job.id,
                     job.draft_id,
                 )
-                # E3 admission (issue #518): background budget for draft
-                # jobs. Unlike the wiki/kms compile loops there is no
-                # per-job failure handler here: a rejection surfaces as a
-                # poll-loop error below (logged, backoff, keep polling) and
-                # the already-claimed row is recovered by the existing
-                # startup orphan recovery — no silent retry bookkeeping.
-                async with get_admission_controller().admit(
-                    AdmissionClass.BACKGROUND, foreground=False
-                ):
-                    await self._run_job(job)
+                # Lease mode (issue #559 stage 4): renew the held lease while
+                # the job runs, so a long model call never looks like a dead
+                # worker; every fenced write is bounded to this worker either
+                # way.
+                heartbeat_task: Optional[asyncio.Task] = None
+                if _draft_lease_enabled():
+                    heartbeat_task = asyncio.create_task(
+                        self._heartbeat_loop(job.id),
+                        name=f"draft-heartbeat-{job.id}",
+                    )
+                try:
+                    # E3 admission (issue #518): background budget for draft
+                    # jobs. Unlike the wiki/kms compile loops there is no
+                    # per-job failure handler here: a rejection surfaces as a
+                    # poll-loop error below (logged, backoff, keep polling) and
+                    # the already-claimed row is recovered by the existing
+                    # startup orphan recovery — no silent retry bookkeeping.
+                    async with get_admission_controller().admit(
+                        AdmissionClass.BACKGROUND, foreground=False
+                    ):
+                        await self._run_job(job)
+                finally:
+                    if heartbeat_task is not None:
+                        heartbeat_task.cancel()
+                        await asyncio.gather(
+                            heartbeat_task, return_exceptions=True
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -368,10 +423,112 @@ class DraftJobProcessor:
                 logger.exception("DraftJobProcessor: poll loop error")
                 await asyncio.sleep(self._poll_interval)
 
+    async def _heartbeat_loop(self, job_id: int) -> None:
+        """Renew a held draft lease every heartbeat interval until it is lost.
+
+        The renewal runs through the shared lease primitive parameterized on
+        ``draft_jobs`` — the same fenced predicate the claims and terminal
+        writes use.
+        """
+        interval = max(1.0, float(settings.jobs_heartbeat_interval_seconds))
+
+        while True:
+            await asyncio.sleep(interval)
+
+            def _renew():
+                with self._pool.connection() as conn:
+                    return _draft_job_lease(conn).heartbeat(
+                        job_id, self._worker_id
+                    )
+
+            try:
+                renewed = await asyncio.to_thread(_renew)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — a missed beat is not fatal
+                logger.debug(
+                    "DraftJobProcessor: heartbeat renewal failed for job %s",
+                    job_id,
+                )
+                continue
+            if not renewed:
+                return
+
+    async def _janitor_loop(self) -> None:
+        """Reclaim expired draft leases (issue #559 stage 4).
+
+        Runs the business-aware orphan recovery scoped to leases whose
+        ``heartbeat_at`` expired past the reclaim timeout — a live worker's
+        row is never touched, and a reclaimed worker's late writes are fenced
+        off by its worker id.
+        """
+        interval = max(5.0, float(settings.jobs_heartbeat_interval_seconds))
+        while self._running:
+            # Sleep BEFORE the first sweep: startup recovery already handled
+            # every row at boot, and the deferred first pass keeps the
+            # janitor's to_thread out of the startup lifecycle window the
+            # lifecycle tests pin (reset -> poll publication order).
+            await asyncio.sleep(interval)
+            if not self._running:
+                break
+            try:
+                await asyncio.to_thread(self._reclaim_expired_leases)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — janitor must never kill the loop
+                logger.exception("DraftJobProcessor: janitor sweep failed")
+
+    def _reclaim_expired_leases(self) -> int:
+        cutoff = f"-{float(settings.jobs_lease_reclaim_timeout_seconds)} seconds"
+        cap = max(int(settings.jobs_max_attempts), 1)
+        with self._pool.connection() as conn:
+            store = DraftStore(conn)
+            # Attempts cap first (issue #559 stage 4): a crash-looping job
+            # whose durable attempts counter reached the cap settles
+            # terminally instead of being resurrected by the recovery —
+            # the same `lease_attempt_cap_exceeded` contract the shared
+            # janitor enforces on the jobs-table queues.
+            expired = conn.execute(
+                """
+                SELECT id, draft_id, job_type, attempts FROM draft_jobs
+                WHERE status = 'running'
+                  AND heartbeat_at IS NOT NULL
+                  AND heartbeat_at < datetime('now', ?)
+                """,
+                (cutoff,),
+            ).fetchall()
+            capped = 0
+            for row in expired:
+                if int(row["attempts"] or 0) < cap:
+                    continue
+                store.settle_expired_job_at_lease_cap(
+                    job_id=int(row["id"]),
+                    draft_id=int(row["draft_id"]),
+                    job_type=row["job_type"],
+                )
+                capped += 1
+            if capped:
+                logger.warning(
+                    "DraftJobProcessor: janitor settled %d expired draft "
+                    "lease(s) at the attempts cap",
+                    capped,
+                )
+            parse_reset = store.recover_orphaned_parse_jobs(heartbeat_cutoff=cutoff)
+            compile_reset = store.recover_orphaned_compile_jobs(
+                heartbeat_cutoff=cutoff
+            )
+        total = capped + parse_reset + compile_reset
+        if total:
+            logger.warning(
+                "DraftJobProcessor: janitor reclaimed %d expired draft lease(s)",
+                total,
+            )
+        return total
+
     def _claim_next_job(self) -> Optional["DraftJobRecord"]:
         with self._pool.connection() as conn:
             store = DraftStore(conn)
-            job = store.claim_next_parse_job()
+            job = store.claim_next_parse_job(worker_id=self._worker_id)
             if job is not None:
                 return job
             # Compile jobs stay pending until the RAG engine is wired (issue
@@ -393,7 +550,7 @@ class DraftJobProcessor:
                         "engine not wired yet; compile claiming deferred"
                     )
                 return None
-            return store.claim_next_compile_job()
+            return store.claim_next_compile_job(worker_id=self._worker_id)
 
     # ------------------------------------------------------------------
     # Per-job dispatch
@@ -413,6 +570,15 @@ class DraftJobProcessor:
             await self._dispatch_job(job)
         except asyncio.CancelledError:
             raise
+        except _LeaseLostError:
+            # Lease mode (issue #559 stage 4): the job was reclaimed or
+            # settled by someone else while we ran — a disowned worker makes
+            # NO terminal write of its own; the janitor owns settlement.
+            logger.warning(
+                "DraftJobProcessor: job id=%s lease lost mid-run; aborting "
+                "without a terminal write",
+                job.id,
+            )
         except Exception as exc:
             logger.error(
                 "DraftJobProcessor: job id=%d dispatch raised %s",
@@ -602,7 +768,12 @@ class DraftJobProcessor:
 
         deps = draft_pipeline.default_deps(engine=self._engine)
         try:
-            await draft_pipeline.run_compile(job_id=job.id, pool=self._pool, deps=deps)
+            await draft_pipeline.run_compile(
+                job_id=job.id,
+                pool=self._pool,
+                deps=deps,
+                worker_id=self._worker_id if _draft_lease_enabled() else None,
+            )
         except draft_pipeline.CompileFailure as failure:
             if (
                 failure.retryable
@@ -689,7 +860,12 @@ class DraftJobProcessor:
         with self._pool.connection() as conn:
             store = DraftStore(conn)
             try:
-                store.set_job_status(job_id=job.id, target="failed", error_code=code)
+                store.set_job_status(
+                    job_id=job.id,
+                    target="failed",
+                    error_code=code,
+                    **self._fence_kwargs(),
+                )
             except Exception:
                 logger.error(
                     "DraftJobProcessor: could not fail compile job id=%d", job.id
@@ -909,14 +1085,28 @@ class DraftJobProcessor:
                         job.input_id,
                     ),
                 )
-                conn.execute(
+                success_params: list = [job.id]
+                success_sql = (
                     "UPDATE draft_jobs SET status = 'completed', "
                     "error_code = NULL, error_message = NULL, "
                     "progress_percent = 100.0, "
                     "heartbeat_at = CURRENT_TIMESTAMP, "
-                    "completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (job.id,),
+                    "completed_at = CURRENT_TIMESTAMP WHERE id = ?"
                 )
+                if _draft_lease_enabled():
+                    # Lease fence (issue #559 stage 4): a parse worker whose
+                    # lease expired mid-extraction must not commit success
+                    # over a row the janitor requeued or a new claimant owns.
+                    # DISTINCT from the cancel-race False above: rowcount 0
+                    # here raises so no completion is published at all.
+                    success_sql += " AND worker_id = ? AND status = 'running'"
+                    success_params.append(self._worker_id)
+                success_cursor = conn.execute(success_sql, success_params)  # nosec B608 — fence fragment is a fixed literal
+                if _draft_lease_enabled() and success_cursor.rowcount == 0:
+                    raise _LeaseLostError(
+                        f"job {job.id} no longer owned by worker "
+                        f"{self._worker_id!r}"
+                    )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -932,13 +1122,22 @@ class DraftJobProcessor:
                 input_id=job.input_id, target="failed", parse_error=code
             )
             store.set_job_status(
-                job_id=job.id, target="failed", error_code=code, error_message=message
+                job_id=job.id,
+                target="failed",
+                error_code=code,
+                error_message=message,
+                **self._fence_kwargs(),
             )
 
     def _fail_job_sync(self, job: "DraftJobRecord", *, code: str) -> None:
         with self._pool.connection() as conn:
             store = DraftStore(conn)
-            store.set_job_status(job_id=job.id, target="failed", error_code=code)
+            store.set_job_status(
+                job_id=job.id,
+                target="failed",
+                error_code=code,
+                **self._fence_kwargs(),
+            )
 
     def _fail_over_limit_sync(self, job: "DraftJobRecord", char_count: int) -> None:
         with self._pool.connection() as conn:
@@ -953,6 +1152,7 @@ class DraftJobProcessor:
                 job_id=job.id,
                 target="failed",
                 error_code=CODE_PARSED_TEXT_LIMIT_EXCEEDED,
+                **self._fence_kwargs(),
             )
 
     def _cancel_job_and_input_sync(self, job: "DraftJobRecord") -> None:
@@ -962,7 +1162,9 @@ class DraftJobProcessor:
             # to 'cancelled' via the ordinary table, which is the state it is
             # in at this point in the flow.
             store.set_input_parse_status(input_id=job.input_id, target="cancelled")
-            store.set_job_status(job_id=job.id, target="cancelled")
+            store.set_job_status(
+                job_id=job.id, target="cancelled", **self._fence_kwargs()
+            )
 
     # ------------------------------------------------------------------
     # Async wrappers that persist then publish (publish only after commit)

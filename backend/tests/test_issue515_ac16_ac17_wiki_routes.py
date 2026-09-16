@@ -39,7 +39,22 @@ except ImportError:
 
     sys.modules["pyarrow"] = types.ModuleType("pyarrow")
 
+import pytest
 from test_wiki_routes import WikiNewRouteTestBase
+
+
+@pytest.fixture(autouse=True)
+def _legacy_wiki_kms_lease_mode(monkeypatch):
+    """Pin the wiki/KMS legacy claim path (issue #559 stage 2): these tests
+    characterize the pre-lease ``*_compile_jobs`` behavior that remains the
+    documented rollback surface; unified-store equivalents live in the 559
+    frozen family. Restored per test so defaults are untouched elsewhere."""
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(
+        _settings, "wiki_kms_job_lease_enabled", False, raising=False
+    )
+
 
 
 class TestIssue515Ac16PlainDocumentWikiStatus(WikiNewRouteTestBase):

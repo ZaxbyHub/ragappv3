@@ -16,8 +16,16 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+from app.config import settings
 from app.services.fts_query import FTS_CANDIDATE_CAP, build_fts_match_query
-from app.services.wiki_store import normalize_slug
+from app.services.job_lease import ensure_jobs_schema
+from app.services.wiki_store import (
+    _job_lease,
+    _lease_enabled,
+    normalize_slug,
+)
+
+KMS_QUEUE = "kms"
 
 # ---------------------------------------------------------------------------
 # DTO dataclasses
@@ -105,6 +113,26 @@ def _to_job(row: sqlite3.Row) -> KMSCompileJob:
         completed_at=d.get("completed_at"),
         input_json=d.get("input_json"),
         retry_count=d.get("retry_count") or 0,
+    )
+
+
+def _compile_job_from_jobs_row(row: sqlite3.Row) -> KMSCompileJob:
+    """Map a unified ``jobs`` row (queue='kms') onto the unchanged DTO."""
+    d = dict(row)
+    payload = json.loads(d.get("payload_json") or "{}")
+    return KMSCompileJob(
+        id=d["id"],
+        vault_id=payload.get("vault_id"),
+        trigger_type=payload.get("trigger_type") or "manual",
+        trigger_id=payload.get("trigger_id"),
+        status=d["status"],
+        error=d.get("error"),
+        result_json=d.get("result_json") or "{}",
+        created_at=d["created_at"],
+        started_at=d.get("started_at"),
+        completed_at=d.get("completed_at"),
+        input_json=payload.get("input_json"),
+        retry_count=d.get("attempts") or 0,
     )
 
 
@@ -373,6 +401,25 @@ class KMSStore:
         trigger_id: Optional[str] = None,
         input_json: Optional[Any] = None,
     ) -> KMSCompileJob:
+        if _lease_enabled():
+            # Stage 2 (issue #559): the unified jobs row IS the KMS compile
+            # job; payload_json carries enqueue inputs, result_json stays with
+            # complete_job.
+            if isinstance(input_json, dict):
+                input_json = json.dumps(input_json)
+            job_id = _job_lease(self._db).enqueue(
+                KMS_QUEUE,
+                {
+                    "vault_id": vault_id,
+                    "trigger_type": trigger_type,
+                    "trigger_id": trigger_id,
+                    "input_json": input_json or "{}",
+                },
+            )
+            row = self._db.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return _compile_job_from_jobs_row(row)
         now = datetime.utcnow().isoformat()
         if isinstance(input_json, dict):
             input_json = json.dumps(input_json)
@@ -388,6 +435,19 @@ class KMSStore:
         return _to_job(row)
 
     def list_jobs(self, vault_id: int, status: Optional[str] = None) -> list[KMSCompileJob]:
+        if _lease_enabled():
+            ensure_jobs_schema(self._db)
+            sql = (
+                "SELECT * FROM jobs WHERE queue = ? "
+                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?"
+            )
+            params: list[Any] = [KMS_QUEUE, vault_id]
+            if status:
+                sql += " AND status = ?"
+                params.append(status)
+            sql += " ORDER BY id DESC"
+            rows = self._db.execute(sql, params).fetchall()
+            return [_compile_job_from_jobs_row(r) for r in rows]
         if status:
             rows = self._db.execute(
                 "SELECT * FROM kms_compile_jobs WHERE vault_id = ? AND status = ? ORDER BY created_at DESC",
@@ -401,17 +461,34 @@ class KMSStore:
         return [_to_job(r) for r in rows]
 
     def get_job(self, job_id: int, vault_id: int) -> Optional[KMSCompileJob]:
+        if _lease_enabled():
+            ensure_jobs_schema(self._db)
+            row = self._db.execute(
+                "SELECT * FROM jobs WHERE id = ? AND queue = ? "
+                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?",
+                (job_id, KMS_QUEUE, vault_id),
+            ).fetchone()
+            return _compile_job_from_jobs_row(row) if row else None
         row = self._db.execute(
             "SELECT * FROM kms_compile_jobs WHERE id = ? AND vault_id = ?",
             (job_id, vault_id),
         ).fetchone()
         return _to_job(row) if row else None
 
-    def claim_next_pending_job(self) -> Optional[KMSCompileJob]:
+    def claim_next_pending_job(
+        self, worker_id: str = "kms-worker"
+    ) -> Optional[KMSCompileJob]:
         """Atomically claim the oldest pending job. Returns it or None.
 
-        Uses BEGIN IMMEDIATE so concurrent workers cannot claim the same row.
+        Lease mode (issue #559 stage 2): the shared ``JobLease``
+        single-statement claim replaces this store's legacy two-statement
+        ``BEGIN IMMEDIATE`` + SELECT + UPDATE — same exactly-one-claimant
+        atomicity plus worker fencing, lease generation, heartbeat and
+        durable attempts.
         """
+        if _lease_enabled():
+            row = _job_lease(self._db).claim(KMS_QUEUE, worker_id)
+            return _compile_job_from_jobs_row(row) if row else None
         now = datetime.utcnow().isoformat()
         try:
             self._db.execute("BEGIN IMMEDIATE")
@@ -435,18 +512,27 @@ class KMSStore:
         ).fetchone()
         return _to_job(row) if row else None
 
-    def complete_job(self, job_id: int, result_json: Any) -> bool:
+    def complete_job(
+        self, job_id: int, result_json: Any, worker_id: Optional[str] = None
+    ) -> bool:
         """Mark job completed. Returns True if the transition committed.
 
-        No-op (returns False) if the job was already cancelled: the UPDATE's
-        ``status != 'cancelled'`` predicate is evaluated atomically with the
-        write, so a cancellation landing between this method's call and its
-        write can never be overwritten (WIKI-004 / issue #515 — mirrors
-        WikiStore.complete_job; the old read-then-write check raced).
+        Lease mode (issue #559 stage 2): fenced on the claiming worker, so a
+        reclaimed (or cancelled) worker can never mutate the new owner's row;
+        ``worker_id`` is required there. Legacy mode keeps the atomic
+        ``status != 'cancelled'`` predicate (issue #515).
         """
-        now = datetime.utcnow().isoformat()
         if isinstance(result_json, dict):
             result_json = json.dumps(result_json)
+        if _lease_enabled():
+            if worker_id is None:
+                raise ValueError(
+                    "complete_job requires the claiming worker_id in lease mode"
+                )
+            return _job_lease(self._db).complete(
+                job_id, worker_id, json.loads(result_json or "{}")
+            )
+        now = datetime.utcnow().isoformat()
         cur = self._db.execute(
             "UPDATE kms_compile_jobs SET status = 'completed', completed_at = ?, result_json = ? "
             "WHERE id = ? AND status != 'cancelled'",
@@ -461,11 +547,40 @@ class KMSStore:
         self._db.commit()
         return True
 
-    def fail_job(self, job_id: int, error: str) -> int:
-        """Mark job failed, increment retry_count. Returns new retry_count.
+    def fail_job(
+        self, job_id: int, error: str, worker_id: Optional[str] = None
+    ) -> int:
+        """Record a failure and return the durable attempt count.
 
-        No-op if the job is already cancelled.
+        Lease mode (issue #559 stage 2): requeues with exponential backoff
+        below ``jobs_max_attempts`` (durable ``run_after`` claim gate), or
+        settles terminally at the cap — the processor schedules nothing.
         """
+        if _lease_enabled():
+            if worker_id is None:
+                raise ValueError(
+                    "fail_job requires the claiming worker_id in lease mode"
+                )
+            lease = _job_lease(self._db)
+            attempts = lease.attempts_of(job_id)
+            if attempts is None:
+                return 0
+            if attempts >= max(int(settings.jobs_max_attempts), 1):
+                settled = lease.fail(
+                    job_id, worker_id, f"attempt_cap_exceeded: {error}"[:2000]
+                )
+            else:
+                settled = lease.requeue(
+                    job_id,
+                    worker_id,
+                    delay_seconds=float(2 ** max(attempts - 1, 0)),
+                    error=error[:2000],
+                )
+            if not settled:
+                # Fenced write rejected: lease lost, row not ours. Return 0
+                # so the processor schedules nothing for it.
+                return 0
+            return attempts
         now = datetime.utcnow().isoformat()
         self._db.execute(
             """UPDATE kms_compile_jobs
@@ -501,8 +616,25 @@ class KMSStore:
         The ``status IN ('pending','running')`` predicate makes the
         check-and-flip atomic, so a job that already reached a terminal state
         (completed / failed / cancelled) can never be resurrected or
-        double-terminalised by a late cancel (issue #515).
+        double-terminalised by a late cancel (issue #515). Lease mode
+        (issue #559 stage 2) keeps the same predicate against the unified
+        row — external cancel stays unfenced and beats a running worker,
+        whose next fenced write then fails on status.
         """
+        if _lease_enabled():
+            ensure_jobs_schema(self._db)
+            cur = self._db.execute(
+                "UPDATE jobs SET status = 'cancelled', completed_at = ? "
+                "WHERE id = ? AND queue = ? "
+                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                "AND status IN ('pending', 'running')",
+                (datetime.utcnow().isoformat(), job_id, KMS_QUEUE, vault_id),
+            )
+            if cur.rowcount == 0:
+                self._db.rollback()
+                return False
+            self._db.commit()
+            return True
         cur = self._db.execute(
             "UPDATE kms_compile_jobs SET status = 'cancelled', completed_at = ? "
             "WHERE id = ? AND vault_id = ? AND status IN ('pending', 'running')",
@@ -520,6 +652,26 @@ class KMSStore:
         The ``status = 'failed'`` predicate makes the check-and-flip atomic:
         a job that was concurrently cancelled or completed cannot be reset.
         """
+        if _lease_enabled():
+            ensure_jobs_schema(self._db)
+            cur = self._db.execute(
+                "UPDATE jobs SET status = 'pending', error = NULL, "
+                "started_at = NULL, completed_at = NULL, run_after = NULL, "
+                "worker_id = NULL, lease_generation = lease_generation + 1, "
+                "heartbeat_at = NULL "
+                "WHERE id = ? AND queue = ? "
+                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                "AND status = 'failed'",
+                (job_id, KMS_QUEUE, vault_id),
+            )
+            if cur.rowcount == 0:
+                self._db.rollback()
+                return None
+            self._db.commit()
+            row = self._db.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return _compile_job_from_jobs_row(row) if row else None
         cur = self._db.execute(
             "UPDATE kms_compile_jobs SET status = 'pending', error = NULL, started_at = NULL, completed_at = NULL "
             "WHERE id = ? AND vault_id = ? AND status = 'failed'",

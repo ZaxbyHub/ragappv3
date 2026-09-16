@@ -255,5 +255,16 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-def test_c26_finalization_convergence():
+def test_c26_finalization_convergence(monkeypatch) -> None:
+    # Pin ALL lease switches off for this pre-lease contract check (issue
+    # #559 stage 4); monkeypatch restores the singleton after the test.
+    from app.config import settings as _settings
+
+    for _name in (
+        "ingestion_job_lease_enabled",
+        "wiki_kms_job_lease_enabled",
+        "reindex_job_lease_enabled",
+        "draft_job_lease_enabled",
+    ):
+        monkeypatch.setattr(_settings, _name, False, raising=False)
     assert main() == 0

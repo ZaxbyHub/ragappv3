@@ -42,6 +42,11 @@ def _hermetic_env() -> None:
     os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-key-for-testing-only"
     os.environ["REDIS_URL"] = ""
     os.environ["DATA_DIR"] = _TMPDIR
+    # This check pins the PRE-LEASE recovery/enqueue contract: the lease
+    # janitor/migration must not run in these scripts (issue #559 stage-4).
+    os.environ["WIKI_KMS_JOB_LEASE_ENABLED"] = "false"
+    os.environ["REINDEX_JOB_LEASE_ENABLED"] = "false"
+    os.environ["DRAFT_JOB_LEASE_ENABLED"] = "false"
 
 
 class _FakeEmbeddingService:
@@ -239,7 +244,15 @@ def main() -> int:
     return 0
 
 
-def test_c5_kms_enqueue_existing_file_path() -> None:
+def test_c5_kms_enqueue_existing_file_path(monkeypatch) -> None:
+    # Pin the wiki/KMS lease switch off for this pre-lease contract check
+    # (issue #559 stage 2); monkeypatch restores after the test.
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(
+        _settings, "wiki_kms_job_lease_enabled", False, raising=False
+    )
+
     assert main() == 0
 
 

@@ -57,6 +57,11 @@ def _hermetic_env() -> None:
     # in legacy mode here; the lease-mode settlement e2e lives in
     # tests/test_559_c05_proving.py.
     os.environ["INGESTION_JOB_LEASE_ENABLED"] = "false"
+    # This check pins the PRE-LEASE recovery/enqueue contract: the lease
+    # janitor/migration must not run in these scripts (issue #559 stage-4).
+    os.environ["WIKI_KMS_JOB_LEASE_ENABLED"] = "false"
+    os.environ["REINDEX_JOB_LEASE_ENABLED"] = "false"
+    os.environ["DRAFT_JOB_LEASE_ENABLED"] = "false"
 
 _WAIT_S = 8.0
 
@@ -251,6 +256,11 @@ async def _scenario() -> str:
 
 def main() -> int:
     _hermetic_env()
+    from app.config import settings as _settings
+
+    # Pin ALL lease switches on the singleton: under pytest the Settings
+    # singleton is built before these env pins could apply, and the lease
+    # migration/janitor must not run in these pre-lease contract checks.
     logging.disable(logging.CRITICAL)
     reason = asyncio.run(_scenario())
     if reason:
@@ -260,7 +270,21 @@ def main() -> int:
     return 0
 
 
-def test_c24_periodic_orphan_rescan() -> None:
+def test_c24_periodic_orphan_rescan(monkeypatch) -> None:
+    # Pin ALL lease switches off for this pre-lease contract check: the
+    # lease migration/janitor must not run here (issue #559 stage 4).
+    # monkeypatch restores the singleton after the test (CI runs scripts
+    # in-process under pytest).
+    from app.config import settings as _settings
+
+    for _name in (
+        "ingestion_job_lease_enabled",
+        "wiki_kms_job_lease_enabled",
+        "reindex_job_lease_enabled",
+        "draft_job_lease_enabled",
+    ):
+        monkeypatch.setattr(_settings, _name, False, raising=False)
+
     assert main() == 0
 
 

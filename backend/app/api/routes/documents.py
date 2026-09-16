@@ -1130,26 +1130,41 @@ BATCHED_STATUS_MAX_IDS = 100
 
 
 def _latest_compile_job_statuses(
-    conn: sqlite3.Connection, table: str, file_ids: List[int]
+    conn: sqlite3.Connection, source: str, file_ids: List[int]
 ) -> dict:
     """Latest per-file compile-job status keyed by int file id.
 
-    Shared by the batched status route for ``wiki_compile_jobs`` and
-    ``kms_compile_jobs``: both queues tag per-file ingest jobs with
-    trigger_id ``file:<id>`` (see DocumentProcessor's ingest enqueue). Rows
-    are read in ascending id order so the last job per file wins, matching
-    the per-file route's ``ORDER BY id DESC LIMIT 1`` derivation.
+    Shared by the batched status route for the wiki and KMS compile queues
+    (issue #559 stage 2: read from the unified ``jobs`` rows when the
+    wiki/KMS lease switch is on, from the legacy ``*_compile_jobs`` tables
+    otherwise). Both queues tag per-file ingest jobs with trigger_id
+    ``file:<id>`` (see DocumentProcessor's ingest enqueue). Rows are read in
+    ascending id order so the last job per file wins, matching the per-file
+    route's ``ORDER BY id DESC LIMIT 1`` derivation.
     """
     if not file_ids:
         return {}
-    placeholders = ",".join("?" * len(file_ids))
     triggers = [f"file:{fid}" for fid in file_ids]
+    lease_on = bool(getattr(settings, "wiki_kms_job_lease_enabled", False))
     try:
-        rows = conn.execute(
-            f"SELECT trigger_id, status FROM {table} "  # nosec B608 — table is a fixed literal passed only from this module
-            f"WHERE trigger_id IN ({placeholders}) ORDER BY id ASC",
-            triggers,
-        ).fetchall()
+        if lease_on:
+            placeholders = ",".join("?" * len(triggers))
+            lease_status_sql = (
+                "SELECT json_extract(payload_json, '$.trigger_id') AS trigger_id,"
+                " status FROM jobs WHERE queue = ? AND"
+                " json_extract(payload_json, '$.trigger_id') IN ("
+                + placeholders
+                + ") ORDER BY id ASC"
+            )  # nosec B608 — placeholders are '?' literals
+            rows = conn.execute(lease_status_sql, [source, *triggers]).fetchall()
+        else:
+            placeholders = ",".join("?" * len(file_ids))
+            table = f"{source}_compile_jobs"
+            rows = conn.execute(
+                f"SELECT trigger_id, status FROM {table} "  # nosec B608 — table is a fixed literal passed only from this module
+                f"WHERE trigger_id IN ({placeholders}) ORDER BY id ASC",
+                triggers,
+            ).fetchall()
     except sqlite3.Error:
         # Compile-job tables may not exist on very old fixtures; treat as no job.
         return {}
@@ -1237,10 +1252,10 @@ async def get_documents_status_batched(
         vault_read[vault] = await evaluate(user, "vault", vault, "read")
 
     wiki_statuses = await asyncio.to_thread(
-        _latest_compile_job_statuses, conn, "wiki_compile_jobs", deduped
+        _latest_compile_job_statuses, conn, "wiki", deduped
     )
     kms_statuses = await asyncio.to_thread(
-        _latest_compile_job_statuses, conn, "kms_compile_jobs", deduped
+        _latest_compile_job_statuses, conn, "kms", deduped
     )
 
     results: List[DocumentBatchedStatusEntry] = []
@@ -1333,16 +1348,28 @@ async def get_document_status(
     wiki_phase: Optional[str] = None
     wiki_job_id: Optional[int] = None
     try:
-        wiki_cursor = await asyncio.to_thread(
-            conn.execute,
-            """
-            SELECT id, status FROM wiki_compile_jobs
-            WHERE trigger_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (f"file:{file_id}",),
-        )
+        if bool(getattr(settings, "wiki_kms_job_lease_enabled", False)):
+            wiki_cursor = await asyncio.to_thread(
+                conn.execute,
+                """
+                SELECT id, status FROM jobs
+                WHERE queue = 'wiki' AND json_extract(payload_json, '$.trigger_id') = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (f"file:{file_id}",),
+            )
+        else:
+            wiki_cursor = await asyncio.to_thread(
+                conn.execute,
+                """
+                SELECT id, status FROM wiki_compile_jobs
+                WHERE trigger_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (f"file:{file_id}",),
+            )
         wiki_row = await asyncio.to_thread(wiki_cursor.fetchone)
         if wiki_row is not None:
             wiki_job_id = int(wiki_row["id"])
@@ -2612,12 +2639,31 @@ async def reindex_documents(
 ) -> ReindexResponse:
     """Trigger a reindex job for documents, optionally scoped to a vault.
 
-    Creates a reindex job in the document_reindex_jobs table and returns
+    Creates a reindex job (in the unified ``jobs`` table when the reindex
+    lease switch is on, in ``document_reindex_jobs`` otherwise) and returns
     immediately with the job_id and status.
     """
     vault_id = payload.vault_id
+    lease_on = bool(getattr(settings, "reindex_job_lease_enabled", False))
 
     def _create_job() -> int:
+        if lease_on:
+            from app.services.job_lease import JobLease, ensure_jobs_schema
+
+            ensure_jobs_schema(conn)
+            return JobLease(
+                conn,
+                reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+                max_attempts=settings.jobs_max_attempts,
+            ).enqueue(
+                "reindex",
+                {
+                    "vault_id": vault_id,
+                    "trigger_type": "api",
+                    "trigger_id": str(user.get("id", "")),
+                    "input_json": json.dumps({"vault_id": vault_id}),
+                },
+            )
         cur = conn.execute(
             "INSERT INTO document_reindex_jobs (vault_id, trigger_type, trigger_id, status, input_json) VALUES (?, ?, ?, ?, ?)",
             (vault_id, "api", str(user.get("id", "")), "pending", json.dumps({"vault_id": vault_id})),
@@ -2646,7 +2692,35 @@ async def get_reindex_job_status(
 ) -> ReindexJobStatusResponse:
     """Return the full status of a reindex job by ID."""
 
+    lease_on = bool(getattr(settings, "reindex_job_lease_enabled", False))
+
     def _fetch_job():
+        if lease_on:
+            # Unified store (issue #559 stage 3): the jobs row carries the
+            # domain fields in payload_json and the durable attempts counter.
+            # The legacy terminal ``interrupted`` status is mapped away — the
+            # unified vocabulary never emits it (migrated rows are stored as
+            # failed already; this catch-all also covers rows created before
+            # the mapping existed).
+            row = conn.execute(
+                """
+                SELECT id,
+                       json_extract(payload_json, '$.vault_id') AS vault_id,
+                       COALESCE(json_extract(payload_json, '$.trigger_type'), 'api') AS trigger_type,
+                       json_extract(payload_json, '$.trigger_id') AS trigger_id,
+                       CASE WHEN status = 'interrupted' THEN 'failed' ELSE status END AS status,
+                       error, result_json,
+                       json_extract(payload_json, '$.input_json') AS input_json,
+                       attempts AS retry_count,
+                       created_at, started_at, completed_at
+                FROM jobs WHERE id = ? AND queue = 'reindex'
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is not None:
+                row = dict(row)
+                row["input_json"] = row.get("input_json") or "{}"
+            return row
         row = conn.execute(
             "SELECT id, vault_id, trigger_type, trigger_id, status, error, result_json, input_json, retry_count, created_at, started_at, completed_at FROM document_reindex_jobs WHERE id = ?",
             (job_id,),

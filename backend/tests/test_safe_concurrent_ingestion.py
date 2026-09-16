@@ -25,6 +25,12 @@ async def test_background_processor_start_assigns_write_semaphore_before_workers
         return MagicMock()
 
     with patch("app.services.background_tasks.settings") as mock_settings:
+        # Pre-lease startup task set is the contract here (issue #559
+        # stage 4 added the lease migration/janitor tasks; pin them off).
+        mock_settings.ingestion_job_lease_enabled = False
+        mock_settings.wiki_kms_job_lease_enabled = False
+        mock_settings.reindex_job_lease_enabled = False
+        mock_settings.draft_job_lease_enabled = False
         mock_settings.ingestion_worker_count = 2
         with patch("app.services.background_tasks.asyncio.create_task", side_effect=fake_create_task):
             await processor.start()

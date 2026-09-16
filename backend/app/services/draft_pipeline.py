@@ -109,6 +109,7 @@ from app.services.draft_store import (
     DraftConflictError,
     DraftStore,
     DraftValidationError,
+    _LeaseLostError,
     canonical_json,
     sha256_text,
     validate_exact_quote,
@@ -519,6 +520,12 @@ class CompileContext:
     transient_retry_limit: int
     retrieval_limit: int
     resume_allowed: bool
+    #: Lease-mode worker identity (issue #559 stage 4). When set, the
+    #: stage-progress/model-call heartbeat writes are fenced on it — a run
+    #: whose lease was reclaimed gets zero-row writes and aborts itself
+    #: instead of racing the new claimant (the R4-S16 double-execution
+    #: failure). None in legacy mode.
+    worker_id: Optional[str] = None
 
     @property
     def sensitive(self) -> bool:
@@ -2720,6 +2727,34 @@ class _CompileRun:
 
     def _db_set_active_stage(self, stage: str) -> None:
         with self._pool.connection() as conn:
+            if self._ctx.worker_id is not None:
+                # Fenced heartbeat (issue #559 stage 4): a run whose lease was
+                # reclaimed gets zero-row writes and aborts itself instead of
+                # refreshing the new claimant's lease.
+                cursor = conn.execute(
+                    "UPDATE draft_jobs SET active_stage = ?, "
+                    "heartbeat_at = CURRENT_TIMESTAMP, progress_percent = ? "
+                    "WHERE id = ? AND status = 'running' AND worker_id = ?",
+                    (
+                        stage,
+                        round(
+                            100.0 * COMPILE_STAGE_ORDER.index(stage)
+                            / len(COMPILE_STAGE_ORDER),
+                            2,
+                        ),
+                        self._ctx.job_id,
+                        self._ctx.worker_id,
+                    ),
+                )
+                conn.commit()
+                if cursor.rowcount == 0:
+                    from app.services.draft_store import _LeaseLostError
+
+                    raise _LeaseLostError(
+                        f"job {self._ctx.job_id} no longer owned by worker "
+                        f"{self._ctx.worker_id!r}"
+                    )
+                return
             conn.execute(
                 "UPDATE draft_jobs SET active_stage = ?, "
                 "heartbeat_at = CURRENT_TIMESTAMP, progress_percent = ? WHERE id = ?",
@@ -2741,6 +2776,22 @@ class _CompileRun:
 
     def _db_bump_model_calls(self, count: int) -> None:
         with self._pool.connection() as conn:
+            if self._ctx.worker_id is not None:
+                cursor = conn.execute(
+                    "UPDATE draft_jobs SET model_call_count = ?, "
+                    "heartbeat_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND status = 'running' AND worker_id = ?",
+                    (count, self._ctx.job_id, self._ctx.worker_id),
+                )
+                conn.commit()
+                if cursor.rowcount == 0:
+                    from app.services.draft_store import _LeaseLostError
+
+                    raise _LeaseLostError(
+                        f"job {self._ctx.job_id} no longer owned by worker "
+                        f"{self._ctx.worker_id!r}"
+                    )
+                return
             conn.execute(
                 "UPDATE draft_jobs SET model_call_count = ?, "
                 "heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -3355,6 +3406,15 @@ def _build_context(
         and job.prompt_bundle_version == PROMPT_BUNDLE_VERSION
     )
     inherit_allowed = _parent_inheritance_allowed(conn, job, payload)
+    # Lease-mode fencing identity (issue #559 stage 4): read straight off the
+    # claimed row so the run's heartbeat writes are fenced to the worker that
+    # actually holds the lease (None in legacy mode).
+    worker_row = conn.execute(
+        "SELECT worker_id FROM draft_jobs WHERE id = ?", (job.id,)
+    ).fetchone()
+    claimed_worker_id = (
+        worker_row[0] if worker_row is not None else None
+    )
     return CompileContext(
         job_id=job.id,
         draft_id=job.draft_id,
@@ -3384,11 +3444,16 @@ def _build_context(
         transient_retry_limit=settings.draft_transient_retry_limit,
         retrieval_limit=settings.draft_research_retrieval_limit,
         resume_allowed=resume_allowed,
+        worker_id=claimed_worker_id,
     )
 
 
 async def run_compile(
-    *, job_id: int, pool: "SQLiteConnectionPool", deps: PipelineDeps
+    *,
+    job_id: int,
+    pool: "SQLiteConnectionPool",
+    deps: PipelineDeps,
+    worker_id: Optional[str] = None,
 ) -> None:
     """Run one ``compile`` job through the full editorial pipeline.
 
@@ -3445,7 +3510,7 @@ async def run_compile(
         ctx = await asyncio.to_thread(_context)
     except CompileFailure as failure:
         await asyncio.to_thread(
-            _persist_failure, pool, job, failure.code, str(failure)
+            _persist_failure, pool, job, failure.code, str(failure), worker_id
         )
         raise
 
@@ -3453,17 +3518,19 @@ async def run_compile(
     try:
         await run.execute()
     except _CompileCancelled:
-        await asyncio.to_thread(_persist_cancelled, pool, job)
+        await asyncio.to_thread(_persist_cancelled, pool, job, worker_id)
         raise CompileFailure(
             CODE_JOB_CANCELLED, retryable=False, message="job cancellation observed"
         ) from None
     except CompileFailure as failure:
         await asyncio.to_thread(
-            _persist_failure, pool, job, failure.code, str(failure)
+            _persist_failure, pool, job, failure.code, str(failure), worker_id
         )
         raise
     except ProviderPolicyError as exc:
-        await asyncio.to_thread(_persist_failure, pool, job, exc.code, "provider policy")
+        await asyncio.to_thread(
+            _persist_failure, pool, job, exc.code, "provider policy", worker_id
+        )
         raise CompileFailure(exc.code, retryable=False) from None
     except asyncio.CancelledError:
         # CancelledError is a BaseException, so it escapes `except Exception`.
@@ -3473,7 +3540,7 @@ async def run_compile(
         # Settle it, then re-raise so cancellation still propagates and the
         # task really does stop.
         await asyncio.shield(
-            asyncio.to_thread(_persist_cancelled, pool, job)
+            asyncio.to_thread(_persist_cancelled, pool, job, worker_id)
         )
         raise
     except Exception as exc:
@@ -3481,17 +3548,24 @@ async def run_compile(
             "draft compile: job id=%d raised %s", job_id, type(exc).__name__
         )
         await asyncio.to_thread(
-            _persist_failure, pool, job, CODE_INTERNAL_ERROR, None
+            _persist_failure, pool, job, CODE_INTERNAL_ERROR, None, worker_id
         )
         raise CompileFailure(CODE_INTERNAL_ERROR, retryable=False) from None
 
-    await asyncio.to_thread(_persist_completed, pool, job)
+    await asyncio.to_thread(_persist_completed, pool, job, worker_id)
 
 
-def _persist_completed(pool: "SQLiteConnectionPool", job: "DraftJobRecord") -> None:
+def _persist_completed(
+    pool: "SQLiteConnectionPool",
+    job: "DraftJobRecord",
+    worker_id: Optional[str] = None,
+) -> None:
     with pool.connection() as conn:
         DraftStore(conn).set_job_status(
-            job_id=job.id, target="completed", progress_percent=100.0
+            job_id=job.id,
+            target="completed",
+            progress_percent=100.0,
+            worker_id=worker_id,
         )
 
 
@@ -3500,24 +3574,53 @@ def _persist_failure(
     job: "DraftJobRecord",
     code: str,
     message: Optional[str],
+    worker_id: Optional[str] = None,
 ) -> None:
-    """Settle job and draft onto ``failed`` with a stable, sanitized code."""
+    """Settle job and draft onto ``failed`` with a stable, sanitized code.
+
+    In lease mode (``worker_id`` set, issue #559 stage 4) the job write is
+    fenced: when the lease was lost the raised ``_LeaseLostError`` propagates
+    and the draft is deliberately NOT moved — the row belongs to whoever
+    reclaimed it, and a disowned worker must not terminally settle anything.
+    """
     with pool.connection() as conn:
         store = DraftStore(conn)
         try:
             store.set_job_status(
-                job_id=job.id, target="failed", error_code=code, error_message=message
+                job_id=job.id,
+                target="failed",
+                error_code=code,
+                error_message=message,
+                worker_id=worker_id,
             )
+        except _LeaseLostError:
+            logger.warning(
+                "draft compile: job id=%s lease lost; failure persist skipped",
+                job.id,
+            )
+            raise
         except Exception:
             logger.error("draft compile: could not fail job id=%d", job.id)
         _move_draft(conn, job.draft_id, "failed")
 
 
-def _persist_cancelled(pool: "SQLiteConnectionPool", job: "DraftJobRecord") -> None:
+def _persist_cancelled(
+    pool: "SQLiteConnectionPool",
+    job: "DraftJobRecord",
+    worker_id: Optional[str] = None,
+) -> None:
     with pool.connection() as conn:
         store = DraftStore(conn)
         try:
-            store.set_job_status(job_id=job.id, target="cancelled")
+            store.set_job_status(
+                job_id=job.id, target="cancelled", worker_id=worker_id
+            )
+        except _LeaseLostError:
+            logger.warning(
+                "draft compile: job id=%s lease lost; cancel persist skipped",
+                job.id,
+            )
+            raise
         except Exception:
             logger.error("draft compile: could not cancel job id=%d", job.id)
         _move_draft(conn, job.draft_id, "cancelled")

@@ -13,7 +13,25 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterator, Optional
 
+from app.config import settings
 from app.services.fts_query import FTS_CANDIDATE_CAP, build_fts_match_query
+from app.services.job_lease import JobLease, ensure_jobs_schema
+
+WIKI_QUEUE = "wiki"
+
+
+def _lease_enabled() -> bool:
+    """Stage-2 lease switch (issue #559): env-only, process-start-stable."""
+    return bool(getattr(settings, "wiki_kms_job_lease_enabled", False))
+
+
+def _job_lease(conn: sqlite3.Connection) -> JobLease:
+    ensure_jobs_schema(conn)
+    return JobLease(
+        conn,
+        reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+        max_attempts=settings.jobs_max_attempts,
+    )
 
 # ---------------------------------------------------------------------------
 # DTO dataclasses
@@ -360,6 +378,26 @@ def _to_compile_job(row: sqlite3.Row) -> WikiCompileJob:
         completed_at=d.get("completed_at"),
         input_json=d.get("input_json"),
         retry_count=d.get("retry_count") or 0,
+    )
+
+
+def _compile_job_from_jobs_row(row: sqlite3.Row) -> WikiCompileJob:
+    """Map a unified ``jobs`` row (queue='wiki') onto the unchanged DTO."""
+    d = _row_to_dict(row)
+    payload = json.loads(d.get("payload_json") or "{}")
+    return WikiCompileJob(
+        id=d["id"],
+        vault_id=payload.get("vault_id"),
+        trigger_type=payload.get("trigger_type") or "manual",
+        trigger_id=payload.get("trigger_id"),
+        status=d["status"],
+        error=d.get("error"),
+        result_json=d.get("result_json") or "{}",
+        created_at=d["created_at"],
+        started_at=d.get("started_at"),
+        completed_at=d.get("completed_at"),
+        input_json=payload.get("input_json"),
+        retry_count=d.get("attempts") or 0,
     )
 
 
@@ -1122,6 +1160,27 @@ class WikiStore:
         trigger_id: Optional[str] = None,
         input_json: Optional[Any] = None,
     ) -> WikiCompileJob:
+        if _lease_enabled():
+            ensure_jobs_schema(self._db)
+            # Stage 2 (issue #559): the unified jobs row IS the wiki compile
+            # job. payload_json carries the enqueue-time inputs; result_json
+            # stays with complete_job, so the semantic status mapping reads
+            # the same structure as before.
+            if isinstance(input_json, dict):
+                input_json = json.dumps(input_json)
+            job_id = _job_lease(self._db).enqueue(
+                WIKI_QUEUE,
+                {
+                    "vault_id": vault_id,
+                    "trigger_type": trigger_type,
+                    "trigger_id": trigger_id,
+                    "input_json": input_json or "{}",
+                },
+            )
+            row = self._db.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return _compile_job_from_jobs_row(row)
         now = datetime.utcnow().isoformat()
         if isinstance(input_json, dict):
             input_json = json.dumps(input_json)
@@ -1142,11 +1201,36 @@ class WikiStore:
         trigger_type: Optional[str] = None,
         trigger_id: Optional[str] = None,
     ) -> list[WikiCompileJob]:
+        if _lease_enabled():
+            ensure_jobs_schema(self._db)
+            # Unified store (issue #559 stage 2): the same filters run against
+            # jobs rows with the domain fields in payload_json. Response
+            # shapes are unchanged (AC4) — including migrated history.
+            sql = (
+                "SELECT * FROM jobs WHERE queue = ? "
+                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?"
+            )
+            params: list[Any] = [WIKI_QUEUE, vault_id]
+            if status:
+                sql += " AND status = ?"
+                params.append(status)
+            if trigger_type is not None:
+                sql += " AND json_extract(payload_json, '$.trigger_type') = ?"
+                params.append(trigger_type)
+            if trigger_id is not None:
+                sql += " AND json_extract(payload_json, '$.trigger_id') = ?"
+                params.append(trigger_id)
+            sql += " ORDER BY id DESC"
+            if limit is not None:
+                sql += " LIMIT ?"
+                params.append(limit)
+            rows = self._db.execute(sql, params).fetchall()
+            return [_compile_job_from_jobs_row(r) for r in rows]
         # F-012: optional bound so callers that only need recent jobs don't pull
         # the vault's entire job history. trigger_type/trigger_id let status
         # endpoints filter in SQL instead of pulling and filtering in Python.
         sql = "SELECT * FROM wiki_compile_jobs WHERE vault_id = ?"
-        params: list[Any] = [vault_id]
+        params = [vault_id]
         if status:
             sql += " AND status = ?"
             params.append(status)
@@ -1164,22 +1248,35 @@ class WikiStore:
         return [_to_compile_job(r) for r in rows]
 
     def get_job(self, job_id: int, vault_id: int) -> Optional[WikiCompileJob]:
+        if _lease_enabled():
+            ensure_jobs_schema(self._db)
+            row = self._db.execute(
+                "SELECT * FROM jobs WHERE id = ? AND queue = ? "
+                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ?",
+                (job_id, WIKI_QUEUE, vault_id),
+            ).fetchone()
+            return _compile_job_from_jobs_row(row) if row else None
         row = self._db.execute(
             "SELECT * FROM wiki_compile_jobs WHERE id = ? AND vault_id = ?",
             (job_id, vault_id),
         ).fetchone()
         return _to_compile_job(row) if row else None
 
-    def claim_next_pending_job(self) -> Optional[WikiCompileJob]:
+    def claim_next_pending_job(
+        self, worker_id: str = "wiki-worker"
+    ) -> Optional[WikiCompileJob]:
         """Atomically claim the oldest pending job. Returns the claimed job or None.
 
-        Uses a single ``UPDATE ... RETURNING`` statement so the claim is atomic
-        without a backend-specific transaction mode such as SQLite's
-        ``BEGIN IMMEDIATE``. The query is portable across SQLite (>= 3.35) and
-        PostgreSQL: the inner ``SELECT`` pins the oldest pending row and the
-        outer ``UPDATE`` flips it to ``running`` in one atomic step, so two
-        concurrent callers can never claim the same job.
+        Lease mode (issue #559 stage 2): delegates to the shared ``JobLease``
+        single-statement claim — ``BEGIN IMMEDIATE`` + ``UPDATE ... WHERE
+        status='pending' ... RETURNING`` — which adds worker fencing, lease
+        generation, heartbeat and durable attempts on top of the same
+        exactly-one-claimant atomicity. Legacy mode keeps the portable
+        single-statement ``UPDATE ... RETURNING`` below.
         """
+        if _lease_enabled():
+            row = _job_lease(self._db).claim(WIKI_QUEUE, worker_id)
+            return _compile_job_from_jobs_row(row) if row else None
         now = datetime.utcnow().isoformat()
         try:
             row = self._db.execute(
@@ -1208,18 +1305,34 @@ class WikiStore:
             self._db.rollback()
             raise
 
-    def complete_job(self, job_id: int, result_json: Any) -> bool:
+    def complete_job(
+        self, job_id: int, result_json: Any, worker_id: Optional[str] = None
+    ) -> bool:
         """Mark job completed. Returns True if the transition committed.
 
-        No-op (returns False) if the job was already cancelled: the UPDATE's
-        ``status != 'cancelled'`` predicate is evaluated atomically with the
-        write, so a cancellation landing between this method's call and its
-        write can never be overwritten (WIKI-004 / issue #515 — the previous
-        read-then-write guard raced in exactly that window).
+        Lease mode (issue #559 stage 2): the write is fenced — it commits only
+        when ``worker_id`` still holds a running lease, so a worker whose job
+        was reclaimed (or cancelled) can never mutate the new owner's row.
+        ``worker_id`` is required there; the processor always supplies the id
+        it claimed with.
+
+        Legacy mode: no-op (returns False) if the job was already cancelled:
+        the UPDATE's ``status != 'cancelled'`` predicate is evaluated atomically
+        with the write, so a cancellation landing between this method's call
+        and its write can never be overwritten (WIKI-004 / issue #515 — the
+        previous read-then-write guard raced in exactly that window).
         """
-        now = datetime.utcnow().isoformat()
         if isinstance(result_json, dict):
             result_json = json.dumps(result_json)
+        if _lease_enabled():
+            if worker_id is None:
+                raise ValueError(
+                    "complete_job requires the claiming worker_id in lease mode"
+                )
+            return _job_lease(self._db).complete(
+                job_id, worker_id, json.loads(result_json or "{}")
+            )
+        now = datetime.utcnow().isoformat()
         cur = self._db.execute(
             "UPDATE wiki_compile_jobs SET status = 'completed', completed_at = ?, result_json = ? "
             "WHERE id = ? AND status != 'cancelled'",
@@ -1234,11 +1347,49 @@ class WikiStore:
         self._db.commit()
         return True
 
-    def fail_job(self, job_id: int, error: str) -> int:
-        """Mark job failed, increment retry_count. Returns new retry_count.
+    def fail_job(
+        self, job_id: int, error: str, worker_id: Optional[str] = None
+    ) -> int:
+        """Record a failure and return the durable attempt count.
 
-        No-op if the job is already cancelled.
+        Lease mode (issue #559 stage 2): the retry decision moves here —
+        below ``jobs_max_attempts`` the job is requeued with exponential
+        backoff via the durable ``run_after`` claim gate; at the cap it is
+        settled terminally (``attempt_cap_exceeded``). The processor no
+        longer schedules detached reset tasks. Legacy mode keeps the old
+        ``retry_count`` increment (the processor owns the backoff there).
         """
+        if _lease_enabled():
+            if worker_id is None:
+                raise ValueError(
+                    "fail_job requires the claiming worker_id in lease mode"
+                )
+            lease = _job_lease(self._db)
+            attempts = lease.attempts_of(job_id)
+            if attempts is None:
+                return 0
+            next_attempts = attempts  # attempts already counts this claim
+            settled = True
+            if next_attempts >= max(int(settings.jobs_max_attempts), 1):
+                settled = lease.fail(
+                    job_id,
+                    worker_id,
+                    f"attempt_cap_exceeded: {error}"[:8000],
+                )
+            else:
+                settled = lease.requeue(
+                    job_id,
+                    worker_id,
+                    delay_seconds=float(2 ** max(next_attempts - 1, 0)),
+                    error=error[:8000],
+                )
+            if not settled:
+                # The fenced write was rejected: the lease was lost and the
+                # row no longer belongs to this worker. Returning 0 keeps the
+                # processor from scheduling a retry or publishing a terminal
+                # event for a job it does not own.
+                return 0
+            return next_attempts
         now = datetime.utcnow().isoformat()
         self._db.execute(
             """UPDATE wiki_compile_jobs
@@ -1286,6 +1437,36 @@ class WikiStore:
         """
         if isinstance(result_json, dict):
             result_json = json.dumps(result_json)
+        if _lease_enabled():
+            # External cancel stays status-guarded and unfenced (issue #559
+            # stage 2): it must beat a running worker's fenced complete, and
+            # the worker's next fenced write then fails on status.
+            ensure_jobs_schema(self._db)
+            # Two complete static literals (no interpolated fragment): the
+            # result_json column is only written when the caller supplies a
+            # cancellation reason (WIKI-001 / issue #515).
+            if result_json:
+                cur = self._db.execute(
+                    "UPDATE jobs SET status = 'cancelled', completed_at = ?, "
+                    "result_json = ? "
+                    "WHERE id = ? AND queue = ? "
+                    "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                    "AND status IN ('pending', 'running')",
+                    [datetime.utcnow().isoformat(), result_json, job_id, WIKI_QUEUE, vault_id],
+                )
+            else:
+                cur = self._db.execute(
+                    "UPDATE jobs SET status = 'cancelled', completed_at = ? "
+                    "WHERE id = ? AND queue = ? "
+                    "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                    "AND status IN ('pending', 'running')",
+                    [datetime.utcnow().isoformat(), job_id, WIKI_QUEUE, vault_id],
+                )
+            if cur.rowcount == 0:
+                self._db.rollback()
+                return False
+            self._db.commit()
+            return True
         set_result = ", result_json = ?" if result_json else ""
         params: list[Any] = [datetime.utcnow().isoformat()]
         if result_json:
@@ -1307,6 +1488,26 @@ class WikiStore:
         The ``status = 'failed'`` predicate makes the check-and-flip atomic:
         a job that was concurrently cancelled or completed cannot be reset.
         """
+        if _lease_enabled():
+            ensure_jobs_schema(self._db)
+            cur = self._db.execute(
+                "UPDATE jobs SET status = 'pending', error = NULL, "
+                "started_at = NULL, completed_at = NULL, run_after = NULL, "
+                "worker_id = NULL, lease_generation = lease_generation + 1, "
+                "heartbeat_at = NULL "
+                "WHERE id = ? AND queue = ? "
+                "AND CAST(json_extract(payload_json, '$.vault_id') AS INTEGER) = ? "
+                "AND status = 'failed'",
+                (job_id, WIKI_QUEUE, vault_id),
+            )
+            if cur.rowcount == 0:
+                self._db.rollback()
+                return None
+            self._db.commit()
+            row = self._db.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return _compile_job_from_jobs_row(row) if row else None
         cur = self._db.execute(
             "UPDATE wiki_compile_jobs SET status = 'pending', error = NULL, started_at = NULL, completed_at = NULL "
             "WHERE id = ? AND vault_id = ? AND status = 'failed'",

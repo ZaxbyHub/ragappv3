@@ -69,9 +69,25 @@ except ImportError:
     sys.modules["unstructured.documents"] = _u.documents
     sys.modules["unstructured.documents.elements"] = _u.documents.elements
 
+import pytest
+
 from app.config import settings
 from app.models.database import SQLiteConnectionPool, run_migrations
 from app.services.wiki_store import WikiStore
+
+
+@pytest.fixture(autouse=True)
+def _legacy_wiki_kms_lease_mode(monkeypatch):
+    """Pin the wiki/KMS legacy claim path (issue #559 stage 2): these tests
+    characterize the pre-lease ``*_compile_jobs`` behavior that remains the
+    documented rollback surface; unified-store equivalents live in the 559
+    frozen family. Restored per test so defaults are untouched elsewhere."""
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(
+        _settings, "wiki_kms_job_lease_enabled", False, raising=False
+    )
+
 
 INGEST_TEXT = "Justice Sakyi is the AFOMIS Chief."
 

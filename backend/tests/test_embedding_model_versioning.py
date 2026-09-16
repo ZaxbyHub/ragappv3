@@ -950,3 +950,20 @@ class TestComputeEmbeddingPrefixHash(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+@pytest.fixture(autouse=True)
+def _legacy_reindex_lease_mode(monkeypatch):
+    """Pin the reindex legacy path (issue #559 stage 3).
+
+    These tests characterize the legacy ``document_reindex_jobs`` behavior
+    that remains the rollback path; the lease-path equivalents live in the
+    issue-559 check family. Restored after every test.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings, "reindex_job_lease_enabled", False, raising=False
+    )

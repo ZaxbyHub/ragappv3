@@ -391,6 +391,14 @@ class BackgroundProcessor:
             bool(getattr(settings, "ingestion_job_lease_enabled", False))
             and pool is not None
         )
+        # Stages 2-3 per-queue lease switches (issue #559): env-only like the
+        # ingestion switch, process-start-stable. The wiki/KMS stores and the
+        # draft processor read their own settings at call time; the reindex
+        # worker needs an instance flag because its claim loop lives here.
+        self._reindex_lease_enabled = (
+            bool(getattr(settings, "reindex_job_lease_enabled", False))
+            and pool is not None
+        )
         # Migration barrier (Round-2 R2-3): workers and the janitor wait on
         # this before their FIRST claim/reclaim, so the new claim path never
         # serves a row the in-flight migration has not yet created.
@@ -488,23 +496,27 @@ class BackgroundProcessor:
                 self._artifact_delete_sweep_loop(), name="artifact-delete-sweep"
             )
             if not getattr(self, "_ingest_lease_enabled", False):
-                # Legacy mode only: the hourly rescan re-enqueues stranded
-                # rows. In lease mode the janitor owns that settlement
-                # (issue #559), so the rescan would double-enqueue.
+                # Legacy ingestion mode only: the hourly rescan re-enqueues
+                # stranded rows. In lease mode the janitor owns that
+                # settlement (issue #559), so the rescan would double-enqueue.
                 self._orphan_rescan_task = create_owned_task(
                     self._orphan_rescan_loop(), name="orphan-rescan"
                 )
-                self._jobs_migration_task = None
-                self._ingest_janitor_task = None
-            else:
-                # Detached in-flight migration, then the lease janitor. Both
-                # gate their first pass on _jobs_barrier (R2-3).
+            if self._any_jobs_lease_enabled():
+                # Detached in-flight migration, then the shared lease janitor.
+                # Both gate their first pass on _jobs_barrier (R2-3). The
+                # migration covers every queue whose lease switch is on (and
+                # reverse-syncs the ones whose switch is off); the janitor
+                # sweep branches per queue on its switch.
                 self._jobs_migration_task = create_owned_task(
                     self._run_jobs_migration(), name="jobs-migration"
                 )
                 self._ingest_janitor_task = create_owned_task(
                     self._ingest_janitor_loop(), name="ingest-janitor"
                 )
+            else:
+                self._jobs_migration_task = None
+                self._ingest_janitor_task = None
             self._startup_recovery_task = create_owned_task(
                 self._run_startup_recovery(),
                 name="startup-recovery",
@@ -554,9 +566,15 @@ class BackgroundProcessor:
                     else self._sync_missing_ingest_job_rows_gated()
                 ),
             ),
-            (
-                "interrupted reindex jobs",
-                self._recover_interrupted_reindex_jobs,
+            *(
+                ()
+                if getattr(self, "_reindex_lease_enabled", False)
+                else (
+                    (
+                        "interrupted reindex jobs",
+                        self._recover_interrupted_reindex_jobs,
+                    ),
+                )
             ),
             (
                 "stranded enrichment rows",
@@ -624,24 +642,60 @@ class BackgroundProcessor:
                 logger.exception("Periodic stranded-row rescan failed")
 
     async def _run_jobs_migration(self) -> None:
-        """Detached boot migration for the ingestion lease (issue #559 R2-3).
+        """Detached boot migration for the DB-claimed leases (issue #559 R2-3).
 
-        Copies every files row that awaits ingestion work but has no live
-        (pending/running) jobs counterpart into the shared ``jobs`` table, and
-        resets stranded ``processing`` rows to ``pending``/``queued`` so the
-        janitor — not the restart — owns their settlement. Idempotent and
-        resumable: a boot that dies mid-migration simply re-runs it. Workers
-        and the janitor hold on ``_jobs_barrier`` until this completes.
+        Stage 1: copies every files row that awaits ingestion work but has no
+        live (pending/running) jobs counterpart into the shared ``jobs`` table,
+        and resets stranded ``processing`` rows to ``pending``/``queued`` so
+        the janitor — not the restart — owns their settlement.
+
+        Stages 2-3: copies pending/running rows from the wiki, KMS and reindex
+        legacy job tables into ``jobs`` (queues ``wiki``/``kms``/``reindex``),
+        each gated by its per-queue lease switch — a queue whose switch is
+        disabled stays on its legacy table, and its jobs-side rows are instead
+        reverse-synced back so the legacy claim path keeps serving them
+        (non-lossy rollback; draft is exempt by construction: ``draft_jobs``
+        IS its lease store). The migration writes ONLY to ``jobs`` (never
+        UPDATEs a source table), so the anti-join on ``payload.legacy_job_id``
+        makes re-runs — including after a mid-migration crash — add zero rows.
+
+        Idempotent and resumable. Workers and the janitor hold on
+        ``_jobs_barrier`` until this completes.
         """
         try:
             if self.processor is None or self.processor.pool is None:
                 return
-            migrated = await asyncio.to_thread(self._sync_missing_ingest_job_rows)
-            if migrated:
+            if getattr(self, "_ingest_lease_enabled", False):
+                # Gated on the ingestion switch itself: with the ingestion
+                # lease disabled the legacy queue owns the files rows and
+                # this migration must not touch them (e.g. the bounded-queue
+                # deadlock regression pins a mock pool per legacy drain).
+                migrated = await asyncio.to_thread(
+                    self._sync_missing_ingest_job_rows
+                )
+                if migrated:
+                    logger.info(
+                        "Jobs migration: created %d ingestion job row(s) "
+                        "from stranded files rows",
+                        migrated,
+                    )
+            compile_migrated = await asyncio.to_thread(
+                self._sync_missing_compile_job_rows
+            )
+            if compile_migrated:
                 logger.info(
-                    "Jobs migration: created %d ingestion job row(s) from "
-                    "stranded files rows",
-                    migrated,
+                    "Jobs migration: created %d wiki/kms/reindex job row(s) "
+                    "from legacy job tables",
+                    compile_migrated,
+                )
+            reversed_rows = await asyncio.to_thread(
+                self._reverse_sync_disabled_queues
+            )
+            if reversed_rows:
+                logger.info(
+                    "Jobs migration: reverse-synced %d job row(s) back to "
+                    "legacy tables for lease-disabled queues",
+                    reversed_rows,
                 )
         except asyncio.CancelledError:
             raise
@@ -717,6 +771,190 @@ class BackgroundProcessor:
                 conn.commit()
         return created if created and created > 0 else 0
 
+    # Legacy table -> jobs queue mapping for the stages 2-3 migration. Each
+    # entry carries the payload projection the unified readers expect; the
+    # copy is gated per queue on its lease switch.
+    _COMPILE_JOB_SOURCES = (
+        ("wiki_compile_jobs", "wiki"),
+        ("kms_compile_jobs", "kms"),
+        ("document_reindex_jobs", "reindex"),
+    )
+
+    def _sync_missing_compile_job_rows(self) -> int:
+        """Copy pending/running legacy job rows into ``jobs`` (stages 2-3).
+
+        Per-queue lease switches gate the copy: a queue whose switch is
+        disabled stays on its legacy table (its rows are reverse-synced in
+        :meth:`_reverse_sync_disabled_queues`). Running rows are copied as
+        reclaim candidates (copied to ``pending`` — the old claim is dead by
+        definition on boot); the reindex terminal ``interrupted`` status is
+        deliberately mapped to ``failed`` in the unified vocabulary, with the
+        original error preserved, so the status endpoint never emits
+        ``interrupted`` again. Writes only to ``jobs`` — sources are read-only,
+        and the anti-join on ``payload.legacy_job_id`` + queue makes re-runs
+        idempotent (zero new rows).
+        """
+        created_total = 0
+        with self.processor.pool.connection() as conn:
+            ensure_jobs_schema(conn)
+            owned = not conn.in_transaction
+            if owned:
+                conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table, queue in self._COMPILE_JOB_SOURCES:
+                    if not self._queue_lease_enabled(queue):
+                        continue
+                    cursor = conn.execute(
+                        f"""
+                        INSERT INTO jobs (queue, payload_json, status, error,
+                            result_json, created_at, started_at, completed_at)
+                        SELECT ?,
+                            json_object('legacy_job_id', j.id,
+                                'vault_id', j.vault_id,
+                                'trigger_type', j.trigger_type,
+                                'trigger_id', j.trigger_id,
+                                'input_json', COALESCE(j.input_json, '{{}}')),
+                            CASE WHEN j.status IN ('pending', 'running')
+                                THEN 'pending'
+                                WHEN j.status = 'interrupted' THEN 'failed'
+                                ELSE j.status END,
+                            j.error, COALESCE(j.result_json, '{{}}'),
+                            j.created_at, j.started_at, j.completed_at
+                        FROM {table} j
+                        WHERE j.id NOT IN (
+                            SELECT CAST(json_extract(j2.payload_json,
+                                    '$.legacy_job_id') AS INTEGER)
+                            FROM jobs j2
+                            WHERE j2.queue = ?
+                              AND json_extract(j2.payload_json,
+                                  '$.legacy_job_id') IS NOT NULL
+                          )
+                        """,  # nosec B608 - table names are module constants
+                        (queue, queue),
+                    )
+                    created_total += max(int(cursor.rowcount), 0)
+                if owned:
+                    conn.commit()
+            except BaseException:
+                if owned:
+                    conn.rollback()
+                raise
+        return created_total
+
+    def _reverse_sync_disabled_queues(self) -> int:
+        """Re-materialize pending jobs rows into legacy tables (rollback).
+
+        For a queue whose lease switch is disabled at boot, a pending jobs row
+        that has no legacy-table counterpart is copied back so the legacy
+        claim path serves it — a flag-flip rollback never strands not-yet-
+        claimed work (issue #559 rollout/rollback contract). Rows are stamped
+        ``$.reversed_at`` after the copy so re-boots stay idempotent even for
+        rows that never had a ``legacy_job_id`` (work created under lease
+        mode). Legacy rows stuck ``running`` (pre-migration claims) are reset
+        to ``pending`` so the legacy claim path can actually serve them.
+        """
+        reversed_total = 0
+        if not any(
+            not self._queue_lease_enabled(queue)
+            for _, queue in self._COMPILE_JOB_SOURCES
+        ):
+            # Every queue's lease switch is on: nothing to reverse-sync and
+            # the (possibly mock/test) pool must stay untouched.
+            return 0
+        with self.processor.pool.connection() as conn:
+            ensure_jobs_schema(conn)
+            owned = not conn.in_transaction
+            if owned:
+                conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table, queue in self._COMPILE_JOB_SOURCES:
+                    if self._queue_lease_enabled(queue):
+                        continue
+                    # Select the SOURCE jobs ids first: RETURNING on the
+                    # INSERT would yield the destination table's ids, which
+                    # must never be stamped back onto jobs rows.
+                    source_ids = [
+                        int(row[0])
+                        for row in conn.execute(
+                            f"""
+                            SELECT j.id FROM jobs j
+                            WHERE j.queue = ? AND j.status = 'pending'
+                              AND json_extract(j.payload_json, '$.reversed_at') IS NULL
+                              AND (
+                                json_extract(j.payload_json, '$.legacy_job_id') IS NULL
+                                OR CAST(json_extract(j.payload_json, '$.legacy_job_id') AS INTEGER)
+                                    NOT IN (SELECT id FROM {table})
+                              )
+                            """,  # nosec B608 - table names are module constants
+                            (queue,),
+                        ).fetchall()
+                    ]
+                    if not source_ids:
+                        continue
+                    placeholders = ",".join("?" * len(source_ids))
+                    conn.execute(
+                        f"""
+                        INSERT INTO {table} (vault_id, trigger_type, trigger_id,
+                            status, error, result_json, created_at, started_at,
+                            completed_at)
+                        SELECT json_extract(j.payload_json, '$.vault_id'),
+                            COALESCE(json_extract(j.payload_json, '$.trigger_type'),
+                                'manual'),
+                            json_extract(j.payload_json, '$.trigger_id'),
+                            'pending', j.error, COALESCE(j.result_json, '{{}}'),
+                            j.created_at, NULL, NULL
+                        FROM jobs j
+                        WHERE j.id IN ({placeholders})
+                        """,  # nosec B608 - table names are module constants
+                        source_ids,
+                    )
+                    # Stamp the source rows so the next boot's sync is a
+                    # no-op (idempotent for legacy_job_id-less rows too).
+                    conn.executemany(
+                        "UPDATE jobs SET payload_json = "
+                        "json_set(payload_json, '$.reversed_at', '1') "
+                        "WHERE id = ?",
+                        [(i,) for i in source_ids],
+                    )
+                    reversed_total += len(source_ids)
+                    # A pre-migration claim left a legacy row 'running'; the
+                    # rollback boot must make it claimable again.
+                    conn.execute(
+                        f"UPDATE {table} SET status = 'pending', started_at = NULL "  # nosec B608 - table names are module constants
+                        "WHERE status = 'running'"
+                    )
+                if owned:
+                    conn.commit()
+            except BaseException:
+                if owned:
+                    conn.rollback()
+                raise
+        return reversed_total
+
+    def _queue_lease_enabled(self, queue: str) -> bool:
+        """Per-queue lease switch (env-only; process-start-stable)."""
+        if queue == INGESTION_QUEUE:
+            return bool(getattr(self, "_ingest_lease_enabled", False))
+        setting_name = {
+            "wiki": "wiki_kms_job_lease_enabled",
+            "kms": "wiki_kms_job_lease_enabled",
+            "reindex": "reindex_job_lease_enabled",
+        }.get(queue)
+        if setting_name is None:
+            return False
+        return bool(getattr(settings, setting_name, False))
+
+    def _any_jobs_lease_enabled(self) -> bool:
+        """True when any queue's DB-claimed lease path is selected, so the
+        boot migration + shared janitor tasks must run."""
+        if getattr(self, "_ingest_lease_enabled", False):
+            return True
+        if getattr(self, "_reindex_lease_enabled", False):
+            return True
+        return self.processor is not None and (
+            bool(getattr(settings, "wiki_kms_job_lease_enabled", False))
+        )
+
     async def _ingest_janitor_loop(self) -> None:
         """Reclaim expired ingestion leases while the process lives (issue #559).
 
@@ -741,9 +979,21 @@ class BackgroundProcessor:
             await asyncio.sleep(interval)
 
     async def _janitor_sweep_once(self) -> None:
-        """One janitor pass: reclaim expired leases, then re-sync files rows."""
+        """One janitor pass: reclaim expired leases, then re-sync files rows.
+
+        Stage 2-3 extension (issue #559): the same pass also reclaims the
+        wiki/KMS/reindex queues whose lease switch is on — their rows ARE the
+        ``jobs`` rows, so no secondary resync is needed beyond the ingestion
+        files-row bookkeeping below.
+        """
         if self.processor is None or self.processor.pool is None:
             return
+
+        if getattr(self, "_ingest_lease_enabled", False):
+            await self._janitor_sweep_ingestion()
+        await self._janitor_reclaim_compile_queues()
+
+    async def _janitor_sweep_ingestion(self) -> None:
 
         def run_reclaim() -> int:
             with self.processor.pool.connection() as conn:
@@ -850,6 +1100,78 @@ class BackgroundProcessor:
         except Exception:  # noqa: BLE001 — a failed claim is retried next poll
             logger.exception("Ingestion job claim failed")
             return None
+
+    # ------------------------------------------------------------------
+    # Stages 2-3: wiki/KMS/reindex queues on the shared lease (issue #559)
+    # ------------------------------------------------------------------
+
+    async def _janitor_reclaim_compile_queues(self) -> None:
+        """Reclaim expired wiki/KMS/reindex leases whose switch is on.
+
+        These queues have no secondary side table to resync — the jobs row IS
+        the durable record — so a reclaim alone re-queues (or caps) the work.
+        """
+        queues = [
+            queue
+            for queue in ("wiki", "kms", "reindex")
+            if self._queue_lease_enabled(queue)
+        ]
+        if not queues:
+            return
+
+        def run_reclaim() -> dict[str, int]:
+            settled: dict[str, int] = {}
+            with self.processor.pool.connection() as conn:
+                ensure_jobs_schema(conn)
+                lease = JobLease(
+                    conn,
+                    reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+                    max_attempts=settings.jobs_max_attempts,
+                )
+                for queue in queues:
+                    settled[queue] = lease.reclaim_expired(queue=queue)
+            return settled
+
+        settled = await asyncio.to_thread(run_reclaim)
+        for queue, count in settled.items():
+            if count:
+                logger.info(
+                    "Lease janitor: reclaimed %d expired %s lease(s)",
+                    count,
+                    queue,
+                )
+
+    async def _claim_next_reindex_job(self, worker_id: str):
+        """Claim one reindex job row off the shared lease (issue #559 stage 3).
+
+        Barrier-gated like the ingestion claim: no row is served before the
+        boot migration has copied the legacy ``document_reindex_jobs`` rows.
+        """
+        if self.processor is None or self.processor.pool is None:
+            return None
+        barrier = getattr(self, "_jobs_barrier", None)
+        if barrier is not None and not barrier.is_set():
+            await barrier.wait()
+
+        def _claim():
+            with self.processor.pool.connection() as conn:
+                ensure_jobs_schema(conn)
+                lease = JobLease(
+                    conn,
+                    reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+                    max_attempts=settings.jobs_max_attempts,
+                )
+                return lease.claim("reindex", worker_id)
+
+        try:
+            return await asyncio.to_thread(_claim)
+        except Exception:  # noqa: BLE001 — a failed claim is retried next poll
+            logger.exception("Reindex job claim failed")
+            return None
+
+    # Heartbeat renewal reuses the stage-1 per-job ``_heartbeat_loop`` —
+    # wiki/KMS/reindex rows live on the same ``jobs`` table with the same
+    # settings, so the ingestion renewal task serves them unchanged.
 
     async def _settle_ingest_job(
         self,
@@ -1046,6 +1368,24 @@ class BackgroundProcessor:
                 "lease_generation = lease_generation + 1, heartbeat_at = NULL "
                 "WHERE queue = ? AND status = 'running'",
                 (INGESTION_QUEUE,),
+            )
+            conn.commit()
+            return cursor.rowcount
+
+    def _release_reindex_leases(self) -> int:
+        """Give back every still-running reindex lease (shutdown path).
+
+        Mirrors the ingestion release (issue #559 stage 3): a graceful stop
+        never leaves a lease waiting out the reclaim timeout on next boot.
+        """
+        if self.processor is None or self.processor.pool is None:
+            return 0
+        with self.processor.pool.connection() as conn:
+            ensure_jobs_schema(conn)
+            cursor = conn.execute(
+                "UPDATE jobs SET status = 'pending', worker_id = NULL, "
+                "lease_generation = lease_generation + 1, heartbeat_at = NULL "
+                "WHERE queue = 'reindex' AND status = 'running'",
             )
             conn.commit()
             return cursor.rowcount
@@ -2393,12 +2733,16 @@ class BackgroundProcessor:
             self._reindex_start_gate.set()
             self._reindex_worker_task.cancel()
             await asyncio.gather(self._reindex_worker_task, return_exceptions=True)
-            # Reindex lifecycle ownership (issue #513 W12): with the worker
-            # cancelled, a 'running' job row would be abandoned forever —
-            # mark it 'interrupted' (terminal, operator-visible).
-            self._mark_running_reindex_jobs_interrupted(
-                "Interrupted by processor shutdown"
-            )
+            # Reindex lifecycle ownership (issue #513 W12, legacy mode only):
+            # with the worker cancelled, a 'running' job row would be
+            # abandoned forever — mark it 'interrupted' (terminal,
+            # operator-visible). In lease mode (issue #559 stage 3) the
+            # janitor owns settlement, so the marking is retired here and the
+            # held reindex leases are released below instead.
+            if not getattr(self, "_reindex_lease_enabled", False):
+                self._mark_running_reindex_jobs_interrupted(
+                    "Interrupted by processor shutdown"
+                )
         # Deferred-retry scheduler (issue #513 W11): cancel the deliverer, then
         # discard any still-pending tickets with a warning — shutdown never
         # hangs on the backlog and never silently delivers post-stop retries.
@@ -2426,6 +2770,16 @@ class BackgroundProcessor:
                     )
             except Exception:  # noqa: BLE001 — janitor reclaims on next boot
                 logger.warning("Shutdown lease release failed", exc_info=True)
+        # Same shutdown release for the reindex queue (issue #559 stage 3).
+        if getattr(self, "_reindex_lease_enabled", False):
+            try:
+                released = await asyncio.to_thread(self._release_reindex_leases)
+                if released:
+                    logger.info(
+                        "Released %d reindex lease(s) at shutdown", released
+                    )
+            except Exception:  # noqa: BLE001 — janitor reclaims on next boot
+                logger.warning("Reindex shutdown lease release failed", exc_info=True)
         # Guarded like every other lifecycle attribute above: ``stop`` must be
         # safe on partially constructed instances (tests and shutdown paths
         # build minimal processors without running ``__init__``).
@@ -2731,7 +3085,14 @@ class BackgroundProcessor:
         logger.debug("Enqueued enrichment for file_id=%s", item.file_id)
 
     async def enqueue_reindex(self, job_id: int) -> None:
-        """Add a reindex job to the reindex queue."""
+        """Add a reindex job to the reindex queue.
+
+        Lease mode (issue #559 stage 3) is a no-op here: the durable ``jobs``
+        row the route inserted IS the work order, and the lease worker claims
+        it straight from the DB.
+        """
+        if getattr(self, "_reindex_lease_enabled", False):
+            return
         job_id = int(job_id)
         if job_id in self._reindex_job_ids:
             logger.debug("Skipping duplicate reindex enqueue for job_id=%s", job_id)
@@ -2900,8 +3261,17 @@ class BackgroundProcessor:
                 self.enrichment_queue.task_done()
 
     async def _reindex_worker_loop(self) -> None:
-        """Process reindex jobs from the reindex queue."""
+        """Process reindex jobs — legacy in-memory queue or the shared lease.
+
+        Lease mode (issue #559 stage 3): poll the DB claim directly; the
+        in-memory queue and its dedupe set are not involved. The
+        ``_reindex_start_gate`` (startup recovery ordering, issue #556) still
+        applies in both modes.
+        """
         await self._reindex_start_gate.wait()
+        if getattr(self, "_reindex_lease_enabled", False):
+            await self._reindex_lease_worker_loop()
+            return
         while True:
             if self.shutdown_event.is_set() and self.reindex_queue.empty():
                 break
@@ -2915,18 +3285,94 @@ class BackgroundProcessor:
                 self.reindex_queue.task_done()
                 self._reindex_job_ids.discard(item.job_id)
 
-    async def _process_reindex_job(self, job_id: int) -> None:
-        """Process a reindex job: re-embed all stored documents with the current model.
+    async def _reindex_lease_worker_loop(self) -> None:
+        """Claim-and-run reindex jobs through the shared lease."""
+        worker_id = f"reindex-{id(self)}"
+        while True:
+            if self.shutdown_event.is_set():
+                break
+            row = await self._claim_next_reindex_job(worker_id)
+            if row is None:
+                await asyncio.sleep(0.25)
+                continue
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(int(row["id"]), worker_id),
+                name=f"reindex-heartbeat-{row['id']}",
+            )
+            try:
+                await self._run_reindex_job_row(row, worker_id)
+            finally:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
 
-        Steps:
-        1. Mark job as 'running'.
-        2. Read vault_id / input_json from the job row.
-        3. Select files with status IN ('indexed', 'error'), optionally filtered by vault_id.
-        4. Group by vault_id and iterate in sorted order.
-        5. For each file call process_existing_file (current model), counting successes/failures.
-        6. On any file failure: continue to next file (partial-failure strategy).
-        7. Mark job 'completed' on full success, 'failed' if any file failed.
-        8. Leave settings_kv and vector_store._ready unchanged (Task 1.7).
+    async def _run_reindex_job_row(self, row, worker_id: str) -> None:
+        """Run one claimed reindex ``jobs`` row and settle it on the lease.
+
+        Success completes the lease; a failure requeues it with backoff
+        (``run_after``) until ``jobs_max_attempts`` is exhausted, then fails
+        it terminally — the durable-retry semantics the legacy queue never
+        had (release-noted as the intended improvement).
+        """
+        job_id = int(row["id"])
+        attempts = int(row["attempts"] or 0)
+        payload = json.loads(row["payload_json"] or "{}")
+        vault_id = payload.get("vault_id")
+        logger.info("Starting lease-claimed reindex job %d", job_id)
+        status, result, exc = await self._reindex_embed_all(job_id, vault_id)
+        # Issue #562 invariant: persisted error fields are user-facing —
+        # redact exception payloads at the persist boundary; operator
+        # constants remain verbatim.
+        error_text = (
+            redact_ingest_error(exc)
+            if isinstance(exc, BaseException)
+            else exc
+        )
+        with self.processor.pool.connection() as conn:
+            lease = JobLease(
+                conn,
+                reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+                max_attempts=settings.jobs_max_attempts,
+            )
+            if status == "completed":
+                settled = lease.complete(job_id, worker_id, result)
+                if settled:
+                    logger.info(
+                        "Lease reindex job %d completed for vault %s",
+                        job_id,
+                        vault_id,
+                    )
+                return
+            if attempts >= settings.jobs_max_attempts:
+                lease.fail(
+                    job_id,
+                    worker_id,
+                    f"attempt_cap_exceeded: {error_text}"[:500],
+                )
+                logger.error(
+                    "Lease reindex job %d failed terminally at the attempt "
+                    "cap: %s",
+                    job_id,
+                    error_text,
+                )
+            else:
+                delay = 2.0 ** max(attempts - 1, 0)
+                lease.requeue(
+                    job_id, worker_id, delay_seconds=delay, error=error_text
+                )
+                logger.warning(
+                    "Lease reindex job %d failed; retrying in %.1fs: %s",
+                    job_id,
+                    delay,
+                    error_text,
+                )
+
+    async def _process_reindex_job(self, job_id: int) -> None:
+        """Legacy-path reindex processing (``reindex_job_lease_enabled=false``).
+
+        Steps preserved verbatim: the ``pending``->``running`` claim on
+        ``document_reindex_jobs``, then the shared embed body, then the legacy
+        settlement writes on the same table. In lease mode the worker claims
+        from ``jobs`` instead (:meth:`_run_reindex_job_row`).
         """
         logger.info("Starting reindex job %d", job_id)
         if self.processor is None or self.processor.pool is None:
@@ -2961,7 +3407,69 @@ class BackgroundProcessor:
                     return
                 vault_id = row["vault_id"] if hasattr(row, "keys") else row[0]
 
-            # Step 3: Select files to reindex
+            status, result, error = await self._reindex_embed_all(job_id, vault_id)
+
+            # Legacy settlement on document_reindex_jobs, mapped from the
+            # shared body's outcome (writes preserved verbatim per branch).
+            if status == "completed":
+                with self.processor.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE document_reindex_jobs SET status = 'completed', result_json = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (json.dumps(result), job_id),
+                    )
+                    conn.commit()
+                logger.info(
+                    "Reindex job %d completed successfully.",
+                    job_id,
+                )
+            else:
+                if error is not None and result == {}:
+                    # Metadata/identity failure path: error is the raw string.
+                    with self.processor.pool.connection() as conn:
+                        conn.execute(
+                            "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
+                            (datetime.now(UTC).isoformat(), str(error), job_id),
+                        )
+                        conn.commit()
+                else:
+                    with self.processor.pool.connection() as conn:
+                        conn.execute(
+                            "UPDATE document_reindex_jobs SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (json.dumps(result), job_id),
+                        )
+                        conn.commit()
+                logger.error(
+                    "Reindex job %d failed; stored model identity left unchanged.",
+                    job_id,
+                )
+
+        except Exception as exc:
+            logger.exception("Error processing reindex job %s", job_id)
+            try:
+                with self.processor.pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
+                        (datetime.now(UTC).isoformat(), str(exc), job_id),
+                    )
+                    conn.commit()
+            except Exception:
+                logger.warning("Failed to update reindex job %s status to failed", job_id)
+
+    async def _reindex_embed_all(
+        self, job_id: int, vault_id: Optional[int]
+    ) -> tuple[str, dict, Optional[str]]:
+        """Re-embed all stored documents for one reindex job (shared body).
+
+        Returns ``(status, result, error)`` where status is ``completed`` or
+        ``failed`` and the caller owns settlement on its own table. Behavior
+        preserved from the pre-refactor legacy path: zero files -> completed;
+        any file failure -> failed after every file was visited; a dimension
+        rebuild (issue #513 W13) commits only when ALL files succeed and is
+        aborted otherwise; stored model identity is updated (and its failure
+        fails the job) before ``completed`` is reported.
+        """
+        try:
+            # Select files to reindex
             with self.processor.pool.connection() as conn:
                 if vault_id is not None:
                     rows = conn.execute(
@@ -2973,7 +3481,7 @@ class BackgroundProcessor:
                         "SELECT id, file_path, vault_id FROM files WHERE status IN ('indexed', 'error')",
                     ).fetchall()
 
-            # Step 4: Group by vault_id
+            # Group by vault_id
             vaults_files: dict[int, list[tuple[int, str, int]]] = {}
             for row in rows:
                 fid = row["id"] if hasattr(row, "keys") else row[0]
@@ -2981,7 +3489,7 @@ class BackgroundProcessor:
                 vid = row["vault_id"] if hasattr(row, "keys") else row[2]
                 vaults_files.setdefault(vid, []).append((fid, fpath, vid))
 
-            # Step 4b: Dimension probe (issue #513 W13 / RC-8). Embed one probe
+            # Dimension probe (issue #513 W13 / RC-8). Embed one probe
             # text BEFORE iterating files; when the target dimension differs
             # from the live table's dimension, every per-file vector write is
             # routed into a rebuild temp table and the live index is replaced
@@ -3011,7 +3519,7 @@ class BackgroundProcessor:
                         getattr(rebuild_handle, "table_name", "?"),
                     )
 
-            # Step 5: Initialize counters
+            # Initialize counters
             total_files = 0
             processed_files = 0
             failed_files = 0
@@ -3067,87 +3575,54 @@ class BackgroundProcessor:
                     rebuild_handle = None
                 raise
 
-            # Step 6: Determine final job status and result
+            # Determine final job status and result
             if total_files == 0:
-                result = {"processed": 0, "failed": 0}
-                with self.processor.pool.connection() as conn:
-                    conn.execute(
-                        "UPDATE document_reindex_jobs SET status = 'completed', result_json = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (json.dumps(result), job_id),
-                    )
-                    conn.commit()
                 logger.info("Reindex job %d completed (no files to reindex).", job_id)
-            elif failed_files > 0:
+                return "completed", {"processed": 0, "failed": 0}, None
+            if failed_files > 0:
                 result = {"processed": processed_files, "failed": failed_files, "details": failed_details[:10]}
-                with self.processor.pool.connection() as conn:
-                    conn.execute(
-                        "UPDATE document_reindex_jobs SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (json.dumps(result), job_id),
-                    )
-                    conn.commit()
                 logger.error(
                     "Reindex job %d failed for %d/%d files; stored model identity left unchanged.",
                     job_id,
                     failed_files,
                     total_files,
                 )
-            else:
-                # Step 7a: Update stored model identity and readiness BEFORE marking completed.
-                # If this fails, mark the job as failed so the app is not left in a mismatched
-                # state on restart (metadata not persisted but job reported as completed).
-                # After a committed dimension rebuild (W13) the recorded dim is
-                # the probe-observed dim the new index was actually built at.
-                try:
-                    vector_store = self.processor.vector_store
-                    if vector_store is not None:
-                        await vector_store.record_embedding_metadata(
-                            probe_dim or settings.embedding_dim, raise_on_error=True
-                        )
-                        await vector_store.mark_ready(True)
-                        logger.info(
-                            "Vector store model identity updated and marked ready after reindex job %d.",
-                            job_id,
-                        )
-                    else:
-                        logger.warning("Vector store unavailable; cannot update model identity after reindex job %d.", job_id)
-                except Exception as exc:
-                    logger.exception("Failed to update vector store model identity after reindex job %d", job_id)
-                    try:
-                        with self.processor.pool.connection() as conn:
-                            conn.execute(
-                                "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
-                                (datetime.now(UTC).isoformat(), str(exc), job_id),
-                            )
-                            conn.commit()
-                    except Exception:
-                        logger.warning("Failed to update reindex job %d status to failed", job_id)
-                    return
+                return "failed", result, None
 
-                # Step 7b: Only mark completed after metadata and readiness updates succeeded.
-                result = {"processed": processed_files, "failed": 0}
-                with self.processor.pool.connection() as conn:
-                    conn.execute(
-                        "UPDATE document_reindex_jobs SET status = 'completed', result_json = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (json.dumps(result), job_id),
+            # Update stored model identity and readiness BEFORE reporting
+            # completion. If this fails, the job is failed so the app is not
+            # left in a mismatched state on restart (metadata not persisted
+            # but job reported as completed). After a committed dimension
+            # rebuild (W13) the recorded dim is the probe-observed dim the
+            # new index was actually built at.
+            try:
+                vector_store = self.processor.vector_store
+                if vector_store is not None:
+                    await vector_store.record_embedding_metadata(
+                        probe_dim or settings.embedding_dim, raise_on_error=True
                     )
-                    conn.commit()
-                logger.info(
-                    "Reindex job %d completed successfully for %d files.",
-                    job_id,
-                    processed_files,
-                )
+                    await vector_store.mark_ready(True)
+                    logger.info(
+                        "Vector store model identity updated and marked ready after reindex job %d.",
+                        job_id,
+                    )
+                else:
+                    logger.warning("Vector store unavailable; cannot update model identity after reindex job %d.", job_id)
+            except Exception as exc:
+                logger.exception("Failed to update vector store model identity after reindex job %d", job_id)
+                return "failed", {}, str(exc)
+
+            result = {"processed": processed_files, "failed": 0}
+            logger.info(
+                "Reindex job %d completed successfully for %d files.",
+                job_id,
+                processed_files,
+            )
+            return "completed", result, None
 
         except Exception as exc:
-            logger.exception("Error processing reindex job %d", job_id)
-            try:
-                with self.processor.pool.connection() as conn:
-                    conn.execute(
-                        "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
-                        (datetime.now(UTC).isoformat(), str(exc), job_id),
-                    )
-                    conn.commit()
-            except Exception:
-                logger.warning("Failed to update reindex job %d status to failed", job_id)
+            logger.exception("Error processing reindex job %s", job_id)
+            return "failed", {}, str(exc)
 
     async def _process_task_wrapper(self, task: TaskItem) -> None:
         """

@@ -428,3 +428,16 @@ async def test_publication_failure_closes_rejected_owned_coroutine():
     assert rejected[0].cr_frame is None
     assert not processor._running
     assert not processor._starting
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _legacy_reindex_lease_mode(monkeypatch):
+    """Pin the reindex legacy path (issue #559 stage 3); restored per test."""
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings, "reindex_job_lease_enabled", False, raising=False
+    )

@@ -262,3 +262,22 @@ class TestIssue515Ac4KmsCompleteJobRace(_CompleteJobRaceTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _legacy_wiki_kms_lease_mode(monkeypatch):
+    """Pin the wiki/KMS legacy claim path (issue #559 stage 2).
+
+    These tests characterize the legacy ``wiki_compile_jobs`` /
+    ``kms_compile_jobs`` behavior that remains the rollback path; the
+    lease-path equivalents live in the issue-559 check family. Restored
+    after every test so the default (lease mode on) is untouched elsewhere.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings, "wiki_kms_job_lease_enabled", False, raising=False
+    )
