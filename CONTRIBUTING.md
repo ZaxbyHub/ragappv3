@@ -116,10 +116,17 @@ python scripts/check_secretscan.py      # .secretscanignore validity
 
 ```bash
 python scripts/run_bandit.py
-# Fails only on NEW findings vs backend/security/bandit-baseline.json.
+# Fails on NEW findings vs backend/security/bandit-baseline.json, and on
+# UNUSED `# nosec` suppressions: a marker that suppresses nothing. Bandit's
+# "nosec encountered ..., but no failed test" warnings name the candidate
+# sites; each is cross-checked with an --ignore-nosec re-scan (the warning
+# stream alone has per-context false positives), and only truly-unused
+# markers fail the gate. Delete the dead marker (keep the safety rationale
+# as a plain comment) or fix the code it claims to suppress.
 # If you intentionally accept a new pre-existing finding, regenerate with
 #   python scripts/run_bandit.py --update-baseline
-# and justify the newly-suppressed finding IDs in your PR.
+# and justify the newly-suppressed finding IDs in your PR. The regen also
+# prints an advisory listing nosec-usage warning sites worth reviewing.
 ```
 
 ## Testing expectations

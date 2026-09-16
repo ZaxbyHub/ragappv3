@@ -154,7 +154,7 @@ jobs:
       - name: Install bandit
         run: pip install -r backend/requirements-dev.txt
 
-      - name: SAST scan (fails on new findings vs baseline)
+      - name: SAST scan (fails on new findings or unused nosec suppressions)
         run: python scripts/run_bandit.py
 
   backend:

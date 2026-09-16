@@ -2673,7 +2673,7 @@ class _CompileRun:
             return
         marks = ", ".join("?" * len(wanted))
         rows = conn.execute(
-            f"SELECT {_INHERITED_STAGE_COLUMNS} FROM draft_job_stages "  # nosec B608
+            f"SELECT {_INHERITED_STAGE_COLUMNS} FROM draft_job_stages "  # nosec B608 — fixed column-name literals; values bound
             f"WHERE job_id = ? AND status = 'completed' "
             f"AND artifact_sha256 IS NOT NULL AND stage IN ({marks}) "
             f"ORDER BY id ASC",
@@ -2688,7 +2688,7 @@ class _CompileRun:
         try:
             for stage, values in latest.items():
                 conn.execute(
-                    f"INSERT INTO draft_job_stages "  # nosec B608
+                    f"INSERT INTO draft_job_stages "  # nosec B608 — fixed column-name literals; values bound
                     f"(job_id, {_INHERITED_STAGE_COLUMNS}) VALUES ({placeholders})",
                     (ctx.job_id, *values),
                 )
@@ -2701,7 +2701,7 @@ class _CompileRun:
                     "DELETE FROM draft_evidence WHERE job_id = ?", (ctx.job_id,)
                 )
                 conn.execute(
-                    f"INSERT INTO draft_evidence "  # nosec B608
+                    f"INSERT INTO draft_evidence "  # nosec B608 — fixed column-name literals; values bound
                     f"(job_id, {_INHERITED_EVIDENCE_COLUMNS}) "
                     f"SELECT ?, {_INHERITED_EVIDENCE_COLUMNS} FROM draft_evidence "
                     f"WHERE job_id = ? ORDER BY id ASC",

@@ -10,8 +10,11 @@ Run the gated scan (what CI runs)::
     python scripts/run_bandit.py
 
     Exits 0 when the only findings are already in the committed baseline
-    (i.e. no NEW findings). Exits non-zero when a NEW finding appears, or
-    when bandit itself errors. The committed baseline lives at
+    (i.e. no NEW findings) and every ``# nosec`` marker suppresses a live
+    finding. Exits non-zero when a NEW finding appears, when a ``# nosec``
+    marker suppresses nothing (an unused suppression — bandit's own
+    ``nosec encountered ..., but no failed test`` warnings name each site),
+    or when bandit itself errors. The committed baseline lives at
     ``backend/security/bandit-baseline.json``.
 
 Regenerate the committed baseline (run after intentionally accepting new
@@ -43,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -65,8 +69,10 @@ TARGETS = ("backend/app", "scripts/backup_set.py", "scripts/restore.py")
 BASELINE = BACKEND / "security" / "bandit-baseline.json"
 
 
-def _run_bandit_json(targets: tuple[str, ...], extra: list[str]) -> tuple[int, dict | None]:
-    """Run bandit with JSON output to a temp file; return (exit_code, parsed_json).
+def _run_bandit_json(
+    targets: tuple[str, ...], extra: list[str]
+) -> tuple[int, dict | None, str]:
+    """Run bandit with JSON output to a temp file; return (exit_code, json, stderr).
 
     bandit exits non-zero when it finds issues, which is expected when generating a
     baseline. We only treat an *unparseable* result as a hard error. A bounded
@@ -74,6 +80,11 @@ def _run_bandit_json(targets: tuple[str, ...], extra: list[str]) -> tuple[int, d
     hanging the gate until the outer CI job timeout. The temp file is written to
     the system temp dir (not the repo root) so a hard kill cannot leak a file into
     the working tree that could be accidentally staged.
+
+    The captured stderr text is returned alongside the parsed JSON because bandit
+    reports unused ``# nosec`` suppressions ONLY there (as
+    ``nosec encountered (Bxxx), but no failed test`` warnings) — that stream is
+    the sole evidence for the dead-marker failure path in ``gated_scan``.
     """
     with tempfile.NamedTemporaryFile(
         mode="w+", suffix=".json", delete=False
@@ -103,7 +114,7 @@ def _run_bandit_json(targets: tuple[str, ...], extra: list[str]) -> tuple[int, d
                 "run_bandit: bandit scan timed out after 300s — "
                 "possible symlink loop or pathological input\n"
             )
-            return 1, None
+            return 1, None, ""
         try:
             with open(out_path, encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -111,11 +122,11 @@ def _run_bandit_json(targets: tuple[str, ...], extra: list[str]) -> tuple[int, d
             # ValueError covers JSONDecodeError and UnicodeDecodeError.
             sys.stderr.write(proc.stdout + proc.stderr)
             sys.stderr.write(f"run_bandit: failed to parse bandit JSON ({exc})\n")
-            return proc.returncode or 1, None
+            return proc.returncode or 1, None, proc.stderr
         # Re-emit bandit's human-readable output for visibility.
         if proc.stderr:
             sys.stderr.write(proc.stderr)
-        return proc.returncode, data
+        return proc.returncode, data, proc.stderr
     finally:
         try:
             os.unlink(out_path)
@@ -161,6 +172,45 @@ def _norm_path(fname: str) -> str:
     if fname.startswith("./"):
         fname = fname[2:]
     return fname
+
+
+# Matches bandit's own dead-suppression notice (the tester logger's WARNING
+# line), e.g. on Windows:
+#   [tester]\tWARNING\tnosec encountered (B608), but no failed test on file backend/app\services\draft_store.py:988
+# and for explicit file targets the path carries a leading "." segment
+# (``.\scripts/restore.py:90``). The path is whatever bandit was given for the
+# scan, so separators are mixed; ``_norm_path`` normalizes them.
+_DEAD_NOSEC_RE = re.compile(
+    r"nosec encountered \((?P<test_id>[A-Z]\d+)\), "
+    r"but no failed test on file (?P<path>.+):(?P<line>\d+)\s*$"
+)
+
+
+def _parse_dead_nosec_warnings(stderr_text: str) -> list[tuple[str, str, int]]:
+    """Extract dead ``# nosec`` sites from bandit's stderr warning stream.
+
+    bandit emits one ``nosec encountered (Bxxx), but no failed test`` WARNING
+    per ``# nosec`` marker that suppressed no finding — the only signal that a
+    marker is dead. Returns a deduplicated, order-preserving list of
+    ``(test_id, normalized_path, line)`` tuples: bandit reports multi-line
+    statements more than once (the same site appeared twice per scan on this
+    repo's own tree), and duplicates must not inflate the failure report.
+    """
+    sites: list[tuple[str, str, int]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for raw_line in stderr_text.splitlines():
+        match = _DEAD_NOSEC_RE.search(raw_line)
+        if not match:
+            continue
+        site = (
+            match.group("test_id"),
+            _norm_path(match.group("path")),
+            int(match.group("line")),
+        )
+        if site not in seen:
+            seen.add(site)
+            sites.append(site)
+    return sites
 
 
 def _finding_key(result: dict) -> str:
@@ -209,7 +259,7 @@ def update_baseline() -> int:
     """Regenerate the committed baseline with normalized paths + no timestamp."""
     BASELINE.parent.mkdir(parents=True, exist_ok=True)
     prev_keys = _load_baseline_keys(BASELINE)
-    exit_code, data = _run_bandit_json(TARGETS, [])
+    _exit_code, data, stderr_text = _run_bandit_json(TARGETS, [])
     if data is None:
         sys.stderr.write("run_bandit: failed to generate baseline JSON\n")
         return 1
@@ -242,6 +292,20 @@ def update_baseline() -> int:
             sys.stdout.write(f"  - {key}\n")
     if not added and not removed and prev_keys:
         sys.stdout.write("run_bandit: no changes vs previous baseline\n")
+    # A baseline regen must not launder a tree the gated scan will reject: some
+    # nosec-usage warnings correspond to markers that suppress nothing and can
+    # mask a future finding on their line. The warning stream alone also has
+    # false positives (per-context emission, see gated_scan), so this is an
+    # advisory pointing at the gated scan, which cross-checks each warned site.
+    warned_sites = _parse_dead_nosec_warnings(stderr_text)
+    if warned_sites:
+        sys.stdout.write(
+            f"run_bandit: WARNING — {len(warned_sites)} nosec-usage warning site(s) "
+            "reported by bandit; run the gated scan to verify whether any are "
+            "genuinely unused suppressions:\n"
+        )
+        for test_id, path, line in warned_sites:
+            sys.stdout.write(f"  [{test_id}] {path}:{line}\n")
     # Baseline regeneration is not a CI failure even when bandit found issues.
     return 0
 
@@ -277,44 +341,93 @@ def gated_scan() -> int:
 
     # A full JSON scan always returns bandit exit 1 when any finding exists; that
     # is expected and is not itself a failure. We decide pass/fail from the diff.
-    _exit_code, data = _run_bandit_json(TARGETS, [])
+    _exit_code, data, stderr_text = _run_bandit_json(TARGETS, [])
     if data is None:
         sys.stderr.write("run_bandit: failed to run bandit for the gated scan\n")
         return 1
     current_results = data.get("results", [])
     current_keys = {_finding_key(r) for r in current_results}
     new_keys = sorted(current_keys - baseline_keys)
+    # Second, independent failure path (issue #564 / C20): a `# nosec` marker
+    # that suppresses nothing. Such a marker never contributes to current_keys,
+    # so the diff above cannot see it — but bandit's own warning stream names
+    # candidate dead sites.
+    #
+    # The warning stream alone is NOT proof a marker is dead: bandit emits
+    # "nosec encountered ..., but no failed test" per *non-firing context*
+    # (core/tester.py), so a marker that suppresses a live finding on one AST
+    # node still warns from sibling contexts on the same statement. A warned
+    # site is therefore only DEAD if a re-scan of the same targets with
+    # `--ignore-nosec` finds no finding of that test id at that exact line —
+    # i.e. the marker is not even suppressing anything. That extra scan runs
+    # only when warnings exist, so the clean steady state pays nothing.
+    #
+    # New findings are reported BEFORE the verification scan so a cross-scan
+    # failure cannot hide them (PR #613 review PRR-002).
+    if new_keys:
+        sys.stdout.write(
+            f"run_bandit: FAIL — {len(new_keys)} new finding(s) detected:\n"
+        )
+        # Index current results by key to print locations for the new findings. A key
+        # may map to multiple findings (e.g. two issues on one line); report the count
+        # so none are hidden by a set/dict collapse.
+        by_key: dict[str, list[dict]] = {}
+        for r in current_results:
+            by_key.setdefault(_finding_key(r), []).append(r)
+        for key in new_keys:
+            rows = by_key.get(key, [])
+            sev = rows[0].get("issue_severity", "?") if rows else "?"
+            text = (
+                rows[0].get("issue_text", "").strip().splitlines()[0][:100] if rows else ""
+            )
+            count_note = f" (x{len(rows)})" if len(rows) > 1 else ""
+            sys.stdout.write(f"  [{sev}] {key}{count_note} — {text}\n")
+        sys.stdout.write(
+            "Fix the code, or if the finding is acceptable pre-existing debt, "
+            "regenerate the baseline with "
+            "`python scripts/run_bandit.py --update-baseline` and justify the "
+            "newly-suppressed IDs in the PR.\n"
+        )
 
-    if not new_keys:
+    warned_sites = _parse_dead_nosec_warnings(stderr_text)
+    dead_nosec: list[tuple[str, str, int]] = []
+    if warned_sites:
+        _ign_exit_code, data_all, _ign_stderr = _run_bandit_json(
+            TARGETS, ["--ignore-nosec"]
+        )
+        if data_all is None:
+            sys.stderr.write(
+                "run_bandit: failed to run the --ignore-nosec verification scan\n"
+            )
+            return 1
+        unsuppressed = {
+            (r.get("test_id", "?"), _norm_path(r.get("filename", "?")), r.get("line_number"))
+            for r in data_all.get("results", [])
+        }
+        dead_nosec = [
+            site for site in warned_sites
+            if (site[0], site[1], site[2]) not in unsuppressed
+        ]
+
+    if not new_keys and not dead_nosec:
         sys.stdout.write(
             f"run_bandit: PASS — no new findings ({len(current_results)} current "
             f"findings, all suppressed by the baseline).\n"
         )
         return 0
 
-    sys.stdout.write(
-        f"run_bandit: FAIL — {len(new_keys)} new finding(s) detected:\n"
-    )
-    # Index current results by key to print locations for the new findings. A key
-    # may map to multiple findings (e.g. two issues on one line); report the count
-    # so none are hidden by a set/dict collapse.
-    by_key: dict[str, list[dict]] = {}
-    for r in current_results:
-        by_key.setdefault(_finding_key(r), []).append(r)
-    for key in new_keys:
-        rows = by_key.get(key, [])
-        sev = rows[0].get("issue_severity", "?") if rows else "?"
-        text = (
-            rows[0].get("issue_text", "").strip().splitlines()[0][:100] if rows else ""
+    if dead_nosec:
+        sys.stdout.write(
+            f"run_bandit: FAIL — {len(dead_nosec)} unused nosec suppression(s) "
+            "detected:\n"
         )
-        count_note = f" (x{len(rows)})" if len(rows) > 1 else ""
-        sys.stdout.write(f"  [{sev}] {key}{count_note} — {text}\n")
-    sys.stdout.write(
-        "Fix the code, or if the finding is acceptable pre-existing debt, "
-        "regenerate the baseline with "
-        "`python scripts/run_bandit.py --update-baseline` and justify the "
-        "newly-suppressed IDs in the PR.\n"
-    )
+        for test_id, path, line in dead_nosec:
+            sys.stdout.write(f"  [{test_id}] {path}:{line}\n")
+        sys.stdout.write(
+            "Every `# nosec` marker must suppress a live finding. Delete the "
+            "marker if it suppresses nothing (keep the safety rationale as a "
+            "plain comment), or fix the code it claims to suppress.\n"
+        )
     return 1
 
 

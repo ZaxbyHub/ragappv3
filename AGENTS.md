@@ -55,4 +55,4 @@ there is no consumer for a routing YAML, and adding one would be unwired
 `.github/workflows/ci.yml` — jobs: **Backend** (ruff + targeted pytest),
 **Frontend** (typecheck, lint `--max-warnings 0`, test, build, subpath build),
 **Quality contracts** (`check_config_contract.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_skill_sync.py`, `check_secretscan.py`),
-**SAST** (`scripts/run_bandit.py` — bandit baseline gate, fails on new findings).
+**SAST** (`scripts/run_bandit.py` — bandit baseline gate, fails on new findings or unused `# nosec` suppressions).
