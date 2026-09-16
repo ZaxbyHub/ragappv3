@@ -1645,7 +1645,7 @@ SCHEMA = (
     # migrate_add_migration_journal (repo double-definition pattern).
     + MIGRATION_JOURNAL_DDL
     + _QUALITY_REPORTS_DDL
-)  # nosec B608
+)  # SCHEMA concatenates module-level DDL literal constants
 
 
 
@@ -2656,7 +2656,7 @@ def migrate_add_chat_turn_columns(sqlite_path: str) -> None:
             "currency_warnings", "citation_enforcement",
         ):
             if name not in existing_msg_cols:
-                conn.execute(f"ALTER TABLE chat_messages ADD COLUMN {name} TEXT")  # nosec B608 — column names are a fixed literal set, not user input
+                conn.execute(f"ALTER TABLE chat_messages ADD COLUMN {name} TEXT")  # column names are a fixed literal set, not user input
 
         # Backfill whenever rows still lack a seq. added_seq alone is not a
         # sufficient guard: ALTER TABLE ADD COLUMN auto-commits outside the

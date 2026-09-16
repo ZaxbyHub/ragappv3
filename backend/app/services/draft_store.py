@@ -1850,7 +1850,7 @@ class DraftStore:
     def get_job(self, *, draft_id: int, owner_id: int, job_id: int) -> DraftJobRecord:
         """Load one job, constrained through its owning draft."""
         row = self._db.execute(
-            f"SELECT {_JOB_COLUMNS} "  # nosec B608
+            f"SELECT {_JOB_COLUMNS} "  # nosec B608 — fixed column-name literals; values bound
             "FROM draft_jobs j "
             "WHERE j.id = ? AND j.draft_id = ? AND EXISTS ("
             "  SELECT 1 FROM drafts d WHERE d.id = j.draft_id AND d.created_by = ?)",
@@ -1949,7 +1949,7 @@ class DraftStore:
             self._db.rollback()
             raise
         row = self._db.execute(
-            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE id = ?",  # nosec B608
+            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE id = ?",  # nosec B608 — fixed column-name literals; values bound
             (job_id,),
         ).fetchone()
         return None if row is None else _row_to_job(row)
@@ -2579,7 +2579,7 @@ class DraftStore:
     ) -> Optional[DraftStageRecord]:
         """Load one stage attempt, or None if it has not been recorded yet."""
         row = self._db.execute(
-            f"SELECT {_STAGE_COLUMNS} FROM draft_job_stages "  # nosec B608
+            f"SELECT {_STAGE_COLUMNS} FROM draft_job_stages "  # nosec B608 — fixed column-name literals; values bound
             "WHERE job_id = ? AND stage = ? AND attempt = ?",
             (job_id, stage, attempt),
         ).fetchone()
@@ -2590,7 +2590,7 @@ class DraftStore:
     ) -> list[DraftStageRecord]:
         """Page through a job's recorded stage attempts, oldest first."""
         rows = self._db.execute(
-            f"SELECT {_STAGE_COLUMNS} FROM draft_job_stages "  # nosec B608
+            f"SELECT {_STAGE_COLUMNS} FROM draft_job_stages "  # nosec B608 — fixed column-name literals; values bound
             "WHERE job_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
             (job_id, limit, offset),
         ).fetchall()
@@ -2782,7 +2782,7 @@ class DraftStore:
                 return []
             resolved_job_id = int(row[0])
         rows = self._db.execute(
-            f"SELECT {_EVIDENCE_COLUMNS} FROM draft_evidence "  # nosec B608
+            f"SELECT {_EVIDENCE_COLUMNS} FROM draft_evidence "  # nosec B608 — fixed column-name literals; values bound
             "WHERE job_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
             (resolved_job_id, limit, offset),
         ).fetchall()
@@ -2802,7 +2802,7 @@ class DraftStore:
         pass unboundedly expensive, so it is deliberately excluded here.
         """
         rows = self._db.execute(
-            f"SELECT {_EVIDENCE_IDENTITY_COLUMNS} "  # nosec B608
+            f"SELECT {_EVIDENCE_IDENTITY_COLUMNS} "  # nosec B608 — fixed column-name literals; values bound
             "FROM draft_evidence e JOIN draft_jobs j ON j.id = e.job_id "
             "WHERE e.job_id = ? ORDER BY e.id ASC LIMIT ? OFFSET ?",
             (job_id, limit, offset),
@@ -2859,9 +2859,9 @@ class DraftStore:
         elif current_revision is False:
             currency = currency_non_current
         rows = self._db.execute(
-            f"SELECT {_EVIDENCE_IDENTITY_COLUMNS} "  # nosec B608
+            f"SELECT {_EVIDENCE_IDENTITY_COLUMNS} "  # nosec B608 — fixed column-name literals; values bound
             "FROM draft_evidence e JOIN draft_jobs j ON j.id = e.job_id "
-            f"WHERE {predicate}{currency} ORDER BY e.id ASC LIMIT ? OFFSET ?",  # nosec B608
+            f"WHERE {predicate}{currency} ORDER BY e.id ASC LIMIT ? OFFSET ?",  # predicate/currency are fixed fragments; values bound
             (source_id, limit, offset),
         ).fetchall()
         return [_row_to_evidence_identity(r) for r in rows]
@@ -2884,7 +2884,7 @@ class DraftStore:
         for chunk in iter_chunks(ids, 500):
             placeholders = ",".join("?" for _ in chunk)
             cur = self._db.execute(
-                "UPDATE draft_evidence SET source_deleted_at = CURRENT_TIMESTAMP "  # nosec B608
+                "UPDATE draft_evidence SET source_deleted_at = CURRENT_TIMESTAMP "  # nosec B608 — fixed literal SQL text; values bound
                 f"WHERE id IN ({placeholders}) AND source_deleted_at IS NULL",
                 tuple(chunk),
             )
@@ -3106,7 +3106,7 @@ class DraftStore:
     ) -> list[DraftClaimRecord]:
         """Page through a revision's claims, in ordinal order."""
         rows = self._db.execute(
-            f"SELECT {_CLAIM_COLUMNS} FROM draft_claims "  # nosec B608
+            f"SELECT {_CLAIM_COLUMNS} FROM draft_claims "  # nosec B608 — fixed column-name literals; values bound
             "WHERE revision_id = ? ORDER BY ordinal ASC LIMIT ? OFFSET ?",
             (revision_id, limit, offset),
         ).fetchall()
@@ -3248,7 +3248,7 @@ class DraftStore:
     ) -> list[DraftClaimSourceRecord]:
         """Page through one claim's evidence citations."""
         rows = self._db.execute(
-            f"SELECT {_CLAIM_SOURCE_COLUMNS} FROM draft_claim_sources "  # nosec B608
+            f"SELECT {_CLAIM_SOURCE_COLUMNS} FROM draft_claim_sources "  # nosec B608 — fixed column-name literals; values bound
             "WHERE claim_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
             (claim_id, limit, offset),
         ).fetchall()
@@ -3405,7 +3405,7 @@ class DraftStore:
         """
         self.get_draft(draft_id, owner_id)
         row = self._db.execute(
-            f"SELECT {_FINDING_COLUMNS} FROM draft_findings "  # nosec B608
+            f"SELECT {_FINDING_COLUMNS} FROM draft_findings "  # nosec B608 — fixed column-name literals; values bound
             "WHERE id = ? AND draft_id = ?",
             (finding_id, draft_id),
         ).fetchone()
@@ -3618,7 +3618,7 @@ class DraftStore:
             self._db.rollback()
             raise
         row = self._db.execute(
-            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE id = ?",  # nosec B608
+            f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE id = ?",  # nosec B608 — fixed column-name literals; values bound
             (job_id,),
         ).fetchone()
         return None if row is None else _row_to_job(row)
@@ -3650,7 +3650,7 @@ class DraftStore:
                 f"field must be one of {sorted(_JOB_JSON_FIELDS)}, got {field!r}"
             )
         row = self._db.execute(
-            f"SELECT {field} FROM draft_jobs WHERE id = ?",  # nosec B608
+            f"SELECT {field} FROM draft_jobs WHERE id = ?",  # nosec B608 — field is allowlisted (_JOB_JSON_FIELDS); id bound
             (job_id,),
         ).fetchone()
         if row is None or row[0] is None:
@@ -3680,7 +3680,7 @@ class DraftStore:
         self._begin_immediate()
         try:
             self._db.execute(
-                f"UPDATE draft_jobs SET {field} = ? WHERE id = ?",  # nosec B608
+                f"UPDATE draft_jobs SET {field} = ? WHERE id = ?",  # nosec B608 — field is allowlisted (_JOB_JSON_FIELDS); values bound
                 (payload, job_id),
             )
             self._db.commit()
