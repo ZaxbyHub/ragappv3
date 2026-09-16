@@ -361,6 +361,34 @@ def gated_scan() -> int:
     # `--ignore-nosec` finds no finding of that test id at that exact line —
     # i.e. the marker is not even suppressing anything. That extra scan runs
     # only when warnings exist, so the clean steady state pays nothing.
+    #
+    # New findings are reported BEFORE the verification scan so a cross-scan
+    # failure cannot hide them (PR #613 review PRR-002).
+    if new_keys:
+        sys.stdout.write(
+            f"run_bandit: FAIL — {len(new_keys)} new finding(s) detected:\n"
+        )
+        # Index current results by key to print locations for the new findings. A key
+        # may map to multiple findings (e.g. two issues on one line); report the count
+        # so none are hidden by a set/dict collapse.
+        by_key: dict[str, list[dict]] = {}
+        for r in current_results:
+            by_key.setdefault(_finding_key(r), []).append(r)
+        for key in new_keys:
+            rows = by_key.get(key, [])
+            sev = rows[0].get("issue_severity", "?") if rows else "?"
+            text = (
+                rows[0].get("issue_text", "").strip().splitlines()[0][:100] if rows else ""
+            )
+            count_note = f" (x{len(rows)})" if len(rows) > 1 else ""
+            sys.stdout.write(f"  [{sev}] {key}{count_note} — {text}\n")
+        sys.stdout.write(
+            "Fix the code, or if the finding is acceptable pre-existing debt, "
+            "regenerate the baseline with "
+            "`python scripts/run_bandit.py --update-baseline` and justify the "
+            "newly-suppressed IDs in the PR.\n"
+        )
+
     warned_sites = _parse_dead_nosec_warnings(stderr_text)
     dead_nosec: list[tuple[str, str, int]] = []
     if warned_sites:
@@ -387,31 +415,6 @@ def gated_scan() -> int:
             f"findings, all suppressed by the baseline).\n"
         )
         return 0
-
-    if new_keys:
-        sys.stdout.write(
-            f"run_bandit: FAIL — {len(new_keys)} new finding(s) detected:\n"
-        )
-        # Index current results by key to print locations for the new findings. A key
-        # may map to multiple findings (e.g. two issues on one line); report the count
-        # so none are hidden by a set/dict collapse.
-        by_key: dict[str, list[dict]] = {}
-        for r in current_results:
-            by_key.setdefault(_finding_key(r), []).append(r)
-        for key in new_keys:
-            rows = by_key.get(key, [])
-            sev = rows[0].get("issue_severity", "?") if rows else "?"
-            text = (
-                rows[0].get("issue_text", "").strip().splitlines()[0][:100] if rows else ""
-            )
-            count_note = f" (x{len(rows)})" if len(rows) > 1 else ""
-            sys.stdout.write(f"  [{sev}] {key}{count_note} — {text}\n")
-        sys.stdout.write(
-            "Fix the code, or if the finding is acceptable pre-existing debt, "
-            "regenerate the baseline with "
-            "`python scripts/run_bandit.py --update-baseline` and justify the "
-            "newly-suppressed IDs in the PR.\n"
-        )
 
     if dead_nosec:
         sys.stdout.write(

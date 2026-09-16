@@ -28,9 +28,12 @@ could never see it, because a suppressed finding never enters the diff.
 - Marker audit across the scanned targets (`backend/app`, `scripts/backup_set.py`,
   `scripts/restore.py`): 42 markers at base. Empirical disposition (delete and
   re-scan): 35 markers suppress live B608 findings on safe, parameterized SQL —
-  retained, now with explicit per-site rationale comments (the issue's original
+  retained; 18 sites gained explicit per-site rationale comments in this change,
+  while the rest already carried a trailing or adjacent rationale (the six bare
+  `# nosec B608` markers in `draft_store.py` sit directly beneath existing
+  "clause is built only from literal fragments" comments) — the issue's original
   "every marker suppresses nothing" claim is refuted by the live run, as the
-  maintainer comment anticipated); 3 markers suppressed nothing
+  maintainer comment anticipated. 3 markers suppressed nothing
   (`backend/app/models/database.py:1648`, `:2659`, `backend/app/services/draft_store.py:2864`)
   and are removed with their safety rationale kept as plain comments.
   The 4 live B110/B311 markers (best-effort `except` drains, seeded eval RNG)
@@ -54,5 +57,5 @@ could never see it, because a suppressed finding never enters the diff.
 
 ## Rollback
 
-Revert the gate diff and the marker-audit commit; restoring any removed marker
-and re-running `--update-baseline` reverts cleanly.
+Revert this PR's single commit; restoring any removed marker and re-running
+`--update-baseline` reverts cleanly.

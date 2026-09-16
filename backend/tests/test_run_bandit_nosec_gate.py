@@ -146,6 +146,63 @@ def test_both_failure_paths_reported_together(gate, tmp_path):
     assert "dead_fixture.py" in output
 
 
+def test_cross_scan_failure_still_reports_new_findings(gate, tmp_path, monkeypatch):
+    """If the --ignore-nosec verification scan fails, already-computed new
+    findings are still reported before the error (PR #613 review PRR-002)."""
+    pkg = tmp_path / "fixture_pkg"
+    pkg.mkdir()
+    (pkg / "dead_fixture.py").write_text(
+        DEAD_MARKER_SOURCE, encoding="utf-8", newline="\n"
+    )
+    (pkg / "unmarked_fixture.py").write_text(
+        UNMARKED_SOURCE, encoding="utf-8", newline="\n"
+    )
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps({"results": []}) + "\n", encoding="utf-8", newline="\n"
+    )
+    gate.TARGETS = (str(pkg.resolve()),)
+    gate.BASELINE = baseline
+
+    real_run = gate._run_bandit_json
+    calls: list[list[str]] = []
+
+    def failing_cross_scan(targets, extra):
+        calls.append(list(extra))
+        if "--ignore-nosec" in extra:
+            return 1, None, ""
+        return real_run(targets, extra)
+
+    monkeypatch.setattr(gate, "_run_bandit_json", failing_cross_scan)
+
+    code, output = _run_gate(gate)
+    assert calls == [[], ["--ignore-nosec"]]
+    assert code != 0
+    assert "new finding" in output
+    assert "--ignore-nosec verification scan" in output
+    assert "run_bandit: PASS" not in output
+
+
+def test_cross_scan_failure_with_no_new_findings(gate, tmp_path, monkeypatch):
+    """A cross-scan failure with a clean finding diff still exits 1 via the
+    verification-scan error path."""
+    module = _scan_surface(gate, tmp_path, DEAD_MARKER_SOURCE, "dead_fixture.py")
+
+    real_run = module._run_bandit_json
+
+    def failing_cross_scan(targets, extra):
+        if "--ignore-nosec" in extra:
+            return 1, None, ""
+        return real_run(targets, extra)
+
+    monkeypatch.setattr(module, "_run_bandit_json", failing_cross_scan)
+
+    code, output = _run_gate(module)
+    assert code != 0
+    assert "--ignore-nosec verification scan" in output
+    assert "run_bandit: PASS" not in output
+
+
 def test_parser_dedupes_and_normalizes_paths(gate):
     """Warning parser: mixed separators, duplicate sites, non-tester noise."""
     sample = (
