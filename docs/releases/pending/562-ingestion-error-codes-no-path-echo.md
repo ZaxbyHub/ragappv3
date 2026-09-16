@@ -17,26 +17,34 @@ status polls). The raw exception text now stays in the server log only.
 ## What changed
 
 - `backend/app/services/document_processor.py`: new redaction boundary — stable codes
-  `PARSER_UNAVAILABLE` / `PARSE_FAILED` / `FILE_MISSING` with fixed content-free reasons
-  (`classify_ingest_error` / `format_ingest_error` / `redact_ingest_error`), mirroring
-  `document_extraction.py`'s shipped stable-code convention. Applied at every persist site: the
-  `process_file` and `process_existing_file` exception handlers (both `error_message` and the
-  `phase_message` written via `set_phase`), both `process_existing_file` missing-file pre-check
-  branches, and the post-index enrichment failure path (`enrichment_error`). The `process_file`
-  handler now also logs the raw exception (`logger.exception`) — previously it logged nothing, so
-  the raw detail existed only on the wire.
+  `PARSER_UNAVAILABLE` / `PARSE_FAILED` / `FILE_MISSING` / `ENRICHMENT_FAILED` with fixed
+  content-free reasons (`classify_ingest_error` / `format_ingest_error` / `redact_ingest_error`),
+  mirroring `document_extraction.py`'s shipped stable-code convention. Classification walks the
+  exception's `__cause__` chain (bounded), so the parser wrapper's re-raised
+  `DocumentParseError` still classifies a missing parser module as `PARSER_UNAVAILABLE` and a
+  vanished file as `FILE_MISSING`. Applied at every persist site: the `process_file` and
+  `process_existing_file` exception handlers (both `error_message` and the `phase_message`
+  written via `set_phase`), both `process_existing_file` missing-file pre-check branches, and
+  the post-index enrichment failure path — which carries the dedicated `ENRICHMENT_FAILED` code
+  ("content enrichment failed; the indexed document is unaffected") because the document is
+  already parsed and indexed there. The `process_file` handler now also logs the raw exception
+  (`logger.exception`) — previously it logged nothing, so the raw detail existed only on the wire.
 - `backend/app/services/background_tasks.py`: the worker passes the caught exception (not
   `str(e)`) to `_handle_failure`; `_mark_task_permanently_failed` redacts exception payloads
   before persisting. Operator-constructed constant strings (e.g. `admission rejected: …`) remain
-  trusted verbatim; the raw exception continues into the server-log line.
+  trusted verbatim; the raw exception continues into the server-log line. The job-lease
+  transport's terminal branch passes the exception object too — its `outcome_error` string stays
+  internal to the `jobs` table, which no API reads.
 - `backend/app/api/routes/documents.py`: `DocumentResponse.file_path` is projected through
-  `_vault_relative_file_path` (vault-relative when derivable, bare file name as fallback,
-  idempotent for already-relative values) on the list, detail, and enrichment-toggle surfaces.
-  The synchronous ingestion HTTP details that interpolated raw exceptions — upload (`Processing
-  error` / `Server error` / `Upload failed`), whole-document retry, retry-chunks, directory scan,
-  single/bulk delete, reindex-job creation, and the duplicate-file 409 (whose text carried the
-  duplicate's stored server path) — now return fixed text; each handler's `logger.exception` (or
-  a newly added one) keeps the detail server-side.
+  `_vault_relative_file_path` — the server prefix up to `/vaults/` is stripped, dot segments are
+  collapsed, and the result (vault id first, e.g. `7/uploads/name`) carries no server-absolute
+  prefix; stored values without the marker fall back to the bare file name. Covers the list,
+  detail, and enrichment-toggle surfaces. The synchronous ingestion HTTP details that
+  interpolated raw exceptions — upload (`Processing error` / `Server error` / `Upload failed`),
+  whole-document retry, retry-chunks, directory scan, single/bulk delete, reindex-job creation,
+  and the duplicate-file 409 (whose text carried the duplicate's stored server path) — now
+  return fixed text; each handler's `logger.exception` (or a newly added one) keeps the detail
+  server-side.
 - `backend/tests/test_issue562_ingest_error_redaction.py` (new): end-to-end regression suite —
   real `DocumentProcessor` + SQLite, deterministic corrupt-parse failure (independent of the
   `unstructured` environment gap tracked as C30): redacted `error_message`/`phase_message`, raw

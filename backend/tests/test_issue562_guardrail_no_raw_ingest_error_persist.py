@@ -25,7 +25,7 @@ DOCUMENTS = os.path.join(BACKEND, "app", "api", "routes", "documents.py")
 # unreachable (SpreadsheetParser's extension gate matches _is_spreadsheet_file)
 # and a future reachable code may be added here deliberately.
 SHIPPED_INGEST_ERROR_CODES = frozenset(
-    {"PARSER_UNAVAILABLE", "PARSE_FAILED", "FILE_MISSING"}
+    {"PARSER_UNAVAILABLE", "PARSE_FAILED", "FILE_MISSING", "ENRICHMENT_FAILED"}
 )
 
 _PERSIST_PATTERNS = (
@@ -85,6 +85,20 @@ class NoRawIngestErrorPersistTest(unittest.TestCase):
             found_redact_call,
             "_mark_task_permanently_failed must persist via"
             " redact_ingest_error() for exception payloads (issue #562)",
+        )
+
+    def test_documents_routes_have_no_raw_exception_http_details(self):
+        # The synchronous ingestion handlers must not interpolate raw
+        # exception text into HTTP details (issue #562 sweep).
+        import re
+
+        source = _source(DOCUMENTS)
+        raw_detail = re.compile(r'detail=f"[^"]*\{(e|exc)\}')
+        self.assertEqual(
+            raw_detail.findall(source),
+            [],
+            "documents.py must not interpolate raw exceptions into HTTP"
+            " details; keep the detail fixed and the raw text in the log",
         )
 
     def test_response_layer_does_not_forward_raw_file_path(self):

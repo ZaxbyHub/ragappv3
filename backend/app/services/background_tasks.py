@@ -954,6 +954,7 @@ class BackgroundProcessor:
             name=f"ingest-heartbeat-{job_id}",
         )
         outcome_error: Optional[str] = None
+        outcome_exc: Optional[BaseException] = None
         try:
             try:
                 async with get_admission_controller().admit(
@@ -966,6 +967,12 @@ class BackgroundProcessor:
                 outcome_error = f"admission rejected: {exc.reason}"
             except Exception as exc:  # noqa: BLE001 — outcome drives settle
                 outcome_error = str(exc)
+                # Retained so the terminal branch hands the exception object
+                # (redacted at the persist boundary) to the permanent-failure
+                # path instead of its raw str(): the jobs-table error field is
+                # a server-side sink, files.error_message is user-facing
+                # (issue #562).
+                outcome_exc = exc
 
             if outcome_error is None:
                 await self._settle_ingest_job(job_id, worker_id, "complete")
@@ -996,7 +1003,9 @@ class BackgroundProcessor:
                     "fail",
                     error=f"attempt_cap_exceeded: {outcome_error}"[:500],
                 )
-                self._mark_task_permanently_failed(task, outcome_error)
+                self._mark_task_permanently_failed(
+                    task, outcome_exc if outcome_exc is not None else outcome_error
+                )
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)

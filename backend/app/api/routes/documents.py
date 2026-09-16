@@ -643,11 +643,12 @@ def _vault_relative_file_path(raw_file_path: str) -> str:
     """Project the stored upload path to a vault-relative path (issue #562).
 
     The API must not echo server-absolute filesystem paths. Stored values look
-    like ``<data_dir>/vaults/<vault_id>/uploads/<name>``; the server prefix up
-    to ``/vaults/`` is stripped, so the vault id survives as the first segment
-    (e.g. ``7/uploads/name``) — free of any server-absolute prefix. Falls back
-    to the bare file name for layouts that do not match and is a no-op for
-    already-relative values.
+    like ``<data_dir>/vaults/<vault_id>/uploads/<name>``: the server prefix up
+    to ``/vaults/`` is stripped, dot segments are collapsed, and the result
+    (vault id first, e.g. ``7/uploads/name``) carries no server-absolute
+    prefix. Stored values without the marker — including already-relative
+    ones — fall back to the bare file name, so the response never grows a
+    server prefix it did not already have.
     """
     normalized = raw_file_path.replace("\\", "/")
     marker = "/vaults/"
@@ -655,7 +656,17 @@ def _vault_relative_file_path(raw_file_path: str) -> str:
     if start != -1:
         remainder = normalized[start + len(marker) :]
         if "/" in remainder:
-            return remainder
+            # Collapse '.'/'..' segments so a malformed stored row cannot
+            # project server structure into the response.
+            parts = [p for p in remainder.split("/") if p not in ("", ".")]
+            while ".." in parts:
+                idx = parts.index("..")
+                if idx == 0:
+                    parts.pop(0)
+                else:
+                    del parts[idx - 1 : idx + 1]
+            if parts:
+                return "/".join(parts)
     return normalized.rsplit("/", 1)[-1]
 
 

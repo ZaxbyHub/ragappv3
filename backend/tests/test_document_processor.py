@@ -852,15 +852,21 @@ CREATE TABLE posts (
         self.processor.embedding_service = MismatchedEmbeddingService()
         self.processor._chunk_enrichment_service = FakeEnrichmentService()
         try:
-            asyncio.run(
-                self.processor.run_enrichment_job(
-                    file_id=75,
-                    file_path=self.sql_file_path,
-                    vault_id=1,
-                    file_hash="abcdef012345",
-                    chunks=[chunk],
-                    document_text="indexed text",
+            with self.assertLogs(
+                "app.services.document_processor", level="WARNING"
+            ) as captured:
+                asyncio.run(
+                    self.processor.run_enrichment_job(
+                        file_id=75,
+                        file_path=self.sql_file_path,
+                        vault_id=1,
+                        file_hash="abcdef012345",
+                        chunks=[chunk],
+                        document_text="indexed text",
+                    )
                 )
+            self.assertIn(
+                "Enriched embedding count mismatch", "\n".join(captured.output)
             )
         finally:
             settings.chunk_enrichment_enabled = original_enabled
@@ -874,10 +880,12 @@ CREATE TABLE posts (
 
         self.assertEqual(row["status"], "indexed")
         self.assertEqual(row["enrichment_status"], "error")
-        # Issue #562: enrichment_error is the stable user-facing code; the raw
-        # mismatch detail stays in the server log only.
+        # Issue #562: enrichment_error carries the dedicated enrichment
+        # code (the document itself is indexed); the raw mismatch detail
+        # stays in the server log only.
         self.assertEqual(
-            row["enrichment_error"], "PARSE_FAILED: document could not be parsed"
+            row["enrichment_error"],
+            "ENRICHMENT_FAILED: content enrichment failed; the indexed document is unaffected",
         )
 
     def test_post_index_enrichment_failure_does_not_change_indexed_status(self):
@@ -909,15 +917,21 @@ CREATE TABLE posts (
         self.processor._llm_client = object()
         self.processor._chunk_enrichment_service = FailingEnrichmentService()
         try:
-            asyncio.run(
-                self.processor.run_enrichment_job(
-                    file_id=77,
-                    file_path=self.sql_file_path,
-                    vault_id=1,
-                    file_hash="abcdef012345",
-                    chunks=[chunk],
-                    document_text="indexed text",
+            with self.assertLogs(
+                "app.services.document_processor", level="WARNING"
+            ) as captured:
+                asyncio.run(
+                    self.processor.run_enrichment_job(
+                        file_id=77,
+                        file_path=self.sql_file_path,
+                        vault_id=1,
+                        file_hash="abcdef012345",
+                        chunks=[chunk],
+                        document_text="indexed text",
+                    )
                 )
+            self.assertIn(
+                "LLM offline", "\n".join(captured.output)
             )
         finally:
             settings.chunk_enrichment_enabled = original_enabled
@@ -932,10 +946,11 @@ CREATE TABLE posts (
         self.assertEqual(row["status"], "indexed")
         self.assertIsNone(row["error_message"])
         self.assertEqual(row["enrichment_status"], "error")
-        # Issue #562: enrichment_error is the stable user-facing code; the raw
-        # "LLM offline" detail stays in the server log only.
+        # Issue #562: enrichment_error carries the dedicated enrichment
+        # code; the raw detail stays in the server log only.
         self.assertEqual(
-            row["enrichment_error"], "PARSE_FAILED: document could not be parsed"
+            row["enrichment_error"],
+            "ENRICHMENT_FAILED: content enrichment failed; the indexed document is unaffected",
         )
 
     def test_cancelled_enrichment_marks_error_and_preserves_indexed_status(self):

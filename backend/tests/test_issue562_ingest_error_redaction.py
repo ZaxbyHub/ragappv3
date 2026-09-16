@@ -31,11 +31,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from _db_pool import SimpleConnectionPool  # noqa: E402
 
+from app.api.routes.documents import _vault_relative_file_path  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.models.database import SQLiteConnectionPool, init_db  # noqa: E402
 from app.services.document_processor import (  # noqa: E402
+    INGEST_ERROR_ENRICHMENT_FAILED,
     INGEST_ERROR_FILE_MISSING,
     INGEST_ERROR_PARSE_FAILED,
+    INGEST_ERROR_PARSER_UNAVAILABLE,
+    DocumentParseError,
     DocumentProcessor,
     format_ingest_error,
     redact_ingest_error,
@@ -45,7 +49,10 @@ _PARTITION_ERROR = ValueError("simulated corrupt document structure at offset 99
 
 
 def _failing_partition(*_args, **_kwargs):
-    raise _PARTITION_ERROR
+    raise _partition_error_holder["exc"]
+
+
+_partition_error_holder = {"exc": _PARTITION_ERROR}
 
 
 try:
@@ -90,9 +97,14 @@ except ImportError:
 class _PartitionFailurePatch:
     """Swap in the failing partition for the duration of a test only."""
 
+    def __init__(self, exc=None):
+        self._exc = exc
+
     def __enter__(self):
         import unstructured.partition.auto as auto_mod
 
+        if self._exc is not None:
+            _partition_error_holder["exc"] = self._exc
         self._auto = auto_mod
         self._original = auto_mod.partition
         auto_mod.partition = _failing_partition
@@ -247,6 +259,95 @@ class IngestErrorRedactionTest(unittest.TestCase):
         self.assertTrue(_is_leak_free(row["error_message"]))
 
 
+class ParserUnavailableEndToEndTest(unittest.TestCase):
+    """The missing-parser failure (ImportError wrapped by DocumentParseError)
+    must surface as PARSER_UNAVAILABLE, not PARSE_FAILED (issue #562 review)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="issue562-importerror-")
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_db(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT OR IGNORE INTO vaults (id, name, description) VALUES (7, 'V', '')"
+        )
+        conn.commit()
+        conn.close()
+        self.pool = SQLiteConnectionPool(self.db_path, max_size=2)
+        self.processor = DocumentProcessor(
+            chunk_size_chars=2000, chunk_overlap_chars=200, pool=self.pool
+        )
+        self._original_data_dir = settings.data_dir
+        settings.data_dir = Path(self.temp_dir)
+        self.vault_uploads = Path(self.temp_dir) / "vaults" / "7" / "uploads"
+        self.vault_uploads.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        settings.data_dir = self._original_data_dir
+        self.pool.close_all()
+        import shutil
+
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_missing_parser_failure_persists_parser_unavailable(self):
+        doc = self.vault_uploads / "no-parser.txt"
+        doc.write_text("x", encoding="utf-8")
+
+        with _PartitionFailurePatch(
+            ImportError("No module named 'unstructured'")
+        ), self.assertRaises(Exception):
+            asyncio.run(self.processor.process_file(str(doc), vault_id=7))
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status, error_message, phase_message FROM files WHERE vault_id = 7"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row["status"], "error")
+        expected = format_ingest_error(INGEST_ERROR_PARSER_UNAVAILABLE)
+        self.assertEqual(row["error_message"], expected)
+        self.assertEqual(row["phase_message"], expected)
+
+
+class WorkerPassesExceptionObjectTest(unittest.TestCase):
+    """The worker must hand the exception OBJECT (not str(e)) to
+    _handle_failure, so the persist boundary can redact it (issue #562)."""
+
+    def test_process_task_passes_exception_to_handle_failure(self):
+        import asyncio
+        from unittest.mock import MagicMock, patch
+
+        from app.services.background_tasks import BackgroundProcessor, TaskItem
+
+        async def run():
+            bp = BackgroundProcessor.__new__(BackgroundProcessor)
+            captured = {}
+
+            async def failing_run(_self, _task):
+                raise ValueError("worker probe failure")
+
+            async def fake_handle(_self, task, error):
+                captured["error"] = error
+
+            bp.shutdown_event = asyncio.Event()
+            bp.max_retries = 3
+            bp.retry_delay = 0.1
+            task = TaskItem(file_path="worker-probe.txt", file_id=None, vault_id=7)
+            with patch.object(
+                BackgroundProcessor, "_run_task_processing", failing_run
+            ), patch.object(
+                BackgroundProcessor, "_handle_failure", fake_handle
+            ), patch.object(
+                BackgroundProcessor, "_schedule_retry", MagicMock(return_value=True)
+            ):
+                await bp._process_task(task)
+            return captured["error"]
+
+        error = asyncio.run(run())
+        self.assertIsInstance(error, ValueError)
+
+
 class MarkPermanentlyFailedRedactionTest(unittest.TestCase):
     """The retry-exhausted persist path redacts exceptions, trusts constants."""
 
@@ -314,6 +415,64 @@ class MarkPermanentlyFailedRedactionTest(unittest.TestCase):
             ).fetchone()
             conn.close()
             self.assertEqual(row[0], "admission rejected: overloaded")
+
+
+class ClassificationCauseWalkTest(unittest.TestCase):
+    """Classification must walk the __cause__ chain the parser wrapper
+    builds (issue #562 review: PARSER_UNAVAILABLE was dead otherwise)."""
+
+    def test_wrapped_import_error_maps_to_parser_unavailable(self):
+        wrapped = DocumentParseError(
+            "Failed to parse document 'C:/x/f.txt': No module named 'unstructured'"
+        )
+        wrapped.__cause__ = ImportError("No module named 'unstructured'")
+        self.assertEqual(
+            redact_ingest_error(wrapped),
+            "PARSER_UNAVAILABLE: document parser is unavailable",
+        )
+
+    def test_wrapped_file_not_found_maps_to_file_missing(self):
+        wrapped = DocumentParseError("Failed to read spreadsheet: boom")
+        wrapped.__cause__ = FileNotFoundError("Spreadsheet file not found")
+        self.assertEqual(
+            redact_ingest_error(wrapped),
+            "FILE_MISSING: uploaded file is missing from storage",
+        )
+
+    def test_unwrapped_failures_keep_top_level_classification(self):
+        self.assertEqual(
+            redact_ingest_error(ValueError("plain")),
+            "PARSE_FAILED: document could not be parsed",
+        )
+
+
+class VaultRelativeFilePathTest(unittest.TestCase):
+    """Projection of the stored upload path (issue #562 review fixes)."""
+
+    def test_dot_segments_are_collapsed(self):
+        # A path whose dot segments escape the vault collapses to the bare
+        # name: no '..' may ever reach the wire.
+        self.assertEqual(
+            _vault_relative_file_path("C:\\data\\vaults\\1\\uploads\\..\\..\\x"),
+            "x",
+        )
+
+    def test_interior_dot_segments_collapse_within_the_vault(self):
+        self.assertEqual(
+            _vault_relative_file_path("/data/vaults/7/uploads/../other.txt"),
+            "7/other.txt",
+        )
+
+    def test_already_relative_values_fall_back_to_bare_name(self):
+        self.assertEqual(
+            _vault_relative_file_path("7/uploads/name.pdf"), "name.pdf"
+        )
+
+    def test_vault_relative_form_keeps_vault_id_first(self):
+        self.assertEqual(
+            _vault_relative_file_path("/data/vaults/7/uploads/name.txt"),
+            "7/uploads/name.txt",
+        )
 
 
 class DocumentApiResponsePathTest(unittest.TestCase):

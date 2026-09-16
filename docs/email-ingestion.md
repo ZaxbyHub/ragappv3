@@ -1064,6 +1064,9 @@ curl -s -H "Authorization: Bearer <token>" \
      http://localhost:9090/api/email/status | jq '{processed: .emails_processed_today, failed: .emails_failed_today}'
 
 # 2. Check failed files in database
+# error_message carries a stable code prefix (PARSER_UNAVAILABLE / PARSE_FAILED /
+# FILE_MISSING) plus a short content-free reason — raw exception text and server
+# paths stay in the server log only (issue #562).
 sqlite3 /data/knowledgevault/app.db "SELECT id, filename, error_message FROM files WHERE status='error' AND source='email' ORDER BY created_at DESC LIMIT 10;"
 
 # 3. Review error logs

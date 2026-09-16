@@ -311,24 +311,43 @@ class DocumentParseError(Exception):
 INGEST_ERROR_PARSER_UNAVAILABLE = "PARSER_UNAVAILABLE"
 INGEST_ERROR_PARSE_FAILED = "PARSE_FAILED"
 INGEST_ERROR_FILE_MISSING = "FILE_MISSING"
+INGEST_ERROR_ENRICHMENT_FAILED = "ENRICHMENT_FAILED"
 
 _INGEST_ERROR_REASONS = {
     INGEST_ERROR_PARSER_UNAVAILABLE: "document parser is unavailable",
     INGEST_ERROR_PARSE_FAILED: "document could not be parsed",
     INGEST_ERROR_FILE_MISSING: "uploaded file is missing from storage",
+    INGEST_ERROR_ENRICHMENT_FAILED: (
+        "content enrichment failed; the indexed document is unaffected"
+    ),
 }
 
 # Matches document_extraction.MAX_ERROR_MESSAGE_CHARS: persisted messages are
 # bounded and content-free, so the cap never truncates a reason mid-word.
 _INGEST_ERROR_MAX_CHARS = 200
 
+# Bound on the __cause__ walk so pathological (or cyclic) exception chains
+# cannot make classification unbounded.
+_INGEST_ERROR_CAUSE_DEPTH = 5
+
 
 def classify_ingest_error(exc: BaseException) -> str:
-    """Map an ingestion failure to a stable, user-facing error code."""
-    if isinstance(exc, ImportError):
-        return INGEST_ERROR_PARSER_UNAVAILABLE
-    if isinstance(exc, (FileNotFoundError, FileExistsError)):
-        return INGEST_ERROR_FILE_MISSING
+    """Map an ingestion failure to a stable, user-facing error code.
+
+    The parser wrapper re-raises underlying failures as
+    ``DocumentParseError(...) from e``, so the motivating failure families
+    (a missing parser module, a vanished file) usually sit on the ``__cause__``
+    chain rather than at the top level; the walk stays bounded.
+    """
+    current: Optional[BaseException] = exc
+    depth = 0
+    while current is not None and depth <= _INGEST_ERROR_CAUSE_DEPTH:
+        if isinstance(current, ImportError):
+            return INGEST_ERROR_PARSER_UNAVAILABLE
+        if isinstance(current, (FileNotFoundError, FileExistsError)):
+            return INGEST_ERROR_FILE_MISSING
+        current = current.__cause__
+        depth += 1
     return INGEST_ERROR_PARSE_FAILED
 
 
@@ -1993,10 +2012,12 @@ class DocumentProcessor:
             raise
         except Exception as e:
             # Raw exception stays in the server log; enrichment_error is
-            # returned to vault readers (issue #562).
+            # returned to vault readers (issue #562). The document is already
+            # parsed and indexed at this point, so a parse-failure code would
+            # be contradictory — use the dedicated enrichment code.
             logger.warning("Post-index enrichment failed for file_id=%s: %s", file_id, e)
             self.set_enrichment_status(
-                file_id, "error", redact_ingest_error(e)
+                file_id, "error", format_ingest_error(INGEST_ERROR_ENRICHMENT_FAILED)
             )
 
     @with_retry(
