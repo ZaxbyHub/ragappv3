@@ -33,7 +33,39 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
+from app.config import settings
+from app.services.job_lease import JobLease
+
 logger = logging.getLogger(__name__)
+
+
+def _draft_lease_enabled() -> bool:
+    """Stage-4 lease switch (issue #559): env-only, process-start-stable."""
+    return bool(getattr(settings, "draft_job_lease_enabled", False))
+
+
+def _draft_job_lease(
+    conn: sqlite3.Connection, *, compile_claim: bool = False
+) -> JobLease:
+    """The shared lease primitive parameterized on ``draft_jobs`` (MAJOR-2).
+
+    ``job_type`` is the queue discriminator and claims run oldest-``created_at``
+    first with an id tiebreak, preserving the pre-lease SELECT ordering. The
+    compile claim passes ``claim_started_at`` so a recovered job keeps its
+    original claim time (deadline continuation, issue #516 DRAFT-013).
+    """
+    return JobLease(
+        conn,
+        reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+        max_attempts=settings.jobs_max_attempts,
+        table="draft_jobs",
+        claim_order="created_at ASC, id ASC",
+        claim_started_at=(
+            "COALESCE(started_at, CURRENT_TIMESTAMP)"
+            if compile_claim
+            else "CURRENT_TIMESTAMP"
+        ),
+    )
 
 
 # ── Errors ───────────────────────────────────────────────────────────────────
@@ -43,6 +75,17 @@ class DraftStoreError(Exception):
     """Base class for Draft Room store failures."""
 
     code = "internal_error"
+
+
+class _LeaseLostError(DraftStoreError):
+    """Internal (issue #559 stage 4): a fenced write found the lease gone.
+
+    Raised only from worker-scoped terminal writes — the job was reclaimed or
+    settled by someone else, and the disowned worker must abort without any
+    terminal write of its own.
+    """
+
+    code = "lease_lost"
 
 
 class DraftNotFoundError(DraftStoreError):
@@ -1917,14 +1960,28 @@ class DraftStore:
         ).fetchone()
         return None if row is None else int(row[0])
 
-    def claim_next_parse_job(self) -> Optional[DraftJobRecord]:
+    def claim_next_parse_job(
+        self, worker_id: Optional[str] = None
+    ) -> Optional[DraftJobRecord]:
         """Atomically claim one pending ``parse_input`` job.
 
-        Takes the write lock with ``BEGIN IMMEDIATE`` and only flips
-        ``pending -> running`` while the status is *still* pending, so a second
-        processor racing for the same row claims nothing rather than double-running
-        it. Returns None when the queue is empty.
+        Lease mode (issue #559 stage 4): served by the shared ``JobLease``
+        single-statement claim parameterized on ``draft_jobs`` — same
+        exactly-one-claimant atomicity, plus worker fencing, lease generation
+        and durable attempts. Legacy mode: ``BEGIN IMMEDIATE`` + SELECT +
+        conditional UPDATE (only flips ``pending -> running`` while still
+        pending). Returns None when the queue is empty.
         """
+        if _draft_lease_enabled():
+            wid = worker_id or f"draft-parse-{id(self)}"
+            claimed = _draft_job_lease(self._db).claim("parse_input", wid)
+            if claimed is None:
+                return None
+            row = self._db.execute(
+                f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE id = ?",  # nosec B608
+                (int(claimed["id"]),),
+            ).fetchone()
+            return None if row is None else _row_to_job(row)
         self._begin_immediate()
         try:
             row = self._db.execute(
@@ -1963,6 +2020,7 @@ class DraftStore:
         error_message: Optional[str] = None,
         progress_percent: Optional[float] = None,
         allow_recovery: bool = False,
+        worker_id: Optional[str] = None,
     ) -> None:
         """Move a job through its state machine and commit.
 
@@ -1972,6 +2030,10 @@ class DraftStore:
             error_message: Bounded, redacted diagnostic. Truncated on write.
             allow_recovery: Only startup recovery may pass True, permitting
                 ``running -> pending``.
+            worker_id: When supplied (lease mode terminal writes, issue #559
+                stage 4), the UPDATE is fenced — it commits only if this
+                worker still holds a running lease, so a reclaimed worker's
+                late terminal write mutates nothing.
         """
         if target not in JOB_STATUSES:
             raise DraftValidationError(f"unknown job status: {target!r}")
@@ -1988,13 +2050,14 @@ class DraftStore:
                 allow_recovery=allow_recovery,
             )
             terminal = target in ("completed", "failed", "cancelled")
-            self._db.execute(
+            fence = " AND worker_id = ? AND status = 'running'" if worker_id else ""
+            cursor = self._db.execute(
                 "UPDATE draft_jobs SET status = ?, error_code = ?, error_message = ?, "
                 "progress_percent = COALESCE(?, progress_percent), "
                 "heartbeat_at = CURRENT_TIMESTAMP, "
                 "started_at = CASE WHEN ? = 'pending' THEN NULL ELSE started_at END, "
                 "completed_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE completed_at END "
-                "WHERE id = ?",
+                f"WHERE id = ?{fence}",  # nosec B608 — fence is a fixed literal
                 (
                     target,
                     error_code,
@@ -2003,8 +2066,13 @@ class DraftStore:
                     target,
                     1 if terminal else 0,
                     job_id,
+                    *([worker_id] if worker_id else []),
                 ),
             )
+            if worker_id and cursor.rowcount == 0:
+                raise _LeaseLostError(
+                    f"job {job_id} no longer owned by worker {worker_id!r}"
+                )
             self._db.commit()
         except Exception:
             self._db.rollback()
@@ -2171,7 +2239,52 @@ class DraftStore:
 
     # ── startup recovery ─────────────────────────────────────────────────
 
-    def recover_orphaned_parse_jobs(self) -> int:
+    def settle_expired_job_at_lease_cap(
+        self, *, job_id: int, draft_id: int, job_type: str
+    ) -> None:
+        """Settle one expired draft job terminally at the attempts cap.
+
+        Draft-side half of the shared lease's ``jobs_max_attempts`` contract
+        (issue #559 stage 4): the janitor calls this instead of the
+        recovery-to-pending path when a crash-looping job's durable
+        ``attempts`` counter has reached the cap, so a poison job settles
+        ``failed`` (``lease_attempt_cap_exceeded``) instead of being
+        resurrected on every sweep. Compile side effects mirror
+        ``recover_orphaned_compile_jobs``: abandoned stage attempts are
+        marked ``worker_restart`` and the draft is settled ``failed`` so it
+        cannot strand on ``queued``; parse inputs are marked ``failed`` with
+        the same code so the UI reflects the terminal state.
+        """
+        self._begin_immediate()
+        try:
+            if job_type == "compile":
+                self._mark_abandoned_stages_worker_restart_locked(job_id)
+            self._db.execute(
+                "UPDATE draft_jobs SET status = 'failed', "
+                "error_code = 'lease_attempt_cap_exceeded', "
+                "error_message = 'job exceeded the durable attempt cap', "
+                "completed_at = CURRENT_TIMESTAMP, heartbeat_at = NULL, "
+                "worker_id = NULL WHERE id = ? AND status = 'running'",
+                (job_id,),
+            )
+            if job_type == "compile":
+                self._settle_draft_after_lost_compile_locked(draft_id, "failed")
+            else:
+                self._db.execute(
+                    "UPDATE draft_inputs SET parse_status = 'failed', "
+                    "parse_error = 'lease_attempt_cap_exceeded', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ("
+                    "SELECT input_id FROM draft_jobs WHERE id = ?)",
+                    (job_id,),
+                )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+    def recover_orphaned_parse_jobs(
+        self, heartbeat_cutoff: Optional[str] = None
+    ) -> int:
         """Return crashed ``running`` parse jobs to ``pending`` at startup.
 
         A process that dies mid-parse leaves the job ``running`` and its input
@@ -2179,16 +2292,30 @@ class DraftStore:
         ``worker_restart`` so the audit trail shows why. Jobs whose cancellation
         was already requested go to ``cancelled`` instead of being resurrected.
 
+        ``heartbeat_cutoff`` (issue #559 stage 4) scopes the sweep to jobs
+        whose ``heartbeat_at`` is older than a SQLite datetime offset (e.g.
+        ``-300 seconds``) — the lease janitor's expired-lease mode, so live
+        workers are never touched; startup recovery passes None (all rows).
+
         Returns:
             The number of jobs reset to pending.
         """
         self._begin_immediate()
         try:
+            cutoff_clause = (
+                "AND j.heartbeat_at IS NOT NULL "
+                "AND j.heartbeat_at < datetime('now', ?) "
+                if heartbeat_cutoff
+                else ""
+            )
+            cutoff_params = [heartbeat_cutoff] if heartbeat_cutoff else []
             rows = self._db.execute(
                 "SELECT j.id, j.input_id, j.cancel_requested_at, i.parse_status "
                 "FROM draft_jobs j "
                 "LEFT JOIN draft_inputs i ON i.id = j.input_id "
-                "WHERE j.status = 'running' AND j.job_type = 'parse_input'"
+                "WHERE j.status = 'running' AND j.job_type = 'parse_input' "
+                f"{cutoff_clause}",  # nosec B608 — clause is a fixed literal
+                cutoff_params,
             ).fetchall()
             reset = 0
             settled = 0
@@ -3579,14 +3706,29 @@ class DraftStore:
         ).fetchone()
         return row is not None
 
-    def claim_next_compile_job(self) -> Optional[DraftJobRecord]:
+    def claim_next_compile_job(
+        self, worker_id: Optional[str] = None
+    ) -> Optional[DraftJobRecord]:
         """Atomically claim one pending ``compile`` job.
 
-        Mirrors :meth:`claim_next_parse_job`: takes the write lock with
-        ``BEGIN IMMEDIATE`` and only flips ``pending -> running`` while the
-        status is *still* pending, so a second concurrent worker racing for
-        the same row claims nothing rather than double-running it.
+        Mirrors :meth:`claim_next_parse_job` through the shared lease when the
+        stage-4 switch is on; the compile claim passes the COALESCE
+        ``started_at`` mode so a recovered job keeps its original claim time —
+        overwriting it would re-grant the full timeout to a job that already
+        spent most of it (issue #516 DRAFT-013, wired up in the #532 review).
         """
+        if _draft_lease_enabled():
+            wid = worker_id or f"draft-compile-{id(self)}"
+            claimed = _draft_job_lease(self._db, compile_claim=True).claim(
+                "compile", wid
+            )
+            if claimed is None:
+                return None
+            row = self._db.execute(
+                f"SELECT {_JOB_COLUMNS} FROM draft_jobs WHERE id = ?",  # nosec B608
+                (int(claimed["id"]),),
+            ).fetchone()
+            return None if row is None else _row_to_job(row)
         self._begin_immediate()
         try:
             row = self._db.execute(
@@ -3711,7 +3853,9 @@ class DraftStore:
             (target, draft_id),
         )
 
-    def recover_orphaned_compile_jobs(self) -> int:
+    def recover_orphaned_compile_jobs(
+        self, heartbeat_cutoff: Optional[str] = None
+    ) -> int:
         """Return crashed ``running`` compile jobs to ``pending`` at startup.
 
         Also settles that job's own abandoned ``running`` stage attempts onto
@@ -3722,14 +3866,26 @@ class DraftStore:
         wall-clock deadline from the original claim time when the job already
         consumed model calls (issue #516 DRAFT-011/DRAFT-013).
 
+        ``heartbeat_cutoff`` (issue #559 stage 4) scopes the sweep to expired
+        leases for the janitor; startup recovery passes None (all rows).
+
         Returns:
             The number of jobs reset to pending (cancelled jobs are not counted).
         """
         self._begin_immediate()
         try:
+            cutoff_clause = (
+                "AND heartbeat_at IS NOT NULL "
+                "AND heartbeat_at < datetime('now', ?) "
+                if heartbeat_cutoff
+                else ""
+            )
+            cutoff_params = [heartbeat_cutoff] if heartbeat_cutoff else []
             rows = self._db.execute(
                 "SELECT id, draft_id, cancel_requested_at FROM draft_jobs "
-                "WHERE status = 'running' AND job_type = 'compile'"
+                "WHERE status = 'running' AND job_type = 'compile' "
+                f"{cutoff_clause}",  # nosec B608 — clause is a fixed literal
+                cutoff_params,
             ).fetchall()
             reset = 0
             for row in rows:

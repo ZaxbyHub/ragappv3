@@ -11,7 +11,9 @@ import json
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from app.config import settings
 from app.services.admission import AdmissionClass, get_admission_controller
+from app.services.job_lease import JobLease
 
 if TYPE_CHECKING:
     from app.models.database import SQLiteConnectionPool
@@ -22,6 +24,11 @@ POLL_INTERVAL = 5        # seconds between polls when queue is empty
 MAX_RETRIES = 3           # max automatic retries before a job is permanently failed
 RESET_RETRY_ATTEMPTS = 3  # attempts to recover a job from 'failed' → 'pending' after a transient DB error
 RESET_RETRY_BASE_DELAY = 0.5  # seconds; doubled per attempt (0.5, 1.0, 2.0)
+
+
+def _lease_enabled() -> bool:
+    """Stage-2 lease switch (issue #559): env-only, process-start-stable."""
+    return bool(getattr(settings, "wiki_kms_job_lease_enabled", False))
 
 
 class WikiCompileProcessor:
@@ -38,6 +45,10 @@ class WikiCompileProcessor:
         self._task: Optional[asyncio.Task] = None
         self._generation = 0
         self._startup_reset_task: Optional[asyncio.Task] = None
+        # Lease-mode worker identity (issue #559 stage 2): every claim/
+        # complete/fail is fenced on this id, so a reclaimed worker's late
+        # write can never mutate the new owner's row.
+        self._worker_id = f"wiki-compile-{id(self)}"
         # Strong references to detached background tasks (e.g. delayed
         # auto-retry resets) so CPython does not garbage-collect them
         # mid-flight (issue #276 E2-3). Tasks remove themselves on completion
@@ -51,6 +62,12 @@ class WikiCompileProcessor:
         generation = self._generation
         self._running = True
         try:
+            # The startup reset task is created unconditionally in BOTH modes
+            # so the lifecycle contract holds (reset task published first,
+            # before the poll task — pinned by
+            # tests/test_compile_processor_startup_lifecycle.py). In lease
+            # mode the reset BODY no-ops: the janitor owns orphan
+            # settlement, and the blanket orphan reset must not run.
             reset_task = self._startup_reset_task
             if reset_task is None or reset_task.done():
                 reset_coro = asyncio.to_thread(self._reset_orphans)
@@ -137,6 +154,13 @@ class WikiCompileProcessor:
     # ------------------------------------------------------------------
 
     def _reset_orphans(self) -> None:
+        if _lease_enabled():
+            # Lease mode (issue #559 stage 2): the janitor owns expired-lease
+            # settlement; the blanket orphan reset must not strip live
+            # leases. The task itself still exists so the startup lifecycle
+            # (reset-before-poll ordering) is identical in both modes.
+            logger.debug("WikiCompileProcessor: lease mode; startup orphan reset skipped")
+            return
         from app.services.wiki_store import WikiStore
 
         with self._pool.connection() as conn:
@@ -163,6 +187,15 @@ class WikiCompileProcessor:
                     job.vault_id,
                 )
 
+                # Lease mode (issue #559 stage 2): renew the lease while the
+                # dispatch runs so a slow-but-alive worker never looks dead;
+                # every settlement write is fenced on the worker id either way.
+                heartbeat_task: Optional[asyncio.Task] = None
+                if _lease_enabled():
+                    heartbeat_task = asyncio.create_task(
+                        self._heartbeat_loop(job.id, self._worker_id),
+                        name=f"wiki-heartbeat-{job.id}",
+                    )
                 try:
                     # E3 admission (issue #518): background budget for compile
                     # work; rejection flows into the bounded retry handler.
@@ -183,18 +216,44 @@ class WikiCompileProcessor:
                         )
                         self._publish_event(job, "job_cancelled", result=result)
                     else:
-                        await asyncio.to_thread(self._complete_job, job.id, result)
-                        logger.info("WikiCompileProcessor: completed job id=%d", job.id)
-                        self._publish_event(job, "job_completed", result=result)
+                        completed = await asyncio.to_thread(
+                            self._complete_job, job.id, result, self._worker_id
+                        )
+                        if not completed:
+                            # The fenced complete was rejected: either the
+                            # lease was lost (janitor reclaimed) or a cancel
+                            # won the race. The row's terminal state was set
+                            # by whoever owns it now — publishing
+                            # "completed" here would be wrong (and would
+                            # mislead operators) in both cases.
+                            logger.info(
+                                "WikiCompileProcessor: job id=%d complete "
+                                "rejected (lease lost or cancelled); no "
+                                "completion published",
+                                job.id,
+                            )
+                        else:
+                            logger.info("WikiCompileProcessor: completed job id=%d", job.id)
+                            self._publish_event(job, "job_completed", result=result)
                 except Exception as exc:
                     logger.exception(
                         "WikiCompileProcessor: job id=%d failed: %s", job.id, exc
                     )
                     try:
                         new_retry_count = await asyncio.to_thread(
-                            self._fail_job, job.id, str(exc)
+                            self._fail_job, job.id, str(exc), self._worker_id
                         )
-                        if new_retry_count < MAX_RETRIES:
+                        if _lease_enabled():
+                            # fail_job already requeued the row with a durable
+                            # ``run_after`` backoff, or settled it terminally
+                            # at jobs_max_attempts — no detached reset here.
+                            if new_retry_count >= max(
+                                int(settings.jobs_max_attempts), 1
+                            ):
+                                self._publish_event(
+                                    job, "job_failed", error=str(exc)
+                                )
+                        elif new_retry_count < MAX_RETRIES:
                             backoff = 2.0 ** new_retry_count
                             logger.info(
                                 "WikiCompileProcessor: job id=%d will auto-retry (%d/%d) in %.0fs",
@@ -218,6 +277,10 @@ class WikiCompileProcessor:
                         logger.error(
                             "WikiCompileProcessor: could not mark job id=%d failed: %s", job.id, e2
                         )
+                finally:
+                    if heartbeat_task is not None:
+                        heartbeat_task.cancel()
+                        await asyncio.gather(heartbeat_task, return_exceptions=True)
 
             except asyncio.CancelledError:
                 raise
@@ -233,21 +296,64 @@ class WikiCompileProcessor:
         from app.services.wiki_store import WikiStore
 
         with self._pool.connection() as conn:
-            return WikiStore(conn).claim_next_pending_job()
+            return WikiStore(conn).claim_next_pending_job(self._worker_id)
 
-    def _complete_job(self, job_id: int, result: dict) -> None:
+    def _complete_job(
+        self, job_id: int, result: dict, worker_id: Optional[str] = None
+    ) -> bool:
         from app.services.wiki_store import WikiStore
 
         with self._pool.connection() as conn:
-            WikiStore(conn).complete_job(job_id, result)
+            return WikiStore(conn).complete_job(job_id, result, worker_id=worker_id)
 
-    def _fail_job(self, job_id: int, error: str) -> int:
-        """Fail a job and return the new retry_count."""
+    def _fail_job(
+        self, job_id: int, error: str, worker_id: Optional[str] = None
+    ) -> int:
+        """Fail a job and return the durable attempt count.
+
+        Lease mode: the store requeues with ``run_after`` backoff or settles
+        terminally at the cap (fenced on ``worker_id``). Legacy mode: the
+        old ``retry_count`` increment; the processor schedules the reset.
+        """
         from app.services.wiki_store import WikiStore
 
         with self._pool.connection() as conn:
-            return WikiStore(conn).fail_job(job_id, error)
+            return WikiStore(conn).fail_job(job_id, error, worker_id=worker_id)
 
+    async def _heartbeat_loop(self, job_id: int, worker_id: str) -> None:
+        """Renew a held lease every heartbeat interval until it is lost.
+
+        A compile dispatch can outlive the reclaim timeout on a slow store;
+        the per-job renewal keeps a live worker's lease fresh. Exits when a
+        renewal is rejected (lease lost) — the fenced settlement will be
+        rejected too.
+        """
+        interval = max(1.0, float(settings.jobs_heartbeat_interval_seconds))
+
+        while True:
+            await asyncio.sleep(interval)
+
+            def _renew():
+                with self._pool.connection() as conn:
+                    return JobLease(
+                        conn,
+                        reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
+                        max_attempts=settings.jobs_max_attempts,
+                    ).heartbeat(job_id, worker_id)
+
+            try:
+                renewed = await asyncio.to_thread(_renew)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — a missed beat is not fatal
+                logger.debug(
+                    "%s: heartbeat renewal failed for job %s",
+                    WikiCompileProcessor,
+                    job_id,
+                )
+                continue
+            if not renewed:
+                return
     def _reset_job_to_pending(self, job_id: int) -> None:
         from app.services.wiki_store import WikiStore
 

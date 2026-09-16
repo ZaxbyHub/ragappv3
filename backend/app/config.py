@@ -15,6 +15,12 @@ from app.utils.paths import normalize_root_path
 
 logger = logging.getLogger(__name__)
 
+# The well-known insecure default (issue #494). Compared against in
+# reject_insecure_defaults to REFUSE unchanged secrets: the comparison IS the
+# security guard, so B105 is suppressed at this single definition site.
+_INSECURE_DEFAULT_JWT_SECRET = "change-me-to-a-random-64-char-string"  # nosec B105 — intentional placeholder constant used only to detect unchanged defaults
+
+
 # Legacy → new settings-field migration table (issue #494 CONFIG-004).
 #
 # Each row is (legacy field, replacement field, conversion factor). The
@@ -221,6 +227,23 @@ class Settings(BaseSettings):
     (issue #559 stage 1). Deliberately NOT runtime-settable: it selects the
     claim path at process start, and flipping it requires a restart so the
     in-flight migration always runs before the new claim path serves work."""
+    wiki_kms_job_lease_enabled: bool = True
+    """Env-only deployment switch for the shared DB-claimed lease on the wiki
+    and KMS compile queues (issue #559 stage 2). Same env-only rule as
+    ``ingestion_job_lease_enabled``: selects the claim path at process start;
+    a restart applies a flip, and a lease-disabled boot reverse-syncs
+    not-yet-claimed rows back to the legacy tables (non-lossy rollback)."""
+    reindex_job_lease_enabled: bool = True
+    """Env-only deployment switch for the shared DB-claimed lease on the
+    reindex queue (issue #559 stage 3). Same env-only rule as
+    ``ingestion_job_lease_enabled``: selects the claim path at process start;
+    a restart applies a flip, and a lease-disabled boot reverse-syncs
+    not-yet-claimed rows back to ``document_reindex_jobs``."""
+    draft_job_lease_enabled: bool = True
+    """Env-only deployment switch for the shared lease primitives on the draft
+    job queue (issue #559 stage 4). ``draft_jobs`` IS the lease store in both
+    modes, so this switch changes only the claim/fencing code path; flipping
+    it requires a restart."""
 
     # ── Ingestion performance configuration ──────────────────────────────────
     ingestion_queue_max_size: int = 1000
@@ -833,7 +856,7 @@ class Settings(BaseSettings):
     users_enabled: bool = True
     """Enable multi-user JWT authentication. When False, only admin_secret_token auth is used."""
 
-    jwt_secret_key: str = "change-me-to-a-random-64-char-string"
+    jwt_secret_key: str = _INSECURE_DEFAULT_JWT_SECRET
     """Secret key for JWT signing. MUST be changed in production. Generate with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""""
 
     jwt_algorithm: str = "HS256"
@@ -1532,7 +1555,11 @@ class Settings(BaseSettings):
                 "ADMIN_SECRET_TOKEN must be set when USERS_ENABLED=True. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
             )
-        if self.users_enabled and (not self.jwt_secret_key.strip() or self.jwt_secret_key == "change-me-to-a-random-64-char-string"):
+        # Comparing against the well-known default IS the security guard
+        # itself (refuse startup on unchanged defaults) — not a hardcoded
+        # secret; B105 suppressed accordingly.
+        jwt_is_default = self.jwt_secret_key == _INSECURE_DEFAULT_JWT_SECRET
+        if self.users_enabled and (not self.jwt_secret_key.strip() or jwt_is_default):
             raise ValueError(
                 "JWT_SECRET_KEY must be changed from the default when USERS_ENABLED=True. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'

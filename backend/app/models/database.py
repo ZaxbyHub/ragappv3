@@ -148,6 +148,12 @@ CREATE TABLE IF NOT EXISTS draft_jobs (
     progress_percent REAL NOT NULL DEFAULT 0,
     cancel_requested_at TIMESTAMP,
     heartbeat_at TIMESTAMP,
+    -- Lease-ownership columns (issue #559 stage 4): the shared JobLease
+    -- primitive targets draft_jobs directly (queue discriminator = job_type),
+    -- so fresh-DB DDL and the ALTER migration converge on this same set.
+    worker_id TEXT,
+    lease_generation INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
     error_code TEXT,
     error_message TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1793,6 +1799,7 @@ def run_migrations(sqlite_path: str) -> None:
     migrate_add_wiki_tables(sqlite_path)
     migrate_add_wiki_refs_and_job_input(sqlite_path)
     migrate_add_wiki_jobs_retry_count(sqlite_path)
+    migrate_add_draft_jobs_lease_columns(sqlite_path)
     migrate_add_kms_tables(sqlite_path)
     migrate_add_kms_refs(sqlite_path)
     migrate_add_chat_turn_columns(sqlite_path)
@@ -2791,6 +2798,40 @@ def migrate_add_wiki_jobs_retry_count(sqlite_path: str) -> None:
         if "retry_count" not in existing_cols:
             conn.execute(
                 "ALTER TABLE wiki_compile_jobs ADD COLUMN retry_count INTEGER DEFAULT 0"
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def migrate_add_draft_jobs_lease_columns(sqlite_path: str) -> None:
+    """Migration: add lease-ownership columns to draft_jobs (issue #559 stage 4).
+
+    The shared ``JobLease`` primitive targets ``draft_jobs`` directly (plan
+    MAJOR-2: one primitive, parameterized by table — no parallel draft-specific
+    claim path), so the table needs the same ownership/fencing columns the
+    ``jobs`` table carries. Idempotent per column; converges with the
+    ``_DRAFT_ROOM_CORE_DDL`` fresh-DB shape (worker_id TEXT NULL,
+    lease_generation 0, attempts 0).
+    """
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        existing_cols = [
+            row[1] for row in conn.execute("PRAGMA table_info(draft_jobs)").fetchall()
+        ]
+        if not existing_cols:
+            # Fresh database: _DRAFT_ROOM_CORE_DDL already creates the full
+            # shape; init_db runs before migrations in run_migrations.
+            return
+        if "worker_id" not in existing_cols:
+            conn.execute("ALTER TABLE draft_jobs ADD COLUMN worker_id TEXT")
+        if "lease_generation" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE draft_jobs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0"
+            )
+        if "attempts" not in existing_cols:
+            conn.execute(
+                "ALTER TABLE draft_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
             )
         conn.commit()
     finally:

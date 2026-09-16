@@ -154,6 +154,22 @@ class TestRecoveryDeadlockRegression:
     async def test_recovery_completes_when_more_stranded_rows_than_queue_maxsize(
         self, tmp_path, monkeypatch
     ):
+        # This test pins the LEGACY in-memory-queue drain; the lease path is
+        # covered by the issue-559 frozen family (issue #559 stage 4).
+        monkeypatch.setattr(
+            settings, "ingestion_job_lease_enabled", False, raising=False
+        )
+        # The wiki/KMS/reindex lease migrations must also stay off: their
+        # sync would consume this test's mock-connection execute window.
+        monkeypatch.setattr(
+            settings, "wiki_kms_job_lease_enabled", False, raising=False
+        )
+        monkeypatch.setattr(
+            settings, "reindex_job_lease_enabled", False, raising=False
+        )
+        monkeypatch.setattr(
+            settings, "draft_job_lease_enabled", False, raising=False
+        )
         """
         Regression for cubic P0 finding: recovery must complete even when
         >queue_maxsize stranded rows exist.

@@ -145,3 +145,16 @@ def test_c8_reindex_restart_recovery() -> None:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _legacy_reindex_lease_mode(monkeypatch):
+    """Pin the reindex legacy path (issue #559 stage 3); restored per test."""
+    from app.config import settings
+
+    monkeypatch.setattr(
+        settings, "reindex_job_lease_enabled", False, raising=False
+    )

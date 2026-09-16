@@ -463,12 +463,25 @@ class CompileEventsTestBase(unittest.IsolatedAsyncioTestCase):
         return draft.id, record.id
 
     def _make_compile_job(self, *, status="running"):
+        # A 'running' compile row in lease mode is one the processor's lease
+        # claimed: fence columns stamped with the processor's worker identity
+        # and a fresh heartbeat, exactly as JobLease.claim would leave it.
         cur = self.conn.execute(
             "INSERT INTO draft_jobs (draft_id, vault_id, created_by, job_type, status, "
-            "max_model_calls, timeout_seconds, prompt_bundle_version) "
-            "VALUES (?, ?, ?, 'compile', ?, 40, 1800, ?)",
-            (self.draft_id, VAULT_ID, OWNER_ID, status, draft_pipeline.PROMPT_BUNDLE_VERSION
-             if hasattr(draft_pipeline, "PROMPT_BUNDLE_VERSION") else "1"),
+            "max_model_calls, timeout_seconds, prompt_bundle_version, "
+            "worker_id, lease_generation, attempts, heartbeat_at) "
+            "VALUES (?, ?, ?, 'compile', ?, 40, 1800, ?, ?, 1, 1, "
+            "CASE WHEN ? = 'running' THEN datetime('now') ELSE NULL END)",
+            (
+                self.draft_id,
+                VAULT_ID,
+                OWNER_ID,
+                status,
+                draft_pipeline.PROMPT_BUNDLE_VERSION
+                if hasattr(draft_pipeline, "PROMPT_BUNDLE_VERSION") else "1",
+                self.processor._worker_id if status == "running" else None,  # noqa: SLF001
+                status,
+            ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
