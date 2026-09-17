@@ -6,7 +6,7 @@
 # (Quality contracts job) — move majors through that gate, not by editing here.
 # Digest pin (issue #404 / #391) freezes the base image for supply-chain
 # integrity; dependabot (docker ecosystem, "/") opens PRs on new digests.
-FROM node:22.14-alpine@sha256:9bef0ef1e268f60627da9ba7d7605e8831d5b56ad07487d24d1aa386336d1944 AS frontend-builder
+FROM node:22.23-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
