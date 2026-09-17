@@ -7,10 +7,13 @@ set -euo pipefail
 # markers and platform-conditional additions change. See
 # docs/engineering/lockfiles.md for the full procedure.
 
-# Install uv if it is not available (the lock compiler since #567)
+# Install uv if it is not available (the lock compiler since #567).
+# Pinned to the same version CI pins (ci.yml: uv==0.12.15): the CI freshness
+# gate byte-compares regeneration output, so a different uv version can
+# produce spurious byte diffs.
 if ! command -v uv &> /dev/null; then
-    echo "uv not found; installing into the current environment (pip install uv)." >&2
-    python -m pip install uv
+    echo "uv not found; installing the CI-pinned version (pip install uv==0.12.15)." >&2
+    python -m pip install "uv==0.12.15"
 fi
 
 # Generate production lockfile (universal, hash-pinned)

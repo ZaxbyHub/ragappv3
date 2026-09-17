@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { normalizeBasePath } from "../vite.paths";
@@ -48,7 +49,13 @@ describe("base-path error diagnostics (frontend/Dockerfile copy)", () => {
   // asserted at the source level instead: every VITE_APP_BASENAME validation
   // throw must concatenate JSON.stringify(raw) so the received value is
   // visible in build logs.
-  const dockerfile = readFileSync(join(process.cwd(), "Dockerfile"), "utf-8");
+  // Location-invariant (any cwd), and deliberately NOT
+  // `new URL(relative, import.meta.url)`: vite statically rewrites that
+  // asset pattern to a non-file URL, which breaks readFileSync under vitest.
+  const dockerfile = readFileSync(
+    resolve(fileURLToPath(import.meta.url), "../../Dockerfile"),
+    "utf-8",
+  );
 
   it("interpolates the received value in every validation throw", () => {
     const allThrows = dockerfile.match(/throw new Error\('VITE_APP_BASENAME[^']*/g) ?? [];

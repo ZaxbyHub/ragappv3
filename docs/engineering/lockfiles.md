@@ -20,8 +20,8 @@ pip-compile locks; the historical "Windows trap" is documented at the end.
 Never edit a lockfile by hand. Edit the source spec, then regenerate.
 The 100%-hashed invariant is asserted mechanically by
 `backend/tests/test_issue258_build_contracts.py::test_ac19_lockfile_entries_all_hash_pinned`,
-and the universal-marker invariant by
-`backend/tests/test_lockfile_install.py::test_locks_are_universal`.
+and the universal-marker invariant by the `TestUniversalLockfiles` tests in
+`backend/tests/test_lockfile_install.py`.
 
 ## CI verification (the contract to stay green)
 
@@ -30,8 +30,9 @@ verifies BOTH lockfiles on every push: each lock is seeded into a scratch
 file, re-resolved with the same `uv pip compile --universal` invocation used
 for regeneration, and byte-compared (`git diff --no-index --exit-code`) to
 the committed lock. A lockfile that is out of sync with its source spec (or
-was regenerated with a different procedure) fails the job before any test
-runs. CI installs from `requirements-lock-ci.txt` (with `--require-hashes` —
+was regenerated with a different procedure or a different uv) fails the job
+before any test runs — CI pins `uv==0.12.15` and the update scripts install
+the same version for byte-diff parity. CI installs from `requirements-lock-ci.txt` (with `--require-hashes` —
 the hash gate is enforced at the real consumer) + `requirements-dev.txt` on
 Linux, and the root Dockerfile installs `requirements-lock.txt` with
 `--require-hashes`; resolution parseability on any host is asserted by
@@ -40,8 +41,8 @@ Linux, and the root Dockerfile installs `requirements-lock.txt` with
 ## Regeneration procedure (any platform)
 
 Universal locks resolve for all platforms at once, so regeneration no longer
-requires Linux. Run from the repo root with uv (0.12.x; `pip install uv` or
-the standalone binary):
+requires Linux. Run from the repo root with uv (CI pins `uv==0.12.15`; the
+update scripts install that version if uv is missing):
 
 ```bash
 # Generate production lockfile (seeding -o with the existing lock keeps every

@@ -33,7 +33,7 @@
   22.14, ubuntu-24.04) — now a required surface in
   `scripts/check_runtime_contract.py`, with tests in
   `backend/tests/test_devcontainer_contract.py`.
-- **New/stronged tests**: `test_lockfile_install.py` parseability tests now
+- **New/strengthened tests**: `test_lockfile_install.py` parseability tests now
   pass `--require-hashes`; `TestUniversalLockfiles` asserts the markers
   (regenerating with a Linux-only resolver turns it red);
   `frontend/src/base-path-message.test.ts` asserts value interpolation for

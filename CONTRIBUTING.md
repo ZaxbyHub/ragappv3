@@ -161,7 +161,10 @@ are the known places where a Windows shell behaves differently (issue #567):
   backend/requirements-lock*.txt` works on Windows and Linux alike
   (`docs/engineering/lockfiles.md`); the `justfile` at the repo root mirrors
   the CI steps locally, and `.devcontainer/devcontainer.json` provides a
-  known-good Linux environment if you would rather skip the seams entirely.
+  known-good Linux environment if you would rather skip the seams entirely
+  (its feature-digest pins live in `.devcontainer/devcontainer-lock.json`,
+  regenerated automatically by the devcontainer CLI whenever the container is
+  built after a feature-version change).
 - **A few tests are platform-sensitive** (symlink-privilege and
   backslash-traversal cases); see `docs/engineering/testing.md`.
 

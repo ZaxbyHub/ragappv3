@@ -92,6 +92,32 @@ def test_wrong_python_pin_fails(tmp_path, monkeypatch) -> None:
     assert any("python" in message for message in failures)
 
 
+def test_bare_string_pins_pass(tmp_path, monkeypatch) -> None:
+    """_feature_version accepts the bare-string pin shape too."""
+    module = _load_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    _write_devcontainer(
+        tmp_path,
+        {
+            "ghcr.io/devcontainers/features/python:1": "3.11",
+            "ghcr.io/devcontainers/features/node:1": "22.14.0",
+        },
+    )
+    failures: list[str] = []
+    module.check_devcontainer(failures)
+    assert failures == []
+
+
+def test_missing_features_map_fails(tmp_path, monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    _write_devcontainer(tmp_path, None)
+    failures: list[str] = []
+    module.check_devcontainer(failures)
+    assert len(failures) == 1
+    assert "features" in failures[0]
+
+
 def test_real_repo_surface_passes() -> None:
     module = _load_module()
     failures: list[str] = []

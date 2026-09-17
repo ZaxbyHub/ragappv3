@@ -2,12 +2,16 @@
 # Issue #567 / E10: contributors run the same commands CI runs, under one
 # name, instead of reconstructing them from the workflow YAML.
 #
-# Prerequisites: Python 3.11, uv (lock compiler), Node >= 22.14, and just.
+# Prerequisites: Python 3.11, uv 0.12.15 (the version CI pins for the lock
+# byte-diff gate), Node >= 22.14, and just.
 # The devcontainer (.devcontainer/devcontainer.json) ships a known-good
 # environment with all of them.
 #
-# `just ci` runs every step the CI workflow runs (backend + frontend +
-# quality contracts + SAST). Individual recipes run one gate at a time.
+# `just ci` runs the backend + frontend + quality-contracts + SAST gates in
+# CI's order. Not mirrored: the informational toolchain-graph *print* is
+# covered by `just frontend-verify-toolchain`, and the conditional
+# docker-smoke job (it builds the Docker image; run
+# `docker build --tag ragappv3:local .` for the same check).
 
 set shell := ["bash", "-cu"]
 
@@ -17,6 +21,7 @@ ci: backend-verify-locks \
     backend-test \
     frontend-typecheck \
     frontend-typecheck-contracts \
+    frontend-verify-toolchain \
     frontend-lint \
     frontend-test-api \
     frontend-test-a11y \
@@ -29,10 +34,16 @@ ci: backend-verify-locks \
     sast
 
 # Verify both lockfiles regenerate byte-identically with the universal
-# procedure (same step as the CI Backend job).
+# procedure (same step as the CI Backend job). CI pins uv==0.12.15 and
+# byte-compares its output, so local verification is only meaningful with
+# the same uv minor — this recipe warns on a mismatch.
 backend-verify-locks:
     #!/usr/bin/env bash
     set -euo pipefail
+    case "$(uv --version 2>/dev/null)" in
+      "uv 0.12."*) : ;;
+      *) echo "WARNING: CI pins uv==0.12.15 for byte-diff parity; a different uv may produce spurious diffs." >&2 ;;
+    esac
     for spec in requirements.txt:requirements-lock.txt requirements-ci.txt:requirements-lock-ci.txt; do
       src="backend/${spec%%:*}"
       lock="backend/${spec##*:}"
@@ -58,6 +69,10 @@ frontend-typecheck:
 
 frontend-typecheck-contracts:
     cd frontend && npm run typecheck:contracts
+
+# Frontend toolchain graph (CI 'Verify frontend toolchain graph' step)
+frontend-verify-toolchain:
+    cd frontend && node --version && npm --version && npm ls vite vitest @vitejs/plugin-react jsdom && npm exec vite -- --version && npm exec vitest -- --version
 
 # Frontend lint (CI: npm run lint, --max-warnings 0)
 frontend-lint:

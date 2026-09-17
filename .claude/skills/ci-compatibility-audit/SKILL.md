@@ -27,15 +27,24 @@ Frontend job:
 Backend job:
 
 - `cd backend`
-- `pip install -r requirements-ci.txt` (a **reduced** set — it deliberately
-  excludes `lancedb`, `pyarrow`, `unstructured[all-docs]`, and
-  `sentence-transformers`; those are stubbed at test time, see caveats below)
+- `pip install uv==0.12.15` (the lock compiler CI pins)
+- `Verify lockfiles (universal regeneration)`: for each of
+  `requirements.txt→requirements-lock.txt` and
+  `requirements-ci.txt→requirements-lock-ci.txt`, seed a scratch copy of the
+  committed lock, re-resolve with
+  `uv pip compile --universal --generate-hashes --no-strip-extras --no-header --python-version 3.11`,
+  and byte-compare (`git diff --no-index --exit-code`) — run from the REPO
+  ROOT so the `# via` annotations match (see `just backend-verify-locks`)
+- `pip install --require-hashes -r requirements-lock-ci.txt` (universal lock;
+  excludes the stubbed heavy packages — `lancedb`, `pyarrow` come from the
+  lock, `unstructured[all-docs]`/`sentence-transformers` are stubbed at test
+  time, see caveats below)
 - `pip install -r requirements-dev.txt`
+- `pip install pytest-xdist`
 - `ruff check .`
-- `pytest --tb=short -v --timeout=300 tests/` — **full backend suite (3918 tests since PR #215 / FR-4)**.
+- `pytest --tb=short -v --timeout=300 -rs -n auto --cov --cov-report=term-missing tests/` — **full backend suite (3918 tests since PR #215 / FR-4)**.
   Job timeout is **60m** (raised from 30m in PR #215 to accommodate the 3918-test full suite + coverage step on slow CI Linux runners; local baseline is ~3-5m, CI is ~18m, plus coverage runs another ~18m).
   `--timeout=300` caps per-test hangs at 5 min. The conftest.py has 4 fixtures (CSRF bypass, rate-limiter reset, SQLite pool reset, bcrypt cache for 'pass123' test password) that the test suite relies on.
-- informational coverage (`continue-on-error: true`) over the same suite, also with `--timeout=300`
 
 Repository contract job:
 
