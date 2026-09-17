@@ -52,7 +52,7 @@ RUN npm run build
 # CI run proves the shipped image builds and runs (B6-2, #289). Parity is
 # enforced by scripts/check_runtime_contract.py (Quality contracts job).
 # Digest pin (issue #404 / #391); dependabot (docker, "/") maintains updates.
-FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534 AS backend
+FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS backend
 
 # Install system dependencies for Unstructured
 # Note: libmagic1 needed for python-magic on Linux
