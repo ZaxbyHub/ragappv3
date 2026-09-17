@@ -184,8 +184,8 @@ The embedding service (Harrier TEI) is pre-configured in `docker-compose.yml` an
 
 ```bash
 # Required: Chat model (choose one)
-ollama pull qwen2.5:32b    # Recommended for technical content
-ollama pull llama3.2:latest # Lighter alternative
+ollama pull llama3.2:latest # Default: light and fast, fits any GPU
+ollama pull gpt-oss:20b     # Stronger reasoning, ~14 GB VRAM (16 GB cards)
 ```
 
 ### 4. Start KnowledgeVault
@@ -215,7 +215,7 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `OLLAMA_CHAT_URL` | http://host.docker.internal:11434 | Thinking chat endpoint |
 | `INSTANT_CHAT_URL` | http://host.docker.internal:1234 | Instant chat endpoint |
 | `EMBEDDING_MODEL` | microsoft/harrier-oss-v1-0.6b | Embedding model name |
-| `CHAT_MODEL` | gemma-4-26b-a4b-it-apex | Thinking chat model name |
+| `CHAT_MODEL` | llama3.2:latest | Thinking chat model name |
 | `INSTANT_CHAT_MODEL` | nvidia/nemotron-3-nano-4b | Instant chat model name |
 | `DEFAULT_CHAT_MODE` | thinking | Default mode for new chats (`thinking` or `instant`) |
 | `LLM_MAX_CONNECTIONS` | 100 | Maximum HTTP connections in the LLM client pool (httpx.AsyncClient) |
@@ -308,16 +308,18 @@ data/
 
 #### Chat Models
 
+Sized for the documented GPU host (two 16 GB cards + one 8 GB card — see
+[docs/gpu-host-layouts.md](docs/gpu-host-layouts.md) for per-GPU placement):
+
 | Model | Size | RAM | Speed | Best For |
 |-------|------|-----|-------|----------|
-| qwen2.5:32b | 32B | ~22GB | ~15 tok/s | Technical reasoning |
-| qwen2.5:72b | 72B | ~45GB | ~10 tok/s | Complex analysis |
-| llama3.2:latest | 3B | ~4GB | ~30 tok/s | General use, fast |
+| llama3.2:latest | 3B | ~4GB | ~30 tok/s | General use, fast; the shipped default |
+| gpt-oss:20b | 21B (MXFP4) | ~14GB | ~20 tok/s | Stronger reasoning on a 16 GB card |
 | mistral:latest | 7B | ~8GB | ~25 tok/s | Balanced performance |
 
 ```bash
 # Pull your preferred chat model
-ollama pull qwen2.5:32b
+ollama pull llama3.2:latest
 ```
 
 ### Verifying Connections

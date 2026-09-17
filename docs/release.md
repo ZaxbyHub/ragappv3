@@ -80,7 +80,7 @@ Before deploying KnowledgeVault to production, ensure the following:
   OLLAMA_CHAT_URL=http://host.docker.internal:11434
   INSTANT_CHAT_URL=http://host.docker.internal:1234
   EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
-  CHAT_MODEL=gemma-4-26b-a4b-it-apex
+  CHAT_MODEL=llama3.2:latest
   INSTANT_CHAT_MODEL=nvidia/nemotron-3-nano-4b
   DEFAULT_CHAT_MODE=thinking
   INSTANT_INITIAL_RETRIEVAL_TOP_K=10
@@ -358,7 +358,7 @@ fi
 # test-llm.sh
 
 CHAT_URL="${OLLAMA_CHAT_URL:-http://localhost:11434}/api/chat"
-CHAT_MODEL="${CHAT_MODEL:-gemma-4-26b-a4b-it-apex}"
+CHAT_MODEL="${CHAT_MODEL:-llama3.2:latest}"
 
 echo "Testing LLM service at $CHAT_URL..."
 

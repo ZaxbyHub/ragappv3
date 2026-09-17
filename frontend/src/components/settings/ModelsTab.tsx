@@ -523,7 +523,7 @@ export function ModelsTab({
           <StringField
             field="chat_model"
             label="Thinking chat model"
-            placeholder="gemma-4-26b-a4b-it-apex"
+            placeholder="llama3.2:latest"
             description="Larger model used for Thinking mode responses."
             formData={formData}
             errors={errors}

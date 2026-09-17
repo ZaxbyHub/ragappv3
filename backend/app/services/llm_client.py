@@ -1130,7 +1130,7 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
     """Create an LLMClient configured for the Thinking backend (Ollama).
 
     Talks to ``settings.ollama_chat_url`` with ``settings.chat_model``
-    (default ``gemma-4-26b-a4b-it-apex``). Carries the Ollama
+    (default ``llama3.2:latest``). Carries the Ollama
     /v1-documented reasoning control ``reasoning_effort='high'`` (issue
     #554): Ollama's OpenAI-compatibility doc lists ``reasoning_effort``
     (high/medium/low/max/none) as the supported

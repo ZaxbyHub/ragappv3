@@ -109,7 +109,7 @@ class Settings(BaseSettings):
 
     # Model configuration
     embedding_model: str = "microsoft/harrier-oss-v1-0.6b"
-    chat_model: str = "gemma-4-26b-a4b-it-apex"
+    chat_model: str = "llama3.2:latest"
 
     # LLM HTTP client pool configuration
     llm_max_connections: int = 100
@@ -178,9 +178,9 @@ class Settings(BaseSettings):
 
     # Document processing configuration (character-based - NEW)
     chunk_size_chars: int | None = None
-    """Character-based chunk size for document processing. Default 1200 chars (~300 tokens) leaves room for instruction prefix."""
+    """Character-based chunk size for document processing. Default 2000 chars (~500 tokens) leaves room for instruction prefix."""
     chunk_overlap_chars: int | None = None
-    """Character-based overlap between chunks. Default 120 chars (~30 tokens)."""
+    """Character-based overlap between chunks. Default 200 chars (~50 tokens)."""
     document_parsing_strategy: str = "auto"
     """Document parsing strategy for unstructured.io: 'fast' (fastest), 'hi_res' (best quality), 'auto' (automatic selection)."""
     document_parse_timeout: float = 300.0

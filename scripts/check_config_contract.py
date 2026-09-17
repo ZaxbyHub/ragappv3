@@ -160,6 +160,34 @@ def main() -> int:
             f"{compose_cors_default!r} does not match backend default {backend_default!r}"
         )
 
+    chat_default = backend_str_default(backend_config, "chat_model")
+    if not chat_default:
+        failures.append("backend/app/config.py chat_model default could not be parsed")
+    if env_value(env_text, "CHAT_MODEL") != chat_default:
+        failures.append(
+            ".env.example CHAT_MODEL default "
+            f"{env_value(env_text, 'CHAT_MODEL')!r} does not match backend default {chat_default!r}"
+        )
+    if compose_default(compose_text, "CHAT_MODEL") != chat_default:
+        failures.append(
+            "docker-compose.yml CHAT_MODEL default "
+            f"{compose_default(compose_text, 'CHAT_MODEL')!r} does not match backend default {chat_default!r}"
+        )
+    installation_doc = read("INSTALLATION.md")
+    active_pulls = sorted(
+        {
+            pull
+            for line in installation_doc.splitlines()
+            if not line.lstrip().startswith("#")
+            for pull in re.findall(r"\bollama pull (\S+)", line)
+        }
+    )
+    if chat_default and chat_default not in active_pulls:
+        failures.append(
+            f"chat_model default {chat_default!r} is not pulled by any active "
+            f"`ollama pull` line in INSTALLATION.md (active: {active_pulls})"
+        )
+
     upload_default = backend_int_default(backend_config, "max_file_size_mb")
     if upload_default is None:
         failures.append("backend/app/config.py max_file_size_mb default could not be parsed")

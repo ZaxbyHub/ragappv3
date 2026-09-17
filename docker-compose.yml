@@ -159,7 +159,7 @@ services:
       - ALLOW_LOCAL_CURATOR=${ALLOW_LOCAL_CURATOR:-}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/harrier-oss-v1-0.6b}
       - EMBEDDING_DIM=${EMBEDDING_DIM:-1024}
-      - CHAT_MODEL=${CHAT_MODEL:-gemma-4-26b-a4b-it-apex}
+      - CHAT_MODEL=${CHAT_MODEL:-llama3.2:latest}
       - INSTANT_CHAT_MODEL=${INSTANT_CHAT_MODEL:-nvidia/nemotron-3-nano-4b}
       - DEFAULT_CHAT_MODE=${DEFAULT_CHAT_MODE:-thinking}
       - INSTANT_INITIAL_RETRIEVAL_TOP_K=${INSTANT_INITIAL_RETRIEVAL_TOP_K:-10}
