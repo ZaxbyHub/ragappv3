@@ -273,8 +273,33 @@ describe("Composer large-input handling (issue #616)", () => {
     expect(onSend).not.toHaveBeenCalled();
     // The block is not silent: the store records the over-cap error.
     expect(mockChatState.setInputError).toHaveBeenCalledWith(
-      expect.stringMatching(/exceeds maximum length of 100,000/i)
+      expect.stringMatching(/exceeds maximum length of 100000/i)
     );
+  });
+
+  it("a mid-debounce session switch flushes the old session's draft and writes the new session's synchronously", () => {
+    mockChatState.activeChatId = "42";
+    const { rerender } = render(
+      <Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />
+    );
+    const textarea = screen.getByLabelText("Message input");
+
+    // Burst for session 42: leading write fires; trailing timer pending.
+    fireEvent.change(textarea, { target: { value: "old-session-1" } });
+    fireEvent.change(textarea, { target: { value: "old-session-2" } });
+    // Only the leading write has happened so far.
+    expect(storage.get("ragapp_chat_draft_42")).toBe("old-session-1");
+
+    // Switch session mid-debounce.
+    mockChatState.activeChatId = "7";
+    rerender(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
+
+    // First change in the new session: the OLD session's final value is
+    // flushed synchronously, and the NEW session gets a synchronous
+    // leading-edge write (no 400 ms loss window after a switch).
+    fireEvent.change(textarea, { target: { value: "new-session-1" } });
+    expect(storage.get("ragapp_chat_draft_42")).toBe("old-session-2");
+    expect(storage.get("ragapp_chat_draft_7")).toBe("new-session-1");
   });
 
   it("sending clears the persisted draft synchronously", () => {

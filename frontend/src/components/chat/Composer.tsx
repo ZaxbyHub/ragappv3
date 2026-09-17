@@ -264,6 +264,13 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const persistDraft = useCallback((value: string) => {
     if (typeof window === "undefined") return;
     const key = getDraftKey(activeChatId);
+    // Session switched mid-debounce: the pending timer belongs to the OLD
+    // session's key. Flush the old session's final value first, then take a
+    // fresh leading edge so the new session's first write is synchronous
+    // (a tab close right after switching must not lose it).
+    if (draftTimerRef.current !== null && pendingDraftRef.current?.key !== key) {
+      flushPendingDraft();
+    }
     pendingDraftRef.current = { key, value };
     if (draftTimerRef.current !== null) return;
     // Leading edge: write immediately, then hold the trailing window open
@@ -365,9 +372,10 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const handleSubmit = () => {
     if (!input.trim() || isStreaming) return;
     // Over the inline cap: surface the reason instead of silently no-op'ing
-    // (issue #616 — the silent block trapped oversized drafts).
+    // (issue #616 — the silent block trapped oversized drafts). Raw number,
+    // locale-independent, matching the useSendMessage error strings.
     if (input.length > MAX_INPUT_LENGTH) {
-      setInputError?.(`Input exceeds maximum length of ${MAX_INPUT_LENGTH.toLocaleString()} characters`);
+      setInputError?.(`Input exceeds maximum length of ${MAX_INPUT_LENGTH} characters`);
       return;
     }
     // Hard-block sending while uploads are still transferring — there is
