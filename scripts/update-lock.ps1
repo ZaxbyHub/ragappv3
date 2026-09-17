@@ -1,24 +1,28 @@
 $ErrorActionPreference = 'Stop'
 
-# Locate Python 3.11
-$python311 = $null
-if (Test-Path 'C:\Python311\python.exe') {
-    $python311 = 'C:\Python311\python.exe'
-} elseif (Get-Command py -ErrorAction SilentlyContinue) {
-    $python311 = (py -3.11 -c "import sys; print(sys.executable)")
-}
-if (-not $python311) {
-    Write-Error "ERROR: Python 3.11 is not installed. CI targets Python 3.11. Install Python 3.11 and ensure it is accessible."
-    exit 1
-}
+# Regenerate both backend lockfiles as UNIVERSAL locks (issue #567 / E10):
+# one lock per source spec that resolves on Linux and Windows. Seeding the
+# output file with the committed lock keeps every pinned version; only
+# markers and platform-conditional additions change. See
+# docs/engineering/lockfiles.md for the full procedure.
 
-# Install pip-tools if pip-compile is not available
-if (-not (Get-Command pip-compile -ErrorAction SilentlyContinue)) {
-    & $python311 -m pip install --upgrade pip-tools
+# Install uv if it is not available (the lock compiler since #567).
+# Pinned to the same version CI pins (ci.yml: uv==0.12.15): the CI freshness
+# gate byte-compares regeneration output, so a different uv version can
+# produce spurious byte diffs.
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Write-Host "uv not found; installing the CI-pinned version (pip install uv==0.12.15)."
+    & python -m pip install "uv==0.12.15"
 }
 
-# Generate production lockfile
-& $python311 -m piptools compile backend/requirements.txt --output-file backend/requirements-lock.txt --generate-hashes --no-header --allow-unsafe --verbose
+# Generate production lockfile (universal, hash-pinned)
+& uv pip compile --universal --generate-hashes --no-strip-extras --no-header `
+    --python-version 3.11 backend/requirements.txt `
+    --output-file backend/requirements-lock.txt
 
-# Generate CI lockfile
-& $python311 -m piptools compile backend/requirements-ci.txt --output-file backend/requirements-lock-ci.txt --generate-hashes --no-header --allow-unsafe --verbose
+# Generate CI lockfile (universal, hash-pinned)
+& uv pip compile --universal --generate-hashes --no-strip-extras --no-header `
+    --python-version 3.11 backend/requirements-ci.txt `
+    --output-file backend/requirements-lock-ci.txt
+
+Write-Host "Done. Diff the two lockfiles and justify every delta beyond markers/platform additions."

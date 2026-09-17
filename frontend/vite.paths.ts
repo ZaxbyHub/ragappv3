@@ -14,22 +14,22 @@ export function normalizeBasePath(value?: string | null): string {
   const raw = value ?? ''
   if (!raw) return ''
   if (raw !== raw.trim()) {
-    throw new Error('Base path cannot contain leading or trailing whitespace')
+    throw new Error(`Base path cannot contain leading or trailing whitespace: ${JSON.stringify(raw)}`)
   }
   if (/^https?:\/\//i.test(raw) || (raw.startsWith('//') && /[^/]/.test(raw))) {
-    throw new Error('Base path must be a path, not a URL')
+    throw new Error(`Base path must be a path, not a URL: ${JSON.stringify(raw)}`)
   }
   if (UNSAFE_BASE_PATH_PATTERN.test(raw) || hasControlCharacter(raw)) {
-    throw new Error('Base path contains unsafe characters')
+    throw new Error(`Base path contains unsafe characters: ${JSON.stringify(raw)}`)
   }
   if (/\/{2,}/.test(raw.replace(/^\/+|\/+$/g, ''))) {
-    throw new Error('Base path cannot contain duplicate slashes')
+    throw new Error(`Base path cannot contain duplicate slashes: ${JSON.stringify(raw)}`)
   }
 
   const stripped = raw.replace(/^\/+|\/+$/g, '')
   if (!stripped) return ''
   if (stripped.split('/').some((part) => part === '.' || part === '..')) {
-    throw new Error('Base path cannot contain relative path segments')
+    throw new Error(`Base path cannot contain relative path segments: ${JSON.stringify(raw)}`)
   }
   return `/${stripped}`
 }
