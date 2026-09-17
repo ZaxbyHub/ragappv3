@@ -56,6 +56,32 @@ def _patch_ssrf():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _configured_chat_endpoints():
+    """No model defaults ship (issue #570): give these payload/family tests
+    a configured endpoint pair so the client factories construct. Tests that
+    monkeypatch a specific model keep overriding the model alone."""
+    from app.config import settings
+
+    saved = (
+        settings.ollama_chat_url,
+        settings.chat_model,
+        settings.instant_chat_url,
+        settings.instant_chat_model,
+    )
+    settings.ollama_chat_url = "http://localhost:11434"
+    settings.chat_model = "test-thinking-model"
+    settings.instant_chat_url = "http://localhost:1234"
+    settings.instant_chat_model = "test-instant-model"
+    yield
+    (
+        settings.ollama_chat_url,
+        settings.chat_model,
+        settings.instant_chat_url,
+        settings.instant_chat_model,
+    ) = saved
+
+
 # ---------------------------------------------------------------------------
 # Fake transport (pattern: backend/tests/test_llm_finish_reason.py:28-98)
 # ---------------------------------------------------------------------------
@@ -537,6 +563,6 @@ class TestFactoryDocstrings:
         )
         assert "gemma 4 must use" not in doc, (
             "AC9-C9: the instant client docstring must not carry the stale "
-            "'Gemma 4 must use no-thinking template mode' claim (default "
-            "model is nvidia/nemotron-3-nano-4b)"
+            "'Gemma 4 must use no-thinking template mode' claim (the instant "
+            "model is operator-configured; no default ships)"
         )

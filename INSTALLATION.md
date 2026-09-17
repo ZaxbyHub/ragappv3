@@ -104,8 +104,10 @@ git --version
 # Verify installation
 ollama --version
 
-# Pull required models
-ollama pull llama3.2
+# Chat model pull is OPTIONAL — the app ships no model default and talks to
+# any OpenAI-compatible endpoint. If you serve chat locally with Ollama, pull
+# a model of your choice, e.g.:
+# ollama pull gemma4:12b
 # Harrier TEI embeddings are started by docker-compose; no Ollama embedding pull is required.
 ```
 
@@ -164,8 +166,10 @@ brew install ollama
 # Start Ollama service
 brew services start ollama
 
-# Pull required models
-ollama pull llama3.2
+# Chat model pull is OPTIONAL — the app ships no model default and talks to
+# any OpenAI-compatible endpoint. If you serve chat locally with Ollama, pull
+# a model of your choice, e.g.:
+# ollama pull gemma4:12b
 # Harrier TEI embeddings are started by docker-compose; no Ollama embedding pull is required.
 ```
 
@@ -215,8 +219,10 @@ curl -fsSL https://ollama.com/install.sh | sh
 # Start Ollama
 sudo systemctl start ollama
 
-# Pull required models
-ollama pull llama3.2
+# Chat model pull is OPTIONAL — the app ships no model default and talks to
+# any OpenAI-compatible endpoint. If you serve chat locally with Ollama, pull
+# a model of your choice, e.g.:
+# ollama pull gemma4:12b
 # Harrier TEI embeddings are started by docker-compose; no Ollama embedding pull is required.
 ```
 
@@ -444,12 +450,12 @@ services:
       - RERANKER_URL=${RERANKER_URL:-http://reranker:8081}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-microsoft/harrier-oss-v1-0.6b}
-      - CHAT_MODEL=${CHAT_MODEL:-llama3.2:latest}
-      - INSTANT_CHAT_MODEL=${INSTANT_CHAT_MODEL:-nvidia/nemotron-3-nano-4b}
-      # Chat endpoints reach the Docker host's Ollama / LM Studio via
-      # host.docker.internal (extra_hosts: host-gateway in the full file):
-      # - OLLAMA_CHAT_URL=${OLLAMA_CHAT_URL:-http://host.docker.internal:11434}
-      # - INSTANT_CHAT_URL=${INSTANT_CHAT_URL:-http://host.docker.internal:1234}
+      # Chat endpoints ship EMPTY — set them in .env (any OpenAI-compatible
+      # server: Ollama, LM Studio, vLLM, or a remote API):
+      - OLLAMA_CHAT_URL=${OLLAMA_CHAT_URL:-}
+      - CHAT_MODEL=${CHAT_MODEL:-}
+      - INSTANT_CHAT_URL=${INSTANT_CHAT_URL:-}
+      - INSTANT_CHAT_MODEL=${INSTANT_CHAT_MODEL:-}
       # REQUIRED — no default, backend rejects empty values
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
@@ -464,21 +470,27 @@ volumes:
   redis_data:
 ```
 
-#### Step 5: Pull the Chat Models (on the Docker Host)
+#### Step 5: Configure Your Chat Model Endpoints
 
 The bundled `harrier-embed`/`reranker` containers download their models on
-first start — no manual pull is needed for embeddings or reranking. Chat
-traffic, however, is served by the Ollama instance on your Docker host
-(`OLLAMA_CHAT_URL` defaults to `http://host.docker.internal:11434`), so pull
-every model you configure as `CHAT_MODEL` / `INSTANT_CHAT_MODEL` on the host:
+first start — no manual pull is needed for embeddings or reranking. Chat is
+different: **no chat model ships with the system**. You point Meridian at
+your own inference — an Ollama, LM Studio, or vLLM endpoint on any machine,
+or a remote OpenAI-compatible API — by setting `OLLAMA_CHAT_URL` +
+`CHAT_MODEL` (thinking) and, optionally, `INSTANT_CHAT_URL` +
+`INSTANT_CHAT_MODEL` (a second, faster endpoint). Configure them in
+`.env`, or later in the admin UI under Settings → Models. Until a thinking
+endpoint is configured, chat requests return a 409 pointing at the setting.
+
+If you serve the chat model yourself with Ollama, pull your chosen model on
+that host first, for example:
 
 ```bash
-# The default CHAT_MODEL used in this guide
-ollama pull llama3.2:latest
-
-# If you override CHAT_MODEL / INSTANT_CHAT_MODEL in .env, pull those too,
-# for example:
-# ollama pull gpt-oss:20b
+# Example: serving chat locally with Ollama
+ollama pull gemma4:26b
+# then set in .env:
+#   OLLAMA_CHAT_URL=http://localhost:11434
+#   CHAT_MODEL=gemma4:26b
 ```
 
 #### Step 6: (Multi-GPU hosts only) Pin the TEI services to specific GPUs
@@ -523,13 +535,14 @@ SQLITE_PATH=./ragapp.db
 #   docker compose up -d harrier-embed reranker
 OLLAMA_EMBEDDING_URL=http://localhost:8080/v1/embeddings
 RERANKER_URL=http://localhost:8081
-OLLAMA_CHAT_URL=http://localhost:11434
-CHAT_MODEL=llama3.2:latest
 EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
-# Optional instant-chat model server (e.g. LM Studio) — uncomment and pull
-# whichever model you point INSTANT_CHAT_MODEL at:
+# Chat endpoints (REQUIRED before chat works; no default ships). Point them
+# at any OpenAI-compatible server and pull/serve the model there yourself:
+# OLLAMA_CHAT_URL=http://localhost:11434
+# CHAT_MODEL=gemma4:26b
+# Optional second, faster endpoint (e.g. LM Studio / llama-server):
 # INSTANT_CHAT_URL=http://localhost:1234
-# INSTANT_CHAT_MODEL=nvidia/nemotron-3-nano-4b
+# INSTANT_CHAT_MODEL=minicpm5-2b
 
 # Embedding Configuration
 # Batch size for embedding requests (default: 32)

@@ -629,10 +629,31 @@ class TestChatEndpoint(unittest.TestCase):
         self._get_current_active_user = get_current_active_user
         self._csrf_protect = csrf_protect
         self._get_evaluate_policy = get_evaluate_policy
+        # Chat endpoints ship no defaults (issue #570): tests that exercise
+        # chat behavior configure a pair deliberately.
+        from app.config import settings as _settings
+
+        self._saved_chat_cfg = (
+            _settings.ollama_chat_url,
+            _settings.chat_model,
+            _settings.instant_chat_url,
+            _settings.instant_chat_model,
+        )
+        _settings.ollama_chat_url = "http://localhost:11434"
+        _settings.chat_model = "test-model"
+        _settings.instant_chat_url = "http://localhost:1234"
+        _settings.instant_chat_model = "test-instant"
 
     def tearDown(self):
         from app.api.deps import get_rag_engine
+        from app.config import settings as _settings
 
+        (
+            _settings.ollama_chat_url,
+            _settings.chat_model,
+            _settings.instant_chat_url,
+            _settings.instant_chat_model,
+        ) = self._saved_chat_cfg
         app.dependency_overrides.pop(get_rag_engine, None)
         app.dependency_overrides.pop(self._get_current_active_user, None)
         app.dependency_overrides.pop(self._csrf_protect, None)

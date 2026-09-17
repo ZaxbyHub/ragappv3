@@ -1622,8 +1622,12 @@ def _model_snapshot() -> dict[str, Any]:
     return {
         "prompt_bundle_version": PROMPT_BUNDLE_VERSION,
         "logical_modes": {
-            "thinking": settings.chat_model,
-            "instant": settings.instant_chat_model or settings.chat_model,
+            "thinking": settings.chat_model or "unconfigured",
+            "instant": (
+                settings.instant_chat_model
+                or settings.chat_model
+                or "unconfigured"
+            ),
         },
         "default_logical_mode": settings.draft_default_logical_mode,
     }

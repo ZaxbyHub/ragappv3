@@ -29,9 +29,13 @@ class TestSettingsDefaults(unittest.TestCase):
         self.assertEqual(
             settings.ollama_embedding_url, "http://harrier-embed:8080/v1/embeddings"
         )
-        self.assertEqual(settings.ollama_chat_url, "http://host.docker.internal:11434")
         self.assertEqual(settings.embedding_model, "microsoft/harrier-oss-v1-0.6b")
-        self.assertEqual(settings.chat_model, "llama3.2:latest")
+        # Chat endpoints ship unconfigured (issue #570 re-scope): the system
+        # prescribes no model; operators configure endpoints at setup.
+        self.assertEqual(settings.ollama_chat_url, "")
+        self.assertEqual(settings.chat_model, "")
+        self.assertEqual(settings.instant_chat_url, "")
+        self.assertEqual(settings.instant_chat_model, "")
         # New character-based fields
         self.assertEqual(settings.chunk_size_chars, 2000)
         self.assertEqual(settings.chunk_overlap_chars, 200)

@@ -105,11 +105,14 @@ class Settings(BaseSettings):
 
     # Ollama configuration
     ollama_embedding_url: str = "http://harrier-embed:8080/v1/embeddings"
-    ollama_chat_url: str = "http://host.docker.internal:11434"
+    # Chat endpoints ship unconfigured (issue #570): operators point them at
+    # their own inference (Ollama, LM Studio, vLLM, any OpenAI-compatible
+    # remote) via env or Settings -> Models; nothing is prescribed by default.
+    ollama_chat_url: str = ""
 
     # Model configuration
     embedding_model: str = "microsoft/harrier-oss-v1-0.6b"
-    chat_model: str = "llama3.2:latest"
+    chat_model: str = ""
 
     # LLM HTTP client pool configuration
     llm_max_connections: int = 100
@@ -117,11 +120,11 @@ class Settings(BaseSettings):
     llm_max_keepalive_connections: int = 50
     """Maximum keep-alive connections in the LLM client pool."""
 
-    # Instant mode (LM Studio on local GPU)
+    # Instant mode (operator-configured; LM Studio or any OpenAI-compatible server)
     editorial_chat_url: str = Field(default="", alias="DRAFT_EDITORIAL_CHAT_URL")
     editorial_chat_model: str = Field(default="", alias="DRAFT_EDITORIAL_CHAT_MODEL")
-    instant_chat_url: str = "http://host.docker.internal:1234"
-    instant_chat_model: str = "nvidia/nemotron-3-nano-4b"
+    instant_chat_url: str = ""
+    instant_chat_model: str = ""
     default_chat_mode: str = "thinking"  # "instant" | "thinking"
 
     # Per-mode retrieval overrides (Instant uses smaller budget)

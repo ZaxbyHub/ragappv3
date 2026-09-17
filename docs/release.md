@@ -77,11 +77,15 @@ Before deploying KnowledgeVault to production, ensure the following:
   # Required settings
   DATA_DIR=/data/knowledgevault
   OLLAMA_EMBEDDING_URL=http://harrier-embed:8080/v1/embeddings
-  OLLAMA_CHAT_URL=http://host.docker.internal:11434
-  INSTANT_CHAT_URL=http://host.docker.internal:1234
+  # Set to your inference endpoint (no default ships):
+  OLLAMA_CHAT_URL=http://192.168.1.50:11434
+  INSTANT_CHAT_URL=http://192.168.1.50:1234
   EMBEDDING_MODEL=microsoft/harrier-oss-v1-0.6b
-  CHAT_MODEL=llama3.2:latest
-  INSTANT_CHAT_MODEL=nvidia/nemotron-3-nano-4b
+  # No chat model ships by default — point CHAT_MODEL/OLLAMA_CHAT_URL at
+  # your own OpenAI-compatible endpoint (Settings -> Models or .env).
+  CHAT_MODEL=
+  # Optional second endpoint/model, e.g. minicpm5-2b:
+  # INSTANT_CHAT_MODEL=minicpm5-2b
   DEFAULT_CHAT_MODE=thinking
   INSTANT_INITIAL_RETRIEVAL_TOP_K=10
   INSTANT_RERANKER_TOP_N=4
@@ -358,7 +362,7 @@ fi
 # test-llm.sh
 
 CHAT_URL="${OLLAMA_CHAT_URL:-http://localhost:11434}/api/chat"
-CHAT_MODEL="${CHAT_MODEL:-llama3.2:latest}"
+CHAT_MODEL="${CHAT_MODEL:?set CHAT_MODEL to your endpoint's model name}"
 
 echo "Testing LLM service at $CHAT_URL..."
 
@@ -383,7 +387,7 @@ fi
 # test-instant-llm.sh
 
 INSTANT_CHAT_URL="${INSTANT_CHAT_URL:-http://localhost:1234}/v1/chat/completions"
-INSTANT_CHAT_MODEL="${INSTANT_CHAT_MODEL:-nvidia/nemotron-3-nano-4b}"
+INSTANT_CHAT_MODEL="${INSTANT_CHAT_MODEL:?set INSTANT_CHAT_MODEL or drop this line}"
 
 echo "Testing instant chat service at $INSTANT_CHAT_URL..."
 

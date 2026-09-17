@@ -160,33 +160,44 @@ def main() -> int:
             f"{compose_cors_default!r} does not match backend default {backend_default!r}"
         )
 
-    chat_default = backend_str_default(backend_config, "chat_model")
-    if not chat_default:
-        failures.append("backend/app/config.py chat_model default could not be parsed")
-    if env_value(env_text, "CHAT_MODEL") != chat_default:
-        failures.append(
-            ".env.example CHAT_MODEL default "
-            f"{env_value(env_text, 'CHAT_MODEL')!r} does not match backend default {chat_default!r}"
-        )
-    if compose_default(compose_text, "CHAT_MODEL") != chat_default:
-        failures.append(
-            "docker-compose.yml CHAT_MODEL default "
-            f"{compose_default(compose_text, 'CHAT_MODEL')!r} does not match backend default {chat_default!r}"
-        )
-    installation_doc = read("INSTALLATION.md")
-    active_pulls = sorted(
-        {
-            pull
-            for line in installation_doc.splitlines()
-            if not line.lstrip().startswith("#")
-            for pull in re.findall(r"\bollama pull (\S+)", line)
-        }
+    # Chat-model endpoints ship EMPTY by default (issue #570 re-scope): the
+    # system prescribes no model; operators configure endpoints at first
+    # setup or in Settings -> Models. Enforce the emptiness contract across
+    # every mirrored surface so no future default can silently return.
+    empty_default_fields = (
+        "chat_model",
+        "instant_chat_model",
+        "ollama_chat_url",
+        "instant_chat_url",
     )
-    if chat_default and chat_default not in active_pulls:
-        failures.append(
-            f"chat_model default {chat_default!r} is not pulled by any active "
-            f"`ollama pull` line in INSTALLATION.md (active: {active_pulls})"
-        )
+    for field_name in empty_default_fields:
+        value = backend_str_default(backend_config, field_name)
+        if value is None:
+            failures.append(
+                f"backend/app/config.py {field_name} default could not be parsed"
+            )
+        elif value != "":
+            failures.append(
+                f"empty-model-defaults: backend/app/config.py {field_name} ships "
+                f"default {value!r}; model endpoints must ship unconfigured "
+                "(configure at setup, not in code)"
+            )
+    for env_name in empty_default_fields:
+        env_val = env_value(env_text, env_name.upper())
+        if env_val is not None:
+            failures.append(
+                f"empty-model-defaults: .env.example sets {env_name.upper()}="
+                f"{env_val!r}; ship it as a commented example instead"
+            )
+        if env_name.upper() not in compose_text:
+            failures.append(f"docker-compose.yml is missing {env_name.upper()}")
+        else:
+            compose_val = compose_default(compose_text, env_name.upper())
+            if compose_val:
+                failures.append(
+                    f"empty-model-defaults: docker-compose.yml {env_name.upper()} "
+                    f"interpolation default {compose_val!r} must be empty"
+                )
 
     upload_default = backend_int_default(backend_config, "max_file_size_mb")
     if upload_default is None:

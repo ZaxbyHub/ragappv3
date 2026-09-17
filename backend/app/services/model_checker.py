@@ -153,10 +153,19 @@ class ModelChecker:
             'instant_chat_model' keys, each containing a dict with
             'available' (bool) and 'error' (str or None).
         """
-        urls = (
-            settings.ollama_embedding_url,
-            settings.ollama_chat_url,
-            settings.instant_chat_url,
+        # Empty chat URLs are the designed unconfigured state (issue #570):
+        # they short-circuit to 'not_configured' inside
+        # _check_model_availability, so exclude them from the SSRF gate —
+        # assert_url_safe rejects empty strings and would crash the deep
+        # health probe on a fresh install.
+        urls = tuple(
+            u
+            for u in (
+                settings.ollama_embedding_url,
+                settings.ollama_chat_url,
+                settings.instant_chat_url,
+            )
+            if u
         )
         await asyncio.gather(*(asyncio.to_thread(assert_url_safe, u) for u in urls))
 
@@ -260,8 +269,16 @@ class ModelChecker:
         dialect in turn until one answers.
 
         Returns:
-            Dictionary with 'available' (bool) and 'error' (str or None)
+            Dictionary with 'available' (bool) and 'error' (str or None);
+            an empty URL/model pair short-circuits to status 'not_configured'
+            (issue #570 — distinct from unreachable, and never probed).
         """
+        if not base_url or not model_name:
+            return {
+                "available": False,
+                "status": "not_configured",
+                "error": "endpoint not configured (set it in Settings -> Models)",
+            }
         base_key = _derive_base(base_url)
         order = self._dialect_order(base_url, base_key)
         mismatch_notes = []

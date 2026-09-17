@@ -24,8 +24,9 @@ def test_chat_mode_enum_rejects_unknown():
 
 
 def test_instant_mode_settings_defaults_present():
-    assert settings.instant_chat_url == "http://host.docker.internal:1234"
-    assert settings.instant_chat_model == "nvidia/nemotron-3-nano-4b"
+    # No model defaults ship (issue #570): endpoints are operator-configured.
+    assert settings.instant_chat_url == ""
+    assert settings.instant_chat_model == ""
     assert settings.default_chat_mode in ("instant", "thinking")
     assert isinstance(settings.instant_initial_retrieval_top_k, int)
     assert isinstance(settings.instant_reranker_top_n, int)

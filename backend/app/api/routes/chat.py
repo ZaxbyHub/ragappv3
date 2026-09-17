@@ -129,6 +129,34 @@ class UsedMemory(BaseModel):
     updated_at: Optional[str] = None
 
 
+def require_mode_configured(mode: Optional[str]) -> None:
+    """Raise 409 with setup guidance when a chat mode has no configured endpoint.
+
+    The system ships no model defaults (issue #570): an unconfigured mode is a
+    setup state, not a server fault, so it answers 409 pointing at the fix
+    instead of letting a None LLM client fail deeper in the pipeline.
+    """
+    resolved = mode or settings.default_chat_mode
+    if resolved == "instant":
+        if not (settings.instant_chat_url and settings.instant_chat_model):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Instant chat model is not configured. Configure it in "
+                    "Settings -> Models (INSTANT_CHAT_URL + INSTANT_CHAT_MODEL), "
+                    "then retry."
+                ),
+            )
+    elif not (settings.ollama_chat_url and settings.chat_model):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Thinking chat model is not configured. Configure it in "
+                "Settings -> Models (OLLAMA_CHAT_URL + CHAT_MODEL), then retry."
+            ),
+        )
+
+
 class ChatResponse(BaseModel):
     """Response model for non-streaming chat endpoint."""
 
@@ -1691,6 +1719,7 @@ async def chat(
             status_code=400,
             detail="Streaming is not supported on this endpoint. Use /chat/stream for streaming responses.",
         )
+    require_mode_configured(body.mode)
     # Role-derived authorization flags (issue #404). These are resolved HERE
     # (where the DI evaluate + DB connection are available) and threaded into
     # the RAG engine, which runs as a long-lived async generator AFTER this
@@ -1900,6 +1929,7 @@ async def chat_stream(
     # silently ignoring a resume position would make a reconnecting client see
     # duplicated frames.
     last_event_id: Optional[int] = None
+
     raw_last_event_id = request.headers.get("last-event-id")
     if raw_last_event_id is not None:
         try:
@@ -1911,6 +1941,9 @@ async def chat_stream(
                 status_code=400,
                 detail="Last-Event-ID must be a non-negative integer",
             )
+    # Configuration state (409) is checked after request validation (400):
+    # a malformed client input is a bad request regardless of setup state.
+    require_mode_configured(body.mode)
     return stream_chat_response(
         last_message.content,
         history,

@@ -161,38 +161,34 @@ Edit `.env` to match your setup:
 # Required: Set your data directory
 HOST_DATA_DIR=/path/to/your/data
 
-# Optional: Change default models
-CHAT_MODEL=llama3.2:latest
+# Required: Point chat at your own inference (no model ships with the
+# system). Any OpenAI-compatible endpoint works — Ollama, LM Studio, vLLM,
+# or a remote API:
+OLLAMA_CHAT_URL=http://192.168.1.50:11434
+CHAT_MODEL=gemma4:26b   # example — use the model YOUR endpoint serves
 ```
 
-### 2. Start Ollama
+### 2. Start Your Inference Endpoint
 
-Ensure Ollama is running on your host machine:
+Meridian does not bundle or prescribe a chat model. Run your own endpoint on
+any machine (it does not have to be the Docker host) and pull/serve your
+chosen model there. For a local Ollama, for example:
 
 ```bash
-# macOS/Linux
-ollama serve
-
-# Windows (Ollama runs as a service by default)
-# Verify with:
-ollama list
+ollama serve          # or install as a service
+# then serve your chosen model on it, e.g.:
+# ollama pull gemma4:26b
 ```
 
-### 3. Pull Required Chat Model
-
-The embedding service (Harrier TEI) is pre-configured in `docker-compose.yml` and downloads automatically on first start. You only need to pull the chat model:
-
-```bash
-# Required: Chat model (choose one)
-ollama pull llama3.2:latest # Default: light and fast, fits any GPU
-ollama pull gpt-oss:20b     # Stronger reasoning, ~14 GB VRAM (16 GB cards)
-```
-
-### 4. Start KnowledgeVault
+### 3. Start KnowledgeVault
 
 ```bash
 docker compose up -d
 ```
+
+Until `OLLAMA_CHAT_URL` + `CHAT_MODEL` are set (env or admin Settings →
+Models), chat requests answer 409 with setup guidance; embeddings and
+reranking work out of the box via the bundled TEI containers.
 
 ### 5. Access the Application
 
@@ -212,11 +208,11 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `HOST_DATA_DIR` | ./data | Host path for data persistence |
 | `DATA_DIR` | /app/data | Container data path |
 | `OLLAMA_EMBEDDING_URL` | http://harrier-embed:8080/v1/embeddings | Embedding service endpoint (TEI) |
-| `OLLAMA_CHAT_URL` | http://host.docker.internal:11434 | Thinking chat endpoint |
-| `INSTANT_CHAT_URL` | http://host.docker.internal:1234 | Instant chat endpoint |
+| `OLLAMA_CHAT_URL` | *(empty — configure at setup)* | Thinking chat endpoint (any OpenAI-compatible server) |
+| `INSTANT_CHAT_URL` | *(empty — optional)* | Instant chat endpoint (second, faster server) |
 | `EMBEDDING_MODEL` | microsoft/harrier-oss-v1-0.6b | Embedding model name |
-| `CHAT_MODEL` | llama3.2:latest | Thinking chat model name |
-| `INSTANT_CHAT_MODEL` | nvidia/nemotron-3-nano-4b | Instant chat model name |
+| `CHAT_MODEL` | *(empty — configure at setup)* | Thinking chat model name, as your endpoint knows it |
+| `INSTANT_CHAT_MODEL` | *(empty — optional)* | Instant chat model name |
 | `DEFAULT_CHAT_MODE` | thinking | Default mode for new chats (`thinking` or `instant`) |
 | `LLM_MAX_CONNECTIONS` | 100 | Maximum HTTP connections in the LLM client pool (httpx.AsyncClient) |
 | `LLM_MAX_KEEPALIVE_CONNECTIONS` | 50 | Maximum keep-alive connections in the LLM client pool |
@@ -308,18 +304,24 @@ data/
 
 #### Chat Models
 
-Sized for the documented GPU host (two 16 GB cards + one 8 GB card — see
-[docs/gpu-host-layouts.md](docs/gpu-host-layouts.md) for per-GPU placement):
+Nothing is preconfigured — bring your own endpoint and model. Any
+OpenAI-compatible server works (Ollama, LM Studio, vLLM, llama-server, or a
+remote API), and inference can live on a different machine than the app.
+If you serve chat yourself, these are current local-serving families and
+their honest footprints (sizes read from the Ollama library, Sept 2026;
+see [docs/gpu-host-layouts.md](docs/gpu-host-layouts.md) for the
+multi-GPU placement guide):
 
-| Model | Size | RAM | Speed | Best For |
-|-------|------|-----|-------|----------|
-| llama3.2:latest | 3B | ~4GB | ~30 tok/s | General use, fast; the shipped default |
-| gpt-oss:20b | 21B (MXFP4) | ~14GB | ~20 tok/s | Stronger reasoning on a 16 GB card |
-| mistral:latest | 7B | ~8GB | ~25 tok/s | Balanced performance |
+| Model | Download | Context | Notes |
+|-------|----------|---------|-------|
+| gemma4:26b | 19 GB | 256K | MoE (4B active); strongest local choice; wants a 24 GB card or reduced context on 16 GB |
+| gemma4:12b | 7.6 GB | 256K | Comfortable on a 16 GB card |
+| qwen3.5:9b | 6.6 GB | — | Current general-purpose pick; fits almost anywhere |
+| minicpm5-2b | ~2 GB (Q4) | 131K | Instant-mode class; tiny and fast |
 
 ```bash
-# Pull your preferred chat model
-ollama pull llama3.2:latest
+# Example: serve chat locally with Ollama, then point the app at it
+ollama pull gemma4:26b
 ```
 
 ### Verifying Connections

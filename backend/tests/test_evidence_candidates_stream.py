@@ -110,8 +110,29 @@ class TestEvidenceCandidatesSSE(unittest.TestCase):
 
     def setUp(self):
         self.client = TestClient(app)
+        # Chat endpoints ship no defaults (issue #570): configure a pair.
+        from app.config import settings
+
+        self._saved_chat_cfg = (
+            settings.ollama_chat_url,
+            settings.chat_model,
+            settings.instant_chat_url,
+            settings.instant_chat_model,
+        )
+        settings.ollama_chat_url = "http://localhost:11434"
+        settings.chat_model = "test-model"
+        settings.instant_chat_url = "http://localhost:1234"
+        settings.instant_chat_model = "test-instant"
 
     def tearDown(self):
+        from app.config import settings
+
+        (
+            settings.ollama_chat_url,
+            settings.chat_model,
+            settings.instant_chat_url,
+            settings.instant_chat_model,
+        ) = self._saved_chat_cfg
         from app.api.deps import get_current_active_user, get_rag_engine
         from app.api.routes.chat import get_stream_auth
         from app.main import app
