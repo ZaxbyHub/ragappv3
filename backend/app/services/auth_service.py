@@ -28,7 +28,11 @@ _auth_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="auth-cpu"
 
 ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 30
-ALGORITHM = "HS256"
+
+# JWT_ALGORITHM is an operator-facing setting (config.py / .env.example). Only
+# the symmetric HS family is supported: mint and decode share one configured
+# algorithm (see get_jwt_config), so anything else fails closed there.
+SUPPORTED_JWT_ALGORITHMS = ("HS256", "HS384", "HS512")
 
 
 def get_jwt_config() -> Tuple[str, str]:
@@ -38,7 +42,14 @@ def get_jwt_config() -> Tuple[str, str]:
     secret_key = settings.jwt_secret_key
     if not secret_key or secret_key == "change-me-to-a-random-64-char-string":
         raise RuntimeError("JWT_SECRET_KEY must be set when users are enabled")
-    return secret_key, ALGORITHM
+    algorithm = settings.jwt_algorithm
+    if algorithm not in SUPPORTED_JWT_ALGORITHMS:
+        raise RuntimeError(
+            f"JWT_ALGORITHM {algorithm!r} is not supported. The value must match "
+            f"exactly (case-sensitive, no whitespace). Supported algorithms: "
+            f"{', '.join(SUPPORTED_JWT_ALGORITHMS)}"
+        )
+    return secret_key, algorithm
 
 
 def hash_password(plain_password: str) -> str:
@@ -252,4 +263,12 @@ def verify_auth_config() -> None:
             raise RuntimeError(
                 "JWT_SECRET_KEY must be set when USERS_ENABLED=True. "
                 'Generate one with: python -c "import secrets; print(secrets.token_urlsafe(48))"'
+            )
+        # Mirror get_jwt_config's allowlist so the two cannot drift if this
+        # gains a startup caller (it has none today — see release-note
+        # Known limitations).
+        if settings.jwt_algorithm not in SUPPORTED_JWT_ALGORITHMS:
+            raise RuntimeError(
+                f"JWT_ALGORITHM {settings.jwt_algorithm!r} is not supported. "
+                f"Supported algorithms: {', '.join(SUPPORTED_JWT_ALGORITHMS)}"
             )

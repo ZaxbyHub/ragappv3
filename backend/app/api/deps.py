@@ -56,7 +56,18 @@ from app.services.authz_policy import (  # noqa: E402,F401
 
 
 class UserRole(IntEnum):
-    """Canonical role hierarchy used for all authorization checks."""
+    """Canonical role hierarchy used for all authorization checks.
+
+    Two-role model (by design — do not conflate them):
+      - ``users.role`` (this enum) is SYSTEM-WIDE: ``superadmin``/``admin`` are
+        system operators who see all orgs and all vaults; ``member``/``viewer``
+        are baseline user levels.
+      - ``org_members.role`` is PER-ORG (owner/admin/member within one
+        organization) and is unrelated to this hierarchy.
+
+    When a PR changes either role concept, its description must state which
+    one it touches (audit #202 F-6.1).
+    """
 
     VIEWER = 1
     MEMBER = 2

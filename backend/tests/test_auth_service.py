@@ -700,6 +700,9 @@ class TestVerifyAuthConfig:
         mock = MagicMock()
         mock.users_enabled = True
         mock.jwt_secret_key = "valid-secret-key-12345"
+        # verify_auth_config now also validates the algorithm (#202 review
+        # follow-up); bare MagicMock attributes would fail the membership check.
+        mock.jwt_algorithm = "HS256"
 
         with patch("app.config.settings", mock, create=True):
             # Should not raise any exception
@@ -747,3 +750,113 @@ class TestGetJwtConfig:
                 get_jwt_config()
 
             assert "JWT_SECRET_KEY must be set" in str(exc_info.value)
+
+
+class TestJwtAlgorithmSetting:
+    """AC1 (#202 / ENH-012): settings.jwt_algorithm is honored and fail-closed.
+
+    get_jwt_config() previously returned a hardcoded module constant, so the
+    declared JWT_ALGORITHM setting (config.py / .env.example, contract-tested)
+    was silently ignored. These tests pin the wired behavior.
+    """
+
+    def test_default_algorithm_is_hs256(self, mock_settings):
+        """Default configuration signs with HS256."""
+        import jwt as pyjwt
+
+        from app.services.auth_service import create_access_token
+
+        token = create_access_token(1, "alice", "member")
+        assert pyjwt.get_unverified_header(token)["alg"] == "HS256"
+
+    def test_configured_algorithm_is_honored_end_to_end(self, mock_settings):
+        """A configured HS384 is used for BOTH mint and decode."""
+        import jwt as pyjwt
+
+        from app.services.auth_service import (
+            create_access_token,
+            decode_access_token,
+            get_jwt_config,
+        )
+
+        mock_settings.jwt_algorithm = "HS384"
+        secret, algorithm = get_jwt_config()
+        assert algorithm == "HS384"
+        token = create_access_token(1, "alice", "member")
+        assert pyjwt.get_unverified_header(token)["alg"] == "HS384"
+        claims = decode_access_token(token)
+        assert claims["sub"] == "1"
+
+    def test_unsupported_algorithm_fails_closed(self, mock_settings):
+        """An algorithm outside the HS family raises with an actionable message."""
+        from app.services.auth_service import get_jwt_config
+
+        mock_settings.jwt_algorithm = "HS1"
+        with pytest.raises(RuntimeError) as exc_info:
+            get_jwt_config()
+
+        message = str(exc_info.value)
+        assert "supported" in message.lower()
+        for allowed in ("HS256", "HS384", "HS512"):
+            assert allowed in message
+        # The offending value is named so the operator can fix the env var.
+        assert "HS1" in message
+
+    def test_alg_none_value_is_rejected(self, mock_settings):
+        """The dangerous literal 'none' is not an accepted algorithm."""
+        from app.services.auth_service import get_jwt_config
+
+        mock_settings.jwt_algorithm = "none"
+        with pytest.raises(RuntimeError):
+            get_jwt_config()
+
+    def test_algorithm_rotation_invalidates_outstanding_tokens(self, mock_settings):
+        """Tokens minted under a prior configured algorithm fail after rotation.
+
+        decode_access_token allows exactly the configured algorithm; there is no
+        auto-migration of in-flight tokens across an algorithm rotation.
+        """
+        from app.services.auth_service import (
+            TokenInvalidError,
+            create_access_token,
+            decode_access_token,
+        )
+
+        mock_settings.jwt_algorithm = "HS256"
+        token = create_access_token(1, "alice", "member")
+        assert decode_access_token(token)["sub"] == "1"
+
+        mock_settings.jwt_algorithm = "HS384"
+        with pytest.raises(TokenInvalidError):
+            decode_access_token(token)
+
+    def test_lowercase_value_rejected_with_case_hint(self, mock_settings):
+        """Exact-case matching: 'hs256' fails closed even though it looks right."""
+        import jwt as pyjwt
+
+        from app.services.auth_service import get_jwt_config
+
+        mock_settings.jwt_algorithm = "hs256"
+        with pytest.raises(RuntimeError) as exc_info:
+            get_jwt_config()
+
+        assert "exactly" in str(exc_info.value)
+        assert pyjwt  # import guard
+
+    def test_verify_auth_config_rejects_unsupported_algorithm(self, mock_settings):
+        """verify_auth_config mirrors the get_jwt_config allowlist (drift guard)."""
+        from app.services.auth_service import verify_auth_config
+
+        mock_settings.jwt_algorithm = "RS256"
+        with pytest.raises(RuntimeError) as exc_info:
+            verify_auth_config()
+
+        assert "JWT_ALGORITHM" in str(exc_info.value)
+        assert "HS512" in str(exc_info.value)
+
+    def test_verify_auth_config_accepts_supported_algorithm(self, mock_settings):
+        """A supported algorithm passes startup verification."""
+        from app.services.auth_service import verify_auth_config
+
+        mock_settings.jwt_algorithm = "HS384"
+        verify_auth_config()  # must not raise
