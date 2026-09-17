@@ -99,7 +99,7 @@ vi.mock("@/hooks/useSendMessage", () => ({
     sendDirect: mockSendDirect,
     currentStage: null,
   }),
-  MAX_INPUT_LENGTH: 2000,
+  MAX_INPUT_LENGTH: 100_000, // mirrors the real constant (issue #616); hoisted mock factories cannot import it
 }));
 vi.mock("@/hooks/useChatHistory", () => ({
   useChatHistory: () => ({

@@ -539,16 +539,21 @@ describe("TranscriptPane ADVERSARIAL TESTS", () => {
     });
 
     it("should handle input exceeding MAX_INPUT_LENGTH", async () => {
-      setMockChatState({ messages: [], input: "A".repeat(3000), isStreaming: false, inputError: null }); // input exceeds MAX_INPUT_LENGTH of 2000
+      // Issue #616 raised the inline cap to 100,000; 3,000 chars is now
+      // ordinary inline input (no counter), while 100,001 is over the cap.
+      setMockChatState({ messages: [], input: "A".repeat(3_000), isStreaming: false, inputError: null });
 
-      render(<TranscriptPane />);
+      const { rerender } = render(<TranscriptPane />);
 
-      const textarea = screen.getByLabelText("Message input");
-      fireEvent.change(textarea, { target: { value: "A".repeat(3000) } });
+      // Below the 75% trigger the counter stays hidden.
+      expect(screen.queryByText(/\d+\/100000/)).not.toBeInTheDocument();
 
-      // Character count warning should appear
+      setMockChatState({ messages: [], input: "A".repeat(100_001), isStreaming: false, inputError: null });
+      rerender(<TranscriptPane />);
+
+      // Character count warning appears once over the cap
       await waitFor(() => {
-        expect(screen.getByText(/\d+\/2000/)).toBeInTheDocument();
+        expect(screen.getByText(/100001\/100000/)).toBeInTheDocument();
       });
     });
 

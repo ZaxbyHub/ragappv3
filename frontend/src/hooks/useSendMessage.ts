@@ -20,7 +20,12 @@ import { computeEffectiveChatMode } from "@/lib/chatMode";
 import type { UsedMemory } from "@/lib/api";
 import useCoalescedAppend from "./useCoalescedAppend";
 
-export const MAX_INPUT_LENGTH = 2000;
+// Inline composer cap. The backend imposes no message-length contract
+// (ChatMessage.content is an unbounded str), so this is a frontend guard
+// only: 100k keeps a bound on the SSE payload while covering long-form
+// RAG prompts; larger paste-sized input is routed to attachments by the
+// Composer instead (LARGE_PASTE_THRESHOLD).
+export const MAX_INPUT_LENGTH = 100_000;
 
 export interface UseSendMessageReturn {
   handleSend: () => Promise<void>;
@@ -42,6 +47,11 @@ export function useSendMessage(
   activeVaultId: number | null,
   refreshHistory: (force?: boolean) => Promise<void>
 ): UseSendMessageReturn {
+  // Actions only, resolved once: zustand action references are stable for
+  // the store's lifetime, and taking them via getState() avoids subscribing
+  // every consumer of this hook (TranscriptPane) to ALL store changes —
+  // a whole-store destructure here re-rendered the transcript tree on every
+  // composer keystroke (issue #616).
   const {
     setInput,
     setIsStreaming,
@@ -51,7 +61,7 @@ export function useSendMessage(
     updateMessage,
     replaceMessageId,
     setStreamingMessageId,
-  } = useChatStore();
+  } = useChatStore.getState();
 
   // Current pipeline stage — set when backend emits a stage SSE event
   const [currentStage, setCurrentStage] = useState<string | null>(null);

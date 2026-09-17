@@ -119,6 +119,22 @@ const SLASH_COMMANDS: SlashCommand[] = [
 const DRAFT_PREFIX = "ragapp_chat_draft_";
 const getDraftKey = (sessionId: string | null) => `${DRAFT_PREFIX}${sessionId ?? "new"}`;
 
+// Draft persistence bounds (issue #616): a leading+trailing debounce keeps
+// rapid input bursts from rewriting the FULL draft string to localStorage
+// on every change (write amplification that saturated the main thread with
+// large drafts), and drafts beyond MAX_DRAFT_CHARS are never persisted —
+// the stale key is dropped instead — so an oversized draft can never be
+// restored into a session loop.
+const DRAFT_DEBOUNCE_MS = 400;
+const MAX_DRAFT_CHARS = MAX_INPUT_LENGTH;
+
+// Plain-text pastes longer than this become a text/plain File attachment
+// (issue #616) instead of flooding the composer textarea. Moderately long
+// prompts (~4k chars ≈ 1k tokens) stay inline-editable; paste-sized input
+// is clearly file material. Matches the threshold recorded in the frozen
+// acceptance checks.
+export const LARGE_PASTE_THRESHOLD = 4_000;
+
 // =============================================================================
 // Composer
 // =============================================================================
@@ -127,7 +143,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   const internalRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = (inputRef ?? internalRef) as React.RefObject<HTMLTextAreaElement>;
 
-  const { input, setInput, inputError, activeChatId } = useChatStore();
+  const { input, setInput, inputError, setInputError, activeChatId } = useChatStore();
   const storedChatMode = useChatModeStore((s) => s.chatMode);
   const setStoredChatMode = useChatModeStore((s) => s.setChatMode);
   const temperature = useChatModeStore((s) => s.temperature);
@@ -214,22 +230,89 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeChatId]);
 
+  // Debounced draft persistence (issue #616). Leading+trailing: the first
+  // change after an idle window writes synchronously (preserving the
+  // single-change contract), a burst only updates the pending value, and
+  // the trailing edge writes the final value once the window closes. The
+  // key is captured when the write is scheduled, so a session switch
+  // mid-debounce can never bleed a draft across sessions.
+  const draftTimerRef = useRef<number | null>(null);
+  const pendingDraftRef = useRef<{ key: string; value: string } | null>(null);
+  const lastWrittenRef = useRef<{ key: string; value: string } | null>(null);
+
+  const writeDraftNow = useCallback((key: string, value: string) => {
+    try {
+      if (value && value.length <= MAX_DRAFT_CHARS) localStorage.setItem(key, value);
+      else localStorage.removeItem(key);
+    } catch { /* ignore */ }
+  }, []);
+
+  const flushPendingDraft = useCallback(() => {
+    if (draftTimerRef.current !== null) {
+      window.clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    const pending = pendingDraftRef.current;
+    pendingDraftRef.current = null;
+    const last = lastWrittenRef.current;
+    if (pending && (last?.key !== pending.key || last?.value !== pending.value)) {
+      writeDraftNow(pending.key, pending.value);
+      lastWrittenRef.current = pending;
+    }
+  }, [writeDraftNow]);
+
   const persistDraft = useCallback((value: string) => {
     if (typeof window === "undefined") return;
+    const key = getDraftKey(activeChatId);
+    // Session switched mid-debounce: the pending timer belongs to the OLD
+    // session's key. Flush the old session's final value first, then take a
+    // fresh leading edge so the new session's first write is synchronous
+    // (a tab close right after switching must not lose it).
+    if (draftTimerRef.current !== null && pendingDraftRef.current?.key !== key) {
+      flushPendingDraft();
+    }
+    pendingDraftRef.current = { key, value };
+    if (draftTimerRef.current !== null) return;
+    // Leading edge: write immediately, then hold the trailing window open
+    // for the burst that often follows (paste, IME, fast typing).
+    writeDraftNow(key, value);
+    lastWrittenRef.current = { key, value };
+    draftTimerRef.current = window.setTimeout(() => {
+      draftTimerRef.current = null;
+      flushPendingDraft();
+    }, DRAFT_DEBOUNCE_MS);
+  }, [activeChatId, writeDraftNow, flushPendingDraft]);
+
+  // Synchronous clear used by the send path: the draft must be gone from
+  // localStorage before onSend() runs, not 400ms later.
+  const clearDraftNow = useCallback(() => {
+    if (typeof window === "undefined") return;
+    if (draftTimerRef.current !== null) {
+      window.clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    pendingDraftRef.current = null;
     try {
-      const k = getDraftKey(activeChatId);
-      if (value) localStorage.setItem(k, value);
-      else localStorage.removeItem(k);
+      localStorage.removeItem(getDraftKey(activeChatId));
+      lastWrittenRef.current = null;
     } catch { /* ignore */ }
   }, [activeChatId]);
+
+  // Unmount: never lose the tail of a burst that had not hit the trailing
+  // edge yet.
+  useEffect(() => () => { flushPendingDraft(); }, [flushPendingDraft]);
 
   // Esc-to-stop: while a response is streaming, Escape stops generation.
   useEscapeToStop(isStreaming, onStop);
 
-  // Auto-grow
+  // Auto-grow. Beyond the paste threshold the content can only ever clamp
+  // to the 200px max anyway, so skip the forced synchronous layout once
+  // the clamp is reached — re-measuring a huge textarea on every keystroke
+  // was one leg of the issue #616 main-thread amplification.
   const adjustHeight = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
+    if (el.value.length > LARGE_PASTE_THRESHOLD && el.style.height === "200px") return;
     el.style.height = "auto";
     el.style.height = `${Math.max(44, Math.min(el.scrollHeight, 200))}px`;
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -242,9 +325,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   );
 
   const insertCommand = useCallback((cmd: SlashCommand) => {
-    const lines = input.split("\n");
-    lines[lines.length - 1] = cmd.label + " ";
-    const next = lines.join("\n");
+    // Replace the last line without splitting/joining the whole value —
+    // O(last line), not O(input) (issue #616).
+    const lastBreak = input.lastIndexOf("\n");
+    const head = lastBreak === -1 ? "" : input.slice(0, lastBreak + 1);
+    const next = head + cmd.label + " ";
     setInput(next);
     persistDraft(next);
     closeSlashMenu();
@@ -257,8 +342,9 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     setInput(value);
     persistDraft(value);
 
-    const lines = value.split("\n");
-    const last = lines[lines.length - 1];
+    // Slash-menu detection reads only the last line (issue #616): a full
+    // value.split("\n") allocated the entire input on every keystroke.
+    const last = value.slice(value.lastIndexOf("\n") + 1);
     if (last.startsWith("/") && !last.includes(" ")) {
       setShowSlashMenu(true);
       setSlashQuery(last.slice(1));
@@ -284,7 +370,14 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
   };
 
   const handleSubmit = () => {
-    if (!input.trim() || isStreaming || input.length > MAX_INPUT_LENGTH) return;
+    if (!input.trim() || isStreaming) return;
+    // Over the inline cap: surface the reason instead of silently no-op'ing
+    // (issue #616 — the silent block trapped oversized drafts). Raw number,
+    // locale-independent, matching the useSendMessage error strings.
+    if (input.length > MAX_INPUT_LENGTH) {
+      setInputError?.(`Input exceeds maximum length of ${MAX_INPUT_LENGTH} characters`);
+      return;
+    }
     // Hard-block sending while uploads are still transferring — there is
     // no file id yet to reference. Indexing-in-progress is a soft warning
     // only (the file may still be partially searchable, and we don't want
@@ -304,7 +397,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
           label: "Send without these files",
           onClick: () => {
             indexingIds.forEach((id) => detachFromChat(id));
-            persistDraft("");
+            clearDraftNow();
             closeSlashMenu();
             onSend();
           },
@@ -312,7 +405,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
       });
       return;
     }
-    persistDraft("");
+    clearDraftNow();
     closeSlashMenu();
     onSend();
     // Keep attachments in the tray after send only if they failed —
@@ -344,12 +437,27 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
     onDrop: enqueueFiles,
   });
 
-  // Handle paste with files
+  // Handle paste with files, and large plain-text pastes as attachments
+  // (issue #616): paste-sized text becomes a text/plain File through the
+  // same upload pipeline as dropped/attached files instead of flooding
+  // the textarea. Small pastes keep the native inline insertion.
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const files = Array.from(e.clipboardData.files);
     if (files.length > 0) {
       e.preventDefault();
       enqueueFiles(files);
+      return;
+    }
+    const text = e.clipboardData.getData("text/plain");
+    // Intercept only when the attachment pipeline can actually accept the
+    // file: with no vault selected addUploads would reject it outright and
+    // the pasted text would be lost — fall through to native inline
+    // insertion instead (the send-time vault requirement still applies).
+    if (text.length > LARGE_PASTE_THRESHOLD && activeVaultId != null) {
+      e.preventDefault();
+      const file = new File([text], `pasted-text-${Date.now()}.txt`, { type: "text/plain" });
+      enqueueFiles([file]);
+      toast.info("Pasted text attached as a file");
     }
   };
 

@@ -275,7 +275,16 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
   const navigate = useNavigate();
 
   const messageIds = useMessageIds();
-  const { isStreaming, streamingMessageId, setInput, removeMessagesFrom, updateMessage, loadChat } = useChatStore();
+  // Selector-scoped subscriptions (issue #616): destructuring the whole
+  // store re-rendered the entire transcript tree on every composer input
+  // event. Actions are stable zustand references; selecting primitives
+  // individually scopes re-renders to the fields this component uses.
+  const isStreaming = useChatStore((s) => s.isStreaming);
+  const streamingMessageId = useChatStore((s) => s.streamingMessageId);
+  const setInput = useChatStore((s) => s.setInput);
+  const removeMessagesFrom = useChatStore((s) => s.removeMessagesFrom);
+  const updateMessage = useChatStore((s) => s.updateMessage);
+  const loadChat = useChatStore((s) => s.loadChat);
 
   const { getActiveVault } = useVaultStore();
   const activeVault = getActiveVault();
