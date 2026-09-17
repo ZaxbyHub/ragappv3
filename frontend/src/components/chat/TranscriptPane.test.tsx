@@ -980,21 +980,36 @@ describe("TranscriptPane", () => {
     });
 
     it("character count shows warning when input is near max length", () => {
-      const longInput = "a".repeat(1700); // > 80% of 2000
+      // 75,001 > 75% of the 100,000 inline cap (issue #616) → counter
+      // renders without the destructive class.
+      const longInput = "a".repeat(75_001);
       mockChatState.input = longInput;
 
-      renderComposerWithProviders({ onSend: mockHandleSend, onStop: mockHandleStop, isStreaming: false });
+      const { rerender } = renderComposerWithProviders({ onSend: mockHandleSend, onStop: mockHandleStop, isStreaming: false });
 
-      expect(screen.getByText(/1700\/2000/)).toBeInTheDocument();
+      const charCount = screen.getByText(/75001\/100000/);
+      expect(charCount).toBeInTheDocument();
+      expect(charCount).not.toHaveClass(/destructive/);
+
+      // Below the 75% trigger the counter stays hidden.
+      mockChatState.input = "a".repeat(1_700);
+      rerender(
+        <TooltipProvider>
+          <Composer onSend={mockHandleSend} onStop={mockHandleStop} isStreaming={false} />
+        </TooltipProvider>
+      );
+      expect(screen.queryByText(/\d+\/100000/)).not.toBeInTheDocument();
     });
 
     it("character count shows destructive color when over max", () => {
-      const overMaxInput = "a".repeat(2100); // > 2000
+      // 100,001 > the 100,000 inline cap (issue #616) → counter renders
+      // with the destructive class.
+      const overMaxInput = "a".repeat(100_001);
       mockChatState.input = overMaxInput;
 
       renderComposerWithProviders({ onSend: mockHandleSend, onStop: mockHandleStop, isStreaming: false });
 
-      const charCount = screen.getByText(/2100\/2000/);
+      const charCount = screen.getByText(/100001\/100000/);
       expect(charCount).toHaveClass(/destructive/);
     });
 
@@ -1053,8 +1068,8 @@ describe("TranscriptPane", () => {
       expect(mockSetInput).toHaveBeenCalled();
     });
 
-    it("shows MAX_INPUT_LENGTH constant is 2000", () => {
-      expect(MAX_INPUT_LENGTH).toBe(2000);
+    it("shows MAX_INPUT_LENGTH constant is 100000", () => {
+      expect(MAX_INPUT_LENGTH).toBe(100_000);
     });
   });
 });
