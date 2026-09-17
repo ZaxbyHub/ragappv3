@@ -9,8 +9,9 @@
   `backend/app/api/routes/chat.py`) and blocked legitimate long-form RAG
   prompts; a ~20k message reported by a user could not be sent at all.
 - The composer's send gate now surfaces the reason (`Input exceeds maximum
-  length of 100,000 characters` via the store's `inputError`) instead of
-  silently no-op'ing, and the character counter reflects the new cap
+  length of 100000 characters` via the store's `inputError`,
+  locale-independent and identical on all three enforcement sites) instead
+  of silently no-op'ing, and the character counter reflects the new cap
   (appears above 75,000, red above 100,000).
 - `sendDirect` (retry/revision of an existing turn) intentionally has no
   length gate, unchanged.
@@ -59,9 +60,10 @@ time. Full trace under `.agents/issue-traces/chat-char-limit-browser-crash/`
 
 ## Operator / user visibility
 
-- No migration required; the draft key format is unchanged. Oversized
-  persisted drafts (from before this change) are dropped on next write
-  rather than restored.
+- No migration required; the draft key format is unchanged. A pre-existing
+  oversized draft (from before this change) is restored once on session
+  open — a single bounded render, no longer a crash vector — and is dropped
+  instead of persisted on the next write.
 - A 100k-character query costs ~13 embedding chunks server-side (8,192
   chars per text) — a proportional retrieval-cost increase accepted with
   the higher cap.
