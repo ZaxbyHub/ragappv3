@@ -41,7 +41,7 @@ class FakeLLMClient:
         self._response = response
         self.calls: list = []
 
-    async def chat_completion(self, messages, max_tokens=None, temperature=None):
+    async def chat_completion(self, messages, max_tokens=None, temperature=None, response_format=None):
         self.calls.append(
             {"messages": messages, "max_tokens": max_tokens, "temperature": temperature}
         )

@@ -156,6 +156,10 @@ class LLMClient:
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
+        keep_alive: Optional[str] = None,
+        num_ctx: Optional[int] = None,
+        ttl: Optional[int] = None,
+        context_length: Optional[int] = None,
     ):
         """
         Initialize the LLM client.
@@ -178,11 +182,34 @@ class LLMClient:
                 max/none) on that endpoint; ``None`` sends no control field
                 and the provider default governs (``think`` is native
                 ``/api/chat``-only and is intentionally not used here).
+            keep_alive: Ollama-native residency control (issue #571) sent on
+                the :meth:`prime_residency` preload call — ``"-1"`` keeps the
+                model loaded, durations like ``"30m"`` or seconds also work.
+                ``None`` disables priming for this client.
+            num_ctx: Ollama-native context window (issue #571) pinned at model
+                load via :meth:`prime_residency`'s ``options.num_ctx``; the
+                OpenAI-compatible surface cannot set it per request.
+                ``None`` sends no sizing.
+            ttl: LM Studio idle TTL in seconds (issue #571) carried on every
+                chat payload; the idle timer resets on each request.
+                ``None`` sends no TTL field.
+            context_length: LM Studio context length (issue #571) requested
+                from the native model-load endpoint by
+                :meth:`prime_residency`; the OpenAI-compatible surface cannot
+                set it per request. ``None`` sends no load call.
         """
         self.base_url = (base_url or settings.ollama_chat_url).rstrip("/")
         self.model = model or settings.chat_model
         self.timeout = timeout
         self.max_tokens = max_tokens
+        # Provider residency/context contracts (issue #571). Factory-fixed
+        # like reasoning_effort: a hot reconfigure never silently flips the
+        # residency posture mid-operation; a settings change applies on
+        # restart when the factories run again.
+        self.keep_alive = keep_alive
+        self.num_ctx = num_ctx
+        self.ttl = ttl
+        self.context_length = context_length
         # Per-client template controls (e.g. Qwen-family Instant no-thinking).
         # Copy so callers cannot mutate the live request policy after creation.
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
@@ -227,7 +254,7 @@ class LLMClient:
         Per-request URLs are computed from ``self.base_url`` at call time, so
         in-place updates take effect immediately without recreating the
         httpx pool or invalidating any stored references held by callers
-        (LLMHealthChecker, background_processor, keepalive tasks, RAGEngine).
+        (LLMHealthChecker, background_processor, residency priming tasks, RAGEngine).
 
         Resets the circuit breaker on any change so a previously opened
         breaker from a now-unreachable endpoint does not block requests to
@@ -259,6 +286,72 @@ class LLMClient:
                 changed = True
         if changed:
             self._circuit_breaker.reset()
+
+    async def prime_residency(self) -> bool:
+        """One-shot native model-load call pinning residency/context (issue #571).
+
+        Replaces the retired 30-second ``max_tokens=1`` ping loop: Ollama
+        clients (``keep_alive``/``num_ctx`` set) preload the model via the
+        native ``/api/generate`` surface — an empty prompt loads the model
+        without generating, ``keep_alive`` pins residency, and
+        ``options.num_ctx`` sizes the loaded instance's context window (the
+        OpenAI-compatible surface cannot express either). LM Studio clients
+        (``context_length`` set) request the context length from the native
+        model-load endpoint, trying the current v1 API first and the legacy
+        v0 path on 404 for pre-0.4.0 servers; residency for LM Studio comes
+        from the per-payload ``ttl`` every chat request already carries.
+
+        Best-effort by contract: any transport/HTTP failure is logged and
+        reported as ``False`` — residency priming must never break startup
+        or a chat turn. Returns ``True`` when the native call succeeded.
+        """
+        if self.keep_alive is None and self.num_ctx is None and self.context_length is None:
+            return False
+        client = await self._ensure_started()
+        try:
+            if self.context_length is not None:
+                # LM Studio native load (v1, with a v0 fallback for older
+                # servers). `ttl` is intentionally not part of the load
+                # request: it rides every chat payload instead.
+                body = {"model": self.model, "context_length": self.context_length}
+                url = f"{self.base_url}/api/v1/models/load"
+                response = await client.post(url, json=body)
+                if response.status_code == 404:
+                    response = await client.post(
+                        f"{self.base_url}/api/v0/models/load", json=body
+                    )
+                response.raise_for_status()
+                logger.info(
+                    "Model residency primed via LM Studio load API (%s, ctx=%d)",
+                    self.base_url,
+                    self.context_length,
+                )
+                return True
+            # Ollama native preload: empty-prompt /api/generate loads the
+            # model without generating (documented preload pattern).
+            body: Dict[str, Any] = {"model": self.model}
+            if self.keep_alive is not None:
+                body["keep_alive"] = self.keep_alive
+            if self.num_ctx is not None:
+                body["options"] = {"num_ctx": self.num_ctx}
+            response = await client.post(f"{self.base_url}/api/generate", json=body)
+            response.raise_for_status()
+            logger.info(
+                "Model residency primed via Ollama preload (%s, keep_alive=%s, num_ctx=%s)",
+                self.base_url,
+                self.keep_alive,
+                self.num_ctx,
+            )
+            return True
+        except (httpx.HTTPError, LLMError) as e:
+            logger.warning(
+                "Residency priming failed for %s (model %s): %s — the model "
+                "will load on demand with provider defaults instead",
+                self.base_url,
+                self.model,
+                type(e).__name__ if isinstance(e, LLMError) else str(e),
+            )
+            return False
 
     async def start(self):
         """Start the HTTP client. Must be called before using the client."""
@@ -401,6 +494,13 @@ class LLMClient:
             payload["chat_template_kwargs"] = self.chat_template_kwargs
         if self.reasoning_effort is not None:
             payload["reasoning_effort"] = self.reasoning_effort
+        if self.ttl is not None:
+            # LM Studio idle TTL (issue #571): seconds until an idle JIT-loaded
+            # model is unloaded; the timer resets on every request. LM Studio
+            # documents this per-payload field on its OpenAI-compatible
+            # surface, which is what makes native residency possible without
+            # the retired 30-second ping loop.
+            payload["ttl"] = self.ttl
         if response_format is not None:
             payload["response_format"] = response_format
 
@@ -461,6 +561,14 @@ class LLMClient:
             self._log_pool_stats()
 
             content = self._strip_thinking_content(content)
+            # Issue #571: prefer provider-exact token counts when the
+            # provider reports them (OpenAI-compatible `usage`; Ollama maps
+            # prompt_eval_count/eval_count onto these fields). The char-based
+            # estimates stay for compatibility and remain the only values
+            # when the provider omits `usage`.
+            usage = data.get("usage") or {}
+            provider_prompt_tokens = usage.get("prompt_tokens")
+            provider_completion_tokens = usage.get("completion_tokens")
             self.last_metrics = {
                 "provider_url": self.base_url,
                 "model": self.model,
@@ -470,6 +578,10 @@ class LLMClient:
                 "finish_reason": finish_reason,
                 "status": "ok",
             }
+            if provider_prompt_tokens is not None:
+                self.last_metrics["prompt_tokens"] = provider_prompt_tokens
+            if provider_completion_tokens is not None:
+                self.last_metrics["completion_tokens"] = provider_completion_tokens
             return content
         except CircuitBreakerError as e:
             self.last_metrics = {"provider_url": self.base_url, "model": self.model, "status": "circuit_open"}
@@ -535,14 +647,27 @@ class LLMClient:
             "stream": True,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            # Issue #571: both supported providers document
+            # `stream_options.include_usage` on the OpenAI-compatible
+            # surface — the final (choices-less) chunk then carries the
+            # authoritative `usage` object, parsed below.
+            "stream_options": {"include_usage": True},
         }
         if self.chat_template_kwargs:
             payload["chat_template_kwargs"] = self.chat_template_kwargs
         if self.reasoning_effort is not None:
             payload["reasoning_effort"] = self.reasoning_effort
+        if self.ttl is not None:
+            # LM Studio idle TTL (issue #571) — same semantics as the
+            # non-streaming payload above.
+            payload["ttl"] = self.ttl
         started_at = time.perf_counter()
         prompt_tokens = self._prompt_token_estimate(messages)
         completion_chars = 0
+        # Issue #571: provider-exact usage from the final usage-only chunk,
+        # captured before the empty-choices skip so the reporting chunk is
+        # never dropped.
+        _usage: Dict[str, Any] = {}
 
         # Check circuit breaker state before attempting stream connection.
         # Use the lock to avoid race conditions with concurrent requests.
@@ -642,6 +767,16 @@ class LLMClient:
                         temperature=temperature,
                         max_tokens=max_tokens,
                     )
+                    # Issue #571: keep the provider-exact usage the non-stream
+                    # call just recorded — the stream summary below would
+                    # otherwise overwrite last_metrics and drop those keys
+                    # (the fallback response never rode the SSE usage chunk).
+                    _fallback_metrics = self.last_metrics or {}
+                    if _fallback_metrics.get("prompt_tokens") is not None:
+                        _usage = {
+                            "prompt_tokens": _fallback_metrics["prompt_tokens"],
+                            "completion_tokens": _fallback_metrics.get("completion_tokens"),
+                        }
                     if content:
                         yield content
                     stream_succeeded = True
@@ -696,6 +831,15 @@ class LLMClient:
 
                         # Extract content delta from choices
                         choices = data.get("choices", [])
+
+                        # Issue #571: the usage-only final chunk (sent when
+                        # stream_options.include_usage is requested) carries
+                        # no choices — capture its usage before the skip
+                        # below so provider-exact counts are never dropped.
+                        chunk_usage = data.get("usage")
+                        if isinstance(chunk_usage, dict):
+                            _usage = chunk_usage
+
                         if not choices:
                             continue
 
@@ -946,6 +1090,12 @@ class LLMClient:
                     "status": "ok",
                     "stream": True,
                 }
+                # Issue #571: provider-exact counts when the usage chunk
+                # arrived; estimates remain the only values otherwise.
+                if _usage.get("prompt_tokens") is not None:
+                    self.last_metrics["prompt_tokens"] = _usage["prompt_tokens"]
+                if _usage.get("completion_tokens") is not None:
+                    self.last_metrics["completion_tokens"] = _usage["completion_tokens"]
             else:
                 # Streaming failed — record a failure metric so the done
                 # payload's llm_metrics does not report a stale/ok value for
@@ -994,6 +1144,12 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
     explicit ``max_tokens`` get the configured thinking budget instead of
     the legacy hardcoded 32768. An explicit per-call ``max_tokens`` still
     wins.
+
+    Provider residency contracts (issue #571): the Ollama-native
+    ``keep_alive`` (default ``"-1"``, the same indefinite residency the
+    retired ping loop provided) and ``num_ctx`` (default 4096, Ollama's
+    documented default) are applied by :meth:`LLMClient.prime_residency`
+    at startup — the OpenAI-compatible surface cannot express either.
     """
     return LLMClient(
         timeout=timeout,
@@ -1002,6 +1158,8 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
         cb_name="llm_thinking",
         max_tokens=settings.thinking_max_tokens,
         reasoning_effort="high",
+        keep_alive=settings.ollama_keep_alive,
+        num_ctx=settings.ollama_num_ctx,
     )
 
 
@@ -1012,12 +1170,20 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
     structured-edit prompts; deployments can point these stages at a
     different endpoint (DRAFT_EDITORIAL_CHAT_URL/MODEL) while falling
     back to the thinking backend when unset.
+
+    Carries the same Ollama-native residency contracts as
+    :func:`create_thinking_client` (issue #571): the editorial backend is
+    an Ollama-mode backend by default, and priming covers it when an
+    explicit override is configured (otherwise its URL+model equal the
+    thinking client's and the thinking prime pins the same server).
     """
     return LLMClient(
         timeout=timeout,
         base_url=settings.editorial_chat_url or settings.ollama_chat_url,
         model=settings.editorial_chat_model or settings.chat_model,
         cb_name="llm_editorial",
+        keep_alive=settings.ollama_keep_alive,
+        num_ctx=settings.ollama_num_ctx,
     )
 
 
@@ -1036,6 +1202,14 @@ def create_instant_client(timeout: float = 120.0) -> "LLMClient":
     mechanism) log a warning and send nothing, failing open. The client
     also carries ``settings.instant_max_tokens`` as its default generation
     budget (ENH-015, issue #494), mirroring ``create_thinking_client``.
+
+    Provider residency contracts (issue #571): every chat payload carries
+    LM Studio's per-request idle ``ttl`` (default 86400s — far more generous
+    than the 60-minute JIT default and the retired ping loop's interval), and
+    ``context_length`` (default 4096) is requested from LM Studio's native
+    model-load endpoint by :meth:`LLMClient.prime_residency` at startup.
+    Note LM Studio's JIT Auto-Evict unloads this model when a DIFFERENT
+    model is requested on the same server.
     """
     # Pydantic guarantees a real bool here; the identity check keeps
     # partially mocked settings objects (tests) on the default-False branch.
@@ -1045,6 +1219,8 @@ def create_instant_client(timeout: float = 120.0) -> "LLMClient":
         else select_no_think_chat_template_kwargs(settings.instant_chat_model)
     )
     instant_max_tokens = getattr(settings, "instant_max_tokens", None)
+    lm_studio_ttl = getattr(settings, "lm_studio_ttl", None)
+    lm_studio_ctx = getattr(settings, "lm_studio_context_length", None)
     return LLMClient(
         timeout=timeout,
         base_url=settings.instant_chat_url,
@@ -1052,4 +1228,8 @@ def create_instant_client(timeout: float = 120.0) -> "LLMClient":
         cb_name="llm_instant",
         max_tokens=instant_max_tokens if isinstance(instant_max_tokens, int) else None,
         chat_template_kwargs=chat_template_kwargs,
+        ttl=lm_studio_ttl if isinstance(lm_studio_ttl, int) else None,
+        context_length=(
+            lm_studio_ctx if isinstance(lm_studio_ctx, int) else None
+        ),
     )

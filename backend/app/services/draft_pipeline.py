@@ -63,13 +63,14 @@ The law this module exists to enforce
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Sequence
 
 from pydantic import BaseModel, ValidationError
 
@@ -386,6 +387,7 @@ async def _default_complete(
     logical_mode: str,
     temperature: float,
     sensitive: bool,
+    response_format: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Production model call for one Draft Room stage.
 
@@ -415,6 +417,10 @@ async def _default_complete(
         return await client.chat_completion(
             [{"role": "user", "content": prompt}],
             temperature=temperature,
+            # Issue #571: stage responses are schema-constrained provider-side
+            # (json_schema response_format) so a non-compliant model response
+            # is a provider error instead of a downstream parse failure.
+            response_format=response_format,
         )
     finally:
         await client.close()
@@ -682,6 +688,45 @@ def _extract_json_object(raw: str) -> Any:
     return json.loads(text[start : end + 1])
 
 
+def _stage_json_schema(name: str, model: type[BaseModel]) -> Dict[str, Any]:
+    """Build the provider-side response_format for one structured stage call.
+
+    Issue #571: stages already validate model output against a Pydantic model
+    with one repair attempt; passing the same schema as a ``json_schema``
+    ``response_format`` moves the constraint provider-side, so a non-compliant
+    response becomes a provider constraint violation instead of a guaranteed
+    repair round-trip.
+    """
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": f"draft_{name}",
+            "schema": model.model_json_schema(),
+        },
+    }
+
+
+def _accepts_response_format(fn: Callable[..., Any]) -> bool:
+    """Whether an injected ``complete`` callable accepts ``response_format=``.
+
+    ``PipelineDeps.complete`` is an injection seam documented as
+    ``complete(prompt, logical_mode=..., temperature=..., sensitive=...)``;
+    ``response_format`` (issue #571) is an optional protocol extension. The
+    production ``_default_complete`` accepts it; strict test doubles that do
+    not simply get the pre-#571 call shape, so existing fakes keep working.
+    """
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if "response_format" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
 def _is_transient(exc: BaseException) -> bool:
     """Classify a provider/retrieval fault as automatically retryable.
 
@@ -939,6 +984,13 @@ class _CompileRun:
         )
         self._attempts: dict[str, int] = {}
         self._checkpoints: dict[str, "DraftStageRecord"] = {}
+        # Issue #571: whether the injected complete callable accepts the
+        # optional response_format keyword (production _default_complete
+        # does; strict test doubles without it keep the pre-#571 shape and
+        # silently skip the provider-side schema constraint).
+        self._complete_takes_response_format = _accepts_response_format(
+            deps.complete
+        )
         # Cross-stage state, all plain Python values.
         self._manifest: Optional[IntakeManifest] = None
         self._packet: Optional[ResearchPacket] = None
@@ -1087,7 +1139,8 @@ class _CompileRun:
         which passes the schema error but never hidden reasoning (SPEC §14.3).
         """
         rendered = prompt.render(**render)
-        raw = await self._provider_call(prompt, rendered)
+        stage_schema = _stage_json_schema(stage, output_model)
+        raw = await self._provider_call(prompt, rendered, stage_schema)
         try:
             payload = _extract_json_object(raw)
             model = output_model.model_validate(payload)
@@ -1099,7 +1152,7 @@ class _CompileRun:
                 "Return ONLY a corrected JSON object matching the schema above. "
                 "Do not explain, and do not include any reasoning."
             )
-            raw = await self._provider_call(prompt, repair)
+            raw = await self._provider_call(prompt, repair, stage_schema)
             try:
                 payload = _extract_json_object(raw)
                 model = output_model.model_validate(payload)
@@ -1131,7 +1184,12 @@ class _CompileRun:
         )
         return model, audit
 
-    async def _provider_call(self, prompt: PromptDefinition, rendered: str) -> str:
+    async def _provider_call(
+        self,
+        prompt: PromptDefinition,
+        rendered: str,
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Guarded provider invocation with bounded transient auto-retry."""
         attempt = 0
         while True:
@@ -1156,7 +1214,7 @@ class _CompileRun:
 
             self._budget.model_calls += 1
             try:
-                raw = await self._complete_bounded(prompt, rendered)
+                raw = await self._complete_bounded(prompt, rendered, response_format)
             except ProviderPolicyError as exc:
                 # Never auto-retried: policy is a decision, not a fault.
                 raise CompileFailure(
@@ -1188,7 +1246,10 @@ class _CompileRun:
             return raw
 
     async def _complete_bounded(
-        self, prompt: PromptDefinition, rendered: str
+        self,
+        prompt: PromptDefinition,
+        rendered: str,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> str:
         """One provider call bounded by the remaining wall-clock budget.
 
@@ -1204,13 +1265,18 @@ class _CompileRun:
         was issued, so the budget increment taken before it stands — a
         timed-out call is charged, never refunded.
         """
+        call_kwargs: dict[str, Any] = {
+            "logical_mode": prompt.logical_mode,
+            "temperature": prompt.temperature,
+            "sensitive": self._ctx.sensitive,
+        }
+        if response_format is not None and self._complete_takes_response_format:
+            call_kwargs["response_format"] = response_format
         try:
             return await asyncio.wait_for(
                 self._deps.complete(
                     rendered,
-                    logical_mode=prompt.logical_mode,
-                    temperature=prompt.temperature,
-                    sensitive=self._ctx.sensitive,
+                    **call_kwargs,
                 ),
                 timeout=self._remaining_wall_clock(),
             )
@@ -1387,7 +1453,14 @@ class _CompileRun:
         cancellation check by holding a raw reference to ``deps.complete``.
         """
         definition = PROMPTS["research"]
-        return await self._provider_call(definition, prompt)
+        # Issue #571: the research packet is schema-validated JSON
+        # (draft_research parses + model_validates it), so the same schema
+        # constrains the response provider-side.
+        return await self._provider_call(
+            definition,
+            prompt,
+            response_format=_stage_json_schema("research_packet", ResearchPacket),
+        )
 
     def _compute_source_snapshot(self) -> str:
         """Hash of the immutable evidence snapshot this job may cite.

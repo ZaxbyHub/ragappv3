@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 80254,
+      "loc": 80532,
       "nosec": 0,
       "skipped_tests": 56
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1352,
+      "loc": 1400,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -400,7 +400,7 @@
       "SEVERITY.LOW": 7,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 807,
+      "loc": 782,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -582,7 +582,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 210,
+      "loc": 227,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -647,7 +647,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 201,
+      "loc": 207,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -699,7 +699,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 219,
+      "loc": 251,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -920,7 +920,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 3041,
+      "loc": 3098,
       "nosec": 0,
       "skipped_tests": 3
     },
@@ -1037,7 +1037,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1294,
+      "loc": 1296,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1245,7 +1245,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 751,
+      "loc": 879,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1284,7 +1284,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 726,
+      "loc": 739,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3230,7 +3230,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "1033         await app.state.thinking_llm_client.close()\n1034     except Exception:\n1035         pass\n1036     try:\n",
+      "code": "1006         await app.state.thinking_llm_client.close()\n1007     except Exception:\n1008         pass\n1009     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3241,17 +3241,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1034,
+      "line_number": 1007,
       "line_range": [
-        1034,
-        1035
+        1007,
+        1008
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1037         await app.state.instant_llm_client.close()\n1038     except Exception:\n1039         pass\n1040     try:\n",
+      "code": "1010         await app.state.instant_llm_client.close()\n1011     except Exception:\n1012         pass\n1013     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3262,17 +3262,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1038,
+      "line_number": 1011,
       "line_range": [
-        1038,
-        1039
+        1011,
+        1012
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1041         await app.state.embedding_service.close()\n1042     except Exception:\n1043         pass\n1044     try:\n",
+      "code": "1014         await app.state.embedding_service.close()\n1015     except Exception:\n1016         pass\n1017     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3283,17 +3283,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1042,
+      "line_number": 1015,
       "line_range": [
-        1042,
-        1043
+        1015,
+        1016
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1045         await app.state.reranking_service.close()\n1046     except Exception:\n1047         pass\n1048     try:\n",
+      "code": "1018         await app.state.reranking_service.close()\n1019     except Exception:\n1020         pass\n1021     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3304,17 +3304,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1046,
+      "line_number": 1019,
       "line_range": [
-        1046,
-        1047
+        1019,
+        1020
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1049         app.state.vector_store.close()\n1050     except Exception:\n1051         pass\n1052     try:\n",
+      "code": "1022         app.state.vector_store.close()\n1023     except Exception:\n1024         pass\n1025     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3325,17 +3325,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1050,
+      "line_number": 1023,
       "line_range": [
-        1050,
-        1051
+        1023,
+        1024
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1053         app.state.db_pool.close_all()\n1054     except Exception:\n1055         pass\n1056     try:\n",
+      "code": "1026         app.state.db_pool.close_all()\n1027     except Exception:\n1028         pass\n1029     try:\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3346,17 +3346,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1054,
+      "line_number": 1027,
       "line_range": [
-        1054,
-        1055
+        1027,
+        1028
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "1058         _auth_executor.shutdown(wait=False)\n1059     except Exception:\n1060         pass\n",
+      "code": "1031         _auth_executor.shutdown(wait=False)\n1032     except Exception:\n1033         pass\n",
       "col_offset": 4,
       "end_col_offset": 12,
       "filename": "backend/app/lifespan.py",
@@ -3367,10 +3367,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1059,
+      "line_number": 1032,
       "line_range": [
-        1059,
-        1060
+        1032,
+        1033
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
@@ -3612,7 +3612,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "610         # frozen snapshot so the key describes the issuing configuration).\n611         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n612         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n",
+      "code": "614         # frozen snapshot so the key describes the issuing configuration).\n615         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n616         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n",
       "col_offset": 28,
       "end_col_offset": 69,
       "filename": "backend/app/services/embeddings.py",
@@ -3623,16 +3623,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 611,
+      "line_number": 615,
       "line_range": [
-        611
+        615
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "611         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n612         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n613         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n",
+      "code": "615         model_fingerprint = hashlib.md5(config.model.encode(\"utf-8\")).hexdigest()[:8]\n616         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n617         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n",
       "col_offset": 26,
       "end_col_offset": 65,
       "filename": "backend/app/services/embeddings.py",
@@ -3643,16 +3643,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 612,
+      "line_number": 616,
       "line_range": [
-        612
+        616
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "612         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n613         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n614         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n",
+      "code": "616         url_fingerprint = hashlib.md5(config.url.encode(\"utf-8\")).hexdigest()[:8]\n617         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n618         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n",
       "col_offset": 29,
       "end_col_offset": 72,
       "filename": "backend/app/services/embeddings.py",
@@ -3663,16 +3663,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 613,
+      "line_number": 617,
       "line_range": [
-        613
+        617
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "613         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n614         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n615 \n",
+      "code": "617         prefix_fingerprint = hashlib.md5((prefix or \"\").encode(\"utf-8\")).hexdigest()[:8]\n618         cache_key = f\"{model_fingerprint}_{url_fingerprint}_{prefix_fingerprint}_{hashlib.md5(text_to_embed.encode('utf-8')).hexdigest()}\"\n619 \n",
       "col_offset": 82,
       "end_col_offset": 124,
       "filename": "backend/app/services/embeddings.py",
@@ -3683,16 +3683,16 @@
       },
       "issue_severity": "HIGH",
       "issue_text": "Use of weak MD5 hash for security. Consider usedforsecurity=False",
-      "line_number": 614,
+      "line_number": 618,
       "line_range": [
-        614
+        618
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b324_hashlib.html",
       "test_id": "B324",
       "test_name": "hashlib"
     },
     {
-      "code": "1175                 )\n1176         except Exception:\n1177             pass  # Silently ignore any errors accessing internal pool state\n1178 \n",
+      "code": "1179                 )\n1180         except Exception:\n1181             pass  # Silently ignore any errors accessing internal pool state\n1182 \n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "backend/app/services/embeddings.py",
@@ -3703,10 +3703,10 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 1176,
+      "line_number": 1180,
       "line_range": [
-        1176,
-        1177
+        1180,
+        1181
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",

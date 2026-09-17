@@ -26,7 +26,6 @@ from app.services.file_watcher import FileWatcher
 from app.services.kms_compile_processor import KMSCompileProcessor
 from app.services.kms_retrieval import KMSRetrievalService
 from app.services.llm_client import (
-    LLMClient,
     create_instant_client,
     create_thinking_client,
 )
@@ -124,59 +123,6 @@ def select_ingestion_llm_client(app: FastAPI, mode: str):
     if mode == "thinking":
         return app.state.thinking_llm_client
     return None
-
-
-async def _llm_keepalive_task(llm_client: LLMClient, interval: int = 30):
-    """
-    Background task to keep LLM model loaded in LM Studio.
-
-    LM Studio unloads models when clients disconnect. This task periodically
-    sends a ping request to keep the model in memory.
-
-    Args:
-        llm_client: The LLM client instance
-        interval: Seconds between keep-alive pings (default: 30)
-    """
-    logger.info("Starting LLM keep-alive task (interval: %ds)", interval)
-
-    # Track consecutive failures so a sustained outage is distinguishable
-    # from a transient model-unload. DEBUG per-ping stays for noise control,
-    # but after _KEEPALIVE_WARN_THRESHOLD consecutive failures we escalate to
-    # WARNING so operators get an alarm for a persistent LLM outage instead
-    # of seeing only DEBUG lines that look identical to a healthy transient.
-    _KEEPALIVE_WARN_THRESHOLD = 3
-    consecutive_failures = 0
-
-    while True:
-        try:
-            await asyncio.sleep(interval)
-            # Send a simple completion to keep model loaded
-            messages = [{"role": "user", "content": "ping"}]
-            await llm_client.chat_completion(messages, max_tokens=1)
-            if consecutive_failures:
-                logger.info(
-                    "LLM keep-alive recovered after %d consecutive failure(s)",
-                    consecutive_failures,
-                )
-            consecutive_failures = 0
-            logger.debug("LLM keep-alive ping sent successfully")
-        except asyncio.CancelledError:
-            logger.info("LLM keep-alive task cancelled")
-            break
-        except Exception as e:
-            consecutive_failures += 1
-            if consecutive_failures >= _KEEPALIVE_WARN_THRESHOLD:
-                # Sustained outage — escalate so it is not buried at DEBUG.
-                logger.warning(
-                    "LLM keep-alive ping failed (%d consecutive): %s",
-                    consecutive_failures,
-                    e,
-                )
-            else:
-                # Transient — model might just be unloaded. Keep noise low.
-                logger.debug(
-                    "LLM keep-alive ping failed (model may be unloaded): %s", e
-                )
 
 
 def _validate_setting_value(key: str, value) -> bool:
@@ -958,35 +904,62 @@ async def lifespan(app: FastAPI):
         )
     )
 
-    # Start LLM keep-alive tasks for both backends to prevent unload on idle.
-    keepalive_task_thinking = None
-    keepalive_task_instant = None
-    try:
-        keepalive_task_thinking = asyncio.create_task(
-            _llm_keepalive_task(app.state.thinking_llm_client)
+    # Provider residency priming (issue #571): one native model-load call per
+    # long-lived backend replaces the retired 30-second max_tokens=1 ping
+    # loop — Ollama pins keep_alive/num_ctx via /api/generate, LM Studio
+    # requests context_length via its native load API (per-request ttl rides
+    # every chat payload). Best-effort: a failed prime logs and continues;
+    # the model then loads on demand with provider defaults.
+    async def _prime_residency(name: str, client) -> None:
+        try:
+            if await client.prime_residency():
+                logger.info("%s model residency primed", name)
+            else:
+                logger.debug("%s client needs no residency priming", name)
+        except Exception as e:  # noqa: BLE001 — priming must never fail startup
+            logger.warning("%s residency priming failed (continuing): %s", name, e)
+
+    residency_tasks = []
+    if getattr(app.state, "thinking_llm_client", None):
+        residency_tasks.append(
+            asyncio.create_task(
+                _prime_residency("Thinking", app.state.thinking_llm_client)
+            )
         )
-    except Exception as e:
-        logger.warning(f"Thinking LLM keepalive task failed (continuing): {e}")
-    try:
-        keepalive_task_instant = asyncio.create_task(
-            _llm_keepalive_task(app.state.instant_llm_client)
+    if getattr(app.state, "instant_llm_client", None):
+        residency_tasks.append(
+            asyncio.create_task(
+                _prime_residency("Instant", app.state.instant_llm_client)
+            )
         )
-    except Exception as e:
-        logger.warning(f"Instant LLM keepalive task failed (continuing): {e}")
+    # An explicitly configured editorial endpoint gets its own prime; when
+    # unset its URL+model equal the thinking client's, which the prime above
+    # already pins on the same server. The throwaway editorial client is
+    # closed after priming (it is not a long-lived app.state client).
+    if settings.editorial_chat_url or settings.editorial_chat_model:
+        from app.services.llm_client import create_editorial_client
+
+        async def _prime_editorial() -> None:
+            editorial_client = create_editorial_client()
+            try:
+                await _prime_residency("Editorial", editorial_client)
+            finally:
+                await editorial_client.close()
+
+        residency_tasks.append(asyncio.create_task(_prime_editorial()))
 
     yield
 
-    # Shutdown: Cancel keepalive, stop file watcher, and close services
+    # Shutdown: stop services, cancel background tasks
     # Stop email ingestion service
     if app.state.email_service:
         await app.state.email_service.stop_polling()
-    for kt in (keepalive_task_thinking, keepalive_task_instant):
-        if kt:
-            kt.cancel()
-            try:
-                await kt
-            except asyncio.CancelledError:
-                pass
+    for rt in residency_tasks:
+        rt.cancel()
+        try:
+            await rt
+        except asyncio.CancelledError:
+            pass
     # Cancel the periodic memory eviction background task.
     if memory_eviction_task:
         memory_eviction_task.cancel()

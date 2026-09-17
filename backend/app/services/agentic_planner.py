@@ -244,6 +244,27 @@ class AgenticPlanner:
                 ],
                 temperature=0.0,
                 max_tokens=256,
+                # Issue #571: constrain the decision to the documented JSON
+                # shape provider-side, so a non-compliant model response is a
+                # provider error instead of a silent parse failure (the
+                # except branch below still fails closed to synthesize).
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "planner_decision",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["retrieve_more", "synthesize"],
+                                },
+                                "sub_query": {"type": "string"},
+                            },
+                            "required": ["action"],
+                        },
+                    },
+                },
             )
             parsed = json.loads(response.strip())
             action = parsed.get("action", "synthesize")

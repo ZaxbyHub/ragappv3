@@ -236,7 +236,7 @@ class TestAgenticPlannerDecisionInjectionDefense:
 
     def _make_planner(self, captured):
         class FakeLLM:
-            async def chat_completion(self, messages, temperature, max_tokens):
+            async def chat_completion(self, messages, temperature, max_tokens, response_format=None):
                 captured.append(messages)
                 return '{"action": "synthesize"}'
 
