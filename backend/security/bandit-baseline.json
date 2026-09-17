@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 80242,
+      "loc": 80254,
       "nosec": 0,
       "skipped_tests": 56
     },
@@ -62,7 +62,7 @@
       "SEVERITY.LOW": 2,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 684,
+      "loc": 693,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1355,
+      "loc": 1352,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -647,7 +647,7 @@
       "SEVERITY.LOW": 1,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 195,
+      "loc": 201,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1902,7 +1902,7 @@
   },
   "results": [
     {
-      "code": "315     if not settings.users_enabled:\n316         DEFAULT_TOKEN = \"admin-secret-token\"\n317 \n",
+      "code": "326     if not settings.users_enabled:\n327         DEFAULT_TOKEN = \"admin-secret-token\"\n328 \n",
       "col_offset": 24,
       "end_col_offset": 44,
       "filename": "backend/app/api/deps.py",
@@ -1913,16 +1913,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'admin-secret-token'",
-      "line_number": 316,
+      "line_number": 327,
       "line_range": [
-        316
+        327
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
       "test_name": "hardcoded_password_string"
     },
     {
-      "code": "334             \"is_active\": True,\n335             \"must_change_password\": False,\n336         }\n337 \n338     # User authentication enabled - validate JWT token\n339     try:\n340         payload = decode_access_token(token)\n341     except TokenExpiredError:\n342         raise HTTPException(\n343             status_code=401,\n",
+      "code": "345             \"is_active\": True,\n346             \"must_change_password\": False,\n347         }\n348 \n349     # User authentication enabled - validate JWT token\n350     try:\n351         payload = decode_access_token(token)\n352     except TokenExpiredError:\n353         raise HTTPException(\n354             status_code=401,\n",
       "col_offset": 12,
       "end_col_offset": 34,
       "filename": "backend/app/api/deps.py",
@@ -1933,16 +1933,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'False'",
-      "line_number": 335,
+      "line_number": 346,
       "line_range": [
-        329,
-        330,
-        331,
-        332,
-        333,
-        334,
-        335,
-        336
+        340,
+        341,
+        342,
+        343,
+        344,
+        345,
+        346,
+        347
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",
@@ -3460,7 +3460,7 @@
       "test_name": "blacklist"
     },
     {
-      "code": "38     secret_key = settings.jwt_secret_key\n39     if not secret_key or secret_key == \"change-me-to-a-random-64-char-string\":\n40         raise RuntimeError(\"JWT_SECRET_KEY must be set when users are enabled\")\n",
+      "code": "42     secret_key = settings.jwt_secret_key\n43     if not secret_key or secret_key == \"change-me-to-a-random-64-char-string\":\n44         raise RuntimeError(\"JWT_SECRET_KEY must be set when users are enabled\")\n",
       "col_offset": 39,
       "end_col_offset": 77,
       "filename": "backend/app/services/auth_service.py",
@@ -3471,9 +3471,9 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Possible hardcoded password: 'change-me-to-a-random-64-char-string'",
-      "line_number": 39,
+      "line_number": 43,
       "line_range": [
-        39
+        43
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html",
       "test_id": "B105",

@@ -860,7 +860,9 @@ class Settings(BaseSettings):
     """Secret key for JWT signing. MUST be changed in production. Generate with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""""
 
     jwt_algorithm: str = "HS256"
-    """JWT signing algorithm."""
+    """JWT signing algorithm. Restricted to the symmetric HS family (HS256, HS384,
+    HS512) and validated fail-closed in auth_service.get_jwt_config. Rotating the
+    algorithm invalidates outstanding tokens minted under the previous one."""
 
     audit_hmac_key_version: str = "v1"
 

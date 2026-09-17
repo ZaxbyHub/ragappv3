@@ -3,19 +3,41 @@
 Uses pytest_configure hook to set test-compatible environment variables
 and clear all app.* modules from sys.modules before test collection.
 This ensures settings are initialized with test-compatible values every time.
+
+Test modules may declare an explicit CSRF test policy with a module-level
+``CSRF_TEST_POLICY = "naive" | "manages"`` assignment — see
+``_module_manages_csrf`` below.
 """
 
 import os
+import re
 import sys
 
 import pytest
 
 _CSRF_AWARE_MODULES: dict = {}
 
+# Explicit per-module policy declaration (issue #202 / ENH-008). A test module
+# may declare, at module level:
+#     CSRF_TEST_POLICY = "naive"    # CSRF bypass allowed for this module
+#     CSRF_TEST_POLICY = "manages"  # module exercises real CSRF enforcement
+# The declaration wins over the lexical scan below. An unrecognized value (or
+# no declaration at all) falls back to the legacy scan, so existing modules
+# that never declare keep their current classification.
+_CSRF_POLICY_DECLARATION = re.compile(
+    r"""^\s*CSRF_TEST_POLICY\s*=\s*["'](naive|manages)["']\s*(?:#.*)?$"""
+)
+
 
 def _module_manages_csrf(path: str) -> bool:
-    """True if a test module's source references CSRF at all.
+    """True if a test module opts into real CSRF enforcement or references CSRF.
 
+    An explicit module-level ``CSRF_TEST_POLICY`` declaration ("naive" or
+    "manages") takes precedence: "naive" lets the autouse CSRF bypass apply
+    even when the source mentions "csrf" incidentally (comment, docstring, or
+    a spelled-out parameter name), and "manages" forces real enforcement.
+    Without a recognized declaration, the legacy default applies: the module
+    is treated as CSRF-managing when its source text mentions "csrf" at all.
     Such modules either install their own ``csrf_protect`` override or assert
     real CSRF enforcement, so the autouse bypass must leave them untouched.
     Cached per file path.
@@ -25,9 +47,22 @@ def _module_manages_csrf(path: str) -> bool:
         return cached
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            manages = "csrf" in fh.read().lower()
+            source = fh.read()
     except OSError:
+        _CSRF_AWARE_MODULES[path] = False
+        return False
+    declared: str | None = None
+    for line in source.splitlines():
+        match = _CSRF_POLICY_DECLARATION.match(line)
+        if match:
+            declared = match.group(1)
+            break
+    if declared == "naive":
         manages = False
+    elif declared == "manages":
+        manages = True
+    else:
+        manages = "csrf" in source.lower()
     _CSRF_AWARE_MODULES[path] = manages
     return manages
 

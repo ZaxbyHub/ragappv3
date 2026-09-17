@@ -240,7 +240,7 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `IMAP_POLL_INTERVAL` | 60 | Email poll interval (seconds) |
 | `USERS_ENABLED` | true | Enable multi-user JWT authentication |
 | `JWT_SECRET_KEY` | change-me-... | Secret key for JWT signing (generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`) |
-| `JWT_ALGORITHM` | HS256 | JWT signing algorithm |
+| `JWT_ALGORITHM` | HS256 | JWT signing algorithm — one of `HS256`, `HS384`, `HS512` (exact case); any other value fails closed at the first token operation. Rotating the algorithm invalidates tokens minted under the previous one |
 | `ADMIN_SECRET_TOKEN` | "" | Admin bootstrap/API token. **Required** when `USERS_ENABLED=true` (JWT mode) and when `USERS_ENABLED=false` (single-admin bearer-token mode) |
 | `PARENT_RETRIEVAL_ENABLED` | `true` | Enable small-to-big context expansion (parent window retrieval) |
 | `MULTI_SCALE_INDEXING_ENABLED` | `true` | Index two chunk sizes for broader recall without the previous three-scale write cost |
