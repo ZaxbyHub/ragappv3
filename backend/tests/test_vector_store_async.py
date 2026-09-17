@@ -30,8 +30,16 @@ from app.services.vector_store import (
 )
 
 
-class TestVectorStoreAsync(unittest.TestCase):
-    """Test cases for async LanceDB VectorStore implementation."""
+class TestVectorStoreAsync(unittest.IsolatedAsyncioTestCase):
+    """Test cases for async LanceDB VectorStore implementation.
+
+    Base is IsolatedAsyncioTestCase, not TestCase: the async test methods in
+    the subclasses were SILENTLY DROPPED under asyncio_mode=auto when these
+    classes derived from plain unittest.TestCase (pytest-asyncio skips
+    TestCase-wrapped coroutines at collection) — the issue #565 AST collection
+    guard now fails the build on exactly that shape, so the 40 dead tests in
+    this file were resurrected by this base-class change (issue #565 / E06).
+    """
 
     def setUp(self):
         """Set up test environment with temporary directory."""
@@ -429,7 +437,9 @@ class TestVectorStoreAddChunks(TestVectorStoreAsync):
             "id": "file1_0",
             "text": "Test text",
             "file_id": "file1",
+            "vault_id": "1",
             "chunk_index": 0,
+            "metadata": "{}",
             "embedding": np.random.randn(self.embedding_dim),  # numpy array
         }]
 
@@ -468,7 +478,9 @@ class TestVectorStoreAddChunks(TestVectorStoreAsync):
             "id": "file1_0",
             "text": "Test text",
             "file_id": "file1",
+            "vault_id": "1",
             "chunk_index": 0,
+            "metadata": "{}",
             "embedding": np.random.randn(self.embedding_dim).tolist(),
             "sparse_embedding": "not valid json",
         }
@@ -532,10 +544,11 @@ class TestVectorStoreAddChunks(TestVectorStoreAsync):
 
         await store.add_chunks([record])
 
-        # Verify the stored vault_id is exactly what we passed, not "1"
-        rows = await store.table.search(
-            np.random.randn(self.embedding_dim).tolist()
-        ).limit(10).to_list()
+        # Verify the stored vault_id is exactly what we passed, not "1".
+        # Metadata-only row fetch uses the synchronous query() builder; on
+        # lancedb 0.36 AsyncTable.search() is itself a coroutine function and
+        # this chain would AttributeError (issue #558 / #565).
+        rows = await store.table.query().where("id = 'file1_0'").limit(10).to_list()
 
         stored = next((r for r in rows if r["id"] == "file1_0"), None)
         self.assertIsNotNone(stored, "Record was not stored")
@@ -565,20 +578,36 @@ class TestVectorStoreSearch(TestVectorStoreAsync):
     @pytest.mark.asyncio
     async def test_search_returns_results(self):
         """Test basic search functionality."""
-        store = self.create_vector_store()
-        await store.init_table(embedding_dim=self.embedding_dim)
+        # Basic dense search is exercised with multi-scale indexing disabled:
+        # the default multi_scale_chunk_sizes (768,1536) do not include this
+        # test table's dimension, and cross-scale RRF over per-scale searches
+        # that cannot run against a 384-dim table legitimately returns [].
+        from app.config import settings as app_settings
 
-        # Add test records
-        records = self.create_test_records(count=3)
-        await store.add_chunks(records)
+        monkeypatch_enabled = app_settings.multi_scale_indexing_enabled
+        app_settings.multi_scale_indexing_enabled = False
+        try:
+            store = self.create_vector_store()
+            await store.init_table(embedding_dim=self.embedding_dim)
 
-        # Search with query embedding
-        query_embedding = records[0]["embedding"]
-        results = await store.search(embedding=query_embedding, limit=2)
+            # Add test records
+            records = self.create_test_records(count=3)
+            await store.add_chunks(records)
 
-        # Should return results
-        self.assertIsInstance(results, list)
-        self.assertGreater(len(results), 0)
+            # Search with query embedding. The dense flat scan
+            # (bypass_vector_index) is the deterministic path on a freshly
+            # created test table with no ANN/FTS indexes; hybrid=True needs an
+            # FTS index for the BM25 leg.
+            query_embedding = records[0]["embedding"]
+            results = await store.search(
+                embedding=query_embedding, limit=2, hybrid=False, bypass_vector_index=True
+            )
+
+            # Should return results
+            self.assertIsInstance(results, list)
+            self.assertGreater(len(results), 0)
+        finally:
+            app_settings.multi_scale_indexing_enabled = monkeypatch_enabled
 
     @pytest.mark.asyncio
     async def test_search_empty_table(self):
@@ -678,7 +707,9 @@ class TestVectorStoreDelete(TestVectorStoreAsync):
             "id": f"file1_{i}",
             "text": f"File 1 chunk {i}",
             "file_id": "file1",
+            "vault_id": "1",
             "chunk_index": i,
+            "metadata": "{}",
             "embedding": np.random.randn(self.embedding_dim).tolist(),
         } for i in range(3)]
 
@@ -686,7 +717,9 @@ class TestVectorStoreDelete(TestVectorStoreAsync):
             "id": f"file2_{i}",
             "text": f"File 2 chunk {i}",
             "file_id": "file2",
+            "vault_id": "1",
             "chunk_index": i,
+            "metadata": "{}",
             "embedding": np.random.randn(self.embedding_dim).tolist(),
         } for i in range(2)]
 
@@ -923,8 +956,12 @@ class TestVectorStoreValidation(TestVectorStoreAsync):
             embedding_dim=self.embedding_dim
         )
 
+        # With no chunks table the short-circuit result carries no expected
+        # metadata (the sidecar comparison never runs).
         self.assertEqual(result["table_exists"], False)
-        self.assertEqual(result["expected_dim"], self.embedding_dim)
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["mismatch"])
+        self.assertIsNone(result["expected_metadata"])
 
     @pytest.mark.asyncio
     async def test_validate_schema_with_table(self):
@@ -938,8 +975,12 @@ class TestVectorStoreValidation(TestVectorStoreAsync):
         )
 
         self.assertEqual(result["table_exists"], True)
-        self.assertEqual(result["expected_dim"], self.embedding_dim)
+        self.assertEqual(
+            result["expected_metadata"]["embedding_dim"], self.embedding_dim
+        )
         self.assertEqual(result["actual_dim"], self.embedding_dim)
+        # Dimensions agree even when the sidecar model identity is unresolved.
+        self.assertNotIn("embedding_dim", result["mismatch_details"])
 
     @pytest.mark.asyncio
     async def test_validate_schema_dimension_mismatch(self):
@@ -947,13 +988,32 @@ class TestVectorStoreValidation(TestVectorStoreAsync):
         store = self.create_vector_store()
         await store.init_table(embedding_dim=self.embedding_dim)
 
-        with self.assertRaises(VectorStoreValidationError) as ctx:
-            await store.validate_schema(
+        # Simulate a persisted sidecar identity that matches model and prefix
+        # but stores the old dimension: only embedding_dim must be flagged.
+        # (In production the sidecar lives in settings_kv, written at ingestion;
+        # a bare test table has none, so the method short-circuits to
+        # no_stored_identifier before dimensions are compared.)
+        stored_metadata = {
+            "embedding_model_id": "test-model",
+            "embedding_dim": self.embedding_dim,
+            "embedding_prefix_hash": store._compute_embedding_prefix_hash(),
+        }
+
+        async def _stored_metadata():
+            return stored_metadata
+
+        with patch.object(store, "get_embedding_metadata", _stored_metadata):
+            # Current contract: identity mismatch (dimension included) is
+            # reported in the result dict with ready=False, not raised.
+            result = await store.validate_schema(
                 embedding_model_id="test-model",
                 embedding_dim=768  # Different dimension
             )
 
-        self.assertIn("dimension changed", str(ctx.exception).lower())
+        self.assertTrue(result["table_exists"])
+        self.assertFalse(result["ready"])
+        self.assertTrue(result["mismatch"])
+        self.assertEqual(result["mismatch_details"], ["embedding_dim"])
 
 
 class TestVectorStoreHelperMethods(TestVectorStoreAsync):

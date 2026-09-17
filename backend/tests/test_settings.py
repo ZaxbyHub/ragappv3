@@ -94,6 +94,13 @@ class TestSettingsResponseFields(unittest.TestCase):
     """Tests for SettingsResponse including reranking and hybrid search fields."""
 
     def setUp(self):
+        # Snapshot every settings field before this POST-heavy class runs and
+        # restore all of them in tearDown: POST /api/settings mutates the
+        # singleton, and randomized collection order (issue #565) let that
+        # pollution fail pristine-default assertions in other test files.
+        self._settings_snapshot = {
+            name: getattr(settings, name) for name in type(settings).model_fields
+        }
         self._orig_users_enabled = settings.users_enabled
         settings.users_enabled = False
         self.client = TestClient(app)
@@ -119,6 +126,8 @@ class TestSettingsResponseFields(unittest.TestCase):
     def tearDown(self):
         # Restore get_db dependency
         app.dependency_overrides.pop(self._get_db, None)
+        for _name, _value in self._settings_snapshot.items():
+            setattr(settings, _name, _value)
         settings.users_enabled = self._orig_users_enabled
 
     def test_settings_response_includes_reranker_fields(self):
@@ -204,6 +213,13 @@ class TestSettingsUpdateValidation(unittest.TestCase):
     """Tests for SettingsUpdate validation of new fields."""
 
     def setUp(self):
+        # Snapshot every settings field before this POST-heavy class runs and
+        # restore all of them in tearDown: POST /api/settings mutates the
+        # singleton, and randomized collection order (issue #565) let that
+        # pollution fail pristine-default assertions in other test files.
+        self._settings_snapshot = {
+            name: getattr(settings, name) for name in type(settings).model_fields
+        }
         self._orig_users_enabled = settings.users_enabled
         settings.users_enabled = False
         self.client = TestClient(app)
@@ -229,7 +245,20 @@ class TestSettingsUpdateValidation(unittest.TestCase):
     def tearDown(self):
         # Restore get_db dependency
         app.dependency_overrides.pop(self._get_db, None)
+        for _name, _value in self._settings_snapshot.items():
+            setattr(settings, _name, _value)
         settings.users_enabled = self._orig_users_enabled
+        # The POSTs above persist every ALLOWED_FIELDS entry into the shared
+        # TEST_DB_PATH settings_kv. Clear the table so later tests (e.g. the
+        # DraftRoom "simulated restart" via _load_persisted_settings, which
+        # replays these rows into the singleton) start from a clean slate —
+        # randomized collection order (issue #565) exposed exactly this leak.
+        conn = self._test_pool.get_connection()
+        try:
+            conn.execute("DELETE FROM settings_kv")
+            conn.commit()
+        finally:
+            self._test_pool.release_connection(conn)
 
     @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
     def test_post_settings_valid_reranker_config(self):
@@ -254,6 +283,11 @@ class TestSettingsUpdateValidation(unittest.TestCase):
 
     def test_post_settings_valid_hybrid_search_config(self):
         """Test POST /api/settings with valid hybrid search configuration."""
+        # POST /api/settings mutates the settings singleton; restore both
+        # fields afterward so randomized collection order (issue #565) cannot
+        # leak the flipped default into other tests.
+        for _field in ("hybrid_search_enabled", "hybrid_alpha"):
+            self.addCleanup(setattr, settings, _field, getattr(settings, _field))
         payload = {
             "hybrid_search_enabled": False,
             "hybrid_alpha": 0.3
@@ -430,6 +464,18 @@ class TestSettingsUpdateValidation(unittest.TestCase):
     @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
     def test_post_settings_combined_new_fields(self):
         """Test POST /api/settings with multiple new fields in one request."""
+        # Restore every singleton field this POST mutates (issue #565
+        # randomized-order canary: pollution failed the default-value test
+        # under a different seed).
+        for _field in (
+            "reranker_url",
+            "reranking_enabled",
+            "reranker_top_n",
+            "hybrid_search_enabled",
+            "hybrid_alpha",
+            "embedding_batch_size",
+        ):
+            self.addCleanup(setattr, settings, _field, getattr(settings, _field))
         payload = {
             "reranker_url": "http://localhost:8000",
             "reranking_enabled": True,
@@ -457,6 +503,11 @@ class TestDraftRoomEnabledSetting(unittest.TestCase):
     lifespan._load_persisted_settings (see NEW_DIRECT_KEYS)."""
 
     def setUp(self):
+        # Snapshot every settings field: the PUT below mutates the singleton
+        # and randomized collection order (issue #565) exposed the pollution.
+        self._settings_snapshot = {
+            name: getattr(settings, name) for name in type(settings).model_fields
+        }
         self._orig_users_enabled = settings.users_enabled
         self._orig_draft_room_enabled = settings.draft_room_enabled
         settings.users_enabled = False
@@ -484,10 +535,15 @@ class TestDraftRoomEnabledSetting(unittest.TestCase):
         app.dependency_overrides.pop(self._get_db, None)
         settings.users_enabled = self._orig_users_enabled
         settings.draft_room_enabled = self._orig_draft_room_enabled
+        # Restore every other settings field the PUT touched (issue #565
+        # randomized-order canary: singleton pollution failed pristine-default
+        # assertions in other test files under a different seed).
+        for _name, _value in self._settings_snapshot.items():
+            setattr(settings, _name, _value)
         # Remove any persisted row so later tests start from a clean slate.
         conn = self._test_pool.get_connection()
         try:
-            conn.execute("DELETE FROM settings_kv WHERE key = 'draft_room_enabled'")
+            conn.execute("DELETE FROM settings_kv")
             conn.commit()
         finally:
             self._test_pool.release_connection(conn)
@@ -569,6 +625,13 @@ class TestConnectionEndpoint(unittest.TestCase):
     """Tests for the /api/settings/connection endpoint."""
 
     def setUp(self):
+        # Snapshot every settings field before this POST-heavy class runs and
+        # restore all of them in tearDown: POST /api/settings mutates the
+        # singleton, and randomized collection order (issue #565) let that
+        # pollution fail pristine-default assertions in other test files.
+        self._settings_snapshot = {
+            name: getattr(settings, name) for name in type(settings).model_fields
+        }
         self._orig_users_enabled = settings.users_enabled
         settings.users_enabled = False
         self.client = TestClient(app)
@@ -594,6 +657,8 @@ class TestConnectionEndpoint(unittest.TestCase):
     def tearDown(self):
         # Restore get_db dependency
         app.dependency_overrides.pop(self._get_db, None)
+        for _name, _value in self._settings_snapshot.items():
+            setattr(settings, _name, _value)
         settings.users_enabled = self._orig_users_enabled
 
     @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})

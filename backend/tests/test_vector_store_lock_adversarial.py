@@ -112,30 +112,44 @@ class TestLockSaturationAdversarial(unittest.IsolatedAsyncioTestCase):
         acquire_count = 0
         release_count = 0
 
-        # Save originals before patching
-        orig_acquire = real_lock.acquire
-        orig_release = real_lock.release
+        # Count acquisitions by wrapping wait_for (which consumes the real
+        # acquire coroutine) instead of replacing Lock.acquire with a wrapper
+        # coroutine: a wrapper installed on the instance makes production's
+        # ``self._write_lock.acquire()`` create a second coroutine object per
+        # call whose lifetime the wrapper does not own, which the issue-#565
+        # never-awaited gate flags.
+        # The patch below rebinds ``wait_for`` on the shared asyncio module, so
+        # the wrapper must call a saved reference to the real wait_for — a bare
+        # ``asyncio.wait_for`` lookup would re-enter the mock and recurse until
+        # RecursionError, leaking the acquire coroutine (issue-#565 gate).
+        real_wait_for = asyncio.wait_for
 
-        async def counting_acquire():
+        async def counting_wait_for(coro, timeout):
             nonlocal acquire_count
-            await orig_acquire()
+            result = await real_wait_for(coro, timeout)
             acquire_count += 1
+            return result
+
+        orig_release = real_lock.release
 
         def counting_release():
             nonlocal release_count
             release_count += 1
             orig_release()
 
-        real_lock.acquire = counting_acquire
         real_lock.release = counting_release
 
-        async def quick_writer():
-            async with store._acquire_write_lock():
-                await asyncio.sleep(0.001)
+        with patch(
+            "app.services.vector_store.asyncio.wait_for",
+            side_effect=counting_wait_for,
+        ):
+            async def quick_writer():
+                async with store._acquire_write_lock():
+                    await asyncio.sleep(0.001)
 
-        # 16 rapid serial acquisitions
-        for i in range(16):
-            await quick_writer()
+            # 16 rapid serial acquisitions
+            for i in range(16):
+                await quick_writer()
 
         self.assertEqual(acquire_count, 16, "Every lock_acquire must be matched")
         self.assertEqual(release_count, 16, "Every lock_release must be matched")
@@ -429,6 +443,10 @@ class TestNestedExceptionHandlingAdversarial(unittest.IsolatedAsyncioTestCase):
         # Mock wait_for to raise CancelledError (simulating task cancellation)
         async def cancelling_wait_for(coro, timeout):
             nonlocal lock_state_after
+            # Close the passed coroutine: this mock cancels without awaiting
+            # it, and an abandoned Lock.acquire coroutine trips the issue-#565
+            # never-awaited gate.
+            coro.close()
             # Cancel immediately
             raise asyncio.CancelledError()
 

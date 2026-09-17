@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseSSEStream, type ChatStreamCallbacks } from "./api";
 
@@ -293,11 +293,31 @@ describe("parseSSEStream - evidence candidate events (issue #508)", () => {
   });
 
   it("drives the real parser from the shared backend fixture line", async () => {
-    const fixturePath = resolve(
-      __dirname,
-      "../../../backend/tests/fixtures/evidence_candidates_sse_line.txt"
-    );
-    const line = readFileSync(fixturePath, "utf8").trimEnd();
+    // The fixture lives in the backend tree so the SSE contract has a single
+    // shared source. Sandboxed runners (e.g. Stryker copies test files into
+    // frontend/.stryker-tmp/sandbox-*/...) change both __dirname and cwd, so
+    // walk upward from __dirname until the repo-root backend tree is found.
+    const fixtureRelative =
+      "backend" + "/" + "tests" + "/" + "fixtures" + "/" + "evidence_candidates_sse_line.txt";
+    let fixtureDir: string | null = null;
+    let probeDir = __dirname;
+    for (let depth = 0; depth < 12; depth += 1) {
+      if (existsSync(resolve(probeDir, fixtureRelative))) {
+        fixtureDir = probeDir;
+        break;
+      }
+      const parent = resolve(probeDir, "..");
+      if (parent === probeDir) {
+        break;
+      }
+      probeDir = parent;
+    }
+    if (fixtureDir === null) {
+      throw new Error(
+        `shared SSE fixture not found above ${__dirname}: ${fixtureRelative}`
+      );
+    }
+    const line = readFileSync(resolve(fixtureDir, fixtureRelative), "utf8").trimEnd();
 
     const candidateCalls: unknown[][] = [];
     const callbacks: ChatStreamCallbacks = {

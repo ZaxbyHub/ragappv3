@@ -54,10 +54,18 @@ class TestAcquireWriteLockTimeout(unittest.IsolatedAsyncioTestCase):
         # Also mock the lock's acquire so we don't get "coroutine never awaited" warning
         store._write_lock.acquire = AsyncMock()
 
-        # Patch asyncio.wait_for to immediately raise TimeoutError
-        with patch("app.services.vector_store.asyncio.wait_for") as mock_wait_for:
-            mock_wait_for.side_effect = asyncio.TimeoutError()
+        # Patch asyncio.wait_for to immediately raise TimeoutError. The mock
+        # must discard the inner coroutine first (the real wait_for cancels it
+        # on timeout) so the never-started AsyncMock call coroutine does not
+        # trip the issue-#565 never-awaited warning gate.
+        def _timeout_wait_for(coro, timeout):
+            coro.close()
+            raise asyncio.TimeoutError()
 
+        with patch(
+            "app.services.vector_store.asyncio.wait_for",
+            side_effect=_timeout_wait_for,
+        ):
             with self.assertRaises(VectorStoreError) as ctx:
                 async with store._acquire_write_lock():
                     pass

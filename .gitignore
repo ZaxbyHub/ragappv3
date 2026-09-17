@@ -86,3 +86,10 @@ tmp/
 # SQLite files created by tests with MagicMock paths
 backend/<MagicMock*
 .zcode/
+
+# Local baseline-run scratch (issue #565 nightly quality gates)
+backend/.schemathesis/
+backend/data_schemathesis/
+backend/mutation-stats/
+frontend/.stryker-tmp/
+frontend/reports/

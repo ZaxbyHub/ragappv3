@@ -238,6 +238,20 @@ class MemoryStore:
         embedding, _outcome = await self._embed_text_with_outcome(text)
         return embedding
 
+    def _run_coro_sync(self, coro):
+        """asyncio.run bridge that does not leak the coroutine when called
+        from inside a running event loop: asyncio.run refuses with
+        RuntimeError *before* consuming the coroutine, and a refused
+        coroutine would otherwise be destroyed un-awaited (tripping the
+        issue-#565 never-awaited warning gate). Close it explicitly and
+        re-raise; the surrounding best-effort handlers swallow as before.
+        """
+        try:
+            return asyncio.run(coro)
+        except RuntimeError:
+            coro.close()
+            raise
+
     def _store_embedding(
         self,
         memory_id: int,
@@ -473,7 +487,7 @@ class MemoryStore:
         # because lexical search continues to work without the embedding.
         if self.embedding_service is not None:
             try:
-                embedding = asyncio.run(self._embed_text(content))
+                embedding = self._run_coro_sync(self._embed_text(content))
                 if embedding is not None:
                     self._store_embedding(memory_id, embedding, content)
             except Exception as exc:  # noqa: BLE001
@@ -522,7 +536,7 @@ class MemoryStore:
 
         if self.embedding_service is not None:
             try:
-                embedding = asyncio.run(self._embed_text(new_content))
+                embedding = self._run_coro_sync(self._embed_text(new_content))
                 if embedding is not None:
                     self._store_embedding(memory_id, embedding, new_content)
             except Exception as exc:  # noqa: BLE001
@@ -838,7 +852,7 @@ class MemoryStore:
                 # when we're not already inside one. The RAG engine calls
                 # ``search_memories`` via ``asyncio.to_thread``, so we are
                 # always on a worker thread without a current loop here.
-                query_emb = asyncio.run(self.embedding_service.embed_single(query))
+                query_emb = self._run_coro_sync(self.embedding_service.embed_single(query))
             except Exception as exc:  # noqa: BLE001 — best effort
                 logger.debug(
                     "Memory dense embedding failed; falling back to FTS-only: %s",

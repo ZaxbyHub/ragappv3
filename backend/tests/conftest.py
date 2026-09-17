@@ -260,6 +260,10 @@ def pytest_configure(config):
     Sets environment variables and clears all app.* modules from the
     import cache so they re-import with test-compatible settings.
     """
+    # Issue #565 warning-gate bookkeeping must start clean in every pytest
+    # process (a re-configure in the same process must not inherit stale
+    # records from an earlier session).
+    _NEVER_AWAITED_RECORDED.clear()
     # config.Settings resolves data_dir (and thus sqlite_path) against the
     # CURRENT WORKING DIRECTORY. The sqlite pool creates connections without
     # mkdir(parents=True), so under xdist any worker that reaches a real
@@ -433,3 +437,160 @@ def _reset_admission_and_telemetry_singletons():
             pass
         if not teardown:
             yield
+
+
+# ---------------------------------------------------------------------------
+# Issue #565 quality gates that can fail (E06).
+#
+# Two guards close the async-defect classes the pre-#565 suite swallowed:
+#
+# 1. AST collection guard (pytest_pycollect_makemodule): an `async def test_*`
+#    method inside a plain unittest.TestCase subclass is silently dropped by
+#    pytest-asyncio's auto mode (zero assertions run, zero failures reported).
+#    IsolatedAsyncioTestCase subclasses legitimately hold async tests and are
+#    exempt. The guard fails collection with file:line instead.
+#
+# 2. Never-awaited warning guard (pytest_warning_recorded): CPython destroys a
+#    never-awaited coroutine at statement end, so nothing survives to a
+#    session-finish gc scan. Every uncaptured "coroutine ... was never awaited"
+#    warning instead transits pytest's warning recorder — directly as
+#    RuntimeWarning under default filters, or via sys.unraisablehook as a
+#    pytest.PytestUnraisableExceptionWarning when `-W error::RuntimeWarning`
+#    (addopts) makes the warn inside coroutine.__del__ raise. Warnings captured
+#    inside a test's own `warnings.catch_warnings(record=True)` block never
+#    reach this hook, so warning-capturing tests are structurally exempt.
+#    sessionfinish fails the session when anything was recorded.
+# ---------------------------------------------------------------------------
+
+_NEVER_AWAITED_RECORDED: list = []
+
+_ISOLATED_ASYNCIO_BASE = "IsolatedAsyncioTestCase"
+
+
+def iter_async_testcase_methods(paths):
+    """Yield (file, line, class, method) for async test methods in plain
+    unittest.TestCase subclasses within the given paths (plan-critic finding 4:
+    IsolatedAsyncioTestCase subclasses are excluded — they legitimately run
+    async tests)."""
+    import ast
+
+    for path in paths:
+        try:
+            source = pathlib.Path(path).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            tree = ast.parse(source, filename=str(path))
+        except SyntaxError:
+            continue
+        # Classify every class in the module to a fixpoint: isolated wins over
+        # plain at every sweep, so a subclass of a local IsolatedAsyncioTestCase
+        # base is exempt even when its base's *name* merely contains
+        # "TestCase" (e.g. DraftResearchAsyncTestCase).
+        classes = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                classes[node.name] = node
+
+        def _base_names(node):
+            names = []
+            for base in node.bases:
+                if isinstance(base, ast.Attribute):
+                    names.append(base.attr)
+                elif isinstance(base, ast.Name):
+                    names.append(base.id)
+            return names
+
+        plain: set = set()
+        isolated: set = set()
+        changed = True
+        while changed:
+            changed = False
+            for name, node in classes.items():
+                if name in isolated:
+                    continue
+                names = _base_names(node)
+                if any(_ISOLATED_ASYNCIO_BASE in b for b in names) or any(b in isolated for b in names):
+                    if name not in isolated:
+                        isolated.add(name)
+                        plain.discard(name)
+                        changed = True
+                elif name not in plain and (
+                    any("TestCase" in b for b in names) or any(b in plain for b in names)
+                ):
+                    plain.add(name)
+                    changed = True
+        # Pass 2: async test methods inside plain TestCase classes.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef) or node.name not in plain:
+                continue
+            for item in node.body:
+                if isinstance(item, ast.AsyncFunctionDef) and item.name.startswith("test"):
+                    yield (str(path), item.lineno, node.name, item.name)
+
+
+def pytest_pycollect_makemodule(module_path, parent):
+    """Fail collection on async test methods inside plain TestCase subclasses
+    (issue #565): pytest-asyncio auto mode drops them silently."""
+    path = getattr(module_path, "path", None) or str(module_path)
+    name = os.path.basename(str(path))
+    if not (name.startswith("test_") and name.endswith(".py")):
+        return None
+    hits = list(iter_async_testcase_methods([str(path)]))
+    if hits:
+        details = "; ".join("%s:%s %s.%s" % (f, ln, cls, meth) for f, ln, cls, meth in hits)
+        raise pytest.UsageError(
+            "issue #565 gate: async test method(s) inside a sync unittest.TestCase are "
+            "silently dropped by asyncio auto mode: %s" % details
+        )
+    return None
+
+
+def never_awaited_warning_match(category, message):
+    """True when a warning record is the un-awaited-coroutine class, on either
+    capture channel: direct RuntimeWarning (default filters) or pytest's
+    PytestUnraisableExceptionWarning wrapping the __del__-routed raise when
+    `-W error::RuntimeWarning` is active (issue #565).
+
+    Exemption: `AsyncMockMixin._execute_mock_call` is NOT matched. A blanket
+    ``AsyncMock()`` test double leaks its internal call coroutine whenever a
+    test tears down between the call and the await, the wrapper's name hides
+    which child was dropped, and the GC-timed warning is routinely attributed
+    to whichever test runs at deallocation time — an unreliable signal that
+    would mis-blame unrelated tests. Real (non-mock) async methods keep the
+    full gate: a production drop-the-await leaks the real method's coroutine
+    and still fails the suite (proven by the frozen checks C6/C7).
+    """
+    text = str(message)
+    if "never awaited" not in text:
+        return False
+    if "_execute_mock_call" in text:
+        return False
+    if category is RuntimeWarning:
+        return True
+    return "PytestUnraisableExceptionWarning" in str(category)
+
+
+def pytest_warning_recorded(warning_message, when, nodeid, location):
+    """Record uncaptured never-awaited coroutine warnings (issue #565)."""
+    if never_awaited_warning_match(warning_message.category, warning_message.message):
+        _NEVER_AWAITED_RECORDED.append(
+            "%s @ %s: %s"
+            % (
+                type(warning_message.category).__name__,
+                nodeid or when,
+                warning_message.message,
+            )
+        )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Fail the session if any never-awaited coroutine warning was recorded
+    (issue #565): the suite must not pass while a coroutine was created and
+    dropped anywhere outside a test's own warning-capture block."""
+    if _NEVER_AWAITED_RECORDED:
+        summary = "; ".join(_NEVER_AWAITED_RECORDED[:5])
+        raise pytest.UsageError(
+            "issue #565 gate: %d never-awaited coroutine warning(s) recorded: %s"
+            % (len(_NEVER_AWAITED_RECORDED), summary)
+        )

@@ -4,3 +4,8 @@ pytest-asyncio>=1.4.0,<2.0
 requests>=2.31.0,<3.0
 pytest-timeout>=2.4.0,<3.0
 bandit>=1.9.4,<2.0
+
+# Randomized test order + per-test random seeding (issue #565 / E06):
+# order-dependent test pollution must surface in CI instead of hiding behind
+# alphabetical collection order.
+pytest-randomly>=5.0,<6.0

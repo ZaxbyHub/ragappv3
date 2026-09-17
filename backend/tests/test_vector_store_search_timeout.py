@@ -45,6 +45,18 @@ class TestSearchSemaphoreTimeoutDefaults(unittest.TestCase):
             Settings(search_semaphore_timeout_seconds=301)
 
 
+def _timeout_wait_for(coro, timeout):
+    """Mock mirroring asyncio.wait_for's timeout contract.
+
+    On timeout the real wait_for CANCELS the inner awaitable; the mock must
+    discard the coroutine the same way (close()), otherwise the never-started
+    coroutine is destroyed un-awaited and trips the issue-#565 never-awaited
+    warning gate.
+    """
+    coro.close()
+    raise asyncio.TimeoutError()
+
+
 class TestAcquireSearchSemaphoreTimeout(unittest.IsolatedAsyncioTestCase):
     """Test cases for _acquire_search_semaphore timeout behavior."""
 
@@ -57,9 +69,10 @@ class TestAcquireSearchSemaphoreTimeout(unittest.IsolatedAsyncioTestCase):
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
-        with patch("app.services.vector_store.asyncio.wait_for") as mock_wait_for:
-            mock_wait_for.side_effect = asyncio.TimeoutError()
-
+        with patch(
+            "app.services.vector_store.asyncio.wait_for",
+            side_effect=_timeout_wait_for,
+        ):
             with self.assertRaises(VectorStoreError) as ctx:
                 async with store._acquire_search_semaphore():
                     pass
@@ -99,9 +112,10 @@ class TestAcquireSearchSemaphoreTimeout(unittest.IsolatedAsyncioTestCase):
         """
         store = VectorStore(db_path=Path("/tmp/test_lancedb"))
 
-        with patch("app.services.vector_store.asyncio.wait_for") as mock_wait_for:
-            mock_wait_for.side_effect = asyncio.TimeoutError()
-
+        with patch(
+            "app.services.vector_store.asyncio.wait_for",
+            side_effect=_timeout_wait_for,
+        ):
             with self.assertRaises(VectorStoreError):
                 async with store._acquire_search_semaphore():
                     pass
@@ -125,8 +139,10 @@ class TestSearchSemaphoreTimeoutIntegration(unittest.IsolatedAsyncioTestCase):
         store.table.list_indices = AsyncMock(return_value=[])
         store.table.count_rows = AsyncMock(return_value=0)
 
-        with patch("app.services.vector_store.asyncio.wait_for") as mock_wait_for:
-            mock_wait_for.side_effect = asyncio.TimeoutError()
+        with patch(
+            "app.services.vector_store.asyncio.wait_for",
+            side_effect=_timeout_wait_for,
+        ):
             with patch.object(settings, "multi_scale_indexing_enabled", False):
                 with self.assertRaises(VectorStoreError) as ctx:
                     await store.search(
@@ -148,6 +164,11 @@ class TestSearchSemaphoreTimeoutIntegration(unittest.IsolatedAsyncioTestCase):
         async def mock_wait_for(coro, timeout):
             nonlocal captured_timeout
             captured_timeout = timeout
+            # The real wait_for would cancel this inner coroutine on timeout;
+            # this mock acquires the semaphore directly, so the coroutine the
+            # caller created must be discarded explicitly (issue #565 gate:
+            # an abandoned coroutine fails the suite).
+            coro.close()
             # Simulate immediate success by acquiring the semaphore directly
             sem = store._get_search_semaphore()
             await sem.acquire()

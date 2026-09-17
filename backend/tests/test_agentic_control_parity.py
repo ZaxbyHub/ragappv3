@@ -283,12 +283,18 @@ class _FakeVectorStore:
     async def search(self, *args, **kwargs):
         return []
 
-    async def get_fts_exceptions(self):
+    def get_fts_exceptions(self):
+        # Sync, matching the real VectorStore.get_fts_exceptions (issue #565
+        # gate: an async-declared fake made rag_engine's plain sync call
+        # produce and drop a coroutine every invocation).
         return 0
 
 
 class _FakeMemoryStore:
-    async def search_memories(self, *args, **kwargs):
+    def search_memories(self, *args, **kwargs):
+        # Sync, matching the real MemoryStore.search_memories (issue #565
+        # gate: an async-declared fake leaks a dropped coroutine when the
+        # sync caller invokes it).
         return []
 
 
