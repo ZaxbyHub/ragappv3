@@ -35,6 +35,11 @@ const mockChatState = vi.hoisted(() => ({
   setInputError: vi.fn(),
 }));
 
+// Mutable so the no-vault paste test can flip the active vault.
+const mockVaultState = vi.hoisted(() => ({
+  activeVaultId: 1 as number | null,
+}));
+
 vi.mock("@/stores/useChatStore", () => ({
   useChatStore: vi.fn(() => mockChatState),
 }));
@@ -64,12 +69,14 @@ vi.mock("@/stores/useVaultStore", () => ({
   useVaultStore: Object.assign(
     vi.fn((selector?: (s: any) => unknown) => {
       const state = {
-        activeVaultId: 1,
+        get activeVaultId() {
+          return mockVaultState.activeVaultId;
+        },
         getActiveVault: () => ({ id: 1, name: "Test Vault", file_count: 1 }),
       };
       return typeof selector === "function" ? selector(state) : state;
     }),
-    { getState: () => ({ activeVaultId: 1 }) }
+    { getState: () => ({ activeVaultId: mockVaultState.activeVaultId }) }
   ),
 }));
 
@@ -165,6 +172,7 @@ describe("Composer large-input handling (issue #616)", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
@@ -192,6 +200,29 @@ describe("Composer large-input handling (issue #616)", () => {
     expect(attachToChat).toHaveBeenCalledTimes(1);
     expect(mockChatState.input).not.toContain(big.slice(0, 100));
     expect(textarea.value).toBe("");
+  });
+
+  it("keeps a large plain-text paste inline when NO vault is selected (no interception, no lost text)", async () => {
+    // PRR-618-02: with no vault the attachment pipeline would reject the
+    // file outright, so interception must not fire — the paste falls
+    // through to native inline insertion (jsdom cannot observe the actual
+    // insertion; non-prevention + no upload is the observable contract).
+    const { addUploads } = await stubUploadStore();
+    const big = "q".repeat(20_000);
+    mockVaultState.activeVaultId = null;
+
+    render(<Composer onSend={vi.fn()} onStop={vi.fn()} isStreaming={false} />);
+    const textarea = screen.getByLabelText("Message input") as HTMLTextAreaElement;
+
+    let event: ReturnType<typeof createEvent.paste>;
+    await act(async () => {
+      event = pastePlainText(textarea, big);
+    });
+
+    expect(event!.defaultPrevented).toBe(false);
+    expect(addUploads).not.toHaveBeenCalled();
+
+    mockVaultState.activeVaultId = 1;
   });
 
   it("a small plain-text paste stays inline (no interception, no upload)", async () => {

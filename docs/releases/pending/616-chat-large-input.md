@@ -22,7 +22,9 @@
   `pasted-text-<timestamp>.txt` (`text/plain`) File and enqueued through
   the existing attachment pipeline (upload store → chip tray → indexing),
   with a toast explaining the conversion. Smaller pastes keep native inline
-  insertion. The backend accepts `.txt` uploads (extension allowlist;
+  insertion, and with no vault selected large pastes also stay inline (the
+  attachment pipeline needs a vault target; the send-time vault requirement
+  still applies). The backend accepts `.txt` uploads (extension allowlist;
   text formats are exempt from magic-byte checks).
 - 4,000 was chosen because this composer is a long-form prompt surface:
   prompts up to ~4k chars (~1k tokens) stay comfortably inline-editable,

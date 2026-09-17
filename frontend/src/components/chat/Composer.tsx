@@ -449,7 +449,11 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
       return;
     }
     const text = e.clipboardData.getData("text/plain");
-    if (text.length > LARGE_PASTE_THRESHOLD) {
+    // Intercept only when the attachment pipeline can actually accept the
+    // file: with no vault selected addUploads would reject it outright and
+    // the pasted text would be lost — fall through to native inline
+    // insertion instead (the send-time vault requirement still applies).
+    if (text.length > LARGE_PASTE_THRESHOLD && activeVaultId != null) {
       e.preventDefault();
       const file = new File([text], `pasted-text-${Date.now()}.txt`, { type: "text/plain" });
       enqueueFiles([file]);
