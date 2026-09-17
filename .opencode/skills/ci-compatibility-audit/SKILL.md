@@ -185,3 +185,58 @@ Classify each risk as:
 - `NOTE`: useful context, not blocking.
 
 Include the exact workflow step or command for every item.
+
+## Nightly quality gates (issue #565 / E06) and strict pytest flags
+
+Second scheduled workflow: `.github/workflows/nightly-quality-gates.yml`
+(name "Nightly quality gates"; distinct from the parser-fidelity workflow
+"Nightly" / job `full-deps` / artifact `parser-bakeoff` in nightly.yml — issue
+#258 ENH-007 owns that tier; keep the names disjoint). Jobs:
+
+- `mutation-backend`: mutmut 3.7 over the seven guard modules
+  (`backend/app/security.py`, `backend/app/api/deps.py`,
+  `backend/app/middleware/{logging,maintenance,telemetry_span}.py`,
+  `backend/app/models/database.py`, `backend/app/services/maintenance.py`),
+  per-module stats via `mutmut export-cicd-stats`, and a per-module score
+  report enforced by `scripts/mutation_score.py` against the
+  `MUTATION_SCORE_FLOOR` literal in the workflow. `workflow_dispatch` with a
+  `pr_number` input scopes the run to guard modules touched by that PR's diff
+  (GLM EP1 PR-gated shape). mutmut 3.x needs fork support — it cannot run on
+  native Windows (upstream boxed/mutmut#397); reproduce locally only under
+  WSL.
+- `schemathesis-api`: boots a live `app.main:app` test instance (uvicorn,
+  dummy secrets, `REDIS_URL=""`, `ALLOW_LOCAL_SERVICES=1`, provider endpoints
+  overridden to an unresolvable-but-allowed local port, `RAGAPP_CSRF_TEST_BYPASS=1`
+  + `PYTEST_CURRENT_TEST=nightly-schemathesis` sentinel narrowing CSRF on the
+  disposable instance) and runs Schemathesis 4.x against `/openapi.json` with
+  `--phases fuzzing,stateful` and an admin-token bearer header.
+- `stryker-frontend`: `npm run test:mutation` (StrykerJS + Vitest runner,
+  `frontend/stryker.config.json` scoped to `src/lib/api/**` and
+  `src/hooks/**`, fail-below `thresholds.break`).
+
+Strict pytest flags (issue #565) apply to EVERY pytest invocation, local and
+CI, because they live in `backend/pyproject.toml`:
+
+- `addopts = "--strict-markers -W error::RuntimeWarning"` — an in-band
+  RuntimeWarning now fails the suite.
+- `filterwarnings = ["error::RuntimeWarning"]` — ini mirror of the flag.
+- `backend/tests/conftest.py` issue-#565 guards: (1) an AST collection guard
+  fails collection on `async def test_*` methods inside plain
+  `unittest.TestCase` subclasses (asyncio auto mode silently drops those —
+  IsolatedAsyncioTestCase subclasses are exempt); (2) a session-finish guard
+  fails the run on any uncaptured "coroutine ... was never awaited" warning
+  (direct RuntimeWarning or the PytestUnraisableExceptionWarning wrapper that
+  `-W error::RuntimeWarning` produces via the unraisable path). Warnings
+  captured inside a test's own `catch_warnings(record=True)` block never
+  reach the guard.
+- `pytest-randomly` (in `requirements-dev.txt`) shuffles test order every
+  run; a failure that appears/disappears with order is a real pollution bug —
+  fix the test, never bypass the plugin. Reproduce with a fixed
+  `--randomly-seed=<n>` (the seed is printed in the pytest header).
+
+Local mirror additions:
+
+```bash
+cd frontend && npm run test:mutation   # stryker (minutes; scoped to lib/api + hooks)
+cd backend && python -m pytest tests/  # inherits strict flags + random order
+```

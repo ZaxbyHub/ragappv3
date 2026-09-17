@@ -380,8 +380,14 @@ class TestErrorPropagation:
         if not _SQLITE_SERIALIZED:
             pytest.skip("asyncio.gather not used on non-SERIALIZED SQLite builds")
 
-        # Replace asyncio.gather with one that immediately raises
+        # Replace asyncio.gather with one that immediately raises. The four
+        # asyncio.to_thread(...) coroutines passed in were already CREATED at
+        # the call site; discard them explicitly (as a gather that fails
+        # before scheduling would own them) so they are not destroyed
+        # un-awaited (issue #565 gate).
         async def raising_gather(*coros):
+            for coro in coros:
+                coro.close()
             raise RuntimeError("simulated DB failure")
 
         with patch("asyncio.gather", raising_gather):

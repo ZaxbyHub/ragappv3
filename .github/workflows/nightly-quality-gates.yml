@@ -1,0 +1,279 @@
+name: Nightly quality gates
+
+# Issue #565 (Workstream K, PR 3 of 7, finding E06): quality gates that can
+# actually fail — mutation testing on the guard modules, schema-driven fuzzing
+# against the live OpenAPI contract, and frontend mutation testing.
+#
+# COORDINATION with the parser-fidelity nightly tier (issue #258 / ENH-007,
+# workflow "Nightly" in .github/workflows/nightly.yml, job "full-deps",
+# artifact "parser-bakeoff"): the two scheduled tiers are deliberately separate
+# workflows with disjoint workflow names, job names, and artifact names so
+# neither can silently overwrite the other's jobs or artifacts. The parser tier
+# owns real-parser fixture fidelity; this workflow owns suite-effectiveness
+# gates (mutation + schema fuzzing).
+
+on:
+  schedule:
+    - cron: "30 3 * * *" # nightly, offset from nightly.yml's 0 3
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Optional PR number. When set, the mutation job scopes to guard-module files touched by that PR's diff (GLM EP1 PR-gated shape) instead of the fixed guard-module list."
+        required: false
+        default: ""
+
+env:
+  # MUTATION_SCORE_FLOOR — the survival budget of the mutation gate, recorded
+  # here (reviewable in this file, not hidden in a script default). The job
+  # fails when any module score or the aggregate drops below this percent of
+  # killed mutants.
+  # Baseline: mutmut 3.x requires fork support and cannot run on Windows dev
+  # boxes (upstream boxed/mutmut#397), so this initial floor is deliberately
+  # conservative; the first nightly run establishes the real per-module
+  # baseline (reported in the job output) and a follow-up PR raises the floor
+  # to baseline-minus-headroom.
+  MUTATION_SCORE_FLOOR: "30"
+
+jobs:
+  mutation-backend:
+    name: Mutation (mutmut, guard modules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements-lock-ci.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock-ci.txt
+          pip install -r requirements-dev.txt
+          pip install mutmut==3.7
+
+      - name: Resolve mutation scope (fixed guard list or PR-diff subset)
+        run: |
+          python - <<'PY'
+          import os, subprocess
+
+          # Guard modules (issue #565): (module_name, file path) pairs. The
+          # file path is the diff-intersection key in PR-diff mode; the
+          # module name is what mutmut scopes on.
+          guard_modules = [
+              ("app.security", "backend/app/security.py"),
+              ("app.api.deps", "backend/app/api/deps.py"),
+              ("app.middleware.logging", "backend/app/middleware/logging.py"),
+              ("app.middleware.maintenance", "backend/app/middleware/maintenance.py"),
+              ("app.middleware.telemetry_span", "backend/app/middleware/telemetry_span.py"),
+              ("app.models.database", "backend/app/models/database.py"),
+              ("app.services.maintenance", "backend/app/services/maintenance.py"),
+          ]
+          pr_number = (os.environ.get("PR_NUMBER") or "").strip()
+          if pr_number:
+              subprocess.run(
+                  ["git", "fetch", "origin", f"pull/{pr_number}/head:pr-{pr_number}"],
+                  check=True,
+              )
+              diff = subprocess.run(
+                  ["git", "diff", "--name-only", f"origin/master...pr-{pr_number}"],
+                  capture_output=True, text=True, check=True,
+              ).stdout.splitlines()
+              touched = {d.strip() for d in diff}
+              selected = [(m, p) for m, p in guard_modules if p in touched]
+              print(f"PR-diff mode: {len(selected)} guard module(s) touched by PR {pr_number}")
+          else:
+              selected = guard_modules
+              print("Nightly mode: fixed guard-module list")
+          if not selected:
+              print("No guard modules touched; nothing to mutate.")
+          with open("mutation_modules.txt", "w") as fh:
+              for module, path in selected:
+                  fh.write(f"{module} {path}\n")
+          PY
+        env:
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+
+      - name: Run mutmut per guard module and export per-module stats
+        run: |
+          set -e
+          mkdir -p mutation-stats
+          while read -r module mpath; do
+            [ -z "$module" ] && continue
+            echo "=== mutmut run: $module ($mpath) ==="
+            python - <<PY
+          import pathlib, re
+
+          pyproject = pathlib.Path("pyproject.toml")
+          text = pyproject.read_text(encoding="utf-8")
+          scoped = "source_paths = [\"$mpath\"]\n"
+          if "[tool.mutmut]" in text:
+              text = re.sub(r"(?ms)^\[tool\.mutmut\]\nsource_paths = \[.*?\]\n", "[tool.mutmut]\n" + scoped, text)
+          else:
+              text += "\n[tool.mutmut]\n" + scoped
+          pyproject.write_text(text, encoding="utf-8")
+          PY
+            rm -rf mutants
+            python -m mutmut run || true
+            python -m mutmut export-cicd-stats > "mutation-stats/${module}.json" 2>&1 || true
+          done < mutation_modules.txt
+
+      - name: Report per-module mutation scores and enforce the survival budget
+        run: |
+          ARGS=""
+          while IFS= read -r module; do
+            [ -z "$module" ] && continue
+            ARGS="$ARGS --module $module:mutation-stats/${module}.json"
+          done < mutation_modules.txt
+          if [ -z "$ARGS" ]; then
+            echo "No guard modules selected; skipping score gate."
+            exit 0
+          fi
+          python ../scripts/mutation_score.py --floor "$MUTATION_SCORE_FLOOR" $ARGS
+
+      - name: Upload mutation stats
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-score-stats
+          path: backend/mutation-stats/
+
+  schemathesis-api:
+    name: Schemathesis (OpenAPI contract fuzzing)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install system parser dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libmagic1 poppler-utils tesseract-ocr
+
+      - name: Install full parser stack + Schemathesis
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+          pip install "schemathesis>=4,<5"
+
+      - name: Boot the app test instance
+        # Disposable fuzzer instance only: RAGAPP_CSRF_TEST_BYPASS=1 plus a
+        # PYTEST_CURRENT_TEST sentinel are BOTH required by the CSRF bypass
+        # check (app/security.py), which deliberately narrows CSRF for this
+        # run so mutating routes stay reachable for stateful link chains.
+        env:
+          ADMIN_SECRET_TOKEN: "nightly-schemathesis-admin-token-0123456789abcdef0123456789abcdef0123"
+          JWT_SECRET_KEY: "nightly-schemathesis-jwt-secret-key-0123456789abcdef0123456789abcdef"
+          USERS_ENABLED: "false"
+          REDIS_URL: ""
+          ALLOW_LOCAL_SERVICES: "1"
+          DATA_DIR: schemathesis-data
+          OLLAMA_EMBEDDING_URL: "http://127.0.0.1:9/v1/embeddings"
+          OLLAMA_CHAT_URL: "http://127.0.0.1:9"
+          INSTANT_CHAT_URL: "http://127.0.0.1:9"
+          RERANKER_URL: "http://127.0.0.1:9"
+          RAGAPP_CSRF_TEST_BYPASS: "1"
+          PYTEST_CURRENT_TEST: nightly-schemathesis
+        run: |
+          mkdir -p schemathesis-data
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 9090 \
+            > schemathesis-uvicorn.log 2>&1 &
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9090/openapi.json || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          [ "$code" = "200" ] || { cat schemathesis-uvicorn.log; exit 1; }
+
+      - name: Run Schemathesis against /openapi.json with stateful links
+        # Full API surface, fuzzing + stateful phases, authenticated with the
+        # instance's admin token. The API carries pre-existing OpenAPI
+        # conformance debt (211 known signatures at baseline capture); the
+        # committed baseline at backend/schemathesis-baseline.json records
+        # them, and the gate step below fails the job on any NEW signature —
+        # the same baseline-diff discipline as the bandit SAST gate.
+        # `|| true` is deliberate: schemathesis exits non-zero whenever ANY
+        # check fails (known-baseline signatures included). GitHub Actions'
+        # default bash has pipefail on, so without it the run step would fail
+        # the job before the baseline-diff gate below could decide. The step
+        # records the schemathesis exit code as a SCHEMATHESIS_EXIT marker in
+        # the log; the gate script treats a missing marker (crash before
+        # completion) or an unexpected exit code as a failure — a crashed run
+        # can never pass the gate.
+        run: |
+          python -c "
+          from schemathesis.cli import schemathesis
+          schemathesis([
+              'run', 'http://127.0.0.1:9090/openapi.json',
+              '--phases', 'fuzzing,stateful',
+              '-H', 'Authorization: Bearer nightly-schemathesis-admin-token-0123456789abcdef0123456789abcdef0123',
+              '--max-examples', '20',
+          ])
+          " 2>&1 | tee schemathesis-run.log || true
+          rc=${PIPESTATUS[0]}
+          echo "SCHEMATHESIS_EXIT=$rc" >> schemathesis-run.log
+
+      - name: Gate on new contract violations (baseline diff)
+        if: always()
+        run: |
+          python ../scripts/schemathesis_gate.py \
+            --run-log schemathesis-run.log \
+            --baseline schemathesis-baseline.json
+
+      - name: Upload Schemathesis run log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: schemathesis-nightly-log
+          path: |
+            backend/schemathesis-run.log
+            backend/schemathesis-uvicorn.log
+
+  stryker-frontend:
+    name: StrykerJS (frontend mutation)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --engine-strict
+
+      - name: Run Stryker (scoped to src/lib/api and src/hooks)
+        run: npm run test:mutation
+
+      - name: Upload Stryker report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stryker-mutation-report
+          path: frontend/reports/mutation/

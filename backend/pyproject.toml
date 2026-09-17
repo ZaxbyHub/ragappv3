@@ -28,10 +28,37 @@ asyncio_mode = "auto"
 # skips them with a visible reason unless RAGAPP_LIVE_TESTS=1 (issue #563 / C10
 # — replaces import-time probes of localhost:9090 that silently skipped in CI
 # and drove foreign listeners on dev hosts).
-addopts = "--strict-markers"
+addopts = "--strict-markers -W error::RuntimeWarning"
 markers = [
     "live: performs real network I/O; skipped unless RAGAPP_LIVE_TESTS=1",
 ]
+# Warnings-as-errors (issue #565 / E06): RuntimeWarnings fail the suite instead
+# of scrolling past in the summary. This escalates the in-band emission paths
+# (pytest's global -W filter raises at the warn site); the GC-timed
+# "coroutine ... was never awaited" shape is closed separately by the conftest
+# session guard in tests/conftest.py, because inside coroutine.__del__ a raised
+# warning cannot propagate — it routes to sys.unraisablehook and pytest re-emits
+# it as PytestUnraisableExceptionWarning, which no filter can escalate.
+# Note: the issue text's literal `error::pytest.PytestUnhandledCoroutineWarning`
+# is NOT used — that warning class does not exist in pytest 9.1.1 (verified:
+# the entry crashes pytest at startup with "module 'pytest' has no attribute
+# PytestUnhandledCoroutineWarning"). The async-test-misconfiguration class it
+# targeted (async test methods inside sync unittest.TestCase subclasses, which
+# auto mode silently drops) is closed by the AST collection guard in
+# tests/conftest.py instead.
+filterwarnings = [
+    "error::RuntimeWarning",
+]
+
+# Mutation testing (issue #565 / E06). The nightly-quality-gates workflow
+# rewrites `source_paths` per guard-module run and captures per-module stats;
+# mutmut 3.x requires fork support, so it runs on the ubuntu nightly only
+# (upstream boxed/mutmut#397 blocks native Windows). `pytest_add_cli_args`
+# keeps the strict pytest config (addopts/-W/filterwarnings) active inside
+# mutant test runs.
+[tool.mutmut]
+source_paths = ["app/security.py"]
+pytest_add_cli_args = "-p no:randomly"
 
 # Coverage gating (H4). Scoped to the SSRF guard modules — these are small,
 # fully exercised in CI, and the security-critical surface this issue's SSRF

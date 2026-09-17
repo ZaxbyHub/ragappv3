@@ -103,6 +103,11 @@ class _PartitionFailurePatch:
     def __enter__(self):
         import unstructured.partition.auto as auto_mod
 
+        # Save and restore the shared holder so a test that injects a
+        # different exception (e.g. the parser-unavailable ImportError) does
+        # not leak it into sibling tests under randomized collection order
+        # (issue #565).
+        self._prev_exc = _partition_error_holder["exc"]
         if self._exc is not None:
             _partition_error_holder["exc"] = self._exc
         self._auto = auto_mod
@@ -112,6 +117,7 @@ class _PartitionFailurePatch:
 
     def __exit__(self, *_exc):
         self._auto.partition = self._original
+        _partition_error_holder["exc"] = self._prev_exc
         return False
 
 

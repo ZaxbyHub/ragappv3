@@ -40,6 +40,25 @@ from fastapi.testclient import TestClient
 
 pytestmark = pytest.mark.usefixtures("ready_vector_store")
 
+# Temporary test database (same pattern as test_settings.py): the chat turn
+# persists via the real get_db dependency, so it needs a real, test-owned
+# SQLite file instead of the cwd-relative ./data/app.db whose availability
+# races across xdist workers on Windows.
+TEST_DB_PATH = None
+
+
+def setUpModule():
+    """Create and initialize the shared test database before any test runs."""
+    global TEST_DB_PATH
+    import tempfile
+    from pathlib import Path
+
+    from app.models.database import init_db
+
+    test_data_dir = tempfile.mkdtemp(prefix="chat-history-role-test-")
+    TEST_DB_PATH = Path(test_data_dir) / "test.db"
+    init_db(str(TEST_DB_PATH))
+
 
 @dataclass
 class MockRAGSource:
@@ -70,7 +89,7 @@ class TestChatHistoryRoleValidationAPI(unittest.TestCase):
 
     def setUp(self):
         # Import here so stubs are in place first
-        from app.api.deps import get_current_active_user, get_rag_engine
+        from app.api.deps import get_current_active_user, get_db, get_rag_engine
         from app.main import app
 
         self.app = app
@@ -78,10 +97,28 @@ class TestChatHistoryRoleValidationAPI(unittest.TestCase):
         self._get_rag_engine = get_rag_engine
         self._get_current_active_user = get_current_active_user
 
+        # DB override: the chat turn persists via the real get_db pool, and
+        # under xdist a worker that reaches it before ./data/app.db exists
+        # fails with "unable to open database file" (order-dependent flake the
+        # issue-#565 randomized-order canary exposed). Point get_db at the
+        # shared TEST_DB_PATH pool like the settings API tests do.
+        from app.models.database import get_pool
+
+        self._test_pool = get_pool(str(TEST_DB_PATH))
+
+        def override_get_db():
+            conn = self._test_pool.get_connection()
+            try:
+                yield conn
+            finally:
+                self._test_pool.release_connection(conn)
+
+        self._get_db = get_db
+        self.app.dependency_overrides[self._get_db] = override_get_db
+
         # Auth override
         mock_user = {"id": 1, "username": "testuser", "role": "admin"}
         self.app.dependency_overrides[self._get_current_active_user] = lambda: mock_user
-
         # RAG engine override (returns a mock that yields done immediately)
         mock_engine = MagicMock()
 
@@ -98,6 +135,7 @@ class TestChatHistoryRoleValidationAPI(unittest.TestCase):
         self.app.dependency_overrides[self._get_rag_engine] = lambda: mock_engine
 
     def tearDown(self):
+        self.app.dependency_overrides.pop(self._get_db, None)
         self.app.dependency_overrides.pop(self._get_rag_engine, None)
         self.app.dependency_overrides.pop(self._get_current_active_user, None)
 
