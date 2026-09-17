@@ -108,6 +108,20 @@ CI (`.github/workflows/ci.yml`) runs the full suite:
 > with `MSYS_NO_PATHCONV=1`, or run it from PowerShell — on Linux/CI the
 > command needs nothing special.
 
+> **Windows host test baseline (pre-existing, not regressions):** a full
+> backend suite run on a Windows/CRLF checkout reports a stable set of
+> environmental failures that CI (Linux) never sees. Know them before
+> debugging: (1) `tests/draft_room/test_gold_corpus_contract.py` — the
+> gold-corpus manifest pins sha256 hashes of LF fixture bytes, and a CRLF
+> checkout rewrites them (~41 errors/failures; provable in seconds with
+> `git show HEAD:<fixture> | sha256sum` vs the on-disk hash); (2)
+> `test_draft_input_storage.py::TestPathSafety::test_symlink_escape_rejected`
+> — Windows symlink privilege (WinError 1314); (3)
+> `test_upload_validation_regression.py::TestSecureFilename::test_strips_traversal`
+> — POSIX-only backslash-traversal semantics; (4) occasional timing flakes
+> under `-n auto` load (e.g. `test_org_invites` concurrent-accept — passes in
+> isolation). Anything outside this set deserves investigation.
+
 **The backend CI dependency set is reduced — "locally green" ≠ "CI green".** CI installs only `requirements-ci.txt` + `requirements-dev.txt`, which omit `unstructured` and `sentence-transformers` (stubbed per-file at test time); `lancedb` and `pyarrow` are installed for real — they were added to `requirements-ci.txt` so the issue-#513 acceptance checks (`tests/issue513_checks/`) can exercise the real LanceDB surface instead of the stub. A dev machine usually has the full `requirements.txt`, so a backend test can pass locally yet fail in CI at import (`ModuleNotFoundError`). To validate a backend **test-scope** change (e.g. adding a file to the CI pytest list) faithfully — and faster, with no multi-GB model/db loads — reproduce the CI env instead of trusting the local run:
 
 ```bash

@@ -11,9 +11,11 @@ tar -xzf /tmp/just.tar.gz -C /tmp just
 sudo mv /tmp/just /usr/local/bin/just
 just --version
 
-# Backend: CI dependency set (universal lock, installs identically on Linux).
+# Backend: CI dependency set (universal lock, installs identically on Linux;
+# the lock install is hash-gated like CI and the Dockerfile — issue #567).
 python -m pip install --upgrade pip
-python -m pip install -r backend/requirements-lock-ci.txt -r backend/requirements-dev.txt
+python -m pip install --require-hashes -r backend/requirements-lock-ci.txt
+python -m pip install -r backend/requirements-dev.txt
 
 # Frontend: pinned toolchain.
 cd frontend && npm ci --engine-strict
