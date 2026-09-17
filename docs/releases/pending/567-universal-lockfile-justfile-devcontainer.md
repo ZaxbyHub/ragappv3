@@ -33,9 +33,10 @@
   22.14, ubuntu-24.04) — now a required surface in
   `scripts/check_runtime_contract.py`, with tests in
   `backend/tests/test_devcontainer_contract.py`.
-- **New/strengthened tests**: `test_lockfile_install.py` parseability tests now
-  pass `--require-hashes`; `TestUniversalLockfiles` asserts the markers
-  (regenerating with a Linux-only resolver turns it red);
+- **New/strengthened tests**: `TestUniversalLockfiles` asserts the universal
+  markers; `--require-hashes` enforcement lives at the real consumers (CI
+  install step, root Dockerfile, devcontainer post-create) — the in-test
+  parseability strengthening was reverted on Linux timeout evidence;
   `frontend/src/base-path-message.test.ts` asserts value interpolation for
   both TS validators and the Dockerfile copy.
 
