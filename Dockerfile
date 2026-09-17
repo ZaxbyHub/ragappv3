@@ -72,9 +72,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install Python dependencies (--require-hashes enforces the universal lock's
+# hash pinning at the real consumer — issue #567)
 COPY backend/requirements-lock.txt .
-RUN pip install --no-cache-dir -r requirements-lock.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements-lock.txt
 
 # Pre-download the spaCy model used by unstructured's NLP paths. spaCy installs
 # models into root-owned site-packages, so a first-parse runtime download as the

@@ -162,6 +162,10 @@ To change from `/knowledgevault` to `/meridian`:
    ```
    docker build --build-arg VITE_APP_BASENAME=/meridian [--build-arg VITE_API_URL=/meridian/api] -t ragapp-frontend .
    ```
+   > Windows/Git Bash: prefix the command with `MSYS_NO_PATHCONV=1` — MSYS
+   > rewrites the leading-slash `--build-arg` values into Windows paths
+   > (`C:/Program Files/Git/meridian`) before docker sees them, silently
+   > baking a wrong basename into the image (issue #567).
 2. Update backend env: `APP_ROOT_PATH=/meridian`
 3. Update the reverse proxy to strip `/meridian/` instead of `/knowledgevault/`
 4. Update `CORS_ORIGINS` if the origin changes

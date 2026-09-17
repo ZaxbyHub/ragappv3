@@ -85,6 +85,11 @@ npm --version
 ```powershell
 # Download from https://git-scm.com/download/win
 # Use Git Bash or Windows Terminal
+# Git Bash caveat: it rewrites leading-slash environment values into Windows
+# paths (MSYS path conversion). Commands like
+#   VITE_APP_BASENAME=/knowledgevault npm run build
+# fail with "Base path contains unsafe characters: <the rewritten value>" —
+# prefix them with MSYS_NO_PATHCONV=1, or run them from PowerShell.
 
 # Verify installation
 git --version

@@ -22,7 +22,7 @@ Frontend job:
 - API smoke tests for shared API, CSRF/SSE streaming, wiki SSE UL, and auth API-base behavior
 - `npm test`
 - `npm run build`
-- subpath build with `VITE_APP_BASENAME=/knowledgevault` and `VITE_API_URL=/knowledgevault/api`
+- subpath build with `VITE_APP_BASENAME=/knowledgevault` and `VITE_API_URL=/knowledgevault/api` (under Windows Git Bash, prefix with `MSYS_NO_PATHCONV=1` — see the note in Local Mirror Commands)
 
 Backend job:
 
@@ -98,6 +98,12 @@ cd frontend && npm ci --engine-strict && npm run typecheck && npm run lint
 cd frontend && npm test -- src/lib/api.test.ts src/lib/api.csrf.test.ts src/lib/api.sse.test.ts src/pages/WikiPage.sse.test.tsx src/stores/useAuthStore.api-base.test.ts
 cd frontend && npm test && npm run build
 cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/api npm run build
+# ^ On Windows/Git Bash, prefix subpath builds with MSYS_NO_PATHCONV=1 —
+#   MSYS rewrites the leading-slash env values into Windows paths before
+#   Node sees them, and the build fails with
+#   "Base path contains unsafe characters: <the rewritten value>" (issue #567).
+#   On PowerShell and on Linux no prefix is needed. The repo justfile handles
+#   this automatically via `just frontend-build-subpath`.
 cd backend && ruff check . && pytest --tb=short -v --timeout=300 tests/
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py

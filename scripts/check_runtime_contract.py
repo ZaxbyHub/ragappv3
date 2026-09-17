@@ -28,6 +28,9 @@ Surfaces checked (each line lists one runtime mention -> required value):
   frontend/package.json               engines.node minimum major    -> node major
   CONTRIBUTING.md                     "Node.js <X.Y>" mentions      -> node major
                                       "python<X.Y>" mentions        -> python version
+  .devcontainer/devcontainer.json     features python/node versions -> python version,
+                                      node major.minor (required surface since issue
+                                      #567; the container mirrors CI's runtimes)
 
 Digest pins (@sha256:...) are honored: the tag before the digest is compared.
 Non-runtime base images (nginx, ollama, ...) are ignored.
@@ -219,12 +222,59 @@ def check_contributing(failures: list[str]) -> None:
             )
 
 
+def _feature_version(value: object) -> str:
+    """Feature pins are either a bare version string or {"version": "..."}."""
+    if isinstance(value, dict):
+        return str(value.get("version", "")).strip()
+    return str(value).strip()
+
+
+def check_devcontainer(failures: list[str]) -> None:
+    """The devcontainer mirrors CI's runtimes; its feature pins are contract
+    surfaces (issue #567). Unlike the optional embedding_server Dockerfile,
+    this file is required: it ships in the same change that made it a
+    surface."""
+    path = ROOT / ".devcontainer" / "devcontainer.json"
+    if not path.is_file():
+        failures.append(
+            ".devcontainer/devcontainer.json: missing (required runtime-"
+            "contract surface since issue #567)"
+        )
+        return
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        failures.append(f".devcontainer/devcontainer.json: invalid JSON: {exc}")
+        return
+    features = doc.get("features")
+    if not isinstance(features, dict):
+        failures.append(".devcontainer/devcontainer.json: no features map")
+        return
+    surface = ".devcontainer/devcontainer.json"
+    python_pin = features.get("ghcr.io/devcontainers/features/python:1")
+    if python_pin is None:
+        failures.append(f"{surface}: python feature is missing")
+    elif _feature_version(python_pin) != ALLOWED_RUNTIME["python"]["version"]:
+        failures.append(
+            f"{surface}: python feature {python_pin!r}, contract requires "
+            f"{ALLOWED_RUNTIME['python']['version']!r}"
+        )
+    node_pin = features.get("ghcr.io/devcontainers/features/node:1")
+    if node_pin is None:
+        failures.append(f"{surface}: node feature is missing")
+    else:
+        ok, why = _node_version_ok(_feature_version(node_pin))
+        if not ok:
+            failures.append(f"{surface}: node feature {node_pin!r} is {why}")
+
+
 def main() -> int:
     failures: list[str] = []
     check_dockerfiles(failures)
     check_ci_versions(failures)
     check_package_engines(failures)
     check_contributing(failures)
+    check_devcontainer(failures)
     for message in failures:
         fail(message)
     if failures:

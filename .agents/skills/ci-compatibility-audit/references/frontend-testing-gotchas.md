@@ -139,6 +139,16 @@ describe("...", () => {
 });
 ```
 
+**Git Bash (Windows) rewrites leading-slash env values — MSYS_NO_PATHCONV.**
+The subpath-build reproduction (`VITE_APP_BASENAME=/knowledgevault npm run
+build`) fails under plain Git Bash because MSYS path conversion hands Node
+`C:/Program Files/Git/knowledgevault` instead of `/knowledgevault`; since
+issue #567 the thrown error names the received value
+(`Base path contains unsafe characters: "C:/Program Files/Git/knowledgevault"`)
+so the rewrite is visible. Prefix the command with `MSYS_NO_PATHCONV=1` (or
+use PowerShell); this affects the real shell command only, not
+`vi.stubEnv` inside tests.
+
 **Anti-pattern: don't mock third-party renderers to silence crashes.** If a
 component crashes at render and you mock the crashing sub-component to
 `() => null` just to make the test pass, you mask a real production bug. The

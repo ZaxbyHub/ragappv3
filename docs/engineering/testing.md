@@ -100,6 +100,14 @@ CI (`.github/workflows/ci.yml`) runs the full suite:
 - **Frontend job:** `npm run typecheck`, `npm run lint`, API smoke tests, full `npm test`, `npm run build`, and a subpath build.
 - **Quality contracts:** `check_config_contract.py`, `check_pr_scope_drift.py`.
 
+> **Windows/Git Bash caveat for the subpath build:** Git Bash's MSYS layer
+> rewrites leading-slash environment values into Windows paths, so
+> `VITE_APP_BASENAME=/knowledgevault npm run build` fails with
+> `Base path contains unsafe characters: "C:/Program Files/Git/knowledgevault"`
+> (the error names the received value since issue #567). Prefix the command
+> with `MSYS_NO_PATHCONV=1`, or run it from PowerShell — on Linux/CI the
+> command needs nothing special.
+
 **The backend CI dependency set is reduced — "locally green" ≠ "CI green".** CI installs only `requirements-ci.txt` + `requirements-dev.txt`, which omit `unstructured` and `sentence-transformers` (stubbed per-file at test time); `lancedb` and `pyarrow` are installed for real — they were added to `requirements-ci.txt` so the issue-#513 acceptance checks (`tests/issue513_checks/`) can exercise the real LanceDB surface instead of the stub. A dev machine usually has the full `requirements.txt`, so a backend test can pass locally yet fail in CI at import (`ModuleNotFoundError`). To validate a backend **test-scope** change (e.g. adding a file to the CI pytest list) faithfully — and faster, with no multi-GB model/db loads — reproduce the CI env instead of trusting the local run:
 
 ```bash

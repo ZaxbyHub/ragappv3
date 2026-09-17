@@ -143,6 +143,28 @@ harness patterns and exemplars.
 > artifact, **not a regression**. Prefer a 3.11 virtualenv. Details in
 > `docs/engineering/testing.md`.
 
+## Windows development
+
+Windows (Git Bash, CRLF checkouts) is a supported development environment
+with documented seams — the CI contract runs on Linux, and the seams below
+are the known places where a Windows shell behaves differently (issue #567):
+
+- **Git Bash rewrites leading-slash environment values.**
+  `VITE_APP_BASENAME=/knowledgevault npm run build` fails because MSYS
+  converts the value to a Windows path (`C:/Program Files/Git/knowledgevault`)
+  before Node sees it — the base-path validators reject that value, and since
+  #567 the thrown error names the received value so the rewrite is visible.
+  Prefix the command with `MSYS_NO_PATHCONV=1` (see
+  `docs/engineering/testing.md` and the `ci-compatibility-audit` skill), or
+  run it from PowerShell.
+- **Backend lockfiles are universal.** `pip install -r
+  backend/requirements-lock*.txt` works on Windows and Linux alike
+  (`docs/engineering/lockfiles.md`); the `justfile` at the repo root mirrors
+  the CI steps locally, and `.devcontainer/devcontainer.json` provides a
+  known-good Linux environment if you would rather skip the seams entirely.
+- **A few tests are platform-sensitive** (symlink-privilege and
+  backslash-traversal cases); see `docs/engineering/testing.md`.
+
 ## Reporting issues
 
 Open a GitHub issue with: what you expected, what happened, steps to reproduce,

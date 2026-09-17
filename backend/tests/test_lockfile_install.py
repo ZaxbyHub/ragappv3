@@ -139,3 +139,49 @@ class TestLockfileInstall:
         lock_path = os.path.normpath(lock_path)
         ok, err = _pip_parse_report(lock_path)
         assert ok, f"pip could not parse requirements-lock.txt: {err}"
+
+
+def _lock_entry_line(lockfile_name: str, package: str) -> str:
+    """Return the first line of `package`'s entry (version + markers)."""
+    lock_path = os.path.join(
+        os.path.dirname(__file__), "..", lockfile_name
+    )
+    lock_path = os.path.normpath(lock_path)
+    prefix = package + "=="
+    with open(lock_path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith(prefix):
+                return line.rstrip("\n")
+    raise AssertionError(f"{package} entry not found in {lockfile_name}")
+
+
+class TestUniversalLockfiles:
+    """Issue #567 (C15/E10): locks must carry platform markers.
+
+    Regenerating with a Linux-only resolver (the pre-#567 pip-compile
+    procedure) strips these markers and drops the win32-conditional entries,
+    which re-breaks Windows installs — these assertions turn that red.
+    """
+
+    def test_uvloop_excluded_on_win32_in_both_locks(self) -> None:
+        for name in ("requirements-lock.txt", "requirements-lock-ci.txt"):
+            entry = _lock_entry_line(name, "uvloop")
+            assert "sys_platform" in entry and "win32" in entry, (
+                f"uvloop entry in {name} lacks a win32-exclusion marker "
+                f"(a Windows install would try to build the sdist): {entry}"
+            )
+
+    def test_prod_cuda_family_gated_to_linux(self) -> None:
+        entry = _lock_entry_line("requirements-lock.txt", "nvidia-cufile")
+        assert "sys_platform" in entry and "linux" in entry, (
+            "nvidia-cufile entry lacks a sys_platform marker (no win32 "
+            f"distribution exists at any version): {entry}"
+        )
+
+    def test_tzdata_present_and_win32_gated_in_both_locks(self) -> None:
+        for name in ("requirements-lock.txt", "requirements-lock-ci.txt"):
+            entry = _lock_entry_line(name, "tzdata")
+            assert "sys_platform" in entry and "win32" in entry, (
+                f"tzdata entry in {name} lacks a win32 marker (pandas needs "
+                f"it on Windows): {entry}"
+            )

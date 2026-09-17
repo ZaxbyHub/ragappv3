@@ -175,15 +175,29 @@ jobs:
             backend/requirements-lock-ci.txt
             backend/requirements-dev.txt
 
-      - name: Install pip-tools
-        run: pip install pip-tools
+      - name: Install uv
+        run: pip install uv==0.12.15
 
-      - name: Verify production lockfile
-        run: pip-compile --dry-run --no-header --allow-unsafe requirements.txt --output-file requirements-lock.txt
+      # Universal lockfiles (issue #567): each lock must regenerate
+      # byte-identically from its source spec with the same uv invocation the
+      # update scripts use. Seeding the scratch file with the committed lock
+      # pins every version; any drift (source edit without relock, or a
+      # non-universal regeneration) fails the diff.
+      - name: Verify lockfiles (universal regeneration)
+        working-directory: .
+        run: |
+          for spec in requirements.txt:requirements-lock.txt requirements-ci.txt:requirements-lock-ci.txt; do
+            src="backend/${spec%%:*}"
+            lock="backend/${spec##*:}"
+            cp "$lock" /tmp/verify-lock.txt
+            uv pip compile --universal --generate-hashes --no-strip-extras --no-header \
+              --python-version 3.11 "$src" -o /tmp/verify-lock.txt
+            git diff --no-index --exit-code "$lock" /tmp/verify-lock.txt
+          done
 
       - name: Install dependencies
         run: |
-          pip install -r requirements-lock-ci.txt
+          pip install --require-hashes -r requirements-lock-ci.txt
           pip install -r requirements-dev.txt
           pip install pytest-xdist
 

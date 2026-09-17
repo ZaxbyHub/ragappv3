@@ -1232,7 +1232,7 @@ handle_path /knowledgevault/* {
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Failed to load module script: MIME type "text/html"` | Docker image built without `VITE_APP_BASENAME` | Rebuild with `--build-arg VITE_APP_BASENAME=/yourprefix` |
+| `Failed to load module script: MIME type "text/html"` | Docker image built without `VITE_APP_BASENAME` | Rebuild with `--build-arg VITE_APP_BASENAME=/yourprefix` (under Windows Git Bash, prefix the command with `MSYS_NO_PATHCONV=1` — MSYS otherwise rewrites the leading-slash value into a Windows path before docker sees it; see `docs/engineering/testing.md`) |
 | 404 with "Proxy misconfiguration" message | Reverse proxy not stripping prefix | Add trailing `/` to `proxy_pass` (nginx) or use `handle_path` (Caddy). Note: the detection is case-sensitive — `APP_ROOT_PATH` must exactly match the casing of the path forwarded by the proxy. |
 | SSE/streaming appears in bursts | nginx buffering enabled | Add `proxy_buffering off;` to nginx location block |
 | Login/auth failures after prefix change | `APP_ROOT_PATH` doesn't match `VITE_APP_BASENAME` | Ensure both use the same prefix value |
