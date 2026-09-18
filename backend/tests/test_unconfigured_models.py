@@ -174,10 +174,17 @@ class TestLifespanClientCreation:
         assert thinking is not None and thinking.model == "some-model"
         assert instant is not None and instant.model == "some-instant"
 
-    def test_keepalive_helper_is_a_noop_for_none_client(self):
-        from app.lifespan import _start_llm_keepalive
+    def test_residency_priming_none_guards_unconfigured_clients(self):
+        """#571 replaced the keepalive loop with residency priming; the
+        priming site must skip None (unconfigured) clients — the designed
+        boot state under this PR."""
+        import inspect
 
-        assert _start_llm_keepalive(None) is None
+        from app import lifespan
+
+        src = inspect.getsource(lifespan)
+        assert 'getattr(app.state, "thinking_llm_client", None)' in src
+        assert 'getattr(app.state, "instant_llm_client", None)' in src
 
 
 def _bare_rag_engine():

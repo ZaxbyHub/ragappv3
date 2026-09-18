@@ -72,6 +72,14 @@ class _GlobalMemoryAuthBase(unittest.TestCase):
         self._original_jwt_secret = settings.jwt_secret_key
         self._original_users_enabled = settings.users_enabled
         self._original_data_dir = settings.data_dir
+        # Chat endpoints ship no defaults (issue #570): the /api/chat
+        # authorization probes in this suite configure a pair deliberately.
+        self._original_chat_cfg = (
+            settings.ollama_chat_url,
+            settings.chat_model,
+        )
+        settings.ollama_chat_url = "http://localhost:11434"
+        settings.chat_model = "test-model"
 
         settings.data_dir = Path(self._temp_dir)
         settings.jwt_secret_key = "test-secret-key-for-testing-at-least-32-chars-long"
@@ -175,6 +183,7 @@ class _GlobalMemoryAuthBase(unittest.TestCase):
 
     def tearDown(self):
         from app.models.database import _pool_cache, _pool_cache_lock
+        (settings.ollama_chat_url, settings.chat_model) = self._original_chat_cfg
 
         with _pool_cache_lock:
             for _path, pool in list(_pool_cache.items()):

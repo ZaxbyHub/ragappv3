@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from app.config import settings
+from app.config import Settings, settings
 from app.models.chat_mode import ChatMode
 
 
@@ -25,8 +25,15 @@ def test_chat_mode_enum_rejects_unknown():
 
 def test_instant_mode_settings_defaults_present():
     # No model defaults ship (issue #570): endpoints are operator-configured.
-    assert settings.instant_chat_url == ""
-    assert settings.instant_chat_model == ""
+    # Construct a fresh Settings (not the test-configured singleton, which
+    # conftest's _default_configured_chat_endpoints fixture populates).
+    fresh = Settings(
+        _env_file=None,
+        admin_secret_token="test-admin-token",
+        jwt_secret_key="test-jwt-secret-key",
+    )
+    assert fresh.instant_chat_url == ""
+    assert fresh.instant_chat_model == ""
     assert settings.default_chat_mode in ("instant", "thinking")
     assert isinstance(settings.instant_initial_retrieval_top_k, int)
     assert isinstance(settings.instant_reranker_top_n, int)
