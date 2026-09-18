@@ -197,18 +197,20 @@ class TestOllamaDialectDetection:
             assert service.provider_mode == "ollama"
             assert service.embeddings_url == LEGACY_URL
 
-    def test_bare_ollama_url_resolves_legacy(self):
+    def test_bare_ollama_url_resolves_modern(self):
+        """Issue #571: a bare Ollama host defaults to the modern dialect."""
         with patch.object(settings, "ollama_embedding_url", "http://localhost:11434"):
             service = EmbeddingService()
             assert service.provider_mode == "ollama"
-            assert service.embeddings_url == LEGACY_URL
+            assert service.embeddings_url == MODERN_URL
 
     def test_endpoint_style_helper(self):
         with patch.object(settings, "ollama_embedding_url", MODERN_URL):
             service = EmbeddingService()
             assert service._ollama_endpoint_style(MODERN_URL) == "modern"
             assert service._ollama_endpoint_style(LEGACY_URL) == "legacy"
-            assert service._ollama_endpoint_style("http://localhost:11434") == "legacy"
+            # Issue #571: bare hosts classify as the modern dialect.
+            assert service._ollama_endpoint_style("http://localhost:11434") == "modern"
             # A URL that is not ollama-mode at all has no ollama style.
             assert service._ollama_endpoint_style(OPENAI_URL) is None
             assert service._ollama_endpoint_style(TEI_URL) is None

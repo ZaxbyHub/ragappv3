@@ -221,7 +221,20 @@ class ChunkEnrichmentService:
         ]
 
         response = await self._llm_client.chat_completion(
-            messages, max_tokens=512, temperature=0.2
+            messages,
+            max_tokens=512,
+            temperature=0.2,
+            # Issue #571: constrain the curator response to the documented
+            # field schema provider-side so malformed output is a provider
+            # constraint violation, not a downstream parse failure. The
+            # per-field tolerant parsing below is unchanged.
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "chunk_enrichment",
+                    "schema": self._response_schema(),
+                },
+            },
         )
 
         enrichment = ChunkEnrichment(
@@ -268,3 +281,28 @@ class ChunkEnrichmentService:
             )
 
         return enrichment
+
+    def _response_schema(self) -> Dict[str, Any]:
+        """JSON schema for the curator response (issue #571).
+
+        Mirrors the per-field coercion above: ``summary`` is a string; every
+        other configured field is an array of strings (questions/entities/
+        aliases). Unknown custom fields degrade to strings so a configured
+        field list never produces an empty or invalid schema.
+        """
+        properties: Dict[str, Any] = {}
+        for field_name in self._fields:
+            if field_name == "summary":
+                properties[field_name] = {"type": "string"}
+            elif field_name in ("questions", "entities", "aliases"):
+                properties[field_name] = {
+                    "type": "array",
+                    "items": {"type": "string"},
+                }
+            else:
+                properties[field_name] = {"type": "string"}
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": list(self._fields),
+        }

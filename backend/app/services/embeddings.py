@@ -352,8 +352,10 @@ class EmbeddingService:
         ``{"model", "input"}`` bodies (scalar or list); legacy Ollama exposes
         ``POST /api/embeddings`` accepting only per-item
         ``{"model", "prompt"}`` bodies. Bare/default Ollama URLs resolve to
-        the legacy dialect. Returns ``None`` for URLs that are not
-        Ollama-mode endpoints (OpenAI/TEI paths).
+        the modern dialect (issue #571): ``/api/embeddings`` is documented as
+        superseded, and a bare host has no reason to keep defaulting to the
+        legacy route. Returns ``None`` for URLs that are not Ollama-mode
+        endpoints (OpenAI/TEI paths).
 
         Args:
             url: The resolved embeddings endpoint URL.
@@ -369,9 +371,9 @@ class EmbeddingService:
         if "/v1/embeddings" in path or path.rstrip("/").endswith("/embed"):
             # Explicit OpenAI / native TEI paths are not Ollama endpoints.
             return None
-        # No explicit path (bare host) — the resolver appends the legacy
-        # /api/embeddings route for those, so treat them as legacy dialect.
-        return "legacy"
+        # No explicit path (bare host) — the resolver appends the modern
+        # /api/embed route for those (issue #571).
+        return "modern"
 
     def _request_config(self) -> _EmbeddingRequestConfig:
         """Capture the live embedding configuration as a frozen snapshot.
@@ -403,7 +405,7 @@ class EmbeddingService:
         - If no explicit embeddings path:
           - Port 1234 -> OpenAI mode (LM Studio default)
           - Port 8080 -> native TEI mode (Text Embeddings Inference default)
-          - Otherwise -> Ollama mode (legacy dialect)
+          - Otherwise -> Ollama mode (modern /api/embed dialect, issue #571)
 
         Native TEI servers (HuggingFace Text Embeddings Inference) always expose
         the route ``POST /embed`` with an ``{"inputs": ...}`` payload, but only
@@ -453,8 +455,10 @@ class EmbeddingService:
             base_url = base_url.rstrip("/") + "/embed"
             return ("tei", base_url)
         else:
-            # Default to Ollama mode (legacy dialect)
-            base_url = base_url.rstrip("/") + "/api/embeddings"
+            # Default to Ollama mode (modern dialect — issue #571 flipped the
+            # bare-host fallback from the superseded /api/embeddings route to
+            # /api/embed; explicit legacy URLs still work as-is).
+            base_url = base_url.rstrip("/") + "/api/embed"
             return ("ollama", base_url)
 
     def _build_payload(self, text: str, config: Optional[_EmbeddingRequestConfig] = None) -> dict:

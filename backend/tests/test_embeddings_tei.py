@@ -118,7 +118,10 @@ class TestTeiProviderDetection:
         mock_tei_settings.ollama_embedding_url = "http://localhost:11434"
         service = EmbeddingService()
         assert service.provider_mode == "ollama"
-        assert service.embeddings_url == "http://localhost:11434/api/embeddings"
+        # Issue #571: the bare-host default now speaks the modern dialect
+        # (/api/embed) instead of the superseded /api/embeddings route; the
+        # mode must still be ollama (never TEI).
+        assert service.embeddings_url == "http://localhost:11434/api/embed"
 
 
 class TestTeiPayloadShape:

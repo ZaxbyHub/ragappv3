@@ -146,6 +146,30 @@ class Settings(BaseSettings):
     per-provider capability tables belong to model qualification (F2), not this
     switch."""
 
+    # Provider residency / context-window contracts (issue #571, E08)
+    ollama_keep_alive: str = "-1"
+    """Ollama ``keep_alive`` sent on the native preload call for the
+    thinking/editorial backends (issue #571). ``-1`` keeps the model loaded
+    indefinitely — the same effective residency the retired 30-second ping
+    loop provided; Ollama also accepts duration strings like ``"30m"`` or a
+    number of seconds (``0`` unloads immediately)."""
+    ollama_num_ctx: int = 4096
+    """Explicit ``num_ctx`` context window pinned at model load for the
+    thinking/editorial Ollama backends (issue #571). Defaults to Ollama's
+    documented default so this is a controls change, not a capability
+    change; the OpenAI-compatible surface cannot set it per request."""
+    lm_studio_ttl: int = 86400
+    """Idle TTL in seconds sent on Instant (LM Studio) chat payloads
+    (issue #571). The idle timer resets on every request; 86400 (24h) is far
+    more generous than LM Studio's 60-minute JIT default and than the
+    30-second-interval ping loop it replaces. LM Studio's JIT Auto-Evict
+    still unloads the model when a DIFFERENT model is requested."""
+    lm_studio_context_length: int = 4096
+    """Explicit context length requested from LM Studio's native model-load
+    endpoint for the Instant backend (issue #571). Defaults to LM Studio's
+    JIT default context window; the OpenAI-compatible surface cannot set it
+    per request."""
+
     # Library vault mapping for file watcher
     library_vault_id: Optional[int] = None
 
@@ -1519,6 +1543,36 @@ class Settings(BaseSettings):
         before startup."""
         if v < 1:
             raise ValueError("per-mode numeric settings must be >= 1")
+        return v
+
+    @field_validator(
+        "ollama_num_ctx",
+        "lm_studio_ttl",
+        "lm_studio_context_length",
+        mode="after",
+    )
+    @classmethod
+    def validate_provider_contract_positive_ints(cls, v: int) -> int:
+        """Validate provider residency/context contract settings (issue #571).
+
+        ``lm_studio_ttl`` uses LM Studio's seconds semantics (idle timer resets
+        on every request; ``0`` would unload immediately, which no deployment
+        wants as a default so values must be >= 1). ``ollama_num_ctx`` and
+        ``lm_studio_context_length`` size a context window, so 0 is meaningless."""
+        if v < 1:
+            raise ValueError("provider contract settings must be >= 1")
+        return v
+
+    @field_validator("ollama_keep_alive", mode="after")
+    @classmethod
+    def validate_ollama_keep_alive(cls, v: str) -> str:
+        """Validate the Ollama keep_alive expression (issue #571).
+
+        Ollama accepts ``-1`` (keep loaded), ``0`` (unload immediately), a
+        number of seconds, or a duration string like ``"5m"``/``"1h"``; only
+        an empty value is invalid here."""
+        if not v.strip():
+            raise ValueError("ollama_keep_alive must be a non-empty Ollama duration expression")
         return v
 
     @field_validator("library_vault_id", mode="after")
