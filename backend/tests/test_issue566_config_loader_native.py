@@ -1,0 +1,80 @@
+"""Issue #566 guardrail — Vite native config-loader compatibility of config files.
+
+Vite 8 loads ``frontend/vite.config.ts`` (and transitively ``vite.paths.ts``)
+through its native ESM config loader BY DEFAULT. That loader warns — and a
+future major is planned to reject — two classes of construct in config-loaded
+files:
+
+* CommonJS module-scope globals (``__dirname`` / ``__filename`` / ``require``),
+  which do not exist under native ESM execution;
+* extensionless relative imports (``./vite.paths``), which native ESM
+  resolution cannot load.
+
+Issue #566 fixed both (``import.meta.dirname`` at the alias and the explicit
+``./vite.paths.ts`` extension at the import). This module pins that shape the
+same way ``test_issue258_coverage_design.py`` pins the coverage-gate design:
+a source-inspection contract that fails loudly if either trigger is
+reintroduced into a config-loaded file, independent of whether a build
+happened to print a warning anyone read.
+
+Out of class by design: ``__dirname`` in Vitest TEST files (they run through
+the transform pipeline's bundler resolution, not the native config loader).
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
+
+# The files Vite's native config loader executes. vite.paths.ts is loaded
+# transitively via the config's relative import.
+CONFIG_LOADED_FILES = ("vite.config.ts", "vite.paths.ts")
+
+CJS_GLOBAL_RE = re.compile(r"\b(?:__dirname|__filename)\b|\brequire\s*\(")
+
+# Relative imports must carry a real module extension: './x.ts' (or .js,
+# .mjs, ...), never './x' and never a bare './vite.paths' whose dot belongs
+# to the file name. Bare specifiers (package imports) are unaffected.
+EXTENSIONLESS_RELATIVE_IMPORT_RE = re.compile(
+    r"""from\s+['"](\.[^'"]*)['"]"""
+)
+
+# A trailing segment that is a known script/data extension. './vite.paths'
+# fails this (its dot is part of the name); './vite.paths.ts' passes.
+_EXTENSION_RE = re.compile(r"\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|json)$")
+
+
+def _config_text(name: str) -> str:
+    path = FRONTEND / name
+    assert path.is_file(), f"config-loaded file {name} is missing"
+    return path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("name", CONFIG_LOADED_FILES)
+def test_config_files_have_no_cjs_only_globals(name: str) -> None:
+    """CJS globals are shimmed+warned today and rejected by the planned
+    native default — none may appear in a config-loaded file."""
+    text = _config_text(name)
+    match = CJS_GLOBAL_RE.search(text)
+    assert match is None, (
+        f"566 GUARDRAIL CHECK: FAIL — {name} uses the CommonJS-only global "
+        f"{match.group(0)!r} at offset {match.start()}; Vite's native config "
+        "loader does not support it (use import.meta.dirname / ESM imports)"
+    )
+    print(f"566 GUARDRAIL CHECK: PASS — {name} free of CJS-only globals")
+
+
+@pytest.mark.parametrize("name", CONFIG_LOADED_FILES)
+def test_config_files_relative_imports_have_extensions(name: str) -> None:
+    """Native ESM resolution requires explicit file extensions on relative
+    imports; an extensionless './vite.paths' style import warns today."""
+    text = _config_text(name)
+    for match in EXTENSIONLESS_RELATIVE_IMPORT_RE.finditer(text):
+        spec = match.group(1)
+        assert _EXTENSION_RE.search(spec), (
+            f"566 GUARDRAIL CHECK: FAIL — {name} imports {spec!r} without a "
+            "file extension; Vite's native config loader cannot resolve it"
+        )
+    print(f"566 GUARDRAIL CHECK: PASS — {name} relative imports carry extensions")

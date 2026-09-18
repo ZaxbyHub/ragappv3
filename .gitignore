@@ -37,6 +37,7 @@ yarn-error.log*
 .npm
 .yarn/
 frontend/dist/
+frontend/dist-dts/
 
 # IDEs
 .vscode/
