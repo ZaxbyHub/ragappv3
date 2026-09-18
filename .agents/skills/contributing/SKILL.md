@@ -123,7 +123,9 @@ and `docs/engineering/testing.md`.
 - **Base branch: `master`.** Default to a **draft** PR unless the user asks for
   ready-for-review.
 - PR body includes `## Summary` (1–3 bullets: what + why) and `## Test plan`
-  (a checklist of commands run and their results).
+  (a checklist of commands run and their results); when the PR closes an
+  issue, it also names `## Closure evidence` per
+  `docs/ci/closure-evidence-gate.md` (checked by the CI closure-evidence gate).
 - Never `git push --force` to a shared branch; use `--force-with-lease` to
   rewrite your own PR branch.
 
@@ -152,5 +154,5 @@ Do not invent or look for these — they belong to other repos:
 - [ ] Frontend: `typecheck`, `lint`, `test`, `build` pass (from `frontend/`)
 - [ ] Quality contracts: both `scripts/check_*.py` pass (from repo root)
 - [ ] New/updated tests assert real behavior and cover negative paths
-- [ ] PR targets `master`, is a draft by default, has `## Summary` + `## Test plan`
+- [ ] PR targets `master`, is a draft by default, has `## Summary` + `## Test plan` (+ `## Closure evidence` when it closes an issue)
 - [ ] Publication done via `commit-pr`

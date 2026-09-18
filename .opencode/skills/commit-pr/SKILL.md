@@ -87,6 +87,10 @@ and the current change touches them.
      - `## Summary`: 1-3 bullets explaining what changed and why.
      - `## Test plan`: markdown checklist of commands run and results.
      - `## Review follow-up`: only when addressing review feedback.
+     - `## Closure evidence`: when the PR body closes an issue
+       (`Closes #N`/`Fixes #N`), name the closure evidence (backend pytest
+       test id or existing artifact) per `docs/ci/closure-evidence-gate.md`
+       (the CI closure-evidence gate checks it).
      - Known warnings or intentionally skipped checks, with reasons.
 
 9. Final status check.
@@ -105,6 +109,13 @@ and the current change touches them.
 
 ## Review follow-up
 - <review follow-up bullet>
+
+## Closure evidence
+Closes #<issue>
+Closure evidence: backend/tests/test_<thing>.py::test_<name> -- fails on the
+pre-fix commit, passes on this PR head (re-executed by the Closure evidence
+workflow's verify-test).
 ```
 
-Omit `## Review follow-up` when there was no review feedback.
+Omit `## Review follow-up` when there was no review feedback. Omit
+`## Closure evidence` when the PR does not close an issue.

@@ -1,0 +1,135 @@
+name: Closure evidence
+
+# Issue #568 (Workstream K, PR 6 of 7, finding E13): enforce closure evidence
+# on `Closes #N` PR bodies and a cross-family second review for
+# `high`/`critical` issues. The gate lives in scripts/check_closure_evidence.py
+# (evaluate = structural gate; verify-test = re-execution of the named
+# evidence test at the pre-fix commit and the PR head). GitHub cannot block
+# the merge-time auto-close itself — enforcement is this required failing
+# check plus the documented reopen-on-merge procedure in
+# docs/ci/closure-evidence-gate.md.
+#
+# ROLLOUT (one release cycle warning-only, per #568): MODE defaults to warn
+# (non-blocking observations). Flip to enforce later by changing the default
+# below — that flip is a one-line change documented in the gate doc and the
+# pending release note. Rollback: disable or delete this workflow file.
+#
+# COORDINATION with sibling workflows (issue #565): deliberately distinct
+# workflow name ("Closure evidence" vs "CI" / "Nightly" / "Nightly quality
+# gates"), job name, and no shared artifacts.
+
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to evaluate (dispatch proving/dry-run mode)"
+        required: true
+      mode:
+        description: "warn (rollout default) or enforce"
+        required: false
+        default: "warn"
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: closure-evidence-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  closure-evidence-gate:
+    name: Closure evidence gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Live `gh api` fetching needs the intra-repo token path; fork PRs cannot
+    # authenticate it. Dispatch runs are in-repo by construction.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      # Structural gate: closing refs, named evidence, cross-family reviews.
+      # The step never fails on its own — the verdict step below applies the
+      # mode so warn runs always complete and print their observations.
+      - name: Evaluate closure evidence
+        id: evaluate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          MODE: ${{ inputs.mode || 'warn' }}
+        run: |
+          python scripts/check_closure_evidence.py evaluate \
+            --pr "$PR_NUMBER" --repo-slug "$GITHUB_REPOSITORY" --mode "$MODE" \
+            > evaluate.log 2>&1
+          EVAL_RC=$?
+          cat evaluate.log
+          TEST_ID="$(grep -m1 '^closure-evidence: evidence-test ' evaluate.log | sed 's/^closure-evidence: evidence-test //')"
+          {
+            echo "eval_rc=$EVAL_RC"
+            echo "test_id=$TEST_ID"
+            echo "mode=$MODE"
+          } >> "$GITHUB_OUTPUT"
+
+      # Behavioral gate: re-execute the named evidence test at the merge-base
+      # (pre-fix commit; must FAIL there — a brand-new test counts, it cannot
+      # run pre-fix) and at the PR head (must PASS). Base commit source:
+      # git merge-base of the PR's base branch and HEAD.
+      - name: Re-execute the named evidence test (verify-test)
+        id: verify
+        if: steps.evaluate.outputs.test_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_ID: ${{ steps.evaluate.outputs.test_id }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'master' }}
+        run: |
+          python -m pip install --quiet -r backend/requirements-ci.txt -r backend/requirements-dev.txt
+          BASE_SHA="$(git merge-base "origin/$BASE_REF" HEAD)"
+          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "verify-test base=$BASE_SHA head=$HEAD_SHA test=$TEST_ID"
+          python scripts/check_closure_evidence.py verify-test \
+            --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --test "$TEST_ID" \
+            > verify.log 2>&1
+          VERIFY_RC=$?
+          cat verify.log
+          echo "verify_rc=$VERIFY_RC" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # The MODE governs the exit code only (diagnostics above are always
+      # truthful): warn completes green with its WARN/ERROR observations;
+      # enforce fails the required check on any evaluation or re-execution
+      # violation.
+      - name: Apply gate mode (warn / enforce)
+        env:
+          EVAL_RC: ${{ steps.evaluate.outputs.eval_rc }}
+          VERIFY_RC: ${{ steps.verify.outputs.verify_rc }}
+          MODE: ${{ steps.evaluate.outputs.mode }}
+        run: |
+          VIOLATION=0
+          if [ "$EVAL_RC" != "0" ]; then VIOLATION=1; fi
+          if [ -n "${VERIFY_RC:-}" ] && [ "$VERIFY_RC" != "0" ]; then VIOLATION=1; fi
+          if [ "$MODE" = "enforce" ] && [ "$VIOLATION" != "0" ]; then
+            echo "closure-evidence: FAIL — enforce-mode violation (see evaluate/verify output above)"
+            exit 1
+          fi
+          if [ "$VIOLATION" != "0" ]; then
+            echo "closure-evidence: WARN — violation observed in warn mode (non-blocking rollout)"
+          else
+            echo "closure-evidence: OK"
+          fi
