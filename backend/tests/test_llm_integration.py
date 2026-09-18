@@ -113,6 +113,13 @@ class TestModelChecker(unittest.TestCase):
 
     def setUp(self):
         """Set up test fixtures."""
+        # The model_checker circuit breaker is a module-level singleton shared
+        # across the suite; a previously-run test whose probes failed (e.g.
+        # the SSRF checker test with mocked DNS) can leave it OPEN and break
+        # every test here under randomized ordering. Reset for hermeticity.
+        from app.services.circuit_breaker import model_checker_cb
+
+        model_checker_cb.reset()
         self.settings_patcher = patch("app.services.model_checker.settings")
         self.mock_settings = self.settings_patcher.start()
         self.mock_settings.ollama_embedding_url = "http://localhost:11434"

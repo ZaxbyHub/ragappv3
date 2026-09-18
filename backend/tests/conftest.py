@@ -101,6 +101,42 @@ def _bypass_csrf_for_csrf_naive_tests(request):
 
 
 @pytest.fixture(autouse=True)
+def _default_configured_chat_endpoints():
+    """Provide configured chat endpoints for suites that exercise chat routes.
+
+    The app ships no chat-model defaults (issue #570): the Settings singleton
+    starts with empty ``chat_model`` / ``instant_chat_model`` / URL pairs, and
+    the chat routes answer 409 until configured. Most existing HTTP suites
+    test chat behavior, not the unconfigured state, so they get a complete
+    localhost pair here. Suites that DO test the unconfigured state
+    (``test_unconfigured_models.py``, ``test_chat_unconfigured_routes.py``)
+    empty the fields per-test via their own context managers, which override
+    this fixture's values for the test's duration.
+    """
+    from app.config import settings
+
+    saved = (
+        settings.ollama_chat_url,
+        settings.chat_model,
+        settings.instant_chat_url,
+        settings.instant_chat_model,
+    )
+    if not (settings.ollama_chat_url and settings.chat_model):
+        settings.ollama_chat_url = "http://localhost:11434"
+        settings.chat_model = "test-chat-model"
+    if not (settings.instant_chat_url and settings.instant_chat_model):
+        settings.instant_chat_url = "http://localhost:1234"
+        settings.instant_chat_model = "test-instant-model"
+    yield
+    (
+        settings.ollama_chat_url,
+        settings.chat_model,
+        settings.instant_chat_url,
+        settings.instant_chat_model,
+    ) = saved
+
+
+@pytest.fixture(autouse=True)
 def _reset_rate_limiter():
     """Reset the in-memory rate limiter and circuit breakers before every test.
 

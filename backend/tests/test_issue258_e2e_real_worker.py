@@ -233,6 +233,18 @@ class TestRealWorkerEndToEnd(unittest.TestCase):
         # tests/test_559_c05_proving.py.
         self._orig_lease_flag = settings.ingestion_job_lease_enabled
         settings.ingestion_job_lease_enabled = False
+        # Chat endpoints ship no defaults (issue #570): the chat leg of this
+        # E2E configures a pair deliberately.
+        self._orig_chat_cfg = (
+            settings.ollama_chat_url,
+            settings.chat_model,
+            settings.instant_chat_url,
+            settings.instant_chat_model,
+        )
+        settings.ollama_chat_url = "http://localhost:11434"
+        settings.chat_model = "test-model"
+        settings.instant_chat_url = "http://localhost:1234"
+        settings.instant_chat_model = "test-instant"
         from app.main import app
 
         self.app = app
@@ -256,6 +268,12 @@ class TestRealWorkerEndToEnd(unittest.TestCase):
         self.app.dependency_overrides.pop(get_rag_engine, None)
         settings.data_dir = self._orig_data_dir
         settings.ingestion_job_lease_enabled = self._orig_lease_flag
+        (
+            settings.ollama_chat_url,
+            settings.chat_model,
+            settings.instant_chat_url,
+            settings.instant_chat_model,
+        ) = self._orig_chat_cfg
         self._cleanup()
 
     def test_upload_real_worker_indexed_then_retrievable(self):

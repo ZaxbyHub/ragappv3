@@ -98,6 +98,14 @@ class TestIssue494AC28DialectFallbackChain(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=transport) as client:
             return await checker._check_model_availability(client, base_url, MODEL)
 
+    async def asyncSetUp(self) -> None:
+        # Shared module-level breaker (PR #619 review F-005): reset so a
+        # previously-run checker test cannot leave it OPEN under randomized
+        # ordering.
+        from app.services.circuit_breaker import model_checker_cb
+
+        model_checker_cb.reset()
+
     async def test_dialect_fallback_chain(self) -> None:
         # ---- (a) 404 on primary ollama dialect -> openai dialect serves ----
         checker = ModelChecker(timeout=PRIMARY_TIMEOUT, fallback_timeout=FALLBACK_TIMEOUT)

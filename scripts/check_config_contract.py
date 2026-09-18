@@ -160,6 +160,45 @@ def main() -> int:
             f"{compose_cors_default!r} does not match backend default {backend_default!r}"
         )
 
+    # Chat-model endpoints ship EMPTY by default (issue #570 re-scope): the
+    # system prescribes no model; operators configure endpoints at first
+    # setup or in Settings -> Models. Enforce the emptiness contract across
+    # every mirrored surface so no future default can silently return.
+    empty_default_fields = (
+        "chat_model",
+        "instant_chat_model",
+        "ollama_chat_url",
+        "instant_chat_url",
+    )
+    for field_name in empty_default_fields:
+        value = backend_str_default(backend_config, field_name)
+        if value is None:
+            failures.append(
+                f"backend/app/config.py {field_name} default could not be parsed"
+            )
+        elif value != "":
+            failures.append(
+                f"empty-model-defaults: backend/app/config.py {field_name} ships "
+                f"default {value!r}; model endpoints must ship unconfigured "
+                "(configure at setup, not in code)"
+            )
+    for env_name in empty_default_fields:
+        env_val = env_value(env_text, env_name.upper())
+        if env_val is not None:
+            failures.append(
+                f"empty-model-defaults: .env.example sets {env_name.upper()}="
+                f"{env_val!r}; ship it as a commented example instead"
+            )
+        if env_name.upper() not in compose_text:
+            failures.append(f"docker-compose.yml is missing {env_name.upper()}")
+        else:
+            compose_val = compose_default(compose_text, env_name.upper())
+            if compose_val:
+                failures.append(
+                    f"empty-model-defaults: docker-compose.yml {env_name.upper()} "
+                    f"interpolation default {compose_val!r} must be empty"
+                )
+
     upload_default = backend_int_default(backend_config, "max_file_size_mb")
     if upload_default is None:
         failures.append("backend/app/config.py max_file_size_mb default could not be parsed")

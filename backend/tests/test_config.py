@@ -1,6 +1,7 @@
 """Unit tests for config Settings defaults."""
 
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -28,9 +29,13 @@ class TestSettingsDefaults(unittest.TestCase):
         self.assertEqual(
             settings.ollama_embedding_url, "http://harrier-embed:8080/v1/embeddings"
         )
-        self.assertEqual(settings.ollama_chat_url, "http://host.docker.internal:11434")
         self.assertEqual(settings.embedding_model, "microsoft/harrier-oss-v1-0.6b")
-        self.assertEqual(settings.chat_model, "gemma-4-26b-a4b-it-apex")
+        # Chat endpoints ship unconfigured (issue #570 re-scope): the system
+        # prescribes no model; operators configure endpoints at setup.
+        self.assertEqual(settings.ollama_chat_url, "")
+        self.assertEqual(settings.chat_model, "")
+        self.assertEqual(settings.instant_chat_url, "")
+        self.assertEqual(settings.instant_chat_model, "")
         # New character-based fields
         self.assertEqual(settings.chunk_size_chars, 2000)
         self.assertEqual(settings.chunk_overlap_chars, 200)
@@ -52,6 +57,38 @@ class TestSettingsDefaults(unittest.TestCase):
         self.assertEqual(settings.auto_scan_interval_minutes, 60)
         self.assertEqual(settings.log_level, "INFO")
         self.assertEqual(settings.port, 9090)
+
+
+class TestChunkDocstringSync(unittest.TestCase):
+    """Field docstrings must state the effective chunk defaults (issue #570 C31)."""
+
+    def test_chunk_docstrings_match_effective_defaults(self):
+        """chunk_size_chars/chunk_overlap_chars docstrings name their resolved values."""
+        settings = Settings(
+            _env_file=None,
+            admin_secret_token="test-admin-token",
+            jwt_secret_key="test-jwt-secret-key",
+        )
+        config_source = (
+            Path(__file__).resolve().parents[1] / "app" / "config.py"
+        ).read_text(encoding="utf-8")
+        for field, effective in (
+            ("chunk_size_chars", settings.chunk_size_chars),
+            ("chunk_overlap_chars", settings.chunk_overlap_chars),
+        ):
+            match = re.search(
+                rf"{field}: int \| None = None\s*\n\s*\"\"\"(.*?)\"\"\"",
+                config_source,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(match, f"{field} docstring not found in config.py")
+            docstring = match.group(1)
+            self.assertIn(
+                str(effective),
+                docstring,
+                f"{field} docstring {docstring!r} does not state the effective "
+                f"default {effective}",
+            )
 
 
 class TestRagRelevanceThreshold(unittest.TestCase):

@@ -340,13 +340,20 @@ def _provider_model_name(logical_mode: str) -> str:
     """Non-secret model identifier for the logical mode (SPEC §9.2).
 
     Persisted on stage artifacts, which are client-visible, so this must never
-    return an endpoint, credential or configured allowlist entry.
+    return an endpoint, credential or configured allowlist entry. An
+    unconfigured mode records the literal "unconfigured" — never a fabricated
+    model name (issue #570: no model defaults ship; per-stage client
+    construction fails with actionable guidance instead).
     """
     if logical_mode == "editorial":
-        return settings.editorial_chat_model or settings.chat_model or "thinking"
+        return (
+            settings.editorial_chat_model
+            or settings.chat_model
+            or "unconfigured"
+        )
     if logical_mode == "instant":
-        return settings.instant_chat_model or "instant"
-    return settings.chat_model or "thinking"
+        return settings.instant_chat_model or "unconfigured"
+    return settings.chat_model or "unconfigured"
 
 
 def _provider_base_url(logical_mode: str) -> str:

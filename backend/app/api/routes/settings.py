@@ -861,9 +861,9 @@ class SettingsResponse(BaseModel):
     embedding_model: str
     chat_model: str
 
-    # Instant mode (LM Studio)
-    instant_chat_url: str = "http://host.docker.internal:1234"
-    instant_chat_model: str = "nvidia/nemotron-3-nano-4b"
+    # Instant mode (operator-configured; no shipped default, issue #570)
+    instant_chat_url: str = ""
+    instant_chat_model: str = ""
     default_chat_mode: str = "thinking"
     ingestion_llm_mode: str = "instant"
     instant_initial_retrieval_top_k: int = 10
@@ -1252,7 +1252,22 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
     ``LLMClient.reconfigure`` mutates ``base_url``/``model`` in place,
     preserving every external reference (LLMHealthChecker,
     background_processor, keepalive task, RAGEngine).
+
+    Late activation (issue #570): when the app booted unconfigured (client
+    is None) and this update completes the endpoint pair, the missing
+    client is constructed here and wired into ``app.state`` and the
+    RAGEngine overrides. Construction is synchronous on purpose —
+    ``LLMClient._ensure_started`` lazily starts the transport on the first
+    request's own event loop, so the sync settings handlers need no loop
+    and no cross-loop handoff happens. Keep-alive tasks for late-activated
+    clients resume on the next restart.
     """
+    from app.services.llm_client import (
+        ModelNotConfiguredError,
+        create_instant_client,
+        create_thinking_client,
+    )
+
     thinking_client = getattr(app.state, "thinking_llm_client", None)
     instant_client = getattr(app.state, "instant_llm_client", None)
     # Review F5 (PR #576): max_tokens and the instant thinking kwarg are read
@@ -1264,43 +1279,137 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
         or update.chat_model is not None
         or update.thinking_max_tokens is not None
     ):
-        thinking_client.reconfigure(
-            base_url=settings.ollama_chat_url,
-            model=settings.chat_model,
-            max_tokens=settings.thinking_max_tokens,
-        )
+        if not (settings.ollama_chat_url and settings.chat_model):
+            # The update cleared the pair: de-activate rather than
+            # reconfigure — reconfigure would run assert_url_safe("") on the
+            # now-empty URL and 500. Requests are 409-guarded from here on.
+            logger.info(
+                "Thinking chat endpoints cleared; existing client parked "
+                "(chat returns 409 until reconfigured)"
+            )
+        else:
+            thinking_client.reconfigure(
+                base_url=settings.ollama_chat_url,
+                model=settings.chat_model,
+                max_tokens=settings.thinking_max_tokens,
+            )
+    elif (
+        thinking_client is None
+        and (update.ollama_chat_url is not None or update.chat_model is not None)
+        and settings.ollama_chat_url
+        and settings.chat_model
+    ):
+        # Late activation: the pair just became complete on a previously
+        # unconfigured boot. Construct and wire the client (see docstring).
+        try:
+            thinking_client = create_thinking_client()
+        except ModelNotConfiguredError as exc:
+            logger.debug("Thinking activation skipped: %s", exc)
+        else:
+            app.state.thinking_llm_client = thinking_client
+            if getattr(app.state, "llm_client", None) is None:
+                app.state.llm_client = thinking_client
+            rag_engine = getattr(app.state, "rag_engine", None)
+            if rag_engine is not None:
+                engine_kwargs = {"thinking_client": thinking_client}
+                if getattr(rag_engine, "llm_client", None) is None:
+                    engine_kwargs["llm_client"] = thinking_client
+                rag_engine.rebind_clients(**engine_kwargs)
+            logger.info(
+                "Thinking chat model configured; client activated live (no restart needed)"
+            )
     if instant_client is not None and (
         update.instant_chat_url is not None
         or update.instant_chat_model is not None
         or update.instant_max_tokens is not None
         or update.instant_enable_thinking is not None
     ):
-        # Issue #554: the no-think control is family-selected from the
-        # (possibly just-swapped) instant_chat_model rather than hard-coded —
-        # so a runtime model swap installs OR removes the control per family,
-        # failing open (no control) for unrecognized families.
-        from app.services.llm_client import select_no_think_chat_template_kwargs
+        if not (settings.instant_chat_url and settings.instant_chat_model):
+            # Cleared pair: de-activate (see the thinking branch above).
+            logger.info(
+                "Instant chat endpoints cleared; existing client parked "
+                "(instant mode returns 409 until reconfigured)"
+            )
+        else:
+            # Issue #554: the no-think control is family-selected from the
+            # (possibly just-swapped) instant_chat_model rather than
+            # hard-coded — so a runtime model swap installs OR removes the
+            # control per family, failing open (no control) for
+            # unrecognized families.
+            from app.services.llm_client import (
+                select_no_think_chat_template_kwargs,
+            )
 
-        instant_client.reconfigure(
-            base_url=settings.instant_chat_url,
-            model=settings.instant_chat_model,
-            max_tokens=settings.instant_max_tokens,
-            chat_template_kwargs=(
-                None
-                if settings.instant_enable_thinking
-                else select_no_think_chat_template_kwargs(settings.instant_chat_model)
-            ),
+            instant_client.reconfigure(
+                base_url=settings.instant_chat_url,
+                model=settings.instant_chat_model,
+                max_tokens=settings.instant_max_tokens,
+                chat_template_kwargs=(
+                    None
+                    if settings.instant_enable_thinking
+                    else select_no_think_chat_template_kwargs(
+                        settings.instant_chat_model
+                    )
+                ),
+            )
+    elif (
+        instant_client is None
+        and (
+            update.instant_chat_url is not None
+            or update.instant_chat_model is not None
+            or update.instant_enable_thinking is not None
         )
-    if update.ingestion_llm_mode is not None:
-        background_processor = getattr(app.state, "background_processor", None)
-        if background_processor is not None:
-            if settings.ingestion_llm_mode == "instant":
-                ingestion_client = instant_client
-            elif settings.ingestion_llm_mode == "thinking":
-                ingestion_client = thinking_client
-            else:
-                ingestion_client = None
-            background_processor.set_llm_client(ingestion_client)
+        and settings.instant_chat_url
+        and settings.instant_chat_model
+    ):
+        # Late activation: see the thinking branch above.
+        try:
+            instant_client = create_instant_client()
+        except ModelNotConfiguredError as exc:
+            logger.debug("Instant activation skipped: %s", exc)
+        else:
+            app.state.instant_llm_client = instant_client
+            rag_engine = getattr(app.state, "rag_engine", None)
+            if rag_engine is not None:
+                rag_engine.rebind_clients(instant_client=instant_client)
+            logger.info(
+                "Instant chat model configured; client activated live (no restart needed)"
+            )
+    def _effective_ingestion_client() -> "object | None":
+        # The selected mode's endpoint pair must be COMPLETE for its client
+        # to serve ingestion work; a cleared pair detaches the worker (PR
+        # #619 final-critic Round 3: parking a client must also unhook it
+        # from the background processor, or contextual chunking keeps
+        # sending to the endpoint the operator removed).
+        if settings.ingestion_llm_mode == "instant":
+            if not (settings.instant_chat_url and settings.instant_chat_model):
+                return None
+            return instant_client
+        if settings.ingestion_llm_mode == "thinking":
+            if not (settings.ollama_chat_url and settings.chat_model):
+                return None
+            return thinking_client
+        return None
+
+    background_processor = getattr(app.state, "background_processor", None)
+    if background_processor is not None and (
+        update.ingestion_llm_mode is not None
+        or (
+            settings.ingestion_llm_mode == "instant"
+            and (
+                update.instant_chat_url is not None
+                or update.instant_chat_model is not None
+            )
+        )
+        or (
+            settings.ingestion_llm_mode == "thinking"
+            and (
+                update.ollama_chat_url is not None
+                or update.chat_model is not None
+            )
+        )
+    ):
+        background_processor.set_llm_client(_effective_ingestion_client())
     mm_client = getattr(app.state, "multimodal_client", None)
     if mm_client is not None and (
         update.multimodal_chat_url is not None or update.multimodal_model is not None

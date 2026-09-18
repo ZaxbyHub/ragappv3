@@ -1126,14 +1126,24 @@ class LLMClient:
             self._client = None
 
 
+class ModelNotConfiguredError(RuntimeError):
+    """A chat-model endpoint pair (URL + model) is not configured.
+
+    The system ships no model defaults (issue #570): operators configure
+    endpoints via env vars or Settings -> Models. Factories raise this
+    instead of constructing a client that would send an empty model name.
+    """
+
+
 def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
     """Create an LLMClient configured for the Thinking backend (Ollama).
 
-    Talks to ``settings.ollama_chat_url`` with ``settings.chat_model``
-    (default ``gemma-4-26b-a4b-it-apex``). Carries the Ollama
-    /v1-documented reasoning control ``reasoning_effort='high'`` (issue
-    #554): Ollama's OpenAI-compatibility doc lists ``reasoning_effort``
-    (high/medium/low/max/none) as the supported
+    Talks to ``settings.ollama_chat_url`` with ``settings.chat_model`` —
+    both operator-configured (no shipped default; configure them via
+    ``OLLAMA_CHAT_URL``/``CHAT_MODEL`` or Settings -> Models). Carries the
+    Ollama /v1-documented reasoning control ``reasoning_effort='high'``
+    (issue #554): Ollama's OpenAI-compatibility doc lists
+    ``reasoning_effort`` (high/medium/low/max/none) as the supported
     ``/v1/chat/completions`` request field and documents no ``think``
     field there (``think`` is native ``/api/chat``-only). Deployments on
     older Ollama versions that do not recognize the field ignore it, which
@@ -1151,6 +1161,12 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
     documented default) are applied by :meth:`LLMClient.prime_residency`
     at startup — the OpenAI-compatible surface cannot express either.
     """
+    if not settings.ollama_chat_url or not settings.chat_model:
+        raise ModelNotConfiguredError(
+            "Thinking chat model is not configured. Set OLLAMA_CHAT_URL and "
+            "CHAT_MODEL (e.g. an Ollama, LM Studio, or vLLM endpoint), or "
+            "configure it in Settings -> Models."
+        )
     return LLMClient(
         timeout=timeout,
         base_url=settings.ollama_chat_url,
@@ -1177,10 +1193,19 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
     explicit override is configured (otherwise its URL+model equal the
     thinking client's and the thinking prime pins the same server).
     """
+    base_url = settings.editorial_chat_url or settings.ollama_chat_url
+    model = settings.editorial_chat_model or settings.chat_model
+    if not base_url or not model:
+        raise ModelNotConfiguredError(
+            "Editorial chat model is not configured. Set "
+            "DRAFT_EDITORIAL_CHAT_URL/MODEL, or the thinking pair "
+            "(OLLAMA_CHAT_URL + CHAT_MODEL) it falls back to, or configure "
+            "them in Settings -> Models."
+        )
     return LLMClient(
         timeout=timeout,
-        base_url=settings.editorial_chat_url or settings.ollama_chat_url,
-        model=settings.editorial_chat_model or settings.chat_model,
+        base_url=base_url,
+        model=model,
         cb_name="llm_editorial",
         keep_alive=settings.ollama_keep_alive,
         num_ctx=settings.ollama_num_ctx,
@@ -1190,7 +1215,9 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
 def create_instant_client(timeout: float = 120.0) -> "LLMClient":
     """Create the Instant client (LM Studio, ``settings.instant_chat_url``).
 
-    Default model ``settings.instant_chat_model`` (``nvidia/nemotron-3-nano-4b``).
+    Both the URL and ``settings.instant_chat_model`` are
+    operator-configured (no shipped default; configure via
+    ``INSTANT_CHAT_URL``/``INSTANT_CHAT_MODEL`` or Settings -> Models).
     ``settings.instant_enable_thinking`` (FU-005, issue #494; default False)
     selects the posture: True sends no control at all and the provider/model
     chat-template default governs; False sends the family-appropriate
@@ -1198,7 +1225,7 @@ def create_instant_client(timeout: float = 120.0) -> "LLMClient":
     :func:`select_no_think_chat_template_kwargs` for the configured
     ``instant_chat_model`` (issue #554) — Qwen-family names get
     ``chat_template_kwargs={'enable_thinking': False}``, unrecognized
-    families (e.g. the nemotron default, whose card names no template
+    families (e.g. nemotron models, whose cards name no template
     mechanism) log a warning and send nothing, failing open. The client
     also carries ``settings.instant_max_tokens`` as its default generation
     budget (ENH-015, issue #494), mirroring ``create_thinking_client``.
@@ -1211,6 +1238,12 @@ def create_instant_client(timeout: float = 120.0) -> "LLMClient":
     Note LM Studio's JIT Auto-Evict unloads this model when a DIFFERENT
     model is requested on the same server.
     """
+    if not settings.instant_chat_url or not settings.instant_chat_model:
+        raise ModelNotConfiguredError(
+            "Instant chat model is not configured. Set INSTANT_CHAT_URL and "
+            "INSTANT_CHAT_MODEL (e.g. an LM Studio or llama-server endpoint), "
+            "or configure it in Settings -> Models."
+        )
     # Pydantic guarantees a real bool here; the identity check keeps
     # partially mocked settings objects (tests) on the default-False branch.
     chat_template_kwargs = (

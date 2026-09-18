@@ -39,10 +39,33 @@ def test_per_instance_circuit_breaker_distinct_objects():
     assert a._circuit_breaker is not b._circuit_breaker
 
 
-def test_thinking_and_instant_factories_have_distinct_breakers():
+def test_thinking_and_instant_factories_have_distinct_breakers(monkeypatch):
     """Factory-created Thinking and Instant clients must have isolated breakers and distinct names."""
-    thinking = create_thinking_client()
-    instant = create_instant_client()
+    # No chat endpoints ship by default (issue #570): configure pairs for
+    # the factory construction this test exercises.
+    monkeypatch.setenv("ALLOW_LOCAL_SERVICES", "1")
+    from app.config import settings
+
+    saved = (
+        settings.ollama_chat_url,
+        settings.chat_model,
+        settings.instant_chat_url,
+        settings.instant_chat_model,
+    )
+    settings.ollama_chat_url = "http://localhost:11434"
+    settings.chat_model = "t"
+    settings.instant_chat_url = "http://localhost:1234"
+    settings.instant_chat_model = "i"
+    try:
+        thinking = create_thinking_client()
+        instant = create_instant_client()
+    finally:
+        (
+            settings.ollama_chat_url,
+            settings.chat_model,
+            settings.instant_chat_url,
+            settings.instant_chat_model,
+        ) = saved
     assert thinking._circuit_breaker is not instant._circuit_breaker
     assert thinking._circuit_breaker.name == "llm_thinking"
     assert instant._circuit_breaker.name == "llm_instant"

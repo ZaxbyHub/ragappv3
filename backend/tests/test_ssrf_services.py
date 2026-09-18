@@ -338,17 +338,20 @@ class TestLLMClientSSRF(unittest.TestCase):
             mock_settings.ollama_chat_url = "https://api.example.com/v1/chat"
             mock_settings.chat_model = "qwen2.5:32b"
 
-        with patch(
-            "socket.getaddrinfo",
-            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
-        ):
-            from app.services.llm_client import LLMClient
+            # Nested: construction must happen while the settings patch is
+            # active — the real singleton ships no chat-endpoint default
+            # (issue #570).
+            with patch(
+                "socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+            ):
+                from app.services.llm_client import LLMClient
 
-            # Must not raise URLBlocked
-            try:
-                _ = LLMClient()
-            except URLBlocked:
-                self.fail("LLMClient raised URLBlocked for public URL")
+                # Must not raise URLBlocked
+                try:
+                    _ = LLMClient()
+                except URLBlocked:
+                    self.fail("LLMClient raised URLBlocked for public URL")
 
     def test_init_with_explicit_base_url_raises_for_private(self):
         """LLMClient(base_url=...) must raise URLBlocked for private explicit URL."""
@@ -385,6 +388,9 @@ class TestModelCheckerSSRF(unittest.TestCase):
     """
 
     def setUp(self):
+        from app.services.circuit_breaker import model_checker_cb
+
+        model_checker_cb.reset()
         self._orig_env = os.environ.pop("ALLOW_LOCAL_SERVICES", None)
 
     def tearDown(self):
@@ -513,27 +519,30 @@ class TestModelCheckerSSRF(unittest.TestCase):
             mock_settings.chat_model = "qwen2.5:32b"
             mock_settings.instant_chat_model = "nemotron"
 
-        with patch(
-            "socket.getaddrinfo",
-            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
-        ):
-            from app.services.model_checker import ModelChecker
+            # Nested: the checker must run while the settings patch is
+            # active — the real singleton ships no chat-endpoint default
+            # (issue #570) and would short-circuit to not_configured.
+            with patch(
+                "socket.getaddrinfo",
+                return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))],
+            ):
+                from app.services.model_checker import ModelChecker
 
-            checker = ModelChecker()
+                checker = ModelChecker()
 
-            import asyncio
+                import asyncio
 
-            async def run():
-                await checker.check_models()
+                async def run():
+                    await checker.check_models()
 
-            # Must not raise URLBlocked for public URLs
-            try:
-                asyncio.run(run())
-            except URLBlocked:
-                self.fail("ModelChecker raised URLBlocked for public URLs")
-            except Exception:
-                # HTTP errors are fine - we only care URLBlocked isn't raised
-                pass
+                # Must not raise URLBlocked for public URLs
+                try:
+                    asyncio.run(run())
+                except URLBlocked:
+                    self.fail("ModelChecker raised URLBlocked for public URLs")
+                except Exception:
+                    # HTTP errors are fine - we only care URLBlocked isn't raised
+                    pass
 
     def test_urlblocked_propagates_from_check_models(self):
         """URLBlocked must propagate from check_models, not be caught internally."""

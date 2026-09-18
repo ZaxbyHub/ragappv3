@@ -26,6 +26,8 @@ from app.services.file_watcher import FileWatcher
 from app.services.kms_compile_processor import KMSCompileProcessor
 from app.services.kms_retrieval import KMSRetrievalService
 from app.services.llm_client import (
+    LLMClient,
+    ModelNotConfiguredError,
     create_instant_client,
     create_thinking_client,
 )
@@ -125,6 +127,35 @@ def select_ingestion_llm_client(app: FastAPI, mode: str):
     return None
 
 
+
+def _create_llm_clients() -> "tuple[LLMClient | None, LLMClient | None]":
+    """Build the dual LLM clients, or (None, None) when unconfigured.
+
+    The system ships no chat-model defaults (issue #570): when either
+    endpoint pair is incomplete the factory raises ModelNotConfiguredError,
+    which here means "not configured yet" — an info line, never a boot
+    failure. The app runs degraded (chat requests 409 with setup guidance)
+    until an operator configures endpoints; Settings saves then activate
+    the missing clients live via _hot_rebind_llm_clients.
+    """
+    thinking: LLMClient | None = None
+    instant: LLMClient | None = None
+    try:
+        thinking = create_thinking_client()
+    except ModelNotConfiguredError:
+        logger.info(
+            "Thinking chat model not configured; chat is disabled until an "
+            "endpoint is set (Settings -> Models or OLLAMA_CHAT_URL/CHAT_MODEL)"
+        )
+    try:
+        instant = create_instant_client()
+    except ModelNotConfiguredError:
+        logger.info(
+            "Instant chat model not configured; instant mode is disabled "
+            "until an endpoint is set (Settings -> Models or "
+            "INSTANT_CHAT_URL/INSTANT_CHAT_MODEL)"
+        )
+    return thinking, instant
 def _validate_setting_value(key: str, value) -> bool:
     """Validate a single setting value through Pydantic field validation.
 
@@ -558,20 +589,24 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Upload migration failed (continuing anyway): {e}")
 
-    # Dual LLM clients: Thinking (gpt-oss-120b on DGX Spark via ollama_chat_url)
-    # and Instant (Nemotron 3 Nano 4B on LM Studio via instant_chat_url).
-    app.state.thinking_llm_client = create_thinking_client()
-    await _safe_await(
-        app.state.thinking_llm_client.start(),
-        "Thinking LLM client start",
-        timeout=10,
-    )
-    app.state.instant_llm_client = create_instant_client()
-    await _safe_await(
-        app.state.instant_llm_client.start(),
-        "Instant LLM client start",
-        timeout=10,
-    )
+    # Dual LLM clients, both operator-configured (no shipped defaults,
+    # issue #570): Thinking (any OpenAI-compatible endpoint via
+    # ollama_chat_url/chat_model) and Instant (via instant_chat_url/
+    # instant_chat_model). Unconfigured pairs boot as None — chat returns
+    # a 409 pointing at Settings -> Models until an endpoint is configured.
+    app.state.thinking_llm_client, app.state.instant_llm_client = _create_llm_clients()
+    if app.state.thinking_llm_client is not None:
+        await _safe_await(
+            app.state.thinking_llm_client.start(),
+            "Thinking LLM client start",
+            timeout=10,
+        )
+    if app.state.instant_llm_client is not None:
+        await _safe_await(
+            app.state.instant_llm_client.start(),
+            "Instant LLM client start",
+            timeout=10,
+        )
     # Back-compat alias — every existing consumer (LLMHealthChecker,
     # background_processor, keepalive, RAGEngine) reads ``llm_client``.
     app.state.llm_client = app.state.thinking_llm_client

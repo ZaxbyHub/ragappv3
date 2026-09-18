@@ -332,6 +332,11 @@ class TestAC31bInstantEnableThinkingSetting(unittest.IsolatedAsyncioTestCase):
 
         previous = getattr(live_settings, "instant_enable_thinking")
         setattr(live_settings, "instant_enable_thinking", True)
+        # No endpoint defaults ship (issue #570): configure the instant pair
+        # the factory construction needs.
+        saved_pair = (live_settings.instant_chat_url, live_settings.instant_chat_model)
+        live_settings.instant_chat_url = "http://localhost:1234"
+        live_settings.instant_chat_model = "i"
         try:
             payloads: list = []
             client = _payload_capture_client(payloads)
@@ -353,6 +358,7 @@ class TestAC31bInstantEnableThinkingSetting(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             setattr(live_settings, "instant_enable_thinking", previous)
+            (live_settings.instant_chat_url, live_settings.instant_chat_model) = saved_pair
 
 
 # ------------------------------------------------------------------
@@ -368,7 +374,11 @@ class TestAC38ThinkingMaxTokensEndToEnd(unittest.IsolatedAsyncioTestCase):
         client = _payload_capture_client(payloads)
         self.addAsyncCleanup(client.aclose)
 
-        settings_with_cap = Settings(thinking_max_tokens=1234)
+        settings_with_cap = Settings(
+            thinking_max_tokens=1234,
+            ollama_chat_url="http://localhost:11434",
+            chat_model="t",
+        )
         with patch(
             "app.services.llm_client.settings", settings_with_cap
         ), patch("app.services.llm_client.assert_url_safe"):

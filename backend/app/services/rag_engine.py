@@ -315,7 +315,11 @@ class RAGEngine:
         self.embedding_service = embedding_service or EmbeddingService()
         self.vector_store = vector_store or None
         self.memory_store = memory_store or MemoryStore()
-        self.llm_client = llm_client or LLMClient()
+        # llm_client may legitimately be None: the system ships no chat-model
+        # defaults (issue #570), so an unconfigured boot passes None here and
+        # the per-mode properties below read as None until an operator
+        # configures endpoints (route guards turn that into a 409).
+        self.llm_client = llm_client
         # Per-mode client overrides. When None, the ``thinking_client`` /
         # ``instant_client`` properties fall back to ``self.llm_client`` so
         # tests that mutate ``engine.llm_client`` post-construction continue
@@ -344,8 +348,9 @@ class RAGEngine:
                 "RAGEngine created without injected memory_store - using default instance"
             )
         if llm_client is None:
-            logger.warning(
-                "RAGEngine created without injected llm_client - using default instance"
+            # Designed unconfigured-chat state (issue #570), not a DI mistake.
+            logger.info(
+                "RAGEngine created without an llm_client (chat not configured yet)"
             )
 
         # Initialize vector store if not provided
@@ -432,6 +437,28 @@ class RAGEngine:
     def instant_client(self) -> LLMClient:
         """LLM client for Instant mode. Falls back to ``self.llm_client`` when no explicit override was passed at construction."""
         return self._instant_client_override or self.llm_client
+
+    def rebind_clients(
+        self,
+        *,
+        thinking_client: Optional[LLMClient] = None,
+        instant_client: Optional[LLMClient] = None,
+        llm_client: Optional[LLMClient] = None,
+    ) -> None:
+        """Wire late-activated LLM clients into the running engine.
+
+        The per-mode properties above are read-only, so runtime activation
+        (an operator completing a previously-unconfigured endpoint pair via
+        Settings, issue #570) rebinds through the override attributes this
+        method owns. Only the arguments passed are changed; None arguments
+        leave the current wiring untouched.
+        """
+        if thinking_client is not None:
+            self._thinking_client_override = thinking_client
+        if instant_client is not None:
+            self._instant_client_override = instant_client
+        if llm_client is not None:
+            self.llm_client = llm_client
 
     def _get_query_transformer(self, client: LLMClient) -> QueryTransformer:
         """Return a per-client cached ``QueryTransformer``.

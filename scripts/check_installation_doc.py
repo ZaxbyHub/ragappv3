@@ -329,7 +329,13 @@ def compose_findings(doc: str) -> list[str]:
 
 
 def model_pull_findings(doc: str) -> list[str]:
-    pulled = set(OLLAMA_PULL_RE.findall(doc))
+    # Commented-out `ollama pull` lines (leading '#') do not provision a model;
+    # only active lines count (issue #570 C28 — a commented pull let the
+    # unpullable default pass this gate).
+    active_doc = "\n".join(
+        line for line in doc.splitlines() if not line.lstrip().startswith("#")
+    )
+    pulled = set(OLLAMA_PULL_RE.findall(active_doc))
     findings: list[str] = []
     for match in CHAT_MODEL_RE.finditer(doc):
         model = match.group(1)

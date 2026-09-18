@@ -471,7 +471,7 @@ export function ModelsTab({
             field="ollama_chat_url"
             label="Thinking chat service URL"
             placeholder="http://localhost:11434"
-            description="Endpoint for the larger Thinking chat model. For Docker, use http://host.docker.internal:11434 to reach a host Ollama."
+            description="Endpoint for the Thinking chat model (any OpenAI-compatible server: Ollama, LM Studio, vLLM, or a remote API)."
             type="url"
             formData={formData}
             errors={errors}
@@ -481,7 +481,7 @@ export function ModelsTab({
           <StringField
             field="instant_chat_url"
             label="Instant chat service URL"
-            placeholder="http://host.docker.internal:1234"
+            placeholder="http://your-inference-host:1234"
             description="Endpoint for the smaller/faster Instant chat model, such as LM Studio on the host."
             type="url"
             formData={formData}
@@ -523,7 +523,7 @@ export function ModelsTab({
           <StringField
             field="chat_model"
             label="Thinking chat model"
-            placeholder="gemma-4-26b-a4b-it-apex"
+            placeholder="e.g. gemma4:26b"
             description="Larger model used for Thinking mode responses."
             formData={formData}
             errors={errors}
@@ -533,7 +533,7 @@ export function ModelsTab({
           <StringField
             field="instant_chat_model"
             label="Instant chat model"
-            placeholder="nvidia/nemotron-3-nano-4b"
+            placeholder="e.g. minicpm5-2b"
             description="Smaller/faster model used for Instant mode responses."
             formData={formData}
             errors={errors}
