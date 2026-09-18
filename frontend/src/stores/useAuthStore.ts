@@ -8,6 +8,7 @@ import {
   refreshAccessToken,
   ensureCsrfToken,
   resetCsrfToken,
+  resetSubpathRefreshDiagnostic,
   attachCsrfInterceptor,
 } from "@/lib/api";
 import { useVaultStore } from "@/stores/useVaultStore";
@@ -203,6 +204,9 @@ export const useAuthStore = create<AuthState>()(
 
           // Sync with apiClient
           setJwtAccessToken(access_token);
+          // New authenticated session: any prior refresh-failure diagnostic
+          // burst is stale, so a fresh mismatch can be reported again.
+          resetSubpathRefreshDiagnostic();
 
           // If user wasn't included in login response, fetch it
           if (!user) {
@@ -248,6 +252,8 @@ export const useAuthStore = create<AuthState>()(
 
           // Sync with apiClient
           setJwtAccessToken(access_token);
+          // New authenticated session: start a fresh diagnostic burst.
+          resetSubpathRefreshDiagnostic();
 
           // Reset and re-fetch CSRF token for new session
           resetCsrfToken();
@@ -274,6 +280,7 @@ export const useAuthStore = create<AuthState>()(
           });
           setJwtAccessToken(null);
           resetCsrfToken();
+          resetSubpathRefreshDiagnostic();
           get()._setLoading(false);
           // Reset init guard so re-login works after logout
           _initAttempted = false;

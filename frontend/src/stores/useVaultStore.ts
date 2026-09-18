@@ -76,6 +76,17 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   addVault: async (request: VaultCreateRequest) => {
     const newVault = await createVault(request);
     set((state) => ({ vaults: [...state.vaults, newVault] }));
+    // Select the vault we just created: uploads and chat snapshot activeVaultId,
+    // so leaving the previous selection active silently targets the wrong vault
+    // for everything the user does right after creating a new one. Selection is
+    // best-effort — the vault itself is already created server-side, so a
+    // storage failure here must not fail the create.
+    try {
+      get().setActiveVault(newVault.id);
+    } catch {
+      // localStorage unavailable (quota/private mode): keep the vault, leave
+      // the previous selection active.
+    }
     return newVault;
   },
 
