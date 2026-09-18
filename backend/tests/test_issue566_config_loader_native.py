@@ -13,15 +13,22 @@ files:
 Issue #566 fixed both (``import.meta.dirname`` at the alias and the explicit
 ``./vite.paths.ts`` extension at the import). This module pins that shape the
 same way ``test_issue258_coverage_design.py`` pins the coverage-gate design:
-a source-inspection contract that fails loudly if either trigger is
-reintroduced into a config-loaded file, independent of whether a build
-happened to print a warning anyone read.
+a contract over the config-loaded files that fails loudly if either trigger
+is reintroduced.
 
-Out of class by design: ``__dirname`` in Vitest TEST files (they run through
-the transform pipeline's bundler resolution, not the native config loader).
+Detection is AST-based via the TypeScript compiler (shelling out to ``node``
+with the frontend's own installed ``typescript`` package). Ground-truth
+parsing is deliberate: regex/token hand-lexing went through four adversarial
+review rounds on #624 (comment token-separation, token joining, ``//`` inside
+quoted specifiers, ``//`` inside regex literals) and each fix sprouted a new
+hole; the compiler has none of them. Out of class by design: ``__dirname`` in
+Vitest TEST files (they run through the transform pipeline's bundler
+resolution, not the native config loader).
 """
 
-import re
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -32,101 +39,105 @@ FRONTEND = Path(__file__).resolve().parents[2] / "frontend"
 # transitively via the config's relative import.
 CONFIG_LOADED_FILES = ("vite.config.ts", "vite.paths.ts")
 
-CJS_GLOBAL_RE = re.compile(r"\b(?:__dirname|__filename)\b|\brequire\s*\(")
-
-# Relative imports must carry a real module extension: './x.ts' (or .js,
-# .mjs, ...), never './x' and never a bare './vite.paths' whose dot belongs
-# to the file name. Bare specifiers (package imports) are unaffected.
-# Covers all three ESM import shapes the native config loader resolves:
-# `from './x'`, side-effect `import './x'`, and dynamic `import('./x')`
-# (PRR-003: a side-effect or dynamic extensionless form would otherwise
-# evade the guardrail).
-EXTENSIONLESS_RELATIVE_IMPORT_RE = re.compile(
-    r"""(?:\bfrom\s+|\bimport\s*\(\s*|\bimport\s+)['"](\.[^'"]*)['"]"""
-)
-
 # A trailing segment that is a known script/data extension. './vite.paths'
 # fails this (its dot is part of the name); './vite.paths.ts' passes.
+_EXTENSION_RE = None  # compiled lazily below to keep the import block simple
+
+import re
+
 _EXTENSION_RE = re.compile(r"\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|json)$")
 
+_NODE = shutil.which("node")
 
-def _config_text(name: str) -> str:
-    path = FRONTEND / name
-    assert path.is_file(), f"config-loaded file {name} is missing"
-    return _strip_js_comments(path.read_text(encoding="utf-8"))
-
-
-def _strip_js_comments(text: str) -> str:
-    """Blank out JS comments with spaces using a quote-aware single-pass
-    scan, so comment placement cannot hide an import from the detector.
-
-    Why not regex substitution: `//` inside a quoted specifier
-    (`import './vite//paths'`) is NOT a line comment, and a comment IS a
-    token separator — so stripping must be string-aware and must preserve
-    token boundaries (blanking with spaces, never joining). Known
-    documented limit: JS regex literals (`/pattern/`) are not modeled, so
-    a `//` sequence inside one could be mistaken for a line comment; the
-    scanned config files contain none adjacent to import statements, and
-    the failure direction is blanking adjacent code (over/under-flag on a
-    pathological line), not silent acceptance of imports on clean lines.
-    """
-    out: list[str] = []
-    i = 0
-    n = len(text)
-    state: str | None = None  # None, or the open quote char ' " `
-    while i < n:
-        ch = text[i]
-        if state is None:
-            if ch in ("'", '"', "`"):
-                state = ch
-                out.append(ch)
-                i += 1
-            elif ch == "/" and text[i + 1 : i + 2] == "/":
-                j = text.find("\n", i)
-                j = n if j == -1 else j
-                out.append(" " * (j - i))
-                i = j
-            elif ch == "/" and text[i + 1 : i + 2] == "*":
-                j = text.find("*/", i + 2)
-                j = n if j == -1 else j + 2
-                out.append(" ".join(" " for _ in range(j - i)))
-                i = j
-            else:
-                out.append(ch)
-                i += 1
-        else:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(text[i + 1])
-                i += 2
-                continue
-            if ch == state:
-                state = None
-            i += 1
-    return "".join(out)
+# Walks a TypeScript source file and reports every module specifier reachable
+# by the native config loader (static import/export declarations and literal
+# dynamic import()), plus any CommonJS-only global reference, as identifiers.
+_AST_WALKER_JS = r"""
+const ts = require('typescript');
+const fs = require('fs');
+// `node -e <script> <file>` places <file> at the END of process.argv
+// regardless of how the runtime seeds argv[1].
+const file = process.argv[process.argv.length - 1];
+const sf = ts.createSourceFile(
+  file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS
+);
+const out = { specifiers: [], cjsGlobals: [], nonLiteralDynamic: 0 };
+function walk(node) {
+  if (
+    (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
+    node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)
+  ) {
+    out.specifiers.push(node.moduleSpecifier.text);
+  }
+  if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+    const arg = node.arguments[0];
+    if (arg && ts.isStringLiteral(arg)) out.specifiers.push(arg.text);
+    else out.nonLiteralDynamic += 1;
+  }
+  if (ts.isIdentifier(node) && (node.text === '__dirname' || node.text === '__filename')) {
+    out.cjsGlobals.push(node.text);
+  }
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
+    out.cjsGlobals.push('require()');
+  }
+  ts.forEachChild(node, walk);
+}
+walk(sf);
+console.log(JSON.stringify(out));
+"""
 
 
+def _ast_facts(name: str) -> dict:
+    """(specifiers, cjsGlobals, nonLiteralDynamic) for one config file,
+    parsed by the real TypeScript compiler."""
+    proc = subprocess.run(
+        [_NODE, "-e", _AST_WALKER_JS, str(FRONTEND / name)],
+        cwd=FRONTEND,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"566 GUARDRAIL CHECK: FAIL — TypeScript walker failed on {name}: "
+        f"{proc.stderr.strip()}"
+    )
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(
+    _NODE is None,
+    reason="node not available (needed for the TypeScript parser); the "
+    "Backend CI runner has node preinstalled, as does any frontend dev box",
+)
 @pytest.mark.parametrize("name", CONFIG_LOADED_FILES)
 def test_config_files_have_no_cjs_only_globals(name: str) -> None:
     """CJS globals are shimmed+warned today and rejected by the planned
-    native default — none may appear in a config-loaded file."""
-    text = _config_text(name)
-    match = CJS_GLOBAL_RE.search(text)
-    assert match is None, (
-        f"566 GUARDRAIL CHECK: FAIL — {name} uses the CommonJS-only global "
-        f"{match.group(0)!r} at offset {match.start()}; Vite's native config "
-        "loader does not support it (use import.meta.dirname / ESM imports)"
+    native default — none may appear in a config-loaded file (as real
+    identifiers, comments excluded by the parser)."""
+    facts = _ast_facts(name)
+    assert not facts["cjsGlobals"], (
+        f"566 GUARDRAIL CHECK: FAIL — {name} references the CommonJS-only "
+        f"{facts['cjsGlobals']}; Vite's native config loader does not "
+        "support them (use import.meta.dirname / ESM imports)"
     )
     print(f"566 GUARDRAIL CHECK: PASS — {name} free of CJS-only globals")
 
 
+@pytest.mark.skipif(
+    _NODE is None,
+    reason="node not available (needed for the TypeScript parser); the "
+    "Backend CI runner has node preinstalled, as does any frontend dev box",
+)
 @pytest.mark.parametrize("name", CONFIG_LOADED_FILES)
 def test_config_files_relative_imports_have_extensions(name: str) -> None:
     """Native ESM resolution requires explicit file extensions on relative
-    imports; an extensionless './vite.paths' style import warns today."""
-    text = _config_text(name)
-    for match in EXTENSIONLESS_RELATIVE_IMPORT_RE.finditer(text):
-        spec = match.group(1)
+    imports; an extensionless './vite.paths' style import warns today.
+    Comments, regex literals, and template holes cannot hide a specifier:
+    the compiler sees through all of them."""
+    facts = _ast_facts(name)
+    for spec in facts["specifiers"]:
+        if not spec.startswith("."):
+            continue  # bare package specifier — unaffected by ESM resolution
         assert _EXTENSION_RE.search(spec), (
             f"566 GUARDRAIL CHECK: FAIL — {name} imports {spec!r} without a "
             "file extension; Vite's native config loader cannot resolve it"
@@ -134,27 +145,50 @@ def test_config_files_relative_imports_have_extensions(name: str) -> None:
     print(f"566 GUARDRAIL CHECK: PASS — {name} relative imports carry extensions")
 
 
-def test_import_detector_catches_commented_forms() -> None:
-    """The detector must not be evaded by comments between import tokens
-    (final-critic Round 2 on #624): side-effect, dynamic, and from shapes
-    with block comments interleaved must all still be flagged."""
-    for snippet in (
-        "import /* c */ './vite.paths'",
-        "import /* c */ ('./vite.paths')",
-        "import x /* c */ from /* c */ './vite.paths'",
-        "const m = await import /* c */ ('./vite.paths')",
-        "import // line comment\n  './vite.paths'",
-        # compact forms: the comment is the ONLY token separator
-        "import/*c*/'./vite.paths'",
-        "import x/*c*/from/*c*/'./vite.paths'",
-        # double slash inside a quoted specifier is string content, not a
-        # comment (final-critic round 4 on #624)
-        "import './vite//paths'",
-        "const m = await import ('./vite//paths')",
-    ):
-        match = EXTENSIONLESS_RELATIVE_IMPORT_RE.search(_strip_js_comments(snippet))
-        assert match is not None, (
-            f"566 GUARDRAIL CHECK: FAIL — detector missed a commented "
-            f"extensionless import: {snippet!r}"
-        )
-    print("566 GUARDRAIL CHECK: PASS — commented import forms still detected")
+@pytest.mark.skipif(
+    _NODE is None,
+    reason="node not available (needed for the TypeScript parser)",
+)
+def test_ast_walker_bites_on_synthetic_evasion(tmp_path: Path) -> None:
+    """The walker itself must not be fooled by the shapes that defeated the
+    earlier regex detectors (#624 review rounds 2-4): commented imports,
+    token-joining comments, ``//`` inside quoted specifiers, and ``//``
+    inside regex literals followed by a real dynamic import."""
+    nasty = tmp_path / "synthetic.config.ts"
+    synthetic = nasty
+    synthetic.write_text(
+        "// import './commented.out'\n"
+        "/* import './block-commented.out' */\n"
+        "const re = /[//]/.test(value); const p = import('./vite//paths');\n"
+        "import/*c*/'./vite.paths';\n"
+        "import x/*c*/from/*c*/'./vite.paths';\n"
+        "import /* mid */ ('./vite.paths');\n"
+        "const ok = import('./vite.paths.ts');\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [_NODE, "-e", _AST_WALKER_JS, str(synthetic)],
+        cwd=FRONTEND,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    facts = json.loads(proc.stdout)
+    assert not facts["cjsGlobals"]
+    # every extensionless specifier in the nasty file is still collected —
+    # commented ones are (correctly) absent, all real ones are present
+    assert sorted(facts["specifiers"]) == [
+        "./vite.paths",
+        "./vite.paths",
+        "./vite.paths",
+        "./vite.paths.ts",
+        "./vite//paths",
+    ], facts["specifiers"]
+    extensionless = [s for s in facts["specifiers"] if not _EXTENSION_RE.search(s)]
+    assert extensionless, "walker found no extensionless specifiers to flag"
+    print(
+        "566 GUARDRAIL CHECK: PASS — walker caught all "
+        f"{len(extensionless)} extensionless imports through comments, "
+        "regex literals, and quoted-// specifiers"
+    )
