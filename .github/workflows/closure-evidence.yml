@@ -43,7 +43,10 @@ permissions:
   issues: read
 
 concurrency:
-  group: closure-evidence-${{ github.ref }}
+  # Include the event name and PR number so two dispatch runs against
+  # different PRs from the same branch never cancel each other; repeated
+  # events for the SAME PR still dedupe as intended.
+  group: closure-evidence-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -96,12 +99,18 @@ jobs:
         if: steps.evaluate.outputs.test_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           TEST_ID: ${{ steps.evaluate.outputs.test_id }}
-          BASE_REF: ${{ github.event.pull_request.base.ref || 'master' }}
         run: |
           python -m pip install --quiet -r backend/requirements-ci.txt -r backend/requirements-dev.txt
-          BASE_SHA="$(git merge-base "origin/$BASE_REF" HEAD)"
-          HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          # Resolve base/head SHAs from the PR itself: on workflow_dispatch,
+          # github.event.pull_request is null and github.sha would point at the
+          # dispatch checkout, not the PR — so fetch both from the API (works
+          # identically for pull_request events).
+          PR_JSON="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+          BASE_REF="$(printf '%s' "$PR_JSON" | python -c "import json,sys; print(json.load(sys.stdin)['base']['ref'])")"
+          HEAD_SHA="$(printf '%s' "$PR_JSON" | python -c "import json,sys; print(json.load(sys.stdin)['head']['sha'])")"
+          BASE_SHA="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
           echo "verify-test base=$BASE_SHA head=$HEAD_SHA test=$TEST_ID"
           python scripts/check_closure_evidence.py verify-test \
             --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --test "$TEST_ID" \

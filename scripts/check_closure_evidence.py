@@ -51,13 +51,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # GitHub's closing-keyword set (same family zaxbygraph indexes on).
+# Keyword matching runs on a markdown-normalized copy of the body: GitHub
+# parses closing keywords AFTER markdown rendering, so `**Closes** #1`,
+# `Closes:#1`, and NBSP-separated forms all auto-close issues and must all be
+# detected here too. Emphasis markers (`*`, backticks) and NBSP become
+# spaces; the keyword-to-`#` separator allows whitespace and colons.
 CLOSE_REF_RE = re.compile(
-    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*#\s*(\d+)",
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[\s:]*#\s*(\d+)",
     re.IGNORECASE,
 )
+MARKDOWN_NOISE_RE = re.compile(r"[*`\u00a0]+")
 
 # Executable evidence: a backend pytest file or node id.
-TEST_ID_RE = re.compile(r"backend/tests/[A-Za-z0-9_/.-]+\.py(?:::[A-Za-z0-9_]+)*")
+TEST_ID_RE = re.compile(r"backend/tests/[A-Za-z0-9_/.-]+\.py(?:::\w+)*")
 
 # Artifact evidence: ``artifact: <repo-relative-path>``. URL-form artifacts
 # are advisory only — the gate never makes network calls to validate them.
@@ -96,11 +102,19 @@ def family_of(path: str) -> str:
     return "/".join(parts[:2]) if len(parts) > 1 else path
 
 
-def extract_close_refs(body: str | None) -> list[int]:
+def normalize_body(body: str | None) -> str:
+    """Markdown-normalize for closing-keyword matching (see CLOSE_REF_RE)."""
     if not body:
+        return ""
+    return MARKDOWN_NOISE_RE.sub(" ", body)
+
+
+def extract_close_refs(body: str | None) -> list[int]:
+    normalized = normalize_body(body)
+    if not normalized:
         return []
     seen: dict[int, None] = {}
-    for match in CLOSE_REF_RE.finditer(body):
+    for match in CLOSE_REF_RE.finditer(normalized):
         seen.setdefault(int(match.group(1)), None)
     return list(seen)
 
@@ -139,7 +153,8 @@ def evaluate_snapshot(snapshot: dict, mode: str, repo_root: Path) -> tuple[list[
                 "existing captured artifact (artifact: <repo-relative-path>)"
             )
         else:
-            if not (repo_root / artifact).is_file():
+            resolved = (repo_root / artifact).resolve()
+            if not resolved.is_relative_to(repo_root.resolve()) or not resolved.is_file():
                 violations.append(
                     f"closure evidence artifact named but missing from the "
                     f"repository: {artifact} — a named-but-absent artifact is "
@@ -153,7 +168,13 @@ def evaluate_snapshot(snapshot: dict, mode: str, repo_root: Path) -> tuple[list[
         for commit in commits:
             author = str(commit.get("author") or "")
             files = list(commit.get("files") or [])
-            if any(family_of(f) in pr_families for f in files):
+            if not files:
+                # Commit with no known files (live mode truncates per-commit
+                # file fetches beyond the first 100 commits): treat the author
+                # as same-family so an unfetched commit can never count as a
+                # cross-family approval (conservative).
+                same_family_logins.add(author)
+            elif any(family_of(f) in pr_families for f in files):
                 same_family_logins.add(author)
         cross_family = [
             review

@@ -39,8 +39,12 @@ the gap is the historical 66-day window, not a current code defect.)
 ## What the gate checks
 
 1. **Closing references.** The PR body is parsed for GitHub's closing keywords
-   (`close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved #N`).
-   No closing reference → the gate is not applicable and passes.
+   (`close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved #N`) on a
+   markdown-normalized copy — GitHub resolves closing keywords after markdown
+   rendering, so `**Closes** #1`, `Closes:#1`, and NBSP-separated variants
+   auto-close issues and are all detected (emphasis markers and backticks are
+   treated as spaces). No closing reference → the gate is not applicable and
+   passes.
 2. **Named closure evidence.** With a closing reference present, the body must
    name, in order of precedence:
    - a **backend pytest test id** — `backend/tests/<file>.py(::node)?`. The
@@ -130,9 +134,9 @@ FAIL / ERROR / evidence-test`) are designed to be quoted directly.
   per issue #568 — only backend pytest ids are re-executed). Name the vitest
   file/function as the artifact and link its captured run output.
 - **Commit cap**: per-commit files are fetched for the first 100 PR commits;
-  beyond that, commits contribute their author to the same-family set with an
-  empty file list (conservative: treats them as same-family only via files
-  fetched elsewhere; documented approximation).
+  a commit whose files could not be fetched is treated conservatively — its
+  author counts as same-family and can never serve as the cross-family
+  approver (an unfetched commit must not weaken the reviewer rule).
 
 ## Satisfying the gate (for PR authors)
 

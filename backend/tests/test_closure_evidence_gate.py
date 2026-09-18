@@ -57,6 +57,52 @@ class TestCloseRefExtraction:
         assert cce.extract_close_refs("") == []
         assert cce.extract_close_refs(None) == []
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "Closes:#1",          # colon separator, no space
+            "closes: #1",         # colon separator with space (lowercase)
+            "**Closes** #1",      # markdown bold around the keyword
+            "`Fixes` #2",         # backtick-wrapped keyword
+            "Resolves\u00a0#3",   # non-breaking space separator
+            "fixed#4",            # no separator at all
+        ],
+    )
+    def test_github_lenient_forms_detected(self, body):
+        # GitHub resolves closing keywords after markdown rendering, so all of
+        # these auto-close issues; the gate must detect every one of them.
+        assert cce.extract_close_refs(body), f"closing ref not detected in: {body!r}"
+
+    def test_underscore_is_not_a_separator(self):
+        # A word character between keyword and # means the token is not the
+        # bare keyword (closes_ is not "closes"); GitHub does not close these.
+        assert cce.extract_close_refs("closes_#1") == []
+
+
+class TestReviewRound1Fixes:
+    """Regression tests for the independent implementation-review findings."""
+
+    def test_artifact_path_traversal_rejected(self, tmp_path, capsys):
+        snap = snapshot(body="Closes #55 evidence. artifact: ../outside-repo.md")
+        assert run_evaluate(tmp_path, snap, "enforce") == 1
+        assert "evidence" in capsys.readouterr().out.lower()
+
+    def test_empty_files_commit_is_conservative_same_family(self, tmp_path):
+        # A commit with an unfetched file list (live-mode >100-commit
+        # truncation) must not qualify its author as cross-family.
+        snap = snapshot(labels=["high"], reviews=[{"author": "bob", "state": "APPROVED"}])
+        snap["commits"] = [
+            {"author": "alice", "files": ["backend/app/api/routes/x.py"]},
+            {"author": "bob", "files": []},
+        ]
+        assert run_evaluate(tmp_path, snap, "enforce") == 1
+
+    def test_unicode_node_id_not_truncated(self):
+        first, _, extra = cce.extract_evidence(
+            "Closes #1 evidence backend/tests/test_foo.py::test_функция end"
+        )
+        assert first == "backend/tests/test_foo.py::test_функция"
+
 
 class TestEvidencePrecedence:
     def test_first_test_id_wins(self):
