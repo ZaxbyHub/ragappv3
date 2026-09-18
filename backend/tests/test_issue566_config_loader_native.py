@@ -27,6 +27,7 @@ resolution, not the native config loader).
 """
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -41,10 +42,6 @@ CONFIG_LOADED_FILES = ("vite.config.ts", "vite.paths.ts")
 
 # A trailing segment that is a known script/data extension. './vite.paths'
 # fails this (its dot is part of the name); './vite.paths.ts' passes.
-_EXTENSION_RE = None  # compiled lazily below to keep the import block simple
-
-import re
-
 _EXTENSION_RE = re.compile(r"\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|json)$")
 
 _NODE = shutil.which("node")
@@ -120,6 +117,11 @@ def test_config_files_have_no_cjs_only_globals(name: str) -> None:
         f"{facts['cjsGlobals']}; Vite's native config loader does not "
         "support them (use import.meta.dirname / ESM imports)"
     )
+    assert facts["nonLiteralDynamic"] == 0, (
+        f"566 GUARDRAIL CHECK: FAIL — {name} contains a non-literal dynamic "
+        "import() whose specifier the guardrail cannot statically verify; "
+        "use a literal specifier or a static import"
+    )
     print(f"566 GUARDRAIL CHECK: PASS — {name} free of CJS-only globals")
 
 
@@ -135,6 +137,11 @@ def test_config_files_relative_imports_have_extensions(name: str) -> None:
     Comments, regex literals, and template holes cannot hide a specifier:
     the compiler sees through all of them."""
     facts = _ast_facts(name)
+    assert facts["nonLiteralDynamic"] == 0, (
+        f"566 GUARDRAIL CHECK: FAIL — {name} contains a non-literal dynamic "
+        "import() whose specifier the guardrail cannot statically verify; "
+        "use a literal specifier or a static import"
+    )
     for spec in facts["specifiers"]:
         if not spec.startswith("."):
             continue  # bare package specifier — unaffected by ESM resolution
@@ -163,7 +170,8 @@ def test_ast_walker_bites_on_synthetic_evasion(tmp_path: Path) -> None:
         "import/*c*/'./vite.paths';\n"
         "import x/*c*/from/*c*/'./vite.paths';\n"
         "import /* mid */ ('./vite.paths');\n"
-        "const ok = import('./vite.paths.ts');\n",
+        "const ok = import('./vite.paths.ts');\n"
+        "const dynamic = import(unevaluated);\n",
         encoding="utf-8",
     )
     proc = subprocess.run(
@@ -187,6 +195,10 @@ def test_ast_walker_bites_on_synthetic_evasion(tmp_path: Path) -> None:
     ], facts["specifiers"]
     extensionless = [s for s in facts["specifiers"] if not _EXTENSION_RE.search(s)]
     assert extensionless, "walker found no extensionless specifiers to flag"
+    assert facts["nonLiteralDynamic"] == 1, (
+        "walker must count non-literal dynamic imports so the parametrized "
+        "checks can fail on statically unverifiable specifiers"
+    )
     print(
         "566 GUARDRAIL CHECK: PASS — walker caught all "
         f"{len(extensionless)} extensionless imports through comments, "
