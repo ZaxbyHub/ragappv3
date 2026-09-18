@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 
 import { CANVAS_PREVIEW_UNSUPPORTED_LABEL } from "./labels";
+import { loadHighlighter } from "@/lib/highlighter";
 
 // ============================================================================
 // Canvas preview — deliberately bounded (issue #509).
@@ -26,67 +27,6 @@ export interface CanvasPreviewProps {
   className?: string;
 }
 
-type HighlightFn = (code: string, lang: string) => Promise<string>;
-
-let _highlightFn: HighlightFn | null = null;
-let _highlightPromise: Promise<HighlightFn> | null = null;
-
-function escapeCodeHtml(code: string) {
-  return code
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function renderPlainCodeHtml(code: string) {
-  return `<pre><code>${escapeCodeHtml(code)}</code></pre>`;
-}
-
-function loadCanvasHighlighter(): Promise<HighlightFn> {
-  if (_highlightFn) return Promise.resolve(_highlightFn);
-  if (_highlightPromise) return _highlightPromise;
-
-  _highlightPromise = (async () => {
-    try {
-      const { createHighlighter } = await import("shiki");
-      const hl = await createHighlighter({
-        themes: ["github-light", "github-dark"],
-        langs: [
-          "javascript", "typescript", "tsx", "jsx",
-          "python", "bash", "sh", "json", "yaml", "toml",
-          "css", "html", "xml", "markdown", "sql",
-          "rust", "go", "java", "c", "cpp", "csharp",
-        ],
-      });
-      const fn: HighlightFn = (code, lang) => {
-        const isDark = document.documentElement.classList.contains("dark");
-        try {
-          return Promise.resolve(
-            hl.codeToHtml(code, {
-              lang: lang || "text",
-              theme: isDark ? "github-dark" : "github-light",
-            })
-          );
-        } catch {
-          // Unknown language — fall back to plain text highlighting.
-          return Promise.resolve(
-            hl.codeToHtml(code, { lang: "text", theme: isDark ? "github-dark" : "github-light" })
-          );
-        }
-      };
-      _highlightFn = fn;
-      return fn;
-    } catch {
-      // Shiki unavailable — plain-text fallback; the source itself is intact.
-      const fn: HighlightFn = (code) => Promise.resolve(renderPlainCodeHtml(code));
-      _highlightFn = fn;
-      return fn;
-    }
-  })();
-
-  return _highlightPromise;
-}
-
 // Kept deliberately small and auditable: GitHub-flavoured Markdown plus the
 // unmodified default sanitize schema (DraftPreview pattern).
 const REMARK_PLUGINS = [remarkGfm];
@@ -103,7 +43,7 @@ export function CanvasPreview({ content, kind, language, className }: CanvasPrev
       return;
     }
     let cancelled = false;
-    loadCanvasHighlighter()
+    loadHighlighter()
       .then((highlight) => highlight(content, language ?? ""))
       .then((result) => {
         if (!cancelled) setHtml(result);

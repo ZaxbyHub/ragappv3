@@ -5,10 +5,10 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Shiki's dynamic import is mocked to reject so the preview fallback path is
-// deterministic — the plain-text branch must show the content unchanged.
-vi.mock("shiki", () => ({
-  createHighlighter: vi.fn(async () => {
+// The shared highlighter's loader is mocked to reject so the preview fallback
+// path is deterministic — the plain-text branch must show the content unchanged.
+vi.mock("@/lib/highlighter", () => ({
+  loadHighlighter: vi.fn(async () => {
     throw new Error("shiki unavailable in canvas tests");
   }),
 }));
@@ -624,15 +624,9 @@ describe("CanvasPage preview tab", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("tab", { name: "Preview tab" }));
 
-    // Shiki's loader is mocked to reject — the fallback branch must render the
-    // version content verbatim (source of truth is the content string).
-    const preview = await waitFor(() => {
-      const plain = screen.queryByTestId("canvas-preview-plain");
-      const highlighted = screen.queryByTestId("canvas-preview-highlighted");
-      const target = plain ?? highlighted;
-      expect(target).not.toBeNull();
-      return target as HTMLElement;
-    });
+    // The loader is mocked to reject — the plain-text fallback branch must
+    // render the version content verbatim (source of truth is the content string).
+    const preview = await waitFor(() => screen.getByTestId("canvas-preview-plain"));
     expect(preview.textContent).toContain("def hello():");
     expect(preview.textContent).toContain("print('v2')");
   });

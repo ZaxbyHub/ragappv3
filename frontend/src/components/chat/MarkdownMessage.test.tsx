@@ -7,12 +7,22 @@ import {
   parseCitationSegments,
 } from "./MarkdownMessage";
 import type { Source, UsedMemory } from "@/lib/api";
+import { loadHighlighter } from "@/lib/highlighter";
 
-vi.mock("shiki", () => ({
-  createHighlighter: vi.fn(async () => {
-    throw new Error("shiki unavailable in markdown fallback tests");
-  }),
-}));
+// The renderer-failure fallback path now lives behind the shared loader
+// module (issue #572). Mocking loadHighlighter to resolve with the module's
+// own plain-text renderer exercises the same contract the former
+// `vi.mock("shiki")` throwing createHighlighter did: when the highlighter
+// stack is unavailable, code renders as escaped plain text.
+vi.mock("@/lib/highlighter", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/highlighter")>();
+  return {
+    ...actual,
+    // Same shape as the real failure path: loadHighlighter resolves to a
+    // HighlightFn whose calls return Promises of plain escaped HTML.
+    loadHighlighter: vi.fn(async () => async (code: string) => actual.renderPlainCodeHtml(code)),
+  };
+});
 
 const clipboardWriteText = vi.fn().mockResolvedValue(undefined);
 Object.defineProperty(navigator, "clipboard", {
@@ -235,6 +245,20 @@ describe("MarkdownMessage code rendering", () => {
     });
     expect(document.querySelector(".shiki-wrapper img")).not.toBeInTheDocument();
     expect(screen.getByText('<img src=x onerror="alert(1)">')).toBeInTheDocument();
+  });
+
+  it("falls back to plain text when highlighting rejects after the loader resolves", async () => {
+    // Loader succeeds, but the per-highlight call rejects (e.g. a grammar
+    // chunk fails to fetch) — CodeBlock's .catch must render the plain branch.
+    vi.mocked(loadHighlighter).mockResolvedValueOnce(async () => {
+      throw new Error("grammar chunk failed");
+    });
+    render(<MarkdownMessage content={"```python\nprint('reject-case')\n```"} />);
+
+    await waitFor(() => {
+      expect(document.querySelector(".shiki-wrapper")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("print('reject-case')")).toBeInTheDocument();
   });
 
   it("joins array code children without inserting commas", () => {
