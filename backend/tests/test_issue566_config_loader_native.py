@@ -71,11 +71,10 @@ function walk(node) {
     if (arg && ts.isStringLiteral(arg)) out.specifiers.push(arg.text);
     else out.nonLiteralDynamic += 1;
   }
-  if (ts.isIdentifier(node) && (node.text === '__dirname' || node.text === '__filename')) {
+  if (ts.isIdentifier(node) && (node.text === '__dirname' || node.text === '__filename' || node.text === 'require')) {
+    // any reference to the name — including aliasing like `const r = require` —
+    // is in class, not just direct require() call expressions (#624 critic r6)
     out.cjsGlobals.push(node.text);
-  }
-  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require') {
-    out.cjsGlobals.push('require()');
   }
   ts.forEachChild(node, walk);
 }
@@ -171,7 +170,8 @@ def test_ast_walker_bites_on_synthetic_evasion(tmp_path: Path) -> None:
         "import x/*c*/from/*c*/'./vite.paths';\n"
         "import /* mid */ ('./vite.paths');\n"
         "const ok = import('./vite.paths.ts');\n"
-        "const dynamic = import(unevaluated);\n",
+        "const dynamic = import(unevaluated);\n"
+        "const aliasedRequire = require;\n",
         encoding="utf-8",
     )
     proc = subprocess.run(
@@ -183,7 +183,9 @@ def test_ast_walker_bites_on_synthetic_evasion(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     facts = json.loads(proc.stdout)
-    assert not facts["cjsGlobals"]
+    assert facts["cjsGlobals"] == ["require"], (
+        "walker must flag an aliased require reference, not just direct calls"
+    )
     # every extensionless specifier in the nasty file is still collected —
     # commented ones are (correctly) absent, all real ones are present
     assert sorted(facts["specifiers"]) == [
