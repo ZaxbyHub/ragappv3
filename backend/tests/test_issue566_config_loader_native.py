@@ -57,16 +57,53 @@ def _config_text(name: str) -> str:
 
 
 def _strip_js_comments(text: str) -> str:
-    """Remove block and line comments so comment placement cannot hide an
-    import from the detector (JS permits comments between any two tokens,
-    e.g. `import /* x */ './y'`). Comments are replaced with a SPACE, not
-    removed: a comment is itself a token separator, so substituting it with
-    a space preserves token boundaries and no legal import form can be
-    hidden (final-critic round 3 on #624: empty-string substitution joined
-    `import/*c*/'./x'` into an undetectable blob). Worst case the scan
-    over-flags, which fails safe for a guardrail."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    return re.sub(r"//[^\n]*", " ", text)
+    """Blank out JS comments with spaces using a quote-aware single-pass
+    scan, so comment placement cannot hide an import from the detector.
+
+    Why not regex substitution: `//` inside a quoted specifier
+    (`import './vite//paths'`) is NOT a line comment, and a comment IS a
+    token separator — so stripping must be string-aware and must preserve
+    token boundaries (blanking with spaces, never joining). Known
+    documented limit: JS regex literals (`/pattern/`) are not modeled, so
+    a `//` sequence inside one could be mistaken for a line comment; the
+    scanned config files contain none adjacent to import statements, and
+    the failure direction is blanking adjacent code (over/under-flag on a
+    pathological line), not silent acceptance of imports on clean lines.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    state: str | None = None  # None, or the open quote char ' " `
+    while i < n:
+        ch = text[i]
+        if state is None:
+            if ch in ("'", '"', "`"):
+                state = ch
+                out.append(ch)
+                i += 1
+            elif ch == "/" and text[i + 1 : i + 2] == "/":
+                j = text.find("\n", i)
+                j = n if j == -1 else j
+                out.append(" " * (j - i))
+                i = j
+            elif ch == "/" and text[i + 1 : i + 2] == "*":
+                j = text.find("*/", i + 2)
+                j = n if j == -1 else j + 2
+                out.append(" ".join(" " for _ in range(j - i)))
+                i = j
+            else:
+                out.append(ch)
+                i += 1
+        else:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == state:
+                state = None
+            i += 1
+    return "".join(out)
 
 
 @pytest.mark.parametrize("name", CONFIG_LOADED_FILES)
@@ -110,6 +147,10 @@ def test_import_detector_catches_commented_forms() -> None:
         # compact forms: the comment is the ONLY token separator
         "import/*c*/'./vite.paths'",
         "import x/*c*/from/*c*/'./vite.paths'",
+        # double slash inside a quoted specifier is string content, not a
+        # comment (final-critic round 4 on #624)
+        "import './vite//paths'",
+        "const m = await import ('./vite//paths')",
     ):
         match = EXTENSIONLESS_RELATIVE_IMPORT_RE.search(_strip_js_comments(snippet))
         assert match is not None, (
