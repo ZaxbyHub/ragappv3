@@ -93,6 +93,15 @@ def _ast_facts(name: str) -> dict:
         text=True,
         timeout=60,
     )
+    if proc.returncode != 0 and "Cannot find module 'typescript'" in proc.stderr:
+        # Backend-only environments without a frontend install: CI's Backend
+        # job installs typescript explicitly (ci.yml), so a skip here is a
+        # bare local env, not a bypassed gate.
+        pytest.skip(
+            "typescript is not installed under frontend/node_modules — run "
+            "`npm install` in frontend/ (Backend CI installs it for this "
+            "guardrail; see ci.yml)"
+        )
     assert proc.returncode == 0, (
         f"566 GUARDRAIL CHECK: FAIL — TypeScript walker failed on {name}: "
         f"{proc.stderr.strip()}"
