@@ -37,8 +37,12 @@ CJS_GLOBAL_RE = re.compile(r"\b(?:__dirname|__filename)\b|\brequire\s*\(")
 # Relative imports must carry a real module extension: './x.ts' (or .js,
 # .mjs, ...), never './x' and never a bare './vite.paths' whose dot belongs
 # to the file name. Bare specifiers (package imports) are unaffected.
+# Covers all three ESM import shapes the native config loader resolves:
+# `from './x'`, side-effect `import './x'`, and dynamic `import('./x')`
+# (PRR-003: a side-effect or dynamic extensionless form would otherwise
+# evade the guardrail).
 EXTENSIONLESS_RELATIVE_IMPORT_RE = re.compile(
-    r"""from\s+['"](\.[^'"]*)['"]"""
+    r"""(?:\bfrom\s+|\bimport\s*\(\s*|\bimport\s+)['"](\.[^'"]*)['"]"""
 )
 
 # A trailing segment that is a known script/data extension. './vite.paths'

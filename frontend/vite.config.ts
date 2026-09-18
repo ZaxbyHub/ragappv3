@@ -42,6 +42,10 @@ export default defineConfig(({ mode }) => {
     test: {
       globals: true,
       environment: 'jsdom',
+      // Pinned explicitly: vitest 5's default (clearMocks true) is the
+      // behavior the suite is validated under; pinning it keeps a future
+      // major's default flip from silently changing mock lifecycle again.
+      clearMocks: true,
       setupFiles: ['./src/test/setup.ts'],
       globalSetup: ['./src/test/global-setup.ts'],
       include: ['src/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}'],
