@@ -201,6 +201,18 @@ jobs:
           pip install -r requirements-dev.txt
           pip install pytest-xdist
 
+      # test_issue566_config_loader_native.py parses the frontend config via
+      # the TypeScript compiler; the Backend checkout has no frontend install,
+      # so the guardrail's parser dependency is provided here (devDep version
+      # from frontend/package.json; --no-save leaves the lockfile untouched).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22.14.0"
+
+      - name: Install TypeScript for the #566 config guardrail
+        run: npm install --no-save typescript@6.0.3
+        working-directory: frontend
+
       - name: Lint (ruff)
         run: ruff check .
 

@@ -2,7 +2,7 @@
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
-import { createApiProxy, normalizeBasePath, normalizeViteBase } from './vite.paths'
+import { createApiProxy, normalizeBasePath, normalizeViteBase } from './vite.paths.ts'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
@@ -13,7 +13,7 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, './src'),
+        '@': path.resolve(import.meta.dirname, './src'),
       },
     },
     build: {
@@ -42,6 +42,10 @@ export default defineConfig(({ mode }) => {
     test: {
       globals: true,
       environment: 'jsdom',
+      // Pinned explicitly: vitest 5's default (clearMocks true) is the
+      // behavior the suite is validated under; pinning it keeps a future
+      // major's default flip from silently changing mock lifecycle again.
+      clearMocks: true,
       setupFiles: ['./src/test/setup.ts'],
       globalSetup: ['./src/test/global-setup.ts'],
       include: ['src/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}'],
