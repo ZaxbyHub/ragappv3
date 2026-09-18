@@ -225,6 +225,36 @@ export function redirectToLogin(): void {
 // not rotated twice (which would invalidate the second caller's session).
 let _refreshInFlight: Promise<string | null> | null = null;
 
+// Subpath deployment guardrail: this bundle bakes VITE_APP_BASENAME at build
+// time while the refresh cookie's Path comes from the backend's APP_ROOT_PATH
+// env. When the two diverge, the browser never returns the cookie and every
+// refresh is rejected with one of two signatures — a 401 from /auth/refresh
+// (cookie missing) or a CSRF-marked 403 (csrf_protect rejects before the
+// handler when the CSRF cookie also misses the prefixed path; the raw fetch
+// here bypasses the axios CSRF retry). Only those authentication-shaped
+// rejections emit the diagnostic, once per failure burst, so unrelated
+// outages (5xx, network errors) and ordinary session expiry noise stay
+// appropriately phrased instead of asserting a misconfiguration.
+let _refreshMismatchDiagnosed = false;
+
+function isAuthShapedRefreshRejection(response: Response): boolean {
+  if (response.status === 401) return true;
+  return response.status === 403 && response.headers.get("x-csrf-error") === "true";
+}
+
+function diagnoseSubpathRefreshFailure(): void {
+  if (_refreshMismatchDiagnosed || !APP_BASENAME) return;
+  _refreshMismatchDiagnosed = true;
+  console.error(
+    `[Auth] Silent token refresh was rejected while the app is served under "${APP_BASENAME}" (VITE_APP_BASENAME). If this is unexpected for an active session, verify APP_ROOT_PATH and VITE_APP_BASENAME are identical in .env (or the Compose environment). VITE_APP_BASENAME is baked into the frontend image; rebuild and restart with \`docker compose build --no-cache && docker compose up -d\`.`
+  );
+}
+
+// Session boundaries (login/register/logout) start a new diagnostic burst.
+export function resetSubpathRefreshDiagnostic(): void {
+  _refreshMismatchDiagnosed = false;
+}
+
 // Standalone refresh function to avoid circular dependencies
 export async function refreshAccessToken(): Promise<string | null> {
   if (_refreshInFlight) {
@@ -260,13 +290,19 @@ async function _doRefresh(): Promise<string | null> {
       credentials: "include", // Send httpOnly cookie with refresh token
       headers,
     });
-    if (!response.ok) return null;
+    if (!response.ok) {
+      if (isAuthShapedRefreshRejection(response)) {
+        diagnoseSubpathRefreshFailure();
+      }
+      return null;
+    }
     // /auth/refresh rotates the CSRF cookie (issue_csrf_token in the handler).
     // Drop the cached token so the next mutating request re-reads the cookie
     // instead of sending the stale pre-refresh token (403 CSRF mismatch).
     resetCsrfToken();
     const data = await response.json();
     _jwtAccessToken = data.access_token;
+    _refreshMismatchDiagnosed = false;
     return data.access_token;
   } catch {
     return null;

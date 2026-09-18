@@ -1,12 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // Use vi.hoisted to make mock functions available at mock time
-const { mockPostFn, mockGetFn, mockPatchFn, mockResetCsrfToken, mockEnsureCsrfToken } = vi.hoisted(() => ({
+const { mockPostFn, mockGetFn, mockPatchFn, mockResetCsrfToken, mockEnsureCsrfToken, mockResetSubpathRefreshDiagnostic } = vi.hoisted(() => ({
   mockPostFn: vi.fn(),
   mockGetFn: vi.fn(),
   mockPatchFn: vi.fn(),
   mockResetCsrfToken: vi.fn(),
   mockEnsureCsrfToken: vi.fn().mockResolvedValue("mock-csrf-token"),
+  mockResetSubpathRefreshDiagnostic: vi.fn(),
 }));
 
 // Mock axios before importing the store
@@ -34,6 +35,7 @@ vi.mock("@/lib/api", () => ({
   refreshAccessToken: vi.fn(),
   resetCsrfToken: mockResetCsrfToken,
   ensureCsrfToken: mockEnsureCsrfToken,
+  resetSubpathRefreshDiagnostic: mockResetSubpathRefreshDiagnostic,
   attachCsrfInterceptor: vi.fn(),
   default: {
     get: vi.fn(),
@@ -351,6 +353,70 @@ describe("useAuthStore", () => {
       expect(state.user).toBeNull();
       expect(state.accessToken).toBeNull();
       expect(state.isAuthenticated).toBe(false);
+    });
+  });
+
+  // =============================================================================
+  // Subpath refresh diagnostic lifecycle (PR #626 review round): session
+  // boundaries start a new diagnostic burst.
+  // =============================================================================
+  describe("subpath refresh diagnostic lifecycle", () => {
+    it("resets the subpath refresh diagnostic after a successful login", async () => {
+      const { login } = useAuthStore.getState();
+
+      mockPost?.mockResolvedValueOnce({
+        data: {
+          access_token: "jwt-login",
+          user: {
+            id: 3,
+            username: "diaguser",
+            full_name: "Diag User",
+            role: "member",
+            is_active: true,
+          },
+        },
+      });
+
+      await login("diaguser", "password123");
+
+      expect(mockResetSubpathRefreshDiagnostic).toHaveBeenCalled();
+    });
+
+    it("resets the subpath refresh diagnostic after a successful registration", async () => {
+      const { register } = useAuthStore.getState();
+
+      mockPost?.mockResolvedValueOnce({
+        data: {
+          access_token: "jwt-register",
+          user: {
+            id: 4,
+            username: "diaguser2",
+            full_name: "Diag User 2",
+            role: "member",
+            is_active: true,
+          },
+        },
+      });
+
+      await register("diaguser2", "password123", "Diag User 2");
+
+      expect(mockResetSubpathRefreshDiagnostic).toHaveBeenCalled();
+    });
+
+    it("resets the subpath refresh diagnostic during logout cleanup even when the server logout fails", async () => {
+      useAuthStore.setState({
+        user: mockUser,
+        accessToken: "jwt123",
+        isAuthenticated: true,
+        authMode: "jwt",
+      });
+
+      const { logout } = useAuthStore.getState();
+      mockPost?.mockRejectedValueOnce(new Error("Network error"));
+
+      await logout();
+
+      expect(mockResetSubpathRefreshDiagnostic).toHaveBeenCalled();
     });
   });
 
