@@ -59,11 +59,14 @@ def _config_text(name: str) -> str:
 def _strip_js_comments(text: str) -> str:
     """Remove block and line comments so comment placement cannot hide an
     import from the detector (JS permits comments between any two tokens,
-    e.g. `import /* x */ './y'`). Deleting comment text cannot create a
-    missed real import; worst case it over-flags, which fails safe for a
-    guardrail."""
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    e.g. `import /* x */ './y'`). Comments are replaced with a SPACE, not
+    removed: a comment is itself a token separator, so substituting it with
+    a space preserves token boundaries and no legal import form can be
+    hidden (final-critic round 3 on #624: empty-string substitution joined
+    `import/*c*/'./x'` into an undetectable blob). Worst case the scan
+    over-flags, which fails safe for a guardrail."""
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", text)
 
 
 @pytest.mark.parametrize("name", CONFIG_LOADED_FILES)
@@ -104,6 +107,9 @@ def test_import_detector_catches_commented_forms() -> None:
         "import x /* c */ from /* c */ './vite.paths'",
         "const m = await import /* c */ ('./vite.paths')",
         "import // line comment\n  './vite.paths'",
+        # compact forms: the comment is the ONLY token separator
+        "import/*c*/'./vite.paths'",
+        "import x/*c*/from/*c*/'./vite.paths'",
     ):
         match = EXTENSIONLESS_RELATIVE_IMPORT_RE.search(_strip_js_comments(snippet))
         assert match is not None, (
