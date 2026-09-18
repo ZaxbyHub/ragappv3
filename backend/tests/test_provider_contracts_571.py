@@ -164,12 +164,14 @@ class TestInstantPayloadCarriesTtl(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payloads[0].get("ttl"), 86400)
 
     async def test_stream_payload_carries_ttl_and_include_usage(self):
+        bodies: list = []
         raw = (
             'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
             "data: [DONE]\n\n"
         ).encode()
 
         def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content.decode("utf-8")))
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
@@ -185,9 +187,13 @@ class TestInstantPayloadCarriesTtl(unittest.IsolatedAsyncioTestCase):
         llm._client = client
         async for _ in llm.chat_completion_stream([{"role": "user", "content": "hi"}]):
             pass
-        # The request body is not captured by the SSE fake above; assert on
-        # the client's own contract instead via the non-stream sibling test
-        # and the include_usage test below.
+        # The wire body must carry the LM Studio idle TTL and the usage
+        # request exactly like the non-stream path (PRR-001: the SSE fake
+        # previously discarded the request body, so neither was asserted).
+        self.assertEqual(bodies[0].get("ttl"), 86400)
+        self.assertEqual(
+            bodies[0].get("stream_options"), {"include_usage": True}
+        )
 
 
 # ------------------------------------------------------------------
@@ -511,6 +517,54 @@ class TestPrimeResidency(unittest.IsolatedAsyncioTestCase):
 # ------------------------------------------------------------------
 # AC5 — bare-host Ollama embed fallback (modern dialect)
 # ------------------------------------------------------------------
+
+
+class TestProviderContractValidators(unittest.TestCase):
+    """PRR-006: the new settings validators must reject invalid values."""
+
+    def _settings(self, **overrides):
+        from app.config import Settings
+
+        base = dict(
+            users_enabled=False,
+            admin_secret_token="test-admin-key-0123456789abcdef",
+            jwt_secret_key="test-jwt-key-0123456789abcdef0123456789abcdef",
+        )
+        base.update(overrides)
+        return Settings(**base)
+
+    def test_zero_or_negative_contract_ints_rejected(self):
+        from pydantic import ValidationError
+
+        for field in (
+            "ollama_num_ctx",
+            "lm_studio_ttl",
+            "lm_studio_context_length",
+        ):
+            with self.assertRaises(ValidationError):
+                self._settings(**{field: 0})
+            with self.assertRaises(ValidationError):
+                self._settings(**{field: -5})
+
+    def test_valid_contract_ints_accepted(self):
+        settings = self._settings(
+            ollama_num_ctx=8192, lm_studio_ttl=3600, lm_studio_context_length=2048
+        )
+        self.assertEqual(settings.ollama_num_ctx, 8192)
+        self.assertEqual(settings.lm_studio_ttl, 3600)
+        self.assertEqual(settings.lm_studio_context_length, 2048)
+
+    def test_empty_keep_alive_rejected(self):
+        from pydantic import ValidationError
+
+        for value in ("", "   "):
+            with self.assertRaises(ValidationError):
+                self._settings(ollama_keep_alive=value)
+
+    def test_keep_alive_expressions_accepted(self):
+        for value in ("-1", "0", "3600", "30m", "1h"):
+            settings = self._settings(ollama_keep_alive=value)
+            self.assertEqual(settings.ollama_keep_alive, value)
 
 
 class TestBareHostEmbedDialect(unittest.TestCase):
