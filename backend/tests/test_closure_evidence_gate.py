@@ -12,6 +12,7 @@ importable because scripts/ ships an __init__.py).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -365,3 +366,181 @@ class TestVerifyTest:
         repo, shas = fixture_repo
         monkeypatch.setattr(cce, "_pytest_available", lambda: False)
         assert self._verify(repo, shas["broken"], shas["fixed"]) == 0
+
+
+WORKFLOW_REL = REPO_ROOT / ".github" / "workflows" / "closure-evidence.yml"
+
+
+def extract_run_blocks(workflow_text: str) -> list[str]:
+    """Return the `run: |` block bodies of the workflow, in file order."""
+    blocks: list[str] = []
+    lines = workflow_text.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == "run: |":
+            i += 1
+            base_indent = len(lines[i]) - len(lines[i].lstrip(" "))
+            body: list[str] = []
+            while i < len(lines):
+                line = lines[i]
+                if line.strip() and (len(line) - len(line.lstrip(" "))) < base_indent:
+                    break
+                body.append(line[base_indent:])
+                i += 1
+            blocks.append("\n".join(body))
+        else:
+            i += 1
+    return blocks
+
+
+class TestWorkflowShellContract:
+    """The workflow's own step scripts must survive `bash -e` on failing runs.
+
+    GitHub Actions executes `run: |` blocks with `bash -e`: a failing
+    verification (the normal violating-PR case) must still reach the
+    mode-application step. These tests extract the REAL step scripts from the
+    workflow file and run them under `bash -e` with shimmed binaries.
+    """
+
+    def setup_method(self):
+        run_blocks = extract_run_blocks(WORKFLOW_REL.read_text(encoding="utf-8"))
+        assert len(run_blocks) == 3, "expected evaluate/verify/apply-mode steps"
+        self.evaluate_step, self.verify_step, self.apply_step = run_blocks
+
+    def _shim_dir(self, tmp_path, python_behaviour: str):
+        shim = tmp_path / "shims"
+        shim.mkdir(exist_ok=True)
+        (shim / "gh").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *"api"* ]]; then echo \'{"base": {"ref": "master"}, '
+            '"head": {"sha": "cafe000000000000000000000000000000000000"}}\'; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (shim / "git").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *"merge-base"* ]]; then echo '
+            '"beef000000000000000000000000000000000000"; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        if python_behaviour == "failing_verify":
+            body = (
+                "#!/usr/bin/env bash\n"
+                'if [[ "$*" == *"verify-test"* ]]; then\n'
+                '  echo "closure-evidence: FAIL - simulated failing verification"\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$*" == *"pip"* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *"base\\x5d\\x5b\\x27ref\\x27"* ]]; then echo master; exit 0; fi\n'
+                'if [[ "$*" == *"head"* ]]; then echo '
+                "cafe000000000000000000000000000000000000; exit 0; fi\n"
+                "exit 0\n"
+            )
+        else:  # failing_evaluate
+            body = (
+                "#!/usr/bin/env bash\n"
+                'if [[ "$*" == *"evaluate"* ]]; then\n'
+                '  echo "closure-evidence: ERROR - simulated failing evaluate"\n'
+                "  exit 1\n"
+                "fi\n"
+                "exit 0\n"
+            )
+        (shim / "python").write_text(body, encoding="utf-8")
+        for name in ("gh", "git", "python"):
+            import stat
+
+            os.chmod(shim / name, os.stat(shim / name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return shim
+
+    def _real_bash(self):
+        """Locate a working bash: shutil.which may return the Windows WSL
+        launcher stub (System32\\bash.exe), which is not a shell here."""
+        import shutil
+
+        candidate = shutil.which("bash")
+        candidates = [candidate] if candidate else []
+        candidates += [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            "/usr/bin/bash",
+            "/bin/bash",
+        ]
+        for path in candidates:
+            if not path:
+                continue
+            if "system32" in path.replace("\\", "/").lower():
+                continue  # WSL launcher stub
+            try:
+                probe = subprocess.run(
+                    [path, "-c", "echo ok"],
+                    capture_output=True, text=True, timeout=15,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if probe.returncode == 0 and probe.stdout.strip() == "ok":
+                return path
+        return None
+
+    def _run_step(self, script: str, tmp_path: Path, env_extra: dict):
+        bash = self._real_bash()
+        if bash is None:  # pragma: no cover - CI and Git Bash both provide bash
+            pytest.skip("no working bash available")
+        bash_dir = str(Path(bash).resolve().parent)
+        out_file = tmp_path / "github_output"
+        # Shims first (they shadow python/gh/git), then the real bash's dir so
+        # the shims' `#!/usr/bin/env bash` shebangs resolve, then the ambient
+        # PATH; keep core Windows vars so native binaries do not misbehave.
+        env = {"PATH": str(tmp_path / "shims") + os.pathsep + bash_dir + os.pathsep + os.environ.get("PATH", "")}
+        for key in ("SYSTEMROOT", "SystemRoot", "COMSPEC", "PATHEXT", "WINDIR", "TEMP", "TMP"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        env["GITHUB_OUTPUT"] = str(out_file)
+        env.update(env_extra)
+        proc = subprocess.run(
+            [bash, "-e", "-c", script],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        return proc, out_file
+
+    def test_failing_evaluate_is_captured_not_fatal(self, tmp_path):
+        self._shim_dir(tmp_path, "failing_evaluate")
+        proc, out_file = self._run_step(
+            self.evaluate_step,
+            tmp_path,
+            {"PR_NUMBER": "5", "MODE": "warn", "GITHUB_REPOSITORY": "O/R"},
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "simulated failing evaluate" in proc.stdout  # log still catted
+        assert "eval_rc=1" in out_file.read_text(encoding="utf-8")
+
+    def test_failing_verify_is_captured_not_fatal_in_warn(self, tmp_path):
+        self._shim_dir(tmp_path, "failing_verify")
+        proc, out_file = self._run_step(
+            self.verify_step,
+            tmp_path,
+            {"PR_NUMBER": "5", "TEST_ID": "backend/tests/test_x.py::test_y", "GITHUB_REPOSITORY": "O/R"},
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "simulated failing verification" in proc.stdout
+        assert "verify_rc=1" in out_file.read_text(encoding="utf-8")
+
+    def test_apply_mode_warn_exits_zero_with_marker(self, tmp_path):
+        proc, _ = self._run_step(
+            self.apply_step, tmp_path, {"EVAL_RC": "1", "VERIFY_RC": "1", "MODE": "warn"}
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "closure-evidence: WARN" in proc.stdout
+
+    def test_apply_mode_enforce_fails(self, tmp_path):
+        proc, _ = self._run_step(
+            self.apply_step, tmp_path, {"EVAL_RC": "1", "VERIFY_RC": "", "MODE": "enforce"}
+        )
+        assert proc.returncode == 1
+        assert "closure-evidence: FAIL" in proc.stdout

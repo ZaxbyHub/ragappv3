@@ -78,10 +78,10 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           MODE: ${{ inputs.mode || 'warn' }}
         run: |
+          EVAL_RC=0
           python scripts/check_closure_evidence.py evaluate \
             --pr "$PR_NUMBER" --repo-slug "$GITHUB_REPOSITORY" --mode "$MODE" \
-            > evaluate.log 2>&1
-          EVAL_RC=$?
+            > evaluate.log 2>&1 || EVAL_RC=$?
           cat evaluate.log
           TEST_ID="$(grep -m1 '^closure-evidence: evidence-test ' evaluate.log | sed 's/^closure-evidence: evidence-test //')"
           {
@@ -112,10 +112,14 @@ jobs:
           HEAD_SHA="$(printf '%s' "$PR_JSON" | python -c "import json,sys; print(json.load(sys.stdin)['head']['sha'])")"
           BASE_SHA="$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")"
           echo "verify-test base=$BASE_SHA head=$HEAD_SHA test=$TEST_ID"
+          # GitHub Actions runs run: blocks under bash -e: capture the
+          # verify-test exit status with || so a FAILED verification (the
+          # normal violating-PR case) reaches the mode-application step
+          # instead of aborting this step — warn mode must stay non-blocking.
+          VERIFY_RC=0
           python scripts/check_closure_evidence.py verify-test \
             --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --test "$TEST_ID" \
-            > verify.log 2>&1
-          VERIFY_RC=$?
+            > verify.log 2>&1 || VERIFY_RC=$?
           cat verify.log
           echo "verify_rc=$VERIFY_RC" >> "$GITHUB_OUTPUT"
           exit 0
