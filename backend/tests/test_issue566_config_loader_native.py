@@ -53,7 +53,17 @@ _EXTENSION_RE = re.compile(r"\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|json)$")
 def _config_text(name: str) -> str:
     path = FRONTEND / name
     assert path.is_file(), f"config-loaded file {name} is missing"
-    return path.read_text(encoding="utf-8")
+    return _strip_js_comments(path.read_text(encoding="utf-8"))
+
+
+def _strip_js_comments(text: str) -> str:
+    """Remove block and line comments so comment placement cannot hide an
+    import from the detector (JS permits comments between any two tokens,
+    e.g. `import /* x */ './y'`). Deleting comment text cannot create a
+    missed real import; worst case it over-flags, which fails safe for a
+    guardrail."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
 
 
 @pytest.mark.parametrize("name", CONFIG_LOADED_FILES)
@@ -82,3 +92,22 @@ def test_config_files_relative_imports_have_extensions(name: str) -> None:
             "file extension; Vite's native config loader cannot resolve it"
         )
     print(f"566 GUARDRAIL CHECK: PASS — {name} relative imports carry extensions")
+
+
+def test_import_detector_catches_commented_forms() -> None:
+    """The detector must not be evaded by comments between import tokens
+    (final-critic Round 2 on #624): side-effect, dynamic, and from shapes
+    with block comments interleaved must all still be flagged."""
+    for snippet in (
+        "import /* c */ './vite.paths'",
+        "import /* c */ ('./vite.paths')",
+        "import x /* c */ from /* c */ './vite.paths'",
+        "const m = await import /* c */ ('./vite.paths')",
+        "import // line comment\n  './vite.paths'",
+    ):
+        match = EXTENSIONLESS_RELATIVE_IMPORT_RE.search(_strip_js_comments(snippet))
+        assert match is not None, (
+            f"566 GUARDRAIL CHECK: FAIL — detector missed a commented "
+            f"extensionless import: {snippet!r}"
+        )
+    print("566 GUARDRAIL CHECK: PASS — commented import forms still detected")
