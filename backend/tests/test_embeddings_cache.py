@@ -257,8 +257,6 @@ class TestEmbeddingServiceCache:
         self.mock_settings.embedding_batch_min_sub_size = 1
         self.mock_settings.chunk_size_chars = 1200
         self.mock_settings.chunk_overlap_chars = 120
-        self.mock_settings.tri_vector_search_enabled = False
-        self.mock_settings.flag_embedding_url = None
 
         yield
 
@@ -569,8 +567,6 @@ class TestEmbedPassagePrefix:
         self.mock_settings.embedding_batch_min_sub_size = 1
         self.mock_settings.chunk_size_chars = 1200
         self.mock_settings.chunk_overlap_chars = 120
-        self.mock_settings.tri_vector_search_enabled = False
-        self.mock_settings.flag_embedding_url = None
 
         yield
 
@@ -685,8 +681,6 @@ class TestCacheKeyFormat:
         self.mock_settings.embedding_batch_min_sub_size = 1
         self.mock_settings.chunk_size_chars = 1200
         self.mock_settings.chunk_overlap_chars = 120
-        self.mock_settings.tri_vector_search_enabled = False
-        self.mock_settings.flag_embedding_url = None
 
         yield
 
@@ -785,8 +779,6 @@ class TestEmbeddingServiceRedisL2Cache:
         self.mock_settings.embedding_batch_min_sub_size = 1
         self.mock_settings.chunk_size_chars = 1200
         self.mock_settings.chunk_overlap_chars = 120
-        self.mock_settings.tri_vector_search_enabled = False
-        self.mock_settings.flag_embedding_url = None
         self.mock_settings.redis_url = "redis://localhost:6379/0"
         self.mock_settings.embedding_cache_ttl_seconds = 604800
 
@@ -1174,8 +1166,6 @@ class TestEmbeddingServiceNoRedisFallback:
         self.mock_settings.embedding_batch_min_sub_size = 1
         self.mock_settings.chunk_size_chars = 1200
         self.mock_settings.chunk_overlap_chars = 120
-        self.mock_settings.tri_vector_search_enabled = False
-        self.mock_settings.flag_embedding_url = None
         self.mock_settings.redis_url = ""  # Empty URL means no Redis
         self.mock_settings.embedding_cache_ttl_seconds = 604800
 

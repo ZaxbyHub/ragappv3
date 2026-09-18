@@ -102,7 +102,6 @@ class TestRAGEngineRetrievalTopK(unittest.TestCase):
         with patch("app.services.rag_engine.settings") as mock_settings:
             mock_settings.retrieval_top_k = 15
             mock_settings.query_transformation_enabled = False
-            mock_settings.tri_vector_search_enabled = False
             mock_settings.maintenance_mode = False
             mock_settings.context_max_tokens = 0
             mock_settings.retrieval_evaluation_enabled = False

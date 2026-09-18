@@ -185,8 +185,6 @@ class TestEmbeddingsAdversarial:
              patch('app.services.embeddings.assert_url_safe'):
             mock.ollama_embedding_url = "http://localhost:11434"
             mock.embedding_model = "test-model"
-            mock.tri_vector_search_enabled = False
-            mock.flag_embedding_url = None
             mock.embedding_doc_prefix = ""
             mock.embedding_query_prefix = ""
             mock.embedding_batch_size = 512
@@ -1034,8 +1032,6 @@ class TestIntegrationAttacks:
              patch('app.services.embeddings.assert_url_safe'):
             mock_emb_settings.ollama_embedding_url = "http://localhost:11434"
             mock_emb_settings.embedding_model = "test-model"
-            mock_emb_settings.tri_vector_search_enabled = False
-            mock_emb_settings.flag_embedding_url = None
             mock_emb_settings.embedding_doc_prefix = ""
             mock_emb_settings.embedding_query_prefix = ""
             mock_emb_settings.embedding_batch_size = 512
@@ -1083,8 +1079,6 @@ class TestIntegrationAttacks:
              patch('app.services.embeddings.assert_url_safe'):
             mock_settings.ollama_embedding_url = "http://localhost:11434"
             mock_settings.embedding_model = "test-model"
-            mock_settings.tri_vector_search_enabled = False
-            mock_settings.flag_embedding_url = None
             mock_settings.embedding_doc_prefix = ""
             mock_settings.embedding_query_prefix = ""
             mock_settings.embedding_batch_size = 512
