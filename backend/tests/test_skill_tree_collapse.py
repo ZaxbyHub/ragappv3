@@ -1,0 +1,166 @@
+"""Collapsed skill-tree invariants (issue #569).
+
+The repo keeps ONE canonical home per skill: repo-specific skills are
+canonical in `.agents/skills/` (thin `.claude` pointer adapters keep them
+discoverable by Claude Code), framework-vendored skills are canonical in
+`.claude/skills/`, and `.opencode/skills/` holds only runner-specific
+opencode-swarm plugin skills, the generated knowledge subgroup, and the
+codebase-review-swarm adapter canonical. The former three-tree byte-mirror
+(`scripts/sync_skills.py` + `scripts/check_skill_sync.py` + the CI drift
+gate) was removed; this test pins the collapsed model so a future
+mirror-reintroduction or pointer rot fails in CI instead of passing
+silently.
+
+Canonical-home documentation: `docs/engineering/skill-conventions.md`
+("Canonical homes").
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+
+REPO_MIRROR = [
+    "auth-timestamp-invalidation",
+    "authz-bridging-exceptions",
+    "ci-compatibility-audit",
+    "ci-fix-monitor",
+    "commit-pr",
+    "config-env-contract-check",
+    "engineering-conventions",
+    "issue-tracer",
+    "module-test-isolation",
+    "qa-sweep",
+    "research-first",
+    "review-finding-validator",
+    "running-tests",
+    "subpath-deployment",
+    "swarm",
+    "swarm-implement",
+    "swarm-pr-feedback",
+    "swarm-pr-review",
+    "tech-debt-ci-review",
+    "test-isolation-patterns",
+    "unswarm",
+    "writing-tests",
+]
+
+FRAMEWORK_VENDORED = [
+    "brainstorm",
+    "clarify",
+    "clarify-spec",
+    "consult",
+    "council",
+    "critic-gate",
+    "deep-dive",
+    "design-docs",
+    "discover",
+    "execute",
+    "issue-ingest",
+    "phase-wrap",
+    "plan",
+    "pre-phase-briefing",
+    "resume",
+    "specify",
+]
+
+RUNNER_SPECIFIC = {
+    ".claude/skills": [
+        "agentic-engineering",
+        "autonomous-loops",
+        "coding-agent",
+        "gh-issues",
+        "github",
+        "plankton-code-quality",
+        "reviewing-code-core",
+        "reviewing-dependencies",
+        "reviewing-doc-drift",
+        "reviewing-security",
+        "ship",
+    ],
+    ".agents/skills": ["contributing", "subprocess-safety"],
+    ".opencode/skills": ["deep-research", "loop", "swarm-pr-subscribe"],
+}
+
+OPENCODE_SURVIVORS = {
+    "deep-research",
+    "loop",
+    "swarm-pr-subscribe",
+    "codebase-review-swarm",
+    "generated",
+}
+
+
+def _skillmd(tree: str, name: str) -> Path:
+    return REPO / tree / "skills" / name / "SKILL.md"
+
+
+def test_repo_specific_canonical_homes() -> None:
+    for name in REPO_MIRROR:
+        canonical = _skillmd(".agents", name)
+        assert canonical.is_file(), f"canonical missing: {canonical}"
+        assert not (REPO / ".opencode" / "skills" / name).exists(), (
+            f".opencode mirror must not exist for repo-specific skill {name}"
+        )
+
+
+def test_framework_vendored_canonical_homes() -> None:
+    for name in FRAMEWORK_VENDORED:
+        canonical = _skillmd(".claude", name)
+        assert canonical.is_file(), f"canonical missing: {canonical}"
+        assert not (REPO / ".opencode" / "skills" / name).exists(), (
+            f".opencode mirror must not exist for framework-vendored skill {name}"
+        )
+    merged = _skillmd(".claude", "phase-wrap").read_text(encoding="utf-8")
+    assert "is scanned by gates for verdict keywords" in merged, (
+        "phase-wrap drift-evidence gotcha must be merged into the .claude canonical"
+    )
+    assert "normalizes CONCERNS verdicts" in merged, (
+        "phase-wrap final-council gotcha must be merged into the .claude canonical"
+    )
+
+
+def test_claude_pointer_adapters_resolve() -> None:
+    for name in REPO_MIRROR:
+        pointer = _skillmd(".claude", name)
+        assert pointer.is_file(), f"Claude Code pointer missing: {pointer}"
+        lines = pointer.read_text(encoding="utf-8").splitlines()
+        assert len(lines) <= 30, f"pointer must stay thin: {pointer} ({len(lines)} lines)"
+        target_rel = f".agents/skills/{name}/SKILL.md"
+        assert target_rel in pointer.read_text(encoding="utf-8"), (
+            f"pointer body must name {target_rel}: {pointer}"
+        )
+        assert (REPO / target_rel).is_file(), f"pointer target missing: {target_rel}"
+
+
+def test_runner_specific_skills_stay_in_their_tree() -> None:
+    for tree, names in RUNNER_SPECIFIC.items():
+        for name in names:
+            path = REPO / tree / name / "SKILL.md"
+            assert path.is_file(), f"runner-specific skill missing: {path}"
+
+
+def test_opencode_tree_holds_only_survivors() -> None:
+    opencode = REPO / ".opencode" / "skills"
+    top_level = {p.name for p in opencode.iterdir() if p.is_dir()}
+    unexpected = sorted(top_level - OPENCODE_SURVIVORS)
+    assert not unexpected, f"unexpected .opencode/skills entries: {unexpected}"
+    adapter = opencode / "codebase-review-swarm"
+    assert (adapter / "SKILL.md").is_file()
+    assert (adapter / "README.md").is_file(), (
+        "secretscan positive sample .opencode/skills/codebase-review-swarm/README.md must survive"
+    )
+    for tree in (".agents", ".claude"):
+        body = (REPO / tree / "skills" / "codebase-review-swarm" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        assert ".opencode/skills/codebase-review-swarm/" in body, (
+            f"{tree} adapter must point at the canonical"
+        )
+
+
+def test_generated_subgroup_survives() -> None:
+    generated = REPO / ".opencode" / "skills" / "generated"
+    skills = [p for p in generated.iterdir() if p.is_dir()]
+    assert len(skills) == 12, f"expected 12 generated knowledge skills, found {len(skills)}"
