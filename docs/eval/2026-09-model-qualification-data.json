@@ -6013,5 +6013,43 @@
    "CDP_OMDS_Mini_ICD.docx",
    "Release_Notes_1.1.65.6.docx"
   ]
+ },
+ "embedding_challenger": {
+  "challenger_model": "Qwen/Qwen3-Embedding-0.6B",
+  "comparability": "attempted-negative",
+  "tei_servability": "confirmed (TEI 1.9.3 cuda image initialized the FlashQwen3 backend on GPU 0)",
+  "attempts": [
+   {
+    "attempt": 1,
+    "outcome": "model loaded on the default docker bridge; isolated app instance could not resolve the container name (URLBlocked: name resolution); container removed and recreated on the app network"
+   },
+   {
+    "attempt": 2,
+    "outcome": "correct network; TEI stalled downloading model.safetensors for >15 minutes inside the session execution budget; ingestion arms recorded 100% embedding failures and were aborted"
+   }
+  ],
+  "per_file_failures": [
+   {
+    "file": "CDP_BADTOK_Mini_ICD.docx",
+    "chunks_failed": 213,
+    "chunks_total": 213,
+    "status": "PARSE_FAILED: document could not be parsed"
+   },
+   {
+    "file": "CDP_OMDS_Mini_ICD.docx",
+    "chunks_failed": 140,
+    "chunks_total": 140,
+    "status": "PARSE_FAILED: document could not be parsed"
+   },
+   {
+    "file": "Release_Notes_1.1.65.6.docx",
+    "chunks_failed": 46,
+    "chunks_total": 46,
+    "status": "PARSE_FAILED: document could not be parsed"
+   }
+  ],
+  "reproduction": "docker run -d --name qwen3-embed-challenger --network ragappv3_default --gpus 'device=0' ghcr.io/huggingface/text-embeddings-inference:cuda-1.9.3 --model-id Qwen/Qwen3-Embedding-0.6B --port 8080 --auto-truncate; then an isolated app instance with EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B and OLLAMA_EMBEDDING_URL=http://qwen3-embed-challenger:8080/v1/embeddings, own data volume",
+  "verdict": "OPEN negative outcome: comparison not completed within the session budget; no adoption claim in either direction",
+  "qwen3_embedding_4b_disposition": "not attempted: 2560-d output requires the staged dimension rebuild against a full re-embed (vector_store.py:2174-2315) and fp16 weights ~8 GB would occupy a full RTX 2000E card; deferred with the frontier-audit's own 'per-card memory/work budgets fit' gate unsatisfied inside this session's budget"
  }
 }

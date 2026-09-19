@@ -87,8 +87,8 @@ from spans — disclosed as derived, not instrumented:
   connection setup and prefill dominate; on-box retrieval/rerank queue wait
   is the 40 ms component).
 - Generation (first content → completion): p50 ≈ 41.2 − 34.9 = 6.3 s at
-  tier 1; ≈ 27.7 s at tier 8 (99.8 − 80.3 minus queue growth), consistent
-  with model-side serialization across concurrent streams.
+  tier 1; ≈ 19.5 s at tier 8 (99.8 − 80.3), consistent with model-side
+  serialization across concurrent streams.
 - Throughput (achieved chat turns per wall-minute, this run's pacing): tier
   1 ≈ 1.0 turn/2 min including the full answer; tier 12 completed 10/12
   turns in ≈ 3 min of steady state ≈ 3.3 turns/min aggregate (2 errors).

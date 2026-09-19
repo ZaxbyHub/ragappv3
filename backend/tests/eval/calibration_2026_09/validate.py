@@ -180,6 +180,12 @@ def check_distributions() -> List[str]:
         rows = rd.get("results") or []
         if len(rows) != 63:
             problems.append("rrf_recency_dump has %d results, need 63" % len(rows))
+        summary = rd.get("summary") or {}
+        for side in ("raw_all_items", "recency_blended_all_items"):
+            st = summary.get(side) or {}
+            for field in ("n", "min", "max", "q25", "q50", "q75", "q95"):
+                if not isinstance(st.get(field), (int, float)):
+                    problems.append("rrf_recency_dump.summary.%s.%s missing or non-numeric" % (side, field))
         blended = [i.get("rrf_recency") for r in rows if r.get("items")
                    for i in r["items"][:3] if i.get("rrf_recency") is not None]
         if len(blended) < 100:
@@ -190,6 +196,7 @@ def check_distributions() -> List[str]:
                 problems.append(
                     "recency-blended top-3 mean %.3f outside the expected [0.5, 1.0] "
                     "normalized band (raw-scale values indicate the blend did not apply)" % top_mean)
+
     return problems
 
 
@@ -311,6 +318,17 @@ def check_e05() -> List[str]:
         "## Negative results",
     ], extra=raw_data_line))
     problems.extend(_check_e05_data())
+    emb = REPO_ROOT / "docs" / "eval" / "2026-09-model-qualification-data.json"
+    if emb.is_file():
+        ed = json.loads(emb.read_text(encoding="utf-8"))
+        ec = ed.get("embedding_challenger") or {}
+        if not ec.get("per_file_failures"):
+            problems.append("qualification data missing embedding_challenger.per_file_failures")
+        if not ec.get("attempts"):
+            problems.append("qualification data missing embedding_challenger.attempts")
+    else:
+        problems.append("MISSING: %s" % emb)
+        print("MISSING: %s" % emb)
     return problems
 
 
