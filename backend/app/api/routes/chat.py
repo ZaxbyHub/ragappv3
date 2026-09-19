@@ -170,9 +170,12 @@ class ChatResponse(BaseModel):
     # Issue #510 honesty fields (parity with the streaming done payload).
     currency_warnings: Optional[List[str]] = None
     citation_enforcement: Optional[Dict[str, Any]] = None
-    # "distance" | "rerank" | "rrf" — tells the client how to interpret `score`
-    # values in each source (polarity + thresholds). Default "distance" keeps
-    # older clients on the safe path if the engine omits it.
+    # Score contract (issue #36, verified against backend producers): chat
+    # sources carry "distance" or "rerank" — how the client interprets `score`
+    # (polarity + thresholds). The memory/UsedMemory channel has its own
+    # score_type vocabulary (rrf/fts/dense) and is rendered without relevance
+    # labels. Default "distance" keeps older clients on the safe path if the
+    # engine omits it.
     score_type: str = "distance"
     # SC-015: prompt version identifier for this response
     prompt_version: Optional[str] = Field(default=None)

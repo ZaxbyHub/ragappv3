@@ -54,7 +54,7 @@ const createSource = (overrides: Partial<Source> = {}): Source => ({
   id: "src-1",
   filename: "document.pdf",
   snippet: "Sample snippet",
-  score: 0.2,
+  score: 0.62,
   score_type: "distance",
   ...overrides,
 });
@@ -457,13 +457,14 @@ describe("AssistantMessage - Citations and Sources", () => {
 
   it("should show relevance badges for sources with scores", () => {
     const sources = [
-      createSource({ id: "src-1", filename: "relevant.pdf", score: 0.2, score_type: "distance" }),
-      createSource({ id: "src-2", filename: "highly-relevant.pdf", score: 0.1, score_type: "distance" }),
+      createSource({ id: "src-1", filename: "relevant.pdf", score: 0.62, score_type: "distance" }),
+      createSource({ id: "src-2", filename: "highly-relevant.pdf", score: 0.5, score_type: "distance" }),
     ];
     const message = createMessage({ content: "[S1] [S2] Test message", sources });
     render(<AssistantMessage message={message} />);
 
-    // Should show "Relevant" and "Highly Relevant" badges
+    // Calibrated distance bands: 0.62 = "Relevant" (<= 0.67), 0.5 = "Highly
+    // Relevant" (<= 0.56). Should show "Relevant" and "Highly Relevant" badges
     expect(screen.getByText("Relevant")).toBeInTheDocument();
     expect(screen.getByText("Highly Relevant")).toBeInTheDocument();
   });

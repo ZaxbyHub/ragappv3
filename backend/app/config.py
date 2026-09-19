@@ -192,12 +192,17 @@ class Settings(BaseSettings):
     """Number of top chunks to retrieve (unifies max_context_chunks and vector_top_k)."""
     vector_metric: str = "cosine"
     """Distance metric for vector similarity search."""
-    max_distance_threshold: float = 0.5
+    max_distance_threshold: float = 0.75
     """Maximum distance threshold for relevance filtering (replaces rag_relevance_threshold).
 
     For cosine distance: 0=identical, 1=orthogonal, 2=opposite.
-    1.0 allows moderately similar results through. Lower values (e.g. 0.5) are
-    more precise but risk filtering out all results for shorter or ambiguous queries.
+    Calibrated 2026-09 (issue #36) against the deployed harrier-oss-v1-0.6b
+    stack: gold-result cosine distances center at ~0.61 (q25/q75 = 0.56/0.67),
+    so the legacy 0.5 default dropped ~76% of relevant results on every
+    non-rerank path (measured gold-recall@7 0.236 -> 0.909 at 0.75, ceiling
+    0.927; no-answer leakage 16.7%). 0.75 also matches the calibrated
+    Related/Tangential UI boundary. Reranked paths bypass this filter
+    (document_retrieval: skip_distance_filter = reranked).
     Can be overridden via MAX_DISTANCE_THRESHOLD env var.
     """
     embedding_doc_prefix: str = ""

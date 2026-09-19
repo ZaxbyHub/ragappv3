@@ -1,0 +1,93 @@
+{
+ "prefix_ab": {
+  "n": 55,
+  "prefix": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
+  "baseline": {
+   "recall_at_7": 0.927,
+   "rank1_gold": 32,
+   "mrr": 0.73
+  },
+  "prefixed": {
+   "recall_at_7": 0.964,
+   "rank1_gold": 38,
+   "mrr": 0.799
+  },
+  "delta_recall_at_7": 0.036,
+  "verdict": "positive but below the pre-declared 0.05 recall bar; recommend controlled deployment trial, no default change in this PR"
+ },
+ "reranker_ab": {
+  "n": 48,
+  "baseline_model": "BAAI/bge-reranker-v2-m3 (TEI 1.9.3, deployed)",
+  "challenger_model": "Qwen/Qwen3-Reranker-0.6B (llama.cpp server-cuda, mradermacher Q8_0 GGUF, GPU 0)",
+  "challenger_comparability": "ad-hoc-gpu",
+  "baseline": {
+   "recall_at_7": 0.979
+  },
+  "challenger": {
+   "recall_at_7": 0.896
+  },
+  "delta": -0.083,
+  "challenger_request_errors": 7,
+  "verdict": "challenger REJECTED: delta -0.083 exceeds the 0.05 noise floor in the baseline's favor; errors retained as failures"
+ },
+ "topk_grid": {
+  "configs": [
+   {
+    "initial_top_k": 10,
+    "rerank_top_n": 10,
+    "recall_at_7": 0.927,
+    "n": 55
+   },
+   {
+    "initial_top_k": 10,
+    "rerank_top_n": 4,
+    "recall_at_7": 0.909,
+    "n": 55
+   },
+   {
+    "initial_top_k": 10,
+    "rerank_top_n": 7,
+    "recall_at_7": 0.909,
+    "n": 55
+   },
+   {
+    "initial_top_k": 20,
+    "rerank_top_n": 10,
+    "recall_at_7": 0.945,
+    "n": 55
+   },
+   {
+    "initial_top_k": 20,
+    "rerank_top_n": 4,
+    "recall_at_7": 0.927,
+    "n": 55
+   },
+   {
+    "initial_top_k": 20,
+    "rerank_top_n": 7,
+    "recall_at_7": 0.945,
+    "n": 55
+   }
+  ],
+  "deployed_default": "initial_top_k=20 -> rerank_top_n=7",
+  "verdict": "deployed default ties the grid optimum (0.945); widening top_n to 10 adds nothing, shrinking initial_top_k to 10 costs recall"
+ },
+ "chunking": {
+  "off": {
+   "recall_at_7": 1.0,
+   "n": 6,
+   "errors": 0
+  },
+  "on": {
+   "recall_at_7": 1.0,
+   "n": 6,
+   "errors": 0
+  },
+  "verdict": "scoped-subset ablation (3 CDP files, 6 labelled queries, isolated instance, same TEI endpoints); see qualification doc for interpretation",
+  "files": [
+   "CDP_BADTOK_Mini_ICD.docx",
+   "CDP_OMDS_Mini_ICD.docx",
+   "Release_Notes_1.1.65.6.docx"
+  ]
+ }
+}
