@@ -10,8 +10,9 @@ Issue: #569 (Workstream K, PR 7 of 7 — audit finding E11) · Date: 2026-09-19
   keeps its documented canonical in `.opencode/skills/`; the 12 generated
   knowledge skills stay in `.opencode/skills/generated/`.
 - **38 mirror copies deleted** from `.opencode/skills/` (22 repo-specific + 16
-  framework-vendored). The `.opencode` tree went from 43 top-level entries to 6
-  (3 plugin skills + `codebase-review-swarm` + `generated/`). opencode discovers
+  framework-vendored). The `.opencode` tree went from 43 top-level entries to 5
+  (3 plugin skills + `codebase-review-swarm` + `generated/`; the enforced
+  inventory is the survivor set in `backend/tests/test_skill_tree_collapse.py`). opencode discovers
   `.claude/skills/` and `.agents/skills/` natively, so no runner loses
   discoverability.
 - **22 `.claude` full copies became thin pointer adapters** (under 30 lines,
@@ -33,7 +34,11 @@ Issue: #569 (Workstream K, PR 7 of 7 — audit finding E11) · Date: 2026-09-19
 - **Scaffold deleted**: `redesign/` (31 files, self-documented as unwired since
   2026-07) removed. `specs/` split explicitly: `specs/draft-room/` (the live,
   code-referenced Draft Room invariant spec) is kept; the 15 externally
-  unreferenced spec subdirectories were removed.
+  unreferenced spec subdirectories were removed. This split removes historical
+  orphans only — the `specs/<feature-name>/SPEC.md` authoring convention (the
+  `ship` skill's path, following the `/spec` default) remains the supported way
+  to add new specs; future spec directories are referenced by their feature's
+  code and are unaffected by this cleanup.
 - Canonical homes, discovery coverage per runner, size budgets, and the
   pruning tally are documented in `docs/engineering/skill-conventions.md`.
 

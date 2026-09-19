@@ -46,7 +46,7 @@ One canonical tree per skill — never a second full copy in another tree:
 Pruning tally (issue #569, 2026-09): the collapse deleted 38 `.opencode`
 mirror copies (22 repo-specific + 16 framework-vendored) and converted the 22
 `.claude` repo-specific full copies into thin pointers; `.opencode/skills/`
-went from 43 top-level entries to 6. No skill content was retired in this
+went from 43 top-level entries to the 5 enforced survivors (4 skill dirs plus `generated/`; the enforced inventory is the survivor set in `backend/tests/test_skill_tree_collapse.py`, not the prose count here). No skill content was retired in this
 pass and no whole skill was deleted; deleted content remains recoverable from
 git history.
 
