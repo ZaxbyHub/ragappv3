@@ -6,9 +6,9 @@ regression-evidence convention at the moment a pull request claims to close an
 issue. It adds enforcement to a standard that already existed in writing — it
 does not redefine it:
 
-- `.opencode/skills/issue-tracer/SKILL.md` — "Regression test fails before the
+- `.agents/skills/issue-tracer/SKILL.md` — "Regression test fails before the
   fix and passes after the fix when feasible."
-- `.opencode/skills/swarm-implement/SKILL.md` — "Regression tests must be
+- `.agents/skills/swarm-implement/SKILL.md` — "Regression tests must be
   falsifiable." (verify the fix actually guards the repair: temporarily revert
   only the source fix, run the test, confirm it fails)
 

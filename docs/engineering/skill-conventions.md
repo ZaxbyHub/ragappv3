@@ -1,103 +1,71 @@
 # Skill Conventions
 
-Canonical specification for repo-specific skills across the three agent-runner
-trees (`.claude/skills/`, `.agents/skills/`, `.opencode/skills/`). Referenced
-by `AGENTS.md`, `docs/engineering/conventions.md`, and enforced in CI by
-`scripts/check_skill_sync.py`. This document is the source of truth for:
+Canonical specification for the repo's agent-runner skills across the three
+runner trees (`.claude/skills/`, `.agents/skills/`, `.opencode/skills/`).
+Referenced by `AGENTS.md` and `docs/engineering/conventions.md`; enforced by
+`backend/tests/test_skill_tree_collapse.py`. This document is the source of
+truth for:
 
-- What counts as a repo-specific skill vs a runner-specific or framework-vendored skill
-- The mirror rule and its exceptions
-- Canonical-tree precedence for sync propagation
+- What counts as a repo-specific vs a runner-specific, framework-vendored, adapter, or generated skill
+- The canonical home of every skill (one canonical tree per skill; no full-copy mirrors)
+- The thin-pointer adapter pattern that keeps multi-runner discoverability without duplication
 - Frontmatter shape
-- The adapter-skill pattern
-- `.secretscanignore` validation contract
+- The `.secretscanignore` validation contract
 - AC traceability format
 
 ## Scope categories
 
 Every skill directory under any of the three trees falls into exactly one
-category. The category determines whether the mirror rule applies.
+category. The category determines the skill's canonical home.
 
-| Category | Mirror rule applies? | Examples |
+| Category | Canonical home | Examples |
 |---|---|---|
-| **Repo-specific** | YES — must be byte-identical across all three trees when present in two or more | `swarm`, `qa-sweep`, `engineering-conventions`, `commit-pr` |
-| **Runner-specific** | NO — legitimately lives in one tree only | `.claude/`: `coding-agent`, `ship`, `github`, `reviewing-*`; `.agents/`: `contributing`, `subprocess-safety`; `.opencode/`: `deep-research`, `loop`, `swarm-pr-subscribe` |
-| **Framework-vendored** | NO — vendored from the upstream swarm framework; reference deleted `.swarm/` and absent `src/agents/architect.ts`; NOT in `AGENTS.md`'s repo-specific list | `brainstorm`, `clarify`, `plan`, `execute`, `council`, `critic-gate`, `phase-wrap`, `pre-phase-briefing`, `resume`, `specify`, `consult`, `deep-dive`, `design-docs`, `discover`, `issue-ingest`, `clarify-spec` |
-| **Adapter** | Adapter rule applies (see below) — one tree holds the canonical protocol; other trees hold thin pointers | `codebase-review-swarm` |
-| **Generated** | NO — auto-generated knowledge skills under `.opencode/skills/generated/`; the sync tool skips this subgroup entirely | the 12 `generated/*` skills |
+| **Repo-specific** | `.agents/skills/` (thin `.claude` pointer adapters) | `swarm`, `qa-sweep`, `engineering-conventions`, `commit-pr` |
+| **Runner-specific** | the single tree of the runner that owns it | `.claude/`: `coding-agent`, `ship`, `github`, `reviewing-*`; `.agents/`: `contributing`, `subprocess-safety`; `.opencode/`: `deep-research`, `loop`, `swarm-pr-subscribe` |
+| **Framework-vendored** | `.claude/skills/` (vendored from the upstream swarm framework; reference deleted `.swarm/` and absent `src/agents/architect.ts`) | `brainstorm`, `clarify`, `plan`, `execute`, `council`, `critic-gate`, `phase-wrap`, `pre-phase-briefing`, `resume`, `specify`, `consult`, `deep-dive`, `design-docs`, `discover`, `issue-ingest`, `clarify-spec` |
+| **Adapter** | one tree holds the canonical protocol; other trees hold thin pointers | `codebase-review-swarm` (canonical `.opencode/skills/codebase-review-swarm/`) |
+| **Generated** | `.opencode/skills/generated/` (auto-generated knowledge skills; plugin-internal) | the 12 `generated/*` skills |
 
-The current category lists are encoded as Python constants in
-`scripts/sync_skills.py` (`RUNNER_SPECIFIC_ALLOWLIST`,
-`FRAMEWORK_VENDORED_ALLOWLIST`, `ADAPTER_SKILLS`, `GENERATED_SUBGROUP`).
-Adding a skill to a non-mirror category requires editing that script.
+The current category membership and every invariant in this document are
+pinned by `backend/tests/test_skill_tree_collapse.py`; editing a skill's
+canonical home without updating that test (and this table) fails the Backend
+CI job.
 
-## Mirror rule (intent-based)
+## Canonical homes
 
-> A repo-specific skill that is present in two or more trees must be present
-> in all three trees with byte-identical content.
+One canonical tree per skill — never a second full copy in another tree:
 
-This is *intent-based*, not literal-counts-equal. The three trees legitimately
-have different sizes because each runner has its own runner-specific and
-framework-vendored skills. The rule catches real drift (a repo-specific skill
-edited in one tree but not the others, or present in two trees but missing
-from the third) without forcing every tree to carry every other runner's
-single-tree skills.
+| Category | Canonical tree | Extra trees hold |
+|---|---|---|
+| Repo-specific (22 skills) | `.agents/skills/<name>/` | thin pointer `SKILL.md` in `.claude/skills/<name>/` |
+| Framework-vendored (16 skills) | `.claude/skills/<name>/` | nothing (opencode discovers `.claude` natively) |
+| Runner-specific (16 skills) | the owning runner's tree | nothing |
+| `codebase-review-swarm` | `.opencode/skills/codebase-review-swarm/` | thin adapters in `.claude` and `.agents` |
+| Generated (12 skills) | `.opencode/skills/generated/` | nothing (plugin-internal) |
 
-Per-tree **frontmatter `description:`** wording differences are forbidden for
-non-adapter repo-specific skills. Use runner-neutral phrasing such as "the
-agent runner" or "the current session" rather than naming a specific runner
-("Claude Code", "Codex", "opencode-swarm"). This keeps the skill portable and
-avoids drift.
+Pruning tally (issue #569, 2026-09): the collapse deleted 38 `.opencode`
+mirror copies (22 repo-specific + 16 framework-vendored) and converted the 22
+`.claude` repo-specific full copies into thin pointers; `.opencode/skills/`
+went from 43 top-level entries to the 5 enforced survivors (4 skill dirs plus `generated/`; the enforced inventory is the survivor set in `backend/tests/test_skill_tree_collapse.py`, not the prose count here). No skill content was retired in this
+pass and no whole skill was deleted; deleted content remains recoverable from
+git history.
 
-**Body-level references are scoped differently.** A skill body may legitimately
-name the primary runner's actual runtime paths (for example
-`.zcode/session/swarm-mode.md` for this repo's primary runner, ZCode) when
-that path is the real file the skill writes. Two rules govern body paths:
+**When you add or change a repo-specific skill:** create or edit it in
+`.agents/skills/<name>/`, then add or update the thin pointer under
+`.claude/skills/<name>/` (see the adapter pattern below). `phase-wrap`'s
+canonical `.claude` copy carries two gotcha lines merged from the former
+`.opencode` copy during the #569 collapse; it is framework-vendored, so its
+canonical is `.claude` per the table above.
 
-1. The path must be **the actual runtime file** for this repo's primary runner
-   (verifiable on disk — e.g. `.zcode/session/swarm-mode.md` exists).
-2. The path must be **identical across all three trees** (so the mirror rule's
-   byte-identical requirement holds). Per-runner portability is a secondary
-   concern; if a secondary runner (Claude Code, Codex, opencode-swarm) needs
-   a different session path, that's a follow-up adaptation the secondary
-   runner's plugin can make, not a violation of this spec.
-
-When a body path is primary-runner-specific, prefer adding a one-line comment
-naming the runner ("for this repo's primary runner, ZCode") so a future
-contributor doesn't read it as universal.
-
-## Canonical-tree precedence
-
-When `scripts/sync_skills.py` propagates a drifted skill, it picks the
-canonical source from the first tree (in precedence order) that contains the
-skill:
-
-```
-.agents/skills > .claude/skills > .opencode/skills
-```
-
-Rationale: `docs/releases/pending/skills-narrowed-directives.md` documents
-that `.opencode/skills/` is the opencode-swarm plugin's internal area and is
-skipped when injecting skills for Claude Code or Codex sessions. Using
-`.opencode` as the canonical source would propagate from a tree that the
-target runners ignore. `.agents/skills/` is the smallest and most
-repo-focused tree; `.claude/skills/` is consumed by Claude Code.
-
-### Per-skill canonical override
-
-When the maintainer wants to preserve content found only in a non-precedence
-tree (for example, a useful addendum present in `.opencode` but absent from
-`.agents`), add an entry to `PER_SKILL_CANONICAL` in `scripts/sync_skills.py`:
-
-```python
-PER_SKILL_CANONICAL = {
-    "ci-fix-monitor": ".opencode/skills",   # preserves the force-push addendum
-    "commit-pr": ".claude/skills",          # runner-neutral branch-prefix wording
-}
-```
-
-Each override MUST carry a comment documenting why. The override is the
-supported escape hatch; do not introduce a second copy of the rule logic.
+Historical note: before #569 the model was a byte-identical three-tree mirror
+enforced by a dedicated local sync script plus a CI wrapper, with
+canonical precedence `.agents > .claude > .opencode` and two per-skill
+canonical overrides (`ci-fix-monitor` → `.opencode` for a force-push
+addendum, `commit-pr` → `.claude` for runner-neutral wording). All mirrored
+copies were byte-identical at collapse time and the overrides' content had
+already propagated, so the precedence winner (`.agents`) became the canonical
+home for every repo-specific skill with zero content change. That machinery
+was removed; a drift-gate reintroduction would need a new justification.
 
 ## Frontmatter shape
 
@@ -116,35 +84,55 @@ Optional keys (allowed, no requirement to include):
 `agent`, `origin`.
 
 The `description` field may be a single line OR a YAML folded scalar (`>`).
-Per-skill per-tree description wording differences are forbidden for
-non-adapter repo-specific skills (see "Mirror rule" above).
+Pointer adapters copy the canonical `description` verbatim (plus a one-line
+adapter notice) so discovery semantics match across runners. Use runner-neutral
+phrasing such as "the agent runner" or "the current session" in canonical
+descriptions rather than naming a specific runner.
 
 This minimal canonical shape was chosen because (a) it matches the only
 prior frontmatter guidance in the repo
 (`.opencode/skills/codebase-review-swarm/README.md:32` — "required `name`
 and `description`, plus harmless metadata"), (b) it minimizes churn across
-the existing 120+ SKILL.md files, and (c) the skill loaders in all three
+the existing SKILL.md files, and (c) the skill loaders in all three
 runners accept both shapes.
 
-## Adapter-skill pattern
+## Thin-pointer adapter pattern
 
-Some skills are too large or too runner-coupled to mirror byte-identically.
-For those, declare the skill in `ADAPTER_SKILLS` in `scripts/sync_skills.py`
-and follow this pattern:
+When a runner's own discovery tree needs a skill whose canonical home is a
+different tree, that runner's tree holds a thin pointer, not a copy:
 
-1. The canonical protocol lives in ONE tree (for `codebase-review-swarm`,
-   that is `.opencode/skills/codebase-review-swarm/` per `AGENTS.md:30` and
-   `.opencode/skills/codebase-review-swarm/INSTALL.md`).
-2. The other two trees hold thin adapters: short SKILL.md files that point
-   to the canonical path.
-3. `scripts/check_skill_sync.py` enforces the adapter relationship:
-   - The non-canonical copy's body MUST contain the literal string
-     `.opencode/skills/<skill-name>/` (a pointer to canonical).
-   - The non-canonical copy MUST be less than 30% of the canonical copy's
-     line count (thinness check).
+1. The canonical protocol lives in ONE tree (see the Canonical homes table).
+2. The other tree holds a short `SKILL.md` whose frontmatter copies the
+   canonical `description` (so discovery matches) and whose body names the
+   canonical path — e.g. `.agents/skills/<skill-name>/SKILL.md`.
+3. Keep the pointer under 30 lines; it must contain the literal canonical
+   path string.
 
-If a future skill needs the adapter pattern, add it to `ADAPTER_SKILLS` and
-verify both adapter invariants hold.
+`backend/tests/test_skill_tree_collapse.py` enforces that every repo-specific
+skill's `.claude` pointer exists, stays thin, names an existing canonical,
+and that no `.opencode` mirror reappears. `codebase-review-swarm` is the
+longest-standing exemplar (canonical `.opencode`, thin adapters in
+`.agents`/`.claude`).
+
+## Discovery coverage
+
+Which tree each runner's documented discovery path loads:
+
+| Runner | Discovery path(s) | What it finds |
+|---|---|---|
+| Codex | `.agents/skills/` + `AGENTS.md` | repo-specific canonicals, `.agents` runner-specific skills, adapter pointer |
+| ZCode | `.agents/skills/` | same as Codex |
+| opencode-swarm | plugin directory discovery of `.opencode/skills/<name>/SKILL.md`, plus native discovery of `.claude/skills/` and `.agents/skills/` | plugin runner-specific + generated + adapter canonical from `.opencode`; repo-specific canonicals via `.agents` |
+| Claude Code | `.claude/skills/` + `CLAUDE.md` (which imports `AGENTS.md`) | runner-specific + framework-vendored canonicals + thin pointers |
+
+Caveat: the opencode native multi-tree discovery claim is grounded in the
+2026-09 audit's runner-docs research (R5-S10 in issue #569) and
+`.opencode/skills/codebase-review-swarm/README.md:31` (portable-install
+paths), not in a locally executable loader probe. The automated guard is
+therefore structural — canonical homes plus valid pointers — which is the
+strongest feasible rung without launching each runner. If a runner gains or
+changes discovery paths, update this table and
+`backend/tests/test_skill_tree_collapse.py` together.
 
 ## `.secretscanignore` validation contract
 
@@ -196,25 +184,19 @@ documentation-only.
 Apply this convention to all skill files with AC sections; do not skip a
 file because the AC is "obvious."
 
-## Sync tooling
+## Skill size budgets
 
-`scripts/sync_skills.py` has three modes:
-
-- **default** (no flag): propagates the canonical copy of each drifted
-  repo-specific skill to every tree missing or divergent. Idempotent —
-  running twice is a no-op.
-- `--check`: reports drift to stderr without writing. Exit 1 on drift,
-  0 when clean. This is the CI mode invoked by
-  `scripts/check_skill_sync.py` from the Quality contracts job.
-- `--dry-run`: prints planned changes without writing.
-
-To run locally:
-
-```bash
-python scripts/sync_skills.py --check     # CI gate; report drift
-python scripts/sync_skills.py --dry-run   # preview propagation
-python scripts/sync_skills.py             # propagate
-```
+The agent-skills specification recommends keeping a `SKILL.md` lean (order
+of ~5k words) and moving reference detail into bundled files
+(`references/`, `assets/`). Measured at the #569 collapse (lines per
+canonical SKILL.md): all repo-specific and framework-vendored skills are
+within budget except `swarm-pr-review` (888 lines; the corresponding
+user-level copies are the ones agents actually load in most sessions) and
+`issue-tracer` (393 lines, close to budget). Both are flagged as known debt:
+rewriting live agent instructions is a content change with regression risk
+and no failing check driving it, so they are recorded here rather than
+silently trimmed. When editing these skills, prefer splitting detail into
+`references/` files over growing the SKILL.md body.
 
 ## What is intentionally NOT here
 
@@ -224,6 +206,8 @@ python scripts/sync_skills.py             # propagate
   YAML and adding one would be unwired. Re-evaluate only if the
   opencode-swarm plugin gains an `audience:`-aware loader (per
   `docs/releases/pending/skills-narrowed-directives.md`).
-- **pytest tests for the check scripts**: the existing `scripts/check_*.py`
-  family has no pytest coverage; the contract is the CI exit code. Follow
-  that convention unless a separate decision establishes a test baseline.
+- **A separate sync/CI drift gate**: the byte-mirror invariant the old
+  local-sync-plus-CI-wrapper pair enforced no longer exists by
+  construction (one canonical home per skill). The enforcement surface is
+  `backend/tests/test_skill_tree_collapse.py` in the Backend CI job;
+  adding a second gate over the same invariant would be redundant.

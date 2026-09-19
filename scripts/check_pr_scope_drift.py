@@ -86,10 +86,8 @@ def main() -> int:
             "scripts/check_config_contract.py",
             "scripts/check_pr_scope_drift.py",
             "scripts/check_closure_evidence.py",
-            "scripts/check_skill_sync.py",
             "scripts/check_secretscan.py",
             "scripts/check_test_collection_scope.py",
-            "scripts/sync_skills.py",
             ".agents/skills/ci-compatibility-audit/",
         ),
     )

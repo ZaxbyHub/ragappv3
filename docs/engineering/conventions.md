@@ -139,15 +139,15 @@ Three agent runners operate in this repo; each loads skills from its own tree:
 
 | Runner | Skill dir | Entry doc |
 |---|---|---|
-| Claude Code | `.claude/skills/` | `CLAUDE.md` |
+| Claude Code | `.claude/skills/` | `CLAUDE.md` (imports `AGENTS.md`) |
 | Codex | `.agents/skills/` | `AGENTS.md` |
-| opencode-swarm | `.opencode/skills/` | `AGENTS.md` |
+| opencode-swarm | `.opencode/skills/` (plugin skills only; natively discovers `.claude/skills/` and `.agents/skills/` too) | `AGENTS.md` |
 
 Repo-specific skills worth knowing: `commit-pr` (branch/commit/PR protocol), `ci-compatibility-audit` (reproduce CI locally), `config-env-contract-check`, `review-finding-validator`, `engineering-conventions` (this doc), `writing-tests` (see `docs/engineering/testing.md`).
 
-**When adding or changing a repo-specific skill, mirror it across all three trees** (or keep it a thin pointer to a canonical doc, as `engineering-conventions` does) so every runner stays consistent. Do not assume one tree's contents apply to another. Skills explicitly tied to *other* projects (e.g. an "opencode-swarm internals" skill) do not belong here.
+**When adding or changing a repo-specific skill, create it in its canonical tree** — `.agents/skills/` for repo-specific skills (the tree Codex/ZCode discover natively) — and give it a thin pointer SKILL.md in `.claude/skills/` so Claude Code discovery finds it (the adapter pattern `codebase-review-swarm` already uses). Never keep a second full copy of a skill in another tree. Skills explicitly tied to *other* projects (e.g. an "opencode-swarm internals" skill) do not belong here.
 
-The full skill specification — scope categories (repo-specific vs runner-specific vs framework-vendored vs adapter vs generated), canonical-tree precedence, frontmatter shape, the adapter-skill pattern, the `.secretscanignore` validation contract, and the AC traceability format — lives in `docs/engineering/skill-conventions.md`. Drift is enforced in CI by `scripts/check_skill_sync.py`; run `python scripts/sync_skills.py --check` locally before pushing skill changes.
+The full skill specification — scope categories (repo-specific vs runner-specific vs framework-vendored vs adapter vs generated), the canonical-homes table, frontmatter shape, the thin-pointer adapter pattern, the `.secretscanignore` validation contract, and the AC traceability format — lives in `docs/engineering/skill-conventions.md`. Canonical-home and pointer integrity is enforced by `backend/tests/test_skill_tree_collapse.py`.
 
 ---
 
