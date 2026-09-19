@@ -171,17 +171,27 @@ describe("SetupPage", () => {
     });
   });
 
-  it("redirects to /login on successful registration", async () => {
+  it("stays on the setup wizard after registration (issue #622 two-step flow)", async () => {
     const navigate = vi.fn();
     const { useNavigate } = await import("react-router-dom");
     vi.mocked(useNavigate).mockReturnValue(navigate);
 
-    const registerMock = vi.fn().mockResolvedValue({ success: true });
-    vi.spyOn(useAuthStoreModule, "useAuthStore").mockReturnValue({
-      register: registerMock,
-      needsSetup: true,
-      isLoading: false,
-    } as any);
+    // Stateful store mock mirroring the REAL register() transition
+    // (useAuthStore sets needsSetup: false after a successful register) —
+    // the final-critic regression for the /login redirect race.
+    let mockNeedsSetup: boolean | null = true;
+    const registerMock = vi.fn().mockImplementation(async () => {
+      mockNeedsSetup = false;
+      return { success: true };
+    });
+    vi.spyOn(useAuthStoreModule, "useAuthStore").mockImplementation(
+      () =>
+        ({
+          register: registerMock,
+          needsSetup: mockNeedsSetup,
+          isLoading: false,
+        }) as any
+    );
 
     const user = userEvent.setup();
     render(
@@ -198,9 +208,45 @@ describe("SetupPage", () => {
     const submitButton = screen.getByRole("button", { name: /Create Superadmin Account/i });
     await user.click(submitButton);
 
+    // Issue #622: registration now leads to the model-endpoint wizard step,
+    // not straight into the app — navigation happens on save/skip only, and
+    // the needsSetup:false flip must NOT trigger the /login redirect here.
+    // First-arg extraction (not toHaveBeenCalledWith) because the redirect
+    // calls navigate("/login", { replace: true }) — an exact-arity matcher
+    // would silently never match the two-arg call (reviewer Round 2 probe).
     await waitFor(() => {
-      expect(navigate).toHaveBeenCalledWith("/");
+      expect(screen.getByText("Configure Chat Models")).toBeInTheDocument();
     });
+    const navigateTargets = navigate.mock.calls.map((call) => call[0]);
+    expect(navigateTargets).not.toContain("/login");
+    expect(navigateTargets).not.toContain("/");
+  });
+
+  it("redirects direct visits to /login when setup is already complete", async () => {
+    // PRR-006: pins the direct-visit leg of the redirect (needsSetup=false at
+    // mount, no registration in flight → registeringRef still false).
+    const navigate = vi.fn();
+    const { useNavigate } = await import("react-router-dom");
+    vi.mocked(useNavigate).mockReturnValue(navigate);
+
+    vi.spyOn(useAuthStoreModule, "useAuthStore").mockReturnValue({
+      register: vi.fn(),
+      needsSetup: false,
+      isLoading: false,
+    } as any);
+
+    render(
+      <BrowserRouter>
+        <SetupPage />
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      const targets = navigate.mock.calls.map((call) => call[0]);
+      expect(targets).toContain("/login");
+    });
+    // The wizard step must never mount for a post-setup visitor.
+    expect(screen.queryByText("Configure Chat Models")).not.toBeInTheDocument();
   });
 
   it("shows Create Superadmin Account button text", () => {

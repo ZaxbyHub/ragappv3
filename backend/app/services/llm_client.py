@@ -2,6 +2,7 @@
 OpenAI-compatible LLM chat client using httpx.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -160,6 +161,7 @@ class LLMClient:
         num_ctx: Optional[int] = None,
         ttl: Optional[int] = None,
         context_length: Optional[int] = None,
+        api_key: Optional[str] = None,
     ):
         """
         Initialize the LLM client.
@@ -197,9 +199,15 @@ class LLMClient:
                 from the native model-load endpoint by
                 :meth:`prime_residency`; the OpenAI-compatible surface cannot
                 set it per request. ``None`` sends no load call.
+            api_key: Operator-supplied bearer credential for keyed remote
+                providers (issue #622). When set, every request carries
+                ``Authorization: Bearer <key>``; hot-updatable via
+                :meth:`reconfigure`. Never logged; write-only through the
+                settings pipeline.
         """
         self.base_url = (base_url or settings.ollama_chat_url).rstrip("/")
         self.model = model or settings.chat_model
+        self.api_key = api_key
         self.timeout = timeout
         self.max_tokens = max_tokens
         # Provider residency/context contracts (issue #571). Factory-fixed
@@ -244,12 +252,18 @@ class LLMClient:
         model: Optional[str] = None,
         max_tokens: Optional[int] = None,
         chat_template_kwargs: object = _KEEP_TEMPLATE_KWARGS,
+        api_key: Optional[str] = None,
     ) -> None:
-        """Hot-update base_url, model, default max_tokens and/or template kwargs in place.
+        """Hot-update base_url, model, default max_tokens, template kwargs and/or api key in place.
 
         ``chat_template_kwargs`` uses a sentinel default because ``None`` is a
         MEANINGFUL value here (omit the kwarg from the payload — instant-mode
         thinking enabled); pass ``_KEEP_TEMPLATE_KWARGS`` to leave it unchanged.
+        ``api_key`` keeps the other parameters' ``None`` = "leave unchanged"
+        convention: pass the new value (or ``""`` to clear) and the transport
+        pool is dropped so the next ``_ensure_started`` rebuilds the
+        AsyncClient with the updated Authorization header — httpx header
+        dicts must not be mutated in place (issue #622).
 
         Per-request URLs are computed from ``self.base_url`` at call time, so
         in-place updates take effect immediately without recreating the
@@ -284,6 +298,23 @@ class LLMClient:
             if normalized != self.chat_template_kwargs:
                 self.chat_template_kwargs = normalized
                 changed = True
+        if api_key is not None and api_key != self.api_key:
+            self.api_key = api_key
+            changed = True
+            # The running AsyncClient baked the old (or absent) Authorization
+            # header at construction; drop it so _ensure_started rebuilds
+            # with the new header instead of mutating httpx header state.
+            # Best-effort close of the retired pool (PR #644 review PRR-005):
+            # sync settings handlers run in a threadpool with no running
+            # loop, where the dropped client falls back to GC; async callers
+            # close it promptly on the next loop tick.
+            old_client = self._client
+            self._client = None
+            if old_client is not None:
+                try:
+                    asyncio.get_running_loop().create_task(old_client.aclose())
+                except RuntimeError:
+                    pass
         if changed:
             self._circuit_breaker.reset()
 
@@ -367,6 +398,11 @@ class LLMClient:
         self._pool_limits = limits
         # Add keep-alive headers to prevent LM Studio from unloading
         headers = {"Connection": "keep-alive", "Keep-Alive": "timeout=300, max=1000"}
+        # Keyed remote providers (issue #622): a stored api_key rides as the
+        # client-level default so every request carries it; per-request
+        # correlation headers merge over (never unset) this default.
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         # SSRFSafeTransport re-validates the resolved IP at request time to
         # close the DNS-rebinding TOCTOU gap the startup-only guard leaves
         # open, while preserving TLS SNI/cert validation. httpx ignores the
@@ -1176,6 +1212,7 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
         reasoning_effort="high",
         keep_alive=settings.ollama_keep_alive,
         num_ctx=settings.ollama_num_ctx,
+        api_key=settings.chat_api_key or None,
     )
 
 
@@ -1209,6 +1246,7 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
         cb_name="llm_editorial",
         keep_alive=settings.ollama_keep_alive,
         num_ctx=settings.ollama_num_ctx,
+        api_key=settings.chat_api_key or None,
     )
 
 
@@ -1264,5 +1302,13 @@ def create_instant_client(timeout: float = 120.0) -> "LLMClient":
         ttl=lm_studio_ttl if isinstance(lm_studio_ttl, int) else None,
         context_length=(
             lm_studio_ctx if isinstance(lm_studio_ctx, int) else None
+        ),
+        # Instant key override with thinking-key fallback (issue #622): a
+        # deployment that uses one keyed provider for both endpoints sets
+        # only the thinking key; a distinct instant provider sets its own.
+        api_key=(
+            settings.instant_api_key
+            or settings.chat_api_key
+            or None
         ),
     )

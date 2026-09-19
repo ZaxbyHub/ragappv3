@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
@@ -6,8 +6,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Database, Shield, User, Loader2, Eye, EyeOff } from "lucide-react";
+import ModelEndpointStep from "@/components/setup/ModelEndpointStep";
+
+// Step 1 = superadmin creation (unchanged); step 2 = chat endpoint
+// selection (issue #622). The wizard stays on /setup until the operator
+// saves or skips; navigate("/") happens on finish only.
+type SetupStep = "account" | "models";
 
 export default function SetupPage() {
+  const [step, setStep] = useState<SetupStep>("account");
+  const modelsHeadingRef = useRef<HTMLParagraphElement>(null);
   const [formData, setFormData] = useState({
     username: "",
     full_name: "",
@@ -21,12 +29,28 @@ export default function SetupPage() {
   const { register, needsSetup, isLoading } = useAuthStore();
   const navigate = useNavigate();
 
-  // Redirect to login if setup is already complete
+  // Redirect to login if setup is already complete. Two guards keep the
+  // just-registered superadmin on the wizard (issue #622): (1) step — the
+  // redirect only applies before the model-endpoint step; (2) registeringRef
+  // — register() flips needsSetup:false SYNCHRONOUSLY inside the submit
+  // handler, so a render flush can observe (needsSetup=false, step=account)
+  // BEFORE setStep("models") lands; the ref (set before the await) closes
+  // that window. Direct visits to /setup post-setup still redirect.
+  const registeringRef = useRef(false);
   useEffect(() => {
-    if (needsSetup === false) {
+    if (needsSetup === false && step === "account" && !registeringRef.current) {
       navigate("/login", { replace: true });
     }
-  }, [needsSetup, navigate]);
+  }, [needsSetup, navigate, step]);
+
+  // a11y (PRR-019): when the wizard step mounts, move focus to its heading
+  // so keyboard/screen-reader users land in the new context instead of on
+  // <body> (the account step's focused submit button was just unmounted).
+  useEffect(() => {
+    if (step === "models") {
+      modelsHeadingRef.current?.focus();
+    }
+  }, [step]);
 
   const validateForm = (): boolean => {
     const newErrors: Record<string, string> = {};
@@ -69,14 +93,19 @@ export default function SetupPage() {
       return;
     }
 
+    // Set BEFORE awaiting register(): the store flip inside register() is
+    // synchronous and must never be observed by the redirect effect while
+    // this submission is in flight.
+    registeringRef.current = true;
     try {
       await register(
         formData.username,
         formData.password,
         formData.full_name || undefined
       );
-      // Navigate to home page on success (user is already authenticated)
-      navigate("/");
+      // The user is authenticated as superadmin; continue to the chat
+      // endpoint wizard (issue #622) instead of entering the app directly.
+      setStep("models");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "";
       setError(msg || "Setup failed. Please try again.");
@@ -94,6 +123,34 @@ export default function SetupPage() {
             <p className="mt-1 text-xs text-muted-foreground">
               Checking whether the database has been initialized.
             </p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (step === "models") {
+    return (
+      <div className="flex min-h-screen items-center justify-center p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="space-y-1">
+            {/* a11y (issue #622 / PRR-019): the step swap unmounts the
+                focused submit button, so focus is programmatically moved to
+                the new step's heading (tabIndex -1, outlined on focus). */}
+            <CardTitle
+              ref={modelsHeadingRef}
+              tabIndex={-1}
+              className="text-2xl text-center focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+            >
+              Configure Chat Models
+            </CardTitle>
+            <CardDescription className="text-center">
+              Point the app at your own inference endpoints — no model ships by
+              default. You can change these later in Settings → Models.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ModelEndpointStep onFinish={() => navigate("/")} />
           </CardContent>
         </Card>
       </div>
