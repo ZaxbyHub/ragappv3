@@ -58,7 +58,7 @@ canonical `.claude` copy carries two gotcha lines merged from the former
 canonical is `.claude` per the table above.
 
 Historical note: before #569 the model was a byte-identical three-tree mirror
-enforced by `scripts/sync_skills.py` / `scripts/check_skill_sync.py` with
+enforced by a dedicated local sync script plus a CI wrapper, with
 canonical precedence `.agents > .claude > .opencode` and two per-skill
 canonical overrides (`ci-fix-monitor` → `.opencode` for a force-push
 addendum, `commit-pr` → `.claude` for runner-neutral wording). All mirrored
@@ -207,7 +207,7 @@ silently trimmed. When editing these skills, prefer splitting detail into
   opencode-swarm plugin gains an `audience:`-aware loader (per
   `docs/releases/pending/skills-narrowed-directives.md`).
 - **A separate sync/CI drift gate**: the byte-mirror invariant the old
-  `sync_skills.py`/`check_skill_sync.py` pair enforced no longer exists by
+  local-sync-plus-CI-wrapper pair enforced no longer exists by
   construction (one canonical home per skill). The enforcement surface is
   `backend/tests/test_skill_tree_collapse.py` in the Backend CI job;
   adding a second gate over the same invariant would be redundant.
