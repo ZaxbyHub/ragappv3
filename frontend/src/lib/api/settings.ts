@@ -16,6 +16,15 @@ export interface SettingsResponse {
   // Instant mode (LM Studio)
   instant_chat_url?: string;
   instant_chat_model?: string;
+  // Operator API keys (issue #622): write-only — the backend never echoes
+  // them; chat_configured/instant_configured are role-safe server-computed
+  // signals (safe to read at any role, unlike the redacted value fields).
+  chat_api_key?: string;
+  instant_api_key?: string;
+  chat_api_key_set?: boolean;
+  instant_api_key_set?: boolean;
+  chat_configured?: boolean;
+  instant_configured?: boolean;
   default_chat_mode?: 'instant' | 'thinking';
   ingestion_llm_mode?: 'instant' | 'thinking' | 'disabled';
   instant_initial_retrieval_top_k?: number;
@@ -149,6 +158,10 @@ export interface UpdateSettingsRequest {
   // Instant mode (LM Studio)
   instant_chat_url?: string;
   instant_chat_model?: string;
+  // Operator API keys (issue #622): write-only secrets persisted to
+  // settings_kv; an empty string clears a stored key.
+  chat_api_key?: string;
+  instant_api_key?: string;
   default_chat_mode?: 'instant' | 'thinking';
   ingestion_llm_mode?: 'instant' | 'thinking' | 'disabled';
   instant_initial_retrieval_top_k?: number;
@@ -211,6 +224,29 @@ export interface CuratorTestResult {
 
 export async function getSettings(): Promise<SettingsResponse> {
   const response = await apiClient.get<SettingsResponse>("/settings");
+  return response.data;
+}
+
+export interface ProbeEndpointResult {
+  status: "ok" | "unreachable" | "model_mismatch";
+  detail: string;
+}
+
+export interface ProbeEndpointRequest {
+  target: "thinking" | "instant";
+  base_url: string;
+  model: string;
+  api_key?: string;
+}
+
+/** Probe an operator-supplied endpoint before saving (issue #622, AC3). */
+export async function probeModelEndpoint(
+  request: ProbeEndpointRequest
+): Promise<ProbeEndpointResult> {
+  const response = await apiClient.post<ProbeEndpointResult>(
+    "/settings/probe",
+    request
+  );
   return response.data;
 }
 

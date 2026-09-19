@@ -171,7 +171,7 @@ describe("SetupPage", () => {
     });
   });
 
-  it("redirects to /login on successful registration", async () => {
+  it("stays on the setup wizard after registration (issue #622 two-step flow)", async () => {
     const navigate = vi.fn();
     const { useNavigate } = await import("react-router-dom");
     vi.mocked(useNavigate).mockReturnValue(navigate);
@@ -198,9 +198,12 @@ describe("SetupPage", () => {
     const submitButton = screen.getByRole("button", { name: /Create Superadmin Account/i });
     await user.click(submitButton);
 
+    // Issue #622: registration now leads to the model-endpoint wizard step,
+    // not straight into the app — navigation happens on save/skip only.
     await waitFor(() => {
-      expect(navigate).toHaveBeenCalledWith("/");
+      expect(screen.getByText("Configure Chat Models")).toBeInTheDocument();
     });
+    expect(navigate).not.toHaveBeenCalledWith("/");
   });
 
   it("shows Create Superadmin Account button text", () => {

@@ -1,8 +1,10 @@
-import { ReactNode } from "react";
+import { ReactNode, useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { Navigation } from "./Navigation";
 import { UploadIndicator } from "@/components/shared/UploadIndicator";
+import UnconfiguredChatBanner from "@/components/UnconfiguredChatBanner";
+import { getSettings } from "@/lib/api/settings";
 import type { HealthStatus } from "@/types/health";
 import type { NavItemId } from "./navigationTypes";
 
@@ -16,6 +18,24 @@ interface PageShellProps {
 export function PageShell({ children, activeItem, onItemSelect, healthStatus }: PageShellProps) {
   const location = useLocation();
   const prefersReducedMotion = useReducedMotion();
+
+  // First-login banner signal (issue #622): one fetch per shell mount.
+  // null = unknown (still loading or fetch failed) — the banner renders
+  // only on an authoritative false, so a failed fetch never nags.
+  const [chatConfigured, setChatConfigured] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getSettings()
+      .then((settings) => {
+        if (!cancelled) setChatConfigured(settings.chat_configured !== false);
+      })
+      .catch(() => {
+        if (!cancelled) setChatConfigured(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Chat pages get edge-to-edge layout (no padding)
   const isChat = location.pathname.startsWith("/chat");
@@ -64,6 +84,9 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
         tabIndex={-1}
         className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden"
       >
+        {chatConfigured === false && (
+          <UnconfiguredChatBanner chatConfigured={false} />
+        )}
         <div className={isChat ? "flex-1 min-h-0 overflow-hidden" : "flex-1 min-h-0 p-6 lg:p-8 overflow-auto pb-20 md:pb-6 mx-auto w-full"}>
           <AnimatePresence mode="wait">
             <motion.div

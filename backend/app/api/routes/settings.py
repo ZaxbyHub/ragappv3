@@ -80,6 +80,11 @@ class SettingsUpdate(BaseModel):
     # Instant mode (LM Studio on local GPU)
     instant_chat_url: Optional[str] = None
     instant_chat_model: Optional[str] = None
+    # Operator-supplied API keys for keyed remote providers (issue #622).
+    # Write-only secrets: persisted to settings_kv, never echoed by GET,
+    # redacted below admin, never logged. An empty string clears.
+    chat_api_key: Optional[str] = None
+    instant_api_key: Optional[str] = None
     default_chat_mode: Optional[str] = None
     ingestion_llm_mode: Optional[str] = None
 
@@ -636,6 +641,9 @@ ALLOWED_FIELDS = [
     # Instant mode (LM Studio)
     "instant_chat_url",
     "instant_chat_model",
+    # Operator-supplied API keys (issue #622; write-only secrets)
+    "chat_api_key",
+    "instant_api_key",
     "default_chat_mode",
     "ingestion_llm_mode",
     "instant_initial_retrieval_top_k",
@@ -864,6 +872,17 @@ class SettingsResponse(BaseModel):
     # Instant mode (operator-configured; no shipped default, issue #570)
     instant_chat_url: str = ""
     instant_chat_model: str = ""
+    # Operator API keys (issue #622): write-only — the wire value is ALWAYS
+    # empty; the *_set flags report presence and are themselves redacted
+    # below admin. chat_configured / instant_configured are role-safe
+    # signals computed server-side from the unredacted pairs (the first-login
+    # banner consumes them; values stay hidden from every non-admin).
+    chat_api_key: str = ""
+    instant_api_key: str = ""
+    chat_api_key_set: bool = False
+    instant_api_key_set: bool = False
+    chat_configured: bool = False
+    instant_configured: bool = False
     default_chat_mode: str = "thinking"
     ingestion_llm_mode: str = "instant"
     instant_initial_retrieval_top_k: int = 10
@@ -1019,6 +1038,16 @@ def _build_settings_dict() -> dict:
         # Instant mode (LM Studio)
         "instant_chat_url": settings.instant_chat_url,
         "instant_chat_model": settings.instant_chat_model,
+        # Operator API keys (issue #622): write-only — always empty on the
+        # wire; only presence flags are exposed (and redacted below admin).
+        "chat_api_key": "",
+        "instant_api_key": "",
+        "chat_api_key_set": bool(settings.chat_api_key),
+        "instant_api_key_set": bool(settings.instant_api_key),
+        # Role-safe configured signals (server-computed from the unredacted
+        # pairs; the first-login banner consumes these, gap G5).
+        "chat_configured": bool(settings.ollama_chat_url and settings.chat_model),
+        "instant_configured": bool(settings.instant_chat_url and settings.instant_chat_model),
         "default_chat_mode": settings.default_chat_mode,
         "ingestion_llm_mode": settings.ingestion_llm_mode,
         "instant_initial_retrieval_top_k": settings.instant_initial_retrieval_top_k,
@@ -1152,6 +1181,18 @@ INFRA_REDACTED_FIELDS: tuple[str, ...] = (
     # is defeated if the allowlist is returned wholesale. A non-empty list also
     # discloses that a multimodal backend is wired at all.
     "multimodal_allowed_model_origins",
+    # Operator API-key presence flags (issue #622): whether a keyed provider
+    # is in use is itself a configuration fact a non-admin should not learn.
+    "chat_api_key",
+    "instant_api_key",
+    "chat_api_key_set",
+    "instant_api_key_set",
+)
+
+# Redaction blanking is type-aware: these response fields must become False
+# (not "") below admin or SettingsResponse validation would fail.
+_REDACT_TO_FALSE_FIELDS: frozenset[str] = frozenset(
+    {"chat_api_key_set", "instant_api_key_set"}
 )
 
 
@@ -1180,9 +1221,12 @@ def _redact_infra_for_non_admin(settings_dict: dict, role: str) -> dict:
         if field in settings_dict:
             # Redaction must be type-aware: multimodal_allowed_model_origins is a
             # list[str] response field, so blank it to [] (not "") or SettingsResponse
-            # validation would fail for every non-admin.
+            # validation would fail for every non-admin. The api-key presence
+            # flags (issue #622) are bools and blank to False for the same reason.
             if field == "multimodal_allowed_model_origins":
                 settings_dict[field] = []
+            elif field in _REDACT_TO_FALSE_FIELDS:
+                settings_dict[field] = False
             else:
                 settings_dict[field] = ""
     # Keep the curator enable flag consistent with the redacted URL/model so
@@ -1278,6 +1322,7 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
         update.ollama_chat_url is not None
         or update.chat_model is not None
         or update.thinking_max_tokens is not None
+        or update.chat_api_key is not None
     ):
         if not (settings.ollama_chat_url and settings.chat_model):
             # The update cleared the pair: de-activate rather than
@@ -1292,6 +1337,10 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
                 base_url=settings.ollama_chat_url,
                 model=settings.chat_model,
                 max_tokens=settings.thinking_max_tokens,
+                # Issue #622: always pass the current key so a saved key
+                # change (set or cleared) reaches the live client; ""
+                # clears. reconfigure's own diff check skips no-ops.
+                api_key=settings.chat_api_key or "",
             )
     elif (
         thinking_client is None
@@ -1323,6 +1372,8 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
         or update.instant_chat_model is not None
         or update.instant_max_tokens is not None
         or update.instant_enable_thinking is not None
+        or update.instant_api_key is not None
+        or update.chat_api_key is not None
     ):
         if not (settings.instant_chat_url and settings.instant_chat_model):
             # Cleared pair: de-activate (see the thinking branch above).
@@ -1351,6 +1402,9 @@ def _hot_rebind_llm_clients(app, update: SettingsUpdate) -> None:
                         settings.instant_chat_model
                     )
                 ),
+                # Issue #622: instant key override with thinking-key
+                # fallback, mirroring create_instant_client's resolution.
+                api_key=settings.instant_api_key or settings.chat_api_key or "",
             )
     elif (
         instant_client is None
@@ -1658,6 +1712,74 @@ async def test_connection(user: dict = Depends(get_current_active_user)):
                 "model": settings.reranker_model,
             }
     return results
+
+
+class _ProbeBody(BaseModel):
+    """Operator-supplied endpoint probe (issue #622 first-setup wizard).
+
+    The wizard validates just-typed values BEFORE saving, so unlike
+    ``GET /settings/connection`` this takes the candidate endpoint as input.
+    ``target`` is advisory metadata for the response contract; ``api_key``
+    is optional (keyed remote providers) and never persisted or logged.
+    """
+
+    target: str
+    base_url: str
+    model: str
+    api_key: Optional[str] = None
+
+
+@router.post("/settings/probe")
+async def probe_model_endpoint(
+    body: _ProbeBody,
+    _role: dict = Depends(require_role("admin")),
+    _csrf_token: str = Depends(csrf_protect),
+):
+    """Probe an operator-supplied {base_url, model} pair (issue #622, AC3).
+
+    Admin-gated like PUT /settings (an arbitrary-URL probe is an SSRF
+    surface) and CSRF-protected as a POST. Validates the pair is complete
+    (422 otherwise — a filled request NEVER yields ``not_configured``),
+    runs the same ``assert_url_safe`` gate as the settings validator (422
+    ``Unsafe probe URL: ...``), then maps the ModelChecker dialect-chain
+    result onto ``{status: ok|unreachable|model_mismatch, detail}``.
+    Transport is mocked-fake friendly: the checker receives the client this
+    handler constructs, so tests can stand in for httpx wholesale.
+    """
+    target = (body.target or "").strip().lower()
+    if target not in ("thinking", "instant"):
+        raise HTTPException(
+            status_code=422,
+            detail="target must be 'thinking' or 'instant'",
+        )
+    base_url = (body.base_url or "").strip()
+    model = (body.model or "").strip()
+    if not base_url or not model:
+        raise HTTPException(
+            status_code=422,
+            detail="base_url and model are required",
+        )
+    try:
+        assert_url_safe(base_url)
+    except URLBlocked as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Unsafe probe URL: {exc}"
+        ) from exc
+
+    from app.services.model_checker import ModelChecker
+
+    checker = ModelChecker()
+    headers = {"Authorization": f"Bearer {body.api_key}"} if body.api_key else None
+    # follow_redirects=False + SSRFSafeTransport mirror check_models: a 30x
+    # must not bypass the SSRF gate, and the resolved IP is re-validated at
+    # request time (DNS-rebinding TOCTOU).
+    async with httpx.AsyncClient(
+        timeout=checker.timeout,
+        follow_redirects=False,
+        transport=SSRFSafeTransport(),
+        headers=headers,
+    ) as client:
+        return await checker.check_endpoint(client, base_url, model)
 
 
 class _CuratorTestBody(BaseModel):

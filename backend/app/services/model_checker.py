@@ -258,6 +258,37 @@ class ModelChecker:
                 order.append(dialect)
         return order
 
+    async def check_endpoint(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        model_name: str,
+    ) -> Dict[str, Any]:
+        """Probe one operator-supplied endpoint for the setup wizard (issue #622).
+
+        Maps the availability result onto the wizard's three-state contract —
+        ``ok`` / ``unreachable`` (transport or host failure) / ``model_mismatch``
+        (endpoint answered, model not served). Empty url/model never reach
+        here (the route 422s them first), so ``not_configured`` cannot surface
+        for a just-filled endpoint (AC3).
+
+        The caller supplies the client: a probe of NOT-yet-saved operator
+        values may carry an Authorization header (keyed remote providers)
+        that the persisted-settings checks must not assume.
+        """
+        result = await self._check_model_availability(client, base_url, model_name)
+        if result.get("available"):
+            return {"status": "ok", "detail": "the model is available"}
+        if isinstance(result, _ProbeFailureResult):
+            return {
+                "status": "unreachable",
+                "detail": result.get("error") or "endpoint unreachable",
+            }
+        return {
+            "status": "model_mismatch",
+            "detail": result.get("error") or "the model is not served",
+        }
+
     async def _check_model_availability(
         self,
         client: httpx.AsyncClient,

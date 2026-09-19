@@ -6,8 +6,15 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Database, Shield, User, Loader2, Eye, EyeOff } from "lucide-react";
+import ModelEndpointStep from "@/components/setup/ModelEndpointStep";
+
+// Step 1 = superadmin creation (unchanged); step 2 = chat endpoint
+// selection (issue #622). The wizard stays on /setup until the operator
+// saves or skips; navigate("/") happens on finish only.
+type SetupStep = "account" | "models";
 
 export default function SetupPage() {
+  const [step, setStep] = useState<SetupStep>("account");
   const [formData, setFormData] = useState({
     username: "",
     full_name: "",
@@ -75,8 +82,9 @@ export default function SetupPage() {
         formData.password,
         formData.full_name || undefined
       );
-      // Navigate to home page on success (user is already authenticated)
-      navigate("/");
+      // The user is authenticated as superadmin; continue to the chat
+      // endpoint wizard (issue #622) instead of entering the app directly.
+      setStep("models");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "";
       setError(msg || "Setup failed. Please try again.");
@@ -94,6 +102,25 @@ export default function SetupPage() {
             <p className="mt-1 text-xs text-muted-foreground">
               Checking whether the database has been initialized.
             </p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (step === "models") {
+    return (
+      <div className="flex min-h-screen items-center justify-center p-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="space-y-1">
+            <CardTitle className="text-2xl text-center">Configure Chat Models</CardTitle>
+            <CardDescription className="text-center">
+              Point the app at your own inference endpoints — no model ships by
+              default. You can change these later in Settings → Models.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ModelEndpointStep onFinish={() => navigate("/")} />
           </CardContent>
         </Card>
       </div>

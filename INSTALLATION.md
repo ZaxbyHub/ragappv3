@@ -474,13 +474,22 @@ volumes:
 
 The bundled `harrier-embed`/`reranker` containers download their models on
 first start — no manual pull is needed for embeddings or reranking. Chat is
-different: **no chat model ships with the system**. You point Meridian at
-your own inference — an Ollama, LM Studio, or vLLM endpoint on any machine,
-or a remote OpenAI-compatible API — by setting `OLLAMA_CHAT_URL` +
+different: **no chat model ships with the system** — you point Meridian at
+your own inference.
+
+**Primary path — the setup wizard.** When you create the first superadmin
+account, the setup wizard offers a "Configure Chat Models" step: pick a
+provider preset (Ollama, LM Studio, vLLM, or another OpenAI-compatible
+API), enter the base URL and model name, optionally add an API key, and
+use "Test connection" to verify before saving. Saving activates the
+endpoint immediately — no restart. Skipping the wizard is fine; a banner
+will point you to Settings → Models until chat is configured.
+
+**Expert path — environment variables.** Set `OLLAMA_CHAT_URL` +
 `CHAT_MODEL` (thinking) and, optionally, `INSTANT_CHAT_URL` +
-`INSTANT_CHAT_MODEL` (a second, faster endpoint). Configure them in
-`.env`, or later in the admin UI under Settings → Models. Until a thinking
-endpoint is configured, chat requests return a 409 pointing at the setting.
+`INSTANT_CHAT_MODEL` (a second, faster endpoint) in `.env`, or later in
+the admin UI under Settings → Models. Until a thinking endpoint is
+configured, chat requests return a 409 pointing at the setting.
 
 If you serve the chat model yourself with Ollama, pull your chosen model on
 that host first, for example:

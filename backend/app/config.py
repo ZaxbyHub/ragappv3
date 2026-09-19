@@ -125,6 +125,11 @@ class Settings(BaseSettings):
     editorial_chat_model: str = Field(default="", alias="DRAFT_EDITORIAL_CHAT_MODEL")
     instant_chat_url: str = ""
     instant_chat_model: str = ""
+    # Operator-supplied API keys for keyed remote providers (issue #622).
+    # Settings-kv-persisted write-only secrets: never in .env.example, never
+    # echoed by GET /settings, redacted below admin, never logged.
+    chat_api_key: str = ""
+    instant_api_key: str = ""
     default_chat_mode: str = "thinking"  # "instant" | "thinking"
 
     # Per-mode retrieval overrides (Instant uses smaller budget)

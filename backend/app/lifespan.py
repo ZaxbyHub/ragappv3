@@ -252,6 +252,10 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "chat_model",
             "instant_chat_url",
             "instant_chat_model",
+            # Operator API keys (issue #622): settings-kv replay so a saved
+            # key survives restart (mirror of PERSISTED_FUNCTIONAL_FIELDS).
+            "chat_api_key",
+            "instant_api_key",
             "default_chat_mode",
             "ingestion_llm_mode",
             "instant_initial_retrieval_top_k",
