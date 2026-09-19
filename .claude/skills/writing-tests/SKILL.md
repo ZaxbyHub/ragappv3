@@ -1,6 +1,6 @@
 ---
 name: writing-tests
-description: > RAGAPPv3 testing policy and conventions. Load before writing or modifying any test, fixing a test/CI failure, or adding coverage. Covers backend pytest + unittest (SimpleConnectionPool dependency-override harness, FK cascades, the Python 3.11-vs-local event-loop trap) and frontend Vitest + React Testing Library + jsdom (MemoryRouter, Radix Select, react-virtual mock patterns). This repo's frontend uses Vitest, NOT bun:test. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
+description: RAGAPPv3 testing policy and conventions. Load before writing or modifying any test, fixing a test/CI failure, or adding coverage. Covers backend pytest + unittest (SimpleConnectionPool dependency-override harness, FK cascades, the Python 3.11-vs-local event-loop trap) and frontend Vitest + React Testing Library + jsdom (MemoryRouter, Radix Select, react-virtual mock patterns). This repo's frontend uses Vitest, NOT bun:test. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
 metadata:
   adapter_for: ".agents/skills/writing-tests/SKILL.md"
 ---

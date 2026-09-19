@@ -1,6 +1,6 @@
 ---
 name: engineering-conventions
-description: > RAGAPPv3 engineering conventions — backend (FastAPI + SQLite + LanceDB), frontend (React + TypeScript + Vite + Vitest), database/migration/RBAC patterns, and the multi-agent skill layout. Load before implementing or refactoring backend routes/services/migrations or frontend pages/components, or when you need to know "how does this repo do X". Adapter pointing to the canonical repo skill; refer to that for the full protocol.
+description: RAGAPPv3 engineering conventions — backend (FastAPI + SQLite + LanceDB), frontend (React + TypeScript + Vite + Vitest), database/migration/RBAC patterns, and the multi-agent skill layout. Load before implementing or refactoring backend routes/services/migrations or frontend pages/components, or when you need to know "how does this repo do X". Adapter pointing to the canonical repo skill; refer to that for the full protocol.
 metadata:
   adapter_for: ".agents/skills/engineering-conventions/SKILL.md"
 ---

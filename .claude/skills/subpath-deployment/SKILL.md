@@ -1,6 +1,6 @@
 ---
 name: subpath-deployment
-description: > RAGAPPv3 subpath/reverse-proxy deployment system. Load before touching anything related to APP_ROOT_PATH, VITE_APP_BASENAME, VITE_API_URL, cookie paths, SPA catch-all routing, proxy configuration, or Docker build args for the frontend. Contains locked architectural decisions that must not be re-litigated. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
+description: RAGAPPv3 subpath/reverse-proxy deployment system. Load before touching anything related to APP_ROOT_PATH, VITE_APP_BASENAME, VITE_API_URL, cookie paths, SPA catch-all routing, proxy configuration, or Docker build args for the frontend. Contains locked architectural decisions that must not be re-litigated. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
 metadata:
   adapter_for: ".agents/skills/subpath-deployment/SKILL.md"
 ---

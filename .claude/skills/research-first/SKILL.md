@@ -1,6 +1,6 @@
 ---
 name: research-first
-description: > Apply when planning fixes, investigating tech debt, architecting solutions, or diagnosing unknown issues. Search online for current documentation and state-of-the-art approaches before tracing through code. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
+description: Apply when planning fixes, investigating tech debt, architecting solutions, or diagnosing unknown issues. Search online for current documentation and state-of-the-art approaches before tracing through code. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
 metadata:
   adapter_for: ".agents/skills/research-first/SKILL.md"
 ---

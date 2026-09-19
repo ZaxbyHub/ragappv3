@@ -1,6 +1,6 @@
 ---
 name: commit-pr
-description: > Commit, push, publish, ship, or open a GitHub pull request for ragappv3 changes. Use for PR creation, PR review follow-up pushes, draft PR updates, and release-ready local changes in this repo. Enforces ragappv3 branch hygiene, scoped staging, conventional commit titles, draft PRs against master, and Python/FastAPI plus npm/Vite validation. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
+description: Commit, push, publish, ship, or open a GitHub pull request for ragappv3 changes. Use for PR creation, PR review follow-up pushes, draft PR updates, and release-ready local changes in this repo. Enforces ragappv3 branch hygiene, scoped staging, conventional commit titles, draft PRs against master, and Python/FastAPI plus npm/Vite validation. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
 metadata:
   adapter_for: ".agents/skills/commit-pr/SKILL.md"
 ---

@@ -134,6 +134,44 @@ def test_claude_pointer_adapters_resolve() -> None:
         assert (REPO / target_rel).is_file(), f"pointer target missing: {target_rel}"
 
 
+ADAPTER_NOTICE = (
+    "Adapter pointing to the canonical repo skill; refer to that for the full protocol."
+)
+
+
+def _normalized_description(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    end = text.index("\n---", 3)
+    description: str | None = None
+    folded = False
+    for line in text[3:end].split("\n"):
+        if description is None:
+            match = line.startswith("description:")
+            if not match:
+                continue
+            value = line[len("description:") :].strip()
+            folded = value in (">", ">-", "|", "|-")
+            description = "" if folded else value
+        elif line.startswith((" ", "\t")):
+            description += " " + line.strip()
+        elif description is not None and not folded:
+            break
+    assert description is not None, f"no description frontmatter: {path}"
+    return " ".join(description.split())
+
+
+def test_pointer_descriptions_track_canonicals() -> None:
+    for name in REPO_MIRROR:
+        canonical = _normalized_description(_skillmd(".agents", name))
+        expected = canonical if canonical.endswith(".") else canonical + "."
+        expected += " " + ADAPTER_NOTICE
+        pointer = _normalized_description(_skillmd(".claude", name))
+        assert pointer == expected, (
+            f"pointer description drifted from canonical for {name}:\n"
+            f"  canonical: {expected}\n  pointer:   {pointer}"
+        )
+
+
 def test_runner_specific_skills_stay_in_their_tree() -> None:
     for tree, names in RUNNER_SPECIFIC.items():
         for name in names:
