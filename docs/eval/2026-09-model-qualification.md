@@ -61,6 +61,25 @@ default (top_k 20 → top_n 7, 0.945) ties the grid optimum; widening top_n to
 10 adds nothing (0.945) and shrinking the initial pool to 10 costs recall.
 Verdict: keep deployed retrieval sizing; no change.
 
+## Embedding challenger (attempted — negative serving outcome, retained)
+
+Qwen3-Embedding-0.6B (frontier-audit lead, claimed MTEB v2 ≈ 70.5 vs
+Harrier 69.0; 1024-d — index-compatible without a dimension rebuild):
+TEI-servability was CONFIRMED (a TEI 1.9.3 container initialized the model
+on the FlashQwen3 backend, GPU 0), and an isolated challenger app instance
+was provisioned with its own versioned index (own data volume,
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B pointed at the challenger TEI).
+Two full serving attempts were made: attempt 1 loaded the model but sat on
+the wrong docker network (removed and recreated); attempt 2 stalled in the
+1.2 GB weights download for >15 minutes inside the session's execution
+budget. The ingestion arm therefore recorded 100% embedding failures
+(213/213, 140/140, 46/46 chunks — failures retained verbatim in the trace)
+and the comparison could not be completed. Disposition: OPEN negative
+outcome — the arm is reproducible with the recorded procedure (exact docker
+run lines in the trace scratch) and remains follow-up work; no adoption
+claim is made in either direction. The frontier-audit's ranking numbers for
+this model remain unverified experiment leads.
+
 ## Negative results
 
 Retained deliberately (the issue requires keeping failures and negative
@@ -74,9 +93,21 @@ outcomes):
 3. Top-k/top-n widening: no gain at the deployed optimum.
 4. Contextual chunking: no measurable gain on the scoped subset at ~30×
    ingestion cost (both arms 6/6) — default stays off.
-5. Derived rerank band candidates (0.957/0.473/0.181 and 0.974/0.715/0.29)
+5. Qwen3-Embedding-0.6B challenger: serving attempt not completed within
+   the session budget (see above) — open, retained.
+6. Derived rerank band candidates (0.957/0.473/0.181 and 0.974/0.715/0.29)
    rejected by held-out validation (84.1% / 77.9% vs shipped 85.0%) — see
    calibration analysis.
-6. First ON-arm serving attempt of the challenger (unsloth GGUF repo) failed
-   to load in llama.cpp; replaced by mradermacher Q8_0 (attempt retained in
-   the trace log, not in this doc's data).
+7. First ON-arm serving attempt of the reranker challenger (unsloth GGUF
+   repo) failed to load in llama.cpp; replaced by mradermacher Q8_0
+   (attempt retained in the trace log, not in this doc's data).
+
+## Per-case raw results
+
+The data JSON carries per-query rows for the reranker A/B (challenger
+rankings and errors per query) and the qualification doc's arms derive from
+per-query raws retained in the trace scratch (e05_ablation_raw.json:
+per-query prefixed rankings and grid results; rerank_ab_raw.json: per-query
+challenger rankings incl. the 7 HTTP-500 failures; ablation_score_off/on
+.json: per-query chunking outcomes). Summary fields in the data JSON are
+computed from those per-case rows by scripts/build pass, never hand-entered.

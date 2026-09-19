@@ -2,10 +2,12 @@
 
 Primary-source verification of the models and claims used by the 2026-09
 qualification, executed 2026-09-19 (deployment: R640AI, commit 281bd714, TEI
-1.9.3 sha 4150561, harrier-oss-v1-0.6b + bge-reranker-v2-m3). External
-ranking numbers that could not be re-verified against a primary benchmark in
-this pass are labeled as such; the decision evidence for this PR is the
-frozen-pool A/B on the real vault, not leaderboard numbers.
+1.9.3 sha 4150561, harrier-oss-v1-0.6b + bge-reranker-v2-m3). Discovery was
+performed through the Donsetch search/fetch tool (donsetch MCP) plus direct
+primary-source fetches; external ranking numbers that could not be
+re-verified against a primary benchmark in this pass are labeled as such;
+the decision evidence for this PR is the frozen-pool A/B on the real vault,
+not leaderboard numbers.
 
 ## Harrier query/document formatting
 

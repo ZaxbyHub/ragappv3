@@ -166,6 +166,30 @@ def check_distributions() -> List[str]:
     for key in ("d_gold", "d_noans", "r_gold", "r_noans", "f_gold", "f_noans"):
         if key not in tuning_stats:
             problems.append("analysis.tuning_stats missing %r" % key)
+    # Recency-ON RRF supplement (final-critic round 1): AC2 requires the rrf
+    # distribution in BOTH forms. The frozen score_dump carries the raw
+    # (recency-off) form actually produced by the deployed pipeline; the
+    # supplement file carries the recency-blended form (rrf_fuse with
+    # recency_scores from file-level processed_at, weight 0.1).
+    rec = HERE / "rrf_recency_dump.json"
+    if not rec.is_file():
+        problems.append("MISSING: %s" % rec)
+        print("MISSING: %s" % rec)
+    else:
+        rd = json.loads(rec.read_text(encoding="utf-8"))
+        rows = rd.get("results") or []
+        if len(rows) != 63:
+            problems.append("rrf_recency_dump has %d results, need 63" % len(rows))
+        blended = [i.get("rrf_recency") for r in rows if r.get("items")
+                   for i in r["items"][:3] if i.get("rrf_recency") is not None]
+        if len(blended) < 100:
+            problems.append("rrf_recency_dump has only %d blended values" % len(blended))
+        else:
+            top_mean = sum(blended) / len(blended)
+            if not (0.5 <= top_mean <= 1.0):
+                problems.append(
+                    "recency-blended top-3 mean %.3f outside the expected [0.5, 1.0] "
+                    "normalized band (raw-scale values indicate the blend did not apply)" % top_mean)
     return problems
 
 

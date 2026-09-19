@@ -54,13 +54,55 @@
  },
  "long_generation": {
   "samples": 5,
-  "p50_ms": 312433.0,
-  "p95_ms": 312433.0
+  "errors": 0,
+  "first_content_p50_ms": 129722.0,
+  "first_content_p95_ms": 145054.0,
+  "p50_ms": 265823.0,
+  "p95_ms": 279918.0,
+  "note": "re-run with fresh login after the first attempt lost 4/5 requests to token expiry",
+  "requests": [
+   {
+    "queue_wait_s": 0.038,
+    "first_content_s": 146.793,
+    "completion_s": 280.438,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": 0.044,
+    "first_content_s": 127.499,
+    "completion_s": 265.823,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": 0.044,
+    "first_content_s": 129.722,
+    "completion_s": 277.838,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": 0.013,
+    "first_content_s": 110.577,
+    "completion_s": 182.28,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": 0.042,
+    "first_content_s": 138.098,
+    "completion_s": 254.197,
+    "error": null,
+    "empty_turn": false
+   }
+  ]
  },
  "bulk_ingestion": {
   "samples": 6,
   "p50_ms": 19400.0,
   "p95_ms": 25900.0,
+  "max_ms": 27900.0,
   "time_to_searchable_s": [
    27.9,
    20.0,

@@ -60,18 +60,41 @@ and was not the bottleneck in any tier measured here.
 
 ## Long generation
 
-5 sequential worst-case exhaustive-answer prompts: completion p50 = 312.4 s
-(p95 = 312.4 s at this sample size; individual runs in the raw data). Long
-thinking-mode generations hold the stream open for ~5 minutes each —
-operationally relevant for SSE timeouts and session limits.
+Re-run with a fresh login (the first attempt lost 4 of 5 requests to access-
+token expiry at the ~30-minute mark — those failures are retained in the
+trace, not hidden): 5/5 completed, 0 errors, 0 empty turns. Completion
+p50 = 265.8 s, p95 = 279.9 s (range 182.3–280.4 s per request, in the raw
+data); first useful content p50 = 129.7 s, p95 = 145.1 s. Long thinking-mode
+generations hold the stream open for ~4–5 minutes each — operationally
+relevant for SSE timeouts and session limits.
 
 ## Bulk ingestion
 
 6 documents (CDP manuals, 18–214 chunks each) uploaded via the real API:
 time-to-searchable per file 17.9 / 18.0 / 19.3 / 19.4 / 20.0 / 27.9 s
-(p50 19.4 s; p95 27.9 s). Uploads and indexing proceed concurrently with chat
-traffic without visible cross-impact at these sizes; files were deleted after
-measurement.
+(p50 19.4 s; p95 25.9 s; max 27.9 s). Uploads and indexing proceed
+concurrently with chat traffic without visible cross-impact at these sizes;
+files were deleted after measurement.
+
+## Stage decomposition and throughput (derived)
+
+Per-stage span capture (#595 E3 telemetry) was not wired into the SSE probe,
+so stage latency is DECOMPOSED from the measured milestones rather than read
+from spans — disclosed as derived, not instrumented:
+
+- Admission + retrieval + rerank + first-model-token = the queue-wait +
+  first-content interval: p50 ≈ 34.8 s at tier 1 (the off-box model's
+  connection setup and prefill dominate; on-box retrieval/rerank queue wait
+  is the 40 ms component).
+- Generation (first content → completion): p50 ≈ 41.2 − 34.9 = 6.3 s at
+  tier 1; ≈ 27.7 s at tier 8 (99.8 − 80.3 minus queue growth), consistent
+  with model-side serialization across concurrent streams.
+- Throughput (achieved chat turns per wall-minute, this run's pacing): tier
+  1 ≈ 1.0 turn/2 min including the full answer; tier 12 completed 10/12
+  turns in ≈ 3 min of steady state ≈ 3.3 turns/min aggregate (2 errors).
+  These are pacing-limited lower bounds, not saturation measurements — the
+  rate limit (30/minute/user) prevented burst-throughput probing, disclosed
+  as a methodology limit.
 
 ## Limits of this evidence (disclosed)
 
