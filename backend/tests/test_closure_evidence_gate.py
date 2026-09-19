@@ -690,7 +690,7 @@ class TestWorkflowF1TriggersAndGuard:
         text = self._workflow_text()
         keys = dict(extract_top_keys(text))
         pr_block = dict(extract_subkeys(keys["on"]))["pull_request"]
-        pr_lines = [l.strip() for l in pr_block]
+        pr_lines = [line.strip() for line in pr_block]
         joined = "\n".join(pr_lines)
         assert "master" in joined
         # The explicit list of activity types must still include synchronize
@@ -705,7 +705,7 @@ class TestWorkflowF1TriggersAndGuard:
         text = self._workflow_text()
         keys = dict(extract_top_keys(text))
         review_block = dict(extract_subkeys(keys["on"]))["pull_request_review"]
-        review_lines = "\n".join(l.strip() for l in review_block)
+        review_lines = "\n".join(line.strip() for line in review_block)
         assert "branches:" not in review_lines, (
             f"pull_request_review cannot carry a branches filter — remove it: {review_lines!r}"
         )
