@@ -21,11 +21,15 @@ export function PageShell({ children, activeItem, onItemSelect, healthStatus }: 
 
   // First-login banner signal (issue #622): one fetch per shell mount.
   // null = unknown (still loading or fetch failed) — the banner renders
-  // only on an authoritative false, so a failed fetch never nags.
+  // only on an authoritative false, so a failed fetch never nags. The
+  // getSettings call is deferred through Promise.resolve() so ANY failure
+  // (including a test double that doesn't export it) lands in .catch()
+  // instead of throwing synchronously inside the effect.
   const [chatConfigured, setChatConfigured] = useState<boolean | null>(null);
   useEffect(() => {
     let cancelled = false;
-    getSettings()
+    Promise.resolve()
+      .then(() => getSettings())
       .then((settings) => {
         if (!cancelled) setChatConfigured(settings.chat_configured !== false);
       })
