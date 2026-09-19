@@ -126,7 +126,7 @@ def extract_evidence(body: str | None) -> tuple[str | None, str | None, list[str
     test_ids = TEST_ID_RE.findall(body)
     artifact_match = ARTIFACT_RE.search(body)
     artifact = artifact_match.group(1).rstrip(".") if artifact_match else None
-    first, *extra = test_ids if test_ids else (None, [])
+    first, extra = (test_ids[0], test_ids[1:]) if test_ids else (None, [])
     return first, artifact, list(extra)
 
 

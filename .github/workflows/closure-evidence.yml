@@ -27,6 +27,15 @@ on:
       - edited
       - synchronize
       - reopened
+  # Re-run on cross-family review events so an outsider's approval unblocks
+  # the gate (Copilot review comment id 4052018483): pull_request_review does
+  # NOT support a `branches` filter, so base-branch scoping moves into the
+  # job's `if`.
+  pull_request_review:
+    types:
+      - submitted
+      - edited
+      - dismissed
   workflow_dispatch:
     inputs:
       pr_number:
@@ -56,7 +65,12 @@ jobs:
     timeout-minutes: 15
     # Live `gh api` fetching needs the intra-repo token path; fork PRs cannot
     # authenticate it. Dispatch runs are in-repo by construction.
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    # pull_request_review cannot carry a `branches` filter (Copilot review id
+    # 4052018483), so the base-branch guard for that event lives here.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event_name != 'pull_request_review' || github.event.pull_request.base.ref == 'master')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

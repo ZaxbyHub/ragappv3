@@ -104,6 +104,21 @@ class TestReviewRound1Fixes:
         )
         assert first == "backend/tests/test_foo.py::test_функция"
 
+    def test_extract_evidence_no_test_id_returns_empty_additional(self):
+        # Copilot review (id 4052018499): when the body names no pytest id,
+        # extract_evidence must return additional_test_ids as [] (a flat
+        # list), not [[]] (a list containing the empty list). The earlier
+        # `first, *extra = (None, [])` bug set extra = [[]]; any future
+        # consumer of the third value would have seen a nested empty list.
+        first, artifact, extra = cce.extract_evidence(
+            "Closes #1\n\nClosure evidence. artifact: CONTRIBUTING.md"
+        )
+        assert first is None
+        assert artifact == "CONTRIBUTING.md"
+        assert extra == []
+        assert isinstance(extra, list)
+        assert all(isinstance(item, str) for item in extra)
+
 
 class TestEvidencePrecedence:
     def test_first_test_id_wins(self):
@@ -393,6 +408,67 @@ def extract_run_blocks(workflow_text: str) -> list[str]:
     return blocks
 
 
+def extract_top_keys(workflow_text: str) -> list[tuple[str, list[str]]]:
+    """Return the list of top-level YAML keys with their nested lines.
+
+    Stdlib only — indentation-aware, same parser family as parse_on_block in
+    check_ac1_wiring_parse.py. Used to assert presence/absence of `on:` events
+    without depending on PyYAML.
+    """
+    keys: list[tuple[str, list[str]]] = []
+    lines = workflow_text.splitlines()
+    top_indent: int | None = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if top_indent is None:
+            top_indent = indent
+            if not stripped.endswith(":"):
+                i += 1
+                continue
+            key = stripped[:-1].strip().strip("\"'")
+            keys.append((key, []))
+            i += 1
+            continue
+        if indent < top_indent:
+            break
+        if indent == top_indent and stripped.endswith(":"):
+            key = stripped[:-1].strip().strip("\"'")
+            keys.append((key, []))
+            i += 1
+            continue
+        if keys:
+            keys[-1][1].append(line)
+        i += 1
+    return keys
+
+
+def extract_subkeys(key_lines: list[str]) -> list[tuple[str, list[str]]]:
+    sub: list[tuple[str, list[str]]] = []
+    if not key_lines:
+        return sub
+    base_indent = None
+    for raw in key_lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if base_indent is None:
+            base_indent = indent
+        if indent < base_indent:
+            break
+        if indent == base_indent and raw.strip().endswith(":"):
+            subkey = raw.strip()[:-1].strip().strip("\"'")
+            sub.append((subkey, []))
+        elif sub:
+            sub[-1][1].append(raw)
+    return sub
+
+
 class TestWorkflowShellContract:
     """The workflow's own step scripts must survive `bash -e` on failing runs.
 
@@ -544,3 +620,92 @@ class TestWorkflowShellContract:
         )
         assert proc.returncode == 1
         assert "closure-evidence: FAIL" in proc.stdout
+
+
+class TestWorkflowF1TriggersAndGuard:
+    """Copilot review comment id 4052018483: the gate must re-fire on cross-
+    family reviews, and the job `if` must scope the review event to master
+    because pull_request_review cannot carry a `branches` filter."""
+
+    def _workflow_text(self):
+        return WORKFLOW_REL.read_text(encoding="utf-8", errors="replace")
+
+    def test_pull_request_review_trigger_present(self):
+        keys = dict(extract_top_keys(self._workflow_text()))
+        on_block = keys["on"]
+        on_subs = [name for name, _ in extract_subkeys(on_block)]
+        assert "pull_request_review" in on_subs
+        # pull_request must also still be present (existing contract).
+        assert "pull_request" in on_subs
+
+    def test_pull_request_review_includes_submitted(self):
+        keys = dict(extract_top_keys(self._workflow_text()))
+        on_subs = dict(extract_subkeys(keys["on"]))
+        types = [
+            t.lstrip("- ").strip().strip("\"'")
+            for t in on_subs["pull_request_review"]
+            if t.lstrip().startswith("- ")
+        ]
+        assert "submitted" in types
+        assert "edited" in types
+        assert "dismissed" in types
+
+    def test_job_if_blocks_review_on_non_master_base(self):
+        """The job `if:` must scope pull_request_review events to master
+        because that event cannot carry a `branches:` filter (Copilot F1)."""
+        text = self._workflow_text()
+        # Find the `if:` line(s) on the closure-evidence-gate job and the
+        # scalar value they hold (which may span multiple lines).
+        in_job = False
+        if_lines: list[str] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("closure-evidence-gate:"):
+                in_job = True
+                continue
+            if in_job and stripped.startswith("steps:"):
+                break
+            if in_job and stripped.startswith("if: |"):
+                if_lines = [stripped[5:].lstrip()]
+                continue
+            if in_job and if_lines:
+                # Continuation lines of the `if:` scalar are more-indented than
+                # the key; stop at any sibling key (no leading space at the
+                # job-key indent).
+                if line and not line[0].isspace():
+                    if_lines = []
+                    continue
+                if_lines.append(stripped)
+        joined = "\n".join(if_lines)
+        assert "pull_request_review" in joined, (
+            f"job `if:` does not branch on pull_request_review (Copilot F1): {joined!r}"
+        )
+        assert "master" in joined, (
+            f"job `if:` does not scope pull_request_review events to master: {joined!r}"
+        )
+
+    def test_pull_request_trigger_still_branches_master(self):
+        """Regression: the original pull_request block keeps its branches:
+        [master] filter (don't lose existing scoping)."""
+        text = self._workflow_text()
+        keys = dict(extract_top_keys(text))
+        pr_block = dict(extract_subkeys(keys["on"]))["pull_request"]
+        pr_lines = [l.strip() for l in pr_block]
+        joined = "\n".join(pr_lines)
+        assert "master" in joined
+        # The explicit list of activity types must still include synchronize
+        # (asserted by C1 frozen driver too, so this is belt-and-braces).
+        assert "synchronize" in joined
+
+    def test_no_pull_request_review_branches_filter_in_yaml(self):
+        """pull_request_review does NOT support `branches:` in YAML on
+        GitHub; this is the whole reason the scoping had to move into the
+        job `if`. Pin that the workflow does NOT add a `branches:` key under
+        pull_request_review (which would be silently ignored)."""
+        text = self._workflow_text()
+        keys = dict(extract_top_keys(text))
+        review_block = dict(extract_subkeys(keys["on"]))["pull_request_review"]
+        review_lines = "\n".join(l.strip() for l in review_block)
+        assert "branches:" not in review_lines, (
+            f"pull_request_review cannot carry a branches filter — remove it: {review_lines!r}"
+        )
