@@ -48,6 +48,14 @@ export default defineConfig(({ mode }) => {
       host: true,
       proxy: createApiProxy(appBasename),
     },
+    // `vite preview` serves the production build; the same API proxy lets the
+    // Playwright e2e tier (issue #573 AC7) run the built app against the
+    // stub backend on :9090 without a dev server.
+    preview: {
+      port: 4173,
+      strictPort: true,
+      proxy: createApiProxy(appBasename),
+    },
     test: {
       globals: true,
       environment: 'jsdom',

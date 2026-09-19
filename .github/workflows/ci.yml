@@ -69,6 +69,50 @@ jobs:
         env:
           VITE_APP_BASENAME: /meridian
 
+  # Issue #573 (AC7): browser-level smoke tier — send / stop-mid-stream /
+  # reload-restores-history / citation-opens-source against the production
+  # build (`vite preview`, API proxied to a zero-dependency stub backend on
+  # :9090). Separate from the Frontend job so the vitest/typecheck/lint/build
+  # gates never depend on Playwright stability.
+  e2e:
+    name: Playwright e2e smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend/e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: frontend/e2e/package-lock.json
+
+      - name: Install e2e dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Install app dependencies and build
+        working-directory: frontend
+        run: |
+          npm ci --engine-strict
+          npm run build
+
+      - name: Run e2e smoke suite
+        run: npx playwright test --reporter=line
+
+      - name: Upload e2e failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.97
+        with:
+          name: playwright-report
+          path: frontend/e2e/test-results/
+          retention-days: 7
+
   quality-contracts:
     name: Quality contracts
     runs-on: ubuntu-latest
