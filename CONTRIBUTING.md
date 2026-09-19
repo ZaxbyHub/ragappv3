@@ -112,6 +112,15 @@ python scripts/check_skill_sync.py      # skill-tree mirror drift
 python scripts/check_secretscan.py      # .secretscanignore validity
 ```
 
+**Closure evidence gate** (from repo root; standalone workflow
+`.github/workflows/closure-evidence.yml`, issue #568 — evaluates PRs whose
+bodies close issues; warn-mode rollout):
+
+```bash
+python scripts/check_closure_evidence.py evaluate --pr-data <snapshot.json> --mode warn
+python scripts/check_closure_evidence.py verify-test --repo . --base <pre-fix-sha> --head <head-sha> --test backend/tests/test_x.py::test_y
+```
+
 **SAST** (from repo root; requires `bandit` from `backend/requirements-dev.txt`):
 
 ```bash

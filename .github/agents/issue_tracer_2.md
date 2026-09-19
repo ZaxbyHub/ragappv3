@@ -148,7 +148,9 @@ You MUST load and follow these, in precedence order (highest authority first):
 The `commit-pr` skill is authoritative for:
 
 - PR title (`<type>(<scope>): <description>`)
-- PR body (`Closes #`, `## Summary`, `## Test plan`, `## Review follow-up`)
+- PR body (`Closes #`, `## Summary`, `## Test plan`, `## Review follow-up`; when
+  the PR closes an issue, also `## Closure evidence` naming the evidence per
+  `docs/ci/closure-evidence-gate.md` — the CI closure-evidence gate checks it)
 - test plan / validation evidence
 - issue comment
 - draft vs ready state
