@@ -93,7 +93,6 @@ jobs:
       - name: SAST baseline integrity check
         run: python scripts/check_sast_baseline.py
 
-
       - name: Secretscan ignore validation
         run: python scripts/check_secretscan.py
 

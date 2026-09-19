@@ -91,6 +91,21 @@ OPENCODE_SURVIVORS = {
     "generated",
 }
 
+GENERATED_SKILLS = {
+    "council-advisory-triage",
+    "dependency-ci-contract",
+    "e2e-regression-async-generators",
+    "fastapi-rate-limiting-integration",
+    "hidden-coupling-cochange",
+    "hidden-coupling-vault-auth",
+    "post-removal-sweep",
+    "pr-review-database-api",
+    "python-async-sqlite",
+    "qa-gate-disciplined-completion",
+    "scalability-sqlite-pool",
+    "testing-mock-async-hygiene",
+}
+
 
 def _skillmd(tree: str, name: str) -> Path:
     return REPO / tree / "skills" / name / "SKILL.md"
@@ -157,6 +172,8 @@ def _normalized_description(path: Path) -> str:
         elif description is not None and not folded:
             break
     assert description is not None, f"no description frontmatter: {path}"
+    if len(description) >= 2 and description.startswith('"') and description.endswith('"'):
+        description = description[1:-1]
     return " ".join(description.split())
 
 
@@ -190,15 +207,21 @@ def test_opencode_tree_holds_only_survivors() -> None:
         "secretscan positive sample .opencode/skills/codebase-review-swarm/README.md must survive"
     )
     for tree in (".agents", ".claude"):
-        body = (REPO / tree / "skills" / "codebase-review-swarm" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
+        adapter_path = REPO / tree / "skills" / "codebase-review-swarm" / "SKILL.md"
+        body = adapter_path.read_text(encoding="utf-8")
         assert ".opencode/skills/codebase-review-swarm/" in body, (
             f"{tree} adapter must point at the canonical"
+        )
+        assert len(body.splitlines()) <= 30, (
+            f"{tree} codebase-review-swarm adapter must stay thin "
+            f"({len(body.splitlines())} lines)"
         )
 
 
 def test_generated_subgroup_survives() -> None:
     generated = REPO / ".opencode" / "skills" / "generated"
-    skills = [p for p in generated.iterdir() if p.is_dir()]
-    assert len(skills) == 12, f"expected 12 generated knowledge skills, found {len(skills)}"
+    skills = {p.name for p in generated.iterdir() if p.is_dir()}
+    assert skills == GENERATED_SKILLS, (
+        "generated knowledge skills changed; update GENERATED_SKILLS together with "
+        f"docs/engineering/skill-conventions.md. diff: {skills ^ GENERATED_SKILLS}"
+    )

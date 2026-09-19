@@ -31,7 +31,7 @@ Issue: #569 (Workstream K, PR 7 of 7 — audit finding E11) · Date: 2026-09-19
   merged into the surviving `.claude` canonical at their positional
   counterparts before the `.opencode` copy was deleted. No other skill content
   changed (all mirrored copies were byte-identical at collapse time).
-- **Scaffold deleted**: `redesign/` (31 files, self-documented as unwired since
+- **Scaffold deleted**: `redesign/` (32 files, self-documented as unwired since
   2026-07) removed. `specs/` split explicitly: `specs/draft-room/` (the live,
   code-referenced Draft Room invariant spec) is kept; the 15 externally
   unreferenced spec subdirectories were removed. This split removes historical
