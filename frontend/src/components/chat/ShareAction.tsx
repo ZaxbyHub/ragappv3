@@ -40,7 +40,7 @@ export function ShareAction({ sessionId }: ShareActionProps) {
       size="icon"
       onClick={handleShare}
       disabled={!sessionId}
-      aria-label="Share conversation link"
+      aria-label={copied ? "Conversation link copied" : "Share conversation link"}
     >
       {copied ? (
         <Check className="h-5 w-5" aria-hidden="true" />

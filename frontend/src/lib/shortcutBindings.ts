@@ -51,6 +51,25 @@ export function clearShortcutBindings(): void {
   }
 }
 
+/** Drop a single shortcut's override (its holder reverts to the default). */
+export function clearShortcutBinding(id: string): void {
+  try {
+    const next = loadShortcutBindings();
+    if (!(id in next)) return;
+    delete next[id];
+    if (Object.keys(next).length === 0) {
+      window.localStorage.removeItem(SHORTCUT_BINDINGS_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(
+        SHORTCUT_BINDINGS_STORAGE_KEY,
+        JSON.stringify(next)
+      );
+    }
+  } catch {
+    // Ignore unavailable storage.
+  }
+}
+
 /** The combo currently bound to `id`, or `fallback` (the shipped default). */
 export function effectiveBinding(id: string, fallback: string): string {
   return loadShortcutBindings()[id] ?? fallback;

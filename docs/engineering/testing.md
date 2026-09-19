@@ -74,7 +74,7 @@ vaults, sessions, durable-turn batch writes, and progressive SSE with
 
 ```bash
 cd frontend && npm ci && npm run build
-cd e2e && npm ci && npx playwright install chromium && npx playwright test
+cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test
 ```
 
 Write specs with resilient selectors (roles/aria-labels) and remember two

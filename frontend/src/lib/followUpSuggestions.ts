@@ -26,8 +26,13 @@ function topicFrom(userContent: string): string {
   while (words.length > 1 && LEADING_FILLERS.has(words[0].toLowerCase())) {
     words = words.slice(1);
   }
-  if (words.length <= 8) return words.join(" ");
-  return words.slice(0, 8).join(" ");
+  if (words.length <= 8) {
+    // Char-cap the topic too: an 8-word topic can still exceed the 80-char
+    // suggestion budget and leave zero suggestions (PRR-009 coverage caught
+    // this edge).
+    return truncate(words.join(" "), 40);
+  }
+  return truncate(words.slice(0, 8).join(" "), 40);
 }
 
 function truncate(text: string, max: number): string {
@@ -48,18 +53,24 @@ export function deriveFollowUps(
     .filter((t) => t.length > 0)
     .slice(0, 3);
 
+  // Interleave the source-grounded comparison with the topic templates so a
+  // present topic never crowds the source-based suggestion out of the 3-slot
+  // cap entirely (PRR-009 coverage surfaced this ordering flaw).
   const candidates: string[] = [];
+  const comparison =
+    titles.length >= 2
+      ? `Where do ${truncate(titles[0], 40)} and ${truncate(titles[1], 40)} disagree?`
+      : titles.length === 1
+        ? `What does ${truncate(titles[0], 50)} conclude?`
+        : null;
   if (topic) {
     candidates.push(`What are the key risks around ${topic}?`);
     candidates.push(`Summarize the main findings about ${topic}`);
+    if (comparison) candidates.push(comparison);
     candidates.push(`List the open questions about ${topic}`);
   }
-  if (titles.length >= 2) {
-    candidates.push(
-      `Where do ${truncate(titles[0], 40)} and ${truncate(titles[1], 40)} disagree?`
-    );
-  } else if (titles.length === 1) {
-    candidates.push(`What does ${truncate(titles[0], 50)} conclude?`);
+  if (comparison && (!topic || candidates[candidates.length - 1] !== comparison)) {
+    candidates.push(comparison);
   }
 
   const seen = new Set<string>();

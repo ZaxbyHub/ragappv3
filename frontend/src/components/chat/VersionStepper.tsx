@@ -27,7 +27,8 @@ export function VersionStepper({ versions, activeIndex, onSelectIndex }: Version
         type="button"
         onClick={() => onSelectIndex(Math.max(0, clampedIndex - 1))}
         aria-label="Show previous version"
-        className="inline-flex h-6 w-6 items-center justify-center rounded-sm transition-colors hover:bg-accent/10 hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+        aria-disabled={clampedIndex === 0}
+        className="inline-flex h-6 w-6 items-center justify-center rounded-sm transition-colors hover:bg-accent/10 hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring aria-disabled:opacity-40"
       >
         <span aria-hidden>‹</span>
       </button>
@@ -38,12 +39,20 @@ export function VersionStepper({ versions, activeIndex, onSelectIndex }: Version
         type="button"
         onClick={() => onSelectIndex(Math.min(versions.length - 1, clampedIndex + 1))}
         aria-label="Show next version"
-        className="inline-flex h-6 w-6 items-center justify-center rounded-sm transition-colors hover:bg-accent/10 hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+        aria-disabled={clampedIndex === versions.length - 1}
+        className="inline-flex h-6 w-6 items-center justify-center rounded-sm transition-colors hover:bg-accent/10 hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring aria-disabled:opacity-40"
       >
         <span aria-hidden>›</span>
       </button>
       <span className="sr-only" data-version-content>
         {versions[clampedIndex].content}
+      </span>
+      {/* Live region: stepping swaps the message content in place, which the
+          transcript's aria-relevant="additions" log does not announce — this
+          separate span carries the swap (position + content) to screen
+          readers without changing the content span's exact text. */}
+      <span className="sr-only" aria-live="polite" data-testid="version-announcement">
+        {`Version ${clampedIndex + 1} of ${versions.length}: ${versions[clampedIndex].content}`}
       </span>
     </div>
   );

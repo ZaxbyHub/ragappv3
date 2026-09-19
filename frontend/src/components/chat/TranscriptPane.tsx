@@ -594,6 +594,17 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     const { messageIds: ids, messagesById, activeChatId } = useChatStore.getState();
     const idx = ids.indexOf(messageId);
     if (idx < 0) return;
+    if (activeChatId) {
+      try {
+        await truncateChatSession(
+          parseInt(activeChatId),
+          durableKeepSeq(ids.slice(0, idx), messagesById)
+        );
+      } catch {
+        toast.error("Couldn't update conversation history");
+        return;
+      }
+    }
     // Issue #573 (AC3): snapshot the pre-edit content keyed by transcript
     // slot ("<activeChatId>:<index>"). Editing truncates in place and the
     // re-sent message lands at the same index, so the slot key is stable and
@@ -604,7 +615,9 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     // the edit starts a new live lineage, so the re-sent message must render
     // as the live content, not the stale selected version. Slots at or after
     // the truncation point become stale (their indices will map to different
-    // messages after the re-send), so they are dropped.
+    // messages after the re-send), so they are dropped. Version-state
+    // mutations run only after the server truncate has SUCCEEDED, so a
+    // failed truncate leaves the version maps untouched (PRR-011).
     const slotKey = activeChatId ? `${activeChatId}:${idx}` : null;
     const editState = useChatStore.getState();
     const originalContent = messagesById[messageId]?.content;
@@ -623,17 +636,6 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
       }
     }
     clearEditVersionsFrom?.(idx + 1);
-    if (activeChatId) {
-      try {
-        await truncateChatSession(
-          parseInt(activeChatId),
-          durableKeepSeq(ids.slice(0, idx), messagesById)
-        );
-      } catch {
-        toast.error("Couldn't update conversation history");
-        return;
-      }
-    }
     removeMessagesFrom(idx);
     setInput(content);
     composerRef.current?.focus();

@@ -12,7 +12,9 @@ import {
   comboFromEvent,
   effectiveBinding,
   saveShortcutBinding,
+  clearShortcutBinding,
   clearShortcutBindings,
+  loadShortcutBindings,
 } from "@/lib/shortcutBindings";
 
 /**
@@ -33,6 +35,13 @@ const shortcuts = [
 ] as const;
 
 export type ShortcutId = (typeof shortcuts)[number]["id"];
+
+/** Canonical (comboFromEvent-normalized) forms of the rebindable defaults —
+ * used for conflict comparison, since stored bindings are normalized. */
+const CANONICAL_DEFAULT: Partial<Record<ShortcutId, string>> = {
+  focusSearch: "Ctrl+K",
+  showShortcuts: "?",
+};
 
 /** Default combo for a shortcut id (the shipped binding). */
 export function defaultBinding(id: ShortcutId): string {
@@ -77,9 +86,15 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
   const [capturing, setCapturing] = useState<ShortcutId | null>(null);
 
   useEffect(() => {
+    // Reset on BOTH transitions: entering capture with a stale state would
+    // be confusing, and leaving the dialog open->false while capturing MUST
+    // disarm the window capture listener — the dialog stays mounted
+    // (ChatShell renders it unconditionally), so without this reset the
+    // listener would swallow the next app-wide keypress and silently persist
+    // it as a rebind (PRR-001).
+    setCapturing(null);
     if (open) {
       setBindings((prev) => ({ ...prev }));
-      setCapturing(null);
     }
   }, [open]);
 
@@ -94,6 +109,22 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
       if (combo === null) {
         if (e.key === "Escape") setCapturing(null);
         return;
+      }
+      // Conflict handling (PRR-003): if another rebindable shortcut already
+      // holds this combo, clear that binding so the combo drives exactly one
+      // action (the previous holder reverts to its default). Comparison uses
+      // canonical combos — stored bindings are comboFromEvent-normalized, and
+      // the rebindable defaults have canonical forms ("Ctrl/Cmd + K" →
+      // "Ctrl+K", "?" → "?").
+      const current = loadShortcutBindings();
+      for (const other of shortcuts) {
+        if (other.id === capturing || !other.rebindable) continue;
+        const otherCanonical = CANONICAL_DEFAULT[other.id] ?? other.key;
+        const otherEffective = current[other.id] ?? otherCanonical;
+        if (otherEffective === combo) {
+          clearShortcutBinding(other.id);
+          setBindings((prev) => ({ ...prev, [other.id]: other.key }));
+        }
       }
       saveShortcutBinding(capturing, combo);
       setBindings((prev) => ({ ...prev, [capturing]: combo }));
@@ -131,12 +162,14 @@ export function KeyboardShortcutsDialog({ open, onOpenChange }: { open: boolean;
             const isCapturingRow = capturing === id;
             return (
               <div key={key} className="flex justify-between items-center gap-2">
-                <dt className="font-mono text-sm bg-muted px-2 py-1 rounded-sm">
+                {/* aria-live so capture entry (the "…" placeholder) and the
+                    saved combo are announced to screen readers (PRR-006/007). */}
+                <dt className="font-mono text-sm bg-muted px-2 py-1 rounded-sm" aria-live="polite">
                   {isCapturingRow ? "…" : shownKey}
                 </dt>
                 <dd className="flex min-w-0 flex-1 items-center justify-end gap-2 text-sm text-muted-foreground">
                   {isCapturingRow ? (
-                    <span className="text-xs italic" data-testid="capture-hint">
+                    <span className="text-xs italic" data-testid="capture-hint" role="status">
                       Press the new key combination (Esc cancels)
                     </span>
                   ) : (

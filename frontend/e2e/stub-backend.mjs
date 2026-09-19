@@ -170,10 +170,21 @@ function sendJson(req, res, status, body, extraHeaders = {}) {
   res.end(payload);
 }
 
+const MAX_BODY_BYTES = 5 * 1024 * 1024; // PRR-012: bound request bodies (413 beyond this)
+
 function readBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("payload too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => {
       const raw = Buffer.concat(chunks).toString("utf-8");
       try {
@@ -257,6 +268,9 @@ const server = http.createServer(async (req, res) => {
       // every fresh context and the login scenario could never run).
       const cookies = req.headers.cookie ?? "";
       if (!loggedIn || !cookies.includes("ragapp_refresh_token=")) {
+        // PRR-010: an anonymous boot re-arms the gate so a stale login state
+        // (process-global, reused server) can never leak into a fresh run.
+        loggedIn = false;
         return sendJson(req, res, 401, { detail: "not authenticated" });
       }
       return sendJson(req, res, 200, { access_token: ACCESS_TOKEN });
@@ -400,6 +414,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+// PRR-012: bind loopback only — the stub never needs LAN exposure.
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`[stub-backend] listening on http://localhost:${PORT}`);
 });
