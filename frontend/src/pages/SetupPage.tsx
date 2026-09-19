@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuthStore } from "@/stores/useAuthStore";
 import { Button } from "@/components/ui/button";
@@ -28,12 +28,16 @@ export default function SetupPage() {
   const { register, needsSetup, isLoading } = useAuthStore();
   const navigate = useNavigate();
 
-  // Redirect to login if setup is already complete. Guarded on the account
-  // step (issue #622): register() itself flips needsSetup to false, and the
-  // operator must not be yanked to /login while the wizard's model-endpoint
-  // step is showing. Direct visits to /setup post-setup still redirect.
+  // Redirect to login if setup is already complete. Two guards keep the
+  // just-registered superadmin on the wizard (issue #622): (1) step — the
+  // redirect only applies before the model-endpoint step; (2) registeringRef
+  // — register() flips needsSetup:false SYNCHRONOUSLY inside the submit
+  // handler, so a render flush can observe (needsSetup=false, step=account)
+  // BEFORE setStep("models") lands; the ref (set before the await) closes
+  // that window. Direct visits to /setup post-setup still redirect.
+  const registeringRef = useRef(false);
   useEffect(() => {
-    if (needsSetup === false && step === "account") {
+    if (needsSetup === false && step === "account" && !registeringRef.current) {
       navigate("/login", { replace: true });
     }
   }, [needsSetup, navigate, step]);
@@ -79,6 +83,10 @@ export default function SetupPage() {
       return;
     }
 
+    // Set BEFORE awaiting register(): the store flip inside register() is
+    // synchronous and must never be observed by the redirect effect while
+    // this submission is in flight.
+    registeringRef.current = true;
     try {
       await register(
         formData.username,

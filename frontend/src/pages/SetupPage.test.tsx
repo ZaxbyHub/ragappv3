@@ -211,11 +211,15 @@ describe("SetupPage", () => {
     // Issue #622: registration now leads to the model-endpoint wizard step,
     // not straight into the app — navigation happens on save/skip only, and
     // the needsSetup:false flip must NOT trigger the /login redirect here.
+    // First-arg extraction (not toHaveBeenCalledWith) because the redirect
+    // calls navigate("/login", { replace: true }) — an exact-arity matcher
+    // would silently never match the two-arg call (reviewer Round 2 probe).
     await waitFor(() => {
       expect(screen.getByText("Configure Chat Models")).toBeInTheDocument();
     });
-    expect(navigate).not.toHaveBeenCalledWith("/login");
-    expect(navigate).not.toHaveBeenCalledWith("/");
+    const navigateTargets = navigate.mock.calls.map((call) => call[0]);
+    expect(navigateTargets).not.toContain("/login");
+    expect(navigateTargets).not.toContain("/");
   });
 
   it("shows Create Superadmin Account button text", () => {
