@@ -626,6 +626,28 @@ class TestChatApiKeySecretHandling(_SettingsRouteHarness):
         merged = self._drive_completion_capture_headers(llm)
         self.assertEqual(merged.get("Authorization"), f"Bearer {SECRET_KEY}")
 
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
+    def test_reconfigure_closes_retired_transport_under_loop(self):
+        """PRR-005: a key change drops the old AsyncClient (sync callers fall
+        back to GC); the async-caller close path is pinned by
+        TestReconfigureRetiresTransport below."""
+        from app.services.llm_client import LLMClient
+
+        with _settings_values(
+            ollama_chat_url="http://localhost:11434",
+            chat_model="wizard-model",
+            chat_api_key="sk-first-622",
+        ):
+            llm = LLMClient(
+                base_url="http://localhost:11434",
+                model="wizard-model",
+                api_key="sk-first-622",
+            )
+            llm.reconfigure(api_key=SECRET_KEY)
+        # Sync threadpool context: no running loop — the drop is a GC
+        # fallback and must not raise.
+        self.assertIsNone(llm._client)
+
     # ── role-safe configured signals (banner input, gap G5) ────────────
 
     def test_chat_configured_false_when_pair_empty(self):
@@ -887,6 +909,42 @@ class TestChatApiKeyLifecycle(_SettingsRouteHarness):
         )
         self.assertEqual(response.status_code, 422, response.text)
         self.assertIn("2048", response.text)
+
+
+class TestReconfigureRetiresTransport(unittest.IsolatedAsyncioTestCase):
+    """PRR-005: a key change not only drops the old AsyncClient — under a
+    running loop (async callers) the retired pool is closed promptly.
+
+    Lives outside the shared sync harness because it drives the client
+    directly. Its class name deliberately does not match the frozen C3/C8
+    ``-k`` filters; it runs with the ordinary suite.
+    """
+
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
+    async def test_key_change_schedules_retired_client_close(self):
+        from app.services.llm_client import LLMClient
+
+        with _settings_values(
+            ollama_chat_url="http://localhost:11434",
+            chat_model="wizard-model",
+            chat_api_key="sk-first-622",
+        ):
+            llm = LLMClient(
+                base_url="http://localhost:11434",
+                model="wizard-model",
+                api_key="sk-first-622",
+            )
+        await llm._ensure_started()
+        old_client = llm._client
+        self.assertIsNotNone(old_client)
+        close_spy = AsyncMock(wraps=old_client.aclose)
+        old_client.aclose = close_spy  # type: ignore[method-assign]
+
+        llm.reconfigure(api_key=SECRET_KEY)
+        self.assertIsNone(llm._client)
+        # Let the scheduled aclose task run.
+        await asyncio.sleep(0)
+        close_spy.assert_awaited_once()
 
 
 if __name__ == "__main__":

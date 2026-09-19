@@ -2,6 +2,7 @@
 OpenAI-compatible LLM chat client using httpx.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -303,7 +304,17 @@ class LLMClient:
             # The running AsyncClient baked the old (or absent) Authorization
             # header at construction; drop it so _ensure_started rebuilds
             # with the new header instead of mutating httpx header state.
+            # Best-effort close of the retired pool (PR #644 review PRR-005):
+            # sync settings handlers run in a threadpool with no running
+            # loop, where the dropped client falls back to GC; async callers
+            # close it promptly on the next loop tick.
+            old_client = self._client
             self._client = None
+            if old_client is not None:
+                try:
+                    asyncio.get_running_loop().create_task(old_client.aclose())
+                except RuntimeError:
+                    pass
         if changed:
             self._circuit_breaker.reset()
 
