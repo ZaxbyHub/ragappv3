@@ -389,7 +389,6 @@ async def test_fts_exceptions_passed_to_done_message():
     # Collect done message — disable optional stages to keep test fast
     done_messages = []
     with \
-        patch("app.services.rag_engine.settings.tri_vector_search_enabled", False), \
         patch("app.services.rag_engine.settings.context_distillation_enabled", False), \
         patch("app.services.rag_engine.settings.retrieval_evaluation_enabled", False), \
         patch("app.services.rag_engine.settings.query_transformation_enabled", False), \
@@ -424,7 +423,6 @@ async def test_get_fts_exceptions_called_once_per_query():
 
     done_messages = []
     with \
-        patch("app.services.rag_engine.settings.tri_vector_search_enabled", False), \
         patch("app.services.rag_engine.settings.context_distillation_enabled", False), \
         patch("app.services.rag_engine.settings.retrieval_evaluation_enabled", False), \
         patch("app.services.rag_engine.settings.query_transformation_enabled", False), \
@@ -448,7 +446,6 @@ async def test_hybrid_status_included_in_done_message():
 
     done_messages = []
     with \
-        patch("app.services.rag_engine.settings.tri_vector_search_enabled", False), \
         patch("app.services.rag_engine.settings.context_distillation_enabled", False), \
         patch("app.services.rag_engine.settings.retrieval_evaluation_enabled", False), \
         patch("app.services.rag_engine.settings.query_transformation_enabled", False), \
@@ -480,7 +477,6 @@ async def test_hybrid_status_dense_only_in_done_message():
 
     done_messages = []
     with \
-        patch("app.services.rag_engine.settings.tri_vector_search_enabled", False), \
         patch("app.services.rag_engine.settings.context_distillation_enabled", False), \
         patch("app.services.rag_engine.settings.retrieval_evaluation_enabled", False), \
         patch("app.services.rag_engine.settings.query_transformation_enabled", False), \
@@ -507,7 +503,6 @@ async def test_hybrid_status_disabled_in_done_message():
 
     done_messages = []
     with \
-        patch("app.services.rag_engine.settings.tri_vector_search_enabled", False), \
         patch("app.services.rag_engine.settings.context_distillation_enabled", False), \
         patch("app.services.rag_engine.settings.retrieval_evaluation_enabled", False), \
         patch("app.services.rag_engine.settings.query_transformation_enabled", False), \
@@ -638,7 +633,6 @@ async def test_fts_exceptions_zero_value():
 
     done_messages = []
     with \
-        patch("app.services.rag_engine.settings.tri_vector_search_enabled", False), \
         patch("app.services.rag_engine.settings.context_distillation_enabled", False), \
         patch("app.services.rag_engine.settings.retrieval_evaluation_enabled", False), \
         patch("app.services.rag_engine.settings.query_transformation_enabled", False), \

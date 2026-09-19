@@ -61,16 +61,6 @@ class TestNewConfigFields:
         settings = Settings()
         assert settings.recency_decay_lambda == 0.001
 
-    def test_tri_vector_search_enabled_default_false(self):
-        """Test tri_vector_search_enabled defaults to False."""
-        settings = Settings()
-        assert settings.tri_vector_search_enabled is False
-
-    def test_flag_embedding_url_default(self):
-        """Test flag_embedding_url defaults to empty string (deprecated post-Harrier migration)."""
-        settings = Settings()
-        assert settings.flag_embedding_url == ""
-
     def test_multi_scale_indexing_enabled_default_true(self):
         """Test multi_scale_indexing_enabled defaults to True."""
         settings = Settings()
@@ -104,11 +94,6 @@ class TestFeatureFlagsDefaultToFalse:
         """Context distillation synthesis feature flag should default to True."""
         settings = Settings()
         assert settings.context_distillation_synthesis_enabled is True
-
-    def test_tri_vector_search_enabled_is_false(self):
-        """Tri-vector search feature flag should default to False."""
-        settings = Settings()
-        assert settings.tri_vector_search_enabled is False
 
     def test_multi_scale_indexing_enabled_is_true(self):
         """Multi-scale indexing feature flag should default to True."""
@@ -760,12 +745,6 @@ class TestConfigAdversarial:
             settings = Settings()
             assert settings.multi_scale_indexing_enabled is True
 
-    def test_feature_flag_tri_vector_toggle(self):
-        """tri_vector_search_enabled should be toggleable via env var."""
-        with patch.dict("os.environ", {"TRI_VECTOR_SEARCH_ENABLED": "true"}):
-            settings = Settings()
-            assert settings.tri_vector_search_enabled is True
-
     def test_feature_flag_query_transformation_toggle(self):
         """query_transformation_enabled should be toggleable via env var."""
         with patch.dict("os.environ", {"QUERY_TRANSFORMATION_ENABLED": "false"}):
@@ -833,12 +812,6 @@ class TestConfigAdversarial:
         with patch.dict("os.environ", {"RERANKER_URL": ""}):
             settings = Settings()
             assert settings.reranker_url == ""
-
-    def test_flag_embedding_url_empty_allowed(self):
-        """flag_embedding_url can be empty."""
-        with patch.dict("os.environ", {"FLAG_EMBEDDING_URL": ""}):
-            settings = Settings()
-            assert settings.flag_embedding_url == ""
 
     def test_ollama_embedding_url_valid_format(self):
         """ollama_embedding_url should accept valid URL format."""

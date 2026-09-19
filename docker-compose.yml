@@ -184,8 +184,6 @@ services:
       - INITIAL_RETRIEVAL_TOP_K=${INITIAL_RETRIEVAL_TOP_K:-20}
       - HYBRID_SEARCH_ENABLED=${HYBRID_SEARCH_ENABLED:-true}
       - HYBRID_ALPHA=${HYBRID_ALPHA:-0.6}
-      - TRI_VECTOR_SEARCH_ENABLED=false
-      - FLAG_EMBEDDING_URL=
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       # REQUIRED — no default, backend rejects empty values
       - ADMIN_SECRET_TOKEN=${ADMIN_SECRET_TOKEN}

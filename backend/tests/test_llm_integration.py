@@ -45,8 +45,6 @@ class TestEmbeddingService(unittest.TestCase):
         self.mock_settings.embedding_batch_max_retries = 3
         self.mock_settings.embedding_batch_min_sub_size = 1
         self.mock_settings.embedding_concurrent_batches = 4
-        self.mock_settings.tri_vector_search_enabled = False
-        self.mock_settings.flag_embedding_url = None
 
     def tearDown(self):
         """Clean up test fixtures."""

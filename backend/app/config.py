@@ -606,12 +606,6 @@ class Settings(BaseSettings):
     new chunks are inserted and the file pointer is flipped BEFORE old chunks are deleted,
     ensuring the corpus is never in a zero-chunk state for a live document."""
 
-    # ── Tri-vector embedding configuration (deprecated) ───────────────────────
-    tri_vector_search_enabled: bool = False
-    """Deprecated: BGE-M3 replaced by Harrier. Field retained for config compatibility."""
-    flag_embedding_url: str = ""
-    """Deprecated: FlagEmbedding server removed. Field retained for config compatibility."""
-
     # ── Agentic RAG configuration ────────────────────────────────────────
     agentic_rag_enabled: bool = False
     """Enable agentic multi-step RAG (iterative retrieval + LLM synthesis via tool registry)."""
