@@ -10,7 +10,16 @@ export default defineConfig(({ mode }) => {
 
   return {
     base: normalizeViteBase(appBasename),
-    plugins: [react()],
+    plugins: [
+      react({
+        // React Compiler 1.0 (issue #572 / R10-S4): compiler-driven memoization
+        // replaces manual useMemo/useCallback discipline where it can prove
+        // safety. plugin-react 6 is oxc-based — the compiler is enabled via
+        // this native option (backed by the oxc-transform-react devDependency),
+        // not through a babel plugin tuple.
+        compiler: true,
+      }),
+    ],
     resolve: {
       alias: {
         '@': path.resolve(import.meta.dirname, './src'),

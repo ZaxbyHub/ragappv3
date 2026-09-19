@@ -3,13 +3,15 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// Keep CodeBlock renders cheap and deterministic — the fallback path is fine,
-// these tests target the canvas button, not highlighting.
-vi.mock("shiki", () => ({
-  createHighlighter: vi.fn(async () => {
-    throw new Error("shiki unavailable in canvas entry tests");
-  }),
-}));
+// Keep CodeBlock renders cheap and deterministic — the plain-renderer path is
+// fine, these tests target the canvas button, not highlighting.
+vi.mock("@/lib/highlighter", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/highlighter")>();
+  return {
+    ...actual,
+    loadHighlighter: vi.fn(async () => async (code: string) => actual.renderPlainCodeHtml(code)),
+  };
+});
 
 const { createCanvasArtifactMock, useCanvasVisibleMock } = vi.hoisted(() => ({
   createCanvasArtifactMock: vi.fn(),

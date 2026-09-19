@@ -21,21 +21,7 @@ import type { Source, UsedMemory, WikiReference, KMSReference } from "@/lib/api"
 // Syntax highlighter — lazily loaded so first chat render is not penalized
 // =============================================================================
 
-type HighlightFn = (code: string, lang: string) => Promise<string>;
-
-let _highlightFn: HighlightFn | null = null;
-let _highlightPromise: Promise<HighlightFn> | null = null;
-
-function escapeCodeHtml(code: string) {
-  return code
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function renderPlainCodeHtml(code: string) {
-  return `<pre><code>${escapeCodeHtml(code)}</code></pre>`;
-}
+import { loadHighlighter, renderPlainCodeHtml } from "@/lib/highlighter";
 
 function codeChildrenToText(children: ReactNode): string {
   if (Array.isArray(children)) {
@@ -45,51 +31,6 @@ function codeChildrenToText(children: ReactNode): string {
     return "";
   }
   return String(children);
-}
-
-function loadHighlighter(): Promise<HighlightFn> {
-  if (_highlightFn) return Promise.resolve(_highlightFn);
-  if (_highlightPromise) return _highlightPromise;
-
-  _highlightPromise = (async () => {
-    try {
-      const { createHighlighter } = await import("shiki");
-      const hl = await createHighlighter({
-        themes: ["github-light", "github-dark"],
-        langs: [
-          "javascript", "typescript", "tsx", "jsx",
-          "python", "bash", "sh", "json", "yaml", "toml",
-          "css", "html", "xml", "markdown", "sql",
-          "rust", "go", "java", "c", "cpp", "csharp",
-        ],
-      });
-      const fn: HighlightFn = (code, lang) => {
-        const isDark = document.documentElement.classList.contains("dark");
-        try {
-          return Promise.resolve(
-            hl.codeToHtml(code, {
-              lang: lang || "text",
-              theme: isDark ? "github-dark" : "github-light",
-            })
-          );
-        } catch {
-          // Unknown language — fallback to plain text
-          return Promise.resolve(
-            hl.codeToHtml(code, { lang: "text", theme: isDark ? "github-dark" : "github-light" })
-          );
-        }
-      };
-      _highlightFn = fn;
-      return fn;
-    } catch {
-      // Shiki unavailable — return no-op so code still renders as plain text
-      const fn: HighlightFn = (code) => Promise.resolve(renderPlainCodeHtml(code));
-      _highlightFn = fn;
-      return fn;
-    }
-  })();
-
-  return _highlightPromise;
 }
 
 // =============================================================================
@@ -115,11 +56,16 @@ const CodeBlock = memo(function CodeBlock({
 
   useEffect(() => {
     let cancelled = false;
-    loadHighlighter().then((highlight) => {
-      highlight(code, language).then((result) => {
+    loadHighlighter()
+      .then((highlight) => highlight(code, language))
+      .then((result) => {
         if (!cancelled) setHtml(result);
+      })
+      .catch(() => {
+        // Grammar/engine load failure — keep the plain-text branch below
+        // (html stays null); the code string itself always renders.
+        if (!cancelled) setHtml(null);
       });
-    });
     return () => { cancelled = true; };
   }, [code, language]);
 
