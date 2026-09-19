@@ -137,6 +137,33 @@ describe("TranscriptPane edit-version cycle (issue #573 AC3, final-critic revisi
     expect(screen.queryByText("3 / 3")).not.toBeInTheDocument();
   });
 
+  it("re-editing from a displayed old version renders the new text live (no stale pointer, no duplicate snapshot)", async () => {
+    render(<TranscriptPane />);
+    fireEvent.click(screen.getByRole("button", { name: "Edit message" }));
+    await waitFor(() => expect(truncateMock).toHaveBeenCalledTimes(1));
+
+    let composer = screen.getByLabelText("Message input");
+    fireEvent.change(composer, { target: { value: "edited question" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+    await waitFor(() => expect(screen.getByText("2 / 2")).toBeInTheDocument());
+
+    // Step back to the original, then edit FROM that displayed old version.
+    fireEvent.click(screen.getByRole("button", { name: "Show previous version" }));
+    await waitFor(() => expect(screen.getByText("1 / 2")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit message" }));
+    await waitFor(() => expect(truncateMock).toHaveBeenCalledTimes(2));
+    composer = screen.getByLabelText("Message input");
+    fireEvent.change(composer, { target: { value: "edited from old" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    // The re-sent message renders ITS text as the live content (the stale
+    // pointer is cleared) and the version list holds three distinct texts.
+    await waitFor(() => expect(screen.getAllByText("edited from old").length).toBeGreaterThan(0));
+    expect(screen.getByText("3 / 3")).toBeInTheDocument();
+    expect(screen.queryByText("1 / 3")).not.toBeInTheDocument();
+  });
+
   it("repeated stepping never grows the version list", async () => {
     render(<TranscriptPane />);
     fireEvent.click(screen.getByRole("button", { name: "Edit message" }));

@@ -598,12 +598,29 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     // slot ("<activeChatId>:<index>"). Editing truncates in place and the
     // re-sent message lands at the same index, so the slot key is stable and
     // the stepper can offer the pre-edit content as a sibling version — with
-    // zero change to the fork/lineage data model. Slots at or after the
-    // truncation point become stale (their indices will map to different
+    // zero change to the fork/lineage data model. Re-editing while an older
+    // version is displayed records that displayed text only if it is not
+    // already a navigable snapshot, and always clears the display pointer:
+    // the edit starts a new live lineage, so the re-sent message must render
+    // as the live content, not the stale selected version. Slots at or after
+    // the truncation point become stale (their indices will map to different
     // messages after the re-send), so they are dropped.
+    const slotKey = activeChatId ? `${activeChatId}:${idx}` : null;
+    const editState = useChatStore.getState();
     const originalContent = messagesById[messageId]?.content;
-    if (activeChatId && typeof originalContent === "string" && originalContent.length > 0) {
-      recordEditVersion?.(`${activeChatId}:${idx}`, originalContent);
+    if (slotKey) {
+      const existingSnapshots = editState.messageEditVersions?.[slotKey] ?? [];
+      const pointerWasSet = editState.activeEditVersion?.[slotKey] !== undefined;
+      if (
+        typeof originalContent === "string" &&
+        originalContent.length > 0 &&
+        !existingSnapshots.includes(originalContent)
+      ) {
+        recordEditVersion?.(slotKey, originalContent);
+      }
+      if (pointerWasSet) {
+        setActiveEditVersion?.(slotKey, null);
+      }
     }
     clearEditVersionsFrom?.(idx + 1);
     if (activeChatId) {
@@ -620,7 +637,7 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
     removeMessagesFrom(idx);
     setInput(content);
     composerRef.current?.focus();
-  }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist, recordEditVersion, clearEditVersionsFrom]);
+  }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist, recordEditVersion, setActiveEditVersion, clearEditVersionsFrom]);
 
   // Issue #573 (AC3): step the displayed sibling version of an edited turn.
   // Invariants (shared with the row-side resolution below):
