@@ -22,6 +22,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { formatRelativeTime } from "@/lib/formatters";
+import { comboFromEvent, effectiveBinding } from "@/lib/shortcutBindings";
 import { useChatShellStore } from "@/stores/useChatShellStore";
 import { useChatStore } from "@/stores/useChatStore";
 import { useVaultStore } from "@/stores/useVaultStore";
@@ -169,10 +170,13 @@ export function ChatSearchInput({
 }: ChatSearchInputProps) {
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Ctrl+K keyboard shortcut to focus search
+  // Focus-search shortcut (default Ctrl/Cmd+K; rebindable per-browser via
+  // issue #573 AC4 — the effective binding is read at event time so a
+  // persisted override applies on every mount).
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+      const combo = comboFromEvent(e);
+      if (combo !== null && combo === effectiveBinding("focusSearch", "Ctrl+K")) {
         e.preventDefault();
         inputRef.current?.focus();
       }
@@ -341,7 +345,7 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="h-5 w-5"
+                    className="h-6 w-6"
                     onClick={(e) => {
                       e.stopPropagation();
                       handleSaveEdit();
@@ -353,7 +357,7 @@ export const SessionItem = forwardRef<HTMLDivElement, SessionItemProps>(
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="h-5 w-5"
+                    className="h-6 w-6"
                     onClick={(e) => {
                       e.stopPropagation();
                       handleCancelEdit();

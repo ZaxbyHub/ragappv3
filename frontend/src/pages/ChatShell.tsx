@@ -11,6 +11,7 @@ import { mockChatMessages } from "@/fixtures/chat";
 import { SessionRail } from "@/components/chat/SessionRail";
 import { TranscriptPane } from "@/components/chat/TranscriptPane";
 import { RightPane } from "@/components/chat/RightPane";
+import { ShareAction } from "@/components/chat/ShareAction";
 import { VaultSelector } from "@/components/vault/VaultSelector";
 import { Button } from "@/components/ui/button";
 import {
@@ -546,6 +547,7 @@ export default function ChatShell() {
           )}
           {!activeSessionTitle && <div className="flex-1" />}
           <VaultSelector />
+          <ShareAction sessionId={activeSessionId ?? ""} />
           <Button variant="ghost" size="icon" onClick={handleExportChat}
             disabled={messages.length === 0}
             aria-label="Export chat">
