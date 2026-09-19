@@ -4,7 +4,7 @@ import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { Navigation } from "./Navigation";
 import { UploadIndicator } from "@/components/shared/UploadIndicator";
 import UnconfiguredChatBanner from "@/components/UnconfiguredChatBanner";
-import { getSettings } from "@/lib/api/settings";
+import { getSettings } from "@/lib/api";
 import type { HealthStatus } from "@/types/health";
 import type { NavItemId } from "./navigationTypes";
 

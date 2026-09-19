@@ -222,6 +222,33 @@ describe("SetupPage", () => {
     expect(navigateTargets).not.toContain("/");
   });
 
+  it("redirects direct visits to /login when setup is already complete", async () => {
+    // PRR-006: pins the direct-visit leg of the redirect (needsSetup=false at
+    // mount, no registration in flight → registeringRef still false).
+    const navigate = vi.fn();
+    const { useNavigate } = await import("react-router-dom");
+    vi.mocked(useNavigate).mockReturnValue(navigate);
+
+    vi.spyOn(useAuthStoreModule, "useAuthStore").mockReturnValue({
+      register: vi.fn(),
+      needsSetup: false,
+      isLoading: false,
+    } as any);
+
+    render(
+      <BrowserRouter>
+        <SetupPage />
+      </BrowserRouter>
+    );
+
+    await waitFor(() => {
+      const targets = navigate.mock.calls.map((call) => call[0]);
+      expect(targets).toContain("/login");
+    });
+    // The wizard step must never mount for a post-setup visitor.
+    expect(screen.queryByText("Configure Chat Models")).not.toBeInTheDocument();
+  });
+
   it("shows Create Superadmin Account button text", () => {
     renderSetupPage();
 

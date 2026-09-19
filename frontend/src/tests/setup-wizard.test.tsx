@@ -297,6 +297,20 @@ describe("SetupPage step 2 - Configure Chat Models", () => {
     );
   });
 
+  it("Test connection surfaces a request failure inline (PRR-012)", async () => {
+    mockProbeModelEndpoint.mockRejectedValue(new Error("Probe request failed."));
+    const { user } = await renderWizard();
+
+    await fillThinkingEndpoint(user);
+    await user.click(screen.getByRole("button", { name: "Test connection" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Probe request failed."
+    );
+    // The status copy renders role="status" — exactly one alert on the page.
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
+
   it("Skip setup finishes without saving any chat settings", async () => {
     const { user, navigate } = await renderWizard();
 

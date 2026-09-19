@@ -15,6 +15,7 @@ type SetupStep = "account" | "models";
 
 export default function SetupPage() {
   const [step, setStep] = useState<SetupStep>("account");
+  const modelsHeadingRef = useRef<HTMLParagraphElement>(null);
   const [formData, setFormData] = useState({
     username: "",
     full_name: "",
@@ -41,6 +42,15 @@ export default function SetupPage() {
       navigate("/login", { replace: true });
     }
   }, [needsSetup, navigate, step]);
+
+  // a11y (PRR-019): when the wizard step mounts, move focus to its heading
+  // so keyboard/screen-reader users land in the new context instead of on
+  // <body> (the account step's focused submit button was just unmounted).
+  useEffect(() => {
+    if (step === "models") {
+      modelsHeadingRef.current?.focus();
+    }
+  }, [step]);
 
   const validateForm = (): boolean => {
     const newErrors: Record<string, string> = {};
@@ -124,7 +134,16 @@ export default function SetupPage() {
       <div className="flex min-h-screen items-center justify-center p-4">
         <Card className="w-full max-w-md">
           <CardHeader className="space-y-1">
-            <CardTitle className="text-2xl text-center">Configure Chat Models</CardTitle>
+            {/* a11y (issue #622 / PRR-019): the step swap unmounts the
+                focused submit button, so focus is programmatically moved to
+                the new step's heading (tabIndex -1, outlined on focus). */}
+            <CardTitle
+              ref={modelsHeadingRef}
+              tabIndex={-1}
+              className="text-2xl text-center focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary"
+            >
+              Configure Chat Models
+            </CardTitle>
             <CardDescription className="text-center">
               Point the app at your own inference endpoints — no model ships by
               default. You can change these later in Settings → Models.

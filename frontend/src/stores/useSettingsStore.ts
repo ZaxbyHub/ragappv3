@@ -51,6 +51,14 @@ export interface SettingsFormData {
   // Instant mode (LM Studio on local GPU)
   instant_chat_url: string;
   instant_chat_model: string;
+  // Operator API keys (issue #622): GET always returns "" (write-only).
+  // Typing a value rotates on save; clearing goes through the Models tab's
+  // explicit Clear control (an empty form field is never sent). The *_set
+  // flags drive the placeholder + Clear affordance.
+  chat_api_key: string;
+  instant_api_key: string;
+  chat_api_key_set: boolean;
+  instant_api_key_set: boolean;
   default_chat_mode: 'instant' | 'thinking';
   ingestion_llm_mode: 'instant' | 'thinking' | 'disabled';
   instant_initial_retrieval_top_k: number;
@@ -134,6 +142,12 @@ export const FIELD_TAB: Record<keyof SettingsFormData, SettingsTab> = {
   chat_model: "models",
   instant_chat_url: "models",
   instant_chat_model: "models",
+  chat_api_key: "models",
+  instant_api_key: "models",
+  // Presence flags are not user-editable (refreshed from the server on
+  // save/clear); mapped to models so the Record stays exhaustive.
+  chat_api_key_set: "models",
+  instant_api_key_set: "models",
   default_chat_mode: "models",
   ingestion_llm_mode: "models",
   instant_initial_retrieval_top_k: "models",
@@ -271,6 +285,10 @@ const defaultFormData: SettingsFormData = {
   ollama_chat_url: "",
   embedding_model: "",
   chat_model: "",
+  chat_api_key: "",
+  instant_api_key: "",
+  chat_api_key_set: false,
+  instant_api_key_set: false,
   instant_chat_url: "",
   instant_chat_model: "",
   default_chat_mode: "thinking",
@@ -363,6 +381,12 @@ function fromSettings(settings: SettingsResponse): SettingsFormData {
     ollama_chat_url: decodeStr(settings.ollama_chat_url, ""),
     embedding_model: decodeStr(settings.embedding_model, ""),
     chat_model: decodeStr(settings.chat_model, ""),
+    // Write-only on the wire (always "") — the form starts empty; typing
+    // rotates, the Models tab Clear control clears via its own PUT.
+    chat_api_key: "",
+    instant_api_key: "",
+    chat_api_key_set: settings.chat_api_key_set ?? false,
+    instant_api_key_set: settings.instant_api_key_set ?? false,
     instant_chat_url: decodeStr(settings.instant_chat_url ?? "", ""),
     instant_chat_model: decodeStr(settings.instant_chat_model ?? "", ""),
     default_chat_mode:

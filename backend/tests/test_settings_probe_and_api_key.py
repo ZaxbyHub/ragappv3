@@ -180,6 +180,15 @@ class _SettingsRouteHarness(unittest.TestCase):
 
         self._pool = get_pool(TEST_DB_PATH)
 
+        # PR #644 review hardening (PRR-004): model_checker_cb is a module
+        # singleton shared with the probe route — reset so a breaker opened
+        # by an earlier test file (pytest-randomly ordering) cannot flip
+        # probe expectations to "circuit breaker open" mismatches.
+        from app.services import circuit_breaker as _cb
+
+        _cb.model_checker_cb.reset()
+        self.addCleanup(_cb.model_checker_cb.reset)
+
         def override_get_db():
             conn = self._pool.get_connection()
             try:
@@ -750,6 +759,134 @@ class TestChatApiKeyLifecycle(_SettingsRouteHarness):
         self.assertEqual(response.json()["status"], "ok")
         leaked = [m for m in handler.messages if SECRET_KEY in m]
         self.assertEqual(leaked, [], f"secret leaked into log records: {leaked!r}")
+
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
+    def test_probe_delivers_api_key_as_bearer_header(self):
+        """PRR-008: the probe route must attach the supplied key as an
+        Authorization header on the outbound request's client."""
+        instance = AsyncMock()
+        instance.get = AsyncMock(
+            return_value=self._listing_response(["wizard-model"])
+        )
+        instance.__aenter__ = AsyncMock(return_value=instance)
+        instance.__aexit__ = AsyncMock(return_value=None)
+        captured: dict = {}
+
+        def _capturing_factory(*args, **kwargs):
+            captured.update(kwargs.get("headers") or {})
+            return instance
+
+        with patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"}):
+            with patch(
+                "app.api.routes.settings.httpx.AsyncClient",
+                new=_capturing_factory,
+            ):
+                response = self._probe(
+                    {
+                        "target": "thinking",
+                        "base_url": "http://localhost:11434",
+                        "model": "wizard-model",
+                        "api_key": SECRET_KEY,
+                    }
+                )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            captured.get("Authorization"),
+            f"Bearer {SECRET_KEY}",
+            f"probe must send Bearer auth, saw client headers: {captured!r}",
+        )
+
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
+    def test_instant_api_key_empty_clears_stored_key(self):
+        """PRR-009: clearing mirrors the chat-key contract for the instant key."""
+        self.assertEqual(
+            self.client.put(
+                "/api/settings",
+                json={
+                    "instant_chat_url": "http://localhost:1234",
+                    "instant_chat_model": "instant-model",
+                    "instant_api_key": SECRET_KEY,
+                },
+            ).status_code,
+            200,
+        )
+        clear = self._put_wizard_settings({"instant_api_key": ""})
+        self.assertEqual(clear.status_code, 200, clear.text)
+
+        conn = self._pool.get_connection()
+        try:
+            row = conn.execute(
+                "SELECT value FROM settings_kv WHERE key = 'instant_api_key'"
+            ).fetchone()
+        finally:
+            self._pool.release_connection(conn)
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(row[0]), "")
+
+        data = self.client.get("/api/settings").json()
+        self.assertEqual(data["instant_api_key"], "")
+        self.assertFalse(data["instant_api_key_set"])
+
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
+    def test_editorial_client_carries_chat_api_key(self):
+        """PRR-010: editorial stages fall back to the thinking pair, so they
+        must inherit its key (else they send unauthenticated requests)."""
+        from app.services.llm_client import create_editorial_client
+
+        with _settings_values(
+            ollama_chat_url="http://localhost:11434",
+            chat_model="wizard-model",
+            chat_api_key=SECRET_KEY,
+        ):
+            client = create_editorial_client()
+        self.assertEqual(getattr(client, "api_key", None), SECRET_KEY)
+
+    @patch.dict(os.environ, {"ALLOW_LOCAL_SERVICES": "1"})
+    def test_put_response_includes_new_flags(self):
+        """PRR-011: the PUT response (same _build_settings_dict shape as GET)
+        must carry the configured signals and key presence flags."""
+        put = self._put_wizard_settings({"chat_api_key": SECRET_KEY})
+        self.assertEqual(put.status_code, 200, put.text)
+        data = put.json()
+        self.assertTrue(data["chat_api_key_set"])
+        self.assertTrue(data["chat_configured"])
+        self.assertEqual(data["chat_api_key"], "")
+
+    def test_probe_rejects_control_characters_with_422(self):
+        """PRR-014: a CRLF-bearing api_key must get a clean validation error,
+        not an h11 'Illegal header value' surfacing as 'unreachable'."""
+        response = self._probe(
+            {
+                "target": "thinking",
+                "base_url": "http://localhost:11434",
+                "model": "wizard-model",
+                "api_key": "sk-bad\r\nX-Injected: 1",
+            }
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("control characters", response.text)
+
+    def test_probe_rejects_control_characters_in_model(self):
+        response = self._probe(
+            {
+                "target": "thinking",
+                "base_url": "http://localhost:11434",
+                "model": "wizard-model\nDROP",
+            }
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("control characters", response.text)
+
+    def test_probe_rejects_oversized_base_url(self):
+        response = self._probe(
+            {
+                "target": "thinking",
+                "base_url": "http://localhost:11434/" + "a" * 2100,
+                "model": "wizard-model",
+            }
+        )
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn("2048", response.text)
 
 
 if __name__ == "__main__":

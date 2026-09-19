@@ -56,7 +56,13 @@ export default function UnconfiguredChatBanner({
         type="button"
         variant="ghost"
         size="sm"
-        onClick={() => {
+        onClick={(event) => {
+          // Move focus off the button before it unmounts (a11y: a removed
+          // focused control drops focus to <body>).
+          const main = event.currentTarget.ownerDocument.getElementById(
+            "main-content"
+          );
+          main?.focus();
           sessionStorage.setItem(DISMISS_KEY, "1");
           setDismissed(true);
         }}

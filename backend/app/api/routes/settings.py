@@ -1728,9 +1728,44 @@ class _ProbeBody(BaseModel):
     model: str
     api_key: Optional[str] = None
 
+    @field_validator("model", "api_key")
+    @classmethod
+    def _reject_control_characters(cls, v: Optional[str]) -> Optional[str]:
+        # Same invariant as SettingsUpdate's curator-model validator: control
+        # characters must never reach outbound requests. For api_key this is
+        # load-bearing — a CRLF would otherwise be rejected late by h11 and
+        # surface as a misleading "unreachable" probe status instead of a
+        # clean validation error.
+        if v is not None and any(ord(c) < 32 or ord(c) == 127 for c in v):
+            raise ValueError("must not contain control characters")
+        return v
+
+    @field_validator("base_url")
+    @classmethod
+    def _bound_base_url(cls, v: str) -> str:
+        if len(v) > 2048:
+            raise ValueError("base_url must be at most 2048 characters")
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def _bound_model(cls, v: str) -> str:
+        if len(v) > 256:
+            raise ValueError("model must be at most 256 characters")
+        return v
+
+    @field_validator("api_key")
+    @classmethod
+    def _bound_api_key(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) > 4096:
+            raise ValueError("api_key must be at most 4096 characters")
+        return v
+
 
 @router.post("/settings/probe")
+@limiter.limit(settings.admin_rate_limit)
 async def probe_model_endpoint(
+    request: Request,
     body: _ProbeBody,
     _role: dict = Depends(require_role("admin")),
     _csrf_token: str = Depends(csrf_protect),

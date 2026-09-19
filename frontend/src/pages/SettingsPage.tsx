@@ -233,6 +233,29 @@ function SettingsPageContent({
     await persistSave();
   };
 
+  // Issue #622 (PRR-002): keys are write-only, so the Models tab can't clear
+  // them through the dirty-payload save path (an empty form field equals the
+  // loaded "" and is never sent). The Clear control PUTs an explicit empty
+  // string, which the backend defines as "clear this key".
+  const handleClearKey = async (
+    field: "chat_api_key" | "instant_api_key",
+  ): Promise<void> => {
+    setError(null);
+    try {
+      const submitSnapshot: SettingsFormData = { ...formData };
+      const updated = await updateSettings({
+        [field]: "",
+      } as UpdateSettingsRequest);
+      setSettings(updated);
+      initializeFormAfterSave(updated, submitSnapshot);
+      toast.success("API key cleared");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to clear API key";
+      setError(msg);
+      toast.error(msg);
+    }
+  };
+
   const handleDiscard = () => {
     discard();
     toast.info("Discarded unsaved changes");
@@ -358,6 +381,7 @@ function SettingsPageContent({
             effectiveSources={
               effectiveSources as Record<string, "kv" | "env" | "default">
             }
+            onClearKey={handleClearKey}
           />
         </TabsContent>
 

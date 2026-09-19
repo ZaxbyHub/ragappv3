@@ -483,7 +483,12 @@ provider preset (Ollama, LM Studio, vLLM, or another OpenAI-compatible
 API), enter the base URL and model name, optionally add an API key, and
 use "Test connection" to verify before saving. Saving activates the
 endpoint immediately — no restart. Skipping the wizard is fine; a banner
-will point you to Settings → Models until chat is configured.
+will point you to Settings → Models until chat is configured. Endpoints
+are typed after setup in Settings → Models (API keys included: type to
+rotate, Clear to remove). Note: the server blocks loopback/private
+endpoint URLs unless the environment sets `ALLOW_LOCAL_SERVICES=1` —
+pointing the wizard at a local Ollama requires that opt-in (the
+"Unsafe probe URL" error names it).
 
 **Expert path — environment variables.** Set `OLLAMA_CHAT_URL` +
 `CHAT_MODEL` (thinking) and, optionally, `INSTANT_CHAT_URL` +

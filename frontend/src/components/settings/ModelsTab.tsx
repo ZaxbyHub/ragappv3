@@ -20,6 +20,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -51,6 +52,13 @@ export interface ModelsTabProps {
     value: SettingsFormData[K],
   ) => void;
   effectiveSources: Record<string, "kv" | "env" | "default">;
+  /**
+   * Issue #622: keys are write-only (GET returns ""), so clearing cannot go
+   * through the dirty-payload save path — an empty form field equals the
+   * loaded "" and is never sent. The Clear control PUTs an explicit empty
+   * string through this handler instead.
+   */
+  onClearKey?: (field: "chat_api_key" | "instant_api_key") => Promise<void>;
 }
 
 function SourceBadge({
@@ -383,6 +391,7 @@ export function ModelsTab({
   onChange,
   effectiveSources,
   vaultId = null,
+  onClearKey,
 }: ModelsTabProps) {
   // Per-vault multimodal provider opt-in (tri-state: inherit/on/off)
   const [vaultMultimodal, setVaultMultimodal] = useState<{
@@ -391,6 +400,7 @@ export function ModelsTab({
     current_user_permission?: string | null;
   } | null>(null);
   const [togglingMultimodal, setTogglingMultimodal] = useState(false);
+  const [clearingKey, setClearingKey] = useState<string | null>(null);
 
   useEffect(() => {
     if (!vaultId) {
@@ -530,6 +540,90 @@ export function ModelsTab({
             onChange={onChange}
             source={effectiveSources.chat_model}
           />
+          <div className="space-y-2">
+            <Label htmlFor="settings-chat-api-key">Thinking API key</Label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="settings-chat-api-key"
+                type="password"
+                autoComplete="off"
+                placeholder={
+                  formData.chat_api_key_set
+                    ? "Stored — type a new key to replace it"
+                    : "Optional — for remote providers that require one"
+                }
+                value={formData.chat_api_key}
+                onChange={(e) => onChange("chat_api_key", e.target.value)}
+              />
+              {formData.chat_api_key_set && onClearKey && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={clearingKey !== null}
+                  aria-label="Clear thinking API key"
+                  onClick={async () => {
+                    setClearingKey("chat_api_key");
+                    try {
+                      await onClearKey("chat_api_key");
+                      onChange("chat_api_key", "");
+                    } finally {
+                      setClearingKey(null);
+                    }
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {formData.chat_api_key_set
+                ? "A key is stored (write-only — it is never shown). Type a new key to rotate it, or use Clear to remove it."
+                : "Sent as a Bearer token to the thinking endpoint. Leave empty for local servers."}
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="settings-instant-api-key">Instant API key</Label>
+            <div className="flex items-center gap-2">
+              <Input
+                id="settings-instant-api-key"
+                type="password"
+                autoComplete="off"
+                placeholder={
+                  formData.instant_api_key_set
+                    ? "Stored — type a new key to replace it"
+                    : "Optional — defaults to the thinking endpoint's key"
+                }
+                value={formData.instant_api_key}
+                onChange={(e) => onChange("instant_api_key", e.target.value)}
+              />
+              {formData.instant_api_key_set && onClearKey && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={clearingKey !== null}
+                  aria-label="Clear instant API key"
+                  onClick={async () => {
+                    setClearingKey("instant_api_key");
+                    try {
+                      await onClearKey("instant_api_key");
+                      onChange("instant_api_key", "");
+                    } finally {
+                      setClearingKey(null);
+                    }
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {formData.instant_api_key_set
+                ? "A key is stored (write-only — it is never shown). Type a new key to rotate it, or use Clear to remove it."
+                : "Sent as a Bearer token to the instant endpoint; defaults to the thinking endpoint's key."}
+            </p>
+          </div>
           <StringField
             field="instant_chat_model"
             label="Instant chat model"
