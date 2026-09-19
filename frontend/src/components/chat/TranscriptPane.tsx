@@ -200,24 +200,33 @@ const MessageRow = memo(function MessageRow({
   const isAssistantStreaming = isStreaming && isLast && safeMessage.role === "assistant" && streamingMessageId === messageId;
   const isHighlighted = highlightedId === messageId;
 
-  // Issue #573 (AC3): sibling versions for this row's transcript slot — the
-  // snapshots plus the live content (deduped). Computed inside the row so
-  // the parent never subscribes to message bodies (#616).
+  // Issue #573 (AC3): sibling versions for this row's transcript slot.
+  // Resolution rule (shared with handleSelectEditVersion): while a pointer is
+  // set the snapshots list is complete and authoritative; otherwise the live
+  // content is the implicit newest version (deduped against the last
+  // snapshot). Computed inside the row so the parent never subscribes to
+  // message bodies (#616).
   let rowEditVersions: Array<{ label: string; content: string }> = [];
   let rowEditActiveIndex = 0;
   if (!isStreaming && safeMessage.role === "user" && activeChatId) {
     const slotKey = `${activeChatId}:${editSlotIndex}`;
     const snapshots = editVersionsMap[slotKey] ?? [];
-    const contents = [...snapshots];
-    if (contents[contents.length - 1] !== safeMessage.content) {
-      contents.push(safeMessage.content);
+    const activeStored = activeEditVersionsMap[slotKey];
+    let contents: string[];
+    let activeIndex: number;
+    if (activeStored !== undefined) {
+      contents = snapshots;
+      activeIndex =
+        activeStored >= contents.length ? Math.max(contents.length - 1, 0) : activeStored;
+    } else {
+      contents =
+        snapshots.length > 0 && snapshots[snapshots.length - 1] === safeMessage.content
+          ? snapshots
+          : [...snapshots, safeMessage.content];
+      activeIndex = contents.length - 1;
     }
     if (contents.length > 1) {
-      const activeStored = activeEditVersionsMap[slotKey];
-      rowEditActiveIndex =
-        activeStored === undefined || activeStored >= contents.length
-          ? contents.length - 1
-          : activeStored;
+      rowEditActiveIndex = activeIndex;
       rowEditVersions = contents.map((content, i) => ({
         label: i === contents.length - 1 ? "Current edit" : `Version ${i + 1}`,
         content,
@@ -614,31 +623,51 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
   }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist, recordEditVersion, clearEditVersionsFrom]);
 
   // Issue #573 (AC3): step the displayed sibling version of an edited turn.
-  // The live (latest) content is frozen as a snapshot the first time the
-  // user steps away from it, so stepping back never loses the edited text;
-  // the swap itself is display-only (updateMessage on the message content).
+  // Invariants (shared with the row-side resolution below):
+  //   * the snapshots list is COMPLETE once a pointer is set — stepping away
+  //     from the live content freezes it as the latest snapshot exactly once;
+  //   * while no pointer is set, the displayed list is snapshots plus the live
+  //     content (deduped), and the live content IS the newest version;
+  //   * stepping to the newest version clears the pointer and restores that
+  //     snapshot's content as the live content.
+  // This prevents the duplicate-sibling bug where displaying an older version
+  // (which overwrites live content) would re-append that older text as a new
+  // version on the next render.
   const handleSelectEditVersion = useCallback(
     (messageId: string, index: number, liveContent: string) => {
-      const { activeChatId, messageIds: ids } = useChatStore.getState();
+      const state = useChatStore.getState();
+      const { activeChatId, messageIds: ids } = state;
       const idx = ids.indexOf(messageId);
       if (!activeChatId || idx < 0) return;
       const slotKey = `${activeChatId}:${idx}`;
-      const snapshots = useChatStore.getState().messageEditVersions?.[slotKey] ?? [];
-      const versions = [...snapshots, liveContent];
-      const liveIndex = versions.length - 1;
-      if (index === liveIndex) {
-        setActiveEditVersion?.(slotKey, null);
-        updateMessage(messageId, { content: liveContent });
+      const snapshots = state.messageEditVersions?.[slotKey] ?? [];
+      const pointerSet = state.activeEditVersion?.[slotKey] !== undefined;
+      const clamped = Math.min(Math.max(index, 0), Math.max(snapshots.length - 1, 0));
+
+      if (!pointerSet) {
+        // The live content is the implicit newest version.
+        const liveIsSnapshot = snapshots[snapshots.length - 1] === liveContent;
+        const liveIndex = liveIsSnapshot ? snapshots.length - 1 : snapshots.length;
+        if (clamped === liveIndex) return; // already displaying the live version
+        if (!liveIsSnapshot && liveContent.length > 0) {
+          recordEditVersion?.(slotKey, liveContent); // freeze the edited text
+        }
+        setActiveEditVersion?.(slotKey, clamped);
+        const target = liveIsSnapshot ? snapshots[clamped] : [...snapshots, liveContent][clamped];
+        updateMessage(messageId, { content: target });
         return;
       }
-      // Freeze the live content as a snapshot before displaying an older
-      // sibling, unless it is already the latest snapshot.
-      if (snapshots[snapshots.length - 1] !== liveContent) {
-        recordEditVersion?.(slotKey, liveContent);
+
+      // Pointer already set: the snapshots list is complete and authoritative.
+      if (clamped === snapshots.length - 1) {
+        // Returning to the newest version clears the pointer; its content
+        // becomes the live content again.
+        setActiveEditVersion?.(slotKey, null);
+        updateMessage(messageId, { content: snapshots[snapshots.length - 1] });
+        return;
       }
-      const content = versions[Math.min(Math.max(index, 0), liveIndex)];
-      setActiveEditVersion?.(slotKey, index);
-      updateMessage(messageId, { content });
+      setActiveEditVersion?.(slotKey, clamped);
+      updateMessage(messageId, { content: snapshots[clamped] });
     },
     [recordEditVersion, setActiveEditVersion, updateMessage]
   );
