@@ -28,12 +28,15 @@ export default function SetupPage() {
   const { register, needsSetup, isLoading } = useAuthStore();
   const navigate = useNavigate();
 
-  // Redirect to login if setup is already complete
+  // Redirect to login if setup is already complete. Guarded on the account
+  // step (issue #622): register() itself flips needsSetup to false, and the
+  // operator must not be yanked to /login while the wizard's model-endpoint
+  // step is showing. Direct visits to /setup post-setup still redirect.
   useEffect(() => {
-    if (needsSetup === false) {
+    if (needsSetup === false && step === "account") {
       navigate("/login", { replace: true });
     }
-  }, [needsSetup, navigate]);
+  }, [needsSetup, navigate, step]);
 
   const validateForm = (): boolean => {
     const newErrors: Record<string, string> = {};

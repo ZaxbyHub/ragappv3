@@ -176,12 +176,22 @@ describe("SetupPage", () => {
     const { useNavigate } = await import("react-router-dom");
     vi.mocked(useNavigate).mockReturnValue(navigate);
 
-    const registerMock = vi.fn().mockResolvedValue({ success: true });
-    vi.spyOn(useAuthStoreModule, "useAuthStore").mockReturnValue({
-      register: registerMock,
-      needsSetup: true,
-      isLoading: false,
-    } as any);
+    // Stateful store mock mirroring the REAL register() transition
+    // (useAuthStore sets needsSetup: false after a successful register) —
+    // the final-critic regression for the /login redirect race.
+    let mockNeedsSetup: boolean | null = true;
+    const registerMock = vi.fn().mockImplementation(async () => {
+      mockNeedsSetup = false;
+      return { success: true };
+    });
+    vi.spyOn(useAuthStoreModule, "useAuthStore").mockImplementation(
+      () =>
+        ({
+          register: registerMock,
+          needsSetup: mockNeedsSetup,
+          isLoading: false,
+        }) as any
+    );
 
     const user = userEvent.setup();
     render(
@@ -199,10 +209,12 @@ describe("SetupPage", () => {
     await user.click(submitButton);
 
     // Issue #622: registration now leads to the model-endpoint wizard step,
-    // not straight into the app — navigation happens on save/skip only.
+    // not straight into the app — navigation happens on save/skip only, and
+    // the needsSetup:false flip must NOT trigger the /login redirect here.
     await waitFor(() => {
       expect(screen.getByText("Configure Chat Models")).toBeInTheDocument();
     });
+    expect(navigate).not.toHaveBeenCalledWith("/login");
     expect(navigate).not.toHaveBeenCalledWith("/");
   });
 
