@@ -54,6 +54,7 @@ there is no consumer for a routing YAML, and adding one would be unwired
 
 `.github/workflows/ci.yml` — jobs: **Backend** (ruff + targeted pytest),
 **Frontend** (typecheck, lint `--max-warnings 0`, test, build, subpath build),
+**Playwright e2e** (`frontend/e2e/` smoke suite against the production build + stub backend; separate job, issue #573),
 **Quality contracts** (`check_config_contract.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_skill_sync.py`, `check_secretscan.py`),
 **SAST** (`scripts/run_bandit.py` — bandit baseline gate, fails on new findings or unused `# nosec` suppressions).
 **Closure evidence** (`.github/workflows/closure-evidence.yml` — PRs whose bodies `Closes #N` an issue must name verifiable closure evidence; `high`/`critical` issues need a cross-family approval; warn-mode rollout — see `docs/ci/closure-evidence-gate.md`).
