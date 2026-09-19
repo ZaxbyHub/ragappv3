@@ -55,7 +55,7 @@ function KMSCard({ kmsRef }: KMSCardProps) {
             <button
               type="button"
               onClick={handleNavigate}
-              className="ml-auto shrink-0 inline-flex items-center gap-0.5 text-[10px] text-emerald-600 dark:text-emerald-400 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+              className="ml-auto -mr-1.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-emerald-600 hover:underline focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring dark:text-emerald-400"
               aria-label={`Open knowledge entry ${kmsRef.title}`}
             >
               <ExternalLink className="h-2.5 w-2.5" aria-hidden />

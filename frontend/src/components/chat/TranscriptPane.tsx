@@ -1,6 +1,6 @@
 // frontend/src/components/chat/TranscriptPane.tsx
 
-import { useRef, useEffect, useState, useCallback, memo } from "react";
+import { useRef, useEffect, useState, useCallback, useMemo, memo } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -20,6 +20,10 @@ import { AssistantMessage } from "./AssistantMessage";
 import { WaitingIndicator } from "./WaitingIndicator";
 import { StageIndicator } from "./StageIndicator";
 import { Composer } from "./Composer";
+import { FollowUpSuggestions } from "./FollowUpSuggestions";
+import { ContinueAction } from "./ContinueAction";
+import { VersionStepper } from "./VersionStepper";
+import { deriveFollowUps } from "@/lib/followUpSuggestions";
 import {
   useChatStore,
   useMessageIds,
@@ -148,7 +152,15 @@ interface MessageRowProps {
   onEdit: (messageId: string, content: string) => void;
   onFork?: (messageId: string) => void;
   onFeedback: (messageId: string, feedback: "up" | "down" | null) => void;
+  /** Issue #573 (AC2): continue a length-truncated assistant response. */
+  onContinue: (messageId: string, payload: { content: string }) => void;
+  /** Issue #573 (AC3): transcript-slot index backing this row's edit versions. */
+  editSlotIndex: number;
+  onSelectEditVersion: (messageId: string, index: number, liveContent: string) => void;
 }
+
+const EMPTY_EDIT_VERSIONS: Record<string, string[]> = {};
+const EMPTY_ACTIVE_VERSIONS: Record<string, number> = {};
 
 const MessageRow = memo(function MessageRow({
   messageId,
@@ -164,8 +176,17 @@ const MessageRow = memo(function MessageRow({
   onEdit,
   onFork,
   onFeedback,
+  onContinue,
+  editSlotIndex,
+  onSelectEditVersion,
 }: MessageRowProps) {
   const message = useMessage(messageId);
+  // Issue #573 (AC3): per-row edit-version subscriptions (partial store
+  // mocks in existing suites lack the maps — the ?? fallbacks keep them
+  // rendering).
+  const editVersionsMap = useChatStore((s) => s.messageEditVersions) ?? EMPTY_EDIT_VERSIONS;
+  const activeEditVersionsMap = useChatStore((s) => s.activeEditVersion) ?? EMPTY_ACTIVE_VERSIONS;
+  const activeChatId = useChatStore((s) => s.activeChatId);
   if (!message) return null;
 
   // Coerce types for safety
@@ -178,6 +199,40 @@ const MessageRow = memo(function MessageRow({
 
   const isAssistantStreaming = isStreaming && isLast && safeMessage.role === "assistant" && streamingMessageId === messageId;
   const isHighlighted = highlightedId === messageId;
+
+  // Issue #573 (AC3): sibling versions for this row's transcript slot.
+  // Resolution rule (shared with handleSelectEditVersion): while a pointer is
+  // set the snapshots list is complete and authoritative; otherwise the live
+  // content is the implicit newest version (deduped against the last
+  // snapshot). Computed inside the row so the parent never subscribes to
+  // message bodies (#616).
+  let rowEditVersions: Array<{ label: string; content: string }> = [];
+  let rowEditActiveIndex = 0;
+  if (!isStreaming && safeMessage.role === "user" && activeChatId) {
+    const slotKey = `${activeChatId}:${editSlotIndex}`;
+    const snapshots = editVersionsMap[slotKey] ?? [];
+    const activeStored = activeEditVersionsMap[slotKey];
+    let contents: string[];
+    let activeIndex: number;
+    if (activeStored !== undefined) {
+      contents = snapshots;
+      activeIndex =
+        activeStored >= contents.length ? Math.max(contents.length - 1, 0) : activeStored;
+    } else {
+      contents =
+        snapshots.length > 0 && snapshots[snapshots.length - 1] === safeMessage.content
+          ? snapshots
+          : [...snapshots, safeMessage.content];
+      activeIndex = contents.length - 1;
+    }
+    if (contents.length > 1) {
+      rowEditActiveIndex = activeIndex;
+      rowEditVersions = contents.map((content, i) => ({
+        label: i === contents.length - 1 ? "Current edit" : `Version ${i + 1}`,
+        content,
+      }));
+    }
+  }
 
   // Persisted terminal status (issue #507): an interrupted/partial/failed
   // turn must never look like a successful answer after reload. The
@@ -250,16 +305,39 @@ const MessageRow = memo(function MessageRow({
               </div>
             </div>
           )}
+          {/* Issue #573 (AC2): a response truncated at max_tokens
+              (finish_reason "length") offers Continue — resending with the
+              truncated content as prior context. Latest turn only: the
+              continuation appends to the live exchange, like Retry. */}
+          {!isAssistantStreaming &&
+            isLast &&
+            safeMessage.finishReason === "length" && (
+              <ContinueAction
+                content={safeMessage.content}
+                onContinue={(payload) => onContinue(messageId, payload)}
+              />
+            )}
         </>
       ) : (
-        <MessageBubble
-          message={safeMessage}
-          isStreaming={isAssistantStreaming}
-          isEditDisabled={isStreaming}
-          onFork={onFork ? () => onFork(messageId) : undefined}
-          userInitial={userInitial}
-          onEdit={onEdit}
-        />
+        <>
+          <MessageBubble
+            message={safeMessage}
+            isStreaming={isAssistantStreaming}
+            isEditDisabled={isStreaming}
+            onFork={onFork ? () => onFork(messageId) : undefined}
+            userInitial={userInitial}
+            onEdit={onEdit}
+          />
+          {/* Issue #573 (AC3): edited turns keep navigable sibling versions
+              (client-side snapshots; the fork/lineage model is unchanged). */}
+          {rowEditVersions.length > 1 && (
+            <VersionStepper
+              versions={rowEditVersions}
+              activeIndex={rowEditActiveIndex}
+              onSelectIndex={(index) => onSelectEditVersion(messageId, index, safeMessage.content)}
+            />
+          )}
+        </>
       )}
     </div>
   );
@@ -285,6 +363,9 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
   const removeMessagesFrom = useChatStore((s) => s.removeMessagesFrom);
   const updateMessage = useChatStore((s) => s.updateMessage);
   const loadChat = useChatStore((s) => s.loadChat);
+  const recordEditVersion = useChatStore((s) => s.recordEditVersion);
+  const setActiveEditVersion = useChatStore((s) => s.setActiveEditVersion);
+  const clearEditVersionsFrom = useChatStore((s) => s.clearEditVersionsFrom);
 
   const { getActiveVault } = useVaultStore();
   const activeVault = getActiveVault();
@@ -524,10 +605,149 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
         return;
       }
     }
+    // Issue #573 (AC3): snapshot the pre-edit content keyed by transcript
+    // slot ("<activeChatId>:<index>"). Editing truncates in place and the
+    // re-sent message lands at the same index, so the slot key is stable and
+    // the stepper can offer the pre-edit content as a sibling version — with
+    // zero change to the fork/lineage data model. Re-editing while an older
+    // version is displayed records that displayed text only if it is not
+    // already a navigable snapshot, and always clears the display pointer:
+    // the edit starts a new live lineage, so the re-sent message must render
+    // as the live content, not the stale selected version. Slots at or after
+    // the truncation point become stale (their indices will map to different
+    // messages after the re-send), so they are dropped. Version-state
+    // mutations run only after the server truncate has SUCCEEDED, so a
+    // failed truncate leaves the version maps untouched (PRR-011).
+    const slotKey = activeChatId ? `${activeChatId}:${idx}` : null;
+    const editState = useChatStore.getState();
+    const originalContent = messagesById[messageId]?.content;
+    if (slotKey) {
+      const existingSnapshots = editState.messageEditVersions?.[slotKey] ?? [];
+      const pointerWasSet = editState.activeEditVersion?.[slotKey] !== undefined;
+      if (
+        typeof originalContent === "string" &&
+        originalContent.length > 0 &&
+        !existingSnapshots.includes(originalContent)
+      ) {
+        recordEditVersion?.(slotKey, originalContent);
+      }
+      if (pointerWasSet) {
+        setActiveEditVersion?.(slotKey, null);
+      }
+    }
+    clearEditVersionsFrom?.(idx + 1);
     removeMessagesFrom(idx);
     setInput(content);
     composerRef.current?.focus();
-  }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist]);
+  }, [isStreaming, removeMessagesFrom, setInput, awaitPendingPersist, recordEditVersion, setActiveEditVersion, clearEditVersionsFrom]);
+
+  // Issue #573 (AC3): step the displayed sibling version of an edited turn.
+  // Invariants (shared with the row-side resolution below):
+  //   * the snapshots list is COMPLETE once a pointer is set — stepping away
+  //     from the live content freezes it as the latest snapshot exactly once;
+  //   * while no pointer is set, the displayed list is snapshots plus the live
+  //     content (deduped), and the live content IS the newest version;
+  //   * stepping to the newest version clears the pointer and restores that
+  //     snapshot's content as the live content.
+  // This prevents the duplicate-sibling bug where displaying an older version
+  // (which overwrites live content) would re-append that older text as a new
+  // version on the next render.
+  const handleSelectEditVersion = useCallback(
+    (messageId: string, index: number, liveContent: string) => {
+      const state = useChatStore.getState();
+      const { activeChatId, messageIds: ids } = state;
+      const idx = ids.indexOf(messageId);
+      if (!activeChatId || idx < 0) return;
+      const slotKey = `${activeChatId}:${idx}`;
+      const snapshots = state.messageEditVersions?.[slotKey] ?? [];
+      const pointerSet = state.activeEditVersion?.[slotKey] !== undefined;
+      const clamped = Math.min(Math.max(index, 0), Math.max(snapshots.length - 1, 0));
+
+      if (!pointerSet) {
+        // The live content is the implicit newest version.
+        const liveIsSnapshot = snapshots[snapshots.length - 1] === liveContent;
+        const liveIndex = liveIsSnapshot ? snapshots.length - 1 : snapshots.length;
+        if (clamped === liveIndex) return; // already displaying the live version
+        if (!liveIsSnapshot && liveContent.length > 0) {
+          recordEditVersion?.(slotKey, liveContent); // freeze the edited text
+        }
+        setActiveEditVersion?.(slotKey, clamped);
+        const target = liveIsSnapshot ? snapshots[clamped] : [...snapshots, liveContent][clamped];
+        updateMessage(messageId, { content: target });
+        return;
+      }
+
+      // Pointer already set: the snapshots list is complete and authoritative.
+      if (clamped === snapshots.length - 1) {
+        // Returning to the newest version clears the pointer; its content
+        // becomes the live content again.
+        setActiveEditVersion?.(slotKey, null);
+        updateMessage(messageId, { content: snapshots[snapshots.length - 1] });
+        return;
+      }
+      setActiveEditVersion?.(slotKey, clamped);
+      updateMessage(messageId, { content: snapshots[clamped] });
+    },
+    [recordEditVersion, setActiveEditVersion, updateMessage]
+  );
+
+  // Issue #573 (AC2): continue a length-truncated response. The truncated
+  // assistant content stays in the history as prior context (the model sees
+  // its own partial answer as the previous turn) and the continuation
+  // instruction rides as the new user message — the response resumes instead
+  // of restarting.
+  const handleContinue = useCallback(
+    (messageId: string, _payload: { content: string }) => {
+      if (isStreaming) return;
+      const { messageIds: ids, messagesById } = useChatStore.getState();
+      const idx = ids.indexOf(messageId);
+      if (idx < 0) return;
+      const history = ids.slice(0, idx + 1).map((id) => messagesById[id]);
+      sendDirect("Continue the previous answer from exactly where it was cut off.", history);
+    },
+    [isStreaming, sendDirect]
+  );
+
+  // Issue #573 (AC1): follow-up suggestions for the newest completed
+  // assistant turn, derived deterministically from the context that turn
+  // already retrieved (its sources) plus the user's question — no new
+  // retrieval call, no LLM call. Only the latest exchange is offered; older
+  // turns keep a stable transcript on reload.
+  const lastMessage = useMessage(messageIds.length > 0 ? messageIds[messageIds.length - 1] : "__none__");
+  // Primitive selector (re-renders only when the last user content string
+  // changes) — keeps the pane off full-store subscriptions (#616) and off
+  // getState()-in-render (partial store mocks in existing suites).
+  const lastUserContent = useChatStore((s) => {
+    for (let i = s.messageIds.length - 1; i >= 0; i--) {
+      const msg = s.messagesById[s.messageIds[i]];
+      if (msg?.role === "user") {
+        return typeof msg.content === "string" ? msg.content : "";
+      }
+    }
+    return "";
+  });
+  const followUpSuggestions = useMemo(() => {
+    if (isStreaming || !lastMessage || lastMessage.role !== "assistant") return [];
+    if (lastMessage.status && lastMessage.status !== "complete") return [];
+    if (lastMessage.error) return [];
+    // Malformed/foreign source entries (adversarial inputs) must not break
+    // the transcript — only well-formed string filenames become topics.
+    const titles = (lastMessage.sources ?? [])
+      .filter((s): s is NonNullable<typeof s> => s != null && typeof s === "object")
+      .map((s) => (typeof s.filename === "string" ? s.filename : ""))
+      .filter((t) => t.length > 0)
+      .slice(0, 3);
+    return deriveFollowUps(lastUserContent, titles);
+  }, [isStreaming, lastMessage, lastUserContent]);
+
+  const handleSuggestionSelect = useCallback(
+    (suggestion: string) => {
+      const { messageIds: ids, messagesById } = useChatStore.getState();
+      const history = ids.map((id) => messagesById[id]);
+      sendDirect(suggestion, history);
+    },
+    [sendDirect]
+  );
 
   // Fork
   const handleFork = useCallback(async (messageId: string) => {
@@ -605,9 +825,20 @@ export function TranscriptPane({ className }: TranscriptPaneProps) {
                       onEdit={handleEdit}
                       onFork={isForking ? undefined : handleFork}
                       onFeedback={handleFeedback}
+                      onContinue={handleContinue}
+                      editSlotIndex={idx}
+                      onSelectEditVersion={handleSelectEditVersion}
                     />
                   </div>
                 ))}
+                {/* Issue #573 (AC1): suggested next questions after the newest
+                    completed assistant turn. */}
+                {followUpSuggestions.length > 0 && (
+                  <FollowUpSuggestions
+                    suggestions={followUpSuggestions}
+                    onSelect={handleSuggestionSelect}
+                  />
+                )}
               </div>
             )}
           </div>

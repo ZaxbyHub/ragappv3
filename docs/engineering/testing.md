@@ -62,6 +62,28 @@ Tests for the `get_current_user_or_service_account` dependency-override branch (
 
 Config: `frontend/vite.config.ts` `test` block — `globals: true`, `environment: "jsdom"`, `setupFiles: ./src/test/setup.ts`. Test files are named `*.test.tsx`. `setup.ts` mocks `localStorage`, `window.confirm`, and `Element.prototype.scrollTo` (jsdom omits it).
 
+### Browser-level e2e tier (Playwright, issue #573)
+
+`frontend/e2e/` is a standalone Playwright package (own `package.json` +
+lockfile; the root frontend package never installs Playwright). It drives the
+**production build** — `npx vite preview --port 4173` with the API proxied to
+a zero-dependency `node:http` stub backend on `:9090` (`stub-backend.mjs`,
+which implements the real client contract: auth/CSRF/login/refresh/me,
+vaults, sessions, durable-turn batch writes, and progressive SSE with
+`SLOW`/`LENGTH` markers). CI runs it as the separate `e2e` job; locally:
+
+```bash
+cd frontend && npm ci && npm run build
+cd e2e && npm ci && npx playwright install --with-deps chromium && npx playwright test
+```
+
+Write specs with resilient selectors (roles/aria-labels) and remember two
+strict-mode facts that bit the first run: the inline citation chip and the
+source-card list item share the accessible name `Source S1: <file>` (use
+`.first()`), and a completed exchange also renders follow-up-suggestion
+buttons whose text can embed the question (use `.first()` on question-text
+locators after a reload).
+
 ### Established jsdom mock patterns
 These cost real debugging cycles to discover — reuse them. Full worked examples and copy-paste snippets are in the `ci-compatibility-audit` skill's `references/frontend-testing-gotchas.md`.
 

@@ -515,6 +515,13 @@ export function useSendMessage(
           onCitationEnforcement: (enforcement) => {
             updateMessage(assistantMessageId, { citationEnforcement: enforcement });
           },
+          // Issue #573 (AC2): why the provider stopped generating. "length"
+          // (max_tokens truncation) is surfaced on the message so the
+          // transcript can offer a Continue action. Transient display state
+          // — persistTurn does not write it (no backend schema change).
+          onFinishReason: (reason) => {
+            updateMessage(assistantMessageId, { finishReason: reason });
+          },
           onError: (error) => {
             // An orphan stream must not clean up a newer send. A pagehide save
             // leaves this generation alive so its later terminal callback can

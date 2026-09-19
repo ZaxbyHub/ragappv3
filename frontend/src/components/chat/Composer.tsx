@@ -558,7 +558,7 @@ export function Composer({ onSend, onStop, isStreaming, className, inputRef }: C
                   </span>
                   <button
                     onClick={() => removeAttachment(att.id)}
-                    className="ml-1 text-muted-foreground hover:text-foreground"
+                    className="ml-1 inline-flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                     aria-label={`Remove ${att.file.name}`}
                   >
                     <X className="h-3 w-3" />

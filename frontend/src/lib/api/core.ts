@@ -810,6 +810,13 @@ export interface ChatStreamCallbacks {
     durationMs?: number;
     tokensEstimate?: number;
   }) => void;
+  /**
+   * Reason the provider stopped generating, from the done event's
+   * llm_metrics.finish_reason (issue #573 AC2): "length" marks a response
+   * truncated at max_tokens and surfaces the Continue action. Fired only
+   * when the backend reports a non-empty reason, just before onComplete.
+   */
+  onFinishReason?: (reason: string) => void;
   onError?: (error: Error) => void;
   onComplete?: () => void;
 }
