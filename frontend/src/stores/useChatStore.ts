@@ -42,6 +42,14 @@ export interface Message {
   /** Assistant terminal state (issue #507). "complete" is the default; "interrupted"/"partial" render retryable.
    * "pending" (issue #553) is the server's pre-write state for a turn that never finalized. */
   status?: "pending" | "complete" | "partial" | "interrupted" | "failed";
+  /**
+   * Why the provider stopped generating, from the done event's
+   * llm_metrics.finish_reason (issue #573 AC2): "length" marks a response
+   * truncated at max_tokens and surfaces the Continue action. Transient
+   * display state — not persisted to the session rows (no backend schema
+   * change), so it is absent after a reload.
+   */
+  finishReason?: string;
   /** Durable save acknowledgment, separate from answer completion (UI-002). */
   saveState?: "saving" | "saved" | "failed";
   /** Per-session durable order (issue #507), as returned by the backend. */
@@ -72,6 +80,19 @@ export interface ChatState {
    */
   pendingTurnPersist: Promise<void> | null;
 
+  /**
+   * Client-side edit-version snapshots (issue #573 AC3), keyed by transcript
+   * slot `"<activeChatId>:<index>"`. Editing truncates the session in place
+   * and re-sends, so the pre-edit content is snapshotted here to make sibling
+   * versions navigable WITHOUT any change to the fork/lineage data model.
+   * The live (latest) content is NOT stored here — it lives on the message;
+   * the displayed version list is snapshots plus the live content (deduped).
+   * In-memory only: cleared on session switch/new chat, absent after reload.
+   */
+  messageEditVersions: Record<string, string[]>;
+  /** Which snapshot version a slot currently displays; absent = live content. */
+  activeEditVersion: Record<string, number>;
+
   // Actions
   addMessage: (message: Message) => void;
   /** Fast streaming path: appends a chunk to content without replacing the full array. */
@@ -99,6 +120,16 @@ export interface ChatState {
   stopStreaming: () => void;
   loadChat: (chatId: string, messages: Message[]) => void;
   newChat: () => void;
+  /**
+   * Append an edit-version snapshot for a transcript slot (issue #573 AC3).
+   * Consecutive duplicates are skipped so re-recording the live content is a
+   * no-op when it is already the latest snapshot.
+   */
+  recordEditVersion: (slotKey: string, content: string) => void;
+  /** Set which snapshot version a slot displays (absent entry = live). */
+  setActiveEditVersion: (slotKey: string, index: number | null) => void;
+  /** Drop snapshots for slots at or after `fromIndex` (stale after a truncate). */
+  clearEditVersionsFrom: (fromIndex: number) => void;
 
   // Legacy compat — converts array to/from normalized shape
   setMessages: (messages: Message[] | ((prev: Message[]) => Message[])) => void;
@@ -115,6 +146,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   expandedSources: new Set(),
   activeChatId: null,
   pendingTurnPersist: null,
+  messageEditVersions: {},
+  activeEditVersion: {},
 
   addMessage: (message) => {
     set((state) => ({
@@ -258,14 +291,56 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const messageIds = messages.map((m) => m.id);
     const messagesById: Record<string, Message> = {};
     for (const m of messages) messagesById[m.id] = m;
-    set({ activeChatId: chatId, messageIds, messagesById, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null });
+    set({ activeChatId: chatId, messageIds, messagesById, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null, messageEditVersions: {}, activeEditVersion: {} });
   },
 
   newChat: () => {
     // Abort any in-flight stream before starting a new chat (see loadChat).
     const { abortFn } = get();
     if (abortFn) abortFn();
-    set({ activeChatId: null, messageIds: [], messagesById: {}, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null });
+    set({ activeChatId: null, messageIds: [], messagesById: {}, expandedSources: new Set(), streamingMessageId: null, isStreaming: false, abortFn: null, messageEditVersions: {}, activeEditVersion: {} });
+  },
+
+  recordEditVersion: (slotKey, content) => {
+    if (typeof content !== "string" || content.length === 0) return;
+    set((state) => {
+      const existing = state.messageEditVersions[slotKey];
+      if (existing && existing[existing.length - 1] === content) return state;
+      return {
+        messageEditVersions: {
+          ...state.messageEditVersions,
+          [slotKey]: [...(existing ?? []), content],
+        },
+      };
+    });
+  },
+
+  setActiveEditVersion: (slotKey, index) => {
+    set((state) => {
+      if (index === null) {
+        if (!(slotKey in state.activeEditVersion)) return state;
+        const next = { ...state.activeEditVersion };
+        delete next[slotKey];
+        return { activeEditVersion: next };
+      }
+      return { activeEditVersion: { ...state.activeEditVersion, [slotKey]: index } };
+    });
+  },
+
+  clearEditVersionsFrom: (fromIndex) => {
+    set((state) => {
+      const versions: Record<string, string[]> = {};
+      const active: Record<string, number> = {};
+      for (const [slotKey, contents] of Object.entries(state.messageEditVersions)) {
+        const idx = Number.parseInt(slotKey.split(":")[1] ?? "", 10);
+        if (Number.isInteger(idx) && idx >= fromIndex) continue;
+        versions[slotKey] = contents;
+        if (slotKey in state.activeEditVersion) {
+          active[slotKey] = state.activeEditVersion[slotKey];
+        }
+      }
+      return { messageEditVersions: versions, activeEditVersion: active };
+    });
   },
 
   setMessages: (messages) => {

@@ -201,9 +201,21 @@ export async function parseSSEStream(
                 llm_metrics?: {
                   reasoning_duration_ms?: unknown;
                   reasoning_tokens_estimate?: unknown;
+                  finish_reason?: unknown;
                 };
               }
             ).llm_metrics;
+            // Issue #573 (AC2): surface why generation stopped — "length"
+            // marks a max_tokens truncation and drives the Continue action.
+            // Fired before onComplete so the message is stamped before the
+            // turn-final persistence reads it.
+            if (
+              metrics &&
+              typeof metrics.finish_reason === "string" &&
+              metrics.finish_reason.length > 0
+            ) {
+              callbacks.onFinishReason?.(metrics.finish_reason);
+            }
             if (metrics && typeof metrics === "object") {
               const durationMs = metrics.reasoning_duration_ms;
               const tokensEstimate = metrics.reasoning_tokens_estimate;
