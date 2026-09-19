@@ -108,7 +108,6 @@ python scripts/check_runtime_contract.py   # runtime pins: Docker/CI/engines/doc
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py   # SAST baseline/scope/workflow integrity
-python scripts/check_skill_sync.py      # skill-tree mirror drift
 python scripts/check_secretscan.py      # .secretscanignore validity
 ```
 

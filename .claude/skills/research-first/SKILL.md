@@ -1,21 +1,16 @@
 ---
 name: research-first
-description: >
-  Apply when planning fixes, investigating tech debt, architecting solutions, or
-  diagnosing unknown issues. Search online for current documentation and state-of-the-art
-  approaches before tracing through code.
-context: fork
-agent: Explore
+description: Apply when planning fixes, investigating tech debt, architecting solutions, or diagnosing unknown issues. Search online for current documentation and state-of-the-art approaches before tracing through code. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
+metadata:
+  adapter_for: ".agents/skills/research-first/SKILL.md"
 ---
 
-## Research Before Planning Protocol
+# research first (Claude Code adapter)
 
-Before planning any fix, tracing any issue, or proposing any solution:
+This is a thin pointer to the canonical skill at
+`.agents/skills/research-first/SKILL.md`. Claude Code runners should load the canonical SKILL.md
+there for the full protocol; this adapter exists only so Claude Code's
+`.claude/skills/` discovery finds the skill.
 
-1. Search online for current official documentation to confirm the behavior is NOT intended or already fixed
-2. Search for state-of-the-art solutions, known community workarounds, and recent discussion on this problem type
-3. Use parallel sub-agents to search multiple sources simultaneously
-4. Report all findings before any code tracing begins
-
-Then trace each problem end-to-end through the actual source code using parallel sub-agents.
-Do not stop until ≥95% confident in the root cause for every issue being investigated.
+Canonical tree for repo-specific skills: `.agents/skills/` (see
+`docs/engineering/skill-conventions.md`).

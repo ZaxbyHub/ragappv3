@@ -1,14 +1,16 @@
 ---
 name: unswarm
-description: Disable swarm mode for the current session and return to normal behavior.
-disable-model-invocation: true
+description: Disable swarm mode for the current session and return to normal behavior. Adapter pointing to the canonical repo skill; refer to that for the full protocol.
+metadata:
+  adapter_for: ".agents/skills/unswarm/SKILL.md"
 ---
 
-# /unswarm
+# unswarm (Claude Code adapter)
 
-Disable swarm mode for the current session.
+This is a thin pointer to the canonical skill at
+`.agents/skills/unswarm/SKILL.md`. Claude Code runners should load the canonical SKILL.md
+there for the full protocol; this adapter exists only so Claude Code's
+`.claude/skills/` discovery finds the skill.
 
-## Steps
-1. If `.zcode/session/swarm-mode.md` exists, delete it.
-2. Confirm that swarm mode is now disabled.
-3. Resume normal agent-runner behavior for future tasks.
+Canonical tree for repo-specific skills: `.agents/skills/` (see
+`docs/engineering/skill-conventions.md`).

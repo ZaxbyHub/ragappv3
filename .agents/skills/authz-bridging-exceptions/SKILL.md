@@ -1,6 +1,6 @@
 ---
 name: authz-bridging-exceptions
-description: Document two anti-patterns in the auth override branch: (a) masking non-401 HTTPExceptions when falling back to an alternative auth mechanism, and (b) using inspect.isawaitable() instead of inspect.iscoroutine() on the evaluate closure, which yields None for async def overrides. Critical for auth dependencies with JWT + service-account (SA) fallback (get_chat_stream_auth_context, get_wiki_events_auth_context, and any override branch calling get_evaluate_policy).
+description: "Document two anti-patterns in the auth override branch: (a) masking non-401 HTTPExceptions when falling back to an alternative auth mechanism, and (b) using inspect.isawaitable() instead of inspect.iscoroutine() on the evaluate closure, which yields None for async def overrides. Critical for auth dependencies with JWT + service-account (SA) fallback (get_chat_stream_auth_context, get_wiki_events_auth_context, and any override branch calling get_evaluate_policy)."
 disable-model-invocation: true
 generated_at: 2026-07-02T22:30:00Z
 ---

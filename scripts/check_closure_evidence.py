@@ -8,9 +8,9 @@ that FAILS on the pre-fix commit and PASSES on the PR head (re-executed by
 artifact that actually exists in the repository. Issues labeled ``high`` or
 ``critical`` additionally require an approving review from outside the fix's
 own file family. The convention enforced here is the repo's existing prose
-standard (.opencode/skills/issue-tracer/SKILL.md: "Regression test fails
+standard (.agents/skills/issue-tracer/SKILL.md: "Regression test fails
 before the fix and passes after the fix when feasible";
-.opencode/skills/swarm-implement/SKILL.md: "Regression tests must be
+.agents/skills/swarm-implement/SKILL.md: "Regression tests must be
 falsifiable"); this gate adds the missing enforcement, it does not redefine
 the standard.
 

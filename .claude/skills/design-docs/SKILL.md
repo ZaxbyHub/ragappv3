@@ -39,7 +39,7 @@ Have the `docs_design` agent (or `doc_scan`) index `<out>/` to discover any exis
 Dispatch the **`docs_design`** agent (the active swarm's `docs_design` — never the standard `docs` agent) with:
 - `TASK`, `MODE` (generate|sync), `OUT_DIR`, `LANGUAGE`
 - For sync: `FILES CHANGED` and `CHANGES SUMMARY` from the current phase/diff
-- `SKILLS: file:.opencode/skills/design-docs/SKILL.md` (this skill)
+- `SKILLS: file:.claude/skills/design-docs/SKILL.md` (this skill)
 
 The agent owns exactly these files under `<out>` and creates NOTHING else:
 

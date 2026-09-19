@@ -18,9 +18,11 @@ A RAG knowledge-management app:
 
 ## Skills
 
-Each runner loads skills from its own tree — `.claude/skills/` (Claude Code),
-`.agents/skills/` (Codex), `.opencode/skills/` (opencode-swarm). Repo-specific
-skills:
+Skills live in one canonical tree per skill: repo-specific skills are canonical
+in `.agents/skills/` (with thin `.claude` pointer adapters so Claude Code
+discovers them), framework-vendored skills are canonical in `.claude/skills/`,
+and `.opencode/skills/` holds only the opencode-swarm plugin's own skills plus
+the generated knowledge subgroup. Repo-specific skills:
 
 - `engineering-conventions` — points to `docs/engineering/conventions.md`.
 - `writing-tests` — points to `docs/engineering/testing.md`.
@@ -29,13 +31,17 @@ skills:
 - `config-env-contract-check`, `review-finding-validator` — config-contract and finding-validation helpers.
 - `codebase-review-swarm` — read-only, quote-grounded full-repo audit (Phase 0 inventory, selected-track depth, reviewer/critic validation); canonical at `.opencode/skills/codebase-review-swarm/`.
 
-When you add or change a repo-specific skill, mirror it across all three trees
-(or keep it a thin pointer to a canonical doc) so every runner stays consistent.
-Skill file structure, frontmatter shape, the mirror rule, the adapter-skill
-pattern, and the `.secretscanignore` validation contract are specified in
-`docs/engineering/skill-conventions.md`. Drift is enforced in CI by
-`scripts/check_skill_sync.py`; `.secretscanignore` validity is enforced by
-`scripts/check_secretscan.py`.
+When you add or change a repo-specific skill, create it in `.agents/skills/` and
+add a thin pointer SKILL.md under `.claude/skills/` (the adapter pattern
+`codebase-review-swarm` uses); never keep a second full copy in another tree.
+Skill file structure, frontmatter shape, the canonical-homes table, the
+thin-pointer adapter pattern, and the `.secretscanignore` validation contract
+are specified in `docs/engineering/skill-conventions.md`. Canonical-home and
+pointer integrity is enforced by `backend/tests/test_skill_tree_collapse.py`;
+`.secretscanignore` validity is enforced by `scripts/check_secretscan.py`.
+
+Instructions sharing: Codex reads this `AGENTS.md` natively; Claude Code reaches
+it through the `@AGENTS.md` import in `CLAUDE.md`.
 
 `.opencode/skill-routing.yaml` is intentionally absent: the opencode-swarm
 plugin uses directory-based skill discovery (`.opencode/skills/<name>/SKILL.md`),
@@ -55,6 +61,6 @@ there is no consumer for a routing YAML, and adding one would be unwired
 `.github/workflows/ci.yml` — jobs: **Backend** (ruff + targeted pytest),
 **Frontend** (typecheck, lint `--max-warnings 0`, test, build, subpath build),
 **Playwright e2e** (`frontend/e2e/` smoke suite against the production build + stub backend; separate job, issue #573),
-**Quality contracts** (`check_config_contract.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_skill_sync.py`, `check_secretscan.py`),
+**Quality contracts** (`check_config_contract.py`, `check_pr_scope_drift.py`, `check_sast_baseline.py`, `check_secretscan.py`),
 **SAST** (`scripts/run_bandit.py` — bandit baseline gate, fails on new findings or unused `# nosec` suppressions).
 **Closure evidence** (`.github/workflows/closure-evidence.yml` — PRs whose bodies `Closes #N` an issue must name verifiable closure evidence; `high`/`critical` issues need a cross-family approval; warn-mode rollout — see `docs/ci/closure-evidence-gate.md`).

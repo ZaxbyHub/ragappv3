@@ -1,6 +1,6 @@
 ---
 name: swarm-implement
-description: Execute complex implementation work with a swarm-like workflow: parallel exploration, scoped planning, selective deep validation, and independent reviewer/critic checks where risk justifies them. Use for feature work, bug fixes, refactors, and multi-file changes.
+description: "Execute complex implementation work with a swarm-like workflow: parallel exploration, scoped planning, selective deep validation, and independent reviewer/critic checks where risk justifies them. Use for feature work, bug fixes, refactors, and multi-file changes."
 disable-model-invocation: true
 ---
 
