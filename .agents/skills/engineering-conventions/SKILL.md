@@ -30,7 +30,7 @@ file you are editing over anything summarized here.
 - `strict` TS, zero-warning lint (`eslint src --max-warnings 0`). Scripts: `typecheck`, `lint`, `test` (`vitest run`), `build`.
 
 **Repo**
-- Three agent runners, three skill trees (`.claude/`, `.agents/`, `.opencode/`). Mirror repo-specific skills across all three, or keep them thin pointers to canonical docs.
+- Repo-specific skills live in one canonical tree (`.agents/skills/`) with thin `.claude` pointer adapters for Claude Code; never keep a second full copy in another tree. See `docs/engineering/skill-conventions.md`.
 - Before push/PR: run `ci-compatibility-audit`. For tests: `writing-tests` / `docs/engineering/testing.md`. For commits/PRs: `commit-pr`.
 
 **Hugeicons + lucide mixed icon discrimination**

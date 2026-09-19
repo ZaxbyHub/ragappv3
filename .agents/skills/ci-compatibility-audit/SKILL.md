@@ -54,10 +54,6 @@ Repository contract job:
   the PR (suppresses new findings without `SAST_ALLOW_BASELINE_EXPANSION=1`),
   if the `sast` CI job no longer runs `run_bandit.py`, or if the scan scope
   (`TARGET`) drifted from `backend/app`.
-- `python scripts/check_skill_sync.py` — fails if repo-specific skills drifted
-  across the three runner trees (`.claude/skills/`, `.agents/skills/`,
-  `.opencode/skills/`). See `docs/engineering/skill-conventions.md` for the
-  mirror rule and `scripts/sync_skills.py` for propagation.
 - `python scripts/check_secretscan.py` — fails if `.secretscanignore` has
   unparseable globs, adversarial positive samples are not ignored, or
   adversarial negative samples are over-matched. Stale and overly-broad globs
@@ -117,7 +113,6 @@ cd backend && ruff check . && pytest --tb=short -v --timeout=300 tests/
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py
-python scripts/check_skill_sync.py
 python scripts/check_secretscan.py
 python scripts/check_test_collection_scope.py
 python scripts/run_bandit.py
