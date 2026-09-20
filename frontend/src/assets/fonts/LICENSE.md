@@ -24,6 +24,11 @@ for an unused family).
 The files preserve Google Fonts' own subset split (unicode-range) and axis
 declarations exactly as served by the css2 API on 2026-09-18.
 
+Provenance mechanism (#640): re-vendor with
+`node frontend/scripts/fetch-fonts.mjs` (same pinned css2 URL and UA as the
+#572 fetch), which also (re)writes `SHA256SUMS` next to the fonts — the
+sha256 manifest verified by `src/tests/font-integrity-manifest.test.ts`.
+
 ---
 
 ## SIL Open Font License 1.1

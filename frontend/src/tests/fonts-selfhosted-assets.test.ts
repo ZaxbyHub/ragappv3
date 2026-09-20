@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, sep } from "node:path";
 
+import { assertFontIntegrity } from "./helpers/font-integrity";
+
 /**
  * Self-hosted font assets contract (issue #572, AC2).
  *
@@ -102,6 +104,16 @@ describe("self-hosted @font-face declarations and assets (AC2)", () => {
         ).toBe(true);
       }
     }
+  });
+
+  // Issue #640 (AC1/AC3): existence alone proved nothing — a corrupted or
+  // substituted binary passed the assertions above. Every vendored font must
+  // additionally match the SHA256SUMS provenance manifest with intact wOF2
+  // magic and a size above the truncation floor.
+  it("matches every vendored font against the SHA256SUMS integrity manifest", () => {
+    const manifest = readFileSync(resolve(fontsDir, "SHA256SUMS"), "utf-8");
+    const result = assertFontIntegrity(fontsDir, manifest);
+    expect(result.verifiedCount).toBeGreaterThan(0);
   });
 
   it("ships an OFL license record in src/assets/fonts", () => {

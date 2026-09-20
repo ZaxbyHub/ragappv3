@@ -1,0 +1,19 @@
+# Build context for frontend/Dockerfile (issue #640).
+#
+# Without this file, `COPY . .` dragged the HOST's node_modules (Windows
+# .bin shims calling node.exe), dist and tool caches into the image on top
+# of the container's own npm ci install — `npm run build` then died with
+# "node.exe: not found" (exit 127). Everything here is either re-created
+# inside the image (node_modules, dist) or irrelevant to the build.
+node_modules
+dist
+dist-dts
+.vite
+coverage
+.stryker-tmp
+.pytest_cache
+
+# Env: never bake local secrets into build contexts.
+.env
+*.env
+!.env.example

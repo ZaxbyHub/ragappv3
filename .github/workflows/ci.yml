@@ -179,6 +179,11 @@ jobs:
       - name: Build root image (no push)
         run: docker build --tag ragappv3:ci-smoke .
 
+      # Issue #640: frontend/Dockerfile had no CI build, so its parse error
+      # (and the NODE_ENV-devDependencies defect behind it) went unnoticed.
+      - name: Build frontend image (no push)
+        run: docker build -f frontend/Dockerfile --tag ragappv3-frontend:ci-smoke frontend/
+
   sast:
     name: SAST (bandit)
     runs-on: ubuntu-latest
