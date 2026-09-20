@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -28,12 +29,22 @@ from app.models.database import SQLiteConnectionPool, init_db, run_migrations
 
 class TestSQLiteConnectionPoolFailures(unittest.TestCase):
     def test_get_connection_restores_count_when_create_fails(self):
+        """A failed connection creation must roll back _created_count.
+
+        (#650) The failure is injected via sqlite3.connect itself: since
+        _create_connection now creates the parent directory (fresh-clone
+        fix), a missing directory no longer makes connect fail, so the old
+        rmtree-the-temp-dir injection would silently succeed.
+        """
         temp_dir = tempfile.mkdtemp()
-        shutil.rmtree(temp_dir)
         pool = SQLiteConnectionPool(os.path.join(temp_dir, "missing.db"), max_size=1)
 
-        with self.assertRaises((sqlite3.Error, OSError)):
-            pool.get_connection()
+        with mock.patch(
+            "app.models.database.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("unable to open database file"),
+        ):
+            with self.assertRaises((sqlite3.Error, OSError)):
+                pool.get_connection()
 
         self.assertEqual(pool._created_count, 0)
 
