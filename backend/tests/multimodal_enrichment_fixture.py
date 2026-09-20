@@ -117,9 +117,20 @@ class MultimodalEnrichmentFixture(unittest.TestCase):
             def __exit__(self, *args):
                 return False
 
+        class _AsyncContext:
+            async def __aenter__(self):
+                return conn
+
+            async def __aexit__(self, *args):
+                return False
+
         class _Pool:
             def connection(self):
                 return _Context()
+
+            # #645: _enrich_atom checks out via the async CM.
+            def connection_async(self):
+                return _AsyncContext()
 
         return _Pool()
 

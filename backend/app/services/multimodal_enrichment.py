@@ -455,7 +455,7 @@ class ArtifactEnrichmentService:
         )
 
         # Claim atom stage running (short claim; release before provider call).
-        with self.pool.connection() as conn:
+        async with self.pool.connection_async() as conn:
             claimed = st.claim_atom_stage(
                 conn, file_id=file_id, generation_hash=generation_hash, atom_pk=atom_pk,
                 stage=st.ENRICH_STAGE, input_fingerprint=input_fingerprint,
@@ -514,7 +514,7 @@ class ArtifactEnrichmentService:
             return {"atom_id": atom_id, "outcome": "retryable", "code": ERR_NETWORK}
 
         # Persist derived + succeed (short claim). Reject stale fingerprint.
-        with self.pool.connection() as conn:
+        async with self.pool.connection_async() as conn:
             ok = st.complete_atom_stage(
                 conn, file_id=file_id, generation_hash=generation_hash, atom_pk=atom_pk,
                 stage=st.ENRICH_STAGE, input_fingerprint=input_fingerprint,

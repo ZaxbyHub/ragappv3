@@ -368,7 +368,7 @@ async def _enqueue_wiki_compile_job(
                 input_json=input_data,
             )
 
-        with pool.connection() as conn:
+        async with pool.connection_async() as conn:
             await asyncio.to_thread(_create_job, conn)
     except Exception as exc:
         logger.warning("Failed to enqueue wiki compile job for vault %d: %s", vault_id, exc)
@@ -1290,7 +1290,7 @@ def stream_chat_response(
                         title_task.add_done_callback(_background_tasks.discard)
                     else:
                         try:
-                            with db_pool.connection() as conn:
+                            async with db_pool.connection_async() as conn:
                                 conn.execute(
                                     "UPDATE chat_sessions SET title = 'New conversation', "
                                     "updated_at = CURRENT_TIMESTAMP "
@@ -1831,15 +1831,14 @@ async def get_stream_auth(
     stream_chat_response constructs the StreamingResponse. Tests override this
     single seam via app.dependency_overrides[get_stream_auth].
 
-    Note (pre-existing): pool.connection() -> get_connection() uses a synchronous
-    blocking Queue.get(timeout=5). That is an inherited characteristic of the
-    legacy SQLiteConnectionPool (the old get_db path was identical); making
-    checkout async is out of scope for #301/#302. If the pool is exhausted the
-    block is bounded to max_wait_attempts*5s, a pool_exhausted event is logged,
+    Note (#645): the checkout runs via pool.connection_async() on the pool's
+    dedicated checkout executor, so the event loop is never blocked by the
+    underlying synchronous Queue.get. If the pool is exhausted the wait is
+    bounded to max_wait_attempts*5s, a pool_exhausted event is logged,
     and the RuntimeError surfaces as a 500.
     """
     pool = request.app.state.db_pool
-    with pool.connection() as conn:
+    async with pool.connection_async() as conn:
         user = await _resolve_active_user(
             conn,
             request,
@@ -2727,7 +2726,7 @@ async def _auto_name_session(
 
         # Atomic UPDATE with WHERE clause to prevent TOCTOU race
         # Only update if the title still starts with first_message prefix and is short (auto-title characteristics)
-        with pool.connection() as conn:
+        async with pool.connection_async() as conn:
             # Get current title for guard check
             check_query = "SELECT title FROM chat_sessions WHERE id = ?"
             check_result = await asyncio.to_thread(
@@ -2790,7 +2789,7 @@ async def _auto_name_session(
         )
         try:
             auto_title = "New conversation"
-            with pool.connection() as conn:
+            async with pool.connection_async() as conn:
                 # Atomic UPDATE for fallback too
                 update_query = """
                     UPDATE chat_sessions SET title = ?, updated_at = CURRENT_TIMESTAMP

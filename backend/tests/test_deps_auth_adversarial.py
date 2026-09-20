@@ -219,7 +219,7 @@ class TestEvaluatePolicyNegativeResourceId:
         mock_conn.execute.return_value = mock_cursor
 
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             # Should return False (no access) or handle safely
@@ -247,7 +247,7 @@ class TestEvaluatePolicyNegativeResourceId:
         mock_conn.execute.return_value = mock_cursor
 
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(
@@ -273,7 +273,7 @@ class TestEvaluatePolicyNegativeResourceId:
         mock_cursor.fetchall.return_value = []
         mock_conn.execute.return_value = mock_cursor
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(
@@ -308,7 +308,7 @@ class TestEvaluatePolicyZeroResourceId:
         mock_conn.execute.return_value = mock_cursor
 
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(
@@ -332,7 +332,7 @@ class TestEvaluatePolicyZeroResourceId:
         mock_cursor.fetchall.return_value = []
         mock_conn.execute.return_value = mock_cursor
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(
@@ -394,7 +394,7 @@ class TestEvaluatePolicyMissingPrincipal:
         mock_conn.execute.return_value = mock_cursor
 
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(
@@ -418,7 +418,7 @@ class TestEvaluatePolicyMissingPrincipal:
         mock_conn.execute.return_value = mock_cursor
 
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(
@@ -448,7 +448,9 @@ class TestEvaluatePolicyMissingPrincipal:
             mock_cursor.fetchone.return_value = None
             mock_cursor.fetchall.return_value = []
             mock_conn.execute.return_value = mock_cursor
-            mock_pool.return_value.get_connection.return_value = mock_conn
+            mock_pool.return_value.get_connection_async = AsyncMock(
+                return_value=mock_conn
+            )
 
             result = await evaluate_policy(
                 principal=principal,
@@ -473,7 +475,9 @@ class TestEvaluatePolicyMissingPrincipal:
             mock_cursor.fetchone.return_value = None
             mock_cursor.fetchall.return_value = []
             mock_conn.execute.return_value = mock_cursor
-            mock_pool.return_value.get_connection.return_value = mock_conn
+            mock_pool.return_value.get_connection_async = AsyncMock(
+                return_value=mock_conn
+            )
 
             result = await evaluate_policy(
                 principal=principal,
@@ -499,7 +503,9 @@ class TestEvaluatePolicyMissingPrincipal:
             mock_cursor.fetchone.return_value = None
             mock_cursor.fetchall.return_value = []
             mock_conn.execute.return_value = mock_cursor
-            mock_pool.return_value.get_connection.return_value = mock_conn
+            mock_pool.return_value.get_connection_async = AsyncMock(
+                return_value=mock_conn
+            )
 
             result = await evaluate_policy(
                 principal=principal,
@@ -820,7 +826,7 @@ class TestIntegerBoundaryConditions:
         mock_conn.execute.return_value = mock_cursor
 
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(
@@ -847,7 +853,7 @@ class TestIntegerBoundaryConditions:
         mock_conn.execute.return_value = mock_cursor
 
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(
@@ -873,7 +879,7 @@ class TestIntegerBoundaryConditions:
         mock_conn.execute.return_value = mock_cursor
 
         mock_pool = MagicMock()
-        mock_pool.get_connection.return_value = mock_conn
+        mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         with patch("app.api.deps.get_pool", return_value=mock_pool):
             result = await evaluate_policy(

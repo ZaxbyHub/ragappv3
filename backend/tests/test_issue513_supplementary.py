@@ -78,9 +78,10 @@ class _CtxPool:
     """Pool facade exposing ``connection()`` as a context manager.
 
     ``BackgroundProcessor._recover_stranded_pending_rows`` consumes
-    ``pool.connection()`` as a ``with`` block and issues explicit
-    ``conn.commit()`` calls after every UPDATE, so a nullcontext over one
-    shared sqlite connection is a faithful stand-in.
+    ``pool.connection_async()`` (the #645 async CM) inside ``async with``
+    blocks and issues explicit ``conn.commit()`` calls after every UPDATE,
+    so an async null-context over one shared sqlite connection is a faithful
+    stand-in.
     """
 
     def __init__(self, conn):
@@ -88,6 +89,10 @@ class _CtxPool:
 
     def connection(self):
         return contextlib.nullcontext(self._conn)
+
+    @contextlib.asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        yield self._conn
 
 
 def _new_db(sqlite_path: str) -> sqlite3.Connection:

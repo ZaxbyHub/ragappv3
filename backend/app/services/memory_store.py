@@ -354,7 +354,7 @@ class MemoryStore:
             logger.info("Memory embedding backfill skipped: no embedding service configured")
             return summary
 
-        conn = self.pool.get_connection()
+        conn = await self.pool.get_connection_async()
         try:
             if not self._has_embedding_columns(conn):
                 logger.info("Memory embedding backfill skipped: embedding columns not present")

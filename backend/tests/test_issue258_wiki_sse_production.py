@@ -48,10 +48,16 @@ class _FakePool:
     The real route resolves auth + vault read permission on a SHORT-LIVED
     pooled connection and releases it BEFORE streaming starts; the connection
     itself is opaque to the generator, so a null context suffices here.
+    Since #645 the route checks out via ``pool.connection_async()``, so the
+    async counterpart mirrors the sync ``connection()`` null context.
     """
 
     def connection(self):
         return contextlib.nullcontext(types.SimpleNamespace())
+
+    @contextlib.asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        yield types.SimpleNamespace()
 
 
 def _fake_request() -> types.SimpleNamespace:

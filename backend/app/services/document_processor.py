@@ -881,7 +881,7 @@ class DocumentProcessor:
         if self._write_semaphore:
             await self._write_semaphore.acquire()
         try:
-            conn = self.pool.get_connection()
+            conn = await self.pool.get_connection_async()
             try:
                 yield conn
             finally:
@@ -1617,7 +1617,7 @@ class DocumentProcessor:
             return None
 
     async def _retry_failed_chunks_locked(self, file_id: int) -> Dict[str, Any]:
-        conn = self.pool.get_connection()
+        conn = await self.pool.get_connection_async()
         try:
             row = conn.execute(
                 "SELECT id, vault_id, file_hash, status, chunks_failed, "
@@ -1731,7 +1731,7 @@ class DocumentProcessor:
         if records or already_indexed_ids:
             live_count = await self._live_vector_count(file_id)
 
-        conn = self.pool.get_connection()
+        conn = await self.pool.get_connection_async()
         try:
             clear_ids = already_indexed_ids + succeeded_row_ids
             if clear_ids:
@@ -2990,7 +2990,7 @@ class DocumentProcessor:
                 # Mark wiki_pending=1 synchronously BEFORE the wiki job is created
                 # so the status route can report wiki_status="pending" during the
                 # brief window before the wiki_compile_jobs row exists.
-                set_wiki_pending(self.pool, file_id, True)
+                await set_wiki_pending(self.pool, file_id, True)
                 if settings.wiki_enabled and settings.wiki_compile_on_ingest:
                     _WikiStore(conn).create_job(
                         vault_id=vault_id,
@@ -3000,7 +3000,7 @@ class DocumentProcessor:
                     )
                 # Always clear the transient marker after the decision is made,
                 # regardless of whether a job row was created.
-                set_wiki_pending(self.pool, file_id, False)
+                await set_wiki_pending(self.pool, file_id, False)
         except Exception as _wiki_exc:
             logger.warning(
                 "Failed to enqueue wiki ingest job for file_id=%d: %s",
@@ -3008,7 +3008,7 @@ class DocumentProcessor:
                 _wiki_exc,
             )
             # If wiki enqueue failed, don't leave wiki_pending=1 hanging.
-            set_wiki_pending(self.pool, file_id, False)
+            await set_wiki_pending(self.pool, file_id, False)
 
         # Enqueue a KMS compile job so the document becomes a user-curatable,
         # full-text-searchable KMS entry. Independent of the wiki pipeline and
@@ -3062,7 +3062,7 @@ class DocumentProcessor:
 
         # Clear transient progress fields and pin phase=indexed so polls show
         # a clean "ready" snapshot rather than stale embedding counters.
-        clear_progress(self.pool, file_id)
+        await clear_progress(self.pool, file_id)
 
     async def process_file(
         self,
@@ -3130,7 +3130,7 @@ class DocumentProcessor:
             conn.commit()
 
         # Mark processing started + initial phase. Best-effort; ignored on failure.
-        set_phase(
+        await set_phase(
             self.pool,
             file_id,
             phase=PHASE_PARSING,
@@ -3152,7 +3152,7 @@ class DocumentProcessor:
                 )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             elif self._is_spreadsheet_file(file_path):
-                set_phase(
+                await set_phase(
                     self.pool,
                     file_id,
                     phase=PHASE_PARSING,
@@ -3164,7 +3164,7 @@ class DocumentProcessor:
                 )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             elif self._is_image_file(file_path):
-                set_phase(
+                await set_phase(
                     self.pool,
                     file_id,
                     phase=PHASE_PARSING,
@@ -3180,7 +3180,7 @@ class DocumentProcessor:
                     file_path, file_id, stage_timings, generation_hash, parser_fingerprint
                 )
 
-            set_phase(
+            await set_phase(
                 self.pool,
                 file_id,
                 phase=PHASE_EXTRACTING_TEXT,
@@ -3254,7 +3254,7 @@ class DocumentProcessor:
                     "The file may be empty, encrypted, or in an unsupported format."
                 )
 
-            set_phase(
+            await set_phase(
                 self.pool,
                 file_id,
                 phase=PHASE_CHUNKING,
@@ -3294,7 +3294,7 @@ class DocumentProcessor:
                     # so we report total/processed at start and again on completion
                     # rather than streaming sub-batch progress (avoids reaching into
                     # the embedding service's batching boundary).
-                    set_phase(
+                    await set_phase(
                         self.pool,
                         file_id,
                         phase=PHASE_EMBEDDING,
@@ -3345,7 +3345,7 @@ class DocumentProcessor:
                         # (Issue #396) BEFORE dropping them from the kept list.
                         # Uses the ORIGINAL chunks list (indices are into it).
                         try:
-                            _fc_conn = self.pool.get_connection()
+                            _fc_conn = await self.pool.get_connection_async()
                             try:
                                 self._persist_failed_chunks(
                                     file_id,
@@ -3379,7 +3379,7 @@ class DocumentProcessor:
                             # path). Clear them so the only recovery is the
                             # whole-document retry, which re-ingests from scratch.
                             try:
-                                _abort_conn = self.pool.get_connection()
+                                _abort_conn = await self.pool.get_connection_async()
                                 try:
                                     _abort_conn.execute(
                                         "DELETE FROM failed_chunks WHERE file_id = ?",
@@ -3405,7 +3405,7 @@ class DocumentProcessor:
                     chunk_embeddings = embeddings
 
                     sparse_embeddings = [None] * len(chunks)
-                    set_phase(
+                    await set_phase(
                         self.pool,
                         file_id,
                         phase=PHASE_EMBEDDING,
@@ -3450,7 +3450,7 @@ class DocumentProcessor:
                         )
 
                     # Phase: writing vector index
-                    set_phase(
+                    await set_phase(
                         self.pool,
                         file_id,
                         phase=PHASE_WRITING_INDEX,
@@ -3514,7 +3514,7 @@ class DocumentProcessor:
                 conn.commit()
             # Surface error in the phase fields so the frontend can render it
             # without waiting for a status-route round-trip.
-            set_phase(
+            await set_phase(
                 self.pool,
                 file_id,
                 phase="error",
@@ -3625,7 +3625,7 @@ class DocumentProcessor:
                     error_message=safe_error,
                 )
                 conn.commit()
-            set_phase(
+            await set_phase(
                 self.pool,
                 file_id,
                 phase="error",
@@ -3647,7 +3647,7 @@ class DocumentProcessor:
                     error_message=safe_error,
                 )
                 conn.commit()
-            set_phase(
+            await set_phase(
                 self.pool,
                 file_id,
                 phase="error",
@@ -3664,7 +3664,7 @@ class DocumentProcessor:
             conn.execute("DELETE FROM failed_chunks WHERE file_id = ?", (file_id,))
             conn.commit()
 
-        set_phase(
+        await set_phase(
             self.pool,
             file_id,
             phase=PHASE_PARSING,
@@ -3692,7 +3692,7 @@ class DocumentProcessor:
                 )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             elif self._is_spreadsheet_file(file_path):
-                set_phase(
+                await set_phase(
                     self.pool,
                     file_id,
                     phase=PHASE_PARSING,
@@ -3704,7 +3704,7 @@ class DocumentProcessor:
                 )
                 _add_elapsed_ms(stage_timings, "parse_ms", stage_started_at)
             elif self._is_image_file(file_path):
-                set_phase(
+                await set_phase(
                     self.pool,
                     file_id,
                     phase=PHASE_PARSING,
@@ -3720,7 +3720,7 @@ class DocumentProcessor:
                     file_path, file_id, stage_timings, generation_hash, parser_fingerprint
                 )
 
-            set_phase(
+            await set_phase(
                 self.pool,
                 file_id,
                 phase=PHASE_EXTRACTING_TEXT,
@@ -3771,7 +3771,7 @@ class DocumentProcessor:
                     "The file may be empty, encrypted, or in an unsupported format."
                 )
 
-            set_phase(
+            await set_phase(
                 self.pool,
                 file_id,
                 phase=PHASE_CHUNKING,
@@ -3801,7 +3801,7 @@ class DocumentProcessor:
                     texts = [c.text for c in chunks]
                     self._validate_chunk_sizes(texts, source_filename)
 
-                    set_phase(
+                    await set_phase(
                         self.pool,
                         file_id,
                         phase=PHASE_EMBEDDING,
@@ -3848,7 +3848,7 @@ class DocumentProcessor:
                         # (Issue #396) BEFORE dropping them from the kept list.
                         # Uses the ORIGINAL chunks list (indices are into it).
                         try:
-                            _fc_conn = self.pool.get_connection()
+                            _fc_conn = await self.pool.get_connection_async()
                             try:
                                 self._persist_failed_chunks(
                                     file_id,
@@ -3882,7 +3882,7 @@ class DocumentProcessor:
                             # path). Clear them so the only recovery is the
                             # whole-document retry, which re-ingests from scratch.
                             try:
-                                _abort_conn = self.pool.get_connection()
+                                _abort_conn = await self.pool.get_connection_async()
                                 try:
                                     _abort_conn.execute(
                                         "DELETE FROM failed_chunks WHERE file_id = ?",
@@ -3908,7 +3908,7 @@ class DocumentProcessor:
                     chunk_embeddings = embeddings
 
                     sparse_embeddings = [None] * len(chunks)
-                    set_phase(
+                    await set_phase(
                         self.pool,
                         file_id,
                         phase=PHASE_EMBEDDING,
@@ -3950,7 +3950,7 @@ class DocumentProcessor:
                             )
                         )
 
-                    set_phase(
+                    await set_phase(
                         self.pool,
                         file_id,
                         phase=PHASE_WRITING_INDEX,
@@ -4073,7 +4073,7 @@ class DocumentProcessor:
             async with self._write_session() as conn:
                 self._update_status(file_id, "error", conn, error_message=safe_error)
                 conn.commit()
-            set_phase(
+            await set_phase(
                 self.pool,
                 file_id,
                 phase="error",

@@ -316,9 +316,20 @@ class TestWikiEventsStreamDI(WikiDITestBase):
             def __exit__(self, *exc):
                 return False
 
+        class _FakeAsyncCM:
+            async def __aenter__(self):
+                return "fake-conn"
+
+            async def __aexit__(self, *exc):
+                return False
+
         class _FakePool:
             def connection(self):
                 return _FakeCM()
+
+            # #645: the SSE stream checks out via the async CM.
+            def connection_async(self):
+                return _FakeAsyncCM()
 
         fake_request = MagicMock()
         fake_request.app.state.db_pool = _FakePool()

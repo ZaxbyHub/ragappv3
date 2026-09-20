@@ -46,6 +46,8 @@ class TestVaultUploadsDirExceptions:
         conn = MagicMock()
         pool.get_connection.return_value = conn
         pool.release_connection = MagicMock()
+        # #645: scan_once checks out via the pool's async surface.
+        pool.get_connection_async = AsyncMock(return_value=conn)
         return pool
 
     @pytest.mark.asyncio
@@ -62,6 +64,7 @@ class TestVaultUploadsDirExceptions:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -88,6 +91,7 @@ class TestVaultUploadsDirExceptions:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -114,6 +118,7 @@ class TestVaultUploadsDirExceptions:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -144,6 +149,8 @@ class TestNegativeAndZeroVaultId:
         conn = MagicMock()
         pool.get_connection.return_value = conn
         pool.release_connection = MagicMock()
+        # #645: scan_once checks out via the pool's async surface.
+        pool.get_connection_async = AsyncMock(return_value=conn)
         return pool
 
     @pytest.mark.asyncio
@@ -166,6 +173,7 @@ class TestNegativeAndZeroVaultId:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(0, "Zero Vault")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -197,6 +205,7 @@ class TestNegativeAndZeroVaultId:
             # Negative vault_id from database
             mock_conn.execute.return_value.fetchall.return_value = [(-1, "Negative Vault")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -227,6 +236,7 @@ class TestNegativeAndZeroVaultId:
             # Very large vault_id (could cause issues if used directly in paths)
             mock_conn.execute.return_value.fetchall.return_value = [(2**31 - 1, "Large Vault")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -253,6 +263,8 @@ class TestSymlinkAndNonExistentPaths:
         conn = MagicMock()
         pool.get_connection.return_value = conn
         pool.release_connection = MagicMock()
+        # #645: scan_once checks out via the pool's async surface.
+        pool.get_connection_async = AsyncMock(return_value=conn)
         return pool
 
     @pytest.mark.asyncio
@@ -275,6 +287,7 @@ class TestSymlinkAndNonExistentPaths:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -300,6 +313,7 @@ class TestSymlinkAndNonExistentPaths:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -325,6 +339,7 @@ class TestSymlinkAndNonExistentPaths:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -351,6 +366,8 @@ class TestRaceConditionVaultDeleted:
         conn = MagicMock()
         pool.get_connection.return_value = conn
         pool.release_connection = MagicMock()
+        # #645: scan_once checks out via the pool's async surface.
+        pool.get_connection_async = AsyncMock(return_value=conn)
         return pool
 
     @pytest.mark.asyncio
@@ -376,6 +393,7 @@ class TestRaceConditionVaultDeleted:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -414,6 +432,7 @@ class TestRaceConditionVaultDeleted:
                 (3, "Vault Three"),
             ]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -440,6 +459,8 @@ class TestSettingsObjectMissingMethod:
         conn = MagicMock()
         pool.get_connection.return_value = conn
         pool.release_connection = MagicMock()
+        # #645: scan_once checks out via the pool's async surface.
+        pool.get_connection_async = AsyncMock(return_value=conn)
         return pool
 
     @pytest.mark.asyncio
@@ -461,6 +482,7 @@ class TestSettingsObjectMissingMethod:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -490,6 +512,7 @@ class TestSettingsObjectMissingMethod:
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -517,6 +540,8 @@ class TestPathTraversalAndInjection:
         conn = MagicMock()
         pool.get_connection.return_value = conn
         pool.release_connection = MagicMock()
+        # #645: scan_once checks out via the pool's async surface.
+        pool.get_connection_async = AsyncMock(return_value=conn)
         return pool
 
     @pytest.mark.asyncio
@@ -541,6 +566,7 @@ class TestPathTraversalAndInjection:
             # Database returns malicious string as vault_id
             mock_conn.execute.return_value.fetchall.return_value = [(malicious_id, "Malicious Vault")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -575,6 +601,7 @@ class TestPathTraversalAndInjection:
             # Vault name contains path traversal attempt
             mock_conn.execute.return_value.fetchall.return_value = [(1, "../../../etc/passwd")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -605,6 +632,8 @@ class TestUnicodeAndEncoding:
         conn = MagicMock()
         pool.get_connection.return_value = conn
         pool.release_connection = MagicMock()
+        # #645: scan_once checks out via the pool's async surface.
+        pool.get_connection_async = AsyncMock(return_value=conn)
         return pool
 
     @pytest.mark.asyncio
@@ -626,6 +655,7 @@ class TestUnicodeAndEncoding:
             # Unicode vault name
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault 🗂️")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -656,6 +686,7 @@ class TestUnicodeAndEncoding:
             # Null byte in vault name
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault\x00Hacked")]
             mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher

@@ -32,6 +32,12 @@ class _Connection:
     def __exit__(self, *_args):
         return False
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
     def execute(self, sql, params=()):
         self.executed.append((sql, params))
         if "status = 'pending'" in sql:
@@ -53,6 +59,10 @@ class _Pool:
         self.connection_obj = _Connection(pending, processing)
 
     def connection(self):
+        return self.connection_obj
+
+    # #645: the recovery sweeps check out via the async CM.
+    def connection_async(self):
         return self.connection_obj
 
 

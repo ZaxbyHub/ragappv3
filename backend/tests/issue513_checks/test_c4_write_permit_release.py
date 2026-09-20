@@ -46,7 +46,9 @@ def main() -> int:
 
     class _OnceFailingPool:
         """pool.get_connection raises RuntimeError exactly once (first call),
-        then hands out a probe connection."""
+        then hands out a probe connection. Since #645 the processor checks
+        out via the async surface, so ``get_connection_async`` mirrors the
+        one-shot failure with the same call counter."""
 
         def __init__(self):
             self._failed_once = False
@@ -56,6 +58,9 @@ def main() -> int:
                 self._failed_once = True
                 raise RuntimeError("injected one-time pool checkout failure")
             return _ProbeConnection()
+
+        async def get_connection_async(self, *_args, **_kwargs):
+            return await asyncio.to_thread(self.get_connection)
 
         def release_connection(self, *_args, **_kwargs):
             pass

@@ -413,6 +413,8 @@ class TestLazyDbCheckout(unittest.TestCase):
 
         self._pool = MagicMock()
         self._pool.get_connection = MagicMock(return_value=MagicMock())
+        # #645: the lazy checkout on the user-resolution path is now async.
+        self._pool.get_connection_async = AsyncMock(return_value=MagicMock())
         self._pool_patcher = patch("app.api.deps.get_pool", return_value=self._pool)
         self._pool_patcher.start()
         self.addCleanup(self._pool_patcher.stop)
@@ -437,7 +439,7 @@ class TestLazyDbCheckout(unittest.TestCase):
     def test_anonymous_shallow_poll_never_touches_the_pool(self):
         self.client.get("/api/health")
         self.assertEqual(
-            self._pool.get_connection.call_count, 0,
+            self._pool.get_connection_async.call_count, 0,
             "anonymous shallow heartbeat must be DB-free (#549 C02)",
         )
 
@@ -447,12 +449,12 @@ class TestLazyDbCheckout(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
-            self._pool.get_connection.call_count, 0,
+            self._pool.get_connection_async.call_count, 0,
             "the X-API-Key path must authenticate without a pool checkout",
         )
 
     def test_user_authed_deep_probe_checks_out_and_releases_once(self):
         response = self.client.get("/api/health?deep=true")
         self.assertEqual(response.status_code, 401)  # anonymous: 401 after release
-        self.assertEqual(self._pool.get_connection.call_count, 1)
+        self.assertEqual(self._pool.get_connection_async.call_count, 1)
         self.assertEqual(self._pool.release_connection.call_count, 1)

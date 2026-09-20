@@ -763,8 +763,7 @@ async def _promote(
             filename=dest_path.name,
             promoted_by=promoted_by,
         )
-        await asyncio.to_thread(
-            set_phase,
+        await set_phase(
             db_pool,
             file_id,
             phase=PHASE_QUEUED,

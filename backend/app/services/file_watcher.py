@@ -186,7 +186,7 @@ class FileWatcher:
         try:
             from app.models.database import get_pool
             pool = get_pool(str(settings.sqlite_path))
-            conn = pool.get_connection()
+            conn = await pool.get_connection_async()
             try:
                 vaults = conn.execute("SELECT id, name FROM vaults").fetchall()
                 for row in vaults:

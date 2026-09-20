@@ -820,7 +820,7 @@ async def wiki_events_stream(
     stream completed, pinning a pool slot indefinitely.
     """
     pool = request.app.state.db_pool
-    with pool.connection() as conn:
+    async with pool.connection_async() as conn:
         user = await _resolve_active_user(
             conn,
             request,

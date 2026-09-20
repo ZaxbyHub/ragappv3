@@ -49,12 +49,13 @@ from app.services.draft_store import DraftStore
 
 
 class _PoolWithConnectionCM:
-    """Thread-safe SQLite pool exposing both the ``get_connection``/
-    ``release_connection`` idiom (backs the ``get_db`` override) and the
-    ``with pool.connection() as conn`` context manager
-    ``app.services.document_progress.set_phase`` requires from
-    ``request.app.state.db_pool`` (mirrors the production
-    ``SQLiteConnectionPool.connection()``)."""
+    """Thread-safe SQLite pool exposing the ``get_connection``/
+    ``release_connection`` idiom (backs the ``get_db`` override), the
+    ``with pool.connection() as conn`` context manager, and the
+    ``get_connection_async`` off-loop checkout
+    (``app.services.document_progress.set_phase`` — async since #645 —
+    requires the latter from ``request.app.state.db_pool``; mirrors the
+    production ``SQLiteConnectionPool`` surfaces)."""
 
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
@@ -68,6 +69,12 @@ class _PoolWithConnectionCM:
             return self._pool.get_nowait()
         except Empty:
             return self._create_connection()
+
+    async def get_connection_async(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
+        # #645: async helpers (set_phase) check out through the pool's async
+        # surface; delegate to the sync checkout on a worker thread to match
+        # the production off-loop contract.
+        return await asyncio.to_thread(self.get_connection)
 
     def _create_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)

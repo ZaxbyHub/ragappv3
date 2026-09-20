@@ -671,7 +671,7 @@ async def require_health_probe_auth(
         result = override()
         return await result if inspect.iscoroutine(result) else result
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         return await _resolve_active_user(conn, request, authorization, access_token)
     finally:
@@ -745,7 +745,7 @@ async def evaluate_policy(
     7. Otherwise -> False
     """
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         return await _evaluate_policy(
             conn, principal, resource_type, resource_id, action

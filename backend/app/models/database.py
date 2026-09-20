@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from functools import partial
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -5004,6 +5004,21 @@ def get_db_connection(sqlite_path: str) -> sqlite3.Connection:
     return conn
 
 
+# Per-attempt pooled-checkout wait budget, in seconds (issue #645).
+# get_connection bounds its TOTAL queue wait with a monotonic deadline of
+# max_wait_attempts * CHECKOUT_WAIT_SECONDS: each Queue.get waits at most
+# min(CHECKOUT_WAIT_SECONDS, remaining-to-deadline), so invalid-connection
+# cycling and validation time cannot stretch the checkout past the documented
+# ceiling. Shared by get_connection_async, which delegates here.
+CHECKOUT_WAIT_SECONDS = 5
+
+# Busy timeout (ms) applied while _validate_connection probes a pooled
+# connection (issue #645): bounded so a contended/locked database fails
+# validation quickly instead of blocking up to the production busy timeout.
+# The connection's original value is restored after the probe.
+VALIDATION_BUSY_TIMEOUT_MS = 1000
+
+
 class SQLiteConnectionPool:
     """
     A connection pool for SQLite databases.
@@ -5094,6 +5109,13 @@ class SQLiteConnectionPool:
         """
         Validate that a connection is still alive and usable.
 
+        The probe temporarily reduces the connection's busy timeout to
+        VALIDATION_BUSY_TIMEOUT_MS so a contended or locked database fails
+        validation in bounded time instead of blocking up to the production
+        busy timeout; the original value is restored on every exit path, so
+        healthy checkouts hand out connections with the production
+        busy_timeout intact (issue #645).
+
         Args:
             conn: The connection to validate.
 
@@ -5101,6 +5123,13 @@ class SQLiteConnectionPool:
             bool: True if the connection is valid, False otherwise.
         """
         try:
+            row = conn.execute("PRAGMA busy_timeout").fetchone()
+            original_busy_timeout = row[0] if row is not None else None
+        except sqlite3.Error:
+            original_busy_timeout = None
+        try:
+            if original_busy_timeout is not None:
+                conn.execute(f"PRAGMA busy_timeout={VALIDATION_BUSY_TIMEOUT_MS}")
             conn.execute("SELECT 1")
             conn.execute("PRAGMA foreign_keys = ON")
             return True
@@ -5113,6 +5142,14 @@ class SQLiteConnectionPool:
             return False
         except sqlite3.Error:
             return False
+        finally:
+            if original_busy_timeout is not None:
+                try:
+                    conn.execute(f"PRAGMA busy_timeout={original_busy_timeout}")
+                except sqlite3.Error:
+                    # A connection too broken to accept the restore is about to
+                    # be discarded by the caller anyway (validation failed).
+                    pass
 
     def get_connection(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
         """
@@ -5133,6 +5170,11 @@ class SQLiteConnectionPool:
         """
         if self._closed:
             raise RuntimeError("Connection pool has been closed")
+
+        # Total-wait budget (issue #645): bound the whole checkout — not just
+        # each Queue.get — so invalid-connection cycling and validation time
+        # cannot stretch a checkout past max_wait_attempts * CHECKOUT_WAIT_SECONDS.
+        deadline = time.monotonic() + max_wait_attempts * CHECKOUT_WAIT_SECONDS
 
         attempts = 0
         while attempts < max_wait_attempts:
@@ -5188,8 +5230,12 @@ class SQLiteConnectionPool:
             # the caller is about to wait on the queue — record the wait so
             # the readiness probe can report saturation (issue #550).
             self._record_capacity_wait()
+            # Wait at most one attempt's budget, and never past the overall
+            # deadline; a clamped-to-zero remaining lets this get fail fast
+            # once the budget is spent (issue #645).
+            remaining = max(0.0, deadline - time.monotonic())
             try:
-                conn = self._pool.get(timeout=5)
+                conn = self._pool.get(timeout=min(CHECKOUT_WAIT_SECONDS, remaining))
                 # Validate the connection before returning it
                 if self._validate_connection(conn):
                     return conn
@@ -5399,6 +5445,34 @@ class SQLiteConnectionPool:
         conn = None
         try:
             conn = self.get_connection()
+            yield conn
+        finally:
+            if conn is not None:
+                try:
+                    self.release_connection(conn)
+                except (RuntimeError, sqlite3.Error):
+                    # Ignore release errors to avoid masking original exception
+                    pass
+
+    @asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        """
+        Async context manager for getting and releasing a connection.
+
+        Async variant of connection(): the blocking checkout runs on the pool's
+        dedicated checkout executor (get_connection_async) so callers can stay on
+        the event loop without blocking it (#645).
+
+        Automatically releases the connection back to the pool when done.
+
+        Example:
+            async with pool.connection_async() as conn:
+                cursor = await asyncio.to_thread(conn.execute, "SELECT * FROM table")
+                results = cursor.fetchall()
+        """
+        conn = None
+        try:
+            conn = await self.get_connection_async(max_wait_attempts)
             yield conn
         finally:
             if conn is not None:

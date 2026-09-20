@@ -9,6 +9,7 @@ two vaults (one the owner can read, one they cannot) per the Draft Room
 authorization model.
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -17,7 +18,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
@@ -45,10 +46,12 @@ from app.services.draft_input_storage import DraftInputPathError
 
 class _PoolWithConnectionCM:
     """Thread-safe SQLite pool exposing both the ``get_connection``/
-    ``release_connection`` idiom (backs the ``get_db`` override) and the
-    ``with pool.connection() as conn`` context manager the Draft Room SSE
-    route requires from ``request.app.state.db_pool`` (mirrors the production
-    ``SQLiteConnectionPool.connection()`` and the pattern in
+    ``release_connection`` idiom (backs the ``get_db`` override), the
+    ``with pool.connection() as conn`` context manager, and the #645 async
+    checkout surfaces (``get_connection_async`` / ``connection_async``) the
+    Draft Room SSE route and async helpers (``set_phase``) require from
+    ``request.app.state.db_pool`` (mirrors the production
+    ``SQLiteConnectionPool`` and the pattern in
     ``test_draft_job_processor.py``)."""
 
     def __init__(self, db_path: str) -> None:
@@ -90,6 +93,20 @@ class _PoolWithConnectionCM:
     @contextmanager
     def connection(self):
         conn = self.get_connection()
+        try:
+            yield conn
+        finally:
+            self.release_connection(conn)
+
+    async def get_connection_async(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
+        # #645: async callers (the SSE stream auth, set_phase) check out
+        # through the pool's async surface; delegate to the sync checkout on
+        # a worker thread to match the production off-loop contract.
+        return await asyncio.to_thread(self.get_connection)
+
+    @asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        conn = await self.get_connection_async(max_wait_attempts)
         try:
             yield conn
         finally:

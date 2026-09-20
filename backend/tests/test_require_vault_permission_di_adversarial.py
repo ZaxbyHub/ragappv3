@@ -114,14 +114,16 @@ class TestDIConnectionReuse:
         with patch("app.api.deps.get_pool") as mock_get_pool:
             mock_conn = MagicMock()
             mock_pool_instance = MagicMock()
-            mock_pool_instance.get_connection.return_value = mock_conn
+            mock_pool_instance.get_connection_async = AsyncMock(
+                return_value=mock_conn
+            )
             mock_get_pool.return_value = mock_pool_instance
 
             result = await evaluate_policy(mock_user, "vault", 1, "read")
 
-            # Legacy path: opens its own pool connection
+            # Legacy path: opens its own pool connection (#645: async checkout)
             mock_get_pool.assert_called_once()
-            mock_pool_instance.get_connection.assert_called_once()
+            mock_pool_instance.get_connection_async.assert_called_once()
 
         assert result is True
 
@@ -137,7 +139,9 @@ class TestDIConnectionReuse:
         with patch("app.api.deps.get_pool") as mock_get_pool:
             mock_conn = MagicMock()
             mock_pool_instance = MagicMock()
-            mock_pool_instance.get_connection.return_value = mock_conn
+            mock_pool_instance.get_connection_async = AsyncMock(
+                return_value=mock_conn
+            )
             mock_get_pool.return_value = mock_pool_instance
 
             result = await evaluate_policy(mock_user, "vault", 1, "read")
@@ -157,7 +161,9 @@ class TestDIConnectionReuse:
         with patch("app.api.deps.get_pool") as mock_get_pool:
             mock_conn = MagicMock()
             mock_pool_instance = MagicMock()
-            mock_pool_instance.get_connection.return_value = mock_conn
+            mock_pool_instance.get_connection_async = AsyncMock(
+                return_value=mock_conn
+            )
             mock_get_pool.return_value = mock_pool_instance
 
             # Simulate an error in _evaluate_policy by patching it
