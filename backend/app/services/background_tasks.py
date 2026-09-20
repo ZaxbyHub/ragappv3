@@ -3501,7 +3501,12 @@ class BackgroundProcessor:
             if vector_store is not None and vaults_files:
                 emb_service = self.processor.embedding_service
                 if emb_service is not None:
-                    probe_embeddings, _probe_failed = await emb_service.embed_batch(
+                    # fail_fast=True returns just the embeddings list, not the
+                    # (embeddings, failed) tuple of the fail_fast=False mode —
+                    # tuple-unpacking it raised ValueError on every reindex
+                    # with a healthy embedding service (found by the #229 F3
+                    # live qualification; introduced with the #513 W13 probe).
+                    probe_embeddings = await emb_service.embed_batch(
                         ["dimension_probe"], fail_fast=True
                     )
                     if probe_embeddings and probe_embeddings[0] is not None:
