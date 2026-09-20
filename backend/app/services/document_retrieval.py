@@ -22,9 +22,13 @@ _RE_HASH8 = re.compile(r"^(?=[0-9a-f]{8}$)(?=[0-9a-f]*[a-f])[0-9a-f]{8}$")
 # This floor is deliberately DECOUPLED from max_distance_threshold (the #36
 # calibration raised that distance max 0.5 → 0.75): one constant must not serve
 # two opposite polarities — sharing it made the 0.5→0.75 move silently drop
-# 0.5–0.75 scores here (CI regression: test_rag_engine_vault_isolation). The
-# floor keeps the legacy pre-calibration score behavior; the #36 calibration
-# measured cosine DISTANCE only.
+# 0.5–0.75 scores here (CI regression: test_rag_engine_vault_isolation).
+# Active ONLY in default mode; when an operator explicitly sets
+# max_distance_threshold=None, the legacy mode resolves the floor from
+# relevance_threshold instead (see filter_relevant), preserving the
+# test_rag_engine_filtering_adversarial legacy-score semantics. The #36
+# calibration measured cosine DISTANCE only, so the calibration value never
+# applies to this score polarity.
 FALLBACK_SCORE_FLOOR = 0.5
 
 from app.config import settings  # noqa: E402
@@ -439,8 +443,12 @@ class DocumentRetrievalService:
             distances.append(distance)
 
             threshold = self.max_distance_threshold
+            legacy_mode = False
             if threshold is None:
+                # Explicit distance-threshold disable: legacy mode resolves the
+                # score floor from relevance_threshold (pre-calibration knob).
                 threshold = self.relevance_threshold
+                legacy_mode = True
 
             should_skip = False
             if not skip_distance_filter and threshold is not None:
@@ -449,10 +457,13 @@ class DocumentRetrievalService:
                     # calibration, 0.75 for the Harrier scale).
                     should_skip = distance > threshold
                 else:
-                    # Similarity-score fallback (higher = better): use the
-                    # dedicated floor, NOT the distance max — see
+                    # Similarity-score fallback (higher = better). Default mode
+                    # uses the dedicated floor — NOT the distance max; see
                     # FALLBACK_SCORE_FLOOR above for the polarity rationale.
-                    should_skip = distance < FALLBACK_SCORE_FLOOR
+                    # Legacy mode keeps the pre-calibration behavior of
+                    # resolving the floor from relevance_threshold.
+                    score_floor = threshold if legacy_mode else FALLBACK_SCORE_FLOOR
+                    should_skip = distance < score_floor
 
             if should_skip:
                 continue
