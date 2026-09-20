@@ -68,6 +68,25 @@ class _FailingCommitConn(_ObservingConn):
         raise sqlite3.Error("injected commit failure")
 
 
+class _PublishObservingCache(dict):
+    """Cache dict recording whether the manager lock was held at each write.
+
+    Pins the publish-inside-the-lock invariant directly: even if a future
+    refactor moves the cache publish out of ``commit_and_publish``'s critical
+    section (every other check only observes the lock at commit time), an
+    unlocked publish lands here as ``False`` and fails the test.
+    """
+
+    def __init__(self, lock):
+        super().__init__()
+        self._lock = lock
+        self.write_lock_observations = []
+
+    def __setitem__(self, key, value):
+        self.write_lock_observations.append(bool(self._lock.locked()))
+        super().__setitem__(key, value)
+
+
 class _ObservingPool:
     """Pool wrapper handing out observing proxies and unwrapping on release,
     so ``ToggleManager.set_toggle``'s own commit can be observed."""
@@ -159,6 +178,8 @@ class ToggleWriterCacheSerializationTest(unittest.TestCase):
 
     def test_commit_and_publish_contract(self):
         generation_before = self.manager._generation
+        observing_cache = _PublishObservingCache(self.manager._lock)
+        self.manager._cache = observing_cache
         proxy = _ObservingConn(self.pool.get_connection(), self.manager._lock)
         try:
             self.manager.set_toggle_on_connection(proxy, "contract", True)
@@ -166,6 +187,9 @@ class ToggleWriterCacheSerializationTest(unittest.TestCase):
         finally:
             self.pool.release_connection(proxy.real)
         self.assertEqual(proxy.lock_observations, [True])
+        # The publish itself must also happen under the lock, not just the
+        # commit (the second_done/interleave drivers cannot see this split).
+        self.assertEqual(observing_cache.write_lock_observations, [True])
         self.assertEqual(self.manager._generation, generation_before + 1)
         self.assertTrue(self.manager.get_toggle("contract", False))
 
@@ -179,7 +203,24 @@ class ToggleWriterCacheSerializationTest(unittest.TestCase):
         self.assertGreaterEqual(failing.rollback_calls, 1)
         self.assertEqual(self.manager._generation, generation_before + 1)
         self.assertNotIn("contract_fail", self.manager._cache)
+        # The failed write must not have published anything to the cache.
+        self.assertEqual(observing_cache.write_lock_observations, [True])
         self.assertIsNone(self._db_value("contract_fail"))
+
+    def test_service_writer_failed_commit_rolls_back_and_skips_publish(self):
+        self.manager.pool = _ObservingPool(
+            self.pool, self.manager._lock, _FailingCommitConn
+        )
+        generation_before = self.manager._generation
+        with self.assertRaises(sqlite3.Error):
+            self.manager.set_toggle("c5_service_failed_commit", True)
+        observed = self.manager.pool.observed
+        # Both rollback layers ran: commit_and_publish's guarded rollback and
+        # set_toggle's own except-branch rollback.
+        self.assertGreaterEqual(observed.rollback_calls, 2)
+        self.assertNotIn("c5_service_failed_commit", self.manager._cache)
+        self.assertEqual(self.manager._generation, generation_before)
+        self.assertIsNone(self._db_value("c5_service_failed_commit"))
 
     def test_failed_commit_leaves_cache_untouched(self):
         publishes = []
@@ -239,7 +280,7 @@ class ToggleWriterCacheSerializationTest(unittest.TestCase):
         )
         errors = []
 
-        def writer(enabled):
+        def writer(enabled, signal_done):
             try:
                 if surface == "route":
                     self._route_writer("c1_interleave", enabled)
@@ -247,11 +288,21 @@ class ToggleWriterCacheSerializationTest(unittest.TestCase):
                     self.manager.set_toggle("c1_interleave", enabled)
             except Exception as exc:
                 errors.append(repr(exc))
+            finally:
+                # Signal the parked first writer as soon as the second writer's
+                # whole write+publish finished. On the fixed tree the first
+                # writer holds its open SQLite transaction across the park, so
+                # the second writer cannot reach this until the park timed out;
+                # on a tree where commit and publish are split again, the
+                # second writer completes during the park and releases it
+                # early — the invariant assert below then catches the race.
+                if signal_done:
+                    second_done.set()
 
-        first = threading.Thread(target=writer, args=(first_enabled,))
+        first = threading.Thread(target=writer, args=(first_enabled, False))
         first.start()
         self.assertTrue(parked.wait(timeout=JOIN_TIMEOUT))
-        second = threading.Thread(target=writer, args=(not first_enabled,))
+        second = threading.Thread(target=writer, args=(not first_enabled, True))
         second.start()
         second.join(timeout=JOIN_TIMEOUT)
         first.join(timeout=JOIN_TIMEOUT)

@@ -28,11 +28,34 @@ calls could interleave commit-A → commit-B → cache-B → cache-A, leaving th
 the next invalidation or TTL expiry. Holding `_lock` across commit + publish
 makes the pair atomic with respect to other writers: the cache can never hold
 a value older than the latest durable commit. Deadlock-free by construction:
-every writer acquires SQLite's write lock before it can reach `_lock`, and no
-holder of `_lock` blocks on SQLite. The reader-side #596 generation guard is
-unchanged and the publish still bumps `_generation`, so in-flight stale reads
-continue to be discarded.
+every writer acquires SQLite's write lock before it can reach `_lock`, so
+concurrent writers serialize at the SQLite layer first, and a `_lock` holder
+never waits on a lock another toggle writer holds (its `commit()` waits only
+on local disk I/O) — the two locks can never cycle. The reader-side #596
+generation guard is unchanged and the publish still bumps `_generation`, so
+in-flight stale reads continue to be discarded.
 
 Latent today (the only wired toggle's `app.state` value has no readers), but
 the endpoint is wired and any new toggle consumer would have observed the
 divergence, per the issue's revisit trigger.
+
+## Migration steps
+
+None. Behavior-only change: no API removals (`commit_and_publish` is
+additive), no schema, config, or wire-format changes, and no action is
+required by callers — both production write paths were updated in the same
+change.
+
+## Known caveats
+
+- `update_cache` remains available and unchanged for callers that already
+  hold a durable commit, but it is no longer on any production write path;
+  its docstring redirects writers to `commit_and_publish`.
+- Holding `_lock` across the commit intentionally serializes toggle writers
+  for the duration of the commit's disk I/O. Toggle writes are rare
+  admin:config operations, and SQLite's `BEGIN IMMEDIATE` already serialized
+  them at the database layer.
+- Cache timestamps continue to use `time.time()` (matching the existing
+  `get_toggle`/`update_cache` arithmetic); migrating the class to
+  `time.monotonic()` per the engineering conventions is a separate,
+  coordinated reader+writer change.

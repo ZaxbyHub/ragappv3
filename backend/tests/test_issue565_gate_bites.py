@@ -25,6 +25,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import uuid
 import warnings
 from pathlib import Path
 
@@ -169,9 +170,13 @@ def _run_pytest(tmp_path, test_body, config_name):
     # shared temp root races with concurrently-deleted sibling dirs (zmem /
     # tooling scratch), aborting collection with FileNotFoundError. backend/data
     # is gitignored (repo .gitignore), so scratch there never pollutes the tree.
+    # The probe name is unique per call: under pytest-xdist two workers can run
+    # these subprocess-contrast tests concurrently, and a shared fixed name
+    # lets one worker's finally-unlink delete the other's probe before its
+    # subprocess collects it (CI failure: "file or directory not found").
     scratch = _BACKEND / "data" / "_565_gate_scratch"
     scratch.mkdir(parents=True, exist_ok=True)
-    probe = scratch / "test_gate_probe.py"
+    probe = scratch / f"test_gate_probe_{uuid.uuid4().hex}.py"
     probe.write_text(textwrap.dedent(test_body), encoding="utf-8")
     try:
         cmd = [sys.executable, "-m", "pytest", str(probe), "-q", "-p", "no:cacheprovider"]
