@@ -391,6 +391,13 @@ class _FailingCommitPool:
     def get_connection(self):
         return _FailingCommitConnProxy(self._real_pool.get_connection())
 
+    async def get_connection_async(self, max_wait_attempts: int = 3):
+        # #592: converted routes check out through the pool's async surface;
+        # delegate to the sync wrapper so the _FailingCommitConnProxy (and its
+        # forced-commit-failure injection, which the route triggers via
+        # asyncio.to_thread(conn.commit)) keeps flowing to the handler.
+        return await asyncio.to_thread(self.get_connection)
+
     def release_connection(self, conn) -> None:
         real_conn = getattr(conn, "_real", conn)
         self._real_pool.release_connection(real_conn)

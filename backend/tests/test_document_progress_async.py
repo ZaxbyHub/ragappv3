@@ -414,6 +414,11 @@ class _SimplePool:
         except Empty:
             return self._create_connection()
 
+    async def get_connection_async(self, max_wait_attempts: int = 3):
+        # #592: converted routes check out through the pool's async surface;
+        # delegate to the sync checkout on a worker thread to match it.
+        return await asyncio.to_thread(self.get_connection)
+
     def _create_connection(self):
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row

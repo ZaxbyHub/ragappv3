@@ -74,7 +74,7 @@ async def list_prompt_versions(
 ) -> list[PromptVersionMetadata]:
     """List all prompt versions (metadata only, no full content)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         store = PromptVersionStore(conn)
         versions = await asyncio.to_thread(store.list_versions)
@@ -99,7 +99,7 @@ async def get_active_prompt_version(
 ) -> PromptVersionContent | None:
     """Get the currently-active prompt version (metadata + content)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         store = PromptVersionStore(conn)
         version = await asyncio.to_thread(store.get_active)
@@ -137,7 +137,7 @@ async def create_prompt_version(
         raise HTTPException(status_code=400, detail="content cannot be empty")
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         store = PromptVersionStore(conn)
         created = await asyncio.to_thread(
@@ -179,7 +179,7 @@ async def activate_prompt_version(
     and all other versions are set to is_active=0.
     """
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         store = PromptVersionStore(conn)
         activated = await asyncio.to_thread(store.activate, version)
@@ -263,7 +263,7 @@ async def create_ab_experiment(
         )
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         ab_service = ABTestingService(conn)
         # Validate that both version strings exist in prompt_versions
@@ -328,7 +328,7 @@ async def list_ab_experiments(
 ) -> list[ExperimentResponse]:
     """List all A/B experiments with per-variant exposure counts."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         ab_service = ABTestingService(conn)
         experiments = await asyncio.to_thread(ab_service.list_experiments)
@@ -371,7 +371,7 @@ async def end_ab_experiment(
         )
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         ab_service = ABTestingService(conn)
         try:
@@ -418,7 +418,7 @@ async def get_prompt_version(
 ) -> PromptVersionContent:
     """Recover a prior prompt version by name (returns full content)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         store = PromptVersionStore(conn)
         pv = await asyncio.to_thread(store.get_version, version)

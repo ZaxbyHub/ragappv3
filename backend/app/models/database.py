@@ -4,12 +4,15 @@ SQLite database initialization and schema for RAGAPPv3.
 This module provides the database schema and initialization helper for the application.
 """
 
+import asyncio
 import logging
 import shutil
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from queue import Empty, Full, Queue
 
@@ -5016,6 +5019,14 @@ class SQLiteConnectionPool:
     # state where all `max_size` connections exist but sit idle in the queue.
     CAPACITY_WAIT_WINDOW_SECONDS = 30.0
 
+    # Bound for the dedicated checkout executor (get_connection_async, #592).
+    # Idle threads cost nothing but stack; the bound caps worst-case queueing
+    # for a checkout burst behind a saturated pool without letting blocked
+    # checkouts multiply unboundedly. Keep well above typical
+    # db_pool_max_size so steady-state checkouts never queue behind
+    # exhausted-pool waiters.
+    CHECKOUT_EXECUTOR_MAX_WORKERS = 16
+
     def __init__(self, sqlite_path: str, max_size: int = 5):
         """
         Initialize the connection pool.
@@ -5030,6 +5041,11 @@ class SQLiteConnectionPool:
         self._lock = threading.Lock()
         self._created_count = 0
         self._closed = False
+        # Dedicated, bounded executor for request-path async checkouts
+        # (get_connection_async, issue #592). Lazily created on first use;
+        # isolated from the loop's default executor so waiting checkouts can
+        # never starve the SQL work of handlers already holding connections.
+        self._checkout_executor: ThreadPoolExecutor | None = None
         # Monotonic timestamp of the most recent checkout that found the pool
         # at capacity and had to block (0.0 = never). Read by
         # recent_capacity_wait(); written only via _record_capacity_wait().
@@ -5120,6 +5136,13 @@ class SQLiteConnectionPool:
 
         attempts = 0
         while attempts < max_wait_attempts:
+            # Re-check on every iteration (#592 review PRR-004): the checkout
+            # runs on a checkout-executor thread, so close_all() on another
+            # thread can flip _closed while this worker is inside the wait
+            # loop. Without the re-check the worker could still create a
+            # fresh connection from a closed pool.
+            if self._closed:
+                raise RuntimeError("Connection pool has been closed")
             # Try to get an existing connection from the pool
             try:
                 conn = self._pool.get_nowait()
@@ -5200,6 +5223,91 @@ class SQLiteConnectionPool:
             f"Could not obtain a connection from the pool after {max_wait_attempts} attempts"
         )
 
+    def _checkout_executor_ready(self) -> ThreadPoolExecutor:
+        """Return the checkout executor, or raise if the pool is closed.
+
+        The closed check and the lazy creation happen under the SAME lock that
+        close_all holds while flipping ``_closed`` and unpublishing the
+        executor, so a post-shutdown checkout can never lazily create an
+        unowned executor (orphaned live threads; #592 final-critic round 2).
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Connection pool has been closed")
+            if self._checkout_executor is None:
+                self._checkout_executor = ThreadPoolExecutor(
+                    max_workers=self.CHECKOUT_EXECUTOR_MAX_WORKERS,
+                    thread_name_prefix="pool-checkout",
+                )
+            return self._checkout_executor
+
+    async def get_connection_async(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
+        """
+        Off-loop checkout for request-path coroutines (issue #592).
+
+        Runs the blocking :meth:`get_connection` on a DEDICATED bounded executor
+        rather than the event loop's default executor. Under pool exhaustion the
+        waiting checkouts would otherwise occupy default-executor workers and
+        starve the SQL work of handlers already holding connections: those
+        holders could not run or release, the pool would stay exhausted, and
+        queued checkouts would mass-fail after the wait budget (the release
+        starvation convoy demonstrated by the #592 final-critic probe). With a
+        dedicated executor, holders always progress on the default executor,
+        free their slots, and queued checkouts drain behind them; the bound
+        (CHECKOUT_EXECUTOR_MAX_WORKERS) caps worst-case queue latency without
+        adding spurious failures.
+
+        Args:
+            max_wait_attempts: Passed through to :meth:`get_connection`.
+
+        Returns:
+            sqlite3.Connection: A database connection.
+
+        Raises:
+            RuntimeError: If the pool has been closed or max wait attempts exhausted.
+        """
+        executor = self._checkout_executor_ready()
+        try:
+            # Submit directly (not loop.run_in_executor) so the completion
+            # callback below can observe the worker's outcome: cancelling the
+            # awaiting task cancels run_in_executor's asyncio wrapper even
+            # while the worker keeps running, which would hide the acquired
+            # connection from any cancellation handling (#592 review PRR-003).
+            work = executor.submit(partial(self.get_connection, max_wait_attempts))
+        except RuntimeError as exc:
+            # A cross-thread close_all() can shut the executor down between
+            # _checkout_executor_ready() and the submit (#592 review PRR-005);
+            # surface the pool-closed contract instead of the executor's
+            # generic "cannot schedule new futures after shutdown".
+            if self._closed:
+                raise RuntimeError("Connection pool has been closed") from exc
+            raise
+        # Cancellation-completion handling (#592 review PRR-003): if the
+        # awaiting task is cancelled after the worker already checked out a
+        # connection, the handler's finally never runs and the connection
+        # would leak with _created_count permanently inflated. Detach a
+        # done-callback on the CONCURRENT future (never cancelled once the
+        # worker is running) that returns the connection to the pool.
+        try:
+            return await asyncio.wrap_future(work)
+        except asyncio.CancelledError:
+            def _release_if_acquired() -> None:
+                try:
+                    conn = work.result()
+                except BaseException:
+                    return
+                try:
+                    self.release_connection(conn)
+                except Exception:  # noqa: BLE001 — teardown must not mask the cancel
+                    logger.warning(
+                        "pool_cancelled_release_failed sqlite_path=%s",
+                        self.sqlite_path,
+                        exc_info=True,
+                    )
+
+            work.add_done_callback(lambda _f: _release_if_acquired())
+            raise
+
     def release_connection(self, conn: sqlite3.Connection) -> None:
         """
         Release a connection back to the pool.
@@ -5263,6 +5371,18 @@ class SQLiteConnectionPool:
                     conn.close()
                 except Empty:
                     break
+            # Unpublish the executor under the same lock that set _closed, so
+            # a racing _checkout_executor_ready() either sees the closed pool
+            # and raises, or got the (about-to-be-shutdown) executor before the
+            # flip — it can never publish a fresh one after shutdown.
+            executor = self._checkout_executor
+            self._checkout_executor = None
+        # wait=False: an in-flight checkout finishes on its own; get_connection
+        # re-checks _closed on every wait-loop iteration (see the loop guard
+        # above) and re-raises RuntimeError("Connection pool has been closed")
+        # to its awaiter instead of returning a connection from a closed pool.
+        if executor is not None:
+            executor.shutdown(wait=False)
 
     @contextmanager
     def connection(self):
