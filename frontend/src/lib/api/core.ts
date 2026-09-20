@@ -638,7 +638,10 @@ export interface Source {
   page_number?: number | null;
   snippet?: string;
   score?: number;
-  score_type?: "distance" | "rerank" | "rrf";
+  // Verified producer contract (issue #36): the chat pipeline emits only
+  // "distance" or "rerank" for sources. The memory channel carries its own
+  // score_type vocabulary (rrf/fts/dense) under UsedMemory/WikiReference.
+  score_type?: "distance" | "rerank";
   /**
    * Multi-modal artifact presentation (issue #462). These are first-class safe
    * fields: they NEVER carry paths, bytes, or base64 — artifact bytes are fetched

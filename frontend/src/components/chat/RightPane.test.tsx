@@ -305,8 +305,8 @@ describe("RightPane", () => {
 
     it("should display relevance badges for each source", () => {
       const sources = [
-        createMockSource({ id: "src-1", filename: "high.pdf", score: 0.1, score_type: "distance" }),
-        createMockSource({ id: "src-2", filename: "medium.pdf", score: 0.3, score_type: "distance" }),
+        createMockSource({ id: "src-1", filename: "high.pdf", score: 0.55, score_type: "distance" }),
+        createMockSource({ id: "src-2", filename: "medium.pdf", score: 0.62, score_type: "distance" }),
       ];
 
       mockUseChatStore.mockReturnValue({
@@ -319,8 +319,8 @@ describe("RightPane", () => {
 
       render(<RightPane />);
 
-      // Score 0.1 (distance) = "Highly Relevant"
-      // Score 0.3 (distance) = "Relevant"
+      // Score 0.55 (distance) = "Highly Relevant" (calibrated band <= 0.56)
+      // Score 0.62 (distance) = "Relevant" (calibrated band <= 0.67)
       expect(screen.getByText("Highly Relevant")).toBeInTheDocument();
       expect(screen.getByText("Relevant")).toBeInTheDocument();
     });
@@ -380,7 +380,7 @@ describe("RightPane", () => {
     it("should handle different score types", () => {
       const sources = [
         createMockSource({ id: "src-1", filename: "rerank.pdf", score: 0.8, score_type: "rerank" }),
-        createMockSource({ id: "src-2", filename: "rrf.pdf", score: 0.6, score_type: "rrf" }),
+        createMockSource({ id: "src-2", filename: "related.pdf", score: 0.72, score_type: "distance" }),
       ];
 
       mockUseChatStore.mockReturnValue({
@@ -393,9 +393,11 @@ describe("RightPane", () => {
 
       render(<RightPane />);
 
-      // Rerank 0.8 = "Highly Relevant", RRF 0.6 = "Top Match"
+      // Rerank 0.8 = "Highly Relevant" (calibrated band >= 0.7)
+      // Distance 0.72 = "Related" (calibrated band <= 0.77); the "rrf" score
+      // type no longer exists in the backend score_type contract.
       expect(screen.getByText("Highly Relevant")).toBeInTheDocument();
-      expect(screen.getByText("Top Match")).toBeInTheDocument();
+      expect(screen.getByText("Related")).toBeInTheDocument();
     });
   });
 
@@ -620,7 +622,7 @@ describe("RightPane", () => {
         createMockSource({
           id: "src-1",
           filename: "doc.pdf",
-          score: 0.2,
+          score: 0.62,
           score_type: "distance",
         }),
       ];
@@ -645,7 +647,7 @@ describe("RightPane", () => {
       }
 
       await waitFor(() => {
-        // Score 0.2 (distance) = "Relevant"
+        // Score 0.62 (distance) = "Relevant" (calibrated band <= 0.67)
         // Check for "Relevance:" label which is only in preview tab
         expect(screen.getByText("Relevance:")).toBeInTheDocument();
         // Also verify "Relevant" appears in the preview section

@@ -223,7 +223,7 @@ On first launch, you'll be redirected to the **Setup Wizard** (`/setup`) to crea
 | `CHUNK_SIZE_CHARS` | 2000 | Document chunk size in characters (~500 tokens) |
 | `CHUNK_OVERLAP_CHARS` | 200 | Chunk overlap in characters (~50 tokens) |
 | `RETRIEVAL_TOP_K` | 12 | Number of chunks to retrieve for RAG context |
-| `MAX_DISTANCE_THRESHOLD` | 0.5 | Maximum distance threshold for relevance (cosine: 0=identical, 1=orthogonal) |
+| `MAX_DISTANCE_THRESHOLD` | 0.75 | Maximum distance threshold for relevance (cosine: 0=identical, 1=orthogonal) |
 | `LOG_LEVEL` | INFO | Logging level |
 | `AUTO_SCAN_ENABLED` | true | Enable auto-scanning |
 | `AUTO_SCAN_INTERVAL_MINUTES` | 60 | Scan interval |

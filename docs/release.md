@@ -706,7 +706,7 @@ groups:
 **Resolution:**
 - Verify documents show as "indexed" in database
 - Check vector store connectivity
-- Verify `max_distance_threshold` setting (default: 0.5)
+- Verify `max_distance_threshold` setting (default: 0.75, calibrated 2026-09 for the Harrier embedding scale)
 - Test embedding service is generating vectors
 
 #### 3. Chat Stream Interrupted

@@ -42,8 +42,8 @@ class TestSettingsDefaults(unittest.TestCase):
         self.assertEqual(settings.retrieval_top_k, 12)
         self.assertEqual(settings.vector_metric, "cosine")
         self.assertEqual(
-            settings.max_distance_threshold, 0.5
-        )  # Default threshold for cosine distance
+            settings.max_distance_threshold, 0.75
+        )  # Calibrated 2026-09 (issue #36) for the Harrier cosine-distance scale
         self.assertEqual(settings.embedding_doc_prefix, "")
         self.assertEqual(settings.embedding_query_prefix, "")
         self.assertEqual(settings.retrieval_window, 1)

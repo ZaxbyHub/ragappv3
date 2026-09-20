@@ -1,0 +1,511 @@
+{
+ "meta": {
+  "host": "R640AI (172.16.50.159)",
+  "deployed_commit": "281bd714",
+  "endpoint": "POST /api/chat/stream (SSE), vault 7 (Legacy)",
+  "date": "2026-09-19",
+  "bench_user": "dedicated bench user (removed after run)"
+ },
+ "tiers": {
+  "1": {
+   "samples": 1,
+   "errors": 0,
+   "empty_turns": 0,
+   "queue_wait_p50_ms": 40.0,
+   "queue_wait_p95_ms": 40.0,
+   "first_content_p50_ms": 34857.0,
+   "first_content_p95_ms": 34857.0,
+   "completion_p50_ms": 41238.0,
+   "completion_p95_ms": 41238.0
+  },
+  "4": {
+   "samples": 4,
+   "errors": 0,
+   "empty_turns": 1,
+   "queue_wait_p50_ms": 112.0,
+   "queue_wait_p95_ms": 114.7,
+   "first_content_p50_ms": 42281.0,
+   "first_content_p95_ms": 53201.6,
+   "completion_p50_ms": 49204.0,
+   "completion_p95_ms": 60463.25
+  },
+  "8": {
+   "samples": 8,
+   "errors": 0,
+   "empty_turns": 0,
+   "queue_wait_p50_ms": 145.5,
+   "queue_wait_p95_ms": 174.45,
+   "first_content_p50_ms": 80280.5,
+   "first_content_p95_ms": 114353.9,
+   "completion_p50_ms": 99796.0,
+   "completion_p95_ms": 130840.4
+  },
+  "12": {
+   "samples": 12,
+   "errors": 2,
+   "empty_turns": 0,
+   "queue_wait_p50_ms": 30281.0,
+   "queue_wait_p95_ms": 85363.5,
+   "first_content_p50_ms": 111081.5,
+   "first_content_p95_ms": 165183.9,
+   "completion_p50_ms": 127529.5,
+   "completion_p95_ms": 175841.85
+  }
+ },
+ "stage_spans": {
+  "1": {
+   "samples": 1,
+   "errors": 0,
+   "empty_turns": 0,
+   "metrics_delta": {
+    "ragapp_chat_turns_total": 1.0,
+    "ragapp_queue_wait_seconds": 0,
+    "ragapp_provider_calls_total{provider=\"llm\",outcome=\"ok\"}": 1.0
+   },
+   "measured_mean_queue_wait_s": 0.0,
+   "stage_spans_s": {
+    "admission_to_searching": {
+     "n": 1,
+     "p50": 0.024,
+     "p95": 0.024
+    },
+    "searching_to_reading": {
+     "n": 1,
+     "p50": 4.915,
+     "p95": 4.915
+    },
+    "reading_to_drafting": {
+     "n": 1,
+     "p50": 0.015,
+     "p95": 0.015
+    },
+    "drafting_to_done": {
+     "n": 1,
+     "p50": 37.038,
+     "p95": 37.038
+    }
+   }
+  },
+  "4": {
+   "samples": 4,
+   "errors": 0,
+   "empty_turns": 0,
+   "metrics_delta": {
+    "ragapp_chat_turns_total": 4.0,
+    "ragapp_queue_wait_seconds": 0,
+    "ragapp_provider_calls_total{provider=\"llm\",outcome=\"ok\"}": 4.0
+   },
+   "measured_mean_queue_wait_s": 0.0,
+   "stage_spans_s": {
+    "admission_to_searching": {
+     "n": 4,
+     "p50": 0.115,
+     "p95": 0.117
+    },
+    "searching_to_reading": {
+     "n": 4,
+     "p50": 10.25,
+     "p95": 12.136
+    },
+    "reading_to_drafting": {
+     "n": 4,
+     "p50": 0.109,
+     "p95": 0.206
+    },
+    "drafting_to_done": {
+     "n": 4,
+     "p50": 32.219,
+     "p95": 38.229
+    }
+   }
+  },
+  "8": {
+   "samples": 8,
+   "errors": 0,
+   "empty_turns": 0,
+   "metrics_delta": {
+    "ragapp_chat_turns_total": 8.0,
+    "ragapp_queue_wait_seconds": 0,
+    "ragapp_provider_calls_total{provider=\"llm\",outcome=\"ok\"}": 8.0
+   },
+   "measured_mean_queue_wait_s": 0.0,
+   "stage_spans_s": {
+    "admission_to_searching": {
+     "n": 8,
+     "p50": 0.175,
+     "p95": 0.195
+    },
+    "searching_to_reading": {
+     "n": 8,
+     "p50": 14.319,
+     "p95": 25.756
+    },
+    "reading_to_drafting": {
+     "n": 8,
+     "p50": 0.022,
+     "p95": 0.166
+    },
+    "drafting_to_done": {
+     "n": 8,
+     "p50": 61.93,
+     "p95": 80.285
+    }
+   }
+  },
+  "12": {
+   "samples": 12,
+   "errors": 0,
+   "empty_turns": 0,
+   "metrics_delta": {
+    "ragapp_chat_turns_total": 12.0,
+    "ragapp_queue_wait_seconds": 0,
+    "ragapp_provider_calls_total{provider=\"llm\",outcome=\"ok\"}": 12.0
+   },
+   "measured_mean_queue_wait_s": 0.0,
+   "stage_spans_s": {
+    "admission_to_searching": {
+     "n": 12,
+     "p50": 0.207,
+     "p95": 67.48
+    },
+    "searching_to_reading": {
+     "n": 12,
+     "p50": 23.111,
+     "p95": 31.474
+    },
+    "reading_to_drafting": {
+     "n": 12,
+     "p50": 0.023,
+     "p95": 0.027
+    },
+    "drafting_to_done": {
+     "n": 12,
+     "p50": 55.439,
+     "p95": 94.076
+    }
+   }
+  }
+ },
+ "long_generation": {
+  "samples": 5,
+  "errors": 0,
+  "first_content_p50_ms": 129722.0,
+  "first_content_p95_ms": 145054.0,
+  "p50_ms": 265823.0,
+  "p95_ms": 279918.0,
+  "note": "re-run with fresh login after the first attempt lost 4/5 requests to token expiry",
+  "requests": [
+   {
+    "queue_wait_s": 0.038,
+    "first_content_s": 146.793,
+    "completion_s": 280.438,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": 0.044,
+    "first_content_s": 127.499,
+    "completion_s": 265.823,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": 0.044,
+    "first_content_s": 129.722,
+    "completion_s": 277.838,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": 0.013,
+    "first_content_s": 110.577,
+    "completion_s": 182.28,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": 0.042,
+    "first_content_s": 138.098,
+    "completion_s": 254.197,
+    "error": null,
+    "empty_turn": false
+   }
+  ]
+ },
+ "bulk_ingestion": {
+  "samples": 6,
+  "p50_ms": 19400.0,
+  "p95_ms": 25900.0,
+  "max_ms": 27900.0,
+  "time_to_searchable_s": [
+   27.9,
+   20.0,
+   18.0,
+   17.9,
+   19.3,
+   19.4
+  ],
+  "files": [
+   {
+    "name": "CDP_BADTOK_Mini_ICD.docx",
+    "file_id": 95,
+    "time_to_searchable_s": 27.9,
+    "status": "indexed"
+   },
+   {
+    "name": "CDP_OMDS_Mini_ICD.docx",
+    "file_id": 96,
+    "time_to_searchable_s": 20.0,
+    "status": "indexed"
+   },
+   {
+    "name": "Release_Notes_1.1.65.6.docx",
+    "file_id": 97,
+    "time_to_searchable_s": 18.0,
+    "status": "indexed"
+   },
+   {
+    "name": "T6_Architecture_Overview_April_2026.docx",
+    "file_id": 98,
+    "time_to_searchable_s": 17.9,
+    "status": "indexed"
+   },
+   {
+    "name": "V1.1_DRAFT_JOMIS_HCD_A006_OpMed_CDP_HSA.docx",
+    "file_id": 99,
+    "time_to_searchable_s": 19.3,
+    "status": "indexed"
+   },
+   {
+    "name": "V1.6_DRAFT_JOMIS_HCD_A006_OpMed_CDP_CSM.docx",
+    "file_id": 100,
+    "time_to_searchable_s": 19.4,
+    "status": "indexed"
+   }
+  ]
+ },
+ "raw": {
+  "tier_requests": {
+   "1": [
+    {
+     "queue_wait_s": 0.04,
+     "first_content_s": 34.857,
+     "completion_s": 41.238,
+     "error": null,
+     "empty_turn": false
+    }
+   ],
+   "4": [
+    {
+     "queue_wait_s": 0.111,
+     "first_content_s": 41.268,
+     "completion_s": 48.132,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.115,
+     "first_content_s": 42.281,
+     "completion_s": 50.276,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.091,
+     "first_content_s": 54.415,
+     "completion_s": 62.261,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.113,
+     "first_content_s": null,
+     "completion_s": 14.764,
+     "error": null,
+     "empty_turn": true
+    }
+   ],
+   "8": [
+    {
+     "queue_wait_s": 0.179,
+     "first_content_s": 54.763,
+     "completion_s": 68.964,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.141,
+     "first_content_s": 42.161,
+     "completion_s": 60.619,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.139,
+     "first_content_s": 111.893,
+     "completion_s": 129.205,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.136,
+     "first_content_s": 115.679,
+     "completion_s": 127.707,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.166,
+     "first_content_s": 111.889,
+     "completion_s": 131.721,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.153,
+     "first_content_s": 55.472,
+     "completion_s": 81.458,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.144,
+     "first_content_s": 51.931,
+     "completion_s": 81.113,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 0.147,
+     "first_content_s": 105.089,
+     "completion_s": 118.134,
+     "error": null,
+     "empty_turn": false
+    }
+   ],
+   "12": [
+    {
+     "queue_wait_s": null,
+     "first_content_s": null,
+     "completion_s": null,
+     "error": "HTTP 500",
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 84.511,
+     "first_content_s": 157.936,
+     "completion_s": 170.294,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 30.289,
+     "first_content_s": 111.968,
+     "completion_s": 130.112,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 30.284,
+     "first_content_s": 115.813,
+     "completion_s": 135.045,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 30.285,
+     "first_content_s": 68.314,
+     "completion_s": 86.06,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 86.061,
+     "first_content_s": 171.114,
+     "completion_s": 180.381,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 30.277,
+     "first_content_s": 110.195,
+     "completion_s": 124.947,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 30.278,
+     "first_content_s": 114.408,
+     "completion_s": 132.51,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 30.272,
+     "first_content_s": 67.603,
+     "completion_s": 84.492,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 30.269,
+     "first_content_s": 74.676,
+     "completion_s": 94.272,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": 30.27,
+     "first_content_s": 70.47,
+     "completion_s": 87.718,
+     "error": null,
+     "empty_turn": false
+    },
+    {
+     "queue_wait_s": null,
+     "first_content_s": null,
+     "completion_s": null,
+     "error": "HTTP 500",
+     "empty_turn": false
+    }
+   ]
+  },
+  "long_requests": [
+   {
+    "queue_wait_s": 0.051,
+    "first_content_s": 193.139,
+    "completion_s": 312.433,
+    "error": null,
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": null,
+    "first_content_s": null,
+    "completion_s": null,
+    "error": "HTTP 401",
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": null,
+    "first_content_s": null,
+    "completion_s": null,
+    "error": "HTTP 401",
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": null,
+    "first_content_s": null,
+    "completion_s": null,
+    "error": "HTTP 401",
+    "empty_turn": false
+   },
+   {
+    "queue_wait_s": null,
+    "first_content_s": null,
+    "completion_s": null,
+    "error": "HTTP 401",
+    "empty_turn": false
+   }
+  ]
+ }
+}
