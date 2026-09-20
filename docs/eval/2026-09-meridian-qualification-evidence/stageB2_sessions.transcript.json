@@ -1,0 +1,108 @@
+{
+  "steps": [
+    {
+      "step": "create_session",
+      "status": 200,
+      "session_id": 16
+    },
+    {
+      "step": "instant_turn",
+      "http": 200,
+      "turn_id": "f3-turn-0702d0bac70f",
+      "mode": "instant",
+      "answer_preview": "According to the vault, the contact for the aeroshell program is **Dana Whitfield**, who is identified as the program director [S1].",
+      "n_sources": 1,
+      "source0_keys": [
+        "chunk_bbox",
+        "evidence_type",
+        "file_id",
+        "filename",
+        "id",
+        "metadata",
+        "page_number",
+        "score",
+        "section",
+        "snippet",
+        "source_label"
+      ],
+      "score0": 0.9805061292286613,
+      "score_type": "rerank",
+      "chunk_id": null,
+      "event_counts": {
+        "mode": 1,
+        "evidence": 1,
+        "content": 31,
+        "stage": 3,
+        "done": 1
+      }
+    },
+    {
+      "step": "session_reload",
+      "status": 200,
+      "n_messages": 2,
+      "roles": [
+        "user",
+        "assistant"
+      ],
+      "last_has_sources": true,
+      "last_mode": "instant",
+      "answer_len": 132
+    },
+    {
+      "step": "truncate_keep_first_user",
+      "status": 200,
+      "body": "{\"remaining_count\":1,\"tail_seq\":1}"
+    },
+    {
+      "step": "retry_turn",
+      "http": 200,
+      "turn_id": "f3-turn-f9531cfc77d8",
+      "answer_preview": "Dana Whitfield",
+      "n_sources": 1
+    },
+    {
+      "step": "fork_session",
+      "status": 200,
+      "new_session_id": 17,
+      "body": "{\"id\":17,\"vault_id\":8,\"title\":\"Branch of F3 journey session 2\",\"forked_from_session_id\":16,\"fork_message_index\":1,\"messa"
+    },
+    {
+      "step": "thinking_attempt",
+      "http": 200,
+      "turn_id": "f3-turn-c03ab6711779",
+      "mode_event": {
+        "type": "mode",
+        "mode": "thinking"
+      },
+      "reasoning_chars": 0,
+      "answer_chars": 0,
+      "answer_preview": "",
+      "error_events": [
+        {
+          "message": "Chat stream failed",
+          "code": "EMBEDDING_ERROR"
+        }
+      ],
+      "done_keys": [
+        "kms_used",
+        "memories_used",
+        "score_type",
+        "sources",
+        "turn_id",
+        "type",
+        "wiki_used"
+      ],
+      "done_mode": null,
+      "llm_metrics": null,
+      "event_counts": {
+        "mode": 1,
+        "error": 1,
+        "done": 1,
+        "stage": 1
+      }
+    }
+  ],
+  "fork_id": 17,
+  "session_id": 16,
+  "vault_id": 8
+}

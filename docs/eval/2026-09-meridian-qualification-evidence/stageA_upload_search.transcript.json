@@ -1,0 +1,84 @@
+{
+  "steps": [
+    {
+      "step": "auth",
+      "ok": true,
+      "user_id": 55
+    },
+    {
+      "step": "create_vault",
+      "status": 201,
+      "body": {
+        "id": 8,
+        "name": "F3 Qualification",
+        "description": "F3 journey fixtures (temporary)",
+        "created_at": "2026-09-20 14:18:18",
+        "updated_at": "2026-09-20 14:18:18",
+        "file_count": 0,
+        "memory_count": 0,
+        "session_count": 0,
+        "org_id": null,
+        "current_user_permission": "admin",
+        "visibility": "private",
+        "enrichment_enabled": null,
+        "effective_enrichment_enabled": false,
+        "multimodal_provider_enabled": null,
+        "effective_multimodal_enabled": false
+      }
+    },
+    {
+      "step": "upload",
+      "status": 200,
+      "body": {
+        "file_id": 101,
+        "file_name": "f3_alpha_note.txt",
+        "id": 101,
+        "filename": "f3_alpha_note.txt",
+        "status": "pending",
+        "message": "File 'f3_alpha_note.txt' uploaded and queued for processing. Poll GET /documents/101/status for progress."
+      }
+    },
+    {
+      "step": "status_progression",
+      "phases": [
+        [
+          "processing",
+          "parsing",
+          null
+        ],
+        [
+          "processing",
+          "writing_index",
+          0.0
+        ],
+        [
+          "indexed",
+          "indexed",
+          null
+        ]
+      ],
+      "final_status": "indexed",
+      "chunk_count": 2,
+      "error": null
+    },
+    {
+      "step": "keyword_search",
+      "status": 200,
+      "hits": 1
+    },
+    {
+      "step": "semantic_search",
+      "status": 200,
+      "top": 0.732742428779602,
+      "file_id": "101",
+      "n_results": 2
+    },
+    {
+      "step": "chunk_context",
+      "status": 200,
+      "filename": "f3_alpha_note.txt"
+    }
+  ],
+  "vault_id": 8,
+  "file_id": 101
+}

@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {
+      "step": "draft_job_retry",
+      "status": 202,
+      "body": "{\"id\":13,\"draft_id\":3,\"job_type\":\"compile\",\"status\":\"pending\",\"start_stage\":\"research\",\"active_stage\":null,\"progress_percent\":0.0,\"model_call_count\":0,\"max_mode"
+    },
+    {
+      "step": "draft_retry_final",
+      "status": "failed",
+      "error_code": "provider_unavailable",
+      "attempt": 2,
+      "parent_job": 12
+    }
+  ]
+}

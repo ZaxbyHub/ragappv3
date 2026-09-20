@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {
+      "step": "wiki_delete_103",
+      "status": 204
+    },
+    {
+      "step": "wiki_delete_100",
+      "status": 204
+    },
+    {
+      "step": "wiki_remaining",
+      "n": 0
+    }
+  ]
+}

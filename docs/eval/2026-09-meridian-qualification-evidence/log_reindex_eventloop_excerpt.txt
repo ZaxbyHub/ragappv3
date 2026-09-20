@@ -1,0 +1,2 @@
+{"ts": "2026-09-20 14:50:48,597", "level": "INFO", "logger": "app.lifespan", "message": "Migration journal (latest 3): migrate_widen_document_reindex_jobs_status[succeeded:noop]; migrate_widen_document_reindex_jobs_status[start:ok]; migrate_widen_files_status[succeeded:noop]"}
+{"ts": "2026-09-20 14:52:14,616", "level": "WARNING", "logger": "app.services.context_distiller", "message": "Context distillation dedup failed, returning unmodified: Embedding batch failed: Event loop is closed", "request_id": "adbda3a1-adcc-4a0a-961b-ec3b49a76af7"}

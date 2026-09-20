@@ -1,0 +1,41 @@
+{
+  "steps": [
+    {
+      "step": "search_after_restart",
+      "n": 2,
+      "top_id": "101_0b2bfe94_768_0",
+      "top_score": 0.732742428779602
+    },
+    {
+      "step": "session_survives_restart",
+      "n_messages": 4,
+      "roles": [
+        "user",
+        "user",
+        "assistant",
+        "user"
+      ]
+    },
+    {
+      "step": "wiki_survives_restart",
+      "n_pages": 3
+    },
+    {
+      "step": "kms_survives_restart",
+      "title": "F3 Aeroshell Runbook"
+    },
+    {
+      "step": "canvas_survives_restart",
+      "http": 200,
+      "current_version": 3,
+      "title": "F3 Aeroshell Canvas",
+      "n_versions": 3,
+      "origins": [
+        "created",
+        "user_edit",
+        "restore"
+      ]
+    }
+  ],
+  "note": "post-restart survival re-verification (consolidated after kwarg-collision crash)"
+}

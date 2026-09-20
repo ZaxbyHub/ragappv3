@@ -1,0 +1,62 @@
+{
+  "steps": [
+    {
+      "step": "wiki_create_page",
+      "status": 201,
+      "page_id": 101,
+      "body": "{\"id\":101,\"vault_id\":8,\"slug\":\"f3-qualification-page\",\"title\":\"F3 Qualification Page\",\"page_type\":\"overview\",\"markdown\":\"The aeroshell program is directed by Dana Whitfield.\\n\\nQ3 revenue was 4.2 mill"
+    },
+    {
+      "step": "wiki_create_claim",
+      "status": 201,
+      "body": "{\"id\":1,\"vault_id\":8,\"page_id\":101,\"claim_text\":\"Dana Whitfield directs the aeroshell program.\",\"claim_type\":\"fact\",\"subject\":\"Dana Whitfiel"
+    },
+    {
+      "step": "wiki_page_detail_claims_layer",
+      "status": 200,
+      "page_status": "needs_review",
+      "n_claims": 1,
+      "claim_statuses": [
+        "active"
+      ],
+      "markdown_roundtrip": true
+    },
+    {
+      "step": "wiki_compile_job_371",
+      "status": 422,
+      "body": "{\"detail\":[{\"loc\":[\"query\",\"vault_id\"],\"msg\":\"Field required\",\"type\":\"missing\",\"input\":null}]}"
+    },
+    {
+      "step": "memory_search_retry",
+      "n": 1,
+      "hits": [
+        [
+          "2",
+          null
+        ]
+      ]
+    },
+    {
+      "step": "wiki_promote_memory",
+      "status": 200,
+      "body": "{\"page\":{\"id\":102,\"vault_id\":8,\"slug\":\"dana-whitfield-directs-the-zaxby-aeroshell-program-per-f3-f\",\"title\":\"Dana Whitfield directs the Zaxby aeroshell program (per F3 fixture alpha).\",\"page_type\":\"en"
+    },
+    {
+      "step": "draft_capabilities",
+      "status": 200,
+      "enabled": true,
+      "modes": [
+        "compose",
+        "rewrite"
+      ],
+      "default_logical_mode": "thinking",
+      "compile_available": true
+    },
+    {
+      "step": "canvas_capabilities",
+      "status": 200,
+      "body": "{\"enabled\":true}"
+    }
+  ],
+  "wiki_page_id": 101
+}

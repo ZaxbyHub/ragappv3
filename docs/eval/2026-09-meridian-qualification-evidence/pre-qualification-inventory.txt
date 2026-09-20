@@ -1,0 +1,232 @@
+== SQLite table counts ==
+vaults=5
+files=93
+users=47
+chat_sessions=2
+chat_messages=12
+memories=1
+wiki_pages=99
+wiki_claims=0
+kms_entries=75
+drafts=2
+draft_jobs=10
+canvas_artifacts=0
+canvas_versions=0
+admin_toggles=0
+jobs=361
+document_reindex_jobs=0
+wiki_compile_jobs=46
+kms_compile_jobs=0
+quality_reports=0
+document_actions=84
+
+== Vaults ==
+vault 1: Default
+vault 2: CDP
+vault 5: Test
+vault 6: Slack
+vault 7: Legacy
+
+== Documents per vault (id status name) ==
+doc 1 vault=2 status=indexed name=CDP_BADTOK_Mini_ICD.docx
+doc 2 vault=2 status=indexed name=CDP_OMDS_Mini_ICD.docx
+doc 3 vault=2 status=indexed name=Release_Notes_1.1.65.6.docx
+doc 4 vault=2 status=indexed name=T6_Architecture_Overview_April_2026.docx
+doc 5 vault=2 status=indexed name=T6_DCW_data_dictionary.xlsx
+doc 6 vault=2 status=indexed name=V1.1_DRAFT_JOMIS_HCD_A006_OpMed_CDP_HSA.docx
+doc 7 vault=2 status=indexed name=V1.6_DRAFT_JOMIS_HCD_A006_OpMed_CDP_CSM.docx
+doc 8 vault=2 status=indexed name=V2.3_DRAFT_JOMIS_HCD_A006_OpMed_CDP_SAM.docx
+doc 9 vault=2 status=indexed name=V2.3_DRAFT_JOMIS_HCD_A006_OpMed_CDP_SIG.docx
+doc 10 vault=2 status=indexed name=V3.3_DRAFT_JOMIS_HCD_A006_OpMed_CDP_SUM.docx
+doc 24 vault=2 status=error name=pasted-text-1789653276002.txt
+doc 25 vault=2 status=error name=pasted-text-1789653295468.txt
+doc 26 vault=2 status=indexed name=pasted-text-1789653483580.txt
+doc 27 vault=2 status=indexed name=pasted-text-1789653645256.txt
+doc 28 vault=2 status=indexed name=pasted-text-1789653833530.txt
+doc 11 vault=5 status=indexed name=Test-rev1-REVIEW.md
+doc 12 vault=5 status=indexed name=mistral-small4-spark-guide.md
+doc 13 vault=5 status=indexed name=enhancement-report.md
+doc 14 vault=5 status=indexed name=Intel-Driver-and-Support-Assistant-Installer_000_DriverSupportAssistantInstaller.log
+doc 15 vault=5 status=indexed name=Post_Carney_SD_and_Stakeholders_Analysis_v1.6.1_-_OFAC.pdf
+doc 16 vault=5 status=indexed name=Post_Carney_SD_and_Stakeholders_Analysis_v1.6.1_-_OFAC.pptx
+doc 17 vault=5 status=indexed name=ADAB_Patient_Meds.xlsx
+doc 18 vault=5 status=indexed name=ADAB-MedBooks.xls
+doc 19 vault=5 status=indexed name=RX_OE_missing_refined_v2.xlsx
+doc 20 vault=5 status=indexed name=Labs_master_-_Unique_results.pdf
+doc 21 vault=5 status=indexed name=T6_Master_Formulary_1.xlsx
+doc 22 vault=5 status=indexed name=BBP_-_CCATT_Electronic_Pt_Care_System.pdf
+doc 23 vault=5 status=indexed name=orchid-audit-source.md
+doc 30 vault=6 status=indexed name=hcdmodernization-channel-export-rag.md
+doc 31 vault=7 status=indexed name=AFCENTSG_Remote_NIPR_Resources_Guide_06222026.pdf
+doc 32 vault=7 status=indexed name=AFMOST_Medical_Systems_Desktop_QRG_06222026_F014.pdf
+doc 33 vault=7 status=indexed name=AFMOST_How_to_Request_Training_09052025_DRAFT.pptx
+doc 34 vault=7 status=indexed name=AFMOST_Help__Assistance_Contact_List_06222026_OPS015.pdf
+doc 35 vault=7 status=indexed name=AFMOST_User_System_Checkout_Procedures_06222026_F028.pdf
+doc 36 vault=7 status=indexed name=PHIMT_Account_Request_Guide1.pdf
+doc 37 vault=7 status=indexed name=TMDS_Access_and_User_Guide_06222026_F015.pdf
+doc 38 vault=7 status=indexed name=AHLTAT_Document_Special_Work_Status_06222026_F023.pdf
+doc 39 vault=7 status=indexed name=AHLTAT_Clinician_Patient_Medication_Managment_06222026__F022.pdf
+doc 40 vault=7 status=indexed name=AHLTAT_Data_Quality_Reporting_06222026_F026.pdf
+doc 41 vault=7 status=indexed name=AHLTAT_Lab_User_Guide_06222026_F007.pdf
+doc 42 vault=7 status=indexed name=AHLTAT_First_Logon_and_Account_Setup_06222026_F030.pdf
+doc 43 vault=7 status=indexed name=AHLTAT_Enter_and_Manage_Patient_Orders_06222026_F012.pptx
+doc 44 vault=7 status=indexed name=AHLTAT_Template_Management_06222026_F010.pdf
+doc 45 vault=7 status=indexed name=AHLTAT_Pharmacy_User_Guide_06222026_F008.pdf
+doc 46 vault=7 status=indexed name=ERPS_Create_an_Encounter_Note_06222026_E003.pdf
+doc 47 vault=7 status=indexed name=AHLTAT_Radiology_User_Guide_06222026_F006.pdf
+doc 48 vault=7 status=indexed name=ERPS_Medical_Documentation_Checklist_06222026_E001.pdf
+doc 49 vault=7 status=indexed name=ERPS_First_Logon_and_Account_Setup_06222026_E004.pdf
+doc 50 vault=7 status=indexed name=FIX_AHLTA-T_Correct_Error_Number_5_06222026_F031.pdf
+doc 51 vault=7 status=indexed name=03.__HALO_Finding_Registered_Patients.pdf
+doc 52 vault=7 status=indexed name=02.__HALO_Creating_Patients.pdf
+doc 53 vault=7 status=indexed name=01.__HALO_Admin_Creating_User_Accounts.pdf
+doc 54 vault=7 status=indexed name=04.__HALO_TRACKING_Filter.pdf
+doc 55 vault=7 status=indexed name=05._HALO_TRIAGE_Tab.pdf
+doc 56 vault=7 status=indexed name=06.__HALO_SUBJECTIVE_Tab_SOAP_Template.pdf
+doc 57 vault=7 status=indexed name=07.__HALO_ASSESSMENT_Tab.pdf
+doc 58 vault=7 status=indexed name=10.__HALO_PLAN_Tab___TRIP_SEGMENTS.pdf
+doc 59 vault=7 status=indexed name=09.__HALO__FLOWSHEET.pdf
+doc 60 vault=7 status=indexed name=08._HALO_PLAN_Tab__Order_Meds__MAR.pdf
+doc 61 vault=7 status=indexed name=12.__HALO_PREVIEW_Tab___SIGN_COSIGN_SAVING.pdf
+doc 62 vault=7 status=indexed name=13.__HALO_TRANSMITTING_MIRTH.pdf
+doc 63 vault=7 status=indexed name=14.__HALO_TRACKING_Tab___PRINTING_ENCOUNTERS.pdf
+doc 64 vault=7 status=indexed name=15.__HALO_-_GENERATING_A_QR_CODE.pdf
+doc 65 vault=7 status=indexed name=16._HALO_-_SCANNING_A_QR_CODE.pdf
+doc 66 vault=7 status=indexed name=Configuring_Scanner_1.pdf
+doc 67 vault=7 status=indexed name=Connecting_Server__Clients_to_Router.pdf
+doc 68 vault=7 status=indexed name=11._HALO_PLAN_Tab___DISPOSITION.pdf
+doc 69 vault=7 status=indexed name=Unlocking_a_User_Account.pdf
+doc 70 vault=7 status=indexed name=Connecting_the_Printer_to_the_Server_1.pdf
+doc 71 vault=7 status=indexed name=Connecting_the_Server_to_the_MiFi_1.pdf
+doc 72 vault=7 status=indexed name=Administrative_Closure_of_Patient_Records_06222026_F009.pdf
+doc 73 vault=7 status=indexed name=AFMOST_Manage_Duplicate_Patient_Profiles_06222026__F025.pdf
+doc 74 vault=7 status=indexed name=AFMOST_Manage_Erroneous_Patient_Data_06222026_F013.pdf
+doc 75 vault=7 status=indexed name=AFMOST_Patient_Pseudo_Person_ID_Assignment_09052025_F20.pdf
+doc 76 vault=7 status=indexed name=AFMOST_Patient_Registration-_New_Visit_Checklist_06222026_F019.pdf
+doc 77 vault=7 status=indexed name=AFMOST_Deployed_Patient_Records_Management_06222026_F11.pdf
+doc 78 vault=7 status=indexed name=PATCAT_TABLE_05Sep2025_.pdf
+doc 79 vault=7 status=indexed name=TC2_PAD_Admission-Disposition_Process_06222026_F017.pdf
+doc 80 vault=7 status=indexed name=Theater_Patient_Category_List_09052025_F024.pdf
+doc 81 vault=7 status=indexed name=TC2_CRO-Carded_For_Record_Only_06222026_F003.pdf
+doc 82 vault=7 status=indexed name=TC2_Amend_Radiology_Exam_Report_06222026_F018.pdf
+doc 83 vault=7 status=indexed name=TC2_Physicians_Menu_06222026_F029.pdf
+doc 84 vault=7 status=indexed name=TC2-GUI_Provider_Documentaton_06222026_F005.pdf
+doc 85 vault=7 status=indexed name=TC2-GUI_Nurse-Ward_Documentation_06222026_F001.pdf
+doc 86 vault=7 status=indexed name=TMIP_Reporting_User_QRG_06222026_F035.pdf
+doc 87 vault=7 status=indexed name=TMIP_Reporting_User_Guide_06222026_F004.pdf
+doc 88 vault=7 status=indexed name=AFMOST_Clinic_4A_Sysadmin_Guide_09052025_T001.pdf
+doc 89 vault=7 status=indexed name=AFMOST_EHR_Deployment_Solution_QRG_09052025_T043.pdf
+doc 90 vault=7 status=indexed name=AFMOST_EHR_Deployment_Solution_User_Guide_09052025_T009.pdf
+doc 91 vault=7 status=indexed name=ARS_4A_Sysadmin_Guide_06222026_T004.pdf
+doc 92 vault=7 status=indexed name=TF_Mirth_QRG_Patient_Data_Transmission_06222026_T006.pdf
+doc 93 vault=7 status=indexed name=Thick_Client_Hotspot_06_22_2026_T050.pdf
+doc 94 vault=7 status=indexed name=TF_Mirth_Reference_Guide_06222026_T007.pdf
+
+== Users (id, role, name prefix) ==
+user 1 role=superadmin name=***
+user 3 role=member name=***
+user 4 role=member name=***
+user 5 role=member name=***
+user 6 role=member name=***
+user 7 role=member name=***
+user 8 role=member name=***
+user 9 role=member name=***
+user 10 role=member name=***
+user 11 role=member name=***
+user 12 role=member name=***
+user 13 role=member name=***
+user 14 role=member name=***
+user 15 role=member name=***
+user 16 role=member name=***
+user 17 role=member name=***
+user 18 role=member name=***
+user 19 role=member name=***
+user 20 role=member name=***
+user 21 role=member name=***
+user 22 role=member name=***
+user 23 role=member name=***
+user 24 role=member name=***
+user 25 role=member name=***
+user 26 role=member name=***
+user 27 role=member name=***
+user 28 role=member name=***
+user 29 role=member name=***
+user 30 role=member name=***
+user 31 role=member name=***
+user 32 role=member name=***
+user 33 role=member name=***
+user 34 role=member name=***
+user 35 role=member name=***
+user 36 role=member name=***
+user 37 role=member name=***
+user 38 role=member name=***
+user 39 role=member name=***
+user 40 role=member name=***
+user 41 role=member name=***
+user 42 role=member name=***
+user 43 role=member name=***
+user 44 role=member name=***
+user 45 role=member name=***
+user 46 role=member name=***
+user 47 role=member name=***
+user 48 role=member name=***
+
+== Settings KV (non-secret keys) ==
+settings_kv draft_room_enabled = true
+settings_kv embedding_dim = 1024
+settings_kv embedding_model_id = microsoft/harrier-oss-v1-0.6b
+settings_kv embedding_prefix_hash = cbe5cfdf7c2118a9
+
+== Admin toggles ==
+
+== LanceDB data dirs ==
+/app/data: ['app.db', 'app.db-shm', 'app.db-wal', 'draft-room', 'lancedb', 'vaults']
+/app/data/lancedb: ['chunks.lance']
+
+== Lance tables (dir sizes) ==
+lance chunks.lance: 708438945 bytes
+
+== Model/feature env (redacted) ==
+ADMISSION_CHAT_BUDGET=8
+ADMISSION_RERANKING_BUDGET=4
+CHAT_MODEL=ChatGPTN
+CONTEXTUAL_CHUNKING_ENABLED=false
+DEFAULT_CHAT_MODE=thinking
+DRAFT_ALLOWED_MODEL_ORIGINS=http://172.16.50.41:8000,http://host.docker.internal:8011,http://192.168.1.145:8003
+DRAFT_BOILERPLATE_RULE_VERSION=1
+DRAFT_COMPILE_RATE_LIMIT=5/minute
+DRAFT_DEFAULT_LOGICAL_MODE=thinking
+DRAFT_EDITORIAL_CHAT_MODEL=qwen38-27b-aggressive
+DRAFT_EDITORIAL_CHAT_URL=http://192.168.1.145:8003
+DRAFT_JOB_LEASE_ENABLED=true
+DRAFT_JOB_MAX_MODEL_CALLS=40
+DRAFT_JOB_TIMEOUT_SECONDS=7200
+DRAFT_LINT_REWRITE_LIMIT=2
+DRAFT_MAX_INPUTS=10
+DRAFT_MAX_SECTIONS=12
+DRAFT_MAX_TOTAL_INPUT_MB=250
+DRAFT_MAX_TOTAL_PARSED_CHARS=500000
+DRAFT_PARSE_TIMEOUT_SECONDS=300
+DRAFT_POLL_INTERVAL_SECONDS=2.0
+DRAFT_QA_RETRY_LIMIT=2
+DRAFT_RESEARCH_RETRIEVAL_LIMIT=8
+DRAFT_ROOM_ENABLED=false
+DRAFT_SENSITIVE_ALLOWED_MODEL_ORIGINS=
+DRAFT_TRANSIENT_RETRY_LIMIT=5
+DRAFT_UPLOAD_RATE_LIMIT=20/minute
+FLAG_EMBEDDING_URL=
+INITIAL_RETRIEVAL_TOP_K=20
+INSTANT_CHAT_MODEL=minicpm5-2b
+INSTANT_CHAT_URL=http://host.docker.internal:8011
+INSTANT_INITIAL_RETRIEVAL_TOP_K=10
+INSTANT_RERANKER_TOP_N=4
+INSTANT_SKIP_RETRIEVAL_EVALUATION=true
+MULTIMODAL_CHAT_URL=
+OLLAMA_CHAT_URL=http://172.16.50.41:8000
+PARENT_RETRIEVAL_ENABLED=true
+PARENT_WINDOW_CHARS=6000
+RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_TOP_N=7
+RERANKER_URL=http://reranker:8081
+RERANKING_ENABLED=true
+TRI_VECTOR_SEARCH_ENABLED=false

@@ -26,7 +26,7 @@ Supporting data: `docs/eval/2026-09-meridian-qualification-data.json` (`deployme
 
 | Step | Result | Evidence |
 |---|---|---|
-| upload | pass | scratch/stageA_upload_search.transcript.json — upload 200 |
+| upload | pass | docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json — upload 200 |
 | parse | pass | phase progression parsing→writing_index→indexed, 2 chunks |
 | searchable | pass | keyword hit + semantic top 0.733 |
 | ask | pass | instant SSE stream with evidence + content + done |
@@ -48,7 +48,7 @@ Supporting data: `docs/eval/2026-09-meridian-qualification-data.json` (`deployme
 | cancelled | pass | client SSE disconnect; server persisted both turn rows |
 | recovered | pass-with-limitation | failed draft job retried (attempt 2, parent linkage); chat retry via truncate+resend; reindex recovery blocked (#645) |
 
-Input modes: keyboard — chat composer Enter-send exercised with vault-validation alert then success (scratch/browser_03_chat_keyboard_sent.png); touch — 375px document-details navigation exercised (scratch/browser_02_doc_detail_mobile_375.png); canvas editor not separately visited on a touch-class viewport.
+Input modes: keyboard — chat composer Enter-send exercised with vault-validation alert then success (docs/eval/2026-09-meridian-qualification-evidence/browser_03_chat_keyboard_sent.png); touch — real touchscreen taps in a hasTouch/isMobile 375px context: search-input focus tap and vault-selector menu tap with observable effects (docs/eval/2026-09-meridian-qualification-evidence/browser_06_touch_context_tap.png); canvas editor not separately visited on a touch viewport.
 
 ## Historical Evidence
 
@@ -75,7 +75,7 @@ Input modes: keyboard — chat composer Enter-send exercised with vault-validati
 
 | ID | Disposition | Evidence |
 |---|---|---|
-| DEEP-C-03 | closed-fixed | production causes identified live: `Circuit breaker 'llm_thinking' opened after 5 consecutive failures` / `All connection attempts failed` (scratch/log_thinking_outage_excerpt.txt); `attempt_cap_exceeded` + Event-loop detail (scratch/log_reindex_eventloop_excerpt.txt); PARSE_FAILED + extraction diagnostics. Narrowing: stream error code for the outage is coarse (EMBEDDING_ERROR); precise cause requires the log trail |
+| DEEP-C-03 | closed-fixed | production causes identified live: `Circuit breaker 'llm_thinking' opened after 5 consecutive failures` / `All connection attempts failed` (docs/eval/2026-09-meridian-qualification-evidence/log_thinking_outage_excerpt.txt); `attempt_cap_exceeded` + Event-loop detail (docs/eval/2026-09-meridian-qualification-evidence/log_reindex_eventloop_excerpt.txt); PARSE_FAILED + extraction diagnostics. Narrowing: stream error code for the outage is coarse (EMBEDDING_ERROR); precise cause requires the log trail |
 | DEEP-C-04 | closed-documented-limitation | browser limitations remain documented: same-origin CSRF enforcement by design, touch hardware not driven (layout-class only), Firefox/Edge not separately exercised — see Excluded Scope |
 
 ## Supplemental Registry Dispositions
@@ -415,7 +415,7 @@ Input modes: keyboard — chat composer Enter-send exercised with vault-validati
 |---|---|
 | supplemental-registry (54 IDs) | each shipped ID's owner-slot release note records its regression suite; closing PRs: #522/#525/#529/#530/#533/#565/#577/#647 |
 | original-audit-207 | per-owner regression coverage in the slot records above; master CI (Backend ruff+pytest, Frontend vitest/build, Playwright e2e, quality contracts, SAST baseline) green at the build commit |
-| DEEP-C-03 | docs/eval/2026-09-meridian-qualification-data.json deep_c evidence; live log excerpts scratch/log_thinking_outage_excerpt.txt |
+| DEEP-C-03 | docs/eval/2026-09-meridian-qualification-data.json deep_c evidence; live log excerpts docs/eval/2026-09-meridian-qualification-evidence/log_thinking_outage_excerpt.txt |
 | MODEL-RESEARCH-01 | docs/eval/2026-09-model-research.md and docs/eval/2026-09-model-qualification.md (F2) |
 | relevance-calibration | frontend/src/lib/relevance.test.ts + backend/tests/test_relevance_cutoff_calibration.py (PR #647) — observed live as max_distance_threshold 0.75 |
 
@@ -435,11 +435,11 @@ Baseline: `docs/eval/2026-09-performance.md` (F2, build 281bd714, thinking-model
 | turn queue-wait p50 (tier 1, instant) | 87.7 ms | 40 ms (F2 tier-1, thinking) | +47.7 ms; both sub-100 ms, healthy |
 | completion p50 (tier 1, instant) | 0.97 s | 41.2 s (F2 tier-1, thinking) | model mismatch — F2 baseline is the thinking model; like-for-like thinking re-run blocked by the outage (see Failures) |
 
-Raw: scratch/perf_tier1_instant.transcript.json (6 samples).
+Raw: docs/eval/2026-09-meridian-qualification-evidence/perf_tier1_instant.transcript.json (6 samples).
 
 ## Failures and Environment Deviations (read before rollout)
 
-1. **Thinking-model endpoint down (external).** http://172.16.50.41:8000 refused connections for the whole window (host pings, all scanned LLM ports closed; not repairable from the R640). Live-thinking, source-only-rewrite and mixed-source-compose gates are recorded FAIL. The product degraded honestly everywhere (error events, UI banner `Using instant — thinking unavailable`, draft job `provider_unavailable` with bounded retries and attempt tracking). Re-run procedure: restore the ChatGPTN service, then re-run scratch/stageB2_sessions_fix.py, stageD2/D3 and update the data JSON — minutes of work.
+1. **Thinking-model endpoint down (external).** http://172.16.50.41:8000 refused connections for the whole window (host pings, all scanned LLM ports closed; not repairable from the R640). Live-thinking, source-only-rewrite and mixed-source-compose gates are recorded FAIL. The product degraded honestly everywhere (error events, UI banner `Using instant — thinking unavailable`, draft job `provider_unavailable` with bounded retries and attempt tracking). Re-run procedure: restore the ChatGPTN service, then re-run docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions_fix.py, stageD2/D3 and update the data JSON — minutes of work.
 2. **Reindex failure (#645 class).** POST /api/documents/reindex failed `attempt_cap_exceeded: Embedding batch failed: Event loop is closed` — a live instance of open issue #645's defect class (on-loop pooled checkouts). Owned by #645; not fixed here (docs-only qualification slot).
 3. **Temporary CORS deviation (restored).** The lab network cannot reach the configured public proxy domains, and raw-IP browser origins are rejected by the same-origin CSRF design. To run the mandated browser legs, `BACKEND_CORS_ORIGINS` temporarily gained `http://172.16.50.159:9090` (backup at `/home/afmostai/ragappv3/.env.pre-f3-backup`), the container was recreated, and the original value was restored and health-gated immediately after the browser legs. Both recreations re-verified restart-survival.
 4. Draft Room was already enabled at runtime (`GET /api/draft-room/capabilities` enabled=true) despite the env default; no setting was changed by this qualification.
@@ -449,7 +449,7 @@ Raw: scratch/perf_tier1_instant.transcript.json (6 samples).
 - Rollout: the qualified build `edd2c741…` is deployed on R640AI as image `65aad900…` (container `knowledgevault`, compose project `ragappv3`, service `knowledgevault`, config `docker-compose.yml`, data bind-mounted at `/home/afmostai/ragappv3/data`). Recreate with `cd /home/afmostai/ragappv3 && docker compose up -d knowledgevault` after `git pull`; health-gate on `/api/health` (`status ok`, backend/embeddings/vector_store true).
 - Rollback (pinned): `docker tag 00d553f3eade ragappv3-knowledgevault:rollback-pre-f3-281bd714` was created before the rebuild; rollback = stop service, `docker run`/recreate from tag `ragappv3-knowledgevault:rollback-pre-f3-281bd714`, or `git checkout 281bd714` + rebuild. Data volume is untouched by both paths.
 - Operator-visible outcomes: post-qualification the deployment runs the final integrated build; `max_distance_threshold` 0.75 calibration live; Draft Room enabled; thinking-model outage banner visible until the external service is restored. Qualification artifacts (vault 8, fixtures, bench user) were removed; see Restoration.
-- Restoration record: scratch/pre-qualification-inventory.txt vs scratch/post-cleanup-inventory.txt — identical baselines (5 vaults, 93 files, 47 users, wiki 99, KMS 75+3 auto-compiled rows removed, memories 1).
+- Restoration record: docs/eval/2026-09-meridian-qualification-evidence/pre-qualification-inventory.txt vs docs/eval/2026-09-meridian-qualification-evidence/post-cleanup-inventory.txt — identical baselines (5 vaults, 93 files, 47 users, wiki 99, KMS 75+3 auto-compiled rows removed, memories 1).
 
 ## CI Gate Results
 

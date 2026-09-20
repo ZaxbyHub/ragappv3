@@ -1,0 +1,49 @@
+{
+  "steps": [
+    {
+      "step": "draft_create",
+      "status": 422,
+      "draft_id": null,
+      "body": "{\"detail\":[{\"loc\":[\"body\",\"brief\",\"transformation_strength\"],\"msg\":\"Field required\",\"type\":\"missing\",\"input\":{\"piece_type\":\"brief\",\"audience\":\"Program leadershi"
+    },
+    {
+      "step": "canvas_create",
+      "status": 200,
+      "artifact_uid": "cav_AVcSduAU0vKf5dXa",
+      "current_version": 1
+    },
+    {
+      "step": "canvas_edit_v2",
+      "status": 200,
+      "body": "{\"id\":25,\"version_no\":2,\"name\":null,\"origin\":\"user_edit\",\"content_sha256\":\"044830772174fd2ac0c2f275f35dd05cde4fe1e297558"
+    },
+    {
+      "step": "canvas_restore_v1",
+      "status": 200,
+      "body": "{\"id\":26,\"version_no\":3,\"name\":\"F3 Aeroshell Canvas\",\"origin\":\"restore\",\"content_sha256\":\"35f13447cdb63f96acffbae408d1ea"
+    },
+    {
+      "step": "canvas_versions",
+      "status": 200,
+      "n": 3,
+      "origins": [
+        "created",
+        "user_edit",
+        "restore"
+      ]
+    },
+    {
+      "step": "canvas_download_v1",
+      "status": 200,
+      "bytes": 56,
+      "disposition": "attachment; filename=\"F3_Aeroshell_Canvas.txt\""
+    },
+    {
+      "step": "canvas_export_manifest",
+      "status": 200,
+      "sha": "35f13447cdb63f96acffbae408d1ea054f0b956e84cb239ae9cb4a68542edc98",
+      "version": 3
+    }
+  ],
+  "canvas_uid": "cav_AVcSduAU0vKf5dXa"
+}

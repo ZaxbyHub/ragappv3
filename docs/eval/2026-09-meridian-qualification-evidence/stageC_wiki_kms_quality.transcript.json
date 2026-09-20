@@ -1,0 +1,68 @@
+{
+  "steps": [
+    {
+      "step": "settings",
+      "status": 200,
+      "values": {
+        "wiki_enabled": true,
+        "wiki_llm_curator_enabled": false,
+        "wiki_compile_on_query": true,
+        "kms_enabled": true,
+        "canvas_enabled": "<absent>",
+        "draft_room_enabled": true,
+        "default_chat_mode": "thinking",
+        "draft_default_logical_mode": "<absent>",
+        "reranking_enabled": true,
+        "max_distance_threshold": 0.75,
+        "hybrid_search_enabled": true,
+        "multimodal_enrichment_enabled": false
+      }
+    },
+    {
+      "step": "wiki_create_page",
+      "status": 400,
+      "page_id": null,
+      "body": "{\"detail\":\"Failed to create wiki page\"}"
+    },
+    {
+      "step": "wiki_compile_doc",
+      "status": 202,
+      "body": "{\"job_id\":371,\"status\":\"pending\"}"
+    },
+    {
+      "step": "kms_create",
+      "status": 201,
+      "entry_id": 77,
+      "body": "{\"id\":77,\"vault_id\":8,\"file_id\":null,\"slug\":\"f3-aeroshell-runbook\",\"title\":\"F3 Aeroshell Runbook\",\"body\":\"# Aeroshell Runbook\\n\\n**Owner:** Dana Whitfield\\n\\n- "
+    },
+    {
+      "step": "kms_edit",
+      "status": 200
+    },
+    {
+      "step": "kms_detail",
+      "status": 200,
+      "body_has_markdown_syntax": true,
+      "body_preview": "# Aeroshell Runbook\n\n**Owner:** Dana Whitfield\n\n- Calibrate the harbor light *be"
+    },
+    {
+      "step": "quality_report",
+      "status": 200,
+      "message_id": 94,
+      "body": "{\"id\":1,\"session_id\":16,\"message_id\":94,\"category\":\"stale_source\",\"note\":\"F3 journey quality-report leg\",\"turn_id\":\"f3-turn-c03ab6711779\",\"seq\":4,\"provenance\":{"
+    },
+    {
+      "step": "quality_convert",
+      "status": 200,
+      "body": "{\"id\":1,\"report_id\":1,\"query\":\"Summarize the harbor light protocol in one sentence.\",\"expected_outcome\":\"Dana Whitfield\",\"provenance\":{\"config_ref\":\"unknown\",\"m"
+    },
+    {
+      "step": "quality_compare",
+      "status": 200,
+      "body": "{\"case_id\":1,\"metrics\":{\"fact_coverage\":{\"before\":0.0,\"after\":1.0,\"delta\":1.0},\"citation_validity\":{\"before\":1.0,\"after\":1.0,\"delta\":0.0}}}"
+    }
+  ],
+  "kms_id": 77,
+  "wiki_page_id": null,
+  "vault_id": 8
+}

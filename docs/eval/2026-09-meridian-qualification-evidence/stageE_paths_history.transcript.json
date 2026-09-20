@@ -1,0 +1,68 @@
+{
+  "steps": [
+    {
+      "step": "upload_bad_ext",
+      "status": 400,
+      "detail": "File extension '.xyz' not allowed. Allowed: {'.log', '.xls', '.webp', '.txt', '.gif', '.bmp', '.xml'"
+    },
+    {
+      "step": "upload_empty",
+      "status": 400,
+      "detail": "File is empty"
+    },
+    {
+      "step": "upload_partial_pdf",
+      "status": 200,
+      "file_id": 102,
+      "detail": "pending"
+    },
+    {
+      "step": "partial_pdf_final",
+      "status": "error",
+      "chunks": 0,
+      "failed_chunks": 0,
+      "diagnostics": null,
+      "error": "PARSE_FAILED: document could not be parsed"
+    },
+    {
+      "step": "stream_cancel_client_disconnect",
+      "events_seen": 4,
+      "closed_ok": true
+    },
+    {
+      "step": "cancel_session_after_disconnect",
+      "n_messages": 2,
+      "statuses": [
+        "pending",
+        "complete"
+      ],
+      "roles": [
+        "user",
+        "assistant"
+      ]
+    },
+    {
+      "step": "reindex_start",
+      "status": 200,
+      "body": "{\"job_id\":374,\"status\":\"pending\",\"vault_id\":8}"
+    },
+    {
+      "step": "reindex_final",
+      "status": "failed",
+      "error": "attempt_cap_exceeded: Embedding batch failed: Event loop is closed"
+    },
+    {
+      "step": "search_after_reindex",
+      "n": 2,
+      "top_file": "101",
+      "top_score": 0.732742428779602
+    }
+  ],
+  "partial_file_id": 102,
+  "cancel_session": 18,
+  "pre_restart_top": {
+    "file_id": "101",
+    "score": 0.732742428779602,
+    "id": "101_0b2bfe94_768_0"
+  }
+}

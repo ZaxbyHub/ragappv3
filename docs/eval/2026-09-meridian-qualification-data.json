@@ -55,148 +55,148 @@
       }
     ],
     "fixtures": [
-      "F2 qualification corpus on the deployment (CDP/Slack/Legacy vaults, 93 files, unchanged \u2014 see scratch/pre-qualification-inventory.txt)",
+      "F2 qualification corpus on the deployment (CDP/Slack/Legacy vaults, 93 files, unchanged \u2014 see docs/eval/2026-09-meridian-qualification-evidence/pre-qualification-inventory.txt)",
       "F3 fixture alpha: f3_alpha_note.txt (text, citation anchor)",
       "F3 fixture inventory: f3_inventory.csv (structured/table)",
       "F3 fixture partial: truncated 3-page PDF (parse-failure boundary)"
     ]
   },
   "restoration": {
-    "pre_snapshot": "scratch/pre-qualification-inventory.txt \u2014 pre-qualification data inventory (5 vaults, 93 files, 47 users, wiki 99/0 claims, KMS 75, canvas 0)",
-    "cleanup_record": "scratch/post-cleanup-inventory.txt \u2014 post-cleanup inventory identical to pre-qualification baseline (vault 8, file 101/102/104, sessions 15/16/17, draft 3, KMS 77-79, wiki 100-103, claim 1, memory 2, bench user 55 all removed)"
+    "pre_snapshot": "docs/eval/2026-09-meridian-qualification-evidence/pre-qualification-inventory.txt \u2014 pre-qualification data inventory (5 vaults, 93 files, 47 users, wiki 99/0 claims, KMS 75, canvas 0)",
+    "cleanup_record": "docs/eval/2026-09-meridian-qualification-evidence/post-cleanup-inventory.txt \u2014 post-cleanup inventory identical to pre-qualification baseline (vault 8, file 101/102/104, sessions 15/16/17, draft 3, KMS 77-79, wiki 100-103, claim 1, memory 2, bench user 55 all removed)"
   },
   "cases": [
     {
       "id": "journey-upload",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageA_upload_search.transcript.json#upload \u2014 POST /api/documents/upload file 101 -> 200 pending; scratch/browser_01_documents_desktop.png",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#upload \u2014 POST /api/documents/upload file 101 -> 200 pending; docs/eval/2026-09-meridian-qualification-evidence/browser_01_documents_desktop.png",
       "step": "upload"
     },
     {
       "id": "journey-parse",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageA_upload_search.transcript.json#status_progression \u2014 phases parsing->writing_index->indexed, chunk_count 2",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#status_progression \u2014 phases parsing->writing_index->indexed, chunk_count 2",
       "step": "parse"
     },
     {
       "id": "journey-searchable",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageA_upload_search.transcript.json#keyword_search+semantic_search \u2014 keyword hits 1; semantic top distance 0.733 on file 101",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#keyword_search+semantic_search \u2014 keyword hits 1; semantic top distance 0.733 on file 101",
       "step": "searchable"
     },
     {
       "id": "journey-ask",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageB2_sessions.transcript.json#instant_turn \u2014 SSE mode/stage/evidence/content/done stream, 48 events",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#instant_turn \u2014 SSE mode/stage/evidence/content/done stream, 48 events",
       "step": "ask"
     },
     {
       "id": "journey-cited-answer",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageB2_sessions.transcript.json#instant_turn \u2014 answer cites [S1] f3_alpha_note.txt, score_type rerank, score 0.9805",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#instant_turn \u2014 answer cites [S1] f3_alpha_note.txt, score_type rerank, score 0.9805",
       "step": "cited-answer"
     },
     {
       "id": "journey-source-viewing",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageA_upload_search.transcript.json#chunk_context + scratch/stageB2_sessions.transcript.json \u2014 GET /api/search/chunks/{id}/context 200; UI source buttons S1/M1 in scratch/browser_03_chat_keyboard_sent.png",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#chunk_context + docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json \u2014 GET /api/search/chunks/{id}/context 200; UI source buttons S1/M1 in docs/eval/2026-09-meridian-qualification-evidence/browser_03_chat_keyboard_sent.png",
       "step": "source-viewing"
     },
     {
       "id": "journey-save-reload-retry-fork",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageB2_sessions.transcript.json#session_reload+truncate_keep_first_user+retry_turn+fork_session \u2014 2 durable messages with sources; truncate keep_seq=1; resend answered; fork session 17",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#session_reload+truncate_keep_first_user+retry_turn+fork_session \u2014 2 durable messages with sources; truncate keep_seq=1; resend answered; fork session 17",
       "step": "save-reload-retry-fork"
     },
     {
       "id": "journey-memory-wiki-kms-promotion-edit",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageB_chat_sessions.transcript.json#memory_create+memory_edit + scratch/stageC_wiki_kms_quality.transcript.json#kms_create+kms_edit + scratch/stageC2_wiki_caps.transcript.json#wiki_promote_memory \u2014 memory 2 created/edited, KMS 77 created/edited, memory promoted to wiki page 102",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB_chat_sessions.transcript.json#memory_create+memory_edit + docs/eval/2026-09-meridian-qualification-evidence/stageC_wiki_kms_quality.transcript.json#kms_create+kms_edit + docs/eval/2026-09-meridian-qualification-evidence/stageC2_wiki_caps.transcript.json#wiki_promote_memory \u2014 memory 2 created/edited, KMS 77 created/edited, memory promoted to wiki page 102",
       "step": "memory-wiki-kms-promotion-edit"
     },
     {
       "id": "journey-draft-compose-rewrite",
       "kind": "journey",
       "status": "fail",
-      "evidence": "scratch/stageD3_draft_compile.transcript.json#draft_compile_final \u2014 compile job 12 failed provider_unavailable at research stage (thinking-model endpoint down, external); scratch/log_thinking_outage_excerpt.txt",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json#draft_compile_final \u2014 compile job 12 failed provider_unavailable at research stage (thinking-model endpoint down, external); docs/eval/2026-09-meridian-qualification-evidence/log_thinking_outage_excerpt.txt",
       "step": "draft-compose-rewrite"
     },
     {
       "id": "journey-findings-compare",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageC_wiki_kms_quality.transcript.json#quality_report+quality_convert+quality_compare \u2014 report 1 -> eval case 1 -> compare metrics fact_coverage delta 1.0",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageC_wiki_kms_quality.transcript.json#quality_report+quality_convert+quality_compare \u2014 report 1 -> eval case 1 -> compare metrics fact_coverage delta 1.0",
       "step": "findings-compare"
     },
     {
       "id": "journey-export",
       "kind": "journey",
       "status": "pass-with-limitation",
-      "evidence": "scratch/stageD_draft_canvas.transcript.json#canvas_download_v1+canvas_export_manifest \u2014 canvas v1 download 200 (Content-Disposition attachment) + export manifest sha256 35f13447...; draft export unexercised (compose blocked, external)",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD_draft_canvas.transcript.json#canvas_download_v1+canvas_export_manifest \u2014 canvas v1 download 200 (Content-Disposition attachment) + export manifest sha256 35f13447...; draft export unexercised (compose blocked, external)",
       "step": "export"
     },
     {
       "id": "journey-canvas-edit-restore-download",
       "kind": "journey",
       "status": "pass",
-      "evidence": "scratch/stageD_draft_canvas.transcript.json#canvas_create+canvas_edit_v2+canvas_restore_v1+canvas_versions \u2014 artifact cav_AVcSduAU0vKf5dXa versions created/user_edit/restore",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD_draft_canvas.transcript.json#canvas_create+canvas_edit_v2+canvas_restore_v1+canvas_versions \u2014 artifact cav_AVcSduAU0vKf5dXa versions created/user_edit/restore",
       "step": "canvas-edit-restore-download"
     },
     {
       "id": "path-failed",
       "kind": "path",
       "status": "pass",
-      "evidence": "scratch/stageE_paths_history.transcript.json#upload_bad_ext+upload_empty+partial_pdf_final \u2014 400 .xyz not allowed; 400 empty; truncated PDF -> error PARSE_FAILED surfaced, index unpolluted",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#upload_bad_ext+upload_empty+partial_pdf_final \u2014 400 .xyz not allowed; 400 empty; truncated PDF -> error PARSE_FAILED surfaced, index unpolluted",
       "path": "failed"
     },
     {
       "id": "path-partial",
       "kind": "path",
       "status": "pass-with-limitation",
-      "evidence": "scratch/stageE_paths_history.transcript.json#partial_pdf_final \u2014 truncated PDF failed at parse boundary with clean error and zero partial chunks indexed; a mid-batch partial-embedding state was not forcibly produced",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#partial_pdf_final \u2014 truncated PDF failed at parse boundary with clean error and zero partial chunks indexed; a mid-batch partial-embedding state was not forcibly produced",
       "path": "partial"
     },
     {
       "id": "path-cancelled",
       "kind": "path",
       "status": "pass",
-      "evidence": "scratch/stageE_paths_history.transcript.json#stream_cancel_client_disconnect+cancel_session_after_disconnect \u2014 client closed SSE after 4 events; server persisted user+assistant rows (statuses pending/complete)",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#stream_cancel_client_disconnect+cancel_session_after_disconnect \u2014 client closed SSE after 4 events; server persisted user+assistant rows (statuses pending/complete)",
       "path": "cancelled"
     },
     {
       "id": "path-recovered",
       "kind": "path",
       "status": "pass-with-limitation",
-      "evidence": "scratch/draft_retry.transcript.json#draft_job_retry+draft_retry_final \u2014 failed job 12 requeued as job 13 (attempt 2, parent linkage) with bounded failure; chat retry via truncate+resend in scratch/stageB2_sessions.transcript.json; reindex recovery blocked (see history:reindex)",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/draft_retry.transcript.json#draft_job_retry+draft_retry_final \u2014 failed job 12 requeued as job 13 (attempt 2, parent linkage) with bounded failure; chat retry via truncate+resend in docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json; reindex recovery blocked (see history:reindex)",
       "path": "recovered"
     },
     {
       "id": "input-keyboard",
       "kind": "input-mode",
       "status": "pass",
-      "evidence": "scratch/browser_03_chat_keyboard_sent.png + scratch/stageG_structured_stale.transcript.json \u2014 keyboard-only: composer Enter submitted (vault-required alert then successful send), message streamed with citations",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_03_chat_keyboard_sent.png + docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json \u2014 keyboard-only: composer Enter submitted (vault-required alert then successful send), message streamed with citations",
       "mode": "keyboard"
     },
     {
       "id": "input-touch",
       "kind": "input-mode",
-      "status": "pass-with-limitation",
-      "evidence": "scratch/browser_02_doc_detail_mobile_375.png \u2014 document details card -> detail page navigable at 375px viewport (touch-class layout); canvas editor not separately visited on a touch-class viewport",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_06_touch_context_tap.png \u2014 real touchscreen taps in a hasTouch/isMobile 375px context (navigator.maxTouchPoints=1): tap focused the document search input and tap opened the vault selector menu with observable effects; canvas editor not separately visited on a touch viewport",
       "mode": "touch"
     },
     {
       "id": "history-document-replacement",
       "kind": "history",
       "status": "pass-with-limitation",
-      "evidence": "scratch/stageG_structured_stale.transcript.json#delete_beta+replacement_upload \u2014 delete 200 + re-upload of same filename with changed content (file 104) indexed; product has no in-place replace endpoint, replacement is delete+re-upload; prior citations to the deleted file resolved to remaining chunks without error",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json#delete_beta+replacement_upload \u2014 delete 200 + re-upload of same filename with changed content (file 104) indexed; product has no in-place replace endpoint, replacement is delete+re-upload; prior citations to the deleted file resolved to remaining chunks without error",
       "phase": "document-replacement",
       "retained": true
     },
@@ -204,7 +204,7 @@
       "id": "history-reindex",
       "kind": "history",
       "status": "fail",
-      "evidence": "scratch/stageE_paths_history.transcript.json#reindex_final \u2014 POST /api/documents/reindex job 374 failed attempt_cap_exceeded: 'Embedding batch failed: Event loop is closed'; defect class owned by open issue #645; scratch/log_reindex_eventloop_excerpt.txt",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#reindex_final \u2014 POST /api/documents/reindex job 374 failed attempt_cap_exceeded: 'Embedding batch failed: Event loop is closed'; defect class owned by open issue #645; docs/eval/2026-09-meridian-qualification-evidence/log_reindex_eventloop_excerpt.txt",
       "phase": "reindex",
       "retained": false
     },
@@ -212,7 +212,7 @@
       "id": "history-restart",
       "kind": "history",
       "status": "pass",
-      "evidence": "scratch/stageF_restart.transcript.json \u2014 after docker restart: same search top chunk 101_0b2bfe94_768_0 score 0.733, session 16 with 4 messages, wiki/KMS/canvas intact",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageF_restart.transcript.json \u2014 after docker restart: same search top chunk 101_0b2bfe94_768_0 score 0.733, session 16 with 4 messages, wiki/KMS/canvas intact",
       "phase": "restart",
       "retained": true
     },
@@ -220,122 +220,122 @@
       "id": "gate-live-thinking",
       "kind": "live-gate",
       "status": "fail",
-      "evidence": "scratch/stageB2_sessions.transcript.json#thinking_attempt \u2014 stream error event code EMBEDDING_ERROR, empty done, no blank completed turn; production cause in scratch/log_thinking_outage_excerpt.txt: circuit breaker llm_thinking opened after 5 consecutive failures, All connection attempts failed to configured thinking endpoint http://172.16.50.41:8000 (external host down, ports closed)",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#thinking_attempt \u2014 stream error event code EMBEDDING_ERROR, empty done, no blank completed turn; production cause in docs/eval/2026-09-meridian-qualification-evidence/log_thinking_outage_excerpt.txt: circuit breaker llm_thinking opened after 5 consecutive failures, All connection attempts failed to configured thinking endpoint http://172.16.50.41:8000 (external host down, ports closed)",
       "gate": "live-thinking"
     },
     {
       "id": "gate-live-instant",
       "kind": "live-gate",
       "status": "pass",
-      "evidence": "scratch/stageB2_sessions.transcript.json#instant_turn \u2014 instant cited answer with rerank source; scratch/perf_tier1_instant.transcript.json \u2014 6/6 turns OK p50 completion 0.97s",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#instant_turn \u2014 instant cited answer with rerank source; docs/eval/2026-09-meridian-qualification-evidence/perf_tier1_instant.transcript.json \u2014 6/6 turns OK p50 completion 0.97s",
       "gate": "live-instant"
     },
     {
       "id": "gate-source-only-rewrite",
       "kind": "live-gate",
       "status": "fail",
-      "evidence": "scratch/stageD3_draft_compile.transcript.json + scratch/draft_retry.transcript.json \u2014 draft pipeline requires the thinking model (draft_default_logical_mode=thinking, env-only); compile + retry fail provider_unavailable at research; same external outage as live-thinking",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json + docs/eval/2026-09-meridian-qualification-evidence/draft_retry.transcript.json \u2014 draft pipeline requires the thinking model (draft_default_logical_mode=thinking, env-only); compile + retry fail provider_unavailable at research; same external outage as live-thinking",
       "gate": "source-only-rewrite"
     },
     {
       "id": "gate-mixed-source-compose",
       "kind": "live-gate",
       "status": "fail",
-      "evidence": "scratch/stageD2_draft.transcript.json#draft_input_parse \u2014 input uploaded and parsed ready (279 chars); compose cannot complete while thinking endpoint is down (scratch/stageD3_draft_compile.transcript.json)",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD2_draft.transcript.json#draft_input_parse \u2014 input uploaded and parsed ready (279 chars); compose cannot complete while thinking endpoint is down (docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json)",
       "gate": "mixed-source-compose"
     },
     {
       "id": "gate-scanned-table-structured-document",
       "kind": "live-gate",
       "status": "pass-with-limitation",
-      "evidence": "scratch/stageG_structured_stale.transcript.json#csv_final + scratch/stageG2_structured_retry.transcript.json#structured_keyword_search \u2014 CSV ingested, indexed, keyword-searchable (AS-1002 total 1); limitation: table chunk did not surface in semantic retrieval for content queries; ask declined honestly instead of hallucinating",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json#csv_final + docs/eval/2026-09-meridian-qualification-evidence/stageG2_structured_retry.transcript.json#structured_keyword_search \u2014 CSV ingested, indexed, keyword-searchable (AS-1002 total 1); limitation: table chunk did not surface in semantic retrieval for content queries; ask declined honestly instead of hallucinating",
       "gate": "scanned-table-structured-document"
     },
     {
       "id": "gate-no-answer-contradictory",
       "kind": "live-gate",
       "status": "pass",
-      "evidence": "scratch/stageG_structured_stale.transcript.json#contradictory_case \u2014 'No, Bob Smith is not the director... Dana Whitfield directs [M1]' \u2014 corrects from memory+vault with citation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json#contradictory_case \u2014 'No, Bob Smith is not the director... Dana Whitfield directs [M1]' \u2014 corrects from memory+vault with citation",
       "gate": "no-answer-contradictory"
     },
     {
       "id": "gate-subpath-layout",
       "kind": "live-gate",
       "status": "pass",
-      "evidence": "scratch/browser_01_documents_desktop.png + scratch/browser_04_kms_markdown_rendered.png \u2014 full app served and navigable under /meridian (login, documents, chat, kms, settings) against API on same origin",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_01_documents_desktop.png + docs/eval/2026-09-meridian-qualification-evidence/browser_04_kms_markdown_rendered.png \u2014 full app served and navigable under /meridian (login, documents, chat, kms, settings) against API on same origin",
       "gate": "subpath-layout"
     },
     {
       "id": "gate-mobile-layout",
       "kind": "live-gate",
       "status": "pass",
-      "evidence": "scratch/browser_02_doc_detail_mobile_375.png \u2014 375px viewport: document detail heading, Back, Ask/Download, Details, Preview pane all rendered",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_02_doc_detail_mobile_375.png \u2014 375px viewport: document detail heading, Back, Ask/Download, Details, Preview pane all rendered",
       "gate": "mobile-layout"
     },
     {
       "id": "gate-disconnect-restart-retry",
       "kind": "live-gate",
       "status": "pass",
-      "evidence": "scratch/stageE_paths_history.transcript.json#stream_cancel_client_disconnect + scratch/stageF_restart.transcript.json + scratch/stageB2_sessions.transcript.json#retry_turn \u2014 disconnect, container restart, and turn retry all exercised on the final build",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#stream_cancel_client_disconnect + docs/eval/2026-09-meridian-qualification-evidence/stageF_restart.transcript.json + docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#retry_turn \u2014 disconnect, container restart, and turn retry all exercised on the final build",
       "gate": "disconnect-restart-retry"
     },
     {
       "id": "gate-failed-original-preview",
       "kind": "live-gate",
       "status": "pass-with-limitation",
-      "evidence": "scratch/stageE_paths_history.transcript.json#partial_pdf_final \u2014 failed-parse document surfaces error status cleanly (PARSE_FAILED, no partial index pollution); UI preview pane of the failed-parse document not separately screenshotted",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#partial_pdf_final \u2014 failed-parse document surfaces error status cleanly (PARSE_FAILED, no partial index pollution); UI preview pane of the failed-parse document not separately screenshotted",
       "gate": "failed-original-preview"
     },
     {
       "id": "gate-stale-source",
       "kind": "live-gate",
       "status": "pass-with-limitation",
-      "evidence": "scratch/stageG_structured_stale.transcript.json#stale_source_chunk_context+search_after_beta_delete \u2014 after source deletion, chunk-context endpoint and search resolved to remaining chunks without error; the deleted-file citation itself was not re-opened in the UI viewer",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json#stale_source_chunk_context+search_after_beta_delete \u2014 after source deletion, chunk-context endpoint and search resolved to remaining chunks without error; the deleted-file citation itself was not re-opened in the UI viewer",
       "gate": "stale-source"
     }
   ],
   "symptoms": {
     "blank-thinking": {
       "disposition": "resolved",
-      "evidence": "scratch/stageB2_sessions.transcript.json#thinking_attempt \u2014 a failed thinking turn emits an explicit error event and an empty done frame, never a blank completed answer; UI additionally shows 'Using instant \u2014 thinking unavailable' (browser_03 transcript log)"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#thinking_attempt \u2014 a failed thinking turn emits an explicit error event and an empty done frame, never a blank completed answer; UI additionally shows 'Using instant \u2014 thinking unavailable' (browser_03 transcript log)"
     },
     "contradictory-upload-status": {
       "disposition": "resolved",
-      "evidence": "scratch/stageA_upload_search.transcript.json#status_progression \u2014 API status/phase progression coherent (pending->processing->indexed); UI status cell text matched terminal state in scratch/browser_01_documents_desktop.png"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#status_progression \u2014 API status/phase progression coherent (pending->processing->indexed); UI status cell text matched terminal state in docs/eval/2026-09-meridian-qualification-evidence/browser_01_documents_desktop.png"
     },
     "missing-previews": {
       "disposition": "resolved",
-      "evidence": "scratch/browser_02_doc_detail_mobile_375.png \u2014 Preview pane renders full extracted text; scratch/stageA_upload_search.transcript.json#chunk_context serves chunk context"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_02_doc_detail_mobile_375.png \u2014 Preview pane renders full extracted text; docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#chunk_context serves chunk context"
     },
     "raw-kms-markdown": {
       "disposition": "resolved",
-      "evidence": "scratch/browser_04_kms_markdown_rendered.png \u2014 KMS entry body Markdown rendered natively (h1, strong, emphasis, list, code block with copy button), not literal syntax"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_04_kms_markdown_rendered.png \u2014 KMS entry body Markdown rendered natively (h1, strong, emphasis, list, code block with copy button), not literal syntax"
     },
     "claimless-wiki-wording": {
       "disposition": "resolved",
-      "evidence": "scratch/stageC2_wiki_caps.transcript.json#wiki_page_detail_claims_layer \u2014 page detail serves the claims layer (claim statuses); claim creation and memory->wiki promotion produce active claims; claimless-page wording shipped by #515 remains in UI copy (not separately screenshotted this run)"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageC2_wiki_caps.transcript.json#wiki_page_detail_claims_layer \u2014 page detail serves the claims layer (claim statuses); claim creation and memory->wiki promotion produce active claims; claimless-page wording shipped by #515 remains in UI copy (not separately screenshotted this run)"
     },
     "inaccessible-mobile-details": {
       "disposition": "resolved",
-      "evidence": "scratch/browser_02_doc_detail_mobile_375.png \u2014 document details fully navigable at 375px (LIVE-04 fix)"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_02_doc_detail_mobile_375.png \u2014 document details fully navigable at 375px (LIVE-04 fix)"
     },
     "stale-saving-accessibility": {
       "disposition": "resolved",
-      "evidence": "scratch/browser_05_settings_idle_no_saving.png \u2014 idle Settings page exposes no false Saving status; the only alert region carries the honest thinking-outage banner"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_05_settings_idle_no_saving.png \u2014 idle Settings page exposes no false Saving status; the only alert region carries the honest thinking-outage banner"
     },
     "incomplete-draft-fact-status": {
       "disposition": "documented-limitation",
-      "evidence": "scratch/stageD3_draft_compile.transcript.json + scratch/stageD_draft_canvas.transcript.json \u2014 fact_status enum exists on revisions and export headers (X-Draft-Fact-Status verified in code); live fact-status display not exercisable because compose could not complete during the thinking outage"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json + docs/eval/2026-09-meridian-qualification-evidence/stageD_draft_canvas.transcript.json \u2014 fact_status enum exists on revisions and export headers (X-Draft-Fact-Status verified in code); live fact-status display not exercisable because compose could not complete during the thinking outage"
     }
   },
   "deep_c": {
     "DEEP-C-03": {
       "disposition": "closed-fixed",
-      "evidence": "scratch/log_thinking_outage_excerpt.txt + scratch/log_reindex_eventloop_excerpt.txt + scratch/stageE_paths_history.transcript.json#partial_pdf_final \u2014 production causes ARE identified on the final build: stream failures carry error codes, logs name the exact cause (circuit breaker llm_thinking opened after 5 consecutive failures; All connection attempts failed; attempt_cap_exceeded with Event-loop detail; PARSE_FAILED with extraction diagnostics). Narrowing note: the stream error code for the thinking outage is the coarse EMBEDDING_ERROR rather than a provider-specific code \u2014 precise cause requires the log trail (recorded as residual narrowing, not a blocker)"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/log_thinking_outage_excerpt.txt + docs/eval/2026-09-meridian-qualification-evidence/log_reindex_eventloop_excerpt.txt + docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#partial_pdf_final \u2014 production causes ARE identified on the final build: stream failures carry error codes, logs name the exact cause (circuit breaker llm_thinking opened after 5 consecutive failures; All connection attempts failed; attempt_cap_exceeded with Event-loop detail; PARSE_FAILED with extraction diagnostics). Narrowing note: the stream error code for the thinking outage is the coarse EMBEDDING_ERROR rather than a provider-specific code \u2014 precise cause requires the log trail (recorded as residual narrowing, not a blocker)"
     },
     "DEEP-C-04": {
       "disposition": "closed-documented-limitation",
-      "evidence": "scratch/browser_02_doc_detail_mobile_375.png + scratch/browser_05_settings_idle_no_saving.png + docs/eval/2026-09-meridian-qualification.md Excluded Scope \u2014 browser limitations remain documented limitations: same-origin CSRF enforcement (raw-IP browser origin outside BACKEND_CORS_ORIGINS is rejected by design; public proxy domains unreachable from the lab network), touch-device hardware not driven by this harness (layout-class verification only), Firefox/Edge not separately exercised"
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_02_doc_detail_mobile_375.png + docs/eval/2026-09-meridian-qualification-evidence/browser_05_settings_idle_no_saving.png + docs/eval/2026-09-meridian-qualification.md Excluded Scope \u2014 browser limitations remain documented limitations: same-origin CSRF enforcement (raw-IP browser origin outside BACKEND_CORS_ORIGINS is rejected by design; public proxy domains unreachable from the lab network), touch-device hardware not driven by this harness (layout-class verification only), Firefox/Edge not separately exercised"
     }
   }
 }
