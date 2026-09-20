@@ -2194,7 +2194,7 @@ async def _compensate_failed_registration(
     """
     if row_created_by_request and file_id is not None:
         try:
-            conn = await asyncio.to_thread(db_pool.get_connection)
+            conn = await db_pool.get_connection_async()
         except Exception as exc:  # noqa: BLE001 — pool failure must not mask the cause
             logger.warning(
                 "Upload compensation could not acquire a connection for "
@@ -2448,7 +2448,7 @@ async def _do_upload(
             # collapse to a single ingestion instead of both racing through
             # to the partial unique index ``idx_files_hash_vault_indexed``,
             # which would surface as a generic IntegrityError on the loser.
-            conn = await asyncio.to_thread(db_pool.get_connection)
+            conn = await db_pool.get_connection_async()
             try:
                 duplicate = processor._check_duplicate_in_flight(
                     file_hash, conn, vault_id

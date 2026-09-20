@@ -110,7 +110,7 @@ async def create_service_account(
     now = datetime.now(timezone.utc).isoformat()
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = await asyncio.to_thread(pool.get_connection)
+    conn = await pool.get_connection_async()
     try:
         cursor = await asyncio.to_thread(
             conn.execute,
@@ -155,7 +155,7 @@ async def list_service_accounts(
 ):
     """List all service accounts (metadata only — raw keys are never returned)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = await asyncio.to_thread(pool.get_connection)
+    conn = await pool.get_connection_async()
     try:
         cursor = await asyncio.to_thread(
             conn.execute,
@@ -195,7 +195,7 @@ async def rotate_service_account_key(
     now = datetime.now(timezone.utc).isoformat()
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = await asyncio.to_thread(pool.get_connection)
+    conn = await pool.get_connection_async()
     try:
         # Generate new key BEFORE the atomic conditional UPDATE to avoid
         # allocating entropy on a row that may already be revoked.
@@ -258,7 +258,7 @@ async def revoke_service_account(
     now = datetime.now(timezone.utc).isoformat()
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = await asyncio.to_thread(pool.get_connection)
+    conn = await pool.get_connection_async()
     try:
         cursor = await asyncio.to_thread(
             conn.execute,
