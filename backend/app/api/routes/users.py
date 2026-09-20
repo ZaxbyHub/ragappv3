@@ -163,7 +163,7 @@ async def create_user(
     hashed_password = await async_hash_password(body.password)
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     try:
         # Check username uniqueness (case-insensitive)
@@ -232,7 +232,7 @@ async def list_users(
 ):
     """List all users (admin/superadmin only). Optional ?q= search filter."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     try:
         if q:
@@ -275,7 +275,7 @@ async def get_user(
 ):
     """Get user details (admin/superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     try:
         cursor = await asyncio.to_thread(conn.execute, "SELECT id, username, full_name, role, is_active, created_at FROM users WHERE id = ?", (user_id,))
@@ -489,7 +489,7 @@ async def update_user_role(
     assert_can_assign_role(user.get("role"), None, body.role)
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     try:
         cursor = await asyncio.to_thread(conn.execute, "SELECT role FROM users WHERE id = ?", (user_id,))
@@ -546,7 +546,7 @@ async def update_user_active(
     before the database operation.
     """
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     try:
         # Cannot deactivate your own account
@@ -604,7 +604,7 @@ async def delete_user(
 ):
     """Delete user (superadmin only). Cannot delete last superadmin or self."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     try:
         cursor = await asyncio.to_thread(conn.execute, "SELECT role FROM users WHERE id = ?", (user_id,))
@@ -733,7 +733,7 @@ async def get_user_organizations(
 ):
     """Get all organizations a user belongs to (admin/superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         cursor = await asyncio.to_thread(conn.execute, "SELECT id FROM users WHERE id = ?", (user_id,))
         if not await asyncio.to_thread(cursor.fetchone):
@@ -782,7 +782,7 @@ async def update_user_organizations(
 ):
     """Replace user's organization memberships (admin/superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     def _update_orgs():
         # Verify user exists
@@ -908,7 +908,7 @@ async def get_user_groups(
 ):
     """Get all groups a user is a member of (admin/superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     try:
         # Verify user exists
@@ -968,7 +968,7 @@ async def update_user_groups(
     Validates that all groups exist and that the user is a member of each group's organization.
     """
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
 
     def _update_groups():
         # Verify user exists

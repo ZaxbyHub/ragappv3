@@ -126,7 +126,7 @@ def _is_org_admin_or_owner(conn: sqlite3.Connection, org_id: int, user_id: int) 
 async def list_organizations(user: dict = Depends(require_role("member"))):
     """List organizations. Superadmin/admin see all; others see their own."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         user_role = user.get("role", "")
         if user_role in ("superadmin", "admin"):
@@ -184,7 +184,7 @@ async def create_organization(
 ):
     """Create a new organization with the current user as owner."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         slug = _generate_slug(req.name)
         try:
@@ -247,7 +247,7 @@ async def get_organization(
 ):
     """Get organization details with members list."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists first (before revealing membership info)
         cursor = await asyncio.to_thread(
@@ -331,7 +331,7 @@ async def update_organization(
 ):
     """Update organization details (admin or owner only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -426,7 +426,7 @@ async def list_org_members(
 ):
     """List members of an organization."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -484,7 +484,7 @@ async def add_org_member(
 ):
     """Add a member to organization (admin or owner only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -616,7 +616,7 @@ async def create_org_invite(
 ):
     """Create an invite for a user to join an organization (admin/owner only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -705,7 +705,7 @@ async def resend_org_invite(
 ):
     """Resend an invite with a new token (admin/owner only). Invalidates old token."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -775,7 +775,7 @@ async def revoke_org_invite(
 ):
     """Revoke an invite (admin/owner only). Idempotent-ish."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -826,7 +826,7 @@ async def list_org_invites(
 ):
     """List invites for an organization (admin/owner only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -884,7 +884,7 @@ async def accept_org_invite(
     token_hash = hashlib.sha256(req.token.encode()).hexdigest()
 
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Look up invite by token hash
         cursor = await asyncio.to_thread(
@@ -1000,7 +1000,7 @@ async def update_org_member_role(
 ):
     """Update a member's role (admin or owner only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -1082,7 +1082,7 @@ async def remove_org_member(
 ):
     """Remove a member from organization (admin or owner only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -1158,7 +1158,7 @@ async def transfer_ownership(
 ):
     """Transfer organization ownership to another member (current owner or superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         cursor = await asyncio.to_thread(
             conn.execute,
@@ -1231,7 +1231,7 @@ async def delete_organization(
 ):
     """Delete organization and all associated data (superadmin only)."""
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check organization exists
         cursor = await asyncio.to_thread(
@@ -1292,7 +1292,7 @@ async def set_prompt_override(
     the global active if no override is set).
     """
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check org exists
         cursor = await asyncio.to_thread(
@@ -1348,7 +1348,7 @@ async def clear_prompt_override(
     the org uses the global active version. Returns the global active version.
     """
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check org exists
         cursor = await asyncio.to_thread(
@@ -1400,7 +1400,7 @@ async def get_prompt_override(
     Does not require org admin/owner — any org member can read the effective version.
     """
     pool = get_pool(str(settings.sqlite_path))
-    conn = pool.get_connection()
+    conn = await asyncio.to_thread(pool.get_connection)
     try:
         # Check org exists
         cursor = await asyncio.to_thread(
