@@ -403,3 +403,26 @@ def test_concurrent_delayed_creation_respects_per_caller_deadline(db_path, monke
             pool.release_connection(conn)
     finally:
         pool.close_all()
+
+
+def test_checkout_creates_missing_parent_directory(tmp_path):
+    """(#650 CI) A pool pointed at a path whose parent directory does not
+    exist yet (fresh clone / fresh CI runner, cwd-relative data dir) must
+    still check out: _create_connection creates the parent directory the
+    same way database.py's init flow does, instead of failing every
+    checkout with 'unable to open database file'.
+    """
+    from app.models.database import SQLiteConnectionPool
+
+    missing_dir = tmp_path / "data" / "nested"
+    db_path = missing_dir / "app.db"
+    assert not missing_dir.exists()
+
+    pool = SQLiteConnectionPool(str(db_path), max_size=1)
+    try:
+        conn = pool.get_connection()
+        conn.execute("SELECT 1")
+        assert missing_dir.exists()
+        pool.release_connection(conn)
+    finally:
+        pool.close_all()

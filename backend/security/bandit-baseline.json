@@ -36,7 +36,7 @@
       "SEVERITY.LOW": 62,
       "SEVERITY.MEDIUM": 60,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 80906,
+      "loc": 81126,
       "nosec": 0,
       "skipped_tests": 56
     },
@@ -75,7 +75,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 136,
+      "loc": 135,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -114,7 +114,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 2848,
+      "loc": 2847,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -309,7 +309,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1533,
+      "loc": 1559,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -387,7 +387,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 1402,
+      "loc": 1407,
       "nosec": 0,
       "skipped_tests": 1
     },
@@ -517,7 +517,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5306,
+      "loc": 5448,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -829,7 +829,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 1,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 151,
+      "loc": 163,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -842,7 +842,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 631,
+      "loc": 635,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -933,7 +933,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 701,
+      "loc": 700,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1245,7 +1245,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 942,
+      "loc": 949,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -1596,7 +1596,7 @@
       "SEVERITY.LOW": 0,
       "SEVERITY.MEDIUM": 0,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 80,
+      "loc": 107,
       "nosec": 0,
       "skipped_tests": 0
     },
@@ -3592,7 +3592,7 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
-      "code": "122             conn.execute(\n123                 f\"UPDATE files SET {', '.join(sets)} WHERE id = ?\",\n124                 params,\n",
+      "code": "124             conn.execute(\n125                 f\"UPDATE files SET {', '.join(sets)} WHERE id = ?\",\n126                 params,\n",
       "col_offset": 16,
       "end_col_offset": 66,
       "filename": "backend/app/services/document_progress.py",
@@ -3603,9 +3603,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Possible SQL injection vector through string-based query construction.",
-      "line_number": 123,
+      "line_number": 125,
       "line_range": [
-        123
+        125
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b608_hardcoded_sql_expressions.html",
       "test_id": "B608",

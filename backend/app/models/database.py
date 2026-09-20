@@ -5101,6 +5101,13 @@ class SQLiteConnectionPool:
         Raises:
             sqlite3.Error: If connection creation fails.
         """
+        # Ensure the parent directory exists: sqlite3.connect cannot create
+        # intermediate directories, and a fresh checkout / CI runner without
+        # the data dir fails every checkout with "unable to open database
+        # file" (the same gap database.py's init flow already covers with
+        # mkdir(parents=True); CI hit it order-dependently via the health
+        # probe auth dependency, PR #650).
+        Path(self.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         try:
             conn.row_factory = sqlite3.Row
