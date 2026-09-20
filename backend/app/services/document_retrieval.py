@@ -16,6 +16,17 @@ from typing import Any, Dict, List, Optional, Set
 # mistaken for a hash (PR #523 review PRR-008).
 _RE_HASH8 = re.compile(r"^(?=[0-9a-f]{8}$)(?=[0-9a-f]*[a-f])[0-9a-f]{8}$")
 
+# Floor for the similarity-score fallback in filter_relevant: records WITHOUT
+# an explicit `_distance` carry a bare higher-is-better `score`, so their
+# comparison is INVERTED relative to cosine distance (skip when score < floor).
+# This floor is deliberately DECOUPLED from max_distance_threshold (the #36
+# calibration raised that distance max 0.5 → 0.75): one constant must not serve
+# two opposite polarities — sharing it made the 0.5→0.75 move silently drop
+# 0.5–0.75 scores here (CI regression: test_rag_engine_vault_isolation). The
+# floor keeps the legacy pre-calibration score behavior; the #36 calibration
+# measured cosine DISTANCE only.
+FALLBACK_SCORE_FLOOR = 0.5
+
 from app.config import settings  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -434,9 +445,14 @@ class DocumentRetrievalService:
             should_skip = False
             if not skip_distance_filter and threshold is not None:
                 if has_distance:
+                    # Cosine-distance semantics: max threshold (issue #36
+                    # calibration, 0.75 for the Harrier scale).
                     should_skip = distance > threshold
                 else:
-                    should_skip = distance < threshold
+                    # Similarity-score fallback (higher = better): use the
+                    # dedicated floor, NOT the distance max — see
+                    # FALLBACK_SCORE_FLOOR above for the polarity rationale.
+                    should_skip = distance < FALLBACK_SCORE_FLOOR
 
             if should_skip:
                 continue

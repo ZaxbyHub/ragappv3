@@ -66,3 +66,44 @@ def test_distance_filter_explicit_05_still_drops():
     kept = asyncio.run(service.filter_relevant(_gold_record(), reranked=False))
     assert kept == []
     assert service.no_match is True
+
+
+def _fallback_score_record(score):
+    """A record with NO `_distance`: the similarity-score fallback branch
+    (bare higher-is-better `score`, compared against FALLBACK_SCORE_FLOOR).
+    This is the branch the CI round-4 regression hit — raising the shared
+    constant to 0.75 silently dropped a 0.7-score fixture record in
+    test_rag_engine_vault_isolation."""
+    return [
+        {
+            "id": "f3",
+            "file_id": "f3",
+            "text": "shared topic",
+            "score": score,
+            "metadata": {},
+        }
+    ]
+
+
+def test_fallback_score_floor_decoupled_from_distance_threshold():
+    # The calibrated distance max (0.75) must NOT tighten the similarity-score
+    # fallback: a 0.7-score record with no _distance survives at the shipped
+    # default because FALLBACK_SCORE_FLOOR stays at the legacy 0.5.
+    service = DocumentRetrievalService(retrieval_window=0)
+    assert service.max_distance_threshold == 0.75
+    kept = asyncio.run(
+        service.filter_relevant(_fallback_score_record(0.7), reranked=False)
+    )
+    assert len(kept) == 1
+    assert kept[0].file_id == "f3"
+
+
+def test_fallback_score_floor_still_drops_below_legacy_floor():
+    # Contrast arm: the decoupled floor keeps its legacy drop behavior —
+    # a 0.4-score fallback record is below 0.5 and is dropped with no_match.
+    service = DocumentRetrievalService(retrieval_window=0)
+    kept = asyncio.run(
+        service.filter_relevant(_fallback_score_record(0.4), reranked=False)
+    )
+    assert kept == []
+    assert service.no_match is True
