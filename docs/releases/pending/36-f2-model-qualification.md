@@ -16,6 +16,13 @@ hardware/performance qualification, and MODEL-RESEARCH-01). Trace:
   separate and renders unlabeled). `Source.score_type` narrowed to the
   verified producer contract; unknown/missing scoreType keeps distance
   semantics.
+- `backend/app/services/document_retrieval.py` — NEW `FALLBACK_SCORE_FLOOR = 0.5`
+  constant decoupling the similarity-score fallback branch (records with no
+  `_distance`, higher-is-better) from the calibrated distance max; regression
+  coverage in `backend/tests/test_relevance_cutoff_calibration.py` (including
+  the dual-mode legacy `relevance_threshold` coupling exercised by the
+  adversarial suite). Fixes the CI round-4 regression where raising the shared
+  constant silently dropped 0.5–0.75 scores in that branch.
 - `backend/app/config.py` — `max_distance_threshold` default 0.5 → 0.75,
   calibrated for the deployed harrier-oss-v1-0.6b cosine scale (measured:
   gold-recall@7 on rerank-off paths 0.236 → 0.909, ceiling 0.927; no-answer
@@ -43,10 +50,13 @@ deployment trial (`EMBEDDING_QUERY_PREFIX`), not a default flip.
 
 Carve-out — the ONE calibrated default that DID change in this PR:
 `max_distance_threshold` 0.5 → 0.75 (backend/app/config.py), per the frozen
-calibration dataset. Measured impact is limited to non-reranked fallback
-paths and the Draft Room seam (the deployed default chat path reranks and is
-unaffected); the new UI distance bands and the new backend cutoff meet at
-the same 0.75/0.77 boundary by design.
+calibration dataset. Measured impact is limited to distance-typed records on
+non-reranked fallback paths and the Draft Room seam (the deployed default chat
+path reranks and is unaffected); the similarity-score fallback branch is pinned
+at its legacy 0.5 floor via FALLBACK_SCORE_FLOOR and is NOT affected by the
+move. The backend cutoff (0.75) sits just inside the UI's Related band
+(Related ≤ 0.77, Tangential > 0.77): the UI labels the 0.75–0.77 tail Related
+while the backend still emits it, and drops only beyond 0.75.
 
 ## Rollback
 

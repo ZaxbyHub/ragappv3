@@ -98,6 +98,18 @@ def test_fallback_score_floor_decoupled_from_distance_threshold():
     assert kept[0].file_id == "f3"
 
 
+def test_fallback_score_floor_exact_boundary_is_kept():
+    # Exact-boundary pin (reviewer round-4 L5-2): the comparison is
+    # score < FALLBACK_SCORE_FLOOR, so a score of exactly 0.5 is KEPT.
+    # Catches a '<' -> '<=' off-by-one that the 0.4/0.7 pair cannot see.
+    service = DocumentRetrievalService(retrieval_window=0)
+    kept = asyncio.run(
+        service.filter_relevant(_fallback_score_record(0.5), reranked=False)
+    )
+    assert len(kept) == 1
+    assert kept[0].file_id == "f3"
+
+
 def test_fallback_score_floor_still_drops_below_legacy_floor():
     # Contrast arm: the decoupled floor keeps its legacy drop behavior —
     # a 0.4-score fallback record is below 0.5 and is dropped with no_match.

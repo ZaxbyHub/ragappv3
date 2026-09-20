@@ -28,6 +28,7 @@ REPO_ROOT = HERE.parents[3]
 QUERIES = HERE / "calibration_queries.jsonl"
 SCORE_DUMP = HERE / "score_dump.json"
 ANALYSIS = HERE / "analysis.json"
+CUTOFF_SWEEP = HERE / "cutoff_sweep.json"
 
 DOC_E05 = REPO_ROOT / "docs" / "eval" / "2026-09-model-qualification.md"
 DOC_E05_DATA = REPO_ROOT / "docs" / "eval" / "2026-09-model-qualification-data.json"
@@ -241,6 +242,27 @@ def check_cuts() -> List[str]:
                 problems.append(
                     "relevance.test.ts does not assert the %s band constant %s"
                     % (family, repr(want)))
+    # Cutoff-impact provenance (reviewer round-4 L4-3): the prose numbers
+    # (0.236 -> 0.909, ceiling 0.927, leak 16.7%) must exist in the generated
+    # cutoff_sweep.json artifact, not only in prose.
+    if not CUTOFF_SWEEP.is_file():
+        problems.append("MISSING: %s (run generate_cutoff_sweep.py)" % CUTOFF_SWEEP)
+        print("MISSING: %s" % CUTOFF_SWEEP)
+    else:
+        sweep = json.loads(CUTOFF_SWEEP.read_text(encoding="utf-8"))
+        expected = {"0.5": 0.236, "0.75": 0.909}
+        for t, want in expected.items():
+            got = (sweep.get("thresholds") or {}).get(t, {}).get("gold_recall_at_7")
+            if got != want:
+                problems.append(
+                    "cutoff_sweep.thresholds.%s.gold_recall_at_7 = %r, expected %r"
+                    % (t, got, want))
+        ceil = (sweep.get("ceiling_no_filter") or {}).get("gold_recall_at_7")
+        if ceil != 0.927:
+            problems.append("cutoff_sweep ceiling %r != 0.927" % ceil)
+        leak = (sweep.get("no_answer_leak_at_075") or {}).get("rate")
+        if leak != 0.167:
+            problems.append("cutoff_sweep no_answer_leak_at_075 %r != 0.167" % leak)
     return problems
 
 

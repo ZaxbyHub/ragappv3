@@ -56,9 +56,10 @@ numbers below are the spec the implementation must match.
 
 - **distance bands 0.56 / 0.67 / 0.77** — Highly Relevant <= 0.56,
   Relevant <= 0.67, Related <= 0.77, else Tangential. Derived as
-  q25(gold) / q75(gold) / q25(no-answer) = 0.559 / 0.671 / 0.765, rounded to
-  0.56 / 0.67 / 0.77. Held-out band agreement: 74.4% (new) vs 30.0% (old
-  0.15/0.3/0.5 cuts).
+  q25(gold) / q75(gold) / max(q25(no-answer), legacy 0.5 backend filter) =
+  0.559 / 0.671 / 0.765, rounded to 0.56 / 0.67 / 0.77 (the max() clause was
+  inert for this dataset: 0.765 > 0.5). Held-out band agreement: 74.4% (new)
+  vs 30.0% (old 0.15/0.3/0.5 cuts).
 - **rerank bands 0.7 / 0.4 / 0.2 kept** — the shipped cut points are
   retained now with recorded provenance: held-out agreement for the shipped
   cuts is tied-best (85.0%) vs the best-derived candidate (C2-posterior

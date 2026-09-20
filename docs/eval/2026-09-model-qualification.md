@@ -1,5 +1,11 @@
 # Model qualification — E05 ablation grid — 2026-09 (issue #36)
 
+Scope note: this doc covers the E05 ablation grid. The companion
+relevance-band / backend-cutoff recalibration shipped in the same PR is
+specified in `backend/tests/eval/calibration_2026_09/README.md` (distance
+bands 0.56/0.67/0.77; `max_distance_threshold` 0.75) — see also the release
+note's carve-out section.
+
 Ablations on the real deployment (R640AI, deployed commit 281bd714,
 harrier-oss-v1-0.6b + bge-reranker-v2-m3 via TEI 1.9.3) against the frozen
 63-query calibration dataset (backend/tests/eval/calibration_2026_09/).

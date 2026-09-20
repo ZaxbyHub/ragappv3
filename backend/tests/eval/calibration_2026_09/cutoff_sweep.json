@@ -1,0 +1,22 @@
+{
+ "thresholds": {
+  "0.5": {
+   "gold_recall_at_7": 0.236
+  },
+  "0.75": {
+   "gold_recall_at_7": 0.909
+  }
+ },
+ "meta": {
+  "source": "score_dump.json (frozen 63-query live deployment dump)",
+  "note": "distance-only (non-reranked) path replay: per-record distance cutoff applied to the retrieved pool, then gold-in-top-7"
+ },
+ "ceiling_no_filter": {
+  "gold_recall_at_7": 0.927
+ },
+ "no_answer_leak_at_075": {
+  "results_passed": 16,
+  "total": 96,
+  "rate": 0.167
+ }
+}

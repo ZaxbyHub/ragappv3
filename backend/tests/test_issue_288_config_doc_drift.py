@@ -61,6 +61,18 @@ class TestReadmeRateLimitTable:
             f"README.md SEARCH_RATE_LIMIT shows {match.group(1)}, expected 30"
         )
 
+    def test_readme_max_distance_threshold_matches_config(self):
+        """PR #647 review (MC-1/L3-1): the README env table must track the
+        calibrated config default so the doc-drift class has a gate."""
+        readme = read("README.md")
+        match = re.search(
+            r"\|\s*`MAX_DISTANCE_THRESHOLD`\s*\|\s*([0-9.]+)\s*\|", readme)
+        assert match, "MAX_DISTANCE_THRESHOLD row not found in README.md"
+        assert match.group(1) == "0.75", (
+            f"README.md MAX_DISTANCE_THRESHOLD shows {match.group(1)}, expected "
+            "0.75 to match the calibrated config.py default (issue #36)"
+        )
+
     def test_readme_vault_create_rate_limit_is_30(self):
         readme = read("README.md")
         match = re.search(r"\|\s*`VAULT_CREATE_RATE_LIMIT`\s*\|\s*`(\d+)`", readme)
