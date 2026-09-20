@@ -321,6 +321,15 @@ def check_e05() -> List[str]:
     emb = REPO_ROOT / "docs" / "eval" / "2026-09-model-qualification-data.json"
     if emb.is_file():
         ed = json.loads(emb.read_text(encoding="utf-8"))
+        c36 = ed.get("chunking36") or {}
+        for side in ("off", "on"):
+            node = c36.get(side) or {}
+            if not isinstance(node.get("recall_at_7"), (int, float)):
+                problems.append("chunking36.%s.recall_at_7 is not numeric" % side)
+        if c36.get("per_query_agreement") != "55/55":
+            problems.append("chunking36.per_query_agreement must be '55/55' (full-corpus tie)")
+    if emb.is_file():
+        ed = json.loads(emb.read_text(encoding="utf-8"))
         ec = ed.get("embedding_challenger") or {}
         if not ec.get("per_file_failures"):
             problems.append("qualification data missing embedding_challenger.per_file_failures")
@@ -440,6 +449,22 @@ def check_perf() -> List[str]:
         for field in ("errors", "empty_turns"):
             if not isinstance(node.get(field), int):
                 problems.append("perf tier %r field %r is not an integer" % (tier, field))
+    # Measured stage spans (user-ordered instrumentation): the app's own SSE
+    # `stage` events + /metrics deltas — the derived milestone proxy is superseded.
+    spans = data.get("stage_spans")
+    if not isinstance(spans, dict):
+        problems.append("perf data missing 'stage_spans'")
+    else:
+        for tier in ("1", "4", "8", "12"):
+            node = spans.get(tier) or {}
+            ss = node.get("stage_spans_s") or {}
+            for span in ("admission_to_searching", "searching_to_reading",
+                         "reading_to_drafting", "drafting_to_done"):
+                entry = ss.get(span) or {}
+                if not isinstance(entry.get("p50"), (int, float)) or not isinstance(entry.get("p95"), (int, float)):
+                    problems.append(
+                        "perf tier %r stage span %r missing numeric p50/p95" % (tier, span))
+                    break
     for probe in ("long_generation", "bulk_ingestion"):
         node = data.get(probe)
         if not isinstance(node, dict):

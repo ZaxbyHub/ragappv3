@@ -35,23 +35,27 @@ not reproduce on this corpus.
 
 ## Contextual chunking ablation
 
-Scoped-subset A/B on an isolated instance pair (identical image, env, TEI
-endpoints; own data volumes): 3 CDP documents (399 chunks), 6 labelled
-queries derived from those files, gold-recall@7 of the full
-retrieve→rerank→top-7 path:
+Two-stage execution per the repo owner's scope decision (the 3-file pilot
+established the harness; the full 36-file corpus arm superseded it):
 
-- contextual_chunking_enabled = false (deployed default): 6/6 = 1.000
-- contextual_chunking_enabled = true (one instant-LLM context call per chunk
-  during re-ingest): 6/6 = 1.000 (399 contextual chunks; ingestion took ~90
-  minutes against ~3 minutes for the OFF arm on identical hardware).
+- **Pilot (3 CDP files, 399 contextual chunks, 6 queries)**: both arms 6/6 —
+  used to validate the isolated-instance harness; ingestion cost ~30×
+  (one instant-LLM context call per chunk: ~90 min vs ~3 min).
+- **Full corpus arm (34 indexed frame files — the complete probe sampling
+  frame; ~11k chunks — all 55 labelled content queries, both arms scored on
+  the full retrieve→rerank→top-7 path on identical isolated instances)**:
+  OFF (deployed default) 54/55 = **0.982**; ON (contextual chunking) 54/55 =
+  **0.982**; **per-query agreement 55/55** — the same single query
+  (cdp-005) misses in both arms. The ON-arm re-ingest took ~12 h of
+  LLM-per-chunk processing vs ~25 min for OFF.
 
-Verdict: NEUTRAL/NEGATIVE at this scope — both arms saturate the subset's
-gold recall, so contextual chunking produced no measurable retrieval gain
-here while adding ~30× ingestion wall-time (one LLM call per chunk). The
-deployment default (off) is retained; the subset was deliberately small to
-bound the per-chunk cost, and a corpus-wide trial is only justified if a
-future, harder labelled set shows the OFF arm failing. Subset limits
-disclosed: single-instance pair, 3 files, 6 queries, same-day run.
+Verdict: **definitive neutral/negative at corpus scale** — contextual
+chunking changed NO ranking across the entire labelled set on this corpus
+while multiplying ingestion wall-time ~30×. The deployment default (off) is
+retained; re-evaluation is only warranted if a future, harder labelled set
+shows the OFF arm failing. Per-query outcomes for both arms are in the data
+JSON (`chunking36`). One duplicate V3.3 SUM upload row (0 chunks, deleted)
+and the 12-h poll-cap are recorded in the trace, not silently dropped.
 
 ## Top-k / top-n grid
 
@@ -91,8 +95,9 @@ outcomes):
    (+0.036 recall) — not adopted; recorded as a deployment trial
    recommendation.
 3. Top-k/top-n widening: no gain at the deployed optimum.
-4. Contextual chunking: no measurable gain on the scoped subset at ~30×
-   ingestion cost (both arms 6/6) — default stays off.
+4. Contextual chunking: full-corpus neutral (both arms 0.982, 55/55
+   per-query agreement, same single miss) at ~30× ingestion cost — default
+   stays off (pilot subset: both arms 6/6).
 5. Qwen3-Embedding-0.6B challenger: serving attempt not completed within
    the session budget (see above) — open, retained.
 6. Derived rerank band candidates (0.957/0.473/0.181 and 0.974/0.715/0.29)

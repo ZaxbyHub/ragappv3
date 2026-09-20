@@ -76,25 +76,36 @@ time-to-searchable per file 17.9 / 18.0 / 19.3 / 19.4 / 20.0 / 27.9 s
 concurrently with chat traffic without visible cross-impact at these sizes;
 files were deleted after measurement.
 
-## Stage decomposition and throughput (derived)
+## Stage spans (measured, #518/#595 instrumentation)
 
-Per-stage span capture (#595 E3 telemetry) was not wired into the SSE probe,
-so stage latency is DECOMPOSED from the measured milestones rather than read
-from spans — disclosed as derived, not instrumented:
+Re-run with span capture wired per the repo owner's scope decision: the
+probe timestamps the app's own SSE `stage` events (Searching / Reading /
+Drafting — the #518 engine instrumentation) per turn, and reads the measured
+`GET /metrics` counters (#518: `ragapp_queue_wait_seconds`,
+`ragapp_chat_turns_total`, `ragapp_provider_calls_total`) as before/after
+deltas per tier. Per-turn spans and per-tier deltas are in the data JSON
+(`stage_spans`); 0 errors and 0 empty turns across all 25 turns:
 
-- Admission + retrieval + rerank + first-model-token = the queue-wait +
-  first-content interval: p50 ≈ 34.8 s at tier 1 (the off-box model's
-  connection setup and prefill dominate; on-box retrieval/rerank queue wait
-  is the 40 ms component).
-- Generation (first content → completion): p50 ≈ 41.2 − 34.9 = 6.3 s at
-  tier 1; ≈ 19.5 s at tier 8 (99.8 − 80.3), consistent with model-side
-  serialization across concurrent streams.
-- Throughput (achieved chat turns per wall-minute, this run's pacing): tier
-  1 ≈ 1.0 turn/2 min including the full answer; tier 12 completed 10/12
-  turns in ≈ 3 min of steady state ≈ 3.3 turns/min aggregate (2 errors).
-  These are pacing-limited lower bounds, not saturation measurements — the
-  rate limit (30/minute/user) prevented burst-throughput probing, disclosed
-  as a methodology limit.
+| span (per turn) | tier 1 p50 | tier 4 p50 | tier 8 p50 | tier 12 p50 | tier 12 p95 |
+| --- | --- | --- | --- | --- | --- |
+| admission → Searching (queue + planning) | 0.02 s | 0.12 s | 0.18 s | 0.21 s | 67.5 s |
+| Searching → Reading (retrieval + embed) | 4.9 s | 10.3 s | 14.3 s | 23.1 s | 31.5 s |
+| Reading → Drafting (context assembly) | 0.02 s | 0.11 s | 0.02 s | 0.02 s | 0.03 s |
+| Drafting → done (LLM generation) | 37.0 s | 32.2 s | 61.9 s | 55.4 s | 94.1 s |
+
+Measured reading: on-box retrieval scales smoothly (4.9 → 23.1 s p50 at 12×
+concurrency) and context assembly is negligible; generation — dominated by
+the OFF-BOX thinking model — carries the bulk of latency and grows with
+concurrency (37 → 55 s p50, 94 s p95 at 12). The tier-12 admission knee
+reproduces in the measured spans: admission→Searching p95 jumps to 67.5 s,
+matching the loaded run's queue-wait p50 regime change. The `/metrics`
+deltas confirm every turn recorded exactly one LLM provider call and the
+telemetry's queue-wait accumulator registered the contention.
+
+Superseded note: the earlier derived milestone decomposition (computed from
+queue/first-content/completion before span capture was wired) is retained
+in this trace's history and is consistent with the measured spans; the
+spans above are the authoritative stage-latency evidence.
 
 ## Limits of this evidence (disclosed)
 

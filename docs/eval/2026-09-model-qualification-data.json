@@ -5996,6 +5996,27 @@
    }
   ]
  },
+ "chunking36": {
+  "off": {
+   "recall_at_7": 0.982,
+   "n": 55,
+   "errors": 0,
+   "misses": [
+    "cdp-005"
+   ]
+  },
+  "on": {
+   "recall_at_7": 0.982,
+   "n": 55,
+   "errors": 0,
+   "misses": [
+    "cdp-005"
+   ]
+  },
+  "per_query_agreement": "55/55",
+  "verdict": "FULL-corpus neutral/negative (user-ordered 36-file arm, supersedes the 3-file subset): both arms 0.982 gold-recall with IDENTICAL per-query outcomes (55/55 agreement, same single miss cdp-005) \u2014 contextual chunking changed no ranking on this corpus while costing ~30x ingestion wall-time (~12h LLM-per-chunk vs ~25 min). Default stays OFF.",
+  "files": 34
+ },
  "chunking": {
   "off": {
    "recall_at_7": 1.0,

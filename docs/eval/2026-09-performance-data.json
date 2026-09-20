@@ -52,6 +52,140 @@
    "completion_p95_ms": 175841.85
   }
  },
+ "stage_spans": {
+  "1": {
+   "samples": 1,
+   "errors": 0,
+   "empty_turns": 0,
+   "metrics_delta": {
+    "ragapp_chat_turns_total": 1.0,
+    "ragapp_queue_wait_seconds": 0,
+    "ragapp_provider_calls_total{provider=\"llm\",outcome=\"ok\"}": 1.0
+   },
+   "measured_mean_queue_wait_s": 0.0,
+   "stage_spans_s": {
+    "admission_to_searching": {
+     "n": 1,
+     "p50": 0.024,
+     "p95": 0.024
+    },
+    "searching_to_reading": {
+     "n": 1,
+     "p50": 4.915,
+     "p95": 4.915
+    },
+    "reading_to_drafting": {
+     "n": 1,
+     "p50": 0.015,
+     "p95": 0.015
+    },
+    "drafting_to_done": {
+     "n": 1,
+     "p50": 37.038,
+     "p95": 37.038
+    }
+   }
+  },
+  "4": {
+   "samples": 4,
+   "errors": 0,
+   "empty_turns": 0,
+   "metrics_delta": {
+    "ragapp_chat_turns_total": 4.0,
+    "ragapp_queue_wait_seconds": 0,
+    "ragapp_provider_calls_total{provider=\"llm\",outcome=\"ok\"}": 4.0
+   },
+   "measured_mean_queue_wait_s": 0.0,
+   "stage_spans_s": {
+    "admission_to_searching": {
+     "n": 4,
+     "p50": 0.115,
+     "p95": 0.117
+    },
+    "searching_to_reading": {
+     "n": 4,
+     "p50": 10.25,
+     "p95": 12.136
+    },
+    "reading_to_drafting": {
+     "n": 4,
+     "p50": 0.109,
+     "p95": 0.206
+    },
+    "drafting_to_done": {
+     "n": 4,
+     "p50": 32.219,
+     "p95": 38.229
+    }
+   }
+  },
+  "8": {
+   "samples": 8,
+   "errors": 0,
+   "empty_turns": 0,
+   "metrics_delta": {
+    "ragapp_chat_turns_total": 8.0,
+    "ragapp_queue_wait_seconds": 0,
+    "ragapp_provider_calls_total{provider=\"llm\",outcome=\"ok\"}": 8.0
+   },
+   "measured_mean_queue_wait_s": 0.0,
+   "stage_spans_s": {
+    "admission_to_searching": {
+     "n": 8,
+     "p50": 0.175,
+     "p95": 0.195
+    },
+    "searching_to_reading": {
+     "n": 8,
+     "p50": 14.319,
+     "p95": 25.756
+    },
+    "reading_to_drafting": {
+     "n": 8,
+     "p50": 0.022,
+     "p95": 0.166
+    },
+    "drafting_to_done": {
+     "n": 8,
+     "p50": 61.93,
+     "p95": 80.285
+    }
+   }
+  },
+  "12": {
+   "samples": 12,
+   "errors": 0,
+   "empty_turns": 0,
+   "metrics_delta": {
+    "ragapp_chat_turns_total": 12.0,
+    "ragapp_queue_wait_seconds": 0,
+    "ragapp_provider_calls_total{provider=\"llm\",outcome=\"ok\"}": 12.0
+   },
+   "measured_mean_queue_wait_s": 0.0,
+   "stage_spans_s": {
+    "admission_to_searching": {
+     "n": 12,
+     "p50": 0.207,
+     "p95": 67.48
+    },
+    "searching_to_reading": {
+     "n": 12,
+     "p50": 23.111,
+     "p95": 31.474
+    },
+    "reading_to_drafting": {
+     "n": 12,
+     "p50": 0.023,
+     "p95": 0.027
+    },
+    "drafting_to_done": {
+     "n": 12,
+     "p50": 55.439,
+     "p95": 94.076
+    }
+   }
+  }
+ },
  "long_generation": {
   "samples": 5,
   "errors": 0,
