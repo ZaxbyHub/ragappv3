@@ -226,3 +226,64 @@ async def test_get_connection_async_matches_sync_budget(db_path):
         pool.release_connection(hog_b)
     finally:
         pool.close_all()
+
+
+def test_checkout_budget_enforced_across_invalid_idle_connections(db_path, monkeypatch):
+    """(#645 final-critic round 1) Cycling through invalid idle connections
+    must not extend the checkout past the nominal budget.
+
+    Pre-fix, both invalid-connection paths ``continue``d without consulting
+    the deadline, so N seeded invalid entries x a slow-failing validation
+    stretched the checkout to N x probe-time regardless of the deadline (a
+    real-pool reproduction measured 16.80s with 16 entries x 1.05s probes
+    against the 15s budget). Post-fix the deadline is enforced on the
+    invalid path: the checkout raises RuntimeError once the budget is spent
+    instead of draining the whole invalid queue.
+    """
+    from app.models.database import SQLiteConnectionPool
+
+    class _InvalidIdleConn:
+        def close(self):
+            pass
+
+    # Shrink the budget: max_wait_attempts=1 -> a 5s deadline, so the test
+    # exercises the deadline with ~5s of slow probes instead of ~15s.
+    deadline_budget = 1 * CHECKOUT_WAIT_SECONDS
+    seeded = 20
+    probe_seconds = 0.4
+    # max_size must exceed the seeded count: the internal queue is a
+    # Queue(maxsize=max_size) and the constructor does not seed eagerly.
+    pool = SQLiteConnectionPool(str(db_path), max_size=seeded + 5)
+    try:
+        for _ in range(seeded):
+            pool._pool.put_nowait(_InvalidIdleConn())
+
+        validations = {"count": 0}
+
+        def slow_failing_validate(conn):
+            validations["count"] += 1
+            time.sleep(probe_seconds)
+            return False
+
+        monkeypatch.setattr(pool, "_validate_connection", slow_failing_validate)
+
+        started = time.monotonic()
+        with pytest.raises(RuntimeError):
+            pool.get_connection(max_wait_attempts=1)
+        elapsed = time.monotonic() - started
+
+        # Post-fix the raise fires at the ~5s deadline: ~13 probes x 0.4s.
+        # A full drain would be 20 probes / ~8.0s. Both assertions leave
+        # margin for timer granularity while failing on a full drain.
+        assert elapsed < seeded * probe_seconds * 0.9, (
+            f"invalid-connection cycling took {elapsed:.1f}s for "
+            f"{validations['count']} probes: the checkout deadline must cap "
+            f"the drain of invalid idle connections"
+        )
+        assert validations["count"] <= seeded - 3, (
+            f"{validations['count']} of {seeded} invalid entries were drained "
+            f"before the budget raised: the deadline is not enforced on the "
+            f"invalid path"
+        )
+    finally:
+        pool.close_all()

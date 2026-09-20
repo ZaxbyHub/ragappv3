@@ -78,3 +78,16 @@ the guard repo-wide so a new on-loop checkout fails CI.
 - `utils/transaction.py::db_transaction` has no production callers today; it
   is fixed in place rather than deleted (public util surface — removal is an
   owner decision).
+- Adjacent on-loop SQL retained by written disposition (the issue lists both
+  as adjacent/bounded-latency; neither performs a pooled checkout on the
+  loop, which is the class this issue closes):
+  - `api/routes/documents.py` `_do_upload` Phase-1 block (duplicate check,
+    `file_path` SELECT, `_insert_or_get_file_record`, commit): the checkout
+    is already off-loop (`get_connection_async` since #592); the statements
+    are single-row keyed operations on the local WAL database whose only
+    wait path is `busy_timeout` — bounded-latency by construction, no queue
+    wait, no unbounded primitive.
+  - `api/routes/users.py` `assign_user_to_default_vault` (implemented in
+    `api/deps.py`): a sync helper invoked with a connection already held
+    from an off-loop checkout; a few trivial INSERT/SELECT statements on
+    that held connection — no checkout, no queue wait.

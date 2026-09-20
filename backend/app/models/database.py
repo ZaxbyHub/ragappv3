@@ -5199,6 +5199,15 @@ class SQLiteConnectionPool:
                         conn.close()
                     except sqlite3.Error:
                         pass
+                    # Cycling through invalid idle connections must not extend
+                    # the checkout past the nominal budget (#645 final critic):
+                    # without this check N slow-failing validations stretch the
+                    # checkout to N x probe-time regardless of the deadline.
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"Could not obtain a connection from the pool after "
+                            f"{max_wait_attempts} attempts"
+                        )
                     continue
             except Empty:
                 pass
@@ -5247,6 +5256,14 @@ class SQLiteConnectionPool:
                         conn.close()
                     except sqlite3.Error:
                         pass
+                    # Same budget enforcement as the get_nowait path above
+                    # (#645 final critic): invalid-connection cycling must not
+                    # extend the checkout past the nominal budget.
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"Could not obtain a connection from the pool after "
+                            f"{max_wait_attempts} attempts"
+                        )
                     continue
             except Empty:
                 # Timeout occurred, increment attempts and retry
