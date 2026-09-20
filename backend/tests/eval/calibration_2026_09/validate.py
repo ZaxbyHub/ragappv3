@@ -324,8 +324,12 @@ def check_e05() -> List[str]:
         c36 = ed.get("chunking36") or {}
         for side in ("off", "on"):
             node = c36.get(side) or {}
-            if not isinstance(node.get("recall_at_7"), (int, float)):
+            val = node.get("recall_at_7")
+            if not isinstance(val, (int, float)):
                 problems.append("chunking36.%s.recall_at_7 is not numeric" % side)
+            elif not (0.0 <= float(val) <= 1.0):
+                problems.append(
+                    "chunking36.%s.recall_at_7 = %r outside [0, 1]" % (side, val))
         if c36.get("per_query_agreement") != "55/55":
             problems.append("chunking36.per_query_agreement must be '55/55' (full-corpus tie)")
     if emb.is_file():
