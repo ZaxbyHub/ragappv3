@@ -64,13 +64,12 @@ class ToggleManager:
         conn = self.pool.get_connection()
         try:
             self.set_toggle_on_connection(conn, feature, enabled)
-            conn.commit()
+            self.commit_and_publish(conn, feature, enabled)
         except Exception:
             conn.rollback()
             raise
         finally:
             self.pool.release_connection(conn)
-        self.update_cache(feature, enabled)
 
     def set_toggle_on_connection(
         self, conn: sqlite3.Connection, feature: str, enabled: bool
@@ -78,11 +77,42 @@ class ToggleManager:
         """Write a toggle using the caller's transaction."""
         conn.execute(self._UPSERT_SQL, (feature, int(enabled)))
 
+    def commit_and_publish(
+        self, conn: sqlite3.Connection, feature: str, enabled: bool
+    ) -> None:
+        """Commit the caller's durable toggle transaction and publish the new
+        value to the cache as one atomic step (issue #603).
+
+        Holding ``_lock`` across both means no other toggle writer can commit
+        between this commit and its cache publish, so the cache can never
+        hold a value older than the latest durable commit. The publish is
+        inlined rather than delegated to ``update_cache`` because that lock
+        is not reentrant. Writers acquire SQLite's write lock (BEGIN
+        IMMEDIATE or the upsert's implicit transaction) before taking
+        ``_lock``, so the two locks can never cycle.
+        """
+        with self._lock:
+            try:
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            self._cache[feature] = ToggleCacheEntry(
+                timestamp=time.time(), enabled=enabled
+            )
+            self._generation += 1
+
     def update_cache(self, feature: str, enabled: bool) -> None:
         """Update the in-memory cache after a durable commit.
 
         Also bumps the cache generation so in-flight stale reads (started
         before this invalidation) are discarded instead of written back.
+
+        Writers should prefer ``commit_and_publish``, which commits the
+        durable transaction and publishes to the cache as one atomic step;
+        calling this separately after ``conn.commit()`` leaves a
+        writer-vs-writer ordering window (issue #603).
         """
         with self._lock:
             self._cache[feature] = ToggleCacheEntry(

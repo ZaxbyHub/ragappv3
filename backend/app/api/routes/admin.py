@@ -89,11 +89,12 @@ def _write_toggle_with_audit(
                 hmac_digest,
             ),
         )
-        conn.commit()
+        # Commit and cache publish are one atomic step (issue #603): two
+        # concurrent toggle writers must never publish out of commit order.
+        toggle_manager.commit_and_publish(conn, feature, enabled)
     except Exception:
         conn.rollback()
         raise
-    toggle_manager.update_cache(feature, enabled)
 
 
 @router.post("/toggles")
