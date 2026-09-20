@@ -71,7 +71,6 @@ class TestSqliteAsyncWrappers(unittest.IsolatedAsyncioTestCase):
         self.test_pool.close_all()
 
         # Clean up temp directory
-        import shutil
 
         try:
             shutil.rmtree(self.temp_dir)
@@ -396,7 +395,6 @@ class TestSqliteAsyncEdgeCases(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.test_pool.close_all()
 
-        import shutil
         try:
             shutil.rmtree(self.temp_dir)
         except Exception:
