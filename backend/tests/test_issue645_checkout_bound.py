@@ -287,3 +287,119 @@ def test_checkout_budget_enforced_across_invalid_idle_connections(db_path, monke
         )
     finally:
         pool.close_all()
+
+
+def test_creation_refused_once_budget_spent_by_invalid_probes(db_path, monkeypatch):
+    """(#645 final critic round 2) Budget-consuming invalid validation
+    followed by delayed creation stays inside the composed checkout
+    ceiling (deadline + creation reserve) and raises instead once the
+    deadline has actually passed: no NEW bounded work starts after
+    expiry, and a creation already started is bounded by its reserve.
+    On the pre-#645 tree this scenario was unbounded (30s-per-probe
+    validation x N entries); on the round-2 tree it could return a
+    connection arbitrarily past the deadline + reserve composed ceiling.
+    """
+    from app.models.database import (
+        CREATE_TIME_RESERVE_SECONDS,
+        SQLiteConnectionPool,
+    )
+
+    class _InvalidIdleConn:
+        def close(self):
+            pass
+
+    seeded = 10
+    probe_seconds = 0.4
+    pool = SQLiteConnectionPool(str(db_path), max_size=seeded + 5)
+    try:
+        for _ in range(seeded):
+            pool._pool.put_nowait(_InvalidIdleConn())
+
+        def slow_failing_validate(conn):
+            time.sleep(probe_seconds)
+            return False
+
+        monkeypatch.setattr(pool, "_validate_connection", slow_failing_validate)
+
+        started = time.monotonic()
+        conn = pool.get_connection(max_wait_attempts=1)
+        elapsed = time.monotonic() - started
+
+        # The 10 probes consume ~4.0s of the 5s budget; creation then runs
+        # inside its reserve: the composed ceiling is
+        # deadline + CREATE_TIME_RESERVE_SECONDS (~10s here), and the
+        # checkout must return a WORKING connection inside it.
+        ceiling = deadline_of(1) + CREATE_TIME_RESERVE_SECONDS
+        assert elapsed < ceiling, (
+            f"delayed creation took {elapsed:.1f}s against the composed "
+            f"ceiling {ceiling:.1f}s"
+        )
+        conn.execute("SELECT 1")
+        pool.release_connection(conn)
+    finally:
+        pool.close_all()
+
+
+def deadline_of(max_wait_attempts):
+    return max_wait_attempts * CHECKOUT_WAIT_SECONDS
+
+
+def test_concurrent_delayed_creation_respects_per_caller_deadline(db_path, monkeypatch):
+    """(#645 final critic round 3) Concurrent workers that pass the entry
+    gate can queue on the serialized creation lock; a worker that acquires
+    the lock after its own deadline must refuse to start creation (with
+    _created_count rolled back), so every caller returns or raises within
+    its own composed ceiling. Probe that motivated this: three workers,
+    4.7s delayed creation -> the tail worker returned at ~13.9s against a
+    5s budget on the previous tree.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.models.database import SQLiteConnectionPool
+
+    # 3 serialized creations at 2.6s each: the tail worker's lock turn
+    # lands at ~5.2s, past its 5s deadline -> it must refuse.
+    delay = 2.6
+    pool = SQLiteConnectionPool(str(db_path), max_size=3)
+    try:
+        original_create = pool._create_connection
+
+        def slow_create():
+            time.sleep(delay)
+            return original_create()
+
+        monkeypatch.setattr(pool, "_create_connection", slow_create)
+
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=3) as pool_of_workers:
+            futures = [
+                pool_of_workers.submit(pool.get_connection, 1) for _ in range(3)
+            ]
+        elapsed = time.monotonic() - started
+
+        returned, refused = [], 0
+        for future in futures:
+            try:
+                returned.append(future.result(timeout=30))
+            except RuntimeError:
+                refused += 1
+
+        # Serialized creations at 1.6s each: only workers whose turn starts
+        # before their 5s deadline may create; the tail must refuse instead
+        # of drifting arbitrarily past its own ceiling. Every caller's wall
+        # clock stays under the composed ceiling (deadline + one reserve).
+        ceiling = deadline_of(1) + 5.0
+        assert refused >= 1, (
+            f"all 3 delayed creations completed by {elapsed:.1f}s: workers "
+            f"queued on the creation lock are not deadline-checked before "
+            f"starting creation"
+        )
+        assert elapsed < ceiling + delay, (
+            f"concurrent checkouts took {elapsed:.1f}s, exceeding the "
+            f"composed ceiling {ceiling:.1f}s plus one in-flight creation"
+        )
+        for conn in returned:
+            conn.execute("SELECT 1")
+            pool.release_connection(conn)
+    finally:
+        pool.close_all()

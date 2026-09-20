@@ -5018,6 +5018,13 @@ CHECKOUT_WAIT_SECONDS = 5
 # The connection's original value is restored after the probe.
 VALIDATION_BUSY_TIMEOUT_MS = 1000
 
+# Bounded worst case of one _create_connection attempt: sqlite3.connect's
+# default 5 s busy timeout. The checkout deadline gates when new bounded
+# work starts; a creation already started may run to its reserve, so the
+# composed checkout ceiling is deadline + CREATE_TIME_RESERVE_SECONDS
+# (issue #645 final critic round 2).
+CREATE_TIME_RESERVE_SECONDS = 5.0
+
 
 class SQLiteConnectionPool:
     """
@@ -5212,7 +5219,16 @@ class SQLiteConnectionPool:
             except Empty:
                 pass
 
-            # No available connections, try to create a new one if under limit
+            # No available connections, try to create a new one if under limit.
+            # Entry-gate: once the deadline has passed, no NEW bounded work
+            # starts — refuse instead (#645 final critic round 2). A creation
+            # already started is bounded by its own worst case (the reserve),
+            # so the composed checkout ceiling is deadline + reserve.
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Could not obtain a connection from the pool after "
+                    f"{max_wait_attempts} attempts"
+                )
             should_create = False
             with self._lock:
                 if self._created_count < self.max_size:
@@ -5228,6 +5244,16 @@ class SQLiteConnectionPool:
                 # inflated count and unnecessarily skip creation /
                 # block on the queue. See issue #262.
                 with self._lock:
+                    # Re-check under the creation lock: concurrent workers can
+                    # queue behind an earlier creator and only acquire the
+                    # lock after their own deadline has passed — refuse to
+                    # start creation then (issue #645 final critic round 3).
+                    if time.monotonic() >= deadline:
+                        self._created_count -= 1
+                        raise RuntimeError(
+                            f"Could not obtain a connection from the pool after "
+                            f"{max_wait_attempts} attempts"
+                        )
                     try:
                         return self._create_connection()
                     except (sqlite3.Error, OSError):
