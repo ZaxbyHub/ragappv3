@@ -5018,11 +5018,13 @@ CHECKOUT_WAIT_SECONDS = 5
 # The connection's original value is restored after the probe.
 VALIDATION_BUSY_TIMEOUT_MS = 1000
 
-# Bounded worst case of one _create_connection attempt: sqlite3.connect's
-# default 5 s busy timeout. The checkout deadline gates when new bounded
-# work starts; a creation already started may run to its reserve, so the
-# composed checkout ceiling is deadline + CREATE_TIME_RESERVE_SECONDS
-# (issue #645 final critic round 2).
+# Assumed worst case of one _create_connection attempt, used only for test
+# margin math and capacity reasoning: sqlite3.connect's default 5 s busy
+# timeout bounds LOCK WAITS during open, not disk I/O, so the reserve is an
+# assumption rather than an enforced bound — no watchdog wraps a creation
+# that has already started (issue #645 final critic round 2/round 5). The
+# checkout deadline gates when new bounded work starts; a creation already
+# started may run past deadline + reserve under pathological I/O.
 CREATE_TIME_RESERVE_SECONDS = 5.0
 
 
@@ -5161,9 +5163,11 @@ class SQLiteConnectionPool:
                 try:
                     conn.execute(f"PRAGMA busy_timeout={original_busy_timeout}")
                 except sqlite3.Error:
-                    # A connection too broken to accept the restore is about to
-                    # be discarded by the caller anyway (validation failed).
-                    pass
+                    # A connection too broken to accept the restore must not be
+                    # handed out with the 1000 ms probe timeout still set (the
+                    # caller discards invalid connections and retries; PR #650
+                    # review finding PRR-D).
+                    return False
 
     def get_connection(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
         """

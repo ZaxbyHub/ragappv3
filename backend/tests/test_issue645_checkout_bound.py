@@ -30,6 +30,7 @@ Windows.
 import asyncio
 import sqlite3
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -250,7 +251,7 @@ def test_checkout_budget_enforced_across_invalid_idle_connections(db_path, monke
     # exercises the deadline with ~5s of slow probes instead of ~15s.
     deadline_budget = 1 * CHECKOUT_WAIT_SECONDS
     seeded = 20
-    probe_seconds = 0.4
+    probe_seconds = 0.35
     # max_size must exceed the seeded count: the internal queue is a
     # Queue(maxsize=max_size) and the constructor does not seed eagerly.
     pool = SQLiteConnectionPool(str(db_path), max_size=seeded + 5)
@@ -309,7 +310,7 @@ def test_creation_refused_once_budget_spent_by_invalid_probes(db_path, monkeypat
             pass
 
     seeded = 10
-    probe_seconds = 0.4
+    probe_seconds = 0.2
     pool = SQLiteConnectionPool(str(db_path), max_size=seeded + 5)
     try:
         for _ in range(seeded):
@@ -357,10 +358,13 @@ def test_concurrent_delayed_creation_respects_per_caller_deadline(db_path, monke
 
     from app.models.database import SQLiteConnectionPool
 
-    # 3 serialized creations at 2.6s each: the tail worker's lock turn
-    # lands at ~5.2s, past its 5s deadline -> it must refuse.
-    delay = 2.6
+    # 3 serialized creations at 3.0s each: the tail worker's lock turn
+    # lands at ~6.0s, past its 5s deadline -> it must refuse. The barrier
+    # collapses thread-start skew so every caller's deadline is minted at
+    # effectively the same instant (PR #650 review finding PRR-B).
+    delay = 3.0
     pool = SQLiteConnectionPool(str(db_path), max_size=3)
+    barrier = threading.Barrier(3)
     try:
         original_create = pool._create_connection
 
@@ -370,10 +374,14 @@ def test_concurrent_delayed_creation_respects_per_caller_deadline(db_path, monke
 
         monkeypatch.setattr(pool, "_create_connection", slow_create)
 
+        def checked_out():
+            barrier.wait()
+            return pool.get_connection(1)
+
         started = time.monotonic()
         with ThreadPoolExecutor(max_workers=3) as pool_of_workers:
             futures = [
-                pool_of_workers.submit(pool.get_connection, 1) for _ in range(3)
+                pool_of_workers.submit(checked_out) for _ in range(3)
             ]
         elapsed = time.monotonic() - started
 

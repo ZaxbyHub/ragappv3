@@ -40,7 +40,9 @@ class MultimodalEnrichmentFixture(unittest.TestCase):
         self.data_dir = Path(self._tmp.name) / "data"
         self.db_path = str(Path(self._tmp.name) / "test.db")
         init_db(self.db_path)
-        self.conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False mirrors production pooled connections
+        # (async callers hand them to asyncio.to_thread workers).
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
 

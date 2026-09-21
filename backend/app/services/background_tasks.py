@@ -2194,7 +2194,9 @@ class BackgroundProcessor:
                 seen.add(key)
                 file_id = row["file_id"]
                 vault_id = row["vault_id"]
-                if not self._should_enqueue_atom_enrichment(file_id, vault_id):
+                if not await asyncio.to_thread(
+                    self._should_enqueue_atom_enrichment, file_id, vault_id
+                ):
                     continue
                 gen_row = None
                 async with self.processor.pool.connection_async() as conn:
@@ -2740,8 +2742,9 @@ class BackgroundProcessor:
             # janitor owns settlement, so the marking is retired here and the
             # held reindex leases are released below instead.
             if not getattr(self, "_reindex_lease_enabled", False):
-                self._mark_running_reindex_jobs_interrupted(
-                    "Interrupted by processor shutdown"
+                await asyncio.to_thread(
+                    self._mark_running_reindex_jobs_interrupted,
+                    "Interrupted by processor shutdown",
                 )
         # Deferred-retry scheduler (issue #513 W11): cancel the deliverer, then
         # discard any still-pending tickets with a warning — shutdown never
@@ -3707,7 +3710,8 @@ class BackgroundProcessor:
                     )
                 )
             if self.multimodal_service is not None:
-                self.enqueue_atom_enrichment(
+                await asyncio.to_thread(
+                    self.enqueue_atom_enrichment,
                     file_id=result.file_id,
                     vault_id=result.vault_id,
                     file_hash=result.file_hash,

@@ -71,10 +71,16 @@ the guard repo-wide so a new on-loop checkout fails CI.
 - `release_connection` remains on-loop by design: it is non-blocking
   (`in_transaction` check + `put_nowait`, dirty-only rollback) — the issue
   classifies the 56 release sites as adjacent with no queue wait.
-- Sync-def checkouts (dispatched to worker threads by their callers) remain
-  sync by contract; the guard's innermost-async-callable barrier rule encodes
-  that contract, and the document_progress dispatch guard pins the
-  helper-dispatch shape.
+- Sync-def checkouts whose callers dispatch them to worker threads
+  (`asyncio.to_thread`) remain sync by contract; the guard's
+  innermost-async-callable barrier rule encodes that contract, and the
+  document_progress dispatch guard pins the helper-dispatch shape. The
+  transitive sync-def sites whose callers did NOT dispatch to a thread
+  (background_tasks `stop()` marking, the multimodal enrichment helpers,
+  the atom-enrichment resume/enqueue gates) were converted in this PR as
+  well — the guard cannot see through a sync def to its dispatch, so the
+  document_progress dispatch audit and adversarial sync-surface tripwires
+  pin the converted surfaces.
 - `utils/transaction.py::db_transaction` has no production callers today; it
   is fixed in place rather than deleted (public util surface — removal is an
   owner decision).

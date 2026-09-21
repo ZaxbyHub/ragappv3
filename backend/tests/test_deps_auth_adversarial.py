@@ -233,6 +233,12 @@ class TestEvaluatePolicyNegativeResourceId:
             # Should NOT grant access to arbitrary negative ID
             assert result is False
 
+            # #645 review (PRR-E): the async checkout surface is the only
+            # legitimate path — a regression to the blocking sync checkout
+            # must fail this test.
+            mock_pool.get_connection_async.assert_called_once()
+            mock_pool.get_connection.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_evaluate_policy_negative_resource_id_minus999999(self):
         """
