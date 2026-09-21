@@ -5,6 +5,18 @@
     <link rel="icon" type="image/svg+xml" href="%BASE_URL%vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="description" content="Meridian — Self-hosted RAG application for document Q&amp;A" />
+    <!-- Primary text font (Spline Sans variable, latin subset — the --font-sans
+         face above the fold). Preload starts the fetch before the CSS bundle
+         parses; Vite rewrites this href to the hashed dist asset (regular and
+         subpath builds verified in the #640 trace). crossorigin is required:
+         font fetches are anonymous CORS requests even same-origin. -->
+    <link
+      rel="preload"
+      href="/src/assets/fonts/spline-sans-latin-normal-300-700.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
     <title>Meridian</title>
   </head>
   <body>

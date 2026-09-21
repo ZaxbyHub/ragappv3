@@ -22,48 +22,73 @@ const THEME_LOADERS = {
 
 type ThemeName = keyof typeof THEME_LOADERS;
 
-// One loader per supported grammar. Keys are the 20 supported language names
-// plus every alias shiki itself resolves to them (enumerated from
-// `bundledLanguages` loader identity — see the issue #572 trace); fences using
-// an alias load the same grammar module as the base name.
-const GRAMMAR_LOADERS: Record<string, () => Promise<GrammarModule>> = {
-  javascript: () => import("@shikijs/langs/javascript"),
-  js: () => import("@shikijs/langs/javascript"),
-  cjs: () => import("@shikijs/langs/javascript"),
-  mjs: () => import("@shikijs/langs/javascript"),
-  typescript: () => import("@shikijs/langs/typescript"),
-  ts: () => import("@shikijs/langs/typescript"),
-  cts: () => import("@shikijs/langs/typescript"),
-  mts: () => import("@shikijs/langs/typescript"),
-  tsx: () => import("@shikijs/langs/tsx"),
-  jsx: () => import("@shikijs/langs/jsx"),
-  python: () => import("@shikijs/langs/python"),
-  py: () => import("@shikijs/langs/python"),
-  bash: () => import("@shikijs/langs/bash"),
-  sh: () => import("@shikijs/langs/bash"),
-  shell: () => import("@shikijs/langs/bash"),
-  zsh: () => import("@shikijs/langs/bash"),
-  shellscript: () => import("@shikijs/langs/bash"),
-  json: () => import("@shikijs/langs/json"),
-  yaml: () => import("@shikijs/langs/yaml"),
-  yml: () => import("@shikijs/langs/yaml"),
-  toml: () => import("@shikijs/langs/toml"),
-  css: () => import("@shikijs/langs/css"),
-  html: () => import("@shikijs/langs/html"),
-  xml: () => import("@shikijs/langs/xml"),
-  markdown: () => import("@shikijs/langs/markdown"),
-  md: () => import("@shikijs/langs/markdown"),
-  sql: () => import("@shikijs/langs/sql"),
-  rust: () => import("@shikijs/langs/rust"),
-  rs: () => import("@shikijs/langs/rust"),
-  go: () => import("@shikijs/langs/go"),
-  java: () => import("@shikijs/langs/java"),
-  c: () => import("@shikijs/langs/c"),
-  cpp: () => import("@shikijs/langs/cpp"),
-  "c++": () => import("@shikijs/langs/cpp"),
-  csharp: () => import("@shikijs/langs/csharp"),
-  cs: () => import("@shikijs/langs/csharp"),
-  "c#": () => import("@shikijs/langs/csharp"),
+// One loader const per BASE grammar, shared by every alias spelling: each
+// alias entry below references the SAME function identity, so highlighting
+// `js` after `javascript` (or `mjs`, `cjs`, ...) triggers exactly one
+// @shikijs/langs/javascript import (#640 AC11 — previously every alias had
+// its own arrow-function literal, defeating the `loaded` Set's
+// reference-based dedupe). Keys are the 20 supported language names plus
+// every alias shiki itself resolves to them (enumerated from
+// `bundledLanguages` loader identity — see the issue #572 trace).
+const loadJavascript = () => import("@shikijs/langs/javascript");
+const loadTypescript = () => import("@shikijs/langs/typescript");
+const loadTsx = () => import("@shikijs/langs/tsx");
+const loadJsx = () => import("@shikijs/langs/jsx");
+const loadPython = () => import("@shikijs/langs/python");
+const loadBash = () => import("@shikijs/langs/bash");
+const loadJson = () => import("@shikijs/langs/json");
+const loadYaml = () => import("@shikijs/langs/yaml");
+const loadToml = () => import("@shikijs/langs/toml");
+const loadCss = () => import("@shikijs/langs/css");
+const loadHtml = () => import("@shikijs/langs/html");
+const loadXml = () => import("@shikijs/langs/xml");
+const loadMarkdown = () => import("@shikijs/langs/markdown");
+const loadSql = () => import("@shikijs/langs/sql");
+const loadRust = () => import("@shikijs/langs/rust");
+const loadGo = () => import("@shikijs/langs/go");
+const loadJava = () => import("@shikijs/langs/java");
+const loadC = () => import("@shikijs/langs/c");
+const loadCpp = () => import("@shikijs/langs/cpp");
+const loadCsharp = () => import("@shikijs/langs/csharp");
+
+export const GRAMMAR_LOADERS: Record<string, () => Promise<GrammarModule>> = {
+  javascript: loadJavascript,
+  js: loadJavascript,
+  cjs: loadJavascript,
+  mjs: loadJavascript,
+  typescript: loadTypescript,
+  ts: loadTypescript,
+  cts: loadTypescript,
+  mts: loadTypescript,
+  tsx: loadTsx,
+  jsx: loadJsx,
+  python: loadPython,
+  py: loadPython,
+  bash: loadBash,
+  sh: loadBash,
+  shell: loadBash,
+  zsh: loadBash,
+  shellscript: loadBash,
+  json: loadJson,
+  yaml: loadYaml,
+  yml: loadYaml,
+  toml: loadToml,
+  css: loadCss,
+  html: loadHtml,
+  xml: loadXml,
+  markdown: loadMarkdown,
+  md: loadMarkdown,
+  sql: loadSql,
+  rust: loadRust,
+  rs: loadRust,
+  go: loadGo,
+  java: loadJava,
+  c: loadC,
+  cpp: loadCpp,
+  "c++": loadCpp,
+  csharp: loadCsharp,
+  cs: loadCsharp,
+  "c#": loadCsharp,
 };
 
 let _highlightFn: HighlightFn | null = null;
@@ -105,23 +130,57 @@ export function loadHighlighter(): Promise<HighlightFn> {
         langs: [],
         engine: engine.createJavaScriptRegexEngine({ forgiving: true }),
       });
-      // Tracks loader function REFERENCES (not fence keys) so aliases of the
-      // same grammar (js/cjs/mjs, sh/shell/zsh, ...) share one entry, and
-      // uses hasOwn so fence tags like "constructor" or "__proto__" resolve
-      // as unknown languages instead of hitting Object.prototype members.
+      // Tracks loader function REFERENCES (not fence keys). Every alias of a
+      // base grammar shares ONE module-level loader const (see GRAMMAR_LOADERS),
+      // so an alias hit after the base load is a Set hit and performs no
+      // second import. hasOwn keeps fence tags like "constructor" or
+      // "__proto__" resolving as unknown languages instead of hitting
+      // Object.prototype members.
       const loaded = new Set<() => Promise<GrammarModule>>();
+      // Negative cache (#640 AC10): a grammar chunk that fails to fetch/parse
+      // is retried at most once more (2 total attempts), after which it
+      // degrades to plain text WITHOUT re-importing for the rest of the page
+      // session — callers re-run per render, so unbounded retries meant every
+      // re-render of a failing fence hammered the network. A page reload
+      // resets the cache (fresh chances after a deploy fix). A later success
+      // clears the failure record.
+      const failedLoads = new Map<() => Promise<GrammarModule>, number>();
+      // Single-flight (PR #651 review F-001): concurrent callers of the same
+      // grammar share one in-flight load, so the retry-cap accounting counts
+      // ATTEMPTS, not concurrent callers racing past the cap check.
+      const inFlightLoads = new Map<() => Promise<GrammarModule>, Promise<void>>();
+      const MAX_GRAMMAR_LOAD_ATTEMPTS = 2;
       const fn: HighlightFn = async (code, lang) => {
         const key = lang.trim().toLowerCase();
         const loader = Object.prototype.hasOwnProperty.call(GRAMMAR_LOADERS, key)
           ? GRAMMAR_LOADERS[key]
           : undefined;
         if (loader && !loaded.has(loader)) {
+          const attempts = failedLoads.get(loader) ?? 0;
+          if (attempts >= MAX_GRAMMAR_LOAD_ATTEMPTS) {
+            // Permanently cached failure for this page session — degrade
+            // immediately, no import attempt.
+            return hl.codeToHtml(code, { lang: "text", theme: currentTheme() });
+          }
+          const loadOnce = async (): Promise<void> => {
+            try {
+              await hl.loadLanguage((await loader()).default);
+              loaded.add(loader);
+              failedLoads.delete(loader);
+            } catch (error: unknown) {
+              failedLoads.set(loader, (failedLoads.get(loader) ?? 0) + 1);
+              inFlightLoads.delete(loader);
+              // Grammar chunk failed to fetch/parse — degrade to themed plain
+              // text rather than unstyled HTML; at most one retry remains.
+              throw error;
+            }
+          };
+          const cached = inFlightLoads.get(loader);
+          const pending: Promise<void> = cached ?? loadOnce();
+          inFlightLoads.set(loader, pending);
           try {
-            await hl.loadLanguage((await loader()).default);
-            loaded.add(loader);
+            await pending;
           } catch {
-            // Grammar chunk failed to fetch/parse — degrade to themed plain
-            // text rather than unstyled HTML; the next call retries the load.
             return hl.codeToHtml(code, { lang: "text", theme: currentTheme() });
           }
         }

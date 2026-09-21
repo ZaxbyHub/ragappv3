@@ -7,7 +7,11 @@ FROM node:22.14-alpine@sha256:9bef0ef1e268f60627da9ba7d7605e8831d5b56ad07487d24d
 
 WORKDIR /app
 
-ENV NODE_ENV=production
+# No ENV NODE_ENV=production in the build stage (issue #640): `npm ci` must
+# install devDependencies — typescript, vite and the tailwind/postcss plugins
+# power the `tsc && vite build` step below, and npm skips devDependencies
+# under NODE_ENV=production. vite still emits a production bundle (build mode
+# is independent of NODE_ENV); the final stage ships only dist/ anyway.
 
 COPY package*.json ./
 
@@ -20,9 +24,18 @@ ARG VITE_API_URL=
 ENV VITE_APP_BASENAME=${VITE_APP_BASENAME}
 ENV VITE_API_URL=${VITE_API_URL}
 
-# Validate VITE_APP_BASENAME before build (inlined from scripts/validate_vite_env.mjs)
-# to avoid needing a COPY from outside the build context.
-RUN node -e "
+# validate_vite_env inlined to avoid dependency on an external file; the
+# validation rules and error-message text are identical to
+# scripts/validate_vite_env.mjs (config-env-contract parity), with one repo-
+# mandated addition: every throw concatenates JSON.stringify(raw) so build
+# logs name the received value (issue #567 — pinned by
+# frontend/src/base-path-message.test.ts).
+# BuildKit heredoc form (same shape the root Dockerfile adopted in #258): the
+# previous unquoted multi-line `RUN node -e "..."` block was un-parseable
+# Dockerfile syntax (every JS line read as a Dockerfile instruction —
+# "unknown instruction: const"); the docker-smoke CI job builds this file, so
+# the parse cannot regress silently again (#640).
+RUN <<'NODEJS' node
 const raw = process.env.VITE_APP_BASENAME ?? '';
 const hasCtrl = function(s) {
   for (const ch of s) { const c = ch.charCodeAt(0); if (c < 32 || c === 127) return true; }
@@ -46,7 +59,7 @@ try {
   console.error('Fix VITE_APP_BASENAME and rebuild.');
   process.exit(1);
 }
-"
+NODEJS
 RUN npm run build
 
 # Final stage

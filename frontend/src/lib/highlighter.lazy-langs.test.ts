@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * Lazy per-language grammar loading contract (issue #572, AC3).
@@ -51,6 +51,14 @@ vi.mock("@shikijs/langs/python", async () => {
 import { loadHighlighter } from "@/lib/highlighter";
 
 describe("loadHighlighter lazy per-language grammar loading (AC3)", () => {
+  // grammarLoads is a vi.hoisted module-scoped array; vite.config.ts's
+  // clearMocks:true resets mock implementations but NOT hoisted arrays, so
+  // without this reset a second test would inherit test 1's recorded loads
+  // (#640 AC9 — the state leak the frozen C9 check pins).
+  beforeEach(() => {
+    grammarLoads.length = 0;
+  });
+
   it(
     "highlights python without loading cpp/csharp/java/rust/go grammars",
     async () => {
@@ -74,6 +82,24 @@ describe("loadHighlighter lazy per-language grammar loading (AC3)", () => {
       // is actually highlighted.
       await hl("int main(){}", "cpp");
       expect(grammarLoads).toContain("cpp");
+    },
+    60000,
+  );
+
+  it(
+    "resets grammar state between tests (AC9 #640)",
+    async () => {
+      // The beforeEach reset means this second test starts from a clean
+      // ledger even though the test above already recorded python + cpp —
+      // without it, this assertion would see the previous test's loads.
+      expect(grammarLoads).toEqual([]);
+
+      const hl = await loadHighlighter();
+      await hl('package main\nfunc main() {}', "go");
+
+      // Only this test's own language is recorded — proving both the reset
+      // (empty at start) and that lazy loading still records per language.
+      expect(grammarLoads).toEqual(["go"]);
     },
     60000,
   );

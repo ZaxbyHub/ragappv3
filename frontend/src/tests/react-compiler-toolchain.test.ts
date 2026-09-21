@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { extractActiveConfigSource } from "./helpers/active-config";
+
 /**
  * React Compiler toolchain contract (issue #572, AC6).
  *
@@ -13,6 +15,11 @@ import { resolve } from "node:path";
  * babel-plugin-react-compiler package belongs to the v4/v5 babel pipeline and
  * cannot be wired into this toolchain. Fails at HEAD (no compiler option, no
  * engine devDependency).
+ *
+ * Issue #640 (AC8): the wiring regex now runs against the comment-stripped
+ * active source (extractActiveConfigSource), so a commented-out
+ * `// compiler: true` can no longer read as wired — see
+ * react-compiler-active-config.test.ts for the fixture proof.
  */
 
 const frontendRoot = resolve(__dirname, "..", "..");
@@ -33,8 +40,9 @@ describe("React Compiler toolchain wiring (AC6)", () => {
     const viteConfig = readFileSync(resolve(frontendRoot, "vite.config.ts"), "utf-8");
 
     expect(
-      viteConfig,
-      "vite.config.ts must enable React Compiler inside the react() plugin options",
+      extractActiveConfigSource(viteConfig),
+      "vite.config.ts must enable React Compiler inside the react() plugin options " +
+        "(active source only — commented-out lines do not count)",
     ).toMatch(/react\(\s*\{[\s\S]*?compiler:\s*true/);
   });
 });

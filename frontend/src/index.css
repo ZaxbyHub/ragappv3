@@ -26,9 +26,11 @@
 /* Self-hosted fonts (issue #572): the four families the app references are
    vendored under src/assets/fonts with the same families, weights, and
    unicode-range subsets Google's css2 API serves, so no page load contacts
-   fonts.googleapis.com/fonts.gstatic.com. font-display: swap preserves the
-   previous display=swap behavior. Files are bundled assets: Vite hashes and
-   base-prefixes the emitted URLs, keeping subpath deployments working. */
+   the Google Fonts CDN (stylesheet or font origins — the external-origin
+   scan treats even comment mentions as violations, hence this rewording).
+   font-display: swap preserves the previous display=swap behavior. Files
+   are bundled assets: Vite hashes and base-prefixes the emitted URLs,
+   keeping subpath deployments working. */
 /* cyrillic-ext */
 @font-face {
   font-family: 'Commissioner';
