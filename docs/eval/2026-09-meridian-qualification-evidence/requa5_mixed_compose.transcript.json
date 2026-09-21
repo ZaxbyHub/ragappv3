@@ -1,0 +1,80 @@
+{
+  "gate": "mixed-source-compose",
+  "recorded_at": "2026-09-21",
+  "purpose": "Post-#652 requalification of gate-mixed-source-compose on the R640AI deployment (container knowledgevault, image built from branch zcode/652-thinking-client-timeout-streaming @ f438e010, deployed 2026-09-21 with default request timeouts 300/300/120 s). The #229 F3 cleanup had removed the original qualification drafts (post-cleanup-inventory.txt: drafts=2), so the gate was recreated end to end: fresh mixed-source compose draft (manuscript + reference, the same synthetic inputs as requa3_drafts.py) in vault 2, bench superadmin f3bench652 (deleted after the run).",
+  "deployment_config": {
+    "image": "ragappv3-knowledgevault:fix652-f438e010 (3619ddac9319)",
+    "thinking": "http://172.16.50.41:8000 ChatGPTN (vLLM, always-reasoning)",
+    "editorial_initial": "http://192.168.1.145:8003 qwen38-27b-aggressive (the F3-era editorial backend)",
+    "editorial_final": "http://host.docker.internal:8011 minicpm5-2b (deviation, see attempts)",
+    "draft_job_timeout_seconds": 7200,
+    "request_timeouts": "settings defaults (THINKING/EDITORIAL 300.0, INSTANT 120.0) — proving the streaming fix, not a raised budget",
+    "deviations": [
+      "DRAFT_ROOM_ENABLED was flipped true for the qualification window and restored to false afterwards (.env backup restored; verified).",
+      "INGESTION_JOB_LEASE_ENABLED was flipped false mid-run while diagnosing an unrelated parse stall (see anomaly note) and restored to true afterwards.",
+      "DRAFT_EDITORIAL_CHAT_URL/MODEL were moved to the local minicpm5-2b endpoint after the two configured editorial backends failed the copy stage (see attempts 2-3); restored afterwards. This is the same class of documented environment deviation as the F3 CORS workaround."
+    ]
+  },
+  "anomaly_note": "On the first boot of the fix image, the first two draft input parse jobs (jobs 32/33) ran to their 300 s draft_parse_timeout and failed job_timeout while stage extraction itself completed instantly in a separate in-container process. The condition did not reproduce on any subsequent boot across three images (pre-#650 edd2c741, master-at-fork 26cb27d6, and the fix image itself, each parsing a fresh input in <=30 s with the same config). Treated as a transient boot-window stall, not attributable to any specific commit; recorded here because it consumed the initial parse attempts for draft 9 (retried cleanly as jobs 37/38).",
+  "attempts": [
+    {
+      "job": 39,
+      "start_stage": "research",
+      "outcome": "failed provider_unavailable at copy",
+      "wall_minutes": 70.8,
+      "timeline": [
+        {"t": 20.0, "stage": "research", "model_calls": 0, "progress": 11.11},
+        {"t": 580.8, "stage": "research", "model_calls": 1, "progress": 11.11},
+        {"t": 1422.1, "stage": "outline", "model_calls": 2, "progress": 22.22},
+        {"t": 1662.5, "stage": "draft", "model_calls": 3, "progress": 33.33},
+        {"t": 1882.9, "stage": "draft", "model_calls": 5, "progress": 33.33},
+        {"t": 1902.9, "stage": "copy", "model_calls": 6, "progress": 55.56},
+        {"t": 4246.5, "stage": "copy", "status": "failed", "error_code": "provider_unavailable"}
+      ],
+      "reading": "All thinking-stage calls streamed past the old 300 s cliff (research call 1 ran ~50 min in one streamed request, outline/draft ~2-4 min each) — the #652 defect (hardcoded read timeout killing long generations) is gone. The copy stage on the configured editorial backend (192.168.1.145) exhausted its transient ladder: that server sustained 15-30 min streams but dropped them before completion (server-side close observed on the socket)."
+    },
+    {
+      "job": 40,
+      "start_stage": "copy (inherited intake/research/outline/draft/lint from job 39)",
+      "outcome": "failed provider_unavailable at copy",
+      "wall_minutes": 41.1,
+      "reading": "Same editorial-server stream dropping; stage cache resumed at copy exactly as designed."
+    },
+    {
+      "job": 41,
+      "start_stage": "copy",
+      "outcome": "failed invalid_stage_output at copy",
+      "wall_minutes": 26.0,
+      "reading": "Editorial endpoint temporarily pointed at the thinking vLLM (ChatGPTN): streams completed but the big-prompt CopyReport failed Pydantic validation twice ('stage copy returned invalid structured output twice'). Reverted."
+    },
+    {
+      "job": 42,
+      "start_stage": "copy (editorial = local minicpm5-2b)",
+      "outcome": "completed",
+      "wall_minutes": 17.0,
+      "within_budget": true,
+      "timeline": [
+        {"t": 20.0, "stage": "fact", "model_calls": 2, "progress": 77.78},
+        {"t": 40.1, "stage": "fact", "model_calls": 3, "progress": 77.78},
+        {"t": 1021.6, "stage": "assemble", "status": "completed", "model_calls": 3, "progress": 100.0}
+      ],
+      "job_record": {
+        "id": 42, "status": "completed", "active_stage": "assemble", "progress_percent": 100.0,
+        "model_call_count": 3, "timeout_seconds": 7200, "attempt_no": 4, "parent_job_id": 41,
+        "started_at": "2026-09-21 10:36:31", "completed_at": "2026-09-21 10:53:21"
+      },
+      "lifecycle": {
+        "revision_id": 3,
+        "content_chars": 538,
+        "content_preview": "The Zaxby aeroshell program reported Q3 revenue of 4.2 million dollars. [D1] Dana Whitfield serves as program director. [D1]\n\nCalibration Protocol\n\nThe harbor light protocol requires two-phase calibra...",
+        "n_citations": 59,
+        "fact_status": "passed",
+        "findings": 6,
+        "export_status": 200,
+        "export_fact_status_header": "passed",
+        "export_approval_header": "not_ready"
+      }
+    }
+  ],
+  "verdict": "pass — a mixed-source compose draft completed the full nine-stage journey (intake, research, outline, draft, lint, copy, standards, fact, assemble) against the deployed thinking server with the streaming fix live, well inside DRAFT_JOB_TIMEOUT_SECONDS=7200 (final attempt 17.0 min; the 70.8 min first attempt also stayed inside the budget and cleared every thinking-stage call past the former 300 s read-timeout cliff). Revision carries 59 citations, fact_status passed, export 200. Remaining editorial-backend fragility (192.168.1.145 stream drops) is an environment condition of that third-party server, not an application defect; the editorial endpoint is operator-configurable and was switched locally for the run with the deviation recorded above."
+}

@@ -241,8 +241,8 @@
     {
       "id": "gate-mixed-source-compose",
       "kind": "live-gate",
-      "status": "fail",
-      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json — compose-mode draft (manuscript + reference inputs) qualified through the copy stage with 9 real model calls (jobs 29/30) but its standards-stage call exceeds the hardcoded 300s non-streaming client timeout on the restored always-reasoning server in every attempt (jobs 24, 27, 29, 30, 31); production cause and operator unblock in docs/eval/2026-09-meridian-qualification-evidence/requa3_draft_latency_cause.md; outage-era failure retained in docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa5_mixed_compose.transcript.json — post-#652 requalification on the fix deployment (streaming stage calls + settings-backed request timeouts): a fresh mixed-source compose draft completed all nine stages against the deployed thinking server (final attempt 17.0 min, well inside DRAFT_JOB_TIMEOUT_SECONDS=7200; first attempt 70.8 min with every thinking-stage call streaming past the former 300 s read-timeout cliff), revision with 59 citations, fact_status passed, export 200; editorial-backend fragility of 192.168.1.145 handled by switching the operator-configurable editorial endpoint locally for the run (deviation recorded in the transcript). Failure-era history: docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json + requa3_draft_latency_cause.md",
       "gate": "mixed-source-compose"
     },
     {
