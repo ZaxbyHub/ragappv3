@@ -264,6 +264,10 @@ def _load_persisted_settings(sqlite_path: str) -> None:
             "instant_max_tokens",
             "thinking_max_tokens",
             "instant_enable_thinking",
+            # Per-mode HTTP request timeouts (issue #652)
+            "thinking_request_timeout_seconds",
+            "editorial_request_timeout_seconds",
+            "instant_request_timeout_seconds",
             # Instant-mode latency skips
             "instant_skip_query_transformation",
             "instant_skip_retrieval_evaluation",

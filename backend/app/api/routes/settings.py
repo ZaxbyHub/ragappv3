@@ -95,6 +95,9 @@ class SettingsUpdate(BaseModel):
     instant_max_tokens: Optional[int] = None
     thinking_max_tokens: Optional[int] = None
     instant_enable_thinking: Optional[bool] = None
+    thinking_request_timeout_seconds: Optional[float] = None
+    editorial_request_timeout_seconds: Optional[float] = None
+    instant_request_timeout_seconds: Optional[float] = None
 
     # Instant-mode latency skips (trade quality for speed in Instant mode only)
     instant_skip_query_transformation: Optional[bool] = None
@@ -219,6 +222,23 @@ class SettingsUpdate(BaseModel):
     def validate_per_mode_positive_ints(cls, v):
         if v is not None and v <= 0:
             raise ValueError("must be a positive integer")
+        return v
+
+    @field_validator(
+        "thinking_request_timeout_seconds",
+        "editorial_request_timeout_seconds",
+        "instant_request_timeout_seconds",
+    )
+    @classmethod
+    def validate_request_timeouts_positive(cls, v):
+        # Issue #652: a zero/negative httpx read timeout would fail every
+        # provider call; keep the positive bound explicit for API callers.
+        # Upper bound mirrors the Settings construction validator (24 h is
+        # generous for a per-read timeout on a streamed response).
+        if v is not None and not 0 < v <= 86400:
+            raise ValueError(
+                "must be a positive number of seconds (<= 86400)"
+            )
         return v
 
     @field_validator("instant_enable_thinking")
@@ -652,6 +672,9 @@ ALLOWED_FIELDS = [
     "instant_max_tokens",
     "thinking_max_tokens",
     "instant_enable_thinking",
+    "thinking_request_timeout_seconds",
+    "editorial_request_timeout_seconds",
+    "instant_request_timeout_seconds",
     "instant_skip_query_transformation",
     "instant_skip_retrieval_evaluation",
     "instant_skip_distillation_synthesis",
@@ -891,6 +914,9 @@ class SettingsResponse(BaseModel):
     instant_max_tokens: int = 4096
     thinking_max_tokens: int = 32768
     instant_enable_thinking: bool = False
+    thinking_request_timeout_seconds: float = 300.0
+    editorial_request_timeout_seconds: float = 300.0
+    instant_request_timeout_seconds: float = 120.0
     instant_skip_query_transformation: bool = True
     instant_skip_retrieval_evaluation: bool = True
     instant_skip_distillation_synthesis: bool = True
@@ -1056,6 +1082,9 @@ def _build_settings_dict() -> dict:
         "instant_max_tokens": settings.instant_max_tokens,
         "thinking_max_tokens": settings.thinking_max_tokens,
         "instant_enable_thinking": settings.instant_enable_thinking,
+        "thinking_request_timeout_seconds": settings.thinking_request_timeout_seconds,
+        "editorial_request_timeout_seconds": settings.editorial_request_timeout_seconds,
+        "instant_request_timeout_seconds": settings.instant_request_timeout_seconds,
         "instant_skip_query_transformation": settings.instant_skip_query_transformation,
         "instant_skip_retrieval_evaluation": settings.instant_skip_retrieval_evaluation,
         "instant_skip_distillation_synthesis": settings.instant_skip_distillation_synthesis,

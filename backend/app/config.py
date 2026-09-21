@@ -143,6 +143,23 @@ class Settings(BaseSettings):
     32768 preserves the prior hardcoded budget exactly. Configurable so operators
     can shrink the thinking-mode token budget without editing source (issue #395
     DD-rag-005). Must be >= 1 (see validate_per_mode_positive_ints)."""
+
+    # Per-mode HTTP request timeouts (issue #652)
+    thinking_request_timeout_seconds: float = 300.0
+    """Read timeout for thinking-mode chat/model calls (seconds). Defaults to
+    the pre-#652 hardcoded ``create_thinking_client`` constant exactly.
+    Streaming consumers get a per-chunk reset (httpx applies the timeout per
+    read), so this bounds the longest chunk gap, not the total generation;
+    a non-streaming call must fit its whole response inside it. Restart
+    required after a change (clients capture the timeout at construction)."""
+    editorial_request_timeout_seconds: float = 300.0
+    """Same contract as ``thinking_request_timeout_seconds`` for the editorial
+    desk stages (copy/standards/fact), defaulting to the pre-#652 hardcoded
+    ``create_editorial_client`` constant."""
+    instant_request_timeout_seconds: float = 120.0
+    """Same contract for the Instant client, defaulting to the pre-#652
+    hardcoded ``create_instant_client`` constant."""
+
     instant_enable_thinking: bool = False
     """Whether Instant-mode chat requests should leave the model's chat-template
     thinking mode enabled. False (default) sends the family-appropriate no-think
@@ -1104,6 +1121,28 @@ class Settings(BaseSettings):
         """
         if v is None or v == "":
             return None
+        return v
+
+    @field_validator(
+        "thinking_request_timeout_seconds",
+        "editorial_request_timeout_seconds",
+        "instant_request_timeout_seconds",
+    )
+    @classmethod
+    def validate_request_timeout_bounds(cls, v):
+        """Reject non-positive or absurd request timeouts at construction.
+
+        Mirrors the ``PUT /api/settings`` validation for the same fields
+        (issue #654 review): ``0``/negative would fail every provider call,
+        and the httpx error surfaces only per-request, long after startup.
+        Upper bound 86400 (24 h) is generous for a per-read timeout on a
+        streamed response — a larger value is a configuration error, not a
+        tuning choice.
+        """
+        if not 0 < float(v) <= 86400:
+            raise ValueError(
+                "request timeout must be a positive number of seconds (<= 86400)"
+            )
         return v
 
     @field_validator("chunk_size_chars", mode="before")

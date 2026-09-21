@@ -137,6 +137,8 @@ services:
       - CANVAS_MAX_VERSIONS=${CANVAS_MAX_VERSIONS:-500}
       - DRAFT_MAX_SECTIONS=${DRAFT_MAX_SECTIONS:-12}
       - DRAFT_QA_RETRY_LIMIT=${DRAFT_QA_RETRY_LIMIT:-2}
+      # Wall-clock budget per compile job; raise for always-reasoning model
+      # deployments (streaming calls run long; the #652 qualification used 7200)
       - DRAFT_JOB_TIMEOUT_SECONDS=${DRAFT_JOB_TIMEOUT_SECONDS:-1800}
       - DRAFT_JOB_MAX_MODEL_CALLS=${DRAFT_JOB_MAX_MODEL_CALLS:-40}
       - DRAFT_COMPILE_RATE_LIMIT=${DRAFT_COMPILE_RATE_LIMIT:-5/minute}
@@ -167,6 +169,11 @@ services:
       - INSTANT_MEMORY_CONTEXT_TOP_K=${INSTANT_MEMORY_CONTEXT_TOP_K:-2}
       - INSTANT_MAX_TOKENS=${INSTANT_MAX_TOKENS:-4096}
       - THINKING_MAX_TOKENS=${THINKING_MAX_TOKENS:-32768}
+      # Per-mode HTTP request read timeouts in seconds (issue #652); numeric
+      # defaults mirror the Settings fields exactly.
+      - THINKING_REQUEST_TIMEOUT_SECONDS=${THINKING_REQUEST_TIMEOUT_SECONDS:-300.0}
+      - EDITORIAL_REQUEST_TIMEOUT_SECONDS=${EDITORIAL_REQUEST_TIMEOUT_SECONDS:-300.0}
+      - INSTANT_REQUEST_TIMEOUT_SECONDS=${INSTANT_REQUEST_TIMEOUT_SECONDS:-120.0}
       # Provider residency/context contracts (issue #571); short form so an
       # unset key is omitted and the Settings defaults govern.
       - OLLAMA_KEEP_ALIVE

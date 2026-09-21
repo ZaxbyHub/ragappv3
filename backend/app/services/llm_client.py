@@ -649,6 +649,7 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: int = _UNSET_MAX_TOKENS,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator["Union[str, ReasoningDelta]", None]:
         """
         Send a streaming chat completion request and yield content chunks.
@@ -659,6 +660,11 @@ class LLMClient:
             max_tokens: Maximum tokens to generate (default: 32768, or the
                 client's configured per-mode budget when one was supplied
                 at construction — ENH-015, issue #494)
+            response_format: Optional provider-side output constraint
+                (e.g. a ``json_schema`` dict), forwarded on the streamed
+                request exactly as ``chat_completion`` forwards it
+                (issue #652: Draft Room structured stages stream with the
+                same #571 schema contract as the non-streaming path).
 
         Yields:
             Plain ``str`` answer-content chunks as they arrive from the SSE
@@ -697,6 +703,8 @@ class LLMClient:
             # LM Studio idle TTL (issue #571) — same semantics as the
             # non-streaming payload above.
             payload["ttl"] = self.ttl
+        if response_format is not None:
+            payload["response_format"] = response_format
         started_at = time.perf_counter()
         prompt_tokens = self._prompt_token_estimate(messages)
         completion_chars = 0
@@ -802,6 +810,9 @@ class LLMClient:
                         messages=messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        # Issue #652: keep the caller's schema contract on the
+                        # non-SSE fallback too, mirroring the streamed payload.
+                        response_format=response_format,
                     )
                     # Issue #571: keep the provider-exact usage the non-stream
                     # call just recorded — the stream summary below would
@@ -1171,7 +1182,7 @@ class ModelNotConfiguredError(RuntimeError):
     """
 
 
-def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
+def create_thinking_client(timeout: Optional[float] = None) -> "LLMClient":
     """Create an LLMClient configured for the Thinking backend (Ollama).
 
     Talks to ``settings.ollama_chat_url`` with ``settings.chat_model`` —
@@ -1191,6 +1202,14 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
     the legacy hardcoded 32768. An explicit per-call ``max_tokens`` still
     wins.
 
+    Read timeout (issue #652): ``timeout`` defaults to
+    ``settings.thinking_request_timeout_seconds`` (300.0 unless configured)
+    instead of a hardcoded constant, so operators can raise it for slow
+    model deployments; an explicit ``timeout=`` argument still wins. This
+    bounds the longest per-read gap on streamed responses, not the total
+    generation; a change requires a restart (the timeout is captured at
+    client construction).
+
     Provider residency contracts (issue #571): the Ollama-native
     ``keep_alive`` (default ``"-1"``, the same indefinite residency the
     retired ping loop provided) and ``num_ctx`` (default 4096, Ollama's
@@ -1204,7 +1223,11 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
             "configure it in Settings -> Models."
         )
     return LLMClient(
-        timeout=timeout,
+        timeout=(
+            timeout
+            if timeout is not None
+            else settings.thinking_request_timeout_seconds
+        ),
         base_url=settings.ollama_chat_url,
         model=settings.chat_model,
         cb_name="llm_thinking",
@@ -1216,7 +1239,7 @@ def create_thinking_client(timeout: float = 300.0) -> "LLMClient":
     )
 
 
-def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
+def create_editorial_client(timeout: Optional[float] = None) -> "LLMClient":
     """Client for editorial desk stages (copy/standards/fact).
 
     Some reasoning-strong chat models loop in reasoning on desk-style
@@ -1229,6 +1252,10 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
     an Ollama-mode backend by default, and priming covers it when an
     explicit override is configured (otherwise its URL+model equal the
     thinking client's and the thinking prime pins the same server).
+
+    Read timeout (issue #652): ``timeout`` defaults to
+    ``settings.editorial_request_timeout_seconds`` (300.0 unless
+    configured); an explicit ``timeout=`` argument still wins.
     """
     base_url = settings.editorial_chat_url or settings.ollama_chat_url
     model = settings.editorial_chat_model or settings.chat_model
@@ -1240,7 +1267,11 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
             "them in Settings -> Models."
         )
     return LLMClient(
-        timeout=timeout,
+        timeout=(
+            timeout
+            if timeout is not None
+            else settings.editorial_request_timeout_seconds
+        ),
         base_url=base_url,
         model=model,
         cb_name="llm_editorial",
@@ -1250,7 +1281,7 @@ def create_editorial_client(timeout: float = 300.0) -> "LLMClient":
     )
 
 
-def create_instant_client(timeout: float = 120.0) -> "LLMClient":
+def create_instant_client(timeout: Optional[float] = None) -> "LLMClient":
     """Create the Instant client (LM Studio, ``settings.instant_chat_url``).
 
     Both the URL and ``settings.instant_chat_model`` are
@@ -1267,6 +1298,11 @@ def create_instant_client(timeout: float = 120.0) -> "LLMClient":
     mechanism) log a warning and send nothing, failing open. The client
     also carries ``settings.instant_max_tokens`` as its default generation
     budget (ENH-015, issue #494), mirroring ``create_thinking_client``.
+
+    Read timeout (issue #652): ``timeout`` defaults to
+    ``settings.instant_request_timeout_seconds`` (120.0 unless configured)
+    instead of a hardcoded constant; an explicit ``timeout=`` argument
+    still wins.
 
     Provider residency contracts (issue #571): every chat payload carries
     LM Studio's per-request idle ``ttl`` (default 86400s — far more generous
@@ -1293,7 +1329,11 @@ def create_instant_client(timeout: float = 120.0) -> "LLMClient":
     lm_studio_ttl = getattr(settings, "lm_studio_ttl", None)
     lm_studio_ctx = getattr(settings, "lm_studio_context_length", None)
     return LLMClient(
-        timeout=timeout,
+        timeout=(
+            timeout
+            if timeout is not None
+            else settings.instant_request_timeout_seconds
+        ),
         base_url=settings.instant_chat_url,
         model=settings.instant_chat_model,
         cb_name="llm_instant",

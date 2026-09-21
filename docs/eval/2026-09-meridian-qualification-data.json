@@ -9,7 +9,7 @@
     "host": "R640AI 172.16.50.159",
     "image": "sha256:1714ba3ba5c657d626ae337a619125dbaca9ee0fee905c30affc298233dbe3e3",
     "rollback_image_tag": "ragappv3-knowledgevault:rollback-pre-f3-281bd714, ragappv3-knowledgevault:rollback-f3-stage1-edd2c741",
-    "build_note": "Qualification staged across two builds: the initial battery ran at edd2c741855c34dd1e330e6e79b7210996b353d7 (identical evidence); the thinking/reindex/draft legs were re-run at the fixed build after the two blockers were resolved (thinking endpoint restored by the operator; reindex dimension-probe bug fixed in this PR). The deployed qualified build is the one above and contains everything from the first."
+    "build_note": "Qualification staged across two builds: the initial battery ran at edd2c741855c34dd1e330e6e79b7210996b353d7 (identical evidence); the thinking/reindex/draft legs were re-run at the fixed build after the two blockers were resolved (thinking endpoint restored by the operator; reindex dimension-probe bug fixed in this PR). The deployed qualified build is the one above and contains everything from the first. Stage 3 (2026-09-21, issue #652): gate-mixed-source-compose was re-qualified and flipped on the #652 fix build zcode/652-thinking-client-timeout-streaming @ f438e0100181f975e4a5255b70cf5cefcb52ef16 (image ragappv3-knowledgevault:fix652-f438e010, 3619ddac9319, contains this build as an ancestor); evidence requa5_mixed_compose.transcript.json; R640 restored to the stage-2 image afterwards."
   },
   "deployment": {
     "browsers": [
@@ -126,8 +126,8 @@
     {
       "id": "journey-draft-compose-rewrite",
       "kind": "journey",
-      "status": "pass-with-limitation",
-      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json — the draft journey is qualified end to end via the completed source-only rewrite lifecycle on the final build (draft 7 jobs 25→26→28 with stage-cache resume; revision with 33 citations, findings, export 200 with fact-status headers); the compose-mode variant qualified through copy (9 model calls) and remains blocked at its standards stage by the documented server-latency limitation (docs/eval/2026-09-meridian-qualification-evidence/requa3_draft_latency_cause.md); outage-era failures retained in docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa5_mixed_compose.transcript.json — both draft legs qualified: mixed-source compose completed the full nine-stage lifecycle post-#652 (17.0 min final attempt, 59 citations, fact_status passed, export 200); source-only rewrite via the completed lifecycle on the earlier build (docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json — draft 7 jobs 25→26→28 with stage-cache resume, revision with 33 citations, export 200); outage-era failures retained in docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json",
       "step": "draft-compose-rewrite"
     },
     {
@@ -140,8 +140,8 @@
     {
       "id": "journey-export",
       "kind": "journey",
-      "status": "pass-with-limitation",
-      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD_draft_canvas.transcript.json#canvas_download_v1+canvas_export_manifest — canvas v1 download 200 (Content-Disposition attachment) + export manifest sha256 35f13447...; draft export unexercised (compose blocked, external)",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD_draft_canvas.transcript.json#canvas_download_v1+canvas_export_manifest — canvas v1 download 200 (Content-Disposition attachment) + export manifest sha256 35f13447...; draft export 200 post-#652 (docs/eval/2026-09-meridian-qualification-evidence/requa5_mixed_compose.transcript.json — X-Draft-Fact-Status: passed)",
       "step": "export"
     },
     {
@@ -241,8 +241,8 @@
     {
       "id": "gate-mixed-source-compose",
       "kind": "live-gate",
-      "status": "fail",
-      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json — compose-mode draft (manuscript + reference inputs) qualified through the copy stage with 9 real model calls (jobs 29/30) but its standards-stage call exceeds the hardcoded 300s non-streaming client timeout on the restored always-reasoning server in every attempt (jobs 24, 27, 29, 30, 31); production cause and operator unblock in docs/eval/2026-09-meridian-qualification-evidence/requa3_draft_latency_cause.md; outage-era failure retained in docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa5_mixed_compose.transcript.json — post-#652 requalification on the fix deployment (streaming stage calls + settings-backed request timeouts): a fresh mixed-source compose draft completed all nine stages against the deployed thinking server (final attempt 17.0 min, well inside DRAFT_JOB_TIMEOUT_SECONDS=7200; the 70.8 min first attempt ran every stage call on the streaming transport with no 300 s cap — provable bounds: research stage 23.7 min across 2 calls, longest single call ~14.0 min, outline/draft calls under 300 s each — and its ~39 min tail was the copy stage's transient ladder against a failing third-party editorial backend), revision with 59 citations, fact_status passed, export 200; editorial-backend fragility handled by switching the operator-configurable editorial endpoint locally for the run (deviation recorded in the transcript). Failure-era history: docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json + requa3_draft_latency_cause.md",
       "gate": "mixed-source-compose"
     },
     {
