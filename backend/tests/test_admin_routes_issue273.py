@@ -48,6 +48,11 @@ def _maintenance_app(
     app.include_router(admin_module.router, prefix="/api")
     app.add_middleware(MaintenanceMiddleware, service=service)
     app.state.csrf_manager = CSRFManager("")
+    # The maintenance route resolves the secret manager for its audit HMAC
+    # (issue #597), exactly as production wiring provides at app state.
+    secret_manager = MagicMock()
+    secret_manager.get_hmac_key.return_value = (b"issue273-key", "v273")
+    app.state.secret_manager = secret_manager
     app.dependency_overrides[admin_module.get_maintenance_service] = lambda: service
     if bypass_csrf:
         app.dependency_overrides[csrf_protect] = lambda: "test-csrf-token"

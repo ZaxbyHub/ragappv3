@@ -25,6 +25,17 @@ class MaintenanceFlag:
     updated_at: Optional[str]
 
 
+@dataclass(frozen=True)
+class MaintenanceAudit:
+    """Tamper-evident audit payload committed atomically with a toggle (issue #597)."""
+
+    user_id: Optional[str]
+    ip: Optional[str]
+    key_version: Optional[str]
+    hmac_sha256: str
+    timestamp: str
+
+
 class MaintenanceService:
     FLAG_NAME = "maintenance"
 
@@ -122,7 +133,12 @@ class MaintenanceService:
             self._flag_cache_at = 0.0
             self._flag_cache_generation += 1
 
-    def set_flag(self, enabled: bool, reason: str = "") -> None:
+    def set_flag(
+        self,
+        enabled: bool,
+        reason: str = "",
+        audit: Optional[MaintenanceAudit] = None,
+    ) -> None:
         attempts = 0
         while True:
             flag = self.get_flag()
@@ -137,7 +153,30 @@ class MaintenanceService:
                     (int(enabled), reason, self.FLAG_NAME, flag.version),
                 )
                 if cursor.rowcount:
-                    conn.commit()
+                    try:
+                        if audit is not None:
+                            # Same transaction as the UPDATE (issue #597): the
+                            # audit row commits atomically with the flag, so a
+                            # failed audit INSERT rolls the toggle back.
+                            conn.execute(
+                                """
+                                INSERT INTO audit_toggle_log(feature, enabled, user_id, ip, timestamp, key_version, hmac_sha256)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    self.FLAG_NAME,
+                                    int(enabled),
+                                    audit.user_id,
+                                    audit.ip,
+                                    audit.timestamp,
+                                    audit.key_version,
+                                    audit.hmac_sha256,
+                                ),
+                            )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
                     # Same-process toggles must be visible to the very next
                     # request (issue #549 AC2): drop the cached value only
                     # after the committed UPDATE, so a failed update leaves

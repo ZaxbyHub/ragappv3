@@ -17,7 +17,7 @@ from app.api.deps import (
 )
 from app.config import settings
 from app.security import csrf_protect, require_scope
-from app.services.maintenance import MaintenanceService
+from app.services.maintenance import MaintenanceAudit, MaintenanceService
 from app.services.secret_manager import SecretManager
 from app.services.toggle_manager import ToggleManager
 
@@ -150,10 +150,42 @@ async def get_maintenance(
 @router.post("/maintenance", response_model=MaintenanceResponse)
 async def set_maintenance(
     payload: MaintenancePayload,
+    request: Request,
     service: MaintenanceService = Depends(get_maintenance_service),
-    _auth: dict = Depends(require_scope("admin:config")),
+    secret_manager: SecretManager = Depends(get_secret_manager),
+    auth: dict = Depends(require_scope("admin:config")),
     _csrf_token: str = Depends(csrf_protect),
 ) -> MaintenanceResponse:
     """Set write-blocking maintenance flag state."""
-    await asyncio.to_thread(service.set_flag, payload.enabled, payload.reason)
+    key, key_version = secret_manager.get_hmac_key()
+    ip = request.client.host if request.client else None
+    try:
+        hmac_digest, timestamp = _compute_hmac(
+            key,
+            MaintenanceService.FLAG_NAME,
+            payload.enabled,
+            auth.get("user_id"),
+            ip,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to compute audit HMAC: {exc}"
+        )
+    try:
+        await asyncio.to_thread(
+            service.set_flag,
+            payload.enabled,
+            payload.reason,
+            MaintenanceAudit(
+                user_id=auth.get("user_id"),
+                ip=ip,
+                key_version=key_version,
+                hmac_sha256=hmac_digest,
+                timestamp=timestamp,
+            ),
+        )
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Failed to update maintenance flag: {exc}"
+        )
     return await asyncio.to_thread(_maintenance_response, service)
