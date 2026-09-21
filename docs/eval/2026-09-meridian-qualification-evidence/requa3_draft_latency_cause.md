@@ -2,12 +2,15 @@
 
 ## Outcome
 
-`journey-draft-compose-rewrite`, `gate-source-only-rewrite`, and
-`gate-mixed-source-compose` remain FAIL on the final build (67527cd9). The
-thinking endpoint itself is restored and verified (streamed, cited, durable
-thinking turns — requa2_thinking.transcript.json). The draft pipeline cannot
-complete against the RESTORED server's serving profile. Cause chain, all
-measured live:
+Updated after the retry ladder completed: `gate-source-only-rewrite` is PASS —
+draft 7's compile finished its full lifecycle once the server warmed (job 28:
+revision with 33 citations, findings, export; requa3e_rewrite_results.transcript.json).
+`gate-mixed-source-compose` remains FAIL on the final build (67527cd9), and
+`journey-draft-compose-rewrite` is recorded pass-with-limitation on that basis.
+The thinking endpoint itself is restored and verified (streamed, cited, durable
+thinking turns — requa2_thinking.transcript.json). The mixed-source compose
+pipeline cannot complete its standards stage against the RESTORED server's
+serving profile. Cause chain, all measured live:
 
 ## Cause chain
 
@@ -58,10 +61,12 @@ measured live:
    2026-08-22-era server completed 19-call drafts at ~3 min/call), or serve a
    non-always-reasoning variant / disable the reasoning parser / lower
    reasoning effort.
-2. Re-run the two queued drafts (scripts:
-   `.agents/issue-traces/229-meridian-experience-qualification/scratch/requa3c_drafts_vault2.transcript.json`
-   driver pattern) and flip the three draft records in
-   `docs/eval/2026-09-meridian-qualification-data.json`.
+2. Retry the mixed-source compose draft's latest failed compile job (the
+   stage-cache resume restarts at its terminal stage — jobs 29/30/31 each
+   resumed progressively further); when it completes, flip the
+   gate-mixed-source-compose record in
+   `docs/eval/2026-09-meridian-qualification-data.json` (the source-only
+   rewrite already completed this way: job 28).
 3. Optional product follow-up outside this qualification's scope (D2/E1):
    make the LLM client timeout settings-configurable and/or stream draft-stage
    model calls (streaming resets the read timeout per chunk, as the chat path
