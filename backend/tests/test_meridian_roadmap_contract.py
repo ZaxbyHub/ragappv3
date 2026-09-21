@@ -51,6 +51,9 @@ def test_f3_matrix_links_release_note_and_performance_baseline():
 def test_f3_performance_profile_has_comparable_rows():
     matrix_text = MATRIX.read_text(encoding="utf-8")
     section = matrix_text.split("## Performance Profile", 1)[1]
+    # Bound at the next heading: later tables (CI Gate Results) must not
+    # satisfy this check after the performance rows are deleted (PRR-002).
+    section = section.split("\n## ", 1)[0]
     rows = [ln for ln in section.splitlines() if ln.startswith("| ") and "---" not in ln]
     rows = rows[1:]  # drop header row
     assert len(rows) >= 2, "performance profile must record at least two measured rows"
