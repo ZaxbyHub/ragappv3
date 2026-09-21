@@ -162,6 +162,7 @@ jobs:
             docker:
               - Dockerfile
               - frontend/Dockerfile
+              - frontend/.dockerignore
               - docker-compose.yml
 
   # BUILD-002: smoke-build the root image (no push) whenever the docker surface

@@ -21,7 +21,7 @@
  * Run from anywhere:  node frontend/scripts/fetch-fonts.mjs
  * (the output directory is resolved relative to this script's location).
  */
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -35,7 +35,14 @@ const CSS2_URL =
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
-const css = execSync(`curl -sfL -A "${UA}" "${CSS2_URL}"`, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+// F-004/F-005 (#651 review): execFileSync (no shell -> no injection
+// surface if the URL ever becomes dynamic) and a bounded network time.
+const CSS_TIMEOUT_S = 60;
+const css = execFileSync(
+  "curl",
+  ["-sfL", "--max-time", String(CSS_TIMEOUT_S), "-A", UA, CSS2_URL],
+  { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+);
 
 // css2 output: /* subset */\n@font-face { ... } blocks.
 const blocks = [];
@@ -73,7 +80,10 @@ for (const b of blocks) {
   const dest = join(OUT_DIR, file);
   if (!seen.has(file)) {
     seen.add(file);
-    execSync(`curl -sfL -A "${UA}" -o "${dest}" "${b.url}"`);
+    execFileSync(
+      "curl",
+      ["-sfL", "--max-time", String(CSS_TIMEOUT_S), "-A", UA, "-o", dest, b.url],
+    );
   }
   const bytes = statSync(dest).size; // cross-platform size (was `stat -c%s`)
   totalBytes += seen.has(file + "c") ? 0 : bytes;

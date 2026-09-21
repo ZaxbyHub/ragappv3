@@ -145,6 +145,10 @@ export function loadHighlighter(): Promise<HighlightFn> {
       // resets the cache (fresh chances after a deploy fix). A later success
       // clears the failure record.
       const failedLoads = new Map<() => Promise<GrammarModule>, number>();
+      // Single-flight (PR #651 review F-001): concurrent callers of the same
+      // grammar share one in-flight load, so the retry-cap accounting counts
+      // ATTEMPTS, not concurrent callers racing past the cap check.
+      const inFlightLoads = new Map<() => Promise<GrammarModule>, Promise<void>>();
       const MAX_GRAMMAR_LOAD_ATTEMPTS = 2;
       const fn: HighlightFn = async (code, lang) => {
         const key = lang.trim().toLowerCase();
@@ -158,14 +162,25 @@ export function loadHighlighter(): Promise<HighlightFn> {
             // immediately, no import attempt.
             return hl.codeToHtml(code, { lang: "text", theme: currentTheme() });
           }
+          const loadOnce = async (): Promise<void> => {
+            try {
+              await hl.loadLanguage((await loader()).default);
+              loaded.add(loader);
+              failedLoads.delete(loader);
+            } catch (error: unknown) {
+              failedLoads.set(loader, (failedLoads.get(loader) ?? 0) + 1);
+              inFlightLoads.delete(loader);
+              // Grammar chunk failed to fetch/parse — degrade to themed plain
+              // text rather than unstyled HTML; at most one retry remains.
+              throw error;
+            }
+          };
+          const cached = inFlightLoads.get(loader);
+          const pending: Promise<void> = cached ?? loadOnce();
+          inFlightLoads.set(loader, pending);
           try {
-            await hl.loadLanguage((await loader()).default);
-            loaded.add(loader);
-            failedLoads.delete(loader);
+            await pending;
           } catch {
-            failedLoads.set(loader, attempts + 1);
-            // Grammar chunk failed to fetch/parse — degrade to themed plain
-            // text rather than unstyled HTML; at most one retry remains.
             return hl.codeToHtml(code, { lang: "text", theme: currentTheme() });
           }
         }

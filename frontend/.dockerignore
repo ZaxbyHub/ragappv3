@@ -16,4 +16,3 @@ coverage
 # Env: never bake local secrets into build contexts.
 .env
 *.env
-!.env.example

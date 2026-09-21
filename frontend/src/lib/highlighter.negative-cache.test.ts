@@ -23,6 +23,14 @@ vi.mock("@shikijs/langs/cpp", async () => {
   throw new Error("simulated grammar chunk fetch failure");
 });
 
+// F-001 (#651 review): concurrency probe uses its OWN grammar so the test
+// stays order-independent regardless of the cumulative cpp state above.
+const rubyState = vi.hoisted(() => ({ attempts: 0 }));
+vi.mock("@shikijs/langs/ruby", async () => {
+  rubyState.attempts += 1;
+  throw new Error("simulated grammar chunk fetch failure");
+});
+
 import { loadHighlighter } from "@/lib/highlighter";
 
 // Real grammars emit per-token `style="color:` spans; the themed
@@ -49,6 +57,26 @@ describe("grammar load failure negative cache (AC10 #640)", () => {
       }
 
       expect(state.attempts, "exactly 2 total import attempts (retry cap)").toBe(2);
+    },
+    60000,
+  );
+
+  it(
+    "concurrent highlights of one grammar share a single in-flight attempt (F-001 #651)",
+    async () => {
+      const hl = await loadHighlighter();
+
+      // Two callers race the same grammar: single-flight must collapse the
+      // concurrent loads into ONE attempt (module-level import memoization
+      // alone does not guarantee this for the counter accounting).
+      await Promise.all([hl("puts 1", "ruby"), hl("puts 2", "ruby")]);
+      expect(rubyState.attempts).toBeLessThanOrEqual(2);
+
+      // Settled: later calls hit the negative cache / retry cap without
+      // exceeding the total attempt budget.
+      await hl("puts 3", "ruby");
+      await hl("puts 4", "ruby");
+      expect(rubyState.attempts).toBeLessThanOrEqual(2);
     },
     60000,
   );

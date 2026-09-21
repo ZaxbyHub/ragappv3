@@ -118,9 +118,13 @@ export function assertFontIntegrity(fontsDir: string, manifestText: string): Fon
     }
   }
 
-  const covered = new Set(manifestNames);
+  // Case-insensitive coverage comparison: on Windows existsSync/hash open
+  // files case-insensitively, so a case mismatch between manifest and disk
+  // would otherwise surface as a confusing "not covered" error instead of
+  // pointing at the manifest/disk case divergence (PR #651 review NEW-001).
+  const covered = new Set(manifestNames.map((name) => name.toLowerCase()));
   for (const name of dirFiles) {
-    if (!covered.has(name)) {
+    if (!covered.has(name.toLowerCase())) {
       problems.push(`woff2 not covered by manifest: ${name}`);
     }
   }
