@@ -45,7 +45,7 @@ def test_good_pins_pass(tmp_path, monkeypatch) -> None:
         tmp_path,
         {
             "ghcr.io/devcontainers/features/python:1": {"version": "3.11"},
-            "ghcr.io/devcontainers/features/node:1": {"version": "22.14.0"},
+            "ghcr.io/devcontainers/features/node:1": {"version": "22.22.0"},
         },
     )
     failures: list[str] = []
@@ -84,7 +84,7 @@ def test_wrong_python_pin_fails(tmp_path, monkeypatch) -> None:
         tmp_path,
         {
             "ghcr.io/devcontainers/features/python:1": {"version": "3.14"},
-            "ghcr.io/devcontainers/features/node:1": {"version": "22.14.0"},
+            "ghcr.io/devcontainers/features/node:1": {"version": "22.22.0"},
         },
     )
     failures: list[str] = []
@@ -100,7 +100,7 @@ def test_bare_string_pins_pass(tmp_path, monkeypatch) -> None:
         tmp_path,
         {
             "ghcr.io/devcontainers/features/python:1": "3.11",
-            "ghcr.io/devcontainers/features/node:1": "22.14.0",
+            "ghcr.io/devcontainers/features/node:1": "22.22.0",
         },
     )
     failures: list[str] = []

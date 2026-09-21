@@ -1,12 +1,12 @@
 # Stage 1: Build Frontend
-# Pinned to node 22.14 (current LTS line; node 20 is EOL since 2026-04-30) to match
-# CI (ci.yml node-version "22.14.0") so a green CI run proves the shipped image
+# Pinned to node 22.22 (current LTS line; node 20 is EOL since 2026-04-30) to match
+# CI (ci.yml node-version "22.22.0") so a green CI run proves the shipped image
 # builds. Parity across this FROM, frontend/Dockerfile, ci.yml, package.json
 # engines and CONTRIBUTING.md is enforced by scripts/check_runtime_contract.py
 # (Quality contracts job) — move majors through that gate, not by editing here.
 # Digest pin (issue #404 / #391) freezes the base image for supply-chain
 # integrity; dependabot (docker ecosystem, "/") opens PRs on new digests.
-FROM node:22.14-alpine@sha256:9bef0ef1e268f60627da9ba7d7605e8831d5b56ad07487d24d1aa386336d1944 AS frontend-builder
+FROM node:22.22-alpine@sha256:e58326d0d441090181ac150dc2078d3e2cf6a0d42e809aebba3ef5880935ffdd AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci

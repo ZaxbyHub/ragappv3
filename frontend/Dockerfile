@@ -1,5 +1,5 @@
 # Build stage
-# Pinned to node 22.14 to match CI (ci.yml node-version "22.14.0"); parity is
+# Pinned to node 22.22 to match CI (ci.yml node-version "22.22.0"); parity is
 # enforced by scripts/check_runtime_contract.py. Digest pin (issue #404 / #391)
 # freezes the base image for supply-chain integrity; dependabot (docker
 # ecosystem, "/frontend") opens PRs on new digests.

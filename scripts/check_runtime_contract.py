@@ -57,10 +57,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # runtime: update this table, then re-align every surface listed in the
 # module docstring to match. Nothing else in this file encodes versions.
 ALLOWED_RUNTIME: dict[str, dict[str, str]] = {
-    # Plan-critic R1 item 7: the Node pin is MINOR-EXACT (e.g. "22.14.0") so the
+    # Plan-critic R1 item 7: the Node pin is MINOR-EXACT (e.g. "22.22.0") so the
     # contract asserts the same minor across ci.yml setup-node, package.json
-    # engines (>=22.14.0), Dockerfile FROM tags, and CONTRIBUTING.md.
-    "node": {"major": "22", "minor": "14"},
+    # engines (>=22.22.0), Dockerfile FROM tags, and CONTRIBUTING.md.
+    "node": {"major": "22", "minor": "22"},
     "python": {"version": "3.11"},
 }
 
