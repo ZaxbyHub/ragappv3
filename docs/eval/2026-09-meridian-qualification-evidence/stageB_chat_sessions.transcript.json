@@ -1,0 +1,114 @@
+{
+  "steps": [
+    {
+      "step": "create_session",
+      "status": 200,
+      "session_id": 15
+    },
+    {
+      "step": "chat_instant",
+      "http": 200,
+      "transport_error": null,
+      "event_types": [
+        "mode",
+        "stage",
+        "stage",
+        "evidence",
+        "stage",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content"
+      ],
+      "n_events": 34,
+      "answer_preview": "",
+      "n_sources": 1,
+      "source0": {
+        "file_name": null,
+        "filename": "f3_alpha_note.txt",
+        "score": 0.9805061292286613,
+        "score_type": null,
+        "chunk_index": null,
+        "document_id": null,
+        "file_id": "101"
+      },
+      "score_type": "rerank"
+    },
+    {
+      "step": "chat_instant_stream_stats",
+      "content_chars": 114,
+      "has_done": true
+    },
+    {
+      "step": "chat_thinking_attempt",
+      "http": 200,
+      "transport_error": null,
+      "event_types": [
+        "mode",
+        "stage",
+        "stage",
+        "evidence",
+        "stage",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content",
+        "content"
+      ],
+      "error_event": null,
+      "preview": ""
+    },
+    {
+      "step": "session_reload",
+      "status": 200,
+      "n_messages": 0,
+      "roles": [],
+      "has_sources": false
+    },
+    {
+      "step": "truncate_for_retry",
+      "status": 200,
+      "body": "{\"remaining_count\":0,\"tail_seq\":0}"
+    },
+    {
+      "step": "chat_retry_resend",
+      "http": 200,
+      "answer_preview": "",
+      "n_sources": 1
+    },
+    {
+      "step": "fork_session",
+      "status": 400,
+      "body": {
+        "detail": "message_index 1 is out of bounds for session with 0 messages"
+      }
+    },
+    {
+      "step": "memory_create",
+      "status": 200,
+      "memory_id": "2"
+    },
+    {
+      "step": "memory_edit",
+      "status": 200
+    },
+    {
+      "step": "memory_search",
+      "status": 200,
+      "n": 0
+    }
+  ],
+  "memory_id": "2",
+  "session_id": 15,
+  "fork_id": null,
+  "vault_id": 8
+}

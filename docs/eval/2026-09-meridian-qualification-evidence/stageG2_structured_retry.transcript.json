@@ -1,0 +1,34 @@
+{
+  "steps": [
+    {
+      "step": "replacement_final",
+      "status": "indexed",
+      "chunks": 1
+    },
+    {
+      "step": "structured_semantic_search",
+      "n": 2,
+      "hits": [
+        {
+          "file": "101",
+          "score": 0.785
+        },
+        {
+          "file": "101",
+          "score": 0.785
+        }
+      ]
+    },
+    {
+      "step": "structured_keyword_search",
+      "total": 1
+    },
+    {
+      "step": "ask_structured_retry",
+      "answer_preview": "I don't have access to an inventory table or information about the unit cost of AS-1002. The only document provided ([S1]) contains a note about a \"F3 QUALIFICATION FIXTURE ALPHA\" and mentions Q3 revenue for the Zaxby ae",
+      "cited": [
+        "f3_alpha_note.txt"
+      ]
+    }
+  ]
+}

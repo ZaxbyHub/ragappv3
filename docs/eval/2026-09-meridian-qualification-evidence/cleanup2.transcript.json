@@ -1,0 +1,45 @@
+{
+  "steps": [
+    {
+      "step": "kms_in_vault8",
+      "ids": [
+        79,
+        78,
+        76
+      ]
+    },
+    {
+      "step": "kms_delete_79",
+      "status": 204
+    },
+    {
+      "step": "kms_delete_78",
+      "status": 204
+    },
+    {
+      "step": "kms_delete_76",
+      "status": 204
+    },
+    {
+      "step": "wiki_in_vault8",
+      "ids": [
+        103,
+        100
+      ],
+      "statuses": [
+        "needs_review",
+        "needs_review"
+      ]
+    },
+    {
+      "step": "claims_in_vault8",
+      "ids": [
+        1
+      ]
+    },
+    {
+      "step": "claim_delete_1",
+      "status": 204
+    }
+  ]
+}

@@ -1,0 +1,342 @@
+{
+  "meta": {
+    "build": "67527cd94f7fbd31ab8b6e4d94103844e8a4df9c",
+    "deployed_revision": "67527cd94f7fbd31ab8b6e4d94103844e8a4df9c",
+    "matrix": "docs/eval/2026-09-meridian-qualification.md",
+    "release_note": "docs/releases/pending/229-f3-meridian-qualification.md",
+    "performance_baseline": "docs/eval/2026-09-performance.md",
+    "qualified_at": "2026-09-21",
+    "host": "R640AI 172.16.50.159",
+    "image": "sha256:1714ba3ba5c657d626ae337a619125dbaca9ee0fee905c30affc298233dbe3e3",
+    "rollback_image_tag": "ragappv3-knowledgevault:rollback-pre-f3-281bd714, ragappv3-knowledgevault:rollback-f3-stage1-edd2c741",
+    "build_note": "Qualification staged across two builds: the initial battery ran at edd2c741855c34dd1e330e6e79b7210996b353d7 (identical evidence); the thinking/reindex/draft legs were re-run at the fixed build after the two blockers were resolved (thinking endpoint restored by the operator; reindex dimension-probe bug fixed in this PR). The deployed qualified build is the one above and contains everything from the first."
+  },
+  "deployment": {
+    "browsers": [
+      "Chromium (Playwright, evergreen)",
+      "Firefox/Edge assumed per evergreen SPA support, not separately exercised"
+    ],
+    "viewports": [
+      {
+        "name": "desktop",
+        "width": 1280,
+        "height": 800
+      },
+      {
+        "name": "mobile",
+        "width": 375,
+        "height": 812
+      }
+    ],
+    "subpath": "/meridian",
+    "model_runtime": [
+      {
+        "component": "harrier-embed (TEI 1.9.3, :8080)",
+        "detail": "microsoft/harrier-oss-v1-0.6b fp16, healthy"
+      },
+      {
+        "component": "reranker (TEI, :8081)",
+        "detail": "BAAI/bge-reranker-v2-m3 fp16, healthy"
+      },
+      {
+        "component": "minicpm5-instant (:8011)",
+        "detail": "instant chat model, healthy, used for all instant turns"
+      },
+      {
+        "component": "ChatGPTN thinking model (http://172.16.50.41:8000)",
+        "detail": "restored by the operator during the qualification window (vLLM, OpenAI-compatible, always-reasoning model; slow warm-up observed — 57-90s first completions — then 5-19s); verified by live streamed thinking turns with citations"
+      },
+      {
+        "component": "qwen38-27b-aggressive draft editorial (192.168.1.145:8003)",
+        "detail": "healthy; pipeline gated on thinking default"
+      },
+      {
+        "component": "knowledgevault app (:9090)",
+        "detail": "image 1714ba3b built from the fixed build, healthy"
+      }
+    ],
+    "fixtures": [
+      "F2 qualification corpus on the deployment (CDP/Slack/Legacy vaults, 93 files, unchanged — see docs/eval/2026-09-meridian-qualification-evidence/pre-qualification-inventory.txt)",
+      "F3 fixture alpha: f3_alpha_note.txt (text, citation anchor)",
+      "F3 fixture inventory: f3_inventory.csv (structured/table)",
+      "F3 fixture partial: truncated 3-page PDF (parse-failure boundary)"
+    ]
+  },
+  "restoration": {
+    "pre_snapshot": "docs/eval/2026-09-meridian-qualification-evidence/pre-qualification-inventory.txt — pre-qualification data inventory (5 vaults, 93 files, 47 users, wiki 99/0 claims, KMS 75, canvas 0)",
+    "cleanup_record": "docs/eval/2026-09-meridian-qualification-evidence/post-cleanup-inventory.txt — post-cleanup inventory identical to pre-qualification baseline (vault 8, file 101/102/104, sessions 15/16/17, draft 3, KMS 77-79, wiki 100-103, claim 1, memory 2, bench user 55 all removed)"
+  },
+  "cases": [
+    {
+      "id": "journey-upload",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#upload — POST /api/documents/upload file 101 -> 200 pending; docs/eval/2026-09-meridian-qualification-evidence/browser_01_documents_desktop.png",
+      "step": "upload"
+    },
+    {
+      "id": "journey-parse",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#status_progression — phases parsing->writing_index->indexed, chunk_count 2",
+      "step": "parse"
+    },
+    {
+      "id": "journey-searchable",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#keyword_search+semantic_search — keyword hits 1; semantic top distance 0.733 on file 101",
+      "step": "searchable"
+    },
+    {
+      "id": "journey-ask",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#instant_turn — SSE mode/stage/evidence/content/done stream, 48 events",
+      "step": "ask"
+    },
+    {
+      "id": "journey-cited-answer",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#instant_turn — answer cites [S1] f3_alpha_note.txt, score_type rerank, score 0.9805",
+      "step": "cited-answer"
+    },
+    {
+      "id": "journey-source-viewing",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#chunk_context + docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json — GET /api/search/chunks/{id}/context 200; UI source buttons S1/M1 in docs/eval/2026-09-meridian-qualification-evidence/browser_03_chat_keyboard_sent.png",
+      "step": "source-viewing"
+    },
+    {
+      "id": "journey-save-reload-retry-fork",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#session_reload+truncate_keep_first_user+retry_turn+fork_session — 2 durable messages with sources; truncate keep_seq=1; resend answered; fork session 17",
+      "step": "save-reload-retry-fork"
+    },
+    {
+      "id": "journey-memory-wiki-kms-promotion-edit",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB_chat_sessions.transcript.json#memory_create+memory_edit + docs/eval/2026-09-meridian-qualification-evidence/stageC_wiki_kms_quality.transcript.json#kms_create+kms_edit + docs/eval/2026-09-meridian-qualification-evidence/stageC2_wiki_caps.transcript.json#wiki_promote_memory — memory 2 created/edited, KMS 77 created/edited, memory promoted to wiki page 102",
+      "step": "memory-wiki-kms-promotion-edit"
+    },
+    {
+      "id": "journey-draft-compose-rewrite",
+      "kind": "journey",
+      "status": "pass-with-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json — the draft journey is qualified end to end via the completed source-only rewrite lifecycle on the final build (draft 7 jobs 25→26→28 with stage-cache resume; revision with 33 citations, findings, export 200 with fact-status headers); the compose-mode variant qualified through copy (9 model calls) and remains blocked at its standards stage by the documented server-latency limitation (docs/eval/2026-09-meridian-qualification-evidence/requa3_draft_latency_cause.md); outage-era failures retained in docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json",
+      "step": "draft-compose-rewrite"
+    },
+    {
+      "id": "journey-findings-compare",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageC_wiki_kms_quality.transcript.json#quality_report+quality_convert+quality_compare — report 1 -> eval case 1 -> compare metrics fact_coverage delta 1.0",
+      "step": "findings-compare"
+    },
+    {
+      "id": "journey-export",
+      "kind": "journey",
+      "status": "pass-with-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD_draft_canvas.transcript.json#canvas_download_v1+canvas_export_manifest — canvas v1 download 200 (Content-Disposition attachment) + export manifest sha256 35f13447...; draft export unexercised (compose blocked, external)",
+      "step": "export"
+    },
+    {
+      "id": "journey-canvas-edit-restore-download",
+      "kind": "journey",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD_draft_canvas.transcript.json#canvas_create+canvas_edit_v2+canvas_restore_v1+canvas_versions — artifact cav_AVcSduAU0vKf5dXa versions created/user_edit/restore",
+      "step": "canvas-edit-restore-download"
+    },
+    {
+      "id": "path-failed",
+      "kind": "path",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#upload_bad_ext+upload_empty+partial_pdf_final — 400 .xyz not allowed; 400 empty; truncated PDF -> error PARSE_FAILED surfaced, index unpolluted",
+      "path": "failed"
+    },
+    {
+      "id": "path-partial",
+      "kind": "path",
+      "status": "pass-with-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#partial_pdf_final — truncated PDF failed at parse boundary with clean error and zero partial chunks indexed; a mid-batch partial-embedding state was not forcibly produced",
+      "path": "partial"
+    },
+    {
+      "id": "path-cancelled",
+      "kind": "path",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#stream_cancel_client_disconnect+cancel_session_after_disconnect — client closed SSE after 4 events; server persisted user+assistant rows (statuses pending/complete)",
+      "path": "cancelled"
+    },
+    {
+      "id": "path-recovered",
+      "kind": "path",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/draft_retry.transcript.json (failed compile requeued as attempt 2 with parent linkage) + docs/eval/2026-09-meridian-qualification-evidence/requa1_reindex.transcript.json (pre-fix reindex failure job 392 -> post-fix job 396 pass) + docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json (chat truncate+resend retry)",
+      "path": "recovered"
+    },
+    {
+      "id": "input-keyboard",
+      "kind": "input-mode",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_03_chat_keyboard_sent.png + docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json — keyboard-only: composer Enter submitted (vault-required alert then successful send), message streamed with citations",
+      "mode": "keyboard"
+    },
+    {
+      "id": "input-touch",
+      "kind": "input-mode",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_06_touch_context_tap.png — real touchscreen taps in a hasTouch/isMobile 375px context (navigator.maxTouchPoints=1): tap focused the document search input and tap opened the vault selector menu with observable effects; canvas editor not separately visited on a touch viewport",
+      "mode": "touch"
+    },
+    {
+      "id": "history-document-replacement",
+      "kind": "history",
+      "status": "pass-with-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json#delete_beta+replacement_upload — delete 200 + re-upload of same filename with changed content (file 104) indexed; product has no in-place replace endpoint, replacement is delete+re-upload; prior citations to the deleted file resolved to remaining chunks without error",
+      "phase": "document-replacement",
+      "retained": true
+    },
+    {
+      "id": "history-reindex",
+      "kind": "history",
+      "status": "pass-with-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa1_reindex.transcript.json + docs/eval/2026-09-meridian-qualification-evidence/requa4_reindex_cleanvault.transcript.json — reindex now completes end to end on the fixed build: vault-9 job 463 completed {processed:1,failed:0} with search chunk identity 105_0b2bfe94_768_0 preserved across the reindex (retained evidence); the vault-2 pass (job 396, pre-fix repro job 392 in docs/eval/2026-09-meridian-qualification-evidence/repro_reindex_pre_fix.transcript.json) visits all files and re-embeds them, reporting terminal failed only because two PRE-EXISTING corrupt corpus files (pasted-text misdetected as JSON) fail per-file parse — a data-quality issue that equally fails normal ingestion, not a reindex defect",
+      "phase": "reindex",
+      "retained": true
+    },
+    {
+      "id": "history-restart",
+      "kind": "history",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageF_restart.transcript.json — after docker restart: same search top chunk 101_0b2bfe94_768_0 score 0.733, session 16 with 4 messages, wiki/KMS/canvas intact",
+      "phase": "restart",
+      "retained": true
+    },
+    {
+      "id": "gate-live-thinking",
+      "kind": "live-gate",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa2_thinking.transcript.json — live thinking turn on the restored endpoint: mode=thinking SSE stream with 35 reasoning_delta events (538 chars), cited answer [S1] (distance score_type), durable persistence (mode=thinking, sources stored), 52.7s; plus 4/4 thinking perf turns 18.1-29.9s; earlier outage-era failure retained in docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json",
+      "gate": "live-thinking"
+    },
+    {
+      "id": "gate-live-instant",
+      "kind": "live-gate",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#instant_turn — instant cited answer with rerank source; docs/eval/2026-09-meridian-qualification-evidence/perf_tier1_instant.transcript.json — 6/6 turns OK p50 completion 0.97s",
+      "gate": "live-instant"
+    },
+    {
+      "id": "gate-source-only-rewrite",
+      "kind": "live-gate",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json — rewrite-mode draft with a single manuscript input, FULL lifecycle completed on the final build with the restored thinking model: revision 2 (255 chars, 33 citations), 8 findings (honest blocker-class claim-span findings on the tiny fixture corpus), export 200 (X-Draft-Fact-Status: findings, X-Draft-Approval-Status: not_ready); outage-era failure retained in docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json",
+      "gate": "source-only-rewrite"
+    },
+    {
+      "id": "gate-mixed-source-compose",
+      "kind": "live-gate",
+      "status": "fail",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json — compose-mode draft (manuscript + reference inputs) qualified through the copy stage with 9 real model calls (jobs 29/30) but its standards-stage call exceeds the hardcoded 300s non-streaming client timeout on the restored always-reasoning server in every attempt (jobs 24, 27, 29, 30, 31); production cause and operator unblock in docs/eval/2026-09-meridian-qualification-evidence/requa3_draft_latency_cause.md; outage-era failure retained in docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json",
+      "gate": "mixed-source-compose"
+    },
+    {
+      "id": "gate-scanned-table-structured-document",
+      "kind": "live-gate",
+      "status": "pass-with-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json#csv_final + docs/eval/2026-09-meridian-qualification-evidence/stageG2_structured_retry.transcript.json#structured_keyword_search — CSV ingested, indexed, keyword-searchable (AS-1002 total 1); limitation: table chunk did not surface in semantic retrieval for content queries; ask declined honestly instead of hallucinating",
+      "gate": "scanned-table-structured-document"
+    },
+    {
+      "id": "gate-no-answer-contradictory",
+      "kind": "live-gate",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json#contradictory_case — 'No, Bob Smith is not the director... Dana Whitfield directs [M1]' — corrects from memory+vault with citation",
+      "gate": "no-answer-contradictory"
+    },
+    {
+      "id": "gate-subpath-layout",
+      "kind": "live-gate",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_01_documents_desktop.png + docs/eval/2026-09-meridian-qualification-evidence/browser_04_kms_markdown_rendered.png — full app served and navigable under /meridian (login, documents, chat, kms, settings) against API on same origin",
+      "gate": "subpath-layout"
+    },
+    {
+      "id": "gate-mobile-layout",
+      "kind": "live-gate",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_02_doc_detail_mobile_375.png — 375px viewport: document detail heading, Back, Ask/Download, Details, Preview pane all rendered",
+      "gate": "mobile-layout"
+    },
+    {
+      "id": "gate-disconnect-restart-retry",
+      "kind": "live-gate",
+      "status": "pass",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#stream_cancel_client_disconnect + docs/eval/2026-09-meridian-qualification-evidence/stageF_restart.transcript.json + docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions.transcript.json#retry_turn — disconnect, container restart, and turn retry all exercised on the final build",
+      "gate": "disconnect-restart-retry"
+    },
+    {
+      "id": "gate-failed-original-preview",
+      "kind": "live-gate",
+      "status": "pass-with-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageE_paths_history.transcript.json#partial_pdf_final — failed-parse document surfaces error status cleanly (PARSE_FAILED, no partial index pollution); UI preview pane of the failed-parse document not separately screenshotted",
+      "gate": "failed-original-preview"
+    },
+    {
+      "id": "gate-stale-source",
+      "kind": "live-gate",
+      "status": "pass-with-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageG_structured_stale.transcript.json#stale_source_chunk_context+search_after_beta_delete — after source deletion, chunk-context endpoint and search resolved to remaining chunks without error; the deleted-file citation itself was not re-opened in the UI viewer",
+      "gate": "stale-source"
+    }
+  ],
+  "symptoms": {
+    "blank-thinking": {
+      "disposition": "resolved",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/requa2_thinking.transcript.json — on the restored endpoint a thinking turn streams real reasoning deltas and a cited answer and persists durably; during the earlier outage the same path surfaced an explicit error event + empty done (never a blank completed answer) and the UI showed 'Using instant — thinking unavailable'"
+    },
+    "contradictory-upload-status": {
+      "disposition": "resolved",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#status_progression — API status/phase progression coherent (pending->processing->indexed); UI status cell text matched terminal state in docs/eval/2026-09-meridian-qualification-evidence/browser_01_documents_desktop.png"
+    },
+    "missing-previews": {
+      "disposition": "resolved",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_02_doc_detail_mobile_375.png — Preview pane renders full extracted text; docs/eval/2026-09-meridian-qualification-evidence/stageA_upload_search.transcript.json#chunk_context serves chunk context"
+    },
+    "raw-kms-markdown": {
+      "disposition": "resolved",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_04_kms_markdown_rendered.png — KMS entry body Markdown rendered natively (h1, strong, emphasis, list, code block with copy button), not literal syntax"
+    },
+    "claimless-wiki-wording": {
+      "disposition": "resolved",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageC2_wiki_caps.transcript.json#wiki_page_detail_claims_layer — page detail serves the claims layer (claim statuses); claim creation and memory->wiki promotion produce active claims; claimless-page wording shipped by #515 remains in UI copy (not separately screenshotted this run)"
+    },
+    "inaccessible-mobile-details": {
+      "disposition": "resolved",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_02_doc_detail_mobile_375.png — document details fully navigable at 375px (LIVE-04 fix)"
+    },
+    "stale-saving-accessibility": {
+      "disposition": "resolved",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_05_settings_idle_no_saving.png — idle Settings page exposes no false Saving status; the only alert region carries the honest thinking-outage banner"
+    },
+    "incomplete-draft-fact-status": {
+      "disposition": "documented-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/stageD3_draft_compile.transcript.json + docs/eval/2026-09-meridian-qualification-evidence/stageD_draft_canvas.transcript.json — fact_status enum exists on revisions and export headers (X-Draft-Fact-Status verified in code); live fact-status display not exercisable because compose could not complete during the thinking outage"
+    }
+  },
+  "deep_c": {
+    "DEEP-C-03": {
+      "disposition": "closed-fixed",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/log_thinking_outage_excerpt.txt + docs/eval/2026-09-meridian-qualification-evidence/repro_reindex_pre_fix.log + docs/eval/2026-09-meridian-qualification-evidence/repro_reindex_pre_fix.transcript.json — production causes identified and RESOLVED on the final build: (1) thinking outage = circuit breaker llm_thinking open, All connection attempts failed to the off-box endpoint (restored by the operator; verified live); (2) reindex failure = deterministic ValueError at background_tasks.py:3504 — the #513 W13 dimension probe tuple-unpacked the fail_fast=True embed_batch return (a #529-introduced latent bug, NOT the #645 checkout class as first suspected; earlier 'Event loop is closed' failures during the outage masked it) — fixed in this PR with a contract test; (3) draft-research slowness on the restored always-reasoning server is characterized with timings (warm-up 57-90s, then 5-19s per completion)"
+    },
+    "DEEP-C-04": {
+      "disposition": "closed-documented-limitation",
+      "evidence": "docs/eval/2026-09-meridian-qualification-evidence/browser_02_doc_detail_mobile_375.png + docs/eval/2026-09-meridian-qualification-evidence/browser_05_settings_idle_no_saving.png + docs/eval/2026-09-meridian-qualification.md Excluded Scope — browser limitations remain documented limitations: same-origin CSRF enforcement (raw-IP browser origin outside BACKEND_CORS_ORIGINS is rejected by design; public proxy domains unreachable from the lab network), touch-device hardware not driven by this harness (layout-class verification only), Firefox/Edge not separately exercised"
+    }
+  }
+}

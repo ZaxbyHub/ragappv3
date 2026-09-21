@@ -1,0 +1,64 @@
+{
+  "steps": [
+    {
+      "step": "upload_csv",
+      "status": 200,
+      "file_id": 103
+    },
+    {
+      "step": "csv_final",
+      "status": "indexed",
+      "chunks": 1,
+      "error": null
+    },
+    {
+      "step": "ask_structured",
+      "answer_preview": "Based on the provided context, I cannot answer the question about how many harbor light calibrators are on hand or what they cost.\n\nThe only relevant passage in [S1] mentions that \"The harbor light pr",
+      "n_sources": 1,
+      "src_files": [
+        "f3_alpha_note.txt"
+      ]
+    },
+    {
+      "step": "contradictory_case",
+      "answer_preview": "No, Bob Smith is not the director of the aeroshell program. According to the vault, Dana Whitfield directs the Zaxby aeroshell program [M1].",
+      "corrects_or_declines": true,
+      "n_sources": 0
+    },
+    {
+      "step": "cite_beta_answer",
+      "answer_preview": "I don't have enough information to answer this question. The documents provided don't mention any \"two-phase calibration gauge\" or its unit cost.",
+      "cited_files": [
+        "f3_alpha_note.txt"
+      ],
+      "cited_chunk_id": "101_0b2bfe94_1536_0"
+    },
+    {
+      "step": "delete_beta",
+      "status": 200,
+      "body": "{\"file_id\":103,\"status\":\"success\",\"message\":\"Document 'f3_inventory.csv' (id: 103) deleted successfully\"}"
+    },
+    {
+      "step": "stale_source_chunk_context",
+      "status": 200,
+      "body": "{\"id\":\"101_0b2bfe94_1536_0\",\"file_id\":\"101\",\"filename\":\"f3_alpha_note.txt\",\"chunk_index\":0,\"chunk_text\":\"F3 QUALIFICATION FIXTURE ALPHA\\n\\nT"
+    },
+    {
+      "step": "search_after_beta_delete",
+      "n": 2,
+      "files": [
+        "101",
+        "101"
+      ]
+    },
+    {
+      "step": "replacement_upload",
+      "status": 200,
+      "file_id": 104,
+      "body": "{\"file_id\":104,\"file_name\":\"f3_inventory.csv\",\"id\":104,\"filename\":\"f3_inventory.csv\",\"status\":\"pending\",\"message\":\"File 'f3_inventory.csv' u"
+    }
+  ],
+  "structured_answer": "Based on the provided context, I cannot answer the question about how many harbor light calibrators are on hand or what they cost.\n\nThe only relevant passage in [S1] mentions that \"The harbor light protocol requires a two-phase calibration sequence,\" but it does not specify the number of calibrators",
+  "contradictory_answer": "No, Bob Smith is not the director of the aeroshell program. According to the vault, Dana Whitfield directs the Zaxby aeroshell program [M1].",
+  "replacement_file_id": 104
+}

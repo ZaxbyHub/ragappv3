@@ -1,0 +1,29 @@
+{
+  "steps": [
+    {
+      "step": "delete_draft_3",
+      "status": 204
+    },
+    {
+      "step": "delete_kms_77",
+      "status": 204
+    },
+    {
+      "step": "delete_wiki_101",
+      "status": 204
+    },
+    {
+      "step": "delete_wiki_102",
+      "status": 204
+    },
+    {
+      "step": "delete_memory_2",
+      "status": 200
+    },
+    {
+      "step": "delete_vault_8",
+      "status": 200,
+      "body": "{\"message\":\"Vault 'F3 Qualification' (id: 8) deleted successfully\"}"
+    }
+  ]
+}

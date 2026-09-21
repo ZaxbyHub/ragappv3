@@ -1,0 +1,95 @@
+{
+  "rounds": [
+    {
+      "rnd": 0,
+      "draft": 7,
+      "event": "retry",
+      "old_job": 26,
+      "http": 202,
+      "new_job": 28,
+      "start_stage": "standards"
+    },
+    {
+      "rnd": 0,
+      "draft": 8,
+      "event": "watch",
+      "job": 27,
+      "status": "running",
+      "stage": "research",
+      "pct": 11.11
+    },
+    {
+      "rnd": 1,
+      "draft": 7,
+      "event": "watch",
+      "job": 28,
+      "status": "pending",
+      "stage": null,
+      "pct": 0.0
+    },
+    {
+      "rnd": 1,
+      "draft": 8,
+      "event": "watch",
+      "job": 27,
+      "status": "running",
+      "stage": "research",
+      "pct": 11.11
+    },
+    {
+      "rnd": 2,
+      "draft": 7,
+      "event": "watch",
+      "job": 28,
+      "status": "pending",
+      "stage": null,
+      "pct": 0.0
+    },
+    {
+      "rnd": 2,
+      "draft": 8,
+      "event": "watch",
+      "job": 27,
+      "status": "running",
+      "stage": "research",
+      "pct": 11.11
+    },
+    {
+      "rnd": 3,
+      "draft": 7,
+      "event": "watch",
+      "job": 28,
+      "status": "pending",
+      "stage": null,
+      "pct": 0.0
+    },
+    {
+      "rnd": 3,
+      "draft": 8,
+      "event": "watch",
+      "job": 27,
+      "status": "running",
+      "stage": "research",
+      "pct": 11.11
+    },
+    {
+      "rnd": 4,
+      "draft": 7,
+      "event": "watch",
+      "job": 28,
+      "status": "pending",
+      "stage": null,
+      "pct": 0.0
+    },
+    {
+      "rnd": 4,
+      "draft": 8,
+      "event": "watch",
+      "job": 27,
+      "status": "running",
+      "stage": "research",
+      "pct": 11.11
+    }
+  ],
+  "done": {}
+}

@@ -1,0 +1,46 @@
+{
+  "steps": [
+    {
+      "step": "draft_create",
+      "status": 201,
+      "draft_id": 3,
+      "body": "{\"id\":3,\"vault_id\":8,\"vault_access\":\"write\",\"title\":\"F3 Aeroshell Brief\",\"mode\":\"compose\",\"status\":\"draft\",\"tier\":\"standard\",\"lock_version\":1,\"current_revision_"
+    },
+    {
+      "step": "draft_input_upload",
+      "status": 202,
+      "body": "{\"input\":{\"id\":3,\"role\":\"manuscript\",\"authority\":\"primary\",\"as_of_date\":null,\"original_name\":\"aeroshell_notes.md\",\"extension\":\".md\",\"media_type\":\"text/markdown\",\"size_bytes\":280,\"content_sha256\":\"42c2a18eebfc8da655462200"
+    },
+    {
+      "step": "draft_input_parse",
+      "parse_statuses": [
+        "ready"
+      ],
+      "chars": [
+        279
+      ]
+    },
+    {
+      "step": "draft_compile",
+      "status": 422,
+      "job_id": null,
+      "body": "{\"detail\":[{\"loc\":[\"body\",\"base_revision_id\"],\"msg\":\"Field required\",\"type\":\"missing\",\"input\":{\"lock_version\":1}}]}"
+    },
+    {
+      "step": "draft_compile_final",
+      "status": null,
+      "error_code": null,
+      "error_message": null,
+      "model_calls": null,
+      "active_stage": null
+    },
+    {
+      "step": "draft_revisions",
+      "status": 200,
+      "n": 0,
+      "fact_statuses": []
+    }
+  ],
+  "draft_id": 3,
+  "draft_job_final": null
+}

@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {
+      "step": "draft_compile",
+      "status": 202,
+      "job_id": 12,
+      "body": "{\"id\":12,\"draft_id\":3,\"job_type\":\"compile\",\"status\":\"pending\",\"start_stage\":\"research\",\"active_stage\":null,\"progress_percent\":0.0,\"model_call_count\":0,\"max_model_calls\":40,\"retry_count\":0,\"parent_job_"
+    },
+    {
+      "step": "draft_compile_final",
+      "status": "failed",
+      "error_code": "provider_unavailable",
+      "error_message": "provider call failed after bounded retries",
+      "model_calls": 0,
+      "active_stage": "research",
+      "progress": 11.11
+    },
+    {
+      "step": "draft_revisions",
+      "status": 200,
+      "n": 0,
+      "fact_statuses": []
+    }
+  ]
+}

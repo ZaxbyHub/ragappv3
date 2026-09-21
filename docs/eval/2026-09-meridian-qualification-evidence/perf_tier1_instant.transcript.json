@@ -1,0 +1,56 @@
+{
+  "tier1_instant_p50": {
+    "queue_wait_p50_ms": 87.7,
+    "first_content_p50_s": 0.43,
+    "completion_p50_s": 0.97,
+    "samples": [
+      {
+        "i": 0,
+        "queue_wait_ms": 72.2,
+        "first_content_s": 0.7,
+        "completion_s": 1.19,
+        "events": 47
+      },
+      {
+        "i": 1,
+        "queue_wait_ms": 88.5,
+        "first_content_s": 0.42,
+        "completion_s": 1.18,
+        "events": 73
+      },
+      {
+        "i": 2,
+        "queue_wait_ms": 86.0,
+        "first_content_s": 0.43,
+        "completion_s": 1.08,
+        "events": 65
+      },
+      {
+        "i": 3,
+        "queue_wait_ms": 94.2,
+        "first_content_s": 0.43,
+        "completion_s": 0.83,
+        "events": 39
+      },
+      {
+        "i": 4,
+        "queue_wait_ms": 98.6,
+        "first_content_s": 0.43,
+        "completion_s": 0.97,
+        "events": 48
+      },
+      {
+        "i": 5,
+        "queue_wait_ms": 87.7,
+        "first_content_s": 0.4,
+        "completion_s": 0.95,
+        "events": 48
+      }
+    ],
+    "f2_baseline_thinking_tier1": {
+      "queue_wait_p50_ms": 40.0,
+      "completion_p50_s": 41.2
+    },
+    "note": "F3 measured on instant (thinking endpoint down during F3 window); F2 baseline tier-1 was thinking-model"
+  }
+}

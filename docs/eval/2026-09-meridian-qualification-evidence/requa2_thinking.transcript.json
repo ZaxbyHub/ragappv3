@@ -1,0 +1,102 @@
+{
+  "steps": [
+    {
+      "step": "find_vault",
+      "vault_id": 9
+    },
+    {
+      "step": "live_thinking_turn",
+      "http": 200,
+      "turn_id": "f3-think-1ddfca42b237",
+      "mode": "thinking",
+      "reasoning_chars": 538,
+      "answer_chars": 161,
+      "answer_preview": "The contact for the aeroshell program is **Dana Whitfield**, program director [S1]. The harbor light protocol requires a **two-phase calibration sequence** [S1].",
+      "n_sources": 1,
+      "score_type": "distance",
+      "errors": [],
+      "elapsed_s": 52.7,
+      "event_counts": {
+        "reasoning_delta": 35,
+        "done": 1,
+        "stage": 3,
+        "evidence": 1,
+        "mode": 1,
+        "content": 8
+      }
+    },
+    {
+      "step": "thinking_turn_persisted",
+      "n_messages": 2,
+      "last_role": "assistant",
+      "last_mode": "thinking",
+      "last_has_sources": true
+    },
+    {
+      "step": "thinking_perf_samples",
+      "samples": [
+        {
+          "i": 0,
+          "http": 200,
+          "ok": true,
+          "completion_s": 29.9,
+          "n_events": 33
+        },
+        {
+          "i": 1,
+          "http": 200,
+          "ok": true,
+          "completion_s": 19.6,
+          "n_events": 27
+        },
+        {
+          "i": 2,
+          "http": 200,
+          "ok": true,
+          "completion_s": 18.1,
+          "n_events": 21
+        },
+        {
+          "i": 3,
+          "http": 200,
+          "ok": true,
+          "completion_s": 19.2,
+          "n_events": 27
+        }
+      ],
+      "ok_count": 4
+    }
+  ],
+  "thinking_answer": "The contact for the aeroshell program is **Dana Whitfield**, program director [S1]. The harbor light protocol requires a **two-phase calibration sequence** [S1].",
+  "thinking_session": 20,
+  "perf_samples": [
+    {
+      "i": 0,
+      "http": 200,
+      "ok": true,
+      "completion_s": 29.9,
+      "n_events": 33
+    },
+    {
+      "i": 1,
+      "http": 200,
+      "ok": true,
+      "completion_s": 19.6,
+      "n_events": 27
+    },
+    {
+      "i": 2,
+      "http": 200,
+      "ok": true,
+      "completion_s": 18.1,
+      "n_events": 21
+    },
+    {
+      "i": 3,
+      "http": 200,
+      "ok": true,
+      "completion_s": 19.2,
+      "n_events": 27
+    }
+  ]
+}
