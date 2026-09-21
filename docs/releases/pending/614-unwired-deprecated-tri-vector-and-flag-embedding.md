@@ -18,7 +18,7 @@
 - `docker-compose.yml` drops the two literal entries (`TRI_VECTOR_SEARCH_ENABLED`
   and `FLAG_EMBEDDING_URL`) from the `knowledgevault` service `environment:`
   block so the compose contract no longer carries keys the app cannot read.
-- `backend/tests/test_config_alignment.py` drops the four assertions that
+- `backend/tests/test_config_alignment.py` drops the five assertions that
   pinned the removed fields' defaults and env-var toggle
   (`test_tri_vector_search_enabled_default_false`,
   `test_flag_embedding_url_default`,
