@@ -69,7 +69,7 @@ class TestVaultUploadsDirExceptions:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -96,7 +96,7 @@ class TestVaultUploadsDirExceptions:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -123,7 +123,7 @@ class TestVaultUploadsDirExceptions:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -184,7 +184,7 @@ class TestNegativeAndZeroVaultId:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(0, "Zero Vault")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -216,7 +216,7 @@ class TestNegativeAndZeroVaultId:
             mock_conn = MagicMock()
             # Negative vault_id from database
             mock_conn.execute.return_value.fetchall.return_value = [(-1, "Negative Vault")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -247,7 +247,7 @@ class TestNegativeAndZeroVaultId:
             mock_conn = MagicMock()
             # Very large vault_id (could cause issues if used directly in paths)
             mock_conn.execute.return_value.fetchall.return_value = [(2**31 - 1, "Large Vault")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -304,7 +304,7 @@ class TestSymlinkAndNonExistentPaths:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -330,7 +330,7 @@ class TestSymlinkAndNonExistentPaths:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -356,7 +356,7 @@ class TestSymlinkAndNonExistentPaths:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -416,7 +416,7 @@ class TestRaceConditionVaultDeleted:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -455,7 +455,7 @@ class TestRaceConditionVaultDeleted:
                 (2, "Vault Two"),
                 (3, "Vault Three"),
             ]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -511,7 +511,7 @@ class TestSettingsObjectMissingMethod:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -541,7 +541,7 @@ class TestSettingsObjectMissingMethod:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault One")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -601,7 +601,7 @@ class TestPathTraversalAndInjection:
             mock_conn = MagicMock()
             # Database returns malicious string as vault_id
             mock_conn.execute.return_value.fetchall.return_value = [(malicious_id, "Malicious Vault")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -636,7 +636,7 @@ class TestPathTraversalAndInjection:
             mock_conn = MagicMock()
             # Vault name contains path traversal attempt
             mock_conn.execute.return_value.fetchall.return_value = [(1, "../../../etc/passwd")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -696,7 +696,7 @@ class TestUnicodeAndEncoding:
             mock_conn = MagicMock()
             # Unicode vault name
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault 🗂️")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
@@ -727,7 +727,7 @@ class TestUnicodeAndEncoding:
             mock_conn = MagicMock()
             # Null byte in vault name
             mock_conn.execute.return_value.fetchall.return_value = [(1, "Vault\x00Hacked")]
-            mock_pool.get_connection.return_value = mock_conn
+            # (sync get_connection intentionally left tripped — #650 review PRR-E)
             mock_pool.get_connection_async.return_value = mock_conn
 
             with patch("app.models.database.get_pool", return_value=mock_pool):

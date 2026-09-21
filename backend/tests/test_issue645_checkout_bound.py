@@ -326,7 +326,7 @@ def test_creation_refused_once_budget_spent_by_invalid_probes(db_path, monkeypat
         conn = pool.get_connection(max_wait_attempts=1)
         elapsed = time.monotonic() - started
 
-        # The 10 probes consume ~4.0s of the 5s budget; creation then runs
+        # The 10 probes consume ~2.0s of the 5s budget; creation then runs
         # inside its reserve: the composed ceiling is
         # deadline + CREATE_TIME_RESERVE_SECONDS (~10s here), and the
         # checkout must return a WORKING connection inside it.

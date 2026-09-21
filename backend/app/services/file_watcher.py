@@ -213,7 +213,10 @@ class FileWatcher:
                 continue
 
             try:
-                new_files = self._find_new_files(directory)
+                # #650 review: _find_new_files does a blocking pooled
+                # checkout (issue #645 flagged this helper explicitly) —
+                # keep it off the event loop.
+                new_files = await asyncio.to_thread(self._find_new_files, directory)
                 for file_path in new_files:
                     await self.processor.enqueue(str(file_path), vault_id=vault_id)
                     enqueued_count += 1
