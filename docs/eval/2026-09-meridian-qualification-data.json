@@ -9,7 +9,7 @@
     "host": "R640AI 172.16.50.159",
     "image": "sha256:1714ba3ba5c657d626ae337a619125dbaca9ee0fee905c30affc298233dbe3e3",
     "rollback_image_tag": "ragappv3-knowledgevault:rollback-pre-f3-281bd714, ragappv3-knowledgevault:rollback-f3-stage1-edd2c741",
-    "build_note": "Qualification staged across two builds: the initial battery ran at edd2c741855c34dd1e330e6e79b7210996b353d7 (identical evidence); the thinking/reindex/draft legs were re-run at the fixed build after the two blockers were resolved (thinking endpoint restored by the operator; reindex dimension-probe bug fixed in this PR). The deployed qualified build is the one above and contains everything from the first."
+    "build_note": "Qualification staged across two builds: the initial battery ran at edd2c741855c34dd1e330e6e79b7210996b353d7 (identical evidence); the thinking/reindex/draft legs were re-run at the fixed build after the two blockers were resolved (thinking endpoint restored by the operator; reindex dimension-probe bug fixed in this PR). The deployed qualified build is the one above and contains everything from the first. Stage 3 (2026-09-21, issue #652): gate-mixed-source-compose was re-qualified and flipped on the #652 fix build zcode/652-thinking-client-timeout-streaming @ f438e0100181f975e4a5255b70cf5cefcb52ef16 (image ragappv3-knowledgevault:fix652-f438e010, 3619ddac9319, contains this build as an ancestor); evidence requa5_mixed_compose.transcript.json; R640 restored to the stage-2 image afterwards."
   },
   "deployment": {
     "browsers": [
