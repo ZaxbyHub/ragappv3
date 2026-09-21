@@ -810,6 +810,9 @@ class LLMClient:
                         messages=messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        # Issue #652: keep the caller's schema contract on the
+                        # non-SSE fallback too, mirroring the streamed payload.
+                        response_format=response_format,
                     )
                     # Issue #571: keep the provider-exact usage the non-stream
                     # call just recorded — the stream summary below would

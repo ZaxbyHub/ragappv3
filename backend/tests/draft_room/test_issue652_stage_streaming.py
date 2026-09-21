@@ -214,3 +214,59 @@ def test_pipeline_deps_protocol_seam_unchanged():
         retrieve_sources=fake_retrieve, complete=strict_fake, now=_utcnow
     )
     assert deps.complete is strict_fake
+
+
+class _NonSSEHandler(_StubHandler):
+    """Provider that answers stream=true requests with a plain JSON body."""
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        received_payloads.append(body)
+        want_schema = bool(body.get("response_format"))
+        content = SCHEMA_JSON if want_schema else EXPECTED_CONTENT
+        payload = json.dumps(
+            {
+                "id": "chatcmpl-stub",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+async def test_non_sse_provider_fallback_keeps_schema_contract(monkeypatch):
+    # chat_completion_stream falls back to a non-streaming call when the
+    # provider ignores stream=true and answers JSON; issue #652 keeps the
+    # caller's response_format on that fallback too.
+    monkeypatch.setenv("ALLOW_LOCAL_SERVICES", "1")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _NonSSEHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    saved = (settings.ollama_chat_url, settings.chat_model)
+    settings.ollama_chat_url = base
+    settings.chat_model = "stub-model"
+    received_payloads.clear()
+    try:
+        result = await _default_complete(
+            "probe prompt",
+            logical_mode="thinking",
+            temperature=0.2,
+            sensitive=False,
+            response_format=DRAFT_SCHEMA,
+        )
+        assert result == SCHEMA_JSON
+        assert any(p.get("response_format") == DRAFT_SCHEMA for p in received_payloads)
+    finally:
+        (settings.ollama_chat_url, settings.chat_model) = saved
+        server.shutdown()
