@@ -403,6 +403,16 @@ async def _default_complete(
     re-asserted here against :func:`draft_http_client_kwargs`. Provider
     exceptions are never logged with their message — only their type name —
     because they can carry response bodies (SPEC §20).
+
+    Issue #652: the stage call streams. The deployed thinking server is
+    always-reasoning, so a non-streaming call must land its entire
+    generation inside one read-timeout window and times out on large
+    prompts; streaming resets the read timeout on every SSE chunk (reasoning
+    deltas included) and lets the per-stage wall-clock budget
+    (``_complete_bounded``) govern instead. Only ``str`` content chunks are
+    accumulated — :class:`ReasoningDelta` objects ride a separate channel
+    and are never stage output. The ``response_format`` schema contract
+    (issue #571) is forwarded on the streamed request unchanged.
     """
     from app.services.llm_client import (
         create_editorial_client,
@@ -421,14 +431,18 @@ async def _default_complete(
         _assert_redirects_disabled(client)
         # SPEC §9.2: record provider kind/model, never keys or endpoints.
         logger.debug("draft compile: provider %s", provider_snapshot(client))
-        return await client.chat_completion(
+        parts: list[str] = []
+        async for chunk in client.chat_completion_stream(
             [{"role": "user", "content": prompt}],
             temperature=temperature,
             # Issue #571: stage responses are schema-constrained provider-side
             # (json_schema response_format) so a non-compliant model response
             # is a provider error instead of a downstream parse failure.
             response_format=response_format,
-        )
+        ):
+            if isinstance(chunk, str):
+                parts.append(chunk)
+        return "".join(parts)
     finally:
         await client.close()
 
