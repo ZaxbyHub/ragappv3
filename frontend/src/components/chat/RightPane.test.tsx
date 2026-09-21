@@ -494,6 +494,13 @@ describe("RightPane", () => {
         expandedSources: new Set(),
       });
 
+      // jsdom does not implement URL.createObjectURL; vitest's jsdom compat
+      // shim covered it, but the shim reads jsdom's Blob impl slot via an
+      // own Symbol(impl) that jsdom 30 stopped exposing, so the call now
+      // throws. Stub the API (as RightPane.virtualization.test.tsx does).
+      vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:artifact-preview");
+      vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+
       render(<RightPane />);
 
       const sourceButtons = screen.getAllByRole("button");
@@ -511,6 +518,9 @@ describe("RightPane", () => {
       await waitFor(() => {
         expect(document.querySelector("img")).not.toBeNull();
       });
+      expect(document.querySelector("img")?.getAttribute("src")).toBe(
+        "blob:artifact-preview"
+      );
     });
   });
 
