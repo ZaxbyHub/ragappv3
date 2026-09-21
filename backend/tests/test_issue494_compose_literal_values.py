@@ -28,12 +28,8 @@ LITERAL_ALLOWED = {
     "HOST_DATA_DIR",
     "HF_TOKEN",
     # Container-internal paths/values pinned by the image + volume contract:
-    # DATA_DIR must agree with the container-internal /app/data volume mount;
-    # the two feature flags below are deliberately pinned off in the compose
-    # deployment until their features graduate.
+    # DATA_DIR must agree with the container-internal /app/data volume mount.
     "DATA_DIR",
-    "TRI_VECTOR_SEARCH_ENABLED",
-    "FLAG_EMBEDDING_URL",
 }
 
 
