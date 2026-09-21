@@ -270,3 +270,30 @@ async def test_non_sse_provider_fallback_keeps_schema_contract(monkeypatch):
     finally:
         (settings.ollama_chat_url, settings.chat_model) = saved
         server.shutdown()
+
+
+async def test_non_sse_provider_fallback_without_response_format(monkeypatch):
+    # The no-schema leg of the same fallback (#654 review F-07): a stage call
+    # without response_format must accumulate the plain content and must NOT
+    # inject a response_format into the fallback payload.
+    monkeypatch.setenv("ALLOW_LOCAL_SERVICES", "1")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _NonSSEHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    saved = (settings.ollama_chat_url, settings.chat_model)
+    settings.ollama_chat_url = base
+    settings.chat_model = "stub-model"
+    received_payloads.clear()
+    try:
+        result = await _default_complete(
+            "probe prompt",
+            logical_mode="thinking",
+            temperature=0.2,
+            sensitive=False,
+        )
+        assert result == EXPECTED_CONTENT
+        assert received_payloads, "stub saw no requests"
+        assert all(not p.get("response_format") for p in received_payloads)
+    finally:
+        (settings.ollama_chat_url, settings.chat_model) = saved
+        server.shutdown()

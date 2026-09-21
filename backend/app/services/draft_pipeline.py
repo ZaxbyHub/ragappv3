@@ -408,11 +408,12 @@ async def _default_complete(
     always-reasoning, so a non-streaming call must land its entire
     generation inside one read-timeout window and times out on large
     prompts; streaming resets the read timeout on every SSE chunk (reasoning
-    deltas included) and lets the per-stage wall-clock budget
-    (``_complete_bounded``) govern instead. Only ``str`` content chunks are
-    accumulated — :class:`ReasoningDelta` objects ride a separate channel
-    and are never stage output. The ``response_format`` schema contract
-    (issue #571) is forwarded on the streamed request unchanged.
+    deltas included) and lets the job-scoped wall-clock budget
+    (``_complete_bounded``, bounded by ``draft_job_timeout_seconds``) govern
+    instead. Only ``str`` content chunks are accumulated —
+    :class:`ReasoningDelta` objects ride a separate channel and are never
+    stage output. The ``response_format`` schema contract (issue #571) is
+    forwarded on the streamed request unchanged.
     """
     from app.services.llm_client import (
         create_editorial_client,

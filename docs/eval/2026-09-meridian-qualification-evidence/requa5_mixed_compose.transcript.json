@@ -23,15 +23,51 @@
       "outcome": "failed provider_unavailable at copy",
       "wall_minutes": 70.8,
       "timeline": [
-        {"t": 20.0, "stage": "research", "model_calls": 0, "progress": 11.11},
-        {"t": 580.8, "stage": "research", "model_calls": 1, "progress": 11.11},
-        {"t": 1422.1, "stage": "outline", "model_calls": 2, "progress": 22.22},
-        {"t": 1662.5, "stage": "draft", "model_calls": 3, "progress": 33.33},
-        {"t": 1882.9, "stage": "draft", "model_calls": 5, "progress": 33.33},
-        {"t": 1902.9, "stage": "copy", "model_calls": 6, "progress": 55.56},
-        {"t": 4246.5, "stage": "copy", "status": "failed", "error_code": "provider_unavailable"}
+        {
+          "t": 20.0,
+          "stage": "research",
+          "model_calls": 0,
+          "progress": 11.11
+        },
+        {
+          "t": 580.8,
+          "stage": "research",
+          "model_calls": 1,
+          "progress": 11.11
+        },
+        {
+          "t": 1422.1,
+          "stage": "outline",
+          "model_calls": 2,
+          "progress": 22.22
+        },
+        {
+          "t": 1662.5,
+          "stage": "draft",
+          "model_calls": 3,
+          "progress": 33.33
+        },
+        {
+          "t": 1882.9,
+          "stage": "draft",
+          "model_calls": 5,
+          "progress": 33.33
+        },
+        {
+          "t": 1902.9,
+          "stage": "copy",
+          "model_calls": 6,
+          "progress": 55.56
+        },
+        {
+          "t": 4246.5,
+          "stage": "copy",
+          "status": "failed",
+          "error_code": "provider_unavailable"
+        }
       ],
-      "reading": "All thinking-stage calls streamed past the old 300 s cliff (research call 1 ran ~50 min in one streamed request, outline/draft ~2-4 min each) — the #652 defect (hardcoded read timeout killing long generations) is gone. The copy stage on the configured editorial backend (192.168.1.145) exhausted its transient ladder: that server sustained 15-30 min streams but dropped them before completion (server-side close observed on the socket)."
+      "reading": "Every stage call used the streaming transport, so no call was capped at the former 300 s read-timeout cliff; the artifact does not capture per-request durations. Provable from the timeline: the research stage completed its 2 thinking calls within 23.7 min (longest single-call bound ~14.0 min), the outline and draft calls each completed in under 300 s, and the remaining ~39 min was the copy stage exhausting its transient ladder against the third-party editorial backend (192.168.1.145), whose long streams dropped before completion (server-side closes observed on the socket).",
+      "outcome_note": "All thinking stages (research, outline, draft) completed under streaming; the failure was environmental (editorial backend), not a read-timeout."
     },
     {
       "job": 40,
@@ -54,14 +90,37 @@
       "wall_minutes": 17.0,
       "within_budget": true,
       "timeline": [
-        {"t": 20.0, "stage": "fact", "model_calls": 2, "progress": 77.78},
-        {"t": 40.1, "stage": "fact", "model_calls": 3, "progress": 77.78},
-        {"t": 1021.6, "stage": "assemble", "status": "completed", "model_calls": 3, "progress": 100.0}
+        {
+          "t": 20.0,
+          "stage": "fact",
+          "model_calls": 2,
+          "progress": 77.78
+        },
+        {
+          "t": 40.1,
+          "stage": "fact",
+          "model_calls": 3,
+          "progress": 77.78
+        },
+        {
+          "t": 1021.6,
+          "stage": "assemble",
+          "status": "completed",
+          "model_calls": 3,
+          "progress": 100.0
+        }
       ],
       "job_record": {
-        "id": 42, "status": "completed", "active_stage": "assemble", "progress_percent": 100.0,
-        "model_call_count": 3, "timeout_seconds": 7200, "attempt_no": 4, "parent_job_id": 41,
-        "started_at": "2026-09-21 10:36:31", "completed_at": "2026-09-21 10:53:21"
+        "id": 42,
+        "status": "completed",
+        "active_stage": "assemble",
+        "progress_percent": 100.0,
+        "model_call_count": 3,
+        "timeout_seconds": 7200,
+        "attempt_no": 4,
+        "parent_job_id": 41,
+        "started_at": "2026-09-21 10:36:31",
+        "completed_at": "2026-09-21 10:53:21"
       },
       "lifecycle": {
         "revision_id": 3,
@@ -76,5 +135,9 @@
       }
     }
   ],
-  "verdict": "pass — a mixed-source compose draft completed the full nine-stage journey (intake, research, outline, draft, lint, copy, standards, fact, assemble) against the deployed thinking server with the streaming fix live, well inside DRAFT_JOB_TIMEOUT_SECONDS=7200 (final attempt 17.0 min; the 70.8 min first attempt also stayed inside the budget and cleared every thinking-stage call past the former 300 s read-timeout cliff). Revision carries 59 citations, fact_status passed, export 200. Remaining editorial-backend fragility (192.168.1.145 stream drops) is an environment condition of that third-party server, not an application defect; the editorial endpoint is operator-configurable and was switched locally for the run with the deviation recorded above."
+  "verdict": "pass — a mixed-source compose draft completed the full nine-stage journey (intake, research, outline, draft, lint, copy, standards, fact, assemble) against the deployed thinking server with the streaming fix live, well inside DRAFT_JOB_TIMEOUT_SECONDS=7200 (final attempt 17.0 min). Streaming carried every stage call with no 300 s cap; the artifact does not capture per-request durations (provable bounds: research stage <= 23.7 min across 2 calls, longest single-call bound ~14.0 min). Revision carries 59 citations, fact_status passed, export 200. Remaining editorial-backend fragility (192.168.1.145 stream drops) is an environment condition of that third-party server, not an application defect; the editorial endpoint is operator-configurable and was switched locally for the run with the deviation recorded above.",
+  "artifact_notes": [
+    "Correction (2026-09-21, PR #654 review round): this file previously claimed job 39's research stage included 'one ~50 min streamed research call' and that 'every thinking-stage call streamed past the former 300 s cliff'. The timeline's own data disproves both: research completed 2 calls within 23.7 min (longest per-call bound ~14.0 min), and the outline/draft calls each completed in under 300 s. The corrected reading above replaces the disproven claims; the 17.0-min job-42 completion, nine-stage coverage, citation count, fact_status and export evidence are unaffected.",
+    "Job 42 copy/standards coverage note: the timeline records only stage transitions (3 entries) because the poller snapshots on change. Copy and standards demonstrably executed: job 42 started at start_stage=copy with 0 model calls, and the first snapshot (t=20 s) already showed model_calls=2 with stage=fact — i.e. both editorial calls (copy, standards) completed inside the first ~20 s on the local minicpm5-2b endpoint."
+  ]
 }

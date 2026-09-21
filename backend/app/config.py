@@ -1129,6 +1129,28 @@ class Settings(BaseSettings):
             return None
         return v
 
+    @field_validator(
+        "thinking_request_timeout_seconds",
+        "editorial_request_timeout_seconds",
+        "instant_request_timeout_seconds",
+    )
+    @classmethod
+    def validate_request_timeout_bounds(cls, v):
+        """Reject non-positive or absurd request timeouts at construction.
+
+        Mirrors the ``PUT /api/settings`` validation for the same fields
+        (issue #654 review): ``0``/negative would fail every provider call,
+        and the httpx error surfaces only per-request, long after startup.
+        Upper bound 86400 (24 h) is generous for a per-read timeout on a
+        streamed response — a larger value is a configuration error, not a
+        tuning choice.
+        """
+        if not 0 < float(v) <= 86400:
+            raise ValueError(
+                "request timeout must be a positive number of seconds (<= 86400)"
+            )
+        return v
+
     @field_validator("chunk_size_chars", mode="before")
     @classmethod
     def migrate_chunk_size_chars(cls, v: int | None, values) -> int:

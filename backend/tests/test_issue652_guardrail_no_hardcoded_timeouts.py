@@ -62,6 +62,53 @@ def test_guardrail_no_hardcoded_factory_timeout_defaults():
         )
 
 
+def test_guardrail_no_literal_timeout_in_factory_bodies():
+    """A regression that moves a numeric literal from the signature into the
+    factory BODY (``LLMClient(timeout=300.0)``) would slip past the signature
+    scan above (#654 review F-06 mutation probe); scan the call sites too."""
+    source = (
+        Path(__file__).resolve().parents[1] / "app" / "services" / "llm_client.py"
+    ).read_text(encoding="utf-8")
+    offenders = _literal_timeout_call_sites(ast.parse(source))
+    assert not offenders, (
+        f"numeric-literal LLMClient(timeout=...) call sites: {offenders} — "
+        "resolve from settings.*_request_timeout_seconds instead"
+    )
+
+
+def test_guardrail_detector_flags_literal_call_sites():
+    """Self-test for the body scanner: it must flag the exact regression shape
+    F-06's mutation probe described (literal moved into a constructor call)."""
+    snippet = (
+        "def create_broken_client(timeout=None):\n"
+        "    return LLMClient(timeout=300.0)\n"
+        "def create_ok_client(timeout=None):\n"
+        "    return LLMClient(timeout=timeout)\n"
+    )
+    assert _literal_timeout_call_sites(ast.parse(snippet)) == ["line 2"]
+    assert _literal_timeout_call_sites(ast.parse("LLMClient(timeout=None)\n")) == []
+
+
+def _literal_timeout_call_sites(tree):
+    """Return 'line N' entries for LLMClient(...) calls whose ``timeout=``
+    keyword is a numeric constant."""
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id == "LLMClient"):
+            continue
+        for keyword in node.keywords:
+            if (
+                keyword.arg == "timeout"
+                and isinstance(keyword.value, ast.Constant)
+                and isinstance(keyword.value.value, (int, float))
+            ):
+                hits.append(f"line {node.lineno}")
+    return hits
+
+
 def test_guardrail_factories_reference_settings_timeouts():
     source = (
         Path(__file__).resolve().parents[1] / "app" / "services" / "llm_client.py"

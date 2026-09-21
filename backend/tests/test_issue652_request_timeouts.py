@@ -18,6 +18,9 @@ a slow model deployment. These tests pin the new contract:
 import ast
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from app.api.routes.settings import (
     ALLOWED_FIELDS,
     SettingsResponse,
@@ -60,7 +63,8 @@ def _lifespan_new_direct_keys():
                         return [
                             elt.value
                             for elt in node.value.elts
-                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                            if isinstance(elt, ast.Constant)
+                            and isinstance(elt.value, str)
                         ]
     raise AssertionError("NEW_DIRECT_KEYS list not found in lifespan.py")
 
@@ -111,3 +115,17 @@ def test_all_five_settings_pipeline_wiring_points():
 def test_build_settings_dict_uses_singleton_values(monkeypatch):
     monkeypatch.setattr(settings, "thinking_request_timeout_seconds", 12.5)
     assert _build_settings_dict()["thinking_request_timeout_seconds"] == 12.5
+
+
+def test_settings_level_validator_rejects_bad_env_values():
+    # The env/.env construction path validates the same bounds as the
+    # PUT /api/settings path (#654 review F-04/F-05): a zero/negative or
+    # absurd (> 24 h) timeout must fail loudly at startup, not per-request.
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, thinking_request_timeout_seconds=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, instant_request_timeout_seconds=-5)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, editorial_request_timeout_seconds=86401)
+    ok = Settings(_env_file=None, thinking_request_timeout_seconds=86400)
+    assert ok.thinking_request_timeout_seconds == 86400.0

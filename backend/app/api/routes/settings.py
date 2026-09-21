@@ -233,8 +233,12 @@ class SettingsUpdate(BaseModel):
     def validate_request_timeouts_positive(cls, v):
         # Issue #652: a zero/negative httpx read timeout would fail every
         # provider call; keep the positive bound explicit for API callers.
-        if v is not None and v <= 0:
-            raise ValueError("must be a positive number of seconds")
+        # Upper bound mirrors the Settings construction validator (24 h is
+        # generous for a per-read timeout on a streamed response).
+        if v is not None and not 0 < v <= 86400:
+            raise ValueError(
+                "must be a positive number of seconds (<= 86400)"
+            )
         return v
 
     @field_validator("instant_enable_thinking")
