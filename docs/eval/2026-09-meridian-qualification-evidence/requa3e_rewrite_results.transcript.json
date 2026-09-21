@@ -1,0 +1,52 @@
+{
+  "steps": [
+    {
+      "step": "rewrite_revision",
+      "id": 2,
+      "content_chars": 255,
+      "preview": "The Zaxby aeroshell program reported Q3 revenue of 4.2 million dollars. Dana Whitfield serves as program director. The harbor light protocol requires two-phase calibration before launch. Program leadership should review the calibration schedule quart",
+      "fact_status": "findings",
+      "n_citations": 33
+    },
+    {
+      "step": "rewrite_findings",
+      "n": 8,
+      "sample": [
+        {
+          "rule_id": "fact.claim_span_unresolved",
+          "severity": "blocker",
+          "can_apply": false
+        },
+        {
+          "rule_id": "fact.claim_span_unresolved",
+          "severity": "blocker",
+          "can_apply": false
+        },
+        {
+          "rule_id": "fact.claim_unsupported",
+          "severity": "blocker",
+          "can_apply": false
+        }
+      ]
+    },
+    {
+      "step": "rewrite_export",
+      "status": 200,
+      "fact": "findings",
+      "approval": "not_ready",
+      "chars": 255
+    },
+    {
+      "step": "compose_retry",
+      "status": 202,
+      "new_job": 29,
+      "start_stage": "research"
+    }
+  ],
+  "source_only_rewrite": {
+    "draft_id": 7,
+    "revision_id": 2,
+    "export_ok": true
+  },
+  "compose_retry_job": 29
+}

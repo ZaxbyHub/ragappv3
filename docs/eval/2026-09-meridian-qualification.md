@@ -5,9 +5,9 @@ Data: `docs/eval/2026-09-meridian-qualification-data.json`. Release note: `docs/
 
 ## Build Identity
 
-- Build: `edd2c741855c34dd1e330e6e79b7210996b353d7`
-- Deployed image: `sha256:65aad90028b9fb8288bd60f047e20e0411f8a63f856a21fc4e19f9d15bfe988e` (built from the master checkout at the build commit above on R640AI; container healthy; `FALLBACK_SCORE_FLOOR` marker of PR #647 verified present in the deployed `document_retrieval.py`).
-- `meta.deployed_revision` provenance: the build-context commit `git -C /home/afmostai/ragappv3 rev-parse HEAD` immediately before `docker compose build knowledgevault`; the image built from that context was the one recreated into service (pre-deploy image `00d553f3eade` preserved as tag `ragappv3-knowledgevault:rollback-pre-f3-281bd714`).
+- Build: `67527cd94f7fbd31ab8b6e4d94103844e8a4df9c`
+- Deployed image: `sha256:1714ba3ba5c657d626ae337a619125dbaca9ee0fee905c30affc298233dbe3e3` (built on R640AI from the qualification branch at the build commit above — master `54f8682e` + this PR's docs and the reindex probe fix; container healthy; the #647 `FALLBACK_SCORE_FLOOR` marker and the probe fix both verified present in the deployed code). Qualification ran in two stages: the full battery at `edd2c741…` (image 65aad900) and the blocker re-runs at the fixed build above, which contains the first as an ancestor.
+- `meta.deployed_revision` provenance: the build-context commit `git -C /home/afmostai/ragappv3 rev-parse HEAD` immediately before `docker compose build knowledgevault`. Rollback images pinned at BOTH stages: `ragappv3-knowledgevault:rollback-pre-f3-281bd714` (00d553f3eade, pre-F3) and `ragappv3-knowledgevault:rollback-f3-stage1-edd2c741` (65aad900, stage-1 qualified build).
 
 ## Deployment and Topology Freeze
 
@@ -34,7 +34,7 @@ Supporting data: `docs/eval/2026-09-meridian-qualification-data.json` (`deployme
 | source-viewing | pass | chunk context API + UI S1/M1 source buttons |
 | save-reload-retry-fork | pass | durable turns, truncate/resend, fork session 17 |
 | memory-wiki-kms-promotion-edit | pass | memory edit, KMS edit, memory→wiki promotion 200 |
-| draft-compose-rewrite | fail | compose blocked: thinking-model endpoint down (external) |
+| draft-compose-rewrite | pass-with-limitation | docs/eval/2026-09-meridian-qualification-evidence/requa3c_drafts_vault2.transcript.json — draft lifecycle qualified with a limitation (see Failures) |
 | findings-compare | pass | quality report→eval case→compare, fact_coverage delta 1.0 |
 | export | pass-with-limitation | canvas download + manifest export; draft export blocked by compose |
 | canvas-edit-restore-download | pass | created/user_edit/restore versions + download + manifest |
@@ -46,7 +46,7 @@ Supporting data: `docs/eval/2026-09-meridian-qualification-data.json` (`deployme
 | failed | pass | bad extension 400; empty file 400; truncated PDF → PARSE_FAILED surfaced, index unpolluted |
 | partial | pass-with-limitation | parse-boundary failure clean; forced mid-batch partial state not produced |
 | cancelled | pass | client SSE disconnect; server persisted both turn rows |
-| recovered | pass-with-limitation | failed draft job retried (attempt 2, parent linkage); chat retry via truncate+resend; reindex recovery blocked (#645) |
+| recovered | pass | failed draft job retried (attempt 2, parent linkage, docs/eval/2026-09-meridian-qualification-evidence/draft_retry.transcript.json); chat retry via truncate+resend; reindex failure reproduced pre-fix (job 392) and recovered post-fix (job 396 pass, job 463 completed) |
 
 Input modes: keyboard — chat composer Enter-send exercised with vault-validation alert then success (docs/eval/2026-09-meridian-qualification-evidence/browser_03_chat_keyboard_sent.png); touch — real touchscreen taps in a hasTouch/isMobile 375px context: search-input focus tap and vault-selector menu tap with observable effects (docs/eval/2026-09-meridian-qualification-evidence/browser_06_touch_context_tap.png); canvas editor not separately visited on a touch viewport.
 
@@ -55,14 +55,14 @@ Input modes: keyboard — chat composer Enter-send exercised with vault-validati
 | Check | Retained | Result |
 |---|---|---|
 | document replacement (delete+re-upload; no in-place replace API exists) | true | pass-with-limitation |
-| reindex | false | FAIL — job failed `attempt_cap_exceeded: Embedding batch failed: Event loop is closed`; live instance of the #645 defect class (open issue, excluded scope) |
+| reindex | true | pass-with-limitation — the #529-introduced dimension-probe bug (tuple-unpacking the fail_fast=True embedding return) is FIXED in this PR; reindex now completes end to end (vault-9 job 463 completed 1/1, chunk identity retained); vault-2 pass (job 396) visits all files with only two PRE-EXISTING corrupt corpus files failing per-file parse |
 | restart (docker restart knowledgevault) | true | pass — search identity `101_0b2bfe94_768_0` score 0.733 unchanged; sessions/wiki/KMS/canvas intact |
 
 ## Symptom Recheck
 
 | Symptom | Disposition | Evidence |
 |---|---|---|
-| blank-thinking | resolved | failed thinking turns surface an error event + empty done, never a blank completed answer; UI shows 'Using instant — thinking unavailable' |
+| blank-thinking | resolved | on the restored endpoint a thinking turn streams real reasoning deltas and a cited answer and persists durably (docs/eval/2026-09-meridian-qualification-evidence/requa2_thinking.transcript.json); during the outage the same path surfaced an explicit error event + empty done, never a blank completed answer, and the UI showed 'Using instant — thinking unavailable' |
 | contradictory-upload-status | resolved | API status/phase progression coherent; UI status text matched terminal state |
 | missing-previews | resolved | detail Preview pane renders full text; chunk-context API serves sources |
 | raw-kms-markdown | resolved | KMS body Markdown rendered natively (h1/strong/em/list/code) |
@@ -75,7 +75,7 @@ Input modes: keyboard — chat composer Enter-send exercised with vault-validati
 
 | ID | Disposition | Evidence |
 |---|---|---|
-| DEEP-C-03 | closed-fixed | production causes identified live: `Circuit breaker 'llm_thinking' opened after 5 consecutive failures` / `All connection attempts failed` (docs/eval/2026-09-meridian-qualification-evidence/log_thinking_outage_excerpt.txt); `attempt_cap_exceeded` + Event-loop detail (docs/eval/2026-09-meridian-qualification-evidence/log_reindex_eventloop_excerpt.txt); PARSE_FAILED + extraction diagnostics. Narrowing: stream error code for the outage is coarse (EMBEDDING_ERROR); precise cause requires the log trail |
+| DEEP-C-03 | closed-fixed | production causes identified and RESOLVED live: (1) thinking outage — circuit breaker llm_thinking opened after 5 consecutive failures / All connection attempts failed to the off-box endpoint (docs/eval/2026-09-meridian-qualification-evidence/log_thinking_outage_excerpt.txt); endpoint restored by the operator and verified live. (2) reindex failure — deterministic ValueError at background_tasks.py:3504: the #513 W13 dimension probe tuple-unpacked the fail_fast=True embed_batch return (latent since PR #529; the outage-era 'Event loop is closed' masking cleared once the embedding service was reachable) — root-cause capture in docs/eval/2026-09-meridian-qualification-evidence/repro_reindex_pre_fix.log, fixed in this PR with a contract regression test. Narrowing retained: the chat stream error code for provider outages is coarse (EMBEDDING_ERROR); precise cause requires the log trail |
 | DEEP-C-04 | closed-documented-limitation | browser limitations remain documented: same-origin CSRF enforcement by design, touch hardware not driven (layout-class only), Firefox/Edge not separately exercised — see Excluded Scope |
 
 ## Supplemental Registry Dispositions
@@ -423,8 +423,9 @@ Input modes: keyboard — chat composer Enter-send exercised with vault-validati
 
 - Open non-F3 follow-ups, recorded but NOT owned or closed here: #597 (admin maintenance audit row), #603 (toggle_manager race follow-up), #614 (unwired operator settings; PR #625 open), #640 (PR #627 follow-ups), #645 (on-loop pooled checkouts — the live reindex `Event loop is closed` failure observed during this qualification is an instance of this open issue's class).
 - Parked: #202 (X1) — security/access-management and related historical obligations; excluded from active completion, no resolution claimed (legacy rows marked `superseded`).
-- Live qualification findings that belong to excluded scope: reindex embedding failure (#645 class); thinking-model endpoint outage (external host, not a product defect; UI/API degrade honestly).
+- Live qualification findings and their disposition: the reindex failure was initially suspected as the #645 checkout class but deterministic reproduction proved it to be the #529-introduced dimension-probe bug, which this PR fixes (#645 remains open for its own on-loop checkout scope); the thinking-model endpoint outage was external (host restored by the operator) — UI/API degrade honestly throughout.
 - Structured (CSV) content is keyword-searchable but its chunk did not surface in semantic retrieval for content queries; the ask declined honestly. Recorded as a retrieval-quality limitation for evaluation follow-up (#237 owns the eval harness; no open defect filed).
+- Two PRE-EXISTING corrupt corpus files in the CDP vault (pasted-text uploads unstructured misdetects as JSON) fail per-file parse during reindex and normal ingestion alike — operator data cleanup, not a product defect (docs/eval/2026-09-meridian-qualification-evidence/requa1_reindex.transcript.json).
 
 ## Performance Profile
 
@@ -433,16 +434,18 @@ Baseline: `docs/eval/2026-09-performance.md` (F2, build 281bd714, thinking-model
 | Metric | Qualified | Baseline | Delta |
 |---|---|---|---|
 | turn queue-wait p50 (tier 1, instant) | 87.7 ms | 40 ms (F2 tier-1, thinking) | +47.7 ms; both sub-100 ms, healthy |
-| completion p50 (tier 1, instant) | 0.97 s | 41.2 s (F2 tier-1, thinking) | model mismatch — F2 baseline is the thinking model; like-for-like thinking re-run blocked by the outage (see Failures) |
+| completion p50 (tier 1, instant) | 0.97 s | — | instant-mode measurement (no F2 instant baseline) |
+| completion p50 (tier 1, thinking) | 19.4 s | 41.2 s (F2 tier-1, thinking) | like-for-like thinking comparison on the restored endpoint (4/4 turns 18.1-29.9 s + a 52.7 s cited research turn; docs/eval/2026-09-meridian-qualification-evidence/requa2_thinking.transcript.json) |
 
 Raw: docs/eval/2026-09-meridian-qualification-evidence/perf_tier1_instant.transcript.json (6 samples).
 
 ## Failures and Environment Deviations (read before rollout)
 
-1. **Thinking-model endpoint down (external).** http://172.16.50.41:8000 refused connections for the whole window (host pings, all scanned LLM ports closed; not repairable from the R640). Live-thinking, source-only-rewrite and mixed-source-compose gates are recorded FAIL. The product degraded honestly everywhere (error events, UI banner `Using instant — thinking unavailable`, draft job `provider_unavailable` with bounded retries and attempt tracking). Re-run procedure: restore the ChatGPTN service, then re-run docs/eval/2026-09-meridian-qualification-evidence/stageB2_sessions_fix.py, stageD2/D3 and update the data JSON — minutes of work.
-2. **Reindex failure (#645 class).** POST /api/documents/reindex failed `attempt_cap_exceeded: Embedding batch failed: Event loop is closed` — a live instance of open issue #645's defect class (on-loop pooled checkouts). Owned by #645; not fixed here (docs-only qualification slot).
-3. **Temporary CORS deviation (restored).** The lab network cannot reach the configured public proxy domains, and raw-IP browser origins are rejected by the same-origin CSRF design. To run the mandated browser legs, `BACKEND_CORS_ORIGINS` temporarily gained `http://172.16.50.159:9090` (backup at `/home/afmostai/ragappv3/.env.pre-f3-backup`), the container was recreated, and the original value was restored and health-gated immediately after the browser legs. Both recreations re-verified restart-survival.
-4. Draft Room was already enabled at runtime (`GET /api/draft-room/capabilities` enabled=true) despite the env default; no setting was changed by this qualification.
+1. **RESOLVED — Thinking-model endpoint outage.** http://172.16.50.41:8000 refused connections through the first battery window (external host). The operator restored it during the qualification; live-thinking and the thinking perf row are GREEN on the restored endpoint (docs/eval/2026-09-meridian-qualification-evidence/requa2_thinking.transcript.json), and the source-only-rewrite draft completed its full lifecycle on it. Outage-era failures are retained as evidence.
+2. **RESOLVED — Reindex failure (reindex dimension-probe bug).** The deterministic post-outage reproduction (docs/eval/2026-09-meridian-qualification-evidence/repro_reindex_pre_fix.log) proved the failure was NOT the #645 checkout class but the #529-introduced probe tuple-unpack bug; this PR fixes it (backend/app/services/background_tasks.py + tests/test_issue229_reindex_dimension_probe.py, RED-on-revert proven) and reindex now completes end to end (docs/eval/2026-09-meridian-qualification-evidence/requa4_reindex_cleanvault.transcript.json job 463 completed; vault-2 job 396 pass over 13/15 files with 2 pre-existing corrupt corpus files failing per-file parse). #645 remains open for its own scope.
+3. **PARTIALLY RESOLVED — Draft gates on the restored server.** Source-only rewrite: PASS (full lifecycle, draft 7 job 28: revision, findings, export). Mixed-source compose: FAIL — qualified through the copy stage with 9 real model calls (jobs 29/30) but its standards-stage call exceeds the hardcoded 300s non-streaming client timeout on the restored always-reasoning server in every attempt (jobs 24, 27, 29, 30, 31); production cause and operator unblock in docs/eval/2026-09-meridian-qualification-evidence/requa3_draft_latency_cause.md (the deployment's own pre-outage reference compile ran 19 calls in 56 minutes; restore that serving profile, then one retry of the queued job finishes the remaining stages via the proven stage-cache resume).
+4. **Temporary CORS deviation (restored).** The lab network cannot reach the configured public proxy domains, and raw-IP browser origins are rejected by the same-origin CSRF design. To run the mandated browser legs, `BACKEND_CORS_ORIGINS` temporarily gained `http://172.16.50.159:9090` (backup at `/home/afmostai/ragappv3/.env.pre-f3-backup`), the container was recreated, and the original value was restored and health-gated immediately after the browser legs. Both recreations re-verified restart-survival.
+5. Draft Room was already enabled at runtime (`GET /api/draft-room/capabilities` enabled=true) despite the env default; no setting was changed by this qualification.
 
 ## Rollout and Rollback
 

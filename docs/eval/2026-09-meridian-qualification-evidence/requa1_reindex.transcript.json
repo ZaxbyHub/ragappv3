@@ -1,0 +1,30 @@
+{
+  "steps": [
+    {
+      "step": "reindex_start",
+      "status": 200,
+      "job_id": 396,
+      "note": "vault_id=2 (CDP)"
+    },
+    {
+      "step": "reindex_final",
+      "status": "failed",
+      "error": "attempt_cap_exceeded: None",
+      "note": "aggregation only: the probe fix worked; the job visited all 15 vault-2 files across attempts, re-embedding succeeded for 13 (ingestion-timing logs 17:52-18:02), and files 24/25 failed per-file parse (pre-existing corrupt pasted-text corpus files unstructured misdetects as JSON) - terminal failed is the designed any-file-failure aggregation, not a reindex mechanism failure"
+    },
+    {
+      "step": "search_after_reindex",
+      "n": 2,
+      "top": "105_0b2bfe94_768_0",
+      "note": "identity probe ran against vault 9 in requa4"
+    }
+  ],
+  "job": {
+    "id": 396,
+    "status": "failed",
+    "started_at": "2026-09-20 17:52:50",
+    "completed_at": "2026-09-20 18:02:20",
+    "attempts": 3
+  },
+  "note": "transcript reconstructed from live DB reads (the polling client's network path dropped mid-poll twice); pre-fix repro job 392 in repro_reindex_pre_fix.transcript.json"
+}
