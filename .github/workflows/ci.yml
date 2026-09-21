@@ -19,7 +19,7 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
-          node-version: "22.22.0"
+          node-version: "22.22.2"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -86,7 +86,7 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
-          node-version: "22.22.0"
+          node-version: "22.22.2"
           cache: npm
           cache-dependency-path: frontend/e2e/package-lock.json
 
@@ -254,7 +254,7 @@ jobs:
       # from frontend/package.json; --no-save leaves the lockfile untouched).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
-          node-version: "22.22.0"
+          node-version: "22.22.2"
 
       - name: Install TypeScript for the #566 config guardrail
         run: npm install --no-save typescript@6.0.3
