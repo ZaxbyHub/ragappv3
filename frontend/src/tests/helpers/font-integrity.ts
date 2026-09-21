@@ -129,6 +129,11 @@ export function assertFontIntegrity(fontsDir: string, manifestText: string): Fon
     }
   }
 
+  // F-009 disposition (PR #651 review): the detection test covers the
+  // load-bearing rejections (truncation, bad magic, hash mismatch, missing
+  // and uncovered files); the remaining defensive branches (unreadable dir,
+  // malformed manifest header) are accepted uncovered — they guard against
+  // environment faults, not the vendored-drift class this helper exists for.
   if (problems.length > 0) {
     throw new Error(`font integrity failures in ${fontsDir}:\n  - ${problems.join("\n  - ")}`);
   }

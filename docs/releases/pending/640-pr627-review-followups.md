@@ -54,5 +54,9 @@ failure retries, and a Dockerfile nothing ever built).
   audit (parsed CSSOM) remains future work if ever needed.
 - The negative cache is page-lifetime: a reload retries a failed grammar load
   once more (deliberate — a fixed deploy should recover without code changes).
+- SHA256SUMS is an integrity pin (trust-on-first-use): it proves the vendored
+  fonts have not drifted since the pin was recorded; it cannot retroactively
+  prove the original vendoring was untampered. The css2 fetch script documents
+  the origin for independent re-vendoring.
 - The fetch script regenerates fonts only on demand; CI does not re-vendor
   fonts (the manifest pins what ships).

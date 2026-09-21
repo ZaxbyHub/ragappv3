@@ -7,8 +7,11 @@
  *   - `stat -c%s` (Linux-only) replaced by fs.statSync(...).size so the script
  *     runs on Windows/macOS/Linux alike;
  *   - at the end it (re)writes frontend/src/assets/fonts/SHA256SUMS — the
- *     provenance manifest verified by src/tests/font-integrity-manifest.test.ts
- *     and the frozen #640 acceptance check.
+ *     integrity manifest verified by src/tests/font-integrity-manifest.test.ts
+ *     and the frozen #640 acceptance check. The manifest pins the bytes that
+ *     ship (TOFU: trust-on-first-use) — it proves the vendored files have not
+ *     drifted since the pin, not that the original vendoring was untampered;
+ *     the css2 URL below documents the origin for re-vendoring.
  *
  * Fetches the css2 stylesheet with a modern-Chrome UA (woff2 + variable fonts,
  * full unicode-range subset split), downloads every woff2 it references into

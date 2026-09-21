@@ -23,11 +23,15 @@ vi.mock("@shikijs/langs/cpp", async () => {
   throw new Error("simulated grammar chunk fetch failure");
 });
 
-// F-001 (#651 review): concurrency probe uses its OWN grammar so the test
+// F-001 (#651 review): concurrency probe uses its OWN REGISTERED grammar
+// ("go" is a GRAMMAR_LOADERS key — highlighter.ts `go: loadGo`) so the test
 // stays order-independent regardless of the cumulative cpp state above.
-const rubyState = vi.hoisted(() => ({ attempts: 0 }));
-vi.mock("@shikijs/langs/ruby", async () => {
-  rubyState.attempts += 1;
+// Using an UNREGISTERED language here would be vacuous: hl() takes the
+// unknown-language fallback before any import, and the assertions pass
+// unconditionally.
+const goState = vi.hoisted(() => ({ attempts: 0 }));
+vi.mock("@shikijs/langs/go", async () => {
+  goState.attempts += 1;
   throw new Error("simulated grammar chunk fetch failure");
 });
 
@@ -62,21 +66,22 @@ describe("grammar load failure negative cache (AC10 #640)", () => {
   );
 
   it(
-    "concurrent highlights of one grammar share a single in-flight attempt (F-001 #651)",
+    "concurrent highlights of one registered grammar share a single in-flight attempt (F-001 #651)",
     async () => {
       const hl = await loadHighlighter();
 
-      // Two callers race the same grammar: single-flight must collapse the
-      // concurrent loads into ONE attempt (module-level import memoization
-      // alone does not guarantee this for the counter accounting).
-      await Promise.all([hl("puts 1", "ruby"), hl("puts 2", "ruby")]);
-      expect(rubyState.attempts).toBeLessThanOrEqual(2);
+      // Two callers race the same registered grammar: single-flight must
+      // collapse the concurrent loads into ONE attempt.
+      await Promise.all([hl("package main", "go"), hl("package main", "go")]);
+      expect(goState.attempts, "single-flight collapses concurrent callers to one attempt").toBe(1);
 
-      // Settled: later calls hit the negative cache / retry cap without
-      // exceeding the total attempt budget.
-      await hl("puts 3", "ruby");
-      await hl("puts 4", "ruby");
-      expect(rubyState.attempts).toBeLessThanOrEqual(2);
+      // Settled: the shared failure counts as attempt 1; the next call is
+      // the one retry (attempt 2, exact cap); calls after that are
+      // negatively cached with no further imports.
+      await hl("package main", "go");
+      await hl("package main", "go");
+      await hl("package main", "go");
+      expect(goState.attempts, "retry cap pins the total attempt budget at exactly 2").toBe(2);
     },
     60000,
   );
