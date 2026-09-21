@@ -44,13 +44,11 @@ class TestVaultUploadsDirExceptions:
     def mock_pool(self):
         pool = MagicMock()
         conn = MagicMock()
-        # #645 review (PRR-E): scan_once must use the async checkout
-        # surface — a sync-checkout regression fails loudly here.
-        pool.get_connection = MagicMock(
-            side_effect=AssertionError(
-                'sync checkout regression: scan_once must use get_connection_async'
-            )
-        )
+        # _find_new_files deliberately uses the SYNC checkout on a
+        # to_thread worker (#645/#650 review): a tripwire here would fire
+        # on that legitimate path every run (thread-blind), so the sync
+        # surface stays a plain mock. Async-frame dispatch is pinned by
+        # test_issue645_document_progress_dispatch.py's audit contract.
         pool.release_connection = MagicMock()
         # #645: scan_once checks out via the pool's async surface.
         pool.get_connection_async = AsyncMock(return_value=conn)
@@ -153,13 +151,11 @@ class TestNegativeAndZeroVaultId:
     def mock_pool(self):
         pool = MagicMock()
         conn = MagicMock()
-        # #645 review (PRR-E): scan_once must use the async checkout
-        # surface — a sync-checkout regression fails loudly here.
-        pool.get_connection = MagicMock(
-            side_effect=AssertionError(
-                'sync checkout regression: scan_once must use get_connection_async'
-            )
-        )
+        # _find_new_files deliberately uses the SYNC checkout on a
+        # to_thread worker (#645/#650 review): a tripwire here would fire
+        # on that legitimate path every run (thread-blind), so the sync
+        # surface stays a plain mock. Async-frame dispatch is pinned by
+        # test_issue645_document_progress_dispatch.py's audit contract.
         pool.release_connection = MagicMock()
         # #645: scan_once checks out via the pool's async surface.
         pool.get_connection_async = AsyncMock(return_value=conn)
@@ -273,13 +269,11 @@ class TestSymlinkAndNonExistentPaths:
     def mock_pool(self):
         pool = MagicMock()
         conn = MagicMock()
-        # #645 review (PRR-E): scan_once must use the async checkout
-        # surface — a sync-checkout regression fails loudly here.
-        pool.get_connection = MagicMock(
-            side_effect=AssertionError(
-                'sync checkout regression: scan_once must use get_connection_async'
-            )
-        )
+        # _find_new_files deliberately uses the SYNC checkout on a
+        # to_thread worker (#645/#650 review): a tripwire here would fire
+        # on that legitimate path every run (thread-blind), so the sync
+        # surface stays a plain mock. Async-frame dispatch is pinned by
+        # test_issue645_document_progress_dispatch.py's audit contract.
         pool.release_connection = MagicMock()
         # #645: scan_once checks out via the pool's async surface.
         pool.get_connection_async = AsyncMock(return_value=conn)
@@ -382,13 +376,11 @@ class TestRaceConditionVaultDeleted:
     def mock_pool(self):
         pool = MagicMock()
         conn = MagicMock()
-        # #645 review (PRR-E): scan_once must use the async checkout
-        # surface — a sync-checkout regression fails loudly here.
-        pool.get_connection = MagicMock(
-            side_effect=AssertionError(
-                'sync checkout regression: scan_once must use get_connection_async'
-            )
-        )
+        # _find_new_files deliberately uses the SYNC checkout on a
+        # to_thread worker (#645/#650 review): a tripwire here would fire
+        # on that legitimate path every run (thread-blind), so the sync
+        # surface stays a plain mock. Async-frame dispatch is pinned by
+        # test_issue645_document_progress_dispatch.py's audit contract.
         pool.release_connection = MagicMock()
         # #645: scan_once checks out via the pool's async surface.
         pool.get_connection_async = AsyncMock(return_value=conn)
@@ -481,13 +473,11 @@ class TestSettingsObjectMissingMethod:
     def mock_pool(self):
         pool = MagicMock()
         conn = MagicMock()
-        # #645 review (PRR-E): scan_once must use the async checkout
-        # surface — a sync-checkout regression fails loudly here.
-        pool.get_connection = MagicMock(
-            side_effect=AssertionError(
-                'sync checkout regression: scan_once must use get_connection_async'
-            )
-        )
+        # _find_new_files deliberately uses the SYNC checkout on a
+        # to_thread worker (#645/#650 review): a tripwire here would fire
+        # on that legitimate path every run (thread-blind), so the sync
+        # surface stays a plain mock. Async-frame dispatch is pinned by
+        # test_issue645_document_progress_dispatch.py's audit contract.
         pool.release_connection = MagicMock()
         # #645: scan_once checks out via the pool's async surface.
         pool.get_connection_async = AsyncMock(return_value=conn)
@@ -568,13 +558,11 @@ class TestPathTraversalAndInjection:
     def mock_pool(self):
         pool = MagicMock()
         conn = MagicMock()
-        # #645 review (PRR-E): scan_once must use the async checkout
-        # surface — a sync-checkout regression fails loudly here.
-        pool.get_connection = MagicMock(
-            side_effect=AssertionError(
-                'sync checkout regression: scan_once must use get_connection_async'
-            )
-        )
+        # _find_new_files deliberately uses the SYNC checkout on a
+        # to_thread worker (#645/#650 review): a tripwire here would fire
+        # on that legitimate path every run (thread-blind), so the sync
+        # surface stays a plain mock. Async-frame dispatch is pinned by
+        # test_issue645_document_progress_dispatch.py's audit contract.
         pool.release_connection = MagicMock()
         # #645: scan_once checks out via the pool's async surface.
         pool.get_connection_async = AsyncMock(return_value=conn)
@@ -666,13 +654,11 @@ class TestUnicodeAndEncoding:
     def mock_pool(self):
         pool = MagicMock()
         conn = MagicMock()
-        # #645 review (PRR-E): scan_once must use the async checkout
-        # surface — a sync-checkout regression fails loudly here.
-        pool.get_connection = MagicMock(
-            side_effect=AssertionError(
-                'sync checkout regression: scan_once must use get_connection_async'
-            )
-        )
+        # _find_new_files deliberately uses the SYNC checkout on a
+        # to_thread worker (#645/#650 review): a tripwire here would fire
+        # on that legitimate path every run (thread-blind), so the sync
+        # surface stays a plain mock. Async-frame dispatch is pinned by
+        # test_issue645_document_progress_dispatch.py's audit contract.
         pool.release_connection = MagicMock()
         # #645: scan_once checks out via the pool's async surface.
         pool.get_connection_async = AsyncMock(return_value=conn)

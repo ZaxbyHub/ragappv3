@@ -392,7 +392,7 @@ def test_concurrent_delayed_creation_respects_per_caller_deadline(db_path, monke
             except RuntimeError:
                 refused += 1
 
-        # Serialized creations at 1.6s each: only workers whose turn starts
+        # Serialized creations at 3.0s each: only workers whose turn starts
         # before their 5s deadline may create; the tail must refuse instead
         # of drifting arbitrarily past its own ceiling. Every caller's wall
         # clock stays under the composed ceiling (deadline + one reserve).

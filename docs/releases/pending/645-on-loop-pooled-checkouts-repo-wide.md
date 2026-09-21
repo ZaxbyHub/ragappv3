@@ -75,12 +75,20 @@ the guard repo-wide so a new on-loop checkout fails CI.
   (`asyncio.to_thread`) remain sync by contract; the guard's
   innermost-async-callable barrier rule encodes that contract, and the
   document_progress dispatch guard pins the helper-dispatch shape. The
-  transitive sync-def sites whose callers did NOT dispatch to a thread
-  (background_tasks `stop()` marking, the multimodal enrichment helpers,
-  the atom-enrichment resume/enqueue gates) were converted in this PR as
-  well — the guard cannot see through a sync def to its dispatch, so the
-  document_progress dispatch audit and adversarial sync-surface tripwires
-  pin the converted surfaces.
+  transitive sync-def sites whose callers did NOT dispatch to a thread —
+  background_tasks `stop()` marking, the multimodal enrichment helpers,
+  the atom-enrichment resume/enqueue gates, and `file_watcher`
+  `_find_new_files` — were converted in this PR (to_thread dispatch).
+  A final sweep additionally identified PRE-EXISTING sync-frame helper
+  groups the guard cannot see (document_processor: `_publish_artifacts`,
+  `_retry_staleness_reason`; background_tasks: `_mark_task_permanently_failed`,
+  `_should_enqueue_atom_enrichment` internal callers; multimodal/status
+  helpers: `set_enrichment_status`, `_is_enrichment_job_current`,
+  `_mark_enrichment_stale_if_current_job`, `_sync_file_enrichment_status`;
+  evidence: `_read_reconcile_cursor`). These run on the event loop only
+  when reached directly from a coroutine, are bounded by the checkout
+  deadline, and are accepted as pre-existing debt for a tracked follow-up —
+  they are not regressions of this PR.
 - `utils/transaction.py::db_transaction` has no production callers today; it
   is fixed in place rather than deleted (public util surface — removal is an
   owner decision).
