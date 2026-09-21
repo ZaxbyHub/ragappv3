@@ -333,7 +333,7 @@ class ArtifactEnrichmentService:
         in_progress_count = 0
 
         # Read the ordered atom list (short claim) for neighbor context.
-        atoms = self._load_ordered_atoms(file_id, generation_hash)
+        atoms = await asyncio.to_thread(self._load_ordered_atoms, file_id, generation_hash)
         if not atoms:
             return {
                 "proxy_records": proxy_records,
@@ -344,7 +344,7 @@ class ArtifactEnrichmentService:
         # already-succeeded atoms (fingerprint/status-based skip), so a
         # retry or re-run does not re-transmit unchanged atoms to the
         # external provider.
-        actionable = self._actionable_atom_pks(file_id, generation_hash)
+        actionable = await asyncio.to_thread(self._actionable_atom_pks, file_id, generation_hash)
         candidates = [a for a in atoms if a["atom_pk"] in actionable]
 
         tasks = [
@@ -423,7 +423,9 @@ class ArtifactEnrichmentService:
         kind = str(atom.get("kind", "")).lower()
         snapshot: dict[str, str] = {}
 
-        authorized, reason = self._authorized(vault_id=vault_id, file_id=file_id)
+        authorized, reason = await asyncio.to_thread(
+            self._authorized, vault_id=vault_id, file_id=file_id
+        )
         if not authorized:
             status = (
                 st.SKIPPED_POLICY
@@ -431,9 +433,12 @@ class ArtifactEnrichmentService:
                 in ("global_disabled", "vault_not_opted_in", "no_allowlisted_origin", "policy_denied")
                 else st.SKIPPED_NOT_APPLICABLE
             )
-            self._skip(atom_pk, file_id, generation_hash, status, "policy_denied")
+            await asyncio.to_thread(
+                self._skip, atom_pk, file_id, generation_hash, status, "policy_denied"
+            )
             # Audit the DENIAL too (no outbound call was made; outcome records why).
-            self._audit(
+            await asyncio.to_thread(
+                self._audit,
                 vault_id, file_id, atom_id, atom.get("asset_id"),
                 "attempted_external_transmission", {}, f"denied:{reason}",
             )
@@ -455,7 +460,7 @@ class ArtifactEnrichmentService:
         )
 
         # Claim atom stage running (short claim; release before provider call).
-        with self.pool.connection() as conn:
+        async with self.pool.connection_async() as conn:
             claimed = st.claim_atom_stage(
                 conn, file_id=file_id, generation_hash=generation_hash, atom_pk=atom_pk,
                 stage=st.ENRICH_STAGE, input_fingerprint=input_fingerprint,
@@ -497,24 +502,54 @@ class ArtifactEnrichmentService:
             description = derived["description"]
             aids = derived["retrieval_aids"]
         except MultimodalProviderError as exc:
-            self._fail(atom_pk, file_id, generation_hash, input_fingerprint, exc.code, exc.retryable)
-            self._audit(vault_id, file_id, atom_id, atom.get("asset_id"), "attempted_external_transmission", snapshot, "failed")
+            await asyncio.to_thread(
+                self._fail,
+                atom_pk,
+                file_id,
+                generation_hash,
+                input_fingerprint,
+                exc.code,
+                exc.retryable,
+            )
+            await asyncio.to_thread(
+                self._audit,
+                vault_id,
+                file_id,
+                atom_id,
+                atom.get("asset_id"),
+                "attempted_external_transmission",
+                snapshot,
+                "failed",
+            )
             return {
                 "atom_id": atom_id,
                 "outcome": "retryable" if exc.retryable else "failed",
                 "code": exc.code,
             }
         except DerivedError:
-            self._fail(atom_pk, file_id, generation_hash, input_fingerprint, ERR_SCHEMA, False)
-            self._audit(vault_id, file_id, atom_id, atom.get("asset_id"), "attempted_external_transmission", snapshot, "failed")
+            await asyncio.to_thread(
+                self._fail, atom_pk, file_id, generation_hash, input_fingerprint, ERR_SCHEMA, False
+            )
+            await asyncio.to_thread(
+                self._audit,
+                vault_id,
+                file_id,
+                atom_id,
+                atom.get("asset_id"),
+                "attempted_external_transmission",
+                snapshot,
+                "failed",
+            )
             return {"atom_id": atom_id, "outcome": "failed", "code": ERR_SCHEMA}
         except Exception as exc:  # noqa: BLE001 — bounded classification
             logger.warning("Multimodal enrichment unexpected error atom=%s: %s", atom_id, type(exc).__name__)
-            self._fail(atom_pk, file_id, generation_hash, input_fingerprint, ERR_NETWORK, True)
+            await asyncio.to_thread(
+                self._fail, atom_pk, file_id, generation_hash, input_fingerprint, ERR_NETWORK, True
+            )
             return {"atom_id": atom_id, "outcome": "retryable", "code": ERR_NETWORK}
 
         # Persist derived + succeed (short claim). Reject stale fingerprint.
-        with self.pool.connection() as conn:
+        async with self.pool.connection_async() as conn:
             ok = st.complete_atom_stage(
                 conn, file_id=file_id, generation_hash=generation_hash, atom_pk=atom_pk,
                 stage=st.ENRICH_STAGE, input_fingerprint=input_fingerprint,
@@ -545,7 +580,16 @@ class ArtifactEnrichmentService:
             )
             return {"atom_id": atom_id, "outcome": "stale"}
 
-        self._audit(vault_id, file_id, atom_id, atom.get("asset_id"), "attempted_external_transmission", snapshot, "succeeded")
+        await asyncio.to_thread(
+            self._audit,
+            vault_id,
+            file_id,
+            atom_id,
+            atom.get("asset_id"),
+            "attempted_external_transmission",
+            snapshot,
+            "succeeded",
+        )
         raw_proxy = build_proxy_text(raw_evidence=raw_evidence, kind=kind, description=description, retrieval_aids=aids)
         # Bound the proxy text so it can never exceed the embedding service's
         # per-text cap (embeddings.MAX_TEXT_LENGTH=8192): a schema-compliant

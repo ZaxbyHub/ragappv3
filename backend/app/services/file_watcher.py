@@ -186,7 +186,7 @@ class FileWatcher:
         try:
             from app.models.database import get_pool
             pool = get_pool(str(settings.sqlite_path))
-            conn = pool.get_connection()
+            conn = await pool.get_connection_async()
             try:
                 vaults = conn.execute("SELECT id, name FROM vaults").fetchall()
                 for row in vaults:
@@ -213,7 +213,10 @@ class FileWatcher:
                 continue
 
             try:
-                new_files = self._find_new_files(directory)
+                # #650 review: _find_new_files does a blocking pooled
+                # checkout (issue #645 flagged this helper explicitly) —
+                # keep it off the event loop.
+                new_files = await asyncio.to_thread(self._find_new_files, directory)
                 for file_path in new_files:
                     await self.processor.enqueue(str(file_path), vault_id=vault_id)
                     enqueued_count += 1

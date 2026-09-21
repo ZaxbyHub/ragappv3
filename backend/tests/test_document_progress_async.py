@@ -154,8 +154,15 @@ class TestProgressMigration(unittest.TestCase):
             conn.close()
 
 
-class TestSetPhase(unittest.TestCase):
-    """The phase helpers must touch only the columns explicitly named."""
+class TestSetPhase(unittest.IsolatedAsyncioTestCase):
+    """The phase helpers must touch only the columns explicitly named.
+
+    #645: the helpers are ``async def`` (their pooled checkout runs off the
+    event loop via ``get_connection_async``), so these tests await them on an
+    ``IsolatedAsyncioTestCase`` event loop. The behavioral assertions
+    (columns written, status untouched, transient fields reset, flag flips)
+    are unchanged.
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -191,8 +198,8 @@ class TestSetPhase(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_set_phase_writes_message_and_units(self):
-        set_phase(
+    async def test_set_phase_writes_message_and_units(self):
+        await set_phase(
             self.pool,
             self.file_id,
             phase=PHASE_CHUNKING,
@@ -210,8 +217,8 @@ class TestSetPhase(unittest.TestCase):
         self.assertEqual(row["unit_label"], "chunks")
         self.assertEqual(row["progress_percent"], 100.0)
 
-    def test_set_phase_does_not_touch_status(self):
-        set_phase(
+    async def test_set_phase_does_not_touch_status(self):
+        await set_phase(
             self.pool,
             self.file_id,
             phase=PHASE_QUEUED,
@@ -220,8 +227,8 @@ class TestSetPhase(unittest.TestCase):
         row = self._row()
         self.assertEqual(row["status"], "pending")  # unchanged
 
-    def test_clear_progress_resets_transient_fields(self):
-        set_phase(
+    async def test_clear_progress_resets_transient_fields(self):
+        await set_phase(
             self.pool,
             self.file_id,
             phase=PHASE_CHUNKING,
@@ -231,7 +238,7 @@ class TestSetPhase(unittest.TestCase):
             unit="chunks",
             percent=100.0,
         )
-        clear_progress(self.pool, self.file_id)
+        await clear_progress(self.pool, self.file_id)
         row = self._row()
         self.assertEqual(row["phase"], PHASE_INDEXED)
         self.assertIsNone(row["phase_message"])
@@ -240,10 +247,10 @@ class TestSetPhase(unittest.TestCase):
         self.assertIsNone(row["total_units"])
         self.assertIsNone(row["unit_label"])
 
-    def test_set_wiki_pending(self):
-        set_wiki_pending(self.pool, self.file_id, True)
+    async def test_set_wiki_pending(self):
+        await set_wiki_pending(self.pool, self.file_id, True)
         self.assertEqual(self._row()["wiki_pending"], 1)
-        set_wiki_pending(self.pool, self.file_id, False)
+        await set_wiki_pending(self.pool, self.file_id, False)
         self.assertEqual(self._row()["wiki_pending"], 0)
 
 

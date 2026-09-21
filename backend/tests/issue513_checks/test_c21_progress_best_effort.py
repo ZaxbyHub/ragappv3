@@ -2,16 +2,22 @@
 
 ``set_phase`` and ``clear_progress`` document their DB writes as best-effort
 ("a progress-update failure must never abort indexing"). A pool whose
-``connection()`` raises — the expected pool-exhaustion/closed-pool outcome,
-a ``RuntimeError`` — must be absorbed (logged) by both helpers, exactly as
+checkout raises — the expected pool-exhaustion/closed-pool outcome, a
+``RuntimeError`` — must be absorbed (logged) by both helpers, exactly as
 ``sqlite3.Error`` already is. Ingestion must therefore return success without
 requeue when the pool is only exhausted during progress cleanup.
+
+Since #645 the helpers are ``async def`` and check out via
+``pool.get_connection_async()``; the stub raises from that surface and each
+helper call is driven to completion on a real event loop (``asyncio.run``),
+so the best-effort absorption is exercised end-to-end.
 
 DISCRIMINATING: at the pre-fix commit the helpers catch only ``sqlite3.Error``
 (document_progress.py), so the RuntimeError propagates and this script prints
 ``C21 CHECK: FAIL: ...`` and exits 1.
 """
 
+import asyncio
 import os
 import sqlite3
 import sys
@@ -38,11 +44,15 @@ class ExhaustedPool:
     def connection(self):
         raise self._exc
 
+    async def get_connection_async(self, max_wait_attempts: int = 3):
+        raise self._exc
+
 
 def _absorbed(helper, pool, label: str) -> str | None:
-    """Run one helper call; return a FAIL reason if the error propagates."""
+    """Run one helper call to completion; return a FAIL reason if the error
+    propagates."""
     try:
-        helper(pool, 1)
+        asyncio.run(helper(pool, 1))
     except Exception as exc:  # noqa: BLE001 - verdict, not crash
         return (
             f"{label} propagated {type(exc).__name__} from pool exhaustion "

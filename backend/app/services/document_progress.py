@@ -46,7 +46,7 @@ ALL_PHASES = frozenset(
 )
 
 
-def set_phase(
+async def set_phase(
     pool: SQLiteConnectionPool,
     file_id: int,
     *,
@@ -61,8 +61,9 @@ def set_phase(
     """Atomically update phase-aware progress fields on a `files` row.
 
     Acquires and releases a pool connection per call so long-running phases
-    (embedding loops) don't pin pool capacity. Writes are best-effort: a
-    progress-update failure must never abort indexing.
+    (embedding loops) don't pin pool capacity. The checkout runs off the
+    event loop via the pool's dedicated checkout executor (#645). Writes are
+    best-effort: a progress-update failure must never abort indexing.
 
     Only fields explicitly provided are written; unset fields preserve
     their prior value. Passing ``phase`` updates ``phase_started_at`` only
@@ -76,7 +77,8 @@ def set_phase(
     params: list[Any] = []
 
     try:
-        with pool.connection() as conn:
+        conn = await pool.get_connection_async()
+        try:
             current_phase: Optional[str] = None
             if phase is not None:
                 row = conn.execute(
@@ -124,6 +126,8 @@ def set_phase(
                 params,
             )
             conn.commit()
+        finally:
+            pool.release_connection(conn)
     except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
         # RuntimeError = expected pool-checkout failure (exhaustion/closed pool,
         # database.py) — best-effort contract absorbs it (issue #513 W2).
@@ -131,16 +135,18 @@ def set_phase(
         logger.warning("set_phase failed for file_id=%s: %s", file_id, e)
 
 
-def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
+async def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
     """Reset transient progress fields on terminal success.
 
     Called after a successful indexing run so the next poll snapshot shows
     a clean ``indexed`` state without stale processed/total counters.
     `phase` is left at ``indexed`` so the frontend can distinguish "ready"
-    from "still mid-pipeline".
+    from "still mid-pipeline". The checkout runs off the event loop via the
+    pool's dedicated checkout executor (#645).
     """
     try:
-        with pool.connection() as conn:
+        conn = await pool.get_connection_async()
+        try:
             conn.execute(
                 """
                 UPDATE files
@@ -156,29 +162,35 @@ def clear_progress(pool: SQLiteConnectionPool, file_id: int) -> None:
                 (PHASE_INDEXED, file_id),
             )
             conn.commit()
+        finally:
+            pool.release_connection(conn)
     except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
         # RuntimeError = expected pool-checkout failure (issue #513 W2).
         logger.warning("clear_progress failed for file_id=%s: %s", file_id, e)
 
 
-def set_wiki_pending(
+async def set_wiki_pending(
     pool: SQLiteConnectionPool, file_id: int, pending: bool
 ) -> None:
-    """Set or clear the wiki_pending flag synchronously.
+    """Set or clear the wiki_pending flag.
 
     Set TRUE when DocumentProcessor is about to enqueue the wiki ingest job
     so the status route can report ``wiki_status="pending"`` for the brief
     window before any wiki_compile_jobs row exists. Cleared once the job
     row appears (route-side derivation also handles the cleared state by
-    falling back to the latest jobs row).
+    falling back to the latest jobs row). The checkout runs off the event
+    loop via the pool's dedicated checkout executor (#645).
     """
     try:
-        with pool.connection() as conn:
+        conn = await pool.get_connection_async()
+        try:
             conn.execute(
                 "UPDATE files SET wiki_pending = ? WHERE id = ?",
                 (1 if pending else 0, file_id),
             )
             conn.commit()
+        finally:
+            pool.release_connection(conn)
     except (sqlite3.Error, RuntimeError) as e:  # pragma: no cover - defensive
         # RuntimeError = expected pool-checkout failure (issue #513 W2).
         logger.warning("set_wiki_pending failed for file_id=%s: %s", file_id, e)

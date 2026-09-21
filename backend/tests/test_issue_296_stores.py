@@ -390,7 +390,8 @@ class TestBackfillConcurrencySetting(unittest.IsolatedAsyncioTestCase):
         mock_conn = MagicMock()
         mock_conn.execute.return_value = mock_cursor
         store.pool = MagicMock()
-        store.pool.get_connection.return_value = mock_conn
+        # #645: backfill awaits the async checkout.
+        store.pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
         mock_settings = MagicMock()
         mock_settings.embedding_model = "test-model"

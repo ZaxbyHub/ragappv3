@@ -57,11 +57,12 @@ from app.services.auth_service import create_access_token
 class CountingPool:
     """Wraps a real SQLiteConnectionPool, tracking outstanding connections.
 
-    The streaming auth boundaries (get_stream_auth, wiki_events_stream) acquire
-    connections via ``pool.connection()`` (a context manager), so counting is
-    done in the CM enter/exit — NOT by wrapping get_connection/release_connection
-    (the real CM delegates to the real pool's own get/release and would bypass
-    those wrappers). ``max_outstanding`` captures the peak across the request,
+    The streaming auth boundaries (get_stream_auth, wiki_events_stream)
+    acquire connections via ``pool.connection_async()`` (the #645 async CM;
+    ``pool.connection()`` before it), so counting is done in the CM
+    enter/exit — NOT by wrapping get_connection/release_connection (the real
+    CM delegates to the real pool's own get/release and would bypass those
+    wrappers). ``max_outstanding`` captures the peak across the request,
     which the concurrency test asserts stays 0 during generation.
     """
 
@@ -105,6 +106,29 @@ class CountingPool:
                     self._outer._released()
 
         return _CountingCM(self)
+
+    # The async context manager the streaming auth boundaries use since #645
+    # (pool.connection_async()): same counting, on __aenter__/__aexit__.
+    def connection_async(self, max_wait_attempts: int = 3):
+        real_cm = self._real.connection_async(max_wait_attempts)
+
+        class _CountingAsyncCM:
+            def __init__(self, outer):
+                self._outer = outer
+                self._real_cm = real_cm
+
+            async def __aenter__(self):
+                c = await self._real_cm.__aenter__()
+                self._outer._acquired()
+                return c
+
+            async def __aexit__(self, *exc):
+                try:
+                    return await self._real_cm.__aexit__(*exc)
+                finally:
+                    self._outer._released()
+
+        return _CountingAsyncCM(self)
 
     def close_all(self):
         self._real.close_all()

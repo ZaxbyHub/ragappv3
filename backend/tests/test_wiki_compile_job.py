@@ -10,7 +10,7 @@ import asyncio
 import os
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -66,11 +66,15 @@ class TestEnqueueWikiCompileJobSignature(unittest.IsolatedAsyncioTestCase):
         Verify _enqueue_wiki_compile_job accepts the simplified signature
         and does not raise TypeError for unexpected keyword arguments.
         """
-        # Set up mock pool so real DB is not accessed
+        # Set up mock pool so real DB is not accessed (#645: async checkout)
         mock_pool = MagicMock()
         mock_conn = MagicMock()
-        mock_pool.connection.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_pool.connection.return_value.__exit__ = MagicMock(return_value=False)
+        mock_pool.connection_async.return_value.__aenter__ = AsyncMock(
+            return_value=mock_conn
+        )
+        mock_pool.connection_async.return_value.__aexit__ = AsyncMock(
+            return_value=False
+        )
         mock_get_pool.return_value = mock_pool
 
         # Mock WikiStore.create_job so it is not called with a real conn
@@ -87,8 +91,8 @@ class TestEnqueueWikiCompileJobSignature(unittest.IsolatedAsyncioTestCase):
 
         # Verify get_pool was called (function uses it)
         mock_get_pool.assert_called_once()
-        # Verify the context manager was entered (pool.connection())
-        mock_pool.connection.return_value.__enter__.assert_called_once()
+        # Verify the async context manager was entered (pool.connection_async())
+        mock_pool.connection_async.return_value.__aenter__.assert_called_once()
 
     def test_enqueue_does_not_reference_session_id(self):
         """

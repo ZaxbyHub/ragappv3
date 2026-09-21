@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -229,6 +229,13 @@ class TestRecoveryDeadlockRegression:
                 return_value=mock_conn
             )
             mock_pool.connection.return_value.__exit__ = MagicMock(return_value=False)
+            # #645: the recovery sweeps now check out via pool.connection_async()
+            mock_pool.connection_async.return_value.__aenter__ = AsyncMock(
+                return_value=mock_conn
+            )
+            mock_pool.connection_async.return_value.__aexit__ = AsyncMock(
+                return_value=False
+            )
 
             # 3. Create processor and inject mock pool
             processor = BackgroundProcessor(
@@ -350,6 +357,13 @@ class TestStrandedRowRecovery:
                 return_value=mock_conn
             )
             mock_pool.connection.return_value.__exit__ = MagicMock(return_value=False)
+            # #645: the recovery sweeps now check out via pool.connection_async()
+            mock_pool.connection_async.return_value.__aenter__ = AsyncMock(
+                return_value=mock_conn
+            )
+            mock_pool.connection_async.return_value.__aexit__ = AsyncMock(
+                return_value=False
+            )
 
             processor.processor.pool = mock_pool
 
@@ -440,6 +454,13 @@ class TestStrandedRowRecovery:
                 return_value=mock_conn
             )
             mock_pool.connection.return_value.__exit__ = MagicMock(return_value=False)
+            # #645: the recovery sweeps now check out via pool.connection_async()
+            mock_pool.connection_async.return_value.__aenter__ = AsyncMock(
+                return_value=mock_conn
+            )
+            mock_pool.connection_async.return_value.__aexit__ = AsyncMock(
+                return_value=False
+            )
 
             processor.processor.pool = mock_pool
 

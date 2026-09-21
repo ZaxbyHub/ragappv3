@@ -52,7 +52,8 @@ def _msg(role, content, **extra):
 
 
 class _FakePool:
-    """Minimal get_pool stand-in exposing .connection() over a test conn."""
+    """Minimal get_pool stand-in exposing .connection()/.connection_async()
+    over a test conn (#645: _auto_name_session now uses the async CM)."""
 
     def __init__(self, conn):
         self._conn = conn
@@ -67,8 +68,21 @@ class _FakePool:
         def __exit__(self, *exc):
             return False
 
+    class _AsyncConnCtx:
+        def __init__(self, conn):
+            self._conn = conn
+
+        async def __aenter__(self):
+            return self._conn
+
+        async def __aexit__(self, *exc):
+            return False
+
     def connection(self):
         return _FakePool._ConnCtx(self._conn)
+
+    def connection_async(self):
+        return _FakePool._AsyncConnCtx(self._conn)
 
 
 class _FakeLLM:

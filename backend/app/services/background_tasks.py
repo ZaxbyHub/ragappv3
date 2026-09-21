@@ -1645,7 +1645,7 @@ class BackgroundProcessor:
 
         # SELECT 1: Pending rows
         try:
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 cursor = conn.execute(
                     """
                     SELECT id, file_path, vault_id, source
@@ -1661,7 +1661,7 @@ class BackgroundProcessor:
         # SELECT 2: Processing rows (age rule per the docstring).
         processing_stranded = []
         try:
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 if require_older_than_minutes is not None:
                     processing_cursor = conn.execute(
                         """
@@ -1745,7 +1745,7 @@ class BackgroundProcessor:
 
                 if not _Path(file_path).exists():
                     try:
-                        with self.processor.pool.connection() as conn:
+                        async with self.processor.pool.connection_async() as conn:
                             conn.execute(
                                 "UPDATE files SET status='error', "
                                 "error_message='Upload file missing after process restart', "
@@ -1802,7 +1802,7 @@ class BackgroundProcessor:
 
                 from pathlib import Path as _Path
                 if not _Path(file_path).exists():
-                    with self.processor.pool.connection() as conn:
+                    async with self.processor.pool.connection_async() as conn:
                         conn.execute(
                             "UPDATE files SET status='error', "
                             "error_message='File missing after process restart', "
@@ -1813,7 +1813,7 @@ class BackgroundProcessor:
                     await self._release_recovery_file(int(row_id))
                     continue
 
-                with self.processor.pool.connection() as conn:
+                async with self.processor.pool.connection_async() as conn:
                     conn.execute(
                         "UPDATE files SET status='pending', phase='queued', "
                         "error_message=NULL WHERE id = ?",
@@ -1873,7 +1873,7 @@ class BackgroundProcessor:
         if self.processor is None or self.processor.pool is None:
             return
         try:
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 cursor = conn.execute(
                     """
                     UPDATE document_reindex_jobs
@@ -1970,7 +1970,7 @@ class BackgroundProcessor:
             return
 
         try:
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 cursor = conn.execute(
                     "SELECT id, file_id, attempts FROM vector_delete_pending"
                 )
@@ -2004,7 +2004,7 @@ class BackgroundProcessor:
                     "Retry of vector delete for file_id=%s failed: %s", file_id, e
                 )
                 try:
-                    with self.processor.pool.connection() as conn:
+                    async with self.processor.pool.connection_async() as conn:
                         conn.execute(
                             "UPDATE vector_delete_pending "
                             "SET attempts = attempts + 1 WHERE id = ?",
@@ -2020,7 +2020,7 @@ class BackgroundProcessor:
                 continue
 
             try:
-                with self.processor.pool.connection() as conn:
+                async with self.processor.pool.connection_async() as conn:
                     conn.execute(
                         "DELETE FROM vector_delete_pending WHERE id = ?", (row_id,)
                     )
@@ -2041,7 +2041,7 @@ class BackgroundProcessor:
             return
         cutoff = startup_cutoff or getattr(self, "_startup_recovery_cutoff", None)
         try:
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 if cutoff is not None:
                     # ``enrichment_updated_at`` is written when the route or
                     # worker enters pending/processing.  Comparing its SQLite
@@ -2096,7 +2096,7 @@ class BackgroundProcessor:
         try:
             from . import enrichment_state as est
 
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 cutoff = startup_cutoff or getattr(
                     self, "_startup_recovery_cutoff", None
                 )
@@ -2126,7 +2126,7 @@ class BackgroundProcessor:
             from . import enrichment_state as est
 
             enqueued = 0
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 # (1) Files with actionable stage rows (interrupted work).
                 rows = conn.execute(
                     "SELECT DISTINCT s.file_id, f.vault_id, f.file_hash "
@@ -2194,10 +2194,12 @@ class BackgroundProcessor:
                 seen.add(key)
                 file_id = row["file_id"]
                 vault_id = row["vault_id"]
-                if not self._should_enqueue_atom_enrichment(file_id, vault_id):
+                if not await asyncio.to_thread(
+                    self._should_enqueue_atom_enrichment, file_id, vault_id
+                ):
                     continue
                 gen_row = None
-                with self.processor.pool.connection() as conn:
+                async with self.processor.pool.connection_async() as conn:
                     gen_row = conn.execute(
                         "SELECT active_generation_hash FROM files WHERE id = ?",
                         (file_id,),
@@ -2475,7 +2477,7 @@ class BackgroundProcessor:
         texts = [pr["proxy_text"] for pr in proxy_records]
         # Resolve the atoms' row PKs once (stage/proxy helpers key on the
         # document_atoms rowid, proxy records carry the opaque atom id).
-        with self.processor.pool.connection() as conn:
+        async with self.processor.pool.connection_async() as conn:
             atom_pks: dict[str, Optional[int]] = {
                 pr.get("atom_id") or "": est.resolve_atom_pk(
                     conn,
@@ -2495,7 +2497,7 @@ class BackgroundProcessor:
                 # re-reaches it (W17 / AC16) instead of silently skipping.
                 if atom_pk is not None:
                     try:
-                        with self.processor.pool.connection() as conn:
+                        async with self.processor.pool.connection_async() as conn:
                             new_status = est.mark_proxy_missing_retryable(
                                 conn,
                                 file_id=file_id,
@@ -2524,7 +2526,7 @@ class BackgroundProcessor:
             # above may have straddled a newer generation claiming the atom.
             if atom_pk is not None:
                 try:
-                    with self.processor.pool.connection() as conn:
+                    async with self.processor.pool.connection_async() as conn:
                         stage_current = est.is_atom_stage_current(
                             conn,
                             file_id=file_id,
@@ -2577,7 +2579,7 @@ class BackgroundProcessor:
         # delete sibling atoms' durable proxies that a partial re-enrichment did not
         # touch, leaving dangling proxy_vector_id references in SQL (F-2 fix).
         batch_atom_ids = [pr.get("atom_id") for pr in proxy_records]
-        with self.processor.pool.connection() as conn:
+        async with self.processor.pool.connection_async() as conn:
             prior_ids = est.prior_proxy_ids_for_atoms(
                 conn, file_id=file_id, generation_hash=generation_hash,
                 atom_ids=[aid for aid in batch_atom_ids if aid],
@@ -2589,7 +2591,7 @@ class BackgroundProcessor:
         # matches (set_proxy_vector_id is fingerprint-guarded and returns 0 on a
         # stale row), so a concurrent re-enrichment can never pin a vector id to
         # the wrong/outdated derived record.
-        with self.processor.pool.connection() as conn:
+        async with self.processor.pool.connection_async() as conn:
             for rec in new_records:
                 meta = json.loads(rec["metadata"])
                 est.set_proxy_vector_id(
@@ -2740,8 +2742,9 @@ class BackgroundProcessor:
             # janitor owns settlement, so the marking is retired here and the
             # held reindex leases are released below instead.
             if not getattr(self, "_reindex_lease_enabled", False):
-                self._mark_running_reindex_jobs_interrupted(
-                    "Interrupted by processor shutdown"
+                await asyncio.to_thread(
+                    self._mark_running_reindex_jobs_interrupted,
+                    "Interrupted by processor shutdown",
                 )
         # Deferred-retry scheduler (issue #513 W11): cancel the deliverer, then
         # discard any still-pending tickets with a warning — shutdown never
@@ -3327,7 +3330,7 @@ class BackgroundProcessor:
             if isinstance(exc, BaseException)
             else exc
         )
-        with self.processor.pool.connection() as conn:
+        async with self.processor.pool.connection_async() as conn:
             lease = JobLease(
                 conn,
                 reclaim_timeout_seconds=settings.jobs_lease_reclaim_timeout_seconds,
@@ -3381,7 +3384,7 @@ class BackgroundProcessor:
 
         try:
             # Step 1: Mark as running (only pending jobs can transition)
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 cursor = conn.execute(
                     """
                     UPDATE document_reindex_jobs
@@ -3397,7 +3400,7 @@ class BackgroundProcessor:
             logger.info("Reindex job %d status updated to running.", job_id)
 
             # Step 2: Read vault_id and input_json from the job row
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 row = conn.execute(
                     "SELECT vault_id, input_json FROM document_reindex_jobs WHERE id = ? AND status = 'running'",
                     (job_id,),
@@ -3412,7 +3415,7 @@ class BackgroundProcessor:
             # Legacy settlement on document_reindex_jobs, mapped from the
             # shared body's outcome (writes preserved verbatim per branch).
             if status == "completed":
-                with self.processor.pool.connection() as conn:
+                async with self.processor.pool.connection_async() as conn:
                     conn.execute(
                         "UPDATE document_reindex_jobs SET status = 'completed', result_json = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
                         (json.dumps(result), job_id),
@@ -3425,14 +3428,14 @@ class BackgroundProcessor:
             else:
                 if error is not None and result == {}:
                     # Metadata/identity failure path: error is the raw string.
-                    with self.processor.pool.connection() as conn:
+                    async with self.processor.pool.connection_async() as conn:
                         conn.execute(
                             "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
                             (datetime.now(UTC).isoformat(), str(error), job_id),
                         )
                         conn.commit()
                 else:
-                    with self.processor.pool.connection() as conn:
+                    async with self.processor.pool.connection_async() as conn:
                         conn.execute(
                             "UPDATE document_reindex_jobs SET status = 'failed', error = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
                             (json.dumps(result), job_id),
@@ -3446,7 +3449,7 @@ class BackgroundProcessor:
         except Exception as exc:
             logger.exception("Error processing reindex job %s", job_id)
             try:
-                with self.processor.pool.connection() as conn:
+                async with self.processor.pool.connection_async() as conn:
                     conn.execute(
                         "UPDATE document_reindex_jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ?",
                         (datetime.now(UTC).isoformat(), str(exc), job_id),
@@ -3470,7 +3473,7 @@ class BackgroundProcessor:
         """
         try:
             # Select files to reindex
-            with self.processor.pool.connection() as conn:
+            async with self.processor.pool.connection_async() as conn:
                 if vault_id is not None:
                     rows = conn.execute(
                         "SELECT id, file_path, vault_id FROM files WHERE vault_id = ? AND status IN ('indexed', 'error')",
@@ -3712,7 +3715,8 @@ class BackgroundProcessor:
                     )
                 )
             if self.multimodal_service is not None:
-                self.enqueue_atom_enrichment(
+                await asyncio.to_thread(
+                    self.enqueue_atom_enrichment,
                     file_id=result.file_id,
                     vault_id=result.vault_id,
                     file_hash=result.file_hash,

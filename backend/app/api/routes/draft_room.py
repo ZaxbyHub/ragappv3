@@ -3324,7 +3324,7 @@ async def draft_room_events_stream(request: Request, draft_id: int) -> Streaming
     pool slot for the connection's entire lifetime.
     """
     pool = request.app.state.db_pool
-    with pool.connection() as conn:
+    async with pool.connection_async() as conn:
         user = await _resolve_active_user(
             conn,
             request,

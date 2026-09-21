@@ -91,6 +91,21 @@ from app.services.auth_service import compute_client_fingerprint, create_access_
 from app.services.vector_store import VectorStore
 
 
+class _AsyncClosingConnection:
+    """Async mirror of contextlib.closing for pool.connection_async() (#645):
+    yields the pre-acquired connection and closes it on exit."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *exc):
+        self._conn.close()
+        return False
+
+
 class TestEmbeddingModelVersioningBase(unittest.TestCase):
     """Base test class for embedding model versioning tests."""
 
@@ -708,11 +723,13 @@ class TestReindexJobCompletionOrdering(TestEmbeddingModelVersioningBase):
         # pool.connection() (context manager). Patch connection() to use get_connection().
         import contextlib
         class PoolConnectionWrapper:
-            """Wrapper that exposes get_connection() as a context manager."""
+            """Wrapper that exposes get_connection() as sync/async context managers."""
             def __init__(self, pool):
                 self._pool = pool
             def connection(self):
                 return contextlib.closing(self._pool.get_connection())
+            def connection_async(self):
+                return _AsyncClosingConnection(self._pool.get_connection())
         processor.processor.pool = PoolConnectionWrapper(self._connection_pool)
 
         # Verify pool is set correctly before calling _process_reindex_job
@@ -828,11 +845,13 @@ class TestReindexJobCompletionOrdering(TestEmbeddingModelVersioningBase):
         )
         import contextlib
         class PoolConnectionWrapper:
-            """Wrapper that exposes get_connection() as a context manager."""
+            """Wrapper that exposes get_connection() as sync/async context managers."""
             def __init__(self, pool):
                 self._pool = pool
             def connection(self):
                 return contextlib.closing(self._pool.get_connection())
+            def connection_async(self):
+                return _AsyncClosingConnection(self._pool.get_connection())
         processor.processor.pool = PoolConnectionWrapper(self._connection_pool)
         processor.processor.process_existing_file = AsyncMock(return_value=MagicMock(file_id=1))
 

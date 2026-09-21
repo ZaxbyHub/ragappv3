@@ -65,6 +65,20 @@ except ImportError:
     sys.modules["unstructured.documents.elements"] = _unstructured.documents.elements
 
 
+class _AsyncConnectionCM:
+    """Async CM standing in for pool.connection_async() (#645), yielding the
+    same recording mock connection the old sync pool.connection() CM did."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+
 class TestAutoNameDefaultTitleGuard(unittest.IsolatedAsyncioTestCase):
     """Test suite for the is_default_title guard in _auto_name_session."""
 
@@ -95,10 +109,9 @@ class TestAutoNameDefaultTitleGuard(unittest.IsolatedAsyncioTestCase):
         self._mock_conn.execute = mock_execute
 
         self._mock_pool = MagicMock()
-        self._cm = MagicMock()
-        self._cm.__enter__ = MagicMock(return_value=self._mock_conn)
-        self._cm.__exit__ = MagicMock(return_value=None)
-        self._mock_pool.connection.return_value = self._cm
+        self._mock_pool.connection_async = MagicMock(
+            return_value=_AsyncConnectionCM(self._mock_conn)
+        )
 
         self.mock_settings_patcher = patch("app.api.routes.chat.settings")
         self.mock_settings = self.mock_settings_patcher.start()
@@ -304,10 +317,9 @@ class TestAutoNameDefaultTitleGuardIsolated(unittest.IsolatedAsyncioTestCase):
         self._mock_conn.execute = mock_execute
 
         self._mock_pool = MagicMock()
-        self._cm = MagicMock()
-        self._cm.__enter__ = MagicMock(return_value=self._mock_conn)
-        self._cm.__exit__ = MagicMock(return_value=None)
-        self._mock_pool.connection.return_value = self._cm
+        self._mock_pool.connection_async = MagicMock(
+            return_value=_AsyncConnectionCM(self._mock_conn)
+        )
 
         self.mock_settings_patcher = patch("app.api.routes.chat.settings")
         self.mock_settings = self.mock_settings_patcher.start()

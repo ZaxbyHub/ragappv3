@@ -725,7 +725,7 @@ class EmailIngestionService:
                 "Email has no vault tag. Configure a [VaultName] subject prefix or reject the email."
             )
 
-        conn = self.pool.get_connection()
+        conn = await self.pool.get_connection_async()
         try:
             cursor = conn.execute(
                 "SELECT id FROM vaults WHERE LOWER(name) = LOWER(?)",

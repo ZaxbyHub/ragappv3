@@ -169,6 +169,12 @@ def main() -> int:
                     return _FailingCleanupConn(conn)
                 return conn
 
+            async def get_connection_async(self, *_args, **_kwargs):
+                # #645: the processor checks out via the pool's async surface;
+                # mirror the sync wrapping (call-count gate + failing wrapper)
+                # on the off-loop path.
+                return await asyncio.to_thread(self.get_connection)
+
             def release_connection(self, conn):
                 self.inner.release_connection(
                     conn._wrapped

@@ -336,6 +336,9 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
     pool = MagicMock()
     conn = MagicMock()
     pool.get_connection.return_value = conn
+    # #645: process_file checks out via the pool's async surface; mirror it
+    # with an AsyncMock so the await resolves to the same fake connection.
+    pool.get_connection_async = AsyncMock(return_value=conn)
 
     embedding_service = MagicMock()
     embedding_service.embed_batch = AsyncMock(return_value=([[0.1, 0.2]], []))
@@ -375,9 +378,9 @@ async def test_process_file_emits_one_stage_timing_log(tmp_path, caplog):
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
-            patch("app.services.document_processor.set_phase"), \
-            patch("app.services.document_processor.clear_progress"), \
-            patch("app.services.document_processor.set_wiki_pending"), \
+            patch("app.services.document_processor.set_phase", new_callable=AsyncMock), \
+            patch("app.services.document_processor.clear_progress", new_callable=AsyncMock), \
+            patch("app.services.document_processor.set_wiki_pending", new_callable=AsyncMock), \
             patch("app.services.wiki_store.WikiStore") as mock_wiki_store:
             mock_wiki_store.return_value.create_job.return_value = None
             caplog.set_level(logging.INFO, logger="app.services.document_processor")

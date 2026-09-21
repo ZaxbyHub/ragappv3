@@ -17,7 +17,7 @@ async def db_transaction(pool):
             conn.execute("UPDATE ...")
         # Auto-committed on clean exit, auto-rolled-back on exception.
     """
-    conn = pool.get_connection()
+    conn = await pool.get_connection_async()
     try:
         yield conn
         await asyncio.to_thread(conn.commit)

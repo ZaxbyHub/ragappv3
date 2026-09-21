@@ -356,7 +356,7 @@ def require_service_account(required_scopes: list[str]):
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
         pool = get_pool(str(settings.sqlite_path))
-        conn = pool.get_connection()
+        conn = await pool.get_connection_async()
         try:
             row = await asyncio.to_thread(
                 lambda: conn.execute(

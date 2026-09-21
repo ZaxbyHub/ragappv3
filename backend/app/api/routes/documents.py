@@ -2512,7 +2512,7 @@ async def _do_upload(
             # Mark queued phase; status stays 'pending' until the worker
             # transitions it to 'processing'. mark_processing_started=False
             # because actual processing has not started yet — only queueing.
-            set_phase(
+            await set_phase(
                 db_pool,
                 file_id,
                 phase=PHASE_QUEUED,

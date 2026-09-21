@@ -185,7 +185,7 @@ async def _conn_ctx():
     from app.models.database import get_pool
 
     pool = get_pool(str(settings.sqlite_path))
-    with pool.connection() as conn:
+    async with pool.connection_async() as conn:
         yield conn
 
 

@@ -108,6 +108,9 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
         pool = MagicMock()
         conn = MagicMock()
         pool.get_connection.return_value = conn
+        # #645: process_file checks out via the pool's async surface; mirror
+        # it with an AsyncMock so the await resolves to the fake connection.
+        pool.get_connection_async = AsyncMock(return_value=conn)
 
         embedding_service = MagicMock()
         embedding_service.embed_batch = AsyncMock(return_value=([[0.1, 0.2]], []))
@@ -159,10 +162,10 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
-            patch("app.services.document_processor.set_phase"), \
-            patch("app.services.document_processor.clear_progress"), \
+            patch("app.services.document_processor.set_phase", new_callable=AsyncMock), \
+            patch("app.services.document_processor.clear_progress", new_callable=AsyncMock), \
             patch("app.services.document_processor.compute_parent_windows"), \
-            patch("app.services.document_processor.set_wiki_pending") as mock_set_wiki_pending, \
+            patch("app.services.document_processor.set_wiki_pending", new_callable=AsyncMock) as mock_set_wiki_pending, \
             patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls:
             mock_wiki_store = MagicMock()
             mock_wiki_store.create_job.return_value = None
@@ -252,10 +255,10 @@ class TestWikiJobEnqueueGating(unittest.IsolatedAsyncioTestCase):
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
-            patch("app.services.document_processor.set_phase"), \
-            patch("app.services.document_processor.clear_progress"), \
+            patch("app.services.document_processor.set_phase", new_callable=AsyncMock), \
+            patch("app.services.document_processor.clear_progress", new_callable=AsyncMock), \
             patch("app.services.document_processor.compute_parent_windows"), \
-            patch("app.services.document_processor.set_wiki_pending") as mock_set_wiki_pending, \
+            patch("app.services.document_processor.set_wiki_pending", new_callable=AsyncMock) as mock_set_wiki_pending, \
             patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls:
             mock_wiki_store = MagicMock()
             mock_wiki_store.create_job.return_value = None
@@ -309,6 +312,8 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
         pool = MagicMock()
         conn = MagicMock()
         pool.get_connection.return_value = conn
+        # #645: process_existing_file checks out via the pool's async surface.
+        pool.get_connection_async = AsyncMock(return_value=conn)
 
         embedding_service = MagicMock()
         embedding_service.embed_batch = AsyncMock(return_value=([[0.1, 0.2]], []))
@@ -346,10 +351,10 @@ class TestWikiJobEnqueueGatingProcessExistingFile(unittest.IsolatedAsyncioTestCa
             ), \
             patch.object(processor, "_get_chunk_enrichment_service", return_value=None), \
             patch("app.services.document_processor.compute_file_hash", return_value="abc12345"), \
-            patch("app.services.document_processor.set_phase"), \
-            patch("app.services.document_processor.clear_progress"), \
+            patch("app.services.document_processor.set_phase", new_callable=AsyncMock), \
+            patch("app.services.document_processor.clear_progress", new_callable=AsyncMock), \
             patch("app.services.document_processor.compute_parent_windows"), \
-            patch("app.services.document_processor.set_wiki_pending") as mock_set_wiki_pending, \
+            patch("app.services.document_processor.set_wiki_pending", new_callable=AsyncMock) as mock_set_wiki_pending, \
             patch("app.services.wiki_store.WikiStore") as mock_wiki_store_cls:
             mock_wiki_store = MagicMock()
             mock_wiki_store.create_job.return_value = None

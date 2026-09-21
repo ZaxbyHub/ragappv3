@@ -44,7 +44,8 @@ class TestFileWatcherPathAlignment:
         """Create a mock database pool."""
         pool = MagicMock()
         conn = MagicMock()
-        pool.get_connection.return_value = conn
+        # #645: scan_once awaits the async checkout.
+        pool.get_connection_async = AsyncMock(return_value=conn)
         pool.release_connection = MagicMock()
         return pool
 
@@ -74,7 +75,7 @@ class TestFileWatcherPathAlignment:
             def get_pool_mock(*args, **kwargs):
                 return mock_pool
 
-            mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
             with patch("app.models.database.get_pool", get_pool_mock):
                 from app.services.file_watcher import FileWatcher
@@ -107,7 +108,7 @@ class TestFileWatcherPathAlignment:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = [(42, "Test Vault")]
-            mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -154,7 +155,7 @@ class TestFileWatcherPathAlignment:
                 (10, "My Important Vault"),
                 (20, "Another Vault with Spaces"),
             ]
-            mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher
@@ -189,7 +190,7 @@ class TestFileWatcherPathAlignment:
 
             mock_conn = MagicMock()
             mock_conn.execute.return_value.fetchall.return_value = []  # No regular vaults
-            mock_pool.get_connection.return_value = mock_conn
+            mock_pool.get_connection_async = AsyncMock(return_value=mock_conn)
 
             with patch("app.models.database.get_pool", return_value=mock_pool):
                 from app.services.file_watcher import FileWatcher

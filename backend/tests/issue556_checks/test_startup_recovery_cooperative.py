@@ -33,6 +33,15 @@ class _RecoveryConnection:
         self.exited.set()
         return False
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        # Mirror the sync exit contract: the tests assert this event to prove
+        # the sweep released its connection (#645 async checkout).
+        self.exited.set()
+        return False
+
     def execute(self, sql, _params=()):
         if "FROM ingestion_stage_states s" in sql and "s.status IN" in sql:
             return _Cursor(self.rows)
@@ -48,6 +57,10 @@ class _RecoveryPool:
         self.connection_obj = _RecoveryConnection(rows)
 
     def connection(self):
+        return self.connection_obj
+
+    # #645: the recovery sweep checks out via the async CM.
+    def connection_async(self):
         return self.connection_obj
 
 

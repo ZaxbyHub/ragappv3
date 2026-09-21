@@ -48,7 +48,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from queue import Empty, Queue
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -76,9 +76,11 @@ from app.services.draft_store import DraftConflictError, DraftStore, sha256_text
 
 class _PoolWithConnectionCM:
     """Thread-safe SQLite pool exposing both the ``get_connection``/
-    ``release_connection`` idiom (backs the ``get_db`` override) and the
-    ``with pool.connection() as conn`` context manager production code
-    requires from ``request.app.state.db_pool`` -- copied verbatim from
+    ``release_connection`` idiom (backs the ``get_db`` override), the
+    ``with pool.connection() as conn`` context manager, and the #645 async
+    checkout surfaces (``get_connection_async`` / ``connection_async``) that
+    async helpers (``set_phase``) require from
+    ``request.app.state.db_pool`` -- copied verbatim from
     ``test_draft_routes.py``."""
 
     def __init__(self, db_path: str) -> None:
@@ -120,6 +122,20 @@ class _PoolWithConnectionCM:
     @contextmanager
     def connection(self):
         conn = self.get_connection()
+        try:
+            yield conn
+        finally:
+            self.release_connection(conn)
+
+    async def get_connection_async(self, max_wait_attempts: int = 3) -> sqlite3.Connection:
+        # #645: async helpers (set_phase) check out through the pool's async
+        # surface; delegate to the sync checkout on a worker thread to match
+        # the production off-loop contract.
+        return await asyncio.to_thread(self.get_connection)
+
+    @asynccontextmanager
+    async def connection_async(self, max_wait_attempts: int = 3):
+        conn = await self.get_connection_async(max_wait_attempts)
         try:
             yield conn
         finally:
