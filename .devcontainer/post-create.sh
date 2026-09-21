@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Devcontainer bootstrap (issue #567 / E10): a known-good Linux environment
-# matching CI (Python 3.11, Node 22.14, ubuntu) plus the tools the justfile
+# matching CI (Python 3.11, Node 22.22, ubuntu) plus the tools the justfile
 # recipes need: just, uv (pinned to the same version CI's lock-verification
 # gate pins), and pytest-xdist (installed ad hoc by CI, ci.yml).
 set -euo pipefail

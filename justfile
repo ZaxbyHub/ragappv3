@@ -3,7 +3,7 @@
 # name, instead of reconstructing them from the workflow YAML.
 #
 # Prerequisites: Python 3.11, uv 0.12.15 (the version CI pins for the lock
-# byte-diff gate), Node >= 22.14, and just.
+# byte-diff gate), Node >= 22.22, and just.
 # The devcontainer (.devcontainer/devcontainer.json) ships a known-good
 # environment with all of them.
 #
