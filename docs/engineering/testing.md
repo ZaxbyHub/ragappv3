@@ -124,7 +124,7 @@ CI (`.github/workflows/ci.yml`) runs the full suite across seven jobs:
 - **Detect docker scope job:** a paths-filter that arms the docker-smoke job only when the docker build surface changed (BUILD-002).
 - **Docker build smoke job:** builds the root and frontend images (no push) when the docker surface changed, proving a green run ships a buildable image.
 - **SAST (bandit) job:** `scripts/run_bandit.py` — fails on new bandit findings or unused `# nosec` suppressions against the committed baseline.
-- **Backend job:** uv universal-lockfile byte-diff verification, hash-pinned install (`requirements-lock-ci.txt` with `--require-hashes`), `ruff check .`, and the full pytest suite (`pytest --tb=short -v --timeout=300 -rs -n auto --cov tests/`).
+- **Backend job:** uv universal-lockfile byte-diff verification, hash-pinned install (`requirements-lock-ci.txt` with `--require-hashes`), `ruff check .`, and the full pytest suite (`pytest --tb=short -v --timeout=300 -rs -n auto --cov --cov-report=term-missing tests/`).
 
 Three more workflows complete the gate lattice: `closure-evidence.yml` (PRs whose bodies close an issue must name verifiable closure evidence; warn-mode rollout per issue #568), `nightly.yml` (full-dependency suite with real parsers + the parser bake-off), and `nightly-quality-gates.yml` (the mutmut backend mutation floor, schemathesis OpenAPI contract fuzzing, and StrykerJS frontend mutation). An inventory of this lattice that names fewer jobs or scripts than `.github/workflows/ci.yml` actually defines is a contract violation — `scripts/check_runtime_contract.py` enforces the job/script inventory of this section and of `docs/engineering/conventions.md` against the workflow (issue #655).
 

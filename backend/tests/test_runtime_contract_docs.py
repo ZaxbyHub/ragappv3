@@ -17,8 +17,9 @@ frozen acceptance drivers use (``docs_surface_failures(conventions_text,
 testing_text, ci_text)``), loaded via importlib because ``scripts/`` is not an
 importable package. Script-level behavior (exit codes, output text) runs via
 subprocess with ``sys.executable``, following the
-``backend/tests/test_issue258_build_contracts.py`` pattern. Stdlib + pytest only:
-the Backend CI job has no frontend/node_modules, so nothing shells out to node.
+``backend/tests/test_issue258_build_contracts.py`` pattern. Dependencies:
+stdlib + pytest + PyYAML (already pinned in backend/requirements-lock-ci.txt);
+nothing shells out to node.
 """
 
 from __future__ import annotations
@@ -58,7 +59,7 @@ def _run_script(path: Path):
         cwd=str(REPO),
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=300,
     )
 
 
@@ -108,15 +109,52 @@ def test_conventions_md_has_no_stale_runtime_pins():
 def test_conventions_md_natural_language_pin_forms_flagged():
     module = _load_checker()
     real = _doc("docs/engineering/conventions.md")
-    for stale in (
+    vitest_forms = [
+        "- Lockfiles need Vitest 4.x and Vite >= 6.\n",
+        "- Lockfiles need vitest ^4.0.0 (package.json style).\n",
+        "- Lockfiles need Vitest ~4.0.0 (tilde range).\n",
+    ]
+    for stale in vitest_forms:
+        failures = _conventions_failures(module, real + "\n" + stale)
+        assert any(
+            "conventions.md" in f and "vitest major" in f for f in failures
+        ), f"stale vitest pin form must be flagged with the vitest major named: {stale!r} -> {failures}"
+    vite_forms = [
+        "- Lockfiles need Vite >= 6.\n",
+        "- Lockfiles need vite ~6.0.0 (package.json style).\n",
+        "- Lockfiles need vite v6.0.0 (v-prefixed).\n",
+    ]
+    for stale in vite_forms:
+        failures = _conventions_failures(module, real + "\n" + stale)
+        assert any(
+            "conventions.md" in f and "vite major" in f for f in failures
+        ), f"stale vite pin form must be flagged with the vite major named: {stale!r} -> {failures}"
+    node_forms = [
         "- CI pins Node.js 20.19.0 for lockfile regeneration.\n",
         "- Any Node 20.x release works for lockfiles.\n",
-        "- Lockfiles need Vitest 4.x and Vite >= 6.\n",
-    ):
+        "- CI pins Node v20.19.0 for lockfile regeneration.\n",
+    ]
+    for stale in node_forms:
         failures = _conventions_failures(module, real + "\n" + stale)
-        assert any("conventions.md" in f for f in failures), (
-            f"natural-language pin form must be flagged: {stale!r} -> {failures}"
-        )
+        assert any(
+            "conventions.md" in f and "Node" in f for f in failures
+        ), f"stale Node pin form (incl. v-prefix) must be flagged: {stale!r} -> {failures}"
+
+
+def test_conventions_md_node_operator_forms_flagged():
+    """DOC_NODE_OP_RE branch: operator-form claims are pinned independently."""
+    module = _load_checker()
+    real = _doc("docs/engineering/conventions.md")
+    stale = "- Any Node >= 20 release works for lockfiles.\n"
+    failures = _conventions_failures(module, real + "\n" + stale)
+    assert any(
+        "conventions.md" in f and "Node" in f for f in failures
+    ), f"stale operator-form Node pin must be flagged: {failures}"
+    ok = "- CI uses Node >= 22.x for lockfiles.\n"
+    failures = _conventions_failures(module, real + "\n" + ok)
+    assert not [
+        f for f in failures if "conventions.md" in f and "Node" in f
+    ], f"a correct operator-form pin (Node >= 22.x) must not be flagged: {failures}"
 
 
 def test_conventions_md_lists_every_ci_job():
@@ -151,6 +189,27 @@ def test_testing_md_lists_every_ci_job():
         "removing a job name from testing.md must be flagged with the doc and "
         "the missing job in one message"
     )
+
+
+def test_testing_md_lists_every_quality_contract_script():
+    """The script-inventory branch must flag a removed quality-contract script.
+
+    Mirror of the job-inventory mutation test: a testing.md copy with one of
+    the six ``scripts/check_*.py`` mentions removed must produce a failure
+    naming both testing.md and the missing script (PR #663 review R-B3).
+    """
+    module = _load_checker()
+    real = _doc("docs/engineering/testing.md")
+    missing_script = "scripts/check_test_collection_scope.py"
+    assert missing_script in real, "sanity: the real doc lists the script"
+    # testing.md lists the six scripts inline within a single bullet, so the
+    # mutation renames the mention rather than deleting a line.
+    trimmed = real.replace(missing_script, "scripts/removed_scope_check.py")
+    assert missing_script not in trimmed, "sanity: the trimmed copy must drop it"
+    failures = _testing_failures(module, trimmed)
+    assert any(
+        "testing.md" in f and missing_script in f for f in failures
+    ), f"removing a quality-contract script from testing.md must be flagged: {failures}"
 
 
 def trimmed_failures_contains_job(module, real: str) -> bool:
@@ -334,6 +393,15 @@ def test_ci_job_display_names_parser():
     # A job without a name: falls back to its key.
     unnamed = "jobs:\n  frontend:\n    runs-on: ubuntu-latest\n  backend:\n    name: Backend\n"
     assert module._ci_job_display_names(unnamed) == ["frontend", "Backend"]
+
+    # A quoted-empty name must fall back to the job key too: an empty-string
+    # entry would make the substring inventory check vacuous ('' in anything).
+    empty = "jobs:\n  frontend:\n    name: ''\n  backend:\n    name: Backend\n"
+    names = module._ci_job_display_names(empty)
+    assert names == ["frontend", "Backend"] and "" not in names, (
+        f"a quoted-empty name: must fall back to the job key, never '' (the "
+        f"substring check cannot fail on ''): {names}"
+    )
 
     # A one-of-seven omission can never silently truncate the inventory: with
     # the name: gone the parser falls back to the job key, so the job stays in

@@ -111,6 +111,7 @@ python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py   # SAST baseline/scope/workflow integrity
 python scripts/check_secretscan.py      # .secretscanignore validity
+python scripts/check_test_collection_scope.py   # all pytest files live under backend/tests/
 ```
 
 **Closure evidence gate** (from repo root; standalone workflow

@@ -106,14 +106,16 @@ DOCS_SURFACES = (
     "docs/engineering/testing.md",
 )
 
-DOC_NODE_PROSE_RE = re.compile(r"(?i)\bnode(?:\.js)?\b[^\n]{0,40}?\b(\d{1,2})\.(\d+|x)\b")
+DOC_NODE_PROSE_RE = re.compile(r"\bnode(?:\.js)?\b[^\n]{0,40}?[\s(\"]v?(\d{1,2})\.(\d+|x)\b", re.IGNORECASE)
 DOC_NODE_OP_RE = re.compile(r"(?i)\bnode(?:\.js)?\s*(?:version\s*)?[><=]=?\s*(\d+)(?:\.(\d+|x))?\b")
 DOC_PYTHON_RE = CONTRIBUTING_PYTHON_RE
 # Version adjacency required (only separators like space/@/(/)/</>/=/+ may sit
 # between the name and the digits), so "vitest requires Node 22" cannot be
-# misread as a vitest version claim.
-DOC_VITEST_RE = re.compile(r"(?i)\bvitest\b[ @()<>=+]*(\d+)(?:\.(\d+|x))?\b")
-DOC_VITE_RE = re.compile(r"(?i)\bvite\b[ @()<>=+]*(\d+)(?:\.(\d+|x))?\b")
+# misread as a vitest version claim. `^~v` are included because that is the
+# exact style frontend/package.json itself uses ("vitest": "~5.0.0") — a stale
+# pin written in package.json style must still be caught.
+DOC_VITEST_RE = re.compile(r"(?i)\bvitest\b[ @()<>=+^~v]*(\d+)(?:\.(\d+|x))?\b")
+DOC_VITE_RE = re.compile(r"(?i)\bvite\b[ @()<>=+^~v]*(\d+)(?:\.(\d+|x))?\b")
 DOC_SCRIPT_RE = re.compile(r"scripts/check_[a-z_]+\.py")
 
 
@@ -374,7 +376,10 @@ def _ci_job_display_names(ci_text: str) -> list[str]:
                 names.append(pending)
             pending = key  # resolved by the job's own `name:` child when present
         elif pending is not None and indent == job_indent + 2 and key == "name" and value:
-            pending = _strip_yaml_quotes(value)
+            # An empty resolved name (e.g. `name: ''`) would make the substring
+            # inventory check vacuous ('' in anything is True) — fall back to
+            # the job key so the job stays visible to the doc checks.
+            pending = _strip_yaml_quotes(value) or pending
     if pending is not None:
         names.append(pending)
     return names
