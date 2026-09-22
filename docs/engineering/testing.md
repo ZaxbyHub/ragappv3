@@ -116,11 +116,17 @@ the new behavior.
 
 ## 4. What CI runs vs. what you should run
 
-CI (`.github/workflows/ci.yml`) runs the full suite:
+CI (`.github/workflows/ci.yml`) runs the full suite across seven jobs:
 
-- **Backend job:** `ruff check .` + the full pytest suite (`pytest --tb=short -v --timeout=300 tests/`).
-- **Frontend job:** `npm run typecheck`, `npm run lint`, API smoke tests, full `npm test`, `npm run build`, and a subpath build.
-- **Quality contracts:** `check_config_contract.py`, `check_pr_scope_drift.py`.
+- **Frontend job:** `npm run typecheck`, `npm run typecheck:contracts`, `npm run lint`, API smoke tests, the accessibility smoke (`npm run test:a11y`), full `npm test`, the coverage gate (`npm run test:coverage`), and three builds (production plus two subpath variants).
+- **Playwright e2e smoke job:** the `frontend/e2e/` browser smoke suite (send / stop-mid-stream / reload-restores-history / citation-opens-source) against the production build with a stub backend (issue #573).
+- **Quality contracts job:** all six contract scripts, in CI order: `scripts/check_runtime_contract.py`, `scripts/check_config_contract.py`, `scripts/check_pr_scope_drift.py`, `scripts/check_sast_baseline.py`, `scripts/check_secretscan.py`, `scripts/check_test_collection_scope.py` (mirrored by the `justfile` `quality-contracts` recipe).
+- **Detect docker scope job:** a paths-filter that arms the docker-smoke job only when the docker build surface changed (BUILD-002).
+- **Docker build smoke job:** builds the root and frontend images (no push) when the docker surface changed, proving a green run ships a buildable image.
+- **SAST (bandit) job:** `scripts/run_bandit.py` — fails on new bandit findings or unused `# nosec` suppressions against the committed baseline.
+- **Backend job:** uv universal-lockfile byte-diff verification, hash-pinned install (`requirements-lock-ci.txt` with `--require-hashes`), `ruff check .`, and the full pytest suite (`pytest --tb=short -v --timeout=300 -rs -n auto --cov tests/`).
+
+Three more workflows complete the gate lattice: `closure-evidence.yml` (PRs whose bodies close an issue must name verifiable closure evidence; warn-mode rollout per issue #568), `nightly.yml` (full-dependency suite with real parsers + the parser bake-off), and `nightly-quality-gates.yml` (the mutmut backend mutation floor, schemathesis OpenAPI contract fuzzing, and StrykerJS frontend mutation). An inventory of this lattice that names fewer jobs or scripts than `.github/workflows/ci.yml` actually defines is a contract violation — `scripts/check_runtime_contract.py` enforces the job/script inventory of this section and of `docs/engineering/conventions.md` against the workflow (issue #655).
 
 > **Windows/Git Bash caveat for the subpath build:** Git Bash's MSYS layer
 > rewrites leading-slash environment values into Windows paths, so

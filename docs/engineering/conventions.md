@@ -15,7 +15,7 @@ update this doc when a convention genuinely changes.
 - **Backend** — Python 3.11, FastAPI + SQLite + LanceDB, under `backend/`.
 - **Frontend** — React + TypeScript + Vite, Vitest, shadcn/ui + Tailwind, under `frontend/`.
 - **Contract scripts** — `scripts/check_config_contract.py`, `scripts/check_pr_scope_drift.py` (run in CI).
-- **CI** — `.github/workflows/ci.yml` (jobs: Backend, Frontend, Quality contracts, SAST). See `docs/engineering/testing.md` and the `ci-compatibility-audit` skill.
+- **CI** — `.github/workflows/ci.yml` (jobs: Frontend, Playwright e2e smoke, Quality contracts, Detect docker scope, Docker build smoke, SAST (bandit), Backend). See `docs/engineering/testing.md` and the `ci-compatibility-audit` skill.
 - **User-facing docs** — `docs/` (admin-guide, email-ingestion, release, etc.). Engineering docs live under `docs/engineering/`.
 
 ---
@@ -123,8 +123,8 @@ Export shared types/interfaces (`Document`, `Tag`, `Vault`, `ChatSession`, etc.)
 
 ### State selectors and zustand upgrades
 - Array/object selectors must be stable across renders. In **zustand 5** the `equalityFn` second argument to `useStore(selector, equalityFn)` is silently ignored; use `useStore(useShallow(selector))` from `zustand/shallow` instead. Existing selectors in `frontend/src/stores/` use `useShallow` to avoid unstable references.
-- CI pins Node 20.19.0; regenerate lockfiles with the same Node release so the bundled npm version matches CI. Lockfiles produced by newer npm may be rejected by CI's older npm.
-- Vitest 4.x requires Vite >= 6; keep the top-level `vite` dependency aligned with the `vitest` range.
+- Regenerate lockfiles with the same Node release CI pins (the exact version lives in `.github/workflows/ci.yml` under `setup-node` and is enforced by `scripts/check_runtime_contract.py`); lockfiles produced by a different npm may be rejected by CI.
+- Keep the top-level `vite` dependency aligned with the `vitest` range (check `frontend/package.json`); the Frontend job's toolchain-graph step fails the build when they disagree.
 
 ### TypeScript & lint
 - `tsconfig` is `strict` with `noUnusedLocals`/`noUnusedParameters`. Use `import type` for type-only imports.

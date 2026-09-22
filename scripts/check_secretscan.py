@@ -3,7 +3,9 @@
 
 .secretscanignore is consumed by the optional local `secretscan` tool (documented
 in .claude/skills/execute/SKILL.md and the .opencode mirror) — it is NOT read by
-git or any CI step today. A malformed glob makes secretscan silently skip files
+git or any CI step today. Until the scanner is wired into a workflow, this
+gate's PASS means the ignore file parses and its globs behave as intended — not
+that a scan ran. A malformed glob makes secretscan silently skip files
 it should flag (false negatives on real secrets). This script enforces:
 
   C-SSECRETSCAN-1 (parseability): .secretscanignore exists and every non-comment,
@@ -371,7 +373,11 @@ def main() -> int:
         _print(msg)
     if failures:
         return 1
-    print("secretscan: all checks passed")
+    print(
+        "secretscan: ignore-file globs valid (note: the secretscan scanner "
+        "itself is not run by any CI job; this gate validates the ignore file "
+        "only)"
+    )
     return 0
 
 

@@ -80,8 +80,10 @@ frontend, and embedding/LLM services together.
 
 ## Before you push — run the CI gates locally
 
-CI (`.github/workflows/ci.yml`) runs the Frontend, Quality contracts, SAST,
-Backend, and Docker build smoke jobs. Reproduce them locally so your PR goes
+CI (`.github/workflows/ci.yml`) runs seven jobs — Frontend, Playwright e2e
+smoke, Quality contracts, Detect docker scope, Docker build smoke,
+SAST (bandit), and Backend (full inventory: `docs/engineering/testing.md`,
+section 4). Reproduce them locally so your PR goes
 green on the first try:
 
 **Backend** (from `backend/`):
