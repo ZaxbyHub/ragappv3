@@ -31,6 +31,14 @@ Surfaces checked (each line lists one runtime mention -> required value):
   .devcontainer/devcontainer.json     features python/node versions -> python version,
                                       node major.minor (required surface since issue
                                       #567; the container mirrors CI's runtimes)
+  docs/engineering/conventions.md     runtime-pin prose (Node/Python/Vitest/Vite)
+                                      -> ALLOWED_RUNTIME + package.json vitest/vite
+                                      majors; CI job-name inventory -> ci.yml
+  docs/engineering/testing.md         CI job-name + quality-contract script
+                                      inventories -> ci.yml ground truth
+                                      (both docs surfaces are required since
+                                      issue #655: a missing file fails instead
+                                      of being skipped)
 
 Digest pins (@sha256:...) are honored: the tag before the digest is compared.
 Non-runtime base images (nginx, ollama, ...) are ignored.
@@ -88,6 +96,27 @@ CI_PYTHON_VERSION_RE = re.compile(
 
 CONTRIBUTING_NODE_RE = re.compile(r"(?i)\bnode(?:\.js)?\b[^\n]{0,40}?\b(\d{1,2})\.\d+")
 CONTRIBUTING_PYTHON_RE = re.compile(r"(?i)\bpython(?:3)?[ @:]\s*(\d+\.\d+)")
+
+# Docs surfaces (issue #655): the engineering docs assert runtime facts and a
+# CI job/script inventory that this gate now keeps true. Prose forms are matched
+# with the same windowed style as the CONTRIBUTING family above, extended with
+# `.x` wildcard majors and `@`-style dependency mentions.
+DOCS_SURFACES = (
+    "docs/engineering/conventions.md",
+    "docs/engineering/testing.md",
+)
+
+DOC_NODE_PROSE_RE = re.compile(r"\bnode(?:\.js)?\b[^\n]{0,40}?[\s(\"]v?(\d{1,2})\.(\d+|x)\b", re.IGNORECASE)
+DOC_NODE_OP_RE = re.compile(r"(?i)\bnode(?:\.js)?\s*(?:version\s*)?[><=]=?\s*(\d+)(?:\.(\d+|x))?\b")
+DOC_PYTHON_RE = CONTRIBUTING_PYTHON_RE
+# Version adjacency required (only separators like space/@/(/)/</>/=/+ may sit
+# between the name and the digits), so "vitest requires Node 22" cannot be
+# misread as a vitest version claim. `^~v` are included because that is the
+# exact style frontend/package.json itself uses ("vitest": "~5.0.0") — a stale
+# pin written in package.json style must still be caught.
+DOC_VITEST_RE = re.compile(r"(?i)\bvitest\b[ @()<>=+^~v]*(\d+)(?:\.(\d+|x))?\b")
+DOC_VITE_RE = re.compile(r"(?i)\bvite\b[ @()<>=+^~v]*(\d+)(?:\.(\d+|x))?\b")
+DOC_SCRIPT_RE = re.compile(r"scripts/check_[a-z_]+\.py")
 
 
 def read(relative_path: str) -> str:
@@ -268,6 +297,226 @@ def check_devcontainer(failures: list[str]) -> None:
             failures.append(f"{surface}: node feature {node_pin!r} is {why}")
 
 
+def _dep_major(package_text: str, key: str, failures: list[str]) -> str | None:
+    """Return the major of a frontend/package.json dependency, or None (fail-loud)."""
+    match = re.search(rf'"{key}"\s*:\s*"[~^]?(\d+)', package_text)
+    if not match:
+        failures.append(
+            f"frontend/package.json: no parseable {key} version for the "
+            "docs-surface comparison"
+        )
+        return None
+    return match.group(1)
+
+
+def _flag_node_doc_mention(
+    failures: list[str], mention: str, whole: str, frac: str | None
+) -> None:
+    """Flag a conventions.md Node mention that breaks the minor-exact contract.
+
+    A ``.x`` fraction (or a bare major from an operator form) is a major-only
+    claim: it passes when the major matches. A concrete ``major.minor`` must
+    satisfy the minor-exact contract.
+    """
+    if frac is None or frac == "x":
+        expected = ALLOWED_RUNTIME["node"]["major"]
+        if whole != expected:
+            failures.append(
+                f"docs/engineering/conventions.md: runtime mention {mention!r} is "
+                f"node major {whole}, contract requires {expected}.x"
+            )
+        return
+    ok, why = _node_version_ok(f"{whole}.{frac}")
+    if not ok:
+        failures.append(
+            f"docs/engineering/conventions.md: runtime mention {mention!r} is {why}"
+        )
+
+
+def _strip_yaml_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _ci_job_display_names(ci_text: str) -> list[str]:
+    """Job display names from a workflow's ``jobs:`` mapping.
+
+    Stdlib indentation walk (the Quality contracts job has no YAML parser):
+    a job's display name is its ``name:`` value — quotes stripped, whatever
+    the indentation inside ``jobs:`` — falling back to the job key when a job
+    declares no ``name:``. Returns [] when ``jobs:`` is absent or empty so the
+    caller can fail loud instead of comparing against a silently truncated
+    inventory.
+    """
+    names: list[str] = []
+    in_jobs = False
+    job_indent: int | None = None
+    pending: str | None = None
+    for raw in ci_text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key = _strip_yaml_quotes(key.strip())
+        value = value.strip()
+        if not in_jobs:
+            if indent == 0 and key == "jobs" and value == "":
+                in_jobs = True
+            continue
+        if indent == 0:
+            break  # the next top-level key ends the jobs: mapping
+        if job_indent is None:
+            job_indent = indent
+        if indent == job_indent:
+            if pending is not None:
+                names.append(pending)
+            pending = key  # resolved by the job's own `name:` child when present
+        elif pending is not None and indent == job_indent + 2 and key == "name" and value:
+            # An empty resolved name (e.g. `name: ''`) would make the substring
+            # inventory check vacuous ('' in anything is True) — fall back to
+            # the job key so the job stays visible to the doc checks.
+            pending = _strip_yaml_quotes(value) or pending
+    if pending is not None:
+        names.append(pending)
+    return names
+
+
+def docs_surface_failures(
+    conventions_text: str, testing_text: str, ci_text: str
+) -> list[str]:
+    """Pure docs-surface check (issue #655; the frozen acceptance-driver contract).
+
+    Flags runtime-pin prose in conventions.md (Node/Python against ALLOWED_RUNTIME,
+    Vitest/Vite majors against the live frontend/package.json) and CI job/script
+    inventory drift in conventions.md + testing.md against ci.yml ground truth.
+    Every failure names the offending doc file and the specific offending item in
+    the same string. Reads frontend/package.json for the dependency majors; a
+    malformed package.json fails loud instead of raising.
+    """
+    failures: list[str] = []
+    label = "docs/engineering/conventions.md"
+
+    package_path = ROOT / "frontend" / "package.json"
+    package_text = (
+        package_path.read_text(encoding="utf-8") if package_path.is_file() else ""
+    )
+    vite_major = _dep_major(package_text, "vite", failures)
+    vitest_major = _dep_major(package_text, "vitest", failures)
+
+    seen: set[str] = set()
+    for match in DOC_NODE_PROSE_RE.finditer(conventions_text):
+        ok, why = (
+            (True, "")
+            if match.group(2) == "x"
+            else _node_version_ok(f"{match.group(1)}.{match.group(2)}")
+        )
+        if match.group(2) == "x" and match.group(1) != ALLOWED_RUNTIME["node"]["major"]:
+            ok, why = False, (
+                f"node major {match.group(1)}, contract requires "
+                f"{ALLOWED_RUNTIME['node']['major']}.x"
+            )
+        if ok:
+            continue
+        mention = match.group(0).strip()
+        if mention not in seen:
+            seen.add(mention)
+            failures.append(f"{label}: runtime mention {mention!r} is {why}")
+    for match in DOC_NODE_OP_RE.finditer(conventions_text):
+        _flag_node_doc_mention(
+            failures, match.group(0).strip(), match.group(1), match.group(2)
+        )
+    for match in DOC_PYTHON_RE.finditer(conventions_text):
+        if match.group(1) != ALLOWED_RUNTIME["python"]["version"]:
+            failures.append(
+                f"{label}: runtime mention {match.group(0).strip()!r} is python "
+                f"{match.group(1)}, contract requires "
+                f"{ALLOWED_RUNTIME['python']['version']}"
+            )
+    if vitest_major is not None:
+        for match in DOC_VITEST_RE.finditer(conventions_text):
+            if match.group(1) != vitest_major:
+                failures.append(
+                    f"{label}: runtime mention {match.group(0).strip()!r} is "
+                    f"vitest major {match.group(1)}, contract requires "
+                    f"{vitest_major} (frontend/package.json)"
+                )
+    if vite_major is not None:
+        for match in DOC_VITE_RE.finditer(conventions_text):
+            if match.group(1) != vite_major:
+                failures.append(
+                    f"{label}: runtime mention {match.group(0).strip()!r} is "
+                    f"vite major {match.group(1)}, contract requires "
+                    f"{vite_major} (frontend/package.json)"
+                )
+
+    job_names = _ci_job_display_names(ci_text)
+    if not job_names:
+        failures.append(
+            "no job names parsed from .github/workflows/ci.yml — parser or "
+            "workflow drift"
+        )
+    else:
+        for name in job_names:
+            if name not in conventions_text:
+                failures.append(
+                    f"{label}: CI job {name!r} missing from the documented "
+                    "job inventory"
+                )
+            if name not in testing_text:
+                failures.append(
+                    "docs/engineering/testing.md: CI job "
+                    f"{name!r} missing from the documented job inventory"
+                )
+    script_names = sorted(set(DOC_SCRIPT_RE.findall(ci_text)))
+    if not script_names:
+        failures.append(
+            "no scripts/check_*.py gates parsed from .github/workflows/ci.yml "
+            "— parser or workflow drift"
+        )
+    else:
+        for name in script_names:
+            if name not in testing_text:
+                failures.append(
+                    "docs/engineering/testing.md: contract script "
+                    f"{name!r} missing from the documented quality-contracts "
+                    "inventory"
+                )
+    return failures
+
+
+def check_docs_surfaces(failures: list[str]) -> None:
+    """Required docs surfaces (issue #655): missing files fail, never skip."""
+    texts: dict[str, str] = {}
+    for surface in DOCS_SURFACES:
+        path = ROOT / surface
+        if not path.is_file():
+            failures.append(
+                f"{surface} missing (required runtime-contract surface since "
+                "issue #655)"
+            )
+        else:
+            texts[surface] = path.read_text(encoding="utf-8")
+    ci_path = ROOT / ".github" / "workflows" / "ci.yml"
+    if not ci_path.is_file():
+        failures.append(
+            ".github/workflows/ci.yml missing (required runtime-contract surface)"
+        )
+        return
+    if len(texts) < len(DOCS_SURFACES):
+        return
+    failures.extend(
+        docs_surface_failures(
+            texts[DOCS_SURFACES[0]],
+            texts[DOCS_SURFACES[1]],
+            ci_path.read_text(encoding="utf-8"),
+        )
+    )
+
+
 def main() -> int:
     failures: list[str] = []
     check_dockerfiles(failures)
@@ -275,6 +524,7 @@ def main() -> int:
     check_package_engines(failures)
     check_contributing(failures)
     check_devcontainer(failures)
+    check_docs_surfaces(failures)
     for message in failures:
         fail(message)
     if failures:
