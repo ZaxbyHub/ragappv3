@@ -19,22 +19,39 @@ tests ``*.test.ts``/``*.test.tsx`` under ``frontend/src/`` — those are not
 pytest files and are invisible to this contract by construction, so no
 frontend allowlist entry is needed; only Python test filenames are policed.
 
-Hidden directories (``.git``, ``.venv*``, ``.agents/issue-traces``, ...),
-``node_modules``, ``__pycache__``, and the non-hidden virtualenv names
-``venv``/``env``/``ENV`` (INSTALLATION.md's ``python -m venv venv`` is
-non-hidden and ships hundreds of packaged test files inside site-packages)
-are pruned from the walk: vendored, generated, virtualenv, and
-agent-artifact trees are not pytest collection surfaces.
+Candidate enumeration (git mode — issue #656): ``git ls-files`` (tracked) plus
+``git ls-files --others --exclude-standard`` (untracked, not ignored). That is
+git's view of the repository — the set this contract is about: files a
+contributor could commit and that ``pytest tests/`` would silently never
+collect. A raw filesystem walk cannot express that set: it sees gitignored
+local artifacts (pytest-xdist leftovers under the ignored ``backend/data/``
+made the gate exit 1 on any developer machine that had run the suite) while
+missing nothing else. Candidates must also exist on disk, so a tracked file
+deleted from the working tree is not an on-disk violation. Hidden directories
+(``.git``, ``.venv*``, ``.agents/issue-traces``, ...) stay pruned: vendored,
+generated, virtualenv, and agent-artifact trees are not pytest collection
+surfaces. ``PRUNE_DIRS`` is NOT applied in git mode — git already excludes
+ignored venvs, and a *tracked* venv's test files are real violations.
+
+Degraded mode: if git is unavailable (binary missing), hung, or fails (for
+example outside a git checkout), the original filesystem walk runs instead —
+hidden directories, ``node_modules``, ``__pycache__``, and the non-hidden
+virtualenv names ``venv``/``env``/``ENV`` pruned (INSTALLATION.md's
+``python -m venv venv`` is non-hidden and ships hundreds of packaged test
+files inside site-packages) — and a one-line note is printed to stderr.
 
 Exit codes: 0 = clean, 1 = violations found (each offender printed).
 Run from the repository root.
 """
 
+import subprocess
 import sys
 from pathlib import Path
 
 PRUNE_DIRS = {"__pycache__", "node_modules", "venv", "env", "ENV"}
 TEST_FILE_SUFFIXES = (".py",)
+GIT_TIMEOUT_SECONDS = 60
+DEGRADED_NOTE = "test-collection-scope: git unavailable; falling back to filesystem walk"
 
 
 def _is_test_filename(name: str) -> bool:
@@ -43,8 +60,44 @@ def _is_test_filename(name: str) -> bool:
     )
 
 
-def find_violations(repo_root: Path) -> list[str]:
-    """Return test files outside backend/tests/, as repo-relative POSIX paths."""
+def _git_paths(repo_root: Path, *args: str) -> list[str] | None:
+    """Return git's answer as repo-relative posix paths, or None.
+
+    None means git could not answer (binary missing, hung past
+    ``GIT_TIMEOUT_SECONDS``, or non-zero exit) and the caller must fall back to
+    the filesystem walk. Tokens are the raw NUL-delimited fields with only the
+    empty terminal token discarded: git permits leading/trailing whitespace in
+    path components, and stripping would resolve them to non-existent paths.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return [token for token in proc.stdout.split("\0") if token]
+
+
+def _has_hidden_parent(rel_posix: str) -> bool:
+    return any(part.startswith(".") for part in Path(rel_posix).parts[:-1])
+
+
+def _is_under_backend_tests(rel_posix: str) -> bool:
+    parts = Path(rel_posix).parts
+    return len(parts) >= 2 and parts[0] == "backend" and parts[1] == "tests"
+
+
+def _walk_violations(repo_root: Path) -> list[str]:
+    """Degraded-mode candidate set: the original filesystem walk, unchanged."""
     tests_root = repo_root / "backend" / "tests"
     violations: list[str] = []
     stack = [repo_root]
@@ -59,6 +112,29 @@ def find_violations(repo_root: Path) -> list[str]:
                 if tests_root == entry or tests_root in entry.parents:
                     continue
                 violations.append(entry.relative_to(repo_root).as_posix())
+    return violations
+
+
+def find_violations(repo_root: Path) -> list[str]:
+    """Return test files outside backend/tests/, as repo-relative POSIX paths."""
+    tracked = _git_paths(repo_root, "ls-files", "-z")
+    untracked = _git_paths(
+        repo_root, "ls-files", "--others", "--exclude-standard", "-z"
+    )
+    if tracked is None or untracked is None:
+        print(DEGRADED_NOTE, file=sys.stderr)
+        return _walk_violations(repo_root)
+    violations: list[str] = []
+    for rel in sorted(set(tracked) | set(untracked)):
+        if not _is_test_filename(Path(rel).name):
+            continue
+        if not (repo_root / rel).is_file():
+            continue
+        if _has_hidden_parent(rel):
+            continue
+        if _is_under_backend_tests(rel):
+            continue
+        violations.append(rel)
     return violations
 
 
