@@ -462,14 +462,20 @@ def load_corpus(root: Optional[Path] = None) -> RetrievalGoldCorpus:
     if not any(case.kind == "not_in_corpus" for case in cases):
         raise RetrievalGoldCorpusError("cases: at least one not_in_corpus case is required")
 
-    probe = next((c for c in cases if c.expected_doc and c.must_not_match), None)
-    if probe is not None:
-        first_trap = probe.must_not_match[0]
-        if texts[first_trap].find(probe.expected_span.text) != probe.expected_span.start:
-            raise RetrievalGoldCorpusError(
-                f"cases: probe case {probe.id} trap document {first_trap!r} does not carry the "
-                "expected span at identical offsets (loader-clean swap property)"
-            )
+    # Tier-1 contract: every trap case WITHOUT a trap_span (doc-level trap)
+    # must carry its expected span in its trap document at the SAME offsets —
+    # this is what guarantees the frozen ranking-degradation probe's swap is
+    # loader-clean. trap_span cases are exempt (their expected span text must
+    # be ABSENT from the trap document instead, checked during case loading).
+    for case in cases:
+        if case.kind == "not_in_corpus" or not case.must_not_match or case.trap_span is not None:
+            continue
+        for trap in case.must_not_match:
+            if texts[trap].find(case.expected_span.text) != case.expected_span.start:
+                raise RetrievalGoldCorpusError(
+                    f"cases: tier-1 case {case.id} trap document {trap!r} does not carry the "
+                    "expected span at identical offsets (loader-clean swap property)"
+                )
 
     seen_units: Dict[str, str] = {}
     for document in documents:

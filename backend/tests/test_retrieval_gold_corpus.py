@@ -243,13 +243,19 @@ class RetrievalGoldCaseIntegrityTests(unittest.TestCase):
 
     def test_probe_case_trap_document_carries_the_span_at_identical_offsets(self):
         """Contract-guarantees the frozen ranking-degradation probe's swap is
-        loader-clean: the first trap case's expected span exists in its trap
-        document at the SAME offsets."""
-        probe = self.corpus.probe_case()
-        trap_text = self.corpus.text(probe.must_not_match[0])
-        self.assertEqual(
-            trap_text.find(probe.expected_span.text), probe.expected_span.start, probe.id
-        )
+        loader-clean: every tier-1 trap case (must_not_match without
+        trap_span) has its expected span in its trap documents at the SAME
+        offsets."""
+        for case in self.corpus.trap_cases:
+            if case.trap_span is not None:
+                continue
+            for trap in case.must_not_match:
+                trap_text = self.corpus.text(trap)
+                self.assertEqual(
+                    trap_text.find(case.expected_span.text),
+                    case.expected_span.start,
+                    f"{case.id} vs {trap}",
+                )
 
     def test_at_least_one_not_in_corpus_case_exists(self):
         self.assertTrue(self.corpus.cases_by_kind("not_in_corpus"))
@@ -542,9 +548,7 @@ class RetrievalDiscriminationTests(unittest.IsolatedAsyncioTestCase):
         engine = self._make_engine(corpus, store, embedder)
 
         saw_nonempty = False
-        with patch.object(settings, "query_transformation_enabled", False), patch.object(
-            settings, "context_max_tokens", 0
-        ):
+        with patch.object(settings, "query_transformation_enabled", False):
             for case in corpus.cases:
                 with self.subTest(case=case.id):
                     calls_before = len(embedder.calls)

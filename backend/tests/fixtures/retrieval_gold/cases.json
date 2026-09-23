@@ -166,18 +166,25 @@
       "id": "rg-008",
       "kind": "memo_quote",
       "query": "which calibration sentence does the site deployment memo tell crews to quote on forms",
-      "notes": "Tier-1 doc-level trap: the memo quotes the specification sentence verbatim, so the span text exists in BOTH documents; the memo's framing vocabulary is the discriminator. Shared text is the confusability mechanism, so no trap_span (the absent-from-trap-doc rule applies only to trap_span cases).",
+      "notes": "Tier-2 text-level trap: the memo quotes the specification sentence verbatim inside its own framing, so the expected span (framing + quote) exists only in the memo while the trap span (the bare quoted sentence) is the specification's own wording; the memo's framing vocabulary is the ranking discriminator.",
       "expected_doc": "site_deployment_memo.md",
       "expected_span": {
-        "start": 519,
-        "end": 570,
-        "text": "Calibration interval: 90 days under normal service.",
-        "sha256": "4d14dc4a2402e446246fdd178fdb26883bc0a947837c255d812f7214aef5def1"
+        "start": 473,
+        "end": 571,
+        "text": "this memo quotes the specification directly: \"Calibration interval: 90 days under normal service.\"",
+        "sha256": "5d3a209b5ea5e6802a2c3318dd2c7779910ecb1b60ddc6cf38dc4b0b329f9d57"
       },
       "must_not_match": [
         "aeris_m_spec_rev2.md"
       ],
-      "also_expected": []
+      "also_expected": [],
+      "trap_span": {
+        "document": "aeris_m_spec_rev2.md",
+        "start": 1278,
+        "end": 1329,
+        "text": "Calibration interval: 90 days under normal service.",
+        "sha256": "4d14dc4a2402e446246fdd178fdb26883bc0a947837c255d812f7214aef5def1"
+      }
     },
     {
       "id": "rg-009",
@@ -460,7 +467,7 @@
       "id": "rg-023",
       "kind": "revision_marker",
       "query": "what cell life does Aeris-M revision 2 promise at the default cadence",
-      "notes": "Cell-life discrimination across the revision pair; this case backs the in-suite trap-chunk-vector right-reason probe.",
+      "notes": "Cell-life discrimination across the revision pair; the in-suite trap-chunk-vector probe uses rg-013 (see the test file).",
       "expected_doc": "aeris_m_spec_rev2.md",
       "expected_span": {
         "start": 2087,
