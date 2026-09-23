@@ -12,15 +12,19 @@ import { describe, expect, it } from "vitest";
 // Two layers:
 //  1. Budget assertions — every top-level `describe(` in the two spec files
 //     must pass an options object as the SECOND argument with
-//     `timeout >= 15_000`. The arg-position check closes the
-//     `describe(name, fn, { timeout })` false-accept; the vitest TypeScript
-//     types (enforced by `npm run typecheck`) reject that shape too.
+//     `timeout >= 15_000`. The arg-position check here is what closes the
+//     `describe(name, fn, { timeout })` false-accept: this guard's own parsing
+//     rejects that shape. (`npm run typecheck` does NOT backstop placement —
+//     tsconfig excludes test files — though the misplaced object-third-arg
+//     shape is a type error wherever typecheck does run.)
 //  2. Class tripwire — every test file under src/ that renders the full
 //     `<App />` must carry at least one explicit `timeout:` budget token, so a
 //     future whole-app render spec cannot silently re-enter the class.
-//     Known limit (recorded in the trace): the tripwire proves a budget token
-//     is present per file, not its per-test placement; per-test placement is
-//     enforced by vitest semantics plus the typecheck.
+//     Known limits (recorded in the trace): the tripwire proves a budget
+//     token is present per file — not its per-test placement, and not that the
+//     token is live code rather than a comment; per-test placement is
+//     enforced by this guard's layer 1 on the named specs and by vitest's
+//     own runtime watchdog everywhere else.
 
 const SPEC_FILES = ["src/App.subpath.test.tsx", "src/App.draft-room.test.tsx"];
 const MIN_BUDGET_MS = 15_000;
