@@ -48,6 +48,12 @@ Backend job:
 
 Repository contract job:
 
+- `python scripts/check_runtime_contract.py` — fails if any runtime surface
+  (Dockerfiles, `ci.yml` setup steps, `frontend/package.json` engines,
+  `CONTRIBUTING.md`, the devcontainer, and the `docs/engineering/` docs
+  surfaces) disagrees with the `ALLOWED_RUNTIME` table, or if a gated doc's
+  CI job/script inventory names fewer jobs or scripts than `ci.yml` defines
+  (issue #655).
 - `python scripts/check_config_contract.py`
 - `python scripts/check_pr_scope_drift.py`
 - `python scripts/check_sast_baseline.py` — fails if the SAST baseline grew on
@@ -110,6 +116,7 @@ cd frontend && VITE_APP_BASENAME=/knowledgevault VITE_API_URL=/knowledgevault/ap
 #   On PowerShell and on Linux no prefix is needed. The repo justfile handles
 #   this automatically via `just frontend-build-subpath`.
 cd backend && ruff check . && pytest --tb=short -v --timeout=300 tests/
+python scripts/check_runtime_contract.py
 python scripts/check_config_contract.py
 python scripts/check_pr_scope_drift.py
 python scripts/check_sast_baseline.py

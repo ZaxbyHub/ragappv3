@@ -33,12 +33,31 @@ Surfaces checked (each line lists one runtime mention -> required value):
                                       #567; the container mirrors CI's runtimes)
   docs/engineering/conventions.md     runtime-pin prose (Node/Python/Vitest/Vite)
                                       -> ALLOWED_RUNTIME + package.json vitest/vite
-                                      majors; CI job-name inventory -> ci.yml
+                                      majors; CI job-name + contract-script
+                                      inventories -> ci.yml
   docs/engineering/testing.md         CI job-name + quality-contract script
                                       inventories -> ci.yml ground truth
                                       (both docs surfaces are required since
                                       issue #655: a missing file fails instead
                                       of being skipped)
+
+Documented scope decisions (issue #655 follow-up review, PR #663):
+
+* The inventory checks are one-directional — ci.yml defines the truth and the
+  docs must name every job/script it defines. The reverse direction (a doc
+  mentioning a job ci.yml no longer has) is deliberately not checked: the
+  inventories are prose-shaped, so extracting "documented job names" reliably
+  is not possible without a real YAML/markdown parser, and a wrong extraction
+  would fail loud on true prose. Deleting a ci.yml job and forgetting the docs
+  therefore stays invisible — a known, accepted limitation.
+* Runtime-pin regexes apply to the whole doc text, including HTML comments and
+  code blocks: a stale version in a comment is flagged like a live claim. That
+  is deliberate (a stale pin in a comment misleads exactly like a live one) and
+  is pinned by a test.
+* The 40-character prose window can attribute a nearby unrelated version to
+  the preceding "node"/"python" token. Narrowing the window was measured and
+  rejected: it reintroduces a loud false-positive class ("Node 22 LTS
+  (22.22.0)" stops matching), which is worse than the rare misattribution.
 
 Digest pins (@sha256:...) are honored: the tag before the digest is compared.
 Non-runtime base images (nginx, ollama, ...) are ignored.
@@ -107,8 +126,18 @@ DOCS_SURFACES = (
 )
 
 DOC_NODE_PROSE_RE = re.compile(r"\bnode(?:\.js)?\b[^\n]{0,40}?[\s(\"]v?(\d{1,2})\.(\d+|x)\b", re.IGNORECASE)
+# Bare-major prose ("Node 20 LTS", "Node v22", "node (22)": no minor claim, so
+# the prose/op regexes above never see it). Only a WRONG major is flagged; a
+# correct bare major is a true statement with no minor to check. The lookaround
+# pair skips digits that are part of a full version ("Node 22.22.0" matches
+# nothing here — it is the prose regex's job).
+DOC_NODE_MAJOR_RE = re.compile(r"\bnode(?:\.js)?\b[^\n]{0,40}?(?<![\d.])v?(\d{1,2})\b(?!\.[0-9x])", re.IGNORECASE)
 DOC_NODE_OP_RE = re.compile(r"(?i)\bnode(?:\.js)?\s*(?:version\s*)?[><=]=?\s*(\d+)(?:\.(\d+|x))?\b")
-DOC_PYTHON_RE = CONTRIBUTING_PYTHON_RE
+# Docs-surface python check: the CONTRIBUTING family requires a single
+# space/@/: separator, so `Python3.11` (space-less — and the real binary name)
+# and newline-separated mentions were invisible here. Same version-claim
+# semantics, wider separator set.
+DOC_PYTHON_RE = re.compile(r"(?i)\bpython\s*[\s:.@]*?(\d+\.\d+)")
 # Version adjacency required (only separators like space/@/(/)/</>/=/+ may sit
 # between the name and the digits), so "vitest requires Node 22" cannot be
 # misread as a vitest version claim. `^~v` are included because that is the
@@ -121,6 +150,20 @@ DOC_SCRIPT_RE = re.compile(r"scripts/check_[a-z_]+\.py")
 
 def read(relative_path: str) -> str:
     return (ROOT / relative_path).read_text(encoding="utf-8")
+
+
+def _read_text_or_empty(path: Path) -> str:
+    """Read a UTF-8 text file, degrading to "" when absent or undecodable.
+
+    The docs-surface dependency comparison treats an unreadable package.json
+    as "no majors to compare" (the caller then fails loud through
+    ``_dep_major``'s missing-version path); a raw traceback here would violate
+    the one-``runtime-contract:``-line-per-mismatch contract.
+    """
+    try:
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 def fail(message: str) -> None:
@@ -335,19 +378,59 @@ def _flag_node_doc_mention(
 
 def _strip_yaml_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
+        inner = value[1:-1]
+        if value[0] == "'":
+            # YAML single-quote escaping doubles the quote: 'O''Reilly'.
+            return inner.replace("''", "'")
+        # Double-quoted scalars escape with backslashes: "say \"hi\"".
+        return inner.replace('\\"', '"').replace("\\\\", "\\")
     return value
+
+
+def _strip_yaml_comment(value: str) -> str:
+    """Drop a trailing YAML comment, but only outside quotes.
+
+    ``name: "Build #123"`` is the name ``Build #123`` — the ``#`` is inside
+    the quoted scalar. Only an unquoted `` #`` starts a comment. Backslash
+    escapes inside a double-quoted scalar do not close it.
+    """
+    if value[:1] and value[0] in "\"'":
+        quote = value[0]
+        end = 1
+        while end < len(value):
+            if quote == '"' and value[end] == "\\":
+                end += 2  # escaped character (\" or \\)
+                continue
+            if value[end] == quote:
+                if quote == "'" and value[end + 1 : end + 2] == "'":
+                    end += 2  # doubled quote escape
+                    continue
+                break
+            end += 1
+        return value[: end + 1]
+    return value.split(" #", 1)[0].rstrip()
+
+
+class UnparseableJobs(ValueError):
+    """ci.yml uses a job shape the stdlib indentation walk cannot inventory."""
 
 
 def _ci_job_display_names(ci_text: str) -> list[str]:
     """Job display names from a workflow's ``jobs:`` mapping.
 
     Stdlib indentation walk (the Quality contracts job has no YAML parser):
-    a job's display name is its ``name:`` value — quotes stripped, whatever
-    the indentation inside ``jobs:`` — falling back to the job key when a job
-    declares no ``name:``. Returns [] when ``jobs:`` is absent or empty so the
-    caller can fail loud instead of comparing against a silently truncated
-    inventory.
+    a job's display name is its ``name:`` value — quotes stripped, trailing
+    comments removed, whatever the indentation inside ``jobs:`` — falling back
+    to the job key when a job declares no ``name:``. Returns [] when ``jobs:``
+    is absent or empty so the caller can fail loud instead of comparing against
+    a silently truncated inventory.
+
+    Raises UnparseableJobs for shapes that would silently mis-inventory rather
+    than fail: block-scalar names (``name: >``), flow mappings, list-form jobs,
+    anchors/aliases, and tab indentation. Silent mis-inventory is worse than a
+    loud parse failure because the caller substring-checks docs against these
+    names (a wrong name can accidentally match, or accidentally never be
+    required).
     """
     names: list[str] = []
     in_jobs = False
@@ -356,13 +439,18 @@ def _ci_job_display_names(ci_text: str) -> list[str]:
     for raw in ci_text.splitlines():
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
+        if in_jobs and "\t" in raw[: len(raw) - len(raw.lstrip())]:
+            # YAML forbids tabs in indentation; a tab-indented workflow is not
+            # something this walk can inventory reliably.
+            raise UnparseableJobs("tab indentation inside jobs:")
         indent = len(raw) - len(raw.lstrip(" "))
         line = raw.strip()
         key, sep, value = line.partition(":")
         if not sep:
             continue
         key = _strip_yaml_quotes(key.strip())
-        value = value.strip()
+        # YAML strips trailing comments outside quotes; keep the parser honest.
+        value = _strip_yaml_comment(value.strip())
         if not in_jobs:
             if indent == 0 and key == "jobs" and value == "":
                 in_jobs = True
@@ -371,11 +459,26 @@ def _ci_job_display_names(ci_text: str) -> list[str]:
             break  # the next top-level key ends the jobs: mapping
         if job_indent is None:
             job_indent = indent
-        if indent == job_indent:
+        at_job_level = job_indent is not None and indent == job_indent
+        at_name_line = (
+            pending is not None
+            and job_indent is not None
+            and indent == job_indent + 2
+            and key == "name"
+        )
+        if at_job_level and line.startswith("- "):
+            raise UnparseableJobs(f"list-form jobs entry ({line!r})")
+        if at_job_level and ("{" in line or "}" in line):
+            raise UnparseableJobs(f"flow-style job mapping ({line!r})")
+        if at_job_level:
             if pending is not None:
                 names.append(pending)
             pending = key  # resolved by the job's own `name:` child when present
-        elif pending is not None and indent == job_indent + 2 and key == "name" and value:
+        elif at_name_line:
+            if value.startswith(("&", "*")):
+                raise UnparseableJobs(f"YAML anchor/alias job name ({line!r})")
+            if value[:1] in (">", "|"):
+                raise UnparseableJobs(f"block-scalar job name ({line!r})")
             # An empty resolved name (e.g. `name: ''`) would make the substring
             # inventory check vacuous ('' in anything is True) — fall back to
             # the job key so the job stays visible to the doc checks.
@@ -401,9 +504,7 @@ def docs_surface_failures(
     label = "docs/engineering/conventions.md"
 
     package_path = ROOT / "frontend" / "package.json"
-    package_text = (
-        package_path.read_text(encoding="utf-8") if package_path.is_file() else ""
-    )
+    package_text = _read_text_or_empty(package_path)
     vite_major = _dep_major(package_text, "vite", failures)
     vitest_major = _dep_major(package_text, "vitest", failures)
 
@@ -426,8 +527,26 @@ def docs_surface_failures(
             seen.add(mention)
             failures.append(f"{label}: runtime mention {mention!r} is {why}")
     for match in DOC_NODE_OP_RE.finditer(conventions_text):
+        mention = match.group(0).strip()
+        if mention in seen:
+            continue  # same mention already reported by the prose loop
+        seen.add(mention)
         _flag_node_doc_mention(
-            failures, match.group(0).strip(), match.group(1), match.group(2)
+            failures, mention, match.group(1), match.group(2)
+        )
+    # Bare-major prose ("Node 22 LTS"): no minor claim to check, but a WRONG
+    # major is still a stale pin and must not pass silently.
+    node_major = ALLOWED_RUNTIME["node"]["major"]
+    for match in DOC_NODE_MAJOR_RE.finditer(conventions_text):
+        if match.group(1) == node_major:
+            continue
+        mention = match.group(0).strip()
+        if mention in seen:
+            continue
+        seen.add(mention)
+        failures.append(
+            f"{label}: runtime mention {mention!r} is node major "
+            f"{match.group(1)}, contract requires {node_major}.x"
         )
     for match in DOC_PYTHON_RE.finditer(conventions_text):
         if match.group(1) != ALLOWED_RUNTIME["python"]["version"]:
@@ -453,7 +572,15 @@ def docs_surface_failures(
                     f"{vite_major} (frontend/package.json)"
                 )
 
-    job_names = _ci_job_display_names(ci_text)
+    try:
+        job_names = _ci_job_display_names(ci_text)
+    except UnparseableJobs as exc:
+        failures.append(
+            f".github/workflows/ci.yml job inventory is unparseable by this "
+            f"gate ({exc}); use plain scalar job names so the documented "
+            "inventory can be verified"
+        )
+        job_names = []
     if not job_names:
         failures.append(
             "no job names parsed from .github/workflows/ci.yml — parser or "
@@ -485,6 +612,11 @@ def docs_surface_failures(
                     f"{name!r} missing from the documented quality-contracts "
                     "inventory"
                 )
+            if name not in conventions_text:
+                failures.append(
+                    f"{label}: contract script {name!r} missing from the "
+                    "documented quality-contracts inventory"
+                )
     return failures
 
 
@@ -498,8 +630,13 @@ def check_docs_surfaces(failures: list[str]) -> None:
                 f"{surface} missing (required runtime-contract surface since "
                 "issue #655)"
             )
-        else:
+            continue
+        try:
             texts[surface] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # Fail in the contract vocabulary (one runtime-contract: line per
+            # mismatch), never as a raw traceback.
+            failures.append(f"{surface} unreadable ({exc.__class__.__name__}: {exc})")
     ci_path = ROOT / ".github" / "workflows" / "ci.yml"
     if not ci_path.is_file():
         failures.append(
@@ -508,11 +645,18 @@ def check_docs_surfaces(failures: list[str]) -> None:
         return
     if len(texts) < len(DOCS_SURFACES):
         return
+    try:
+        ci_text = ci_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        failures.append(
+            f".github/workflows/ci.yml unreadable ({exc.__class__.__name__}: {exc})"
+        )
+        return
     failures.extend(
         docs_surface_failures(
             texts[DOCS_SURFACES[0]],
             texts[DOCS_SURFACES[1]],
-            ci_path.read_text(encoding="utf-8"),
+            ci_text,
         )
     )
 

@@ -118,7 +118,7 @@ the new behavior.
 
 CI (`.github/workflows/ci.yml`) runs the full suite across seven jobs:
 
-- **Frontend job:** `npm run typecheck`, `npm run typecheck:contracts`, `npm run lint`, API smoke tests, the accessibility smoke (`npm run test:a11y`), full `npm test`, the coverage gate (`npm run test:coverage`), and three builds (production plus two subpath variants).
+- **Frontend job:** `npm run typecheck`, `npm run typecheck:contracts`, `npm run lint`, API smoke tests, the accessibility smoke (`npm run test:a11y`), full `npm test`, the coverage gate (`npm run test:coverage`), the toolchain-graph print (`node --version`, `npm --version`, `npm ls vite vitest @vitejs/plugin-react jsdom`, and the resolved `vite`/`vitest` versions — it fails the build when the two disagree), and three builds (production plus two subpath variants).
 - **Playwright e2e smoke job:** the `frontend/e2e/` browser smoke suite (send / stop-mid-stream / reload-restores-history / citation-opens-source) against the production build with a stub backend (issue #573).
 - **Quality contracts job:** all six contract scripts, in CI order: `scripts/check_runtime_contract.py`, `scripts/check_config_contract.py`, `scripts/check_pr_scope_drift.py`, `scripts/check_sast_baseline.py`, `scripts/check_secretscan.py`, `scripts/check_test_collection_scope.py` (mirrored by the `justfile` `quality-contracts` recipe).
 - **Detect docker scope job:** a paths-filter that arms the docker-smoke job only when the docker build surface changed (BUILD-002).
