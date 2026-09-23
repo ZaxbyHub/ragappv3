@@ -44,6 +44,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest.mock
 from pathlib import Path
 
@@ -366,3 +367,98 @@ def test_git_paths_returns_none_when_binary_missing(tmp_path):
         module.subprocess, "run", side_effect=FileNotFoundError("git")
     ):
         assert module._git_paths(repo, "ls-files") is None
+
+
+# ── PR #664 swarm-review follow-ups ───────────────────────────────────────────
+
+
+def test_undecodable_git_output_degrades_instead_of_crashing(tmp_path: Path):
+    """Non-UTF-8 bytes in git output must degrade, never traceback.
+
+    surrogateescape decoding plus the widened except clause keep the documented
+    degraded-mode contract: a decode failure (or a None stdout, which is how
+    Windows surfaces a decode failure in the reader thread) returns None.
+    """
+    import subprocess as sp
+
+    module = _load_gate_module()
+    repo = _seed_repo(tmp_path)
+    (repo / "test_probe.py").write_text(PROBE_PASS, encoding="utf-8")
+    _install_gate(repo)
+
+    with unittest.mock.patch.object(
+        module.subprocess,
+        "run",
+        side_effect=UnicodeDecodeError("utf-8", b"\xff\xfe", 0, 1, "invalid start byte"),
+    ):
+        assert module._git_paths(repo, "ls-files", "-z") is None
+
+    broken = sp.CompletedProcess(args=["git"], returncode=0, stdout=None, stderr="")
+    with unittest.mock.patch.object(module.subprocess, "run", return_value=broken):
+        assert module._git_paths(repo, "ls-files", "-z") is None
+
+    with unittest.mock.patch.object(module.subprocess, "run", return_value=broken):
+        with pytest.MonkeyPatch.context() as mp:
+            import io
+
+            mp.setattr(sys, "stderr", io.StringIO())
+            violations = module.find_violations(repo)
+            note = sys.stderr.getvalue()
+    assert violations == ["test_probe.py"], (
+        f"a git answer that cannot be decoded must degrade to the walk: {violations}"
+    )
+    assert "git unavailable" in note.lower()
+
+
+def test_degraded_mode_prunes_prune_dirs(tmp_path: Path):
+    """Degraded mode keeps the documented PRUNE_DIRS pruning (issue #656
+    follow-up: the branch had no test, so dropping it would pass the suite)."""
+    repo = _seed_repo(tmp_path, gitignore="data/\n")
+    for pruned in ("venv", "env", "ENV", "__pycache__", "node_modules"):
+        _write(repo, f"{pruned}/lib/test_thing.py", PROBE_PASS)
+    _write(repo, "test_probe_real.py", PROBE_PASS)
+    _install_gate(repo)
+
+    proc = _run_gate(repo, git_available=False)
+    combined = (proc.stdout or "") + (proc.stderr or "")
+
+    assert proc.returncode == 1, f"the real probe must still fail: {combined}"
+    assert "test_probe_real.py" in combined
+    for pruned in ("venv", "env", "ENV", "__pycache__", "node_modules"):
+        assert f"{pruned}/lib/test_thing.py" not in combined, (
+            f"{pruned}/ is a documented degraded-mode prune: {combined}"
+        )
+
+
+def test_nested_backend_tests_file_is_exempt_in_git_mode(tmp_path: Path):
+    """Containment is a prefix test (backend/tests/ at any depth), not an exact
+    two-component match — pinned synthetically so a future narrowing cannot
+    silently flag real tests."""
+    repo = _seed_repo(tmp_path)
+    _write(repo, "backend/tests/sub/deep/test_nested.py", PROBE_PASS)
+    _write(repo, "backend/tests/test_direct.py", PROBE_PASS)
+    _write(repo, "backend/testsx/test_not_in_tests.py", PROBE_PASS)
+    _commit(repo, "backend/tests/sub/deep/test_nested.py")
+    _commit(repo, "backend/tests/test_direct.py")
+    _install_gate(repo)
+
+    proc = _run_gate(repo)
+    combined = (proc.stdout or "") + (proc.stderr or "")
+
+    assert "backend/tests/sub/deep/test_nested.py" not in combined
+    assert "backend/tests/test_direct.py" not in combined
+    assert proc.returncode == 1 and "backend/testsx/test_not_in_tests.py" in combined, (
+        f"only the near-miss directory outside backend/tests/ must be flagged: {combined}"
+    )
+
+
+def test_walk_violations_missing_root_returns_empty():
+    """A library caller with a nonexistent root gets no violations, not a
+    traceback (unreachable via main(), pinned for API users)."""
+    module = _load_gate_module()
+    missing = Path(tempfile.gettempdir()) / "definitely-not-here-656" / "nested"
+    assert not missing.exists()
+    with unittest.mock.patch.object(
+        module.subprocess, "run", side_effect=FileNotFoundError("git")
+    ):
+        assert module.find_violations(missing) == []

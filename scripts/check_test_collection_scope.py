@@ -41,7 +41,7 @@ virtualenv names ``venv``/``env``/``ENV`` pruned (INSTALLATION.md's
 files inside site-packages) — and a one-line note is printed to stderr.
 
 Exit codes: 0 = clean, 1 = violations found (each offender printed).
-Run from the repository root.
+Run from any cwd (paths resolve from this file).
 """
 
 import subprocess
@@ -68,6 +68,13 @@ def _git_paths(repo_root: Path, *args: str) -> list[str] | None:
     the filesystem walk. Tokens are the raw NUL-delimited fields with only the
     empty terminal token discarded: git permits leading/trailing whitespace in
     path components, and stripping would resolve them to non-existent paths.
+
+    Output is decoded with ``errors="surrogateescape"``: git emits raw bytes and
+    a non-UTF-8 path component would otherwise raise UnicodeDecodeError (or, on
+    Windows, surface as ``stdout=None``) and crash the gate instead of
+    degrading. Surrogate-escaped tokens still round-trip through ``Path`` and
+    the filesystem unchanged. ``ValueError`` is caught alongside the OS/timeout
+    errors as defense in depth for any future decode misconfiguration.
     """
     try:
         proc = subprocess.run(
@@ -76,13 +83,14 @@ def _git_paths(repo_root: Path, *args: str) -> list[str] | None:
             check=False,
             text=True,
             encoding="utf-8",
+            errors="surrogateescape",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=GIT_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
-    if proc.returncode != 0:
+    if proc.returncode != 0 or proc.stdout is None:
         return None
     return [token for token in proc.stdout.split("\0") if token]
 
@@ -98,6 +106,11 @@ def _is_under_backend_tests(rel_posix: str) -> bool:
 
 def _walk_violations(repo_root: Path) -> list[str]:
     """Degraded-mode candidate set: the original filesystem walk, unchanged."""
+    if not repo_root.is_dir():
+        # Unreachable via main() (ROOT is derived from this file's location) —
+        # a library caller with a nonexistent root gets "no violations", not a
+        # traceback from iterdir().
+        return []
     tests_root = repo_root / "backend" / "tests"
     violations: list[str] = []
     stack = [repo_root]
@@ -122,6 +135,10 @@ def find_violations(repo_root: Path) -> list[str]:
         repo_root, "ls-files", "--others", "--exclude-standard", "-z"
     )
     if tracked is None or untracked is None:
+        # Conservative on purpose: either call failing degrades the whole gate,
+        # because a partial git view is not a safe candidate set. Each call is
+        # bounded by GIT_TIMEOUT_SECONDS, so the degraded walk starts within
+        # 2 x GIT_TIMEOUT_SECONDS of entry.
         print(DEGRADED_NOTE, file=sys.stderr)
         return _walk_violations(repo_root)
     violations: list[str] = []
