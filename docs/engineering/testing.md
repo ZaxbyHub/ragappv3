@@ -137,9 +137,9 @@ Three more workflows complete the gate lattice: `closure-evidence.yml` (PRs whos
 > command needs nothing special.
 
 > **Windows host test baseline (pre-existing, not regressions):** a full
-> backend suite run on a Windows/CRLF checkout reports a stable set of
-> environmental failures that CI (Linux) never sees. Know them before
-> debugging: (1) `tests/draft_room/test_gold_corpus_contract.py` — the
+> test-suite run (backend or frontend) on a Windows/CRLF checkout reports a
+> stable set of environmental failures that CI (Linux) never sees. Know them
+> before debugging: (1) `tests/draft_room/test_gold_corpus_contract.py` — the
 > gold-corpus manifest pins sha256 hashes of LF fixture bytes, and a CRLF
 > checkout rewrites them (~41 errors/failures; provable in seconds with
 > `git show HEAD:<fixture> | sha256sum` vs the on-disk hash); (2)

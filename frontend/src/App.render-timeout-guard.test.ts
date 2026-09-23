@@ -29,6 +29,7 @@ const SELF = "src/App.render-timeout-guard.test.ts";
 interface DescribeCall {
   line: number;
   optionsArg: string | null;
+  body: string;
 }
 
 // Scan `source` for column-0 `describe(` calls. Returns each call's line
@@ -101,7 +102,7 @@ function parseTopLevelDescribes(source: string): DescribeCall[] {
       if (end !== -1) break;
     }
     if (end === -1) {
-      calls.push({ line: i + 1, optionsArg: null });
+      calls.push({ line: i + 1, optionsArg: null, body: "" });
       continue;
     }
     const inner = lines.slice(i, end + 1).join("\n").slice(start + 1, -1);
@@ -133,7 +134,7 @@ function parseTopLevelDescribes(source: string): DescribeCall[] {
     }
     args.push(current);
     const optionsArg = args.length >= 3 && args[1].trim().startsWith("{") ? args[1] : null;
-    calls.push({ line: i + 1, optionsArg });
+    calls.push({ line: i + 1, optionsArg, body: inner });
   }
   return calls;
 }
@@ -160,6 +161,10 @@ describe("App render timeout guard", { timeout: 30_000 }, () => {
         `${file} must contain top-level describe blocks (guard cannot verify an empty file)`,
       ).toBeGreaterThan(0);
       for (const call of describes) {
+        expect(
+          /\b(it|test)\s*\(/.test(call.body),
+          `${file}:${call.line} describe must contain at least one it()/test() — a budgeted but empty describe guards nothing`,
+        ).toBe(true);
         expect(
           call.optionsArg,
           `${file}:${call.line} describe must pass an options object as its second argument with an explicit timeout`,
