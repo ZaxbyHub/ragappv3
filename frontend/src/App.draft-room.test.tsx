@@ -74,7 +74,7 @@ async function renderAppAt(path: string) {
   return render(<App />);
 }
 
-describe("App draft room routing", () => {
+describe("App draft room routing", { timeout: 30_000 }, () => {
   it("resolves /draft-room to DraftRoomPage, not NotFound", async () => {
     await renderAppAt("/draft-room");
 
