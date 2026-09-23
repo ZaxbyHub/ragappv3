@@ -453,3 +453,199 @@ def test_docs_surface_fails_loud_on_unparseable_jobs():
     assert any("no job names parsed" in f for f in failures), (
         f"an unparseable jobs: mapping must fail loud: {failures}"
     )
+
+
+# ── PR #663 review follow-ups (swarm-pr-feedback) ────────────────────────────
+
+
+def test_conventions_md_bare_major_node_pins_flagged():
+    """Bare-major Node prose ("Node 20 LTS") is a pin claim: wrong majors fail."""
+    module = _load_checker()
+    real = _doc("docs/engineering/conventions.md")
+    for stale in [
+        "- CI requires Node 20 LTS for lockfile regeneration.\n",
+        "- Tooling targets Node v20.\n",
+        "- Minimum runtime: node (20).\n",
+    ]:
+        failures = _conventions_failures(module, real + "\n" + stale)
+        assert any(
+            "conventions.md" in f and "node major" in f for f in failures
+        ), f"a stale bare-major Node claim must be flagged: {stale!r} -> {failures}"
+    for ok in [
+        "- CI requires Node 22 LTS for lockfile regeneration.\n",
+        "- Tooling targets Node v22.\n",
+        "- Minimum runtime: node (22).\n",
+    ]:
+        failures = _conventions_failures(module, real + "\n" + ok)
+        assert not [
+            f for f in failures if "conventions.md" in f and "node major" in f
+        ], f"a correct bare-major Node claim must not be flagged: {ok!r} -> {failures}"
+    # A full version is the prose regex's job, never the bare-major regex's.
+    failures = _conventions_failures(module, real + "\n- Pin: Node 22.22.0.\n")
+    assert not [
+        f for f in failures if "node major" in f
+    ], f"full versions must not double-report as bare majors: {failures}"
+
+
+def test_unsupported_yaml_job_shapes_fail_loud():
+    """YAML shapes the indentation walk cannot inventory fail loud, never
+    silently mis-inventory (block scalars and flow mappings previously
+    produced zero failures)."""
+    module = _load_checker()
+    conventions = _doc("docs/engineering/conventions.md")
+    testing = _doc("docs/engineering/testing.md")
+    shapes = {
+        "block scalar": "jobs:\n  frontend:\n    name: >\n      Frontend\n",
+        "flow mapping": "jobs:\n  frontend: { name: Frontend, runs-on: x }\n",
+        "list form": "jobs:\n  - name: Frontend\n    runs-on: x\n",
+        "anchor name": "jobs:\n  frontend:\n    name: &f Frontend\n",
+        "tab indent": "jobs:\n\tfrontend:\n    name: Frontend\n",
+    }
+    for label, ci_text in shapes.items():
+        failures = module.docs_surface_failures(conventions, testing, ci_text)
+        assert any("unparseable" in f for f in failures), (
+            f"{label} jobs: shape must fail loud as unparseable: {failures}"
+        )
+
+
+def test_name_trailing_comment_and_apostrophe_are_decoded():
+    """YAML details a maintainer will actually type: trailing comments are
+    stripped and single-quote escaping is decoded."""
+    module = _load_checker()
+    assert module._ci_job_display_names(
+        "jobs:\n  frontend:\n    name: Frontend  # the web build\n"
+    ) == ["Frontend"]
+    assert module._ci_job_display_names(
+        "jobs:\n  frontend:\n    name: 'O''Reilly Frontend'\n"
+    ) == ["O'Reilly Frontend"]
+    # The real workflow still parses to its documented inventory.
+    ci_text = _doc(".github/workflows/ci.yml")
+    names = module._ci_job_display_names(ci_text)
+    assert "Quality contracts" in names and "Docker build smoke" in names
+
+
+def test_conventions_md_lists_every_contract_script():
+    """The conventions.md contract-script inventory is gated too (it claimed
+    two of six scripts while CI runs six)."""
+    module = _load_checker()
+    real = _doc("docs/engineering/conventions.md")
+    dropped = real.replace("`scripts/check_secretscan.py`", "`scripts/check_ghost.py`")
+    assert dropped != real, "test fixture must actually drop a script mention"
+    failures = module.docs_surface_failures(
+        dropped, _doc("docs/engineering/testing.md"), _ci_text()
+    )
+    assert any(
+        "conventions.md" in f and "check_secretscan.py" in f for f in failures
+    ), f"a script missing from conventions.md must be flagged: {failures}"
+    failures = module.docs_surface_failures(real, _doc("docs/engineering/testing.md"), _ci_text())
+    assert not [
+        f for f in failures if "conventions.md" in f and "contract script" in f
+    ], f"the real conventions.md lists every contract script: {failures}"
+
+
+def test_node_op_form_duplicate_mention_reported_once():
+    """A repeated operator-form Node mention yields one failure line, matching
+    the prose loop's dedup (the module's one-line-per-mismatch contract)."""
+    module = _load_checker()
+    repeated = (
+        "- Backoff: Use Node >= 20.19.0 in tooling.\n"
+        "- Again: Use Node >= 20.19.0 in tooling.\n"
+    )
+    failures = _conventions_failures(module, repeated)
+    node_lines = [f for f in failures if "Node >= 20.19" in f]
+    assert len(node_lines) == 1, (
+        f"a repeated mention must report once, got {len(node_lines)}: {node_lines}"
+    )
+
+
+def test_docs_surface_unreadable_file_fails_clean():
+    """A non-UTF-8 docs surface fails with a runtime-contract: line, not a raw
+    UnicodeDecodeError traceback."""
+    module = _load_checker()
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch)
+        (root / "docs" / "engineering").mkdir(parents=True)
+        (root / "docs" / "engineering" / "conventions.md").write_bytes(b"\xff\xfe bad")
+        (root / "docs" / "engineering" / "testing.md").write_text("x\n", encoding="utf-8")
+        (root / ".github" / "workflows").mkdir(parents=True)
+        (root / ".github" / "workflows" / "ci.yml").write_text(
+            "name: CI\njobs:\n  backend:\n    name: Backend\n", encoding="utf-8"
+        )
+        original_root = module.ROOT
+        module.ROOT = root
+        try:
+            failures: list[str] = []
+            module.check_docs_surfaces(failures)
+        finally:
+            module.ROOT = original_root
+    assert any("unreadable" in f for f in failures), (
+        f"an undecodable docs surface must fail clean: {failures}"
+    )
+
+
+def test_python_space_less_and_newline_forms_flagged():
+    """`Python3.14` (space-less — the real binary name) and newline-separated
+    mentions are pin claims and must not pass silently."""
+    module = _load_checker()
+    real = _doc("docs/engineering/conventions.md")
+    allowed = module.ALLOWED_RUNTIME["python"]["version"]
+    stale_major, stale_minor = ("3", "14") if allowed != "3.14" else ("3", "99")
+    for stale in [
+        f"- Tooling assumes Python{stale_major}.{stale_minor} only.\n",
+        f"- We standardize on Python\n  {stale_major}.{stale_minor} for tooling.\n",
+    ]:
+        failures = _conventions_failures(module, real + "\n" + stale)
+        assert any(
+            "conventions.md" in f and "python" in f.lower() for f in failures
+        ), f"a space-less/newline python pin must be flagged: {stale!r} -> {failures}"
+
+
+def test_comment_mention_is_flagged_by_design():
+    """Runtime pins inside HTML comments are flagged like live claims — a
+    deliberate, documented scope decision, pinned here so it cannot drift."""
+    module = _load_checker()
+    real = _doc("docs/engineering/conventions.md")
+    failures = _conventions_failures(
+        module, real + "\n<!-- historical note: CI once pinned Node 20.19.0 -->\n"
+    )
+    assert any(
+        "conventions.md" in f and "Node 20.19" in f for f in failures
+    ), f"a commented stale pin is still a pin: {failures}"
+
+
+def test_quoted_job_name_with_hash_is_not_comment_stripped():
+    """A `#` inside a quoted job name is part of the name, not a comment."""
+    module = _load_checker()
+    assert module._ci_job_display_names(
+        'jobs:\n  frontend:\n    name: "Build #123"\n'
+    ) == ["Build #123"]
+    assert module._ci_job_display_names(
+        "jobs:\n  frontend:\n    name: 'Build #7'\n"
+    ) == ["Build #7"]
+    # Unquoted comments are still stripped.
+    assert module._ci_job_display_names(
+        "jobs:\n  frontend:\n    name: Frontend # the web build\n"
+    ) == ["Frontend"]
+
+
+def test_wildcard_node_claim_reports_once():
+    """A `.x` wildcard claim is the prose regex's job; the bare-major regex
+    must not double-report it."""
+    module = _load_checker()
+    real = _doc("docs/engineering/conventions.md")
+    failures = _conventions_failures(module, real + "\n- Any Node 20.x works.\n")
+    lines = [f for f in failures if "Node 20" in f]
+    assert len(lines) == 1, (
+        f"a wildcard claim must report exactly once, got {len(lines)}: {lines}"
+    )
+
+
+def test_escaped_quotes_inside_double_quoted_name():
+    """Backslash escapes do not close a double-quoted scalar (PyYAML parity)."""
+    module = _load_checker()
+    assert module._ci_job_display_names(
+        'jobs:\n  frontend:\n    name: "Build \\"x\\" #1"\n'
+    ) == ['Build "x" #1']
+    assert module._ci_job_display_names(
+        'jobs:\n  frontend:\n    name: "Build #123"  # real comment\n'
+    ) == ["Build #123"]

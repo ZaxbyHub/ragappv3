@@ -9,7 +9,7 @@
 - `backend/tests/test_runtime_contract_docs.py` (new): pins all of the above, including natural-language pin forms, the single-message failure contract, fail-loud missing-file behavior, and the dependency-major derivation.
 
 ## Why
-The 2026-09-22 frontier audit found the authoritative conventions doc instructing contributors to regenerate lockfiles with a Node release CI abandoned months earlier (20.19.0 vs the pinned 22.22.2), a testing doc that understated the CI gate lattice (3 of 7 jobs, 2 of 6 scripts), and a secretscan CI gate whose green status implied protection CI does not have. `check_runtime_contract.py` — the gate built to prevent exactly this — could not see any of it; it exited 0 while the docs lied. Post-fix documentation regression is the class; the gate now keeps the docs true.
+The 2026-09-22 frontier audit found the authoritative conventions doc instructing contributors to regenerate lockfiles with a Node release CI abandoned months earlier (20.19.0 vs the pinned 22.22.2), a testing doc that understated the CI gate lattice (3 of 7 jobs, 2 of 6 scripts), and a secretscan CI gate whose green status implied protection CI does not have. `check_runtime_contract.py` — the gate built to prevent exactly this — could not see any of it; it exited 0 while the docs lied. Post-fix documentation regression is the class; the gate now fails whenever a gated doc names fewer jobs or scripts than `ci.yml` defines.
 
 ## Migration
 No migration required. If your PR adds a ci.yml job or a `scripts/check_*.py` gate, update the inventories in `docs/engineering/testing.md` (and the job list in `docs/engineering/conventions.md`) in the same change — the Quality contracts job now enforces it.
