@@ -178,6 +178,12 @@ are the known places where a Windows shell behaves differently (issue #567):
   built after a feature-version change).
 - **A few tests are platform-sensitive** (symlink-privilege and
   backslash-traversal cases); see `docs/engineering/testing.md`.
+- **A green backend run can still exit 1.** On Windows, pytest's tmp-dir
+  cleanup can raise `PermissionError [WinError 5]` on
+  `pytest-of-<user>\pytest-current` during teardown — after every test
+  passed, with no FAILED lines and no summary. Re-run with `--basetemp`
+  pointed inside the repo (e.g. `--basetemp=.swarm/pytest-tmp`); see
+  `docs/engineering/testing.md`.
 
 ## Reporting issues
 
