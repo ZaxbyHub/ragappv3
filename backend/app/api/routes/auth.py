@@ -261,8 +261,8 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(max_length=128)
 
 
-@limiter.limit("5/hour")
 @router.post("/register")
+@limiter.limit("5/hour")
 async def register(
     request: Request,
     response: Response,
@@ -414,8 +414,8 @@ async def register(
     }
 
 
-@limiter.limit("10/minute")
 @router.post("/login")
+@limiter.limit("10/minute")
 async def login(
     request: Request,
     response: Response,
@@ -610,8 +610,8 @@ async def login(
     }
 
 
-@limiter.limit("30/minute")
 @router.post("/refresh")
+@limiter.limit("30/minute")
 async def refresh(
     request: Request,
     response: Response,

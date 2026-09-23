@@ -48,13 +48,18 @@ class TestRateLimitingDecorators(unittest.TestCase):
 
     def test_register_has_5_per_hour_limit(self):
         """Register endpoint must have @limiter.limit('5/hour')."""
+        # Match @router.post('/register') immediately followed by
+        # @limiter.limit("5/hour") — the CORRECT enforcement order (router
+        # outermost so the router stores the limiter-wrapped function).
         match = re.search(
-            r'@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)\s*\n\s*@router\.post\(\s*["\']\/register["\']',
+            r'@router\.post\(\s*["\']\/register["\']\s*\)\s*\n\s*@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)',
             self.src,
         )
         self.assertIsNotNone(
             match,
-            "Could not find @limiter.limit decorator before @router.post('/register')",
+            "Could not find @router.post('/register') followed by "
+            "@limiter.limit — the decorator order must be router-outermost "
+            "for enforcement to fire",
         )
         self.assertEqual(
             match.group(1),
@@ -64,13 +69,18 @@ class TestRateLimitingDecorators(unittest.TestCase):
 
     def test_login_has_10_per_minute_limit(self):
         """Login endpoint must have @limiter.limit('10/minute')."""
+        # Match @router.post('/login') immediately followed by
+        # @limiter.limit("10/minute") — the CORRECT enforcement order (router
+        # outermost so the router stores the limiter-wrapped function).
         match = re.search(
-            r'@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)\s*\n\s*@router\.post\(\s*["\']\/login["\']',
+            r'@router\.post\(\s*["\']\/login["\']\s*\)\s*\n\s*@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)',
             self.src,
         )
         self.assertIsNotNone(
             match,
-            "Could not find @limiter.limit decorator before @router.post('/login')",
+            "Could not find @router.post('/login') followed by "
+            "@limiter.limit — the decorator order must be router-outermost "
+            "for enforcement to fire",
         )
         self.assertEqual(
             match.group(1),
@@ -80,13 +90,18 @@ class TestRateLimitingDecorators(unittest.TestCase):
 
     def test_refresh_has_30_per_minute_limit(self):
         """Refresh endpoint must have @limiter.limit('30/minute')."""
+        # Match @router.post('/refresh') immediately followed by
+        # @limiter.limit("30/minute") — the CORRECT enforcement order (router
+        # outermost so the router stores the limiter-wrapped function).
         match = re.search(
-            r'@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)\s*\n\s*@router\.post\(\s*["\']\/refresh["\']',
+            r'@router\.post\(\s*["\']\/refresh["\']\s*\)\s*\n\s*@limiter\.limit\(\s*["\'](\d+/\w+)["\']\s*\)',
             self.src,
         )
         self.assertIsNotNone(
             match,
-            "Could not find @limiter.limit decorator before @router.post('/refresh')",
+            "Could not find @router.post('/refresh') followed by "
+            "@limiter.limit — the decorator order must be router-outermost "
+            "for enforcement to fire",
         )
         self.assertEqual(
             match.group(1),
@@ -106,9 +121,9 @@ class TestRateLimitingDecorators(unittest.TestCase):
         function so the router stores the wrapper (not the raw endpoint).
         The reverse order (limiter above router) silently breaks enforcement
         because the router stores the unwrapped function and the limit check
-        never fires. The pre-existing register/login/refresh routes have the
-        broken order; change-password is fixed here and a follow-up should
-        correct the others.
+        never fires. The pre-existing register/login/refresh routes were
+        stacked in the broken order; they were corrected by #659 together
+        with a repo-wide AST guard that makes the order unrepresentable.
         """
         # Match @router.post('/change-password') immediately followed by
         # @limiter.limit("10/minute") — the CORRECT enforcement order.
