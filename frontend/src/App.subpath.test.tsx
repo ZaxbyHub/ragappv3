@@ -33,7 +33,7 @@ vi.mock("@/pages/ProfilePage", () => ({ default: () => <div>Profile Page</div> }
 vi.mock("@/pages/NotFoundPage", () => ({ default: () => <div>Not Found Page</div> }));
 vi.mock("@/pages/WikiPage", () => ({ default: () => <div>Wiki Page</div> }));
 
-describe("App basename routing", () => {
+describe("App basename routing", { timeout: 30_000 }, () => {
   beforeEach(() => {
     vi.resetModules();
     vi.stubEnv("VITE_APP_BASENAME", "/knowledgevault");

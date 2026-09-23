@@ -137,9 +137,9 @@ Three more workflows complete the gate lattice: `closure-evidence.yml` (PRs whos
 > command needs nothing special.
 
 > **Windows host test baseline (pre-existing, not regressions):** a full
-> backend suite run on a Windows/CRLF checkout reports a stable set of
-> environmental failures that CI (Linux) never sees. Know them before
-> debugging: (1) `tests/draft_room/test_gold_corpus_contract.py` — the
+> test-suite run (backend or frontend) on a Windows/CRLF checkout reports a
+> stable set of environmental failures that CI (Linux) never sees. Know them
+> before debugging: (1) `tests/draft_room/test_gold_corpus_contract.py` — the
 > gold-corpus manifest pins sha256 hashes of LF fixture bytes, and a CRLF
 > checkout rewrites them (~41 errors/failures; provable in seconds with
 > `git show HEAD:<fixture> | sha256sum` vs the on-disk hash); (2)
@@ -148,7 +148,11 @@ Three more workflows complete the gate lattice: `closure-evidence.yml` (PRs whos
 > `test_upload_validation_regression.py::TestSecureFilename::test_strips_traversal`
 > — POSIX-only backslash-traversal semantics; (4) occasional timing flakes
 > under `-n auto` load (e.g. `test_org_invites` concurrent-accept — passes in
-> isolation). Anything outside this set deserves investigation.
+> isolation). (5) Frontend: under full-suite load on Windows the full-App render specs (`src/App.subpath.test.tsx`, `src/App.draft-room.test.tsx`) can exceed Vitest's default 5000ms timeout —
+> they carry an explicit per-suite budget and pass in isolation; treat a timeout in only these specs as this known load-sensitive class; anything
+> else is a regression. (6) Backend: a Windows run can exit 1 after all tests pass with `PermissionError [WinError 5]` on
+> `pytest-of-<user>\pytest-current` during teardown — zero FAILED lines, no summary; re-run with `--basetemp` inside the repo (e.g.
+> `--basetemp=.swarm/pytest-tmp`) to get a clean result. Anything outside this set deserves investigation.
 
 **The backend CI dependency set is reduced — "locally green" ≠ "CI green".** CI installs only `requirements-ci.txt` + `requirements-dev.txt`, which omit `unstructured` and `sentence-transformers` (stubbed per-file at test time); `lancedb` and `pyarrow` are installed for real — they were added to `requirements-ci.txt` so the issue-#513 acceptance checks (`tests/issue513_checks/`) can exercise the real LanceDB surface instead of the stub. A dev machine usually has the full `requirements.txt`, so a backend test can pass locally yet fail in CI at import (`ModuleNotFoundError`). To validate a backend **test-scope** change (e.g. adding a file to the CI pytest list) faithfully — and faster, with no multi-GB model/db loads — reproduce the CI env instead of trusting the local run:
 
