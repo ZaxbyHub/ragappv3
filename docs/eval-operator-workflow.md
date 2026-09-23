@@ -50,6 +50,38 @@ The report states actual sample counts, per-metric denominators
 Lexical-overlap numbers from `/api/eval/heuristic` are sanity checks, not
 calibrated truth — never report them as reference-based metrics.
 
+## 3a. The deterministic retrieval gold corpus (issue #658)
+
+`backend/tests/fixtures/retrieval_gold/` ships a sha-pinned synthetic corpus
+(10 plain-text documents on deliberately confusable topics: a superseded
+specification revision pair sharing a verbatim preamble, a competing vendor
+specification, a distributor bulletin contradicting the controlling spec,
+and a memo quoting it) with 25 pinned query/expected-span cases, enforced by
+`backend/tests/test_retrieval_gold_corpus.py` in the Backend CI job (~8s,
+fully offline). Manifest hashes are computed over CRLF-to-LF normalized
+bytes, so the corpus holds identically on Linux CI and Windows/CRLF
+checkouts.
+
+What the retrieval gold corpus PROVES, deterministically in CI: retrieval
+discrimination on confusable fixtures — every expected span's chunk is
+retrieved in the top-k through the real LanceDB dense + BM25 hybrid search,
+real RRF fusion and the real relevance cutoff; near-trap passages from the
+wrong document never outrank the expected passage; and an out-of-domain
+query returns no confident hit instead of a hallucinated one.
+
+What it does NOT prove: answer quality or generation faithfulness (still
+requires the labeled real corpus in section 1 and the human calibration
+panel in section 5); calibrated relevance bands (issue #36 calibration
+remains the source); real-embedding semantics — the harness substitutes a
+deterministic token-hash embedding for the network-bound embedding provider,
+so synonym/paraphrase retrieval is out of reach by construction (the
+`morphological_variant` cases cover only token-sharing variants); the real
+`SemanticChunker` (the harness splits fixtures by its documented paragraph
+policy at the 768/1536 scales instead); reranker integration (pinned off);
+and multi-variant query transformation (pinned off). A ranking regression
+caught here is real; absence of a regression here is not evidence about the
+substituted components.
+
 ## 4. Compare runs before/after a change
 
 `app.services.eval_compare.compare_runs` loads two run reports (each

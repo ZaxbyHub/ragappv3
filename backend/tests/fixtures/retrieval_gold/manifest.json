@@ -1,0 +1,122 @@
+{
+  "schema_version": "1.0.0",
+  "corpus_id": "retrieval_gold_corpus_v1",
+  "description": "Synthetic, license-safe gold corpus for retrieval-quality measurement. Every name, organisation, place, date, number and quotation is invented. The corpus deliberately contains confusable documents (a superseded revision pair sharing a verbatim preamble, a competing vendor specification, a distributor bulletin contradicting the controlling specification, and a memo quoting the specification) so retrieval discrimination can be measured deterministically offline.",
+  "normalization": {
+    "encoding": "utf-8",
+    "policy": "crlf-to-lf",
+    "note": "CRLF and lone CR are folded to LF before hashing and before offsets are computed. All document sha256 values are over the UTF-8 encoding of the normalized text, NOT raw file bytes, so the manifest holds identically on LF and CRLF checkouts. All start/end offsets are character offsets into the normalized text. cases.json is deliberately not byte-hashed here: it is protected structurally (every span carries its verbatim text and sha256, validated against the document hashes) so the frozen ranking-degradation probe's sanctioned cases.json rewrite stays loader-valid."
+  },
+  "roles": [
+    "controlling_spec",
+    "superseded_spec",
+    "competing_spec",
+    "safety",
+    "distributor_guidance",
+    "site_memo",
+    "timeline",
+    "glossary",
+    "permit",
+    "opinion"
+  ],
+  "case_kinds": [
+    "exact_fact",
+    "revision_marker",
+    "vendor_confusion",
+    "memo_quote",
+    "morphological_variant",
+    "not_in_corpus"
+  ],
+  "documents": [
+    {
+      "id": "doc_aeris_m_spec_rev2",
+      "path": "aeris_m_spec_rev2.md",
+      "title": "Kellerman Aeris-M Field Specification, Revision 2",
+      "role": "controlling_spec",
+      "sha256": "59f71420bbac7eec074df7e286336a99607d8fe7279b8465d5fb093cafbab17a",
+      "char_length": 3239,
+      "superseded_by": null
+    },
+    {
+      "id": "doc_aeris_m_spec_rev1",
+      "path": "aeris_m_spec_rev1_superseded.md",
+      "title": "Kellerman Aeris-M Field Specification, Revision 1 (superseded)",
+      "role": "superseded_spec",
+      "sha256": "bf8d63cdb149771381c6861a6efc0ba3e625bfd4edfeba23d9999ea28a9d2ec4",
+      "char_length": 2496,
+      "superseded_by": "doc_aeris_m_spec_rev2"
+    },
+    {
+      "id": "doc_hydraprobe_9_spec",
+      "path": "hydraprobe_9_spec.md",
+      "title": "Voss HydraProbe-9 Product Specification",
+      "role": "competing_spec",
+      "sha256": "8ad248ed92c1da98db641b8762269b53ccb05ee3a31ee71564324d6f5e6f85d5",
+      "char_length": 2118,
+      "superseded_by": null
+    },
+    {
+      "id": "doc_aeris_m_safety_datasheet",
+      "path": "aeris_m_safety_datasheet.md",
+      "title": "Aeris-M Field Safety Datasheet",
+      "role": "safety",
+      "sha256": "2f46aa7b56933946f4f11c2a0306d8d8a2c88e577379d076d4110894b14d9993",
+      "char_length": 1916,
+      "superseded_by": null
+    },
+    {
+      "id": "doc_distributor_bulletin",
+      "path": "distributor_bulletin.md",
+      "title": "Cobalt AgriSupply Service Bulletin SB-2031-04",
+      "role": "distributor_guidance",
+      "sha256": "9e1ff028480c6629b7e6feef3492fc7f8c98e8f132873c06695e332b61eda306",
+      "char_length": 2519,
+      "superseded_by": null
+    },
+    {
+      "id": "doc_site_deployment_memo",
+      "path": "site_deployment_memo.md",
+      "title": "Site Deployment Memo - Gretna Marsh Pilot",
+      "role": "site_memo",
+      "sha256": "1209a18fec41f54e156863dee0a4ea7a1fcc16b51ad1deff69fd09d11705e7d2",
+      "char_length": 2190,
+      "superseded_by": null
+    },
+    {
+      "id": "doc_programme_timeline",
+      "path": "programme_timeline.md",
+      "title": "Gretna Marsh Programme Timeline",
+      "role": "timeline",
+      "sha256": "ca227c80d7cadc526b74a1f8563e493a0822c4b7109afe3ae336cef6e6bd8b09",
+      "char_length": 2784,
+      "superseded_by": null
+    },
+    {
+      "id": "doc_programme_glossary",
+      "path": "programme_glossary.md",
+      "title": "Gretna Marsh Programme Glossary",
+      "role": "glossary",
+      "sha256": "c7493d727381cc91ea1882049a9c7fecd8091831a03e9f601e1e6ee87924f0c4",
+      "char_length": 2765,
+      "superseded_by": null
+    },
+    {
+      "id": "doc_site_permit",
+      "path": "site_permit.txt",
+      "title": "Provincial Board of Alderbury Field Instrumentation Permit WPB-2049-1187",
+      "role": "permit",
+      "sha256": "a9ded50a7a0d20929ff0fcd893a1d92274d1e817963e520a6bfa372629282e79",
+      "char_length": 2450,
+      "superseded_by": null
+    },
+    {
+      "id": "doc_field_notes_opinion",
+      "path": "field_notes_opinion.md",
+      "title": "Field Notes - A Column of Opinions",
+      "role": "opinion",
+      "sha256": "a405bb3c3583ae5e41b979103a308d15df3d94a671c50063065c13badc4a7dd7",
+      "char_length": 1833,
+      "superseded_by": null
+    }
+  ]
+}
